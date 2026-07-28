@@ -1,0 +1,143 @@
+{
+  "name": "LM AI-SDLC — Nightly Compliance Sweep",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [{ "mode": "everyDay", "hour": 2, "minute": 0 }]
+        }
+      },
+      "id": "cron-nightly",
+      "name": "Nightly Trigger",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            { "name": "lm_sdlc_base_url", "value": "https://your-lm-sdlc-host.example.com" },
+            { "name": "lm_sdlc_api_key", "value": "lmsdlc_REPLACE_WITH_YOUR_KEY" },
+            { "name": "slack_webhook_url", "value": "https://hooks.slack.com/services/REPLACE/ME/HERE" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Edit this list to the repos/files this sweep should watch.\nconst targets = [\n  { project_name: 'Patient Portal API', github_repo_url: 'https://github.com/your-org/patient-portal-api' },\n  { project_name: 'Billing Service', github_repo_url: 'https://github.com/your-org/billing-service' }\n];\nreturn targets.map(t => ({ json: t }));"
+      },
+      "id": "function-repo-list",
+      "name": "Repo List",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $node[\"Config\"].json[\"lm_sdlc_base_url\"] }}/api/v1/agents/compliance",
+        "authentication": "none",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-API-Key", "value": "={{ $node[\"Config\"].json[\"lm_sdlc_api_key\"] }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ project_name: $json.project_name, text: $json.github_repo_url }) }}",
+        "options": {}
+      },
+      "id": "http-compliance-scan",
+      "name": "Compliance Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [900, 220]
+    },
+    {
+      "parameters": {
+        "url": "={{ $node[\"Config\"].json[\"lm_sdlc_base_url\"] }}/api/v1/agents/sensitive-data",
+        "authentication": "none",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-API-Key", "value": "={{ $node[\"Config\"].json[\"lm_sdlc_api_key\"] }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ project_name: $node[\"Repo List\"].json.project_name, github_file_url: $node[\"Repo List\"].json.github_repo_url }) }}",
+        "options": {}
+      },
+      "id": "http-sensitive-scan",
+      "name": "Sensitive Data Scan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [900, 380]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Runs once with all Compliance Scan results collected — build one Slack summary.\nconst lines = items.map(item => {\n  const r = item.json;\n  return `• ${r.project_name || 'Unknown'}: gate=${r.gate_status}, risk=${r.risk_score}, findings=${r.total_findings}`;\n});\nreturn [{ json: { summary: lines.join('\\n') } }];"
+      },
+      "id": "function-summarize",
+      "name": "Summarize Results",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 220]
+    },
+    {
+      "parameters": {
+        "url": "={{ $node[\"Config\"].json[\"slack_webhook_url\"] }}",
+        "authentication": "none",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: \":shield: LM AI-SDLC nightly compliance sweep\\n\" + $json.summary }) }}",
+        "options": {}
+      },
+      "id": "http-slack-summary",
+      "name": "Post Slack Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1340, 220]
+    }
+  ],
+  "connections": {
+    "Nightly Trigger": {
+      "main": [[{ "node": "Config", "type": "main", "index": 0 }]]
+    },
+    "Config": {
+      "main": [[{ "node": "Repo List", "type": "main", "index": 0 }]]
+    },
+    "Repo List": {
+      "main": [
+        [
+          { "node": "Compliance Scan", "type": "main", "index": 0 },
+          { "node": "Sensitive Data Scan", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Compliance Scan": {
+      "main": [[{ "node": "Summarize Results", "type": "main", "index": 0 }]]
+    },
+    "Summarize Results": {
+      "main": [[{ "node": "Post Slack Summary", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "LM AI-SDLC Nightly Compliance Sweep — runs Compliance + Sensitive Data agents against a fixed list of repos every night and posts a Slack summary. Edit the Repo List node to point at your own repos."
+  }
+}

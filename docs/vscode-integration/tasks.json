@@ -1,0 +1,56 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "LM AI-SDLC: Review Current File",
+      "type": "shell",
+      "command": "python",
+      "windows": { "command": "python" },
+      "linux": { "command": "python3" },
+      "osx": { "command": "python3" },
+      "args": ["${workspaceFolder}/.vscode/lm_sdlc_review.py", "--file", "${file}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true, "focus": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "LM AI-SDLC: Review Working Diff",
+      "type": "shell",
+      "command": "python",
+      "windows": { "command": "python" },
+      "linux": { "command": "python3" },
+      "osx": { "command": "python3" },
+      "args": ["${workspaceFolder}/.vscode/lm_sdlc_review.py", "--diff"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true, "focus": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "LM AI-SDLC: Review Staged Diff",
+      "type": "shell",
+      "command": "python",
+      "windows": { "command": "python" },
+      "linux": { "command": "python3" },
+      "osx": { "command": "python3" },
+      "args": ["${workspaceFolder}/.vscode/lm_sdlc_review.py", "--diff", "--staged"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true, "focus": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "LM AI-SDLC: Review GitHub PR",
+      "type": "shell",
+      "command": "python",
+      "windows": { "command": "python" },
+      "linux": { "command": "python3" },
+      "osx": { "command": "python3" },
+      "args": ["${workspaceFolder}/.vscode/lm_sdlc_review.py", "--pr", "${input:lmSdlcPrUrl}"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true, "focus": true },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "lmSdlcPrUrl",
+      "type": "promptString",
+      "description": "GitHub PR URL to review (e.g. https://github.com/org/repo/pull/42)"
+    }
+  ]
+}

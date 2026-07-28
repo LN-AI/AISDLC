@@ -1,0 +1,20 @@
+anthropic>=0.40.0
+openai>=1.50.0
+cryptography>=42.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.0
+pydantic>=2.6.0
+httpx>=0.27.0
+jinja2>=3.1.0
+aiosqlite>=0.20.0
+PyPDF2>=3.0.0
+python-docx>=1.1.0
+PyJWT>=2.8.0
+headroom-ai>=0.1.0
+# Pinned below 1.92.0: from 1.92.0 onward litellm ships a Rust extension with
+# manylinux-only wheels (no win_amd64 wheel), so `pip install` on Windows without
+# a Rust+MSVC toolchain fails. 1.91.x is pure-Python and satisfies headroom-ai's
+# own requirement (litellm<2.0,>=1.86.2).
+litellm<1.92.0

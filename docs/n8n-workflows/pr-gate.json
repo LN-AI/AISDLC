@@ -1,0 +1,188 @@
+{
+  "name": "LM AI-SDLC — PR Governance Gate",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lm-sdlc-pr-gate",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "webhook-github-pr",
+      "name": "GitHub PR Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "values": {
+          "string": [
+            { "name": "lm_sdlc_base_url", "value": "https://your-lm-sdlc-host.example.com" },
+            { "name": "lm_sdlc_api_key", "value": "lmsdlc_REPLACE_WITH_YOUR_KEY" },
+            { "name": "policy_name", "value": "standard" },
+            { "name": "github_token", "value": "ghp_REPLACE_WITH_A_REPO_STATUS_TOKEN" },
+            { "name": "slack_webhook_url", "value": "https://hooks.slack.com/services/REPLACE/ME/HERE" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "set-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.body.action }}",
+              "operation": "regex",
+              "value2": "^(opened|synchronize|reopened)$"
+            }
+          ]
+        }
+      },
+      "id": "if-relevant-pr-action",
+      "name": "Relevant PR Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $node[\"Config\"].json[\"lm_sdlc_base_url\"] }}/api/v1/swarm",
+        "authentication": "none",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-API-Key", "value": "={{ $node[\"Config\"].json[\"lm_sdlc_api_key\"] }}" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ project_name: $json.body.repository.full_name, github_pr_url: $json.body.pull_request.html_url, policy_name: $node[\"Config\"].json[\"policy_name\"] }) }}",
+        "options": {}
+      },
+      "id": "http-run-swarm",
+      "name": "Run Governance Swarm",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [900, 220]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ [\"RED\", \"BLOCKED\"].includes($json.swarm_gate) }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "if-gate-failed",
+      "name": "Gate Failed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 220]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $node[\"GitHub PR Webhook\"].json.body.repository.full_name }}/statuses/{{ $node[\"GitHub PR Webhook\"].json.body.pull_request.head.sha }}",
+        "authentication": "none",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=token {{ $node[\"Config\"].json[\"github_token\"] }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: \"failure\", description: \"LM AI-SDLC gate: \" + $json.swarm_gate, context: \"lm-ai-sdlc/governance\" }) }}",
+        "options": {}
+      },
+      "id": "http-github-status-failure",
+      "name": "Set GitHub Status: Failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1340, 140]
+    },
+    {
+      "parameters": {
+        "url": "={{ $node[\"Config\"].json[\"slack_webhook_url\"] }}",
+        "authentication": "none",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: \":no_entry: LM AI-SDLC blocked \" + $node[\"GitHub PR Webhook\"].json.body.pull_request.html_url + \" — gate: \" + $json.swarm_gate + \", risk: \" + $json.swarm_risk_score }) }}",
+        "options": {}
+      },
+      "id": "http-slack-alert",
+      "name": "Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1560, 140]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.github.com/repos/{{ $node[\"GitHub PR Webhook\"].json.body.repository.full_name }}/statuses/{{ $node[\"GitHub PR Webhook\"].json.body.pull_request.head.sha }}",
+        "authentication": "none",
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=token {{ $node[\"Config\"].json[\"github_token\"] }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: \"success\", description: \"LM AI-SDLC gate: \" + $json.swarm_gate, context: \"lm-ai-sdlc/governance\" }) }}",
+        "options": {}
+      },
+      "id": "http-github-status-success",
+      "name": "Set GitHub Status: Success",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1340, 300]
+    }
+  ],
+  "connections": {
+    "GitHub PR Webhook": {
+      "main": [[{ "node": "Config", "type": "main", "index": 0 }]]
+    },
+    "Config": {
+      "main": [[{ "node": "Relevant PR Event?", "type": "main", "index": 0 }]]
+    },
+    "Relevant PR Event?": {
+      "main": [
+        [{ "node": "Run Governance Swarm", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Run Governance Swarm": {
+      "main": [[{ "node": "Gate Failed?", "type": "main", "index": 0 }]]
+    },
+    "Gate Failed?": {
+      "main": [
+        [{ "node": "Set GitHub Status: Failure", "type": "main", "index": 0 }],
+        [{ "node": "Set GitHub Status: Success", "type": "main", "index": 0 }]
+      ]
+    },
+    "Set GitHub Status: Failure": {
+      "main": [[{ "node": "Slack Alert", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "description": "LM AI-SDLC PR Governance Gate — runs the Governance Swarm on every PR open/update, sets a GitHub commit status, and alerts Slack when the gate is RED/BLOCKED."
+  }
+}

@@ -1,0 +1,1854 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LM AI-SDLC ReviewOps</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-logo">
+        <span class="logo-icon">⚡</span>
+        <div>
+          <div class="logo-title">LM AI-SDLC</div>
+          <div class="logo-sub">ReviewOps Agent</div>
+        </div>
+      </div>
+      <ul class="nav-list">
+        <li class="nav-item active" data-page="dashboard">
+          <span class="nav-icon">📊</span> Dashboard
+        </li>
+
+        <li class="nav-section" data-section="requirement-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">Requirement Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="requirement">
+              <span class="nav-icon">📋</span> Requirement Review
+            </li>
+          </ul>
+        </li>
+
+        <li class="nav-section" data-section="architecture-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">Architecture Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="architecture">
+              <span class="nav-icon">🏗️</span> Architecture Review
+            </li>
+            <li class="nav-item" data-page="security">
+              <span class="nav-icon">🔐</span> Security Review (Threat Model)
+            </li>
+          </ul>
+        </li>
+
+        <li class="nav-section" data-section="developer-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">Developer Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="code">
+              <span class="nav-icon">💻</span> Code Review
+            </li>
+            <li class="nav-item" data-page="codegen">
+              <span class="nav-icon">🧩</span> Code Generation
+            </li>
+            <li class="nav-item" data-page="migration">
+              <span class="nav-icon">🔀</span> Code Migration
+            </li>
+            <li class="nav-item" data-page="ai-provenance">
+              <span class="nav-icon">🧬</span> AI Provenance
+            </li>
+            <li class="nav-item" data-page="github">
+              <span class="nav-icon">🐙</span> GitHub PR Review
+            </li>
+          </ul>
+        </li>
+
+        <li class="nav-section" data-section="qa-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">QA Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="test-scenario">
+              <span class="nav-icon">🧪</span> Test Scenario Generation
+            </li>
+            <li class="nav-item" data-page="test-case">
+              <span class="nav-icon">📝</span> Test Case Generation
+            </li>
+          </ul>
+        </li>
+
+        <li class="nav-section" data-section="security-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">Security Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="vapt">
+              <span class="nav-icon">🛡️</span> VAPT
+            </li>
+            <li class="nav-item" data-page="sensitive">
+              <span class="nav-icon">🔍</span> Sensitive Data
+            </li>
+            <li class="nav-item" data-page="prompt">
+              <span class="nav-icon">🤖</span> Prompt Safety
+            </li>
+            <li class="nav-item" data-page="cfr21">
+              <span class="nav-icon">💊</span> 21 CFR Part 11
+            </li>
+            <li class="nav-item" data-page="gxp-docs">
+              <span class="nav-icon">📑</span> GxP Document Check
+            </li>
+            <li class="nav-item" data-page="gxp-generate">
+              <span class="nav-icon">🏭</span> GxP Document Generation
+            </li>
+          </ul>
+        </li>
+
+        <li class="nav-section" data-section="operations-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">Operations Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="issue-triage">
+              <span class="nav-icon">🧯</span> Issue Triage
+            </li>
+          </ul>
+        </li>
+
+        <li class="nav-section" data-section="governance-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">Governance Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="full">
+              <span class="nav-icon">🔍</span> Full SDLC Review
+            </li>
+            <li class="nav-item" data-page="gate">
+              <span class="nav-icon">🚦</span> Release Gate
+            </li>
+            <li class="nav-item" data-page="inventory">
+              <span class="nav-icon">📦</span> AI Inventory
+            </li>
+            <li class="nav-item" data-page="approvals">
+              <span class="nav-icon">✅</span> Approvals
+              <span class="approval-badge hidden" id="approval-badge">0</span>
+            </li>
+            <li class="nav-item" data-page="audit">
+              <span class="nav-icon">📋</span> Audit Trail
+            </li>
+            <li class="nav-item" data-page="projects" id="nav-projects" style="display:none">
+              <span class="nav-icon">🗂️</span> Projects
+            </li>
+            <li class="nav-item" data-page="users" id="nav-users" style="display:none">
+              <span class="nav-icon">👥</span> Users
+            </li>
+            <li class="nav-item" data-page="api-keys" id="nav-api-keys" style="display:none">
+              <span class="nav-icon">🔑</span> API Keys
+            </li>
+          </ul>
+        </li>
+
+        <li class="nav-section" data-section="knowledge-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">Knowledge Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="agent-hub">
+              <span class="nav-icon">⚡</span> Agent Hub
+            </li>
+            <li class="nav-item" data-page="knowledge-base">
+              <span class="nav-icon">📚</span> Knowledge Base
+            </li>
+            <li class="nav-item" data-page="cost-optimization">
+              <span class="nav-icon">💰</span> Cost Optimization
+            </li>
+            <li class="nav-item" data-page="history">
+              <span class="nav-icon">📜</span> Review History
+            </li>
+            <li class="nav-item" data-page="vertical" id="nav-vertical" style="display:none">
+              <span class="nav-icon">🏥</span> Vertical Dashboard
+            </li>
+          </ul>
+        </li>
+      </ul>
+      <div class="sidebar-user" id="sidebar-user">
+        <button class="btn-login" onclick="openLogin()">🔑 Sign In</button>
+      </div>
+    </nav>
+
+    <!-- Main content -->
+    <main class="main">
+      <!-- Dashboard Page -->
+      <div id="page-dashboard" class="page active">
+        <div class="page-header">
+          <h1>Risk Overview</h1>
+          <p class="subtitle">Real-time governance posture across all SDLC reviews</p>
+        </div>
+        <div class="stats-grid" id="dashboard-stats">
+          <div class="stat-card">
+            <div class="stat-value" id="stat-total">—</div>
+            <div class="stat-label">Total Reviews</div>
+          </div>
+          <div class="stat-card red">
+            <div class="stat-value" id="stat-critical">—</div>
+            <div class="stat-label">Open Critical</div>
+          </div>
+          <div class="stat-card orange">
+            <div class="stat-value" id="stat-high">—</div>
+            <div class="stat-label">Open High</div>
+          </div>
+          <div class="stat-card green">
+            <div class="stat-value" id="stat-green">—</div>
+            <div class="stat-label">Green Gates</div>
+          </div>
+          <div class="stat-card amber">
+            <div class="stat-value" id="stat-amber">—</div>
+            <div class="stat-label">Amber Gates</div>
+          </div>
+          <div class="stat-card red">
+            <div class="stat-value" id="stat-red">—</div>
+            <div class="stat-label">Red Gates</div>
+          </div>
+        </div>
+        <div class="section-title">Recent Reviews</div>
+        <div id="recent-reviews" class="reviews-table-wrap">
+          <div class="empty-state">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Requirement Review Page -->
+      <div id="page-requirement" class="page">
+        <div class="page-header">
+          <h1>Requirement Risk Reviewer</h1>
+          <p class="subtitle">Upload or paste a user story, BRD, FRD, or PRD to get a comprehensive risk review</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project Name (optional)</label>
+            <input type="text" id="req-project" placeholder="e.g. Patient Portal AI Feature" />
+          </div>
+          <div class="form-group">
+            <label>Requirement Text <span class="required">*</span></label>
+            <textarea id="req-content" rows="12" placeholder="Paste your user story, BRD, FRD, or PRD here...
+
+Example:
+As a clinician, I want to view AI-generated patient risk scores so that I can prioritize care.
+
+Acceptance Criteria:
+- Risk score displayed on patient dashboard
+- Score updated daily from ML model"></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="req-context" placeholder="e.g. Healthcare SaaS, HIPAA environment, pharma client" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewRequirement()">
+              <span class="btn-icon">🔍</span> Run Requirement Review
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <span class="btn-icon">📎</span> Upload File (PDF/DOCX/TXT)
+              <input type="file" id="req-file" accept=".pdf,.docx,.doc,.txt" style="display:none" onchange="uploadRequirement()" />
+            </label>
+          </div>
+        </div>
+        <div id="req-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Test Scenario Generation Page -->
+      <div id="page-test-scenario" class="page">
+        <div class="page-header">
+          <h1>Test Scenario Generation</h1>
+          <p class="subtitle">Converts a requirement or user story into a business-level test scenario catalogue — happy path, negative, boundary value, role-based, integration, and exception handling</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project Name (optional)</label>
+            <input type="text" id="ts-project" placeholder="e.g. Patient Portal API" />
+          </div>
+          <div class="form-group">
+            <label>Requirement / User Story <span class="required">*</span></label>
+            <textarea id="ts-requirement" rows="10" placeholder="Paste the requirement or user story to generate test scenarios for...
+
+Example:
+As a clinician, I want to export a patient's full medical history to CSV so I can share it with another provider."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="ts-context" placeholder="e.g. Healthcare SaaS, HIPAA environment" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runTestScenarioGeneration()">
+              <span class="btn-icon">🧪</span> Generate Test Scenarios
+            </button>
+          </div>
+        </div>
+        <div id="test-scenario-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Test Case Generation Page -->
+      <div id="page-test-case" class="page">
+        <div class="page-header">
+          <h1>Test Case Generation</h1>
+          <p class="subtitle">Generates detailed, executable manual test cases — step-by-step actions, expected results, concrete test data — from a requirement, or from a Test Scenario catalogue</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project Name (optional)</label>
+            <input type="text" id="tc-project" placeholder="e.g. Patient Portal API" />
+          </div>
+          <div class="form-group">
+            <label>Requirement / User Story <span class="required">*</span></label>
+            <textarea id="tc-requirement" rows="8" placeholder="Paste the requirement or user story to generate test cases for..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Test Scenario Catalogue (optional)</label>
+            <textarea id="tc-scenarios-context" rows="6" placeholder="Paste a prior test scenario catalogue to write test cases against those scenarios instead of the raw requirement — or run Test Scenario Generation first, then click 'Use Last Test Scenario Result' below."></textarea>
+            <div style="margin-top:6px">
+              <button class="btn btn-secondary" style="font-size:12px;padding:4px 10px" onclick="useLastTestScenarioResult()">↳ Use Last Test Scenario Result</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="tc-context" placeholder="e.g. Healthcare SaaS, HIPAA environment" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runTestCaseGeneration()">
+              <span class="btn-icon">📝</span> Generate Test Cases
+            </button>
+          </div>
+        </div>
+        <div id="test-case-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Code Review Page -->
+      <div id="page-code" class="page">
+        <div class="page-header">
+          <h1>Code & PR Security Reviewer</h1>
+          <p class="subtitle">Scan code for security vulnerabilities, secrets, PHI exposure, and AI-specific risks</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name</label>
+              <input type="text" id="code-project" placeholder="Project name" />
+            </div>
+            <div class="form-group flex1">
+              <label>Language (optional)</label>
+              <input type="text" id="code-language" placeholder="e.g. Python, JavaScript, Java" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Code / PR Diff <span class="required">*</span></label>
+            <textarea id="code-content" rows="16" placeholder="Paste your code, function, class, or PR diff here...
+
+Example:
+def get_patient_data(patient_id, query):
+    conn = sqlite3.connect('patients.db')
+    result = conn.execute(f'SELECT * FROM patients WHERE id = {patient_id}')
+    logging.info(f'Retrieved patient: {result}')
+    return result"></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="code-context" placeholder="e.g. Healthcare API endpoint, processes PHI" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewCode()">
+              <span class="btn-icon">🔒</span> Run Security Review
+            </button>
+          </div>
+        </div>
+        <div id="code-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Prompt Safety Page -->
+      <div id="page-prompt" class="page">
+        <div class="page-header">
+          <h1>Prompt & Agent Safety Reviewer</h1>
+          <p class="subtitle">Review system prompts, tool definitions, and RAG configs for AI safety risks</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project Name</label>
+            <input type="text" id="prompt-project" placeholder="e.g. Clinical AI Assistant" />
+          </div>
+          <div class="form-group">
+            <label>System Prompt</label>
+            <textarea id="prompt-system" rows="8" placeholder="Paste your system prompt / instructions here...
+
+Example:
+You are a clinical decision support assistant. You have access to patient records.
+You can send email notifications and update treatment plans.
+Answer questions about patients based on the provided context."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Tool / Function Definitions (JSON)</label>
+            <textarea id="prompt-tools" rows="6" placeholder='Example:
+[{"name": "update_patient_record", "description": "Update patient treatment plan", "parameters": {...}},
+ {"name": "send_email", "description": "Send email to any address", "parameters": {...}}]'></textarea>
+          </div>
+          <div class="form-group">
+            <label>RAG / Knowledge Base Config (optional)</label>
+            <textarea id="prompt-rag" rows="4" placeholder="Describe your RAG setup: vector DB, ingestion sources, retrieval filters, access control..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>User Prompt Template (optional)</label>
+            <textarea id="prompt-user" rows="4" placeholder="Paste the user prompt template if applicable..."></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewPrompt()">
+              <span class="btn-icon">🛡️</span> Run Safety Review
+            </button>
+          </div>
+        </div>
+        <div id="prompt-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Full SDLC Review Page -->
+      <div id="page-full" class="page">
+        <div class="page-header">
+          <h1>Full SDLC Review</h1>
+          <p class="subtitle">Run all agents in one pass — requirement, code, prompt safety, compliance, and release gate</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project Name <span class="required">*</span></label>
+            <input type="text" id="full-project" placeholder="e.g. AI Patient Risk Scoring Feature v2.1" />
+          </div>
+          <div class="form-group">
+            <label>Requirement / User Story</label>
+            <textarea id="full-req" rows="6" placeholder="Paste your requirement or user story..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Compliance Artifact (optional)</label>
+            <textarea id="full-compliance" rows="4" placeholder="Data flows, integrations, or a system description to map to compliance frameworks (NIST AI-RMF, OWASP LLM, HIPAA, GDPR, GxP, etc.)..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Architecture Description (optional)</label>
+            <textarea id="full-arch" rows="5" placeholder="Describe the system architecture, data flow, integrations, AI model usage — runs a real Architecture Review (quality scoring, anti-patterns, SPOFs)..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Code Sample (key functions or PR diff)</label>
+            <textarea id="full-code" rows="8" placeholder="Paste representative code or PR diff..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>System Prompt (if AI feature)</label>
+            <textarea id="full-prompt" rows="5" placeholder="Paste system prompt or agent instructions..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Test Evidence Summary</label>
+            <textarea id="full-test" rows="4" placeholder="Describe test coverage, test results, red-team tests, validation evidence..."></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary btn-large" onclick="runFullReview()">
+              <span class="btn-icon">🚀</span> Run Full SDLC Review
+            </button>
+          </div>
+        </div>
+        <div id="full-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- GitHub PR Page -->
+      <div id="page-github" class="page">
+        <div class="page-header">
+          <h1>GitHub PR Review</h1>
+          <p class="subtitle">Connect to GitHub and automatically review a pull request for security and AI risks</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>GitHub PR URL <span class="required">*</span></label>
+            <input type="url" id="gh-url" placeholder="https://github.com/owner/repo/pull/123" />
+          </div>
+          <div class="form-group">
+            <label>Jira Ticket (optional)</label>
+            <input type="text" id="gh-jira" placeholder="e.g. PROJ-456" />
+          </div>
+          <div class="form-group checkbox-group">
+            <label>
+              <input type="checkbox" id="gh-prompt" />
+              Also run Prompt Safety Review (for AI feature PRs)
+            </label>
+          </div>
+          <div class="form-group">
+            <label>Max files to auto-fix (auto-fix only)</label>
+            <input type="number" id="gh-max-files" value="5" min="1" max="15" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewGithubPR()">
+              <span class="btn-icon">🐙</span> Review PR
+            </button>
+            <button class="btn btn-secondary" onclick="autoFixGithubPR()">
+              <span class="btn-icon">🛠️</span> Auto-Fix &amp; Open PR
+            </button>
+          </div>
+          <div class="info-box">
+            <strong>Note:</strong> Requires GITHUB_TOKEN configured in .env. "Review PR" posts findings as a PR comment.
+            "Auto-Fix &amp; Open PR" additionally requires <strong>write</strong> access on that token — it commits
+            fixes to a new <code>lm-autofix/pr-N</code> branch off the PR's head branch and opens a follow-up PR back
+            into it. This pushes real commits to GitHub — review the diff before merging.
+          </div>
+        </div>
+        <div id="gh-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Release Gate Page -->
+      <div id="page-gate" class="page">
+        <div class="page-header">
+          <h1>Release Gate</h1>
+          <p class="subtitle">Evaluate release readiness — get a Green / Amber / Red gate decision</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name</label>
+              <input type="text" id="gate-project" placeholder="Project name" />
+            </div>
+            <div class="form-group flex1">
+              <label>Release Version</label>
+              <input type="text" id="gate-version" placeholder="e.g. v2.1.0" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Paste Review IDs (one per line, optional)</label>
+            <textarea id="gate-review-ids" rows="4" placeholder="If you have prior review IDs, paste them here to load their findings..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Or paste findings JSON directly (optional)</label>
+            <textarea id="gate-findings" rows="6" placeholder='[{"control_id": "SEC-003", "severity": 5, "title": "Hardcoded API key", ...}]'></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runReleaseGate()">
+              <span class="btn-icon">🚦</span> Check Release Gate
+            </button>
+          </div>
+        </div>
+        <div id="gate-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Knowledge Base Page -->
+      <div id="page-knowledge-base" class="page">
+        <div class="page-header">
+          <h1>Knowledge Base</h1>
+          <p class="subtitle">Every agent has its own knowledge base category — upload your own standards, checklists, and guidelines so its reviews are grounded in your organization's actual practices. Scope a document to one project, or leave it shared across all of them.</p>
+        </div>
+        <div class="kb-toolbar" style="flex-wrap:wrap;gap:10px">
+          <div class="kb-upload-area" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <select id="kb-upload-category" style="min-width:220px"></select>
+            <input type="text" id="kb-upload-project" placeholder="Project (optional — blank = shared/global)" style="min-width:240px" />
+            <label class="btn btn-primary btn-arch">
+              <input type="file" id="kb-upload-input" accept=".md" onchange="uploadKBDoc()" hidden />
+              <span class="btn-icon">📤</span> Upload .md Document
+            </label>
+            <span style="font-size:12px;color:var(--text-muted);">Only Markdown (.md) files accepted</span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;margin-left:auto;flex-wrap:wrap">
+            <label style="font-size:12px;color:var(--text-muted)">Category:</label>
+            <select id="kb-filter-category" onchange="loadKnowledgeBase()" style="min-width:200px">
+              <option value="">All categories</option>
+            </select>
+            <label style="font-size:12px;color:var(--text-muted)">Project:</label>
+            <input type="text" id="kb-filter-project" placeholder="e.g. Patient Portal API" oninput="loadKnowledgeBase()" style="min-width:200px" />
+            <button class="btn btn-secondary" onclick="loadKnowledgeBase()">↺ Refresh</button>
+          </div>
+        </div>
+        <div id="kb-doc-list" class="kb-doc-list">
+          <div class="empty-state">Loading knowledge base…</div>
+        </div>
+        <!-- Inline viewer/editor -->
+        <div id="kb-viewer" class="kb-viewer hidden">
+          <div class="kb-viewer-header">
+            <h3 id="kb-viewer-title">Document</h3>
+            <div style="display:flex;gap:8px;">
+              <button class="btn btn-secondary" onclick="closeKBViewer()">Close</button>
+              <button class="btn btn-primary btn-danger-outline" onclick="deleteKBDoc()" id="kb-delete-btn">Delete</button>
+            </div>
+          </div>
+          <pre id="kb-viewer-content" class="kb-content-pre"></pre>
+        </div>
+      </div>
+
+      <!-- Cost Optimization Page -->
+      <div id="page-cost-optimization" class="page">
+        <div class="page-header">
+          <h1>Cost Optimization</h1>
+          <p class="subtitle">Powered by <a href="https://github.com/headroomlabs-ai/headroom" target="_blank" rel="noopener">Headroom</a> — compresses large prompt content (logs, stack traces, codebase files, KB context) before it reaches the LLM, cutting token usage with no change to review quality. 21 CFR Part 11 and GxP document agents are always exempt to preserve exact compliance-evidence fidelity.</p>
+        </div>
+
+        <div class="form-card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+          <div>
+            <div class="section-title" style="margin-top:0">Platform Toggle</div>
+            <div id="co-status-label" style="font-size:13px;color:var(--text-muted)">Loading…</div>
+          </div>
+          <div id="co-toggle-actions" style="display:none">
+            <button class="btn btn-secondary" id="co-enable-btn" onclick="setCostOptimization(true)">Enable</button>
+            <button class="btn btn-secondary btn-danger-outline" id="co-disable-btn" onclick="setCostOptimization(false)">Disable</button>
+          </div>
+        </div>
+
+        <div class="form-card" style="margin-top:16px">
+          <div class="form-row" style="align-items:flex-end">
+            <div class="form-group flex1">
+              <label>Project Name (leave blank for all projects)</label>
+              <input type="text" id="co-dash-project" placeholder="e.g. Patient Portal API" />
+            </div>
+            <div class="form-actions" style="margin:0">
+              <button class="btn btn-secondary" onclick="loadCostOptimizationDashboard()">
+                <span class="btn-icon">📊</span> Load Dashboard
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="co-dashboard-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Architecture Review Page -->
+      <div id="page-architecture" class="page">
+        <div class="page-header">
+          <h1>Architecture Review</h1>
+          <p class="subtitle">Identify architecture type, score quality dimensions, detect anti-patterns, find SPOFs, and compare alternative patterns</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Project Name (optional)</label>
+              <input type="text" id="arch-project" placeholder="e.g. Clinical AI Platform" />
+            </div>
+            <div class="form-group">
+              <label>Review Mode</label>
+              <select id="arch-mode">
+                <option value="review">Review — assess existing architecture</option>
+                <option value="recommend">Recommend — suggest architecture from requirements</option>
+                <option value="compare">Compare — evaluate multiple architecture options</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Architecture / System Description <span class="required">*</span></label>
+            <textarea id="arch-artifact" rows="12" placeholder="Describe your architecture — components, services, databases, integrations, data flows, deployment.
+
+Examples:
+• React SPA → FastAPI backend (monolith) → PostgreSQL. Auth via JWT. External: SendGrid, Stripe, S3. Deployed on a single EC2 instance. No load balancer. All features in one codebase.
+
+• 12 microservices in Kubernetes. Services call each other synchronously via REST. All services share one PostgreSQL DB. Each team deploys their service but they always break each other.
+
+• Requirements: Build a real-time clinical decision support system. 500k patients, 10k concurrent users, PHI data, 99.99% uptime SLA, HIPAA compliance, AI-generated risk scores updated hourly."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Requirements &amp; Constraints (optional)</label>
+            <textarea id="arch-requirements" rows="4" placeholder="Non-functional requirements, scale targets, compliance needs, team size, budget constraints...
+
+e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI features needed"></textarea>
+          </div>
+          <div class="form-group">
+            <label>Additional Context (optional)</label>
+            <input type="text" id="arch-context" placeholder="e.g. Startup, 3 years old, considering re-architecture, current system is slow" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary btn-arch" onclick="runArchitectureReview()">
+              <span class="btn-icon">🏗️</span> Run Architecture Review
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="arch-file" accept=".txt,.md,.pdf,.docx,.yaml,.json" onchange="uploadArchitectureReview()" hidden />
+              Upload Architecture Doc
+            </label>
+          </div>
+        </div>
+        <div id="arch-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Code Generation Page -->
+      <div id="page-codegen" class="page">
+        <div class="page-header">
+          <h1>Code Generation</h1>
+          <p class="subtitle">Recommend a language, stack, and architecture pattern for a new system, then generate a runnable starter scaffold</p>
+        </div>
+
+        <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. Get a Recommendation</div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="cg-project" placeholder="e.g. Patient Portal API" />
+              <span style="font-size:11px;color:var(--text-muted)">Matches this name against the Knowledge Base — any docs uploaded there under the same project are used as authoritative context.</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Requirement <span class="required">*</span></label>
+            <textarea id="cg-requirement" rows="6" placeholder="Describe the system or feature you're building.
+
+e.g. A patient appointment booking system for a mid-size clinic network. Patients book/cancel appointments online, clinicians manage schedules, admins see utilization reports. Must integrate with an existing EHR via HL7."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Constraints (optional)</label>
+            <textarea id="cg-constraints" rows="3" placeholder="Scale, compliance, team, or technical constraints — e.g. Expect 50k MAU, must be HIPAA compliant, team knows Python, must deploy on AWS"></textarea>
+          </div>
+          <details style="margin:12px 0" open>
+            <summary style="cursor:pointer;color:var(--text-muted);font-size:13px">Advanced — pin specific choices (optional)</summary>
+            <p class="subtitle" style="margin:8px 0 4px;font-size:12px">Leave anything as "Let AI decide" to have the recommendation choose it for you.</p>
+            <div class="form-row" style="margin-top:6px">
+              <div class="form-group flex1">
+                <label>Language</label>
+                <select id="cg-pin-language"><option value="">— Let AI decide —</option></select>
+              </div>
+              <div class="form-group flex1">
+                <label>Backend Framework</label>
+                <select id="cg-pin-backend"><option value="">— Let AI decide —</option></select>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>Frontend Framework</label>
+                <select id="cg-pin-frontend"><option value="">— Let AI decide —</option></select>
+              </div>
+              <div class="form-group flex1">
+                <label>Database</label>
+                <select id="cg-pin-database"><option value="">— Let AI decide —</option></select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Architecture Pattern</label>
+              <select id="cg-pin-pattern"><option value="">— Let AI decide —</option></select>
+            </div>
+          </details>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runCodegenAdvisory()">
+              <span class="btn-icon">🧭</span> Get Recommendation
+            </button>
+          </div>
+        </div>
+        <div id="codegen-advisory-result" class="result-area hidden"></div>
+
+        <div class="form-card" id="cg-scaffold-card" style="margin-top:24px">
+          <div class="section-title" style="margin-top:0">2. Generate Scaffold</div>
+          <p class="subtitle" style="margin-top:-6px">Fields are pre-filled from your recommendation above — edit anything before generating.</p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Language</label>
+              <input type="text" id="cg-s-language" list="cg-list-language" placeholder="e.g. Python" />
+            </div>
+            <div class="form-group flex1">
+              <label>Backend Framework</label>
+              <input type="text" id="cg-s-backend" list="cg-list-backend" placeholder="e.g. FastAPI" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Frontend Framework (optional)</label>
+              <input type="text" id="cg-s-frontend" list="cg-list-frontend" placeholder="e.g. React + TypeScript" />
+            </div>
+            <div class="form-group flex1">
+              <label>Database (optional)</label>
+              <input type="text" id="cg-s-database" list="cg-list-database" placeholder="e.g. PostgreSQL" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Architecture Pattern</label>
+            <input type="text" id="cg-s-pattern" list="cg-list-pattern" value="Modular Monolith" />
+          </div>
+          <datalist id="cg-list-language"></datalist>
+          <datalist id="cg-list-backend"></datalist>
+          <datalist id="cg-list-frontend"></datalist>
+          <datalist id="cg-list-database"></datalist>
+          <datalist id="cg-list-pattern"></datalist>
+          <div class="form-row" style="align-items:center">
+            <label style="font-size:13px"><input type="checkbox" id="cg-s-auth" checked /> Include auth stub</label>
+            <label style="font-size:13px"><input type="checkbox" id="cg-s-docker" checked /> Include Dockerfile</label>
+            <label style="font-size:13px"><input type="checkbox" id="cg-s-tests" checked /> Include example test</label>
+            <label style="font-size:13px"><input type="checkbox" id="cg-s-review" /> Auto-review generated code</label>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runCodegenScaffold()">
+              <span class="btn-icon">⚙️</span> Generate Scaffold
+            </button>
+          </div>
+        </div>
+        <div id="codegen-scaffold-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Code Migration Page -->
+      <div id="page-migration" class="page">
+        <div class="page-header">
+          <h1>Code Migration</h1>
+          <p class="subtitle">Assess the complexity and risk of a migration, then transform a specific file to the target stack — preserving behavior, with an honest list of what needs manual follow-up.</p>
+        </div>
+
+        <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. Assess Migration</div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="mg-project" placeholder="e.g. Patient Portal API" />
+            </div>
+            <div class="form-group flex1">
+              <label>Migration Target <span class="required">*</span></label>
+              <input type="text" id="mg-target" placeholder="e.g. Flask to FastAPI, Python 2.7 to 3.12, MySQL to PostgreSQL" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Source Code / Artifact <span class="required">*</span></label>
+            <textarea id="mg-source" rows="12" placeholder="Paste the code, module, or artifact you're planning to migrate."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Constraints (optional)</label>
+            <textarea id="mg-constraints" rows="3" placeholder="Scale, timeline, team, or compliance constraints — e.g. Must stay live during migration, HIPAA data, 2-person team, 4-week deadline"></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runMigrationAssessment()">
+              <span class="btn-icon">🧭</span> Assess Migration
+            </button>
+          </div>
+        </div>
+        <div id="migration-assessment-result" class="result-area hidden"></div>
+
+        <div class="form-card" id="mg-execute-card" style="margin-top:24px">
+          <div class="section-title" style="margin-top:0">2. Execute Migration</div>
+          <p class="subtitle" style="margin-top:-6px">Migrates one file at a time. Fields are pre-fillable from the assessment above.</p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Migration Target <span class="required">*</span></label>
+              <input type="text" id="mg-e-target" placeholder="e.g. Flask to FastAPI" />
+            </div>
+            <div class="form-group flex1">
+              <label>File Path (optional)</label>
+              <input type="text" id="mg-e-filepath" placeholder="e.g. app/routes/auth.py" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>File / Artifact to Migrate <span class="required">*</span></label>
+            <textarea id="mg-e-source" rows="12" placeholder="Paste the exact file content to migrate."></textarea>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="font-size:13px"><input type="checkbox" id="mg-e-review" /> Auto-review migrated code (Code Review + Sensitive Data)</label>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runMigrationExecution()">
+              <span class="btn-icon">⚙️</span> Execute Migration
+            </button>
+          </div>
+        </div>
+        <div id="migration-execution-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Issue Triage Page -->
+      <div id="page-issue-triage" class="page">
+        <div class="page-header">
+          <h1>Issue Triaging Agent</h1>
+          <p class="subtitle">Classifies, prioritizes, assigns, and enriches defects, incidents, support tickets, security findings, and test failures. Duplicate detection compares against this project's own triage history. Critical/P0/P1/security issues, or anything below 70% confidence, are always flagged for mandatory human review.</p>
+        </div>
+
+        <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. Submit an Issue</div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="it-project" placeholder="e.g. Patient Portal API" />
+            </div>
+            <div class="form-group flex1">
+              <label>Environment</label>
+              <select id="it-environment">
+                <option value="">Unknown</option>
+                <option value="Production">Production</option>
+                <option value="Staging">Staging</option>
+                <option value="QA">QA</option>
+                <option value="Test">Test</option>
+                <option value="Development">Development</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Title</label>
+            <input type="text" id="it-title" placeholder="e.g. Login fails for all users in production" />
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <textarea id="it-description" rows="4" placeholder="Full issue description / reporter's account of the problem"></textarea>
+          </div>
+          <div class="form-group">
+            <label>...or GitHub Issue URL (used only if Title/Description above are empty)</label>
+            <input type="text" id="it-github-issue-url" placeholder="https://github.com/owner/repo/issues/123" />
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Application</label>
+              <input type="text" id="it-application" placeholder="e.g. Patient Portal" />
+            </div>
+            <div class="form-group flex1">
+              <label>Module</label>
+              <input type="text" id="it-module" placeholder="e.g. Auth Service" />
+            </div>
+            <div class="form-group flex1">
+              <label>Build / Release Version</label>
+              <input type="text" id="it-build-version" placeholder="e.g. v3.2.1" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Reporter</label>
+              <input type="text" id="it-reporter" placeholder="e.g. customer, QA lead, monitoring alert" />
+            </div>
+            <div class="form-group flex1">
+              <label>Error Code</label>
+              <input type="text" id="it-error-code" placeholder="e.g. HTTP 504, NullPointerException" />
+            </div>
+            <div class="form-group flex1">
+              <label>Related Test Case / Requirement</label>
+              <input type="text" id="it-test-case-ref" placeholder="e.g. TC-1042, REQ-88" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Customer Impact Notes</label>
+            <input type="text" id="it-customer-impact" placeholder="e.g. All users, 500 accounts, revenue-impacting" />
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Logs</label>
+              <textarea id="it-logs" rows="4" placeholder="Relevant application/server logs"></textarea>
+            </div>
+            <div class="form-group flex1">
+              <label>Stack Trace</label>
+              <textarea id="it-stack-trace" rows="4" placeholder="Stack trace, if any"></textarea>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Team / Ownership Mapping (optional)</label>
+            <textarea id="it-team-roster" rows="3" placeholder="Paste a CODEOWNERS-style mapping, e.g.&#10;auth-service: @team-identity&#10;billing: @team-payments&#10;Without this, the agent flags ownership as insufficient data rather than guessing."></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runIssueTriage()">
+              <span class="btn-icon">🧯</span> Triage Issue
+            </button>
+          </div>
+        </div>
+        <div id="issue-triage-result" class="result-area hidden"></div>
+
+        <div class="form-card" style="margin-top:24px">
+          <div class="section-title" style="margin-top:0">2. Batch Triage from GitHub</div>
+          <p class="subtitle" style="margin-top:-6px">Pulls the most recently updated open issues from a repo and triages each one.</p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>GitHub Repo URL <span class="required">*</span></label>
+              <input type="text" id="it-batch-repo" placeholder="https://github.com/owner/repo" />
+            </div>
+            <div class="form-group" style="max-width:120px">
+              <label>Limit</label>
+              <input type="number" id="it-batch-limit" value="10" min="1" max="25" />
+            </div>
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="it-batch-project" placeholder="e.g. Patient Portal API" />
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runIssueTriageBatchGithub()">
+              <span class="btn-icon">🐙</span> Fetch &amp; Triage Open Issues
+            </button>
+          </div>
+        </div>
+        <div id="issue-triage-batch-result" class="result-area hidden"></div>
+
+        <div class="form-card" style="margin-top:24px">
+          <div class="section-title" style="margin-top:0">3. Triage Analytics Dashboard</div>
+          <div class="form-row" style="align-items:flex-end">
+            <div class="form-group flex1">
+              <label>Project Name (leave blank for all projects)</label>
+              <input type="text" id="it-dash-project" placeholder="e.g. Patient Portal API" />
+            </div>
+            <div class="form-actions" style="margin:0">
+              <button class="btn btn-secondary" onclick="loadIssueTriageDashboard()">
+                <span class="btn-icon">📊</span> Load Dashboard
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="issue-triage-dashboard-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- VAPT Page -->
+      <div id="page-vapt" class="page">
+        <div class="page-header">
+          <h1>VAPT — Vulnerability Assessment &amp; Penetration Testing</h1>
+          <p class="subtitle">Identify security vulnerabilities with CVSS v3.1 scoring, OWASP mapping, CWE IDs, and exploitation scenarios</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Project Name (optional)</label>
+              <input type="text" id="vapt-project" placeholder="e.g. Patient Portal API" />
+            </div>
+            <div class="form-group">
+              <label>Scope (optional)</label>
+              <input type="text" id="vapt-scope" placeholder="e.g. REST API endpoints, authentication module, admin panel" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Artifact to Assess <span class="required">*</span></label>
+            <textarea id="vapt-artifact" rows="14" placeholder="Paste code, API specification, architecture description, or endpoint list.
+
+Examples:
+• Python FastAPI code with authentication endpoints
+• OpenAPI/Swagger specification
+• Architecture: React frontend → Node.js API → PostgreSQL DB, JWT auth, AWS S3 file storage
+• List of URLs: /api/login, /api/users/{id}, /api/admin/users, /upload/file
+• Express.js route handlers for user management"></textarea>
+          </div>
+          <div class="form-group">
+            <label>Additional Context (optional)</label>
+            <input type="text" id="vapt-context" placeholder="e.g. Healthcare app handling PHI, external-facing, no WAF in place" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary btn-security" onclick="runVAPT()">
+              <span class="btn-icon">🛡️</span> Run VAPT Assessment
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="vapt-file" accept=".txt,.py,.js,.ts,.java,.go,.php,.rb,.yaml,.yml,.json,.md" onchange="uploadVAPT()" hidden />
+              Upload File
+            </label>
+          </div>
+        </div>
+        <div id="vapt-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Security Review Page -->
+      <div id="page-security" class="page">
+        <div class="page-header">
+          <h1>Security Architecture Review</h1>
+          <p class="subtitle">STRIDE threat modeling, trust boundary analysis, attack surface enumeration, and security architecture gap assessment</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Project Name (optional)</label>
+              <input type="text" id="sec-project" placeholder="e.g. Clinical AI Platform" />
+            </div>
+            <div class="form-group">
+              <label>System Type (optional)</label>
+              <input type="text" id="sec-type" placeholder="e.g. Healthcare SaaS, AI agent with RAG, Microservices API" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Architecture / System Description <span class="required">*</span></label>
+            <textarea id="sec-artifact" rows="14" placeholder="Describe the system architecture, components, data flows, and integrations.
+
+Examples:
+• System has React frontend, FastAPI backend, PostgreSQL DB, Redis cache.
+  Auth: JWT tokens via Auth0. AI: Claude API for summarisation.
+  Integrations: Jira (write), GitHub (read), S3 (file storage), SendGrid (email).
+  Deployment: AWS ECS, behind ALB. No WAF configured.
+  Data: Stores PHI for 50k patients. Logs to CloudWatch.
+
+• Architecture diagram description: User → CDN → API Gateway → Lambda → DynamoDB.
+  Admin portal on /admin with basic auth. Third-party analytics SDK embedded in frontend."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Additional Context (optional)</label>
+            <input type="text" id="sec-context" placeholder="e.g. SOC2 Type II target, HIPAA environment, external audit scheduled" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary btn-security" onclick="runSecurityReview()">
+              <span class="btn-icon">🔐</span> Run Security Review
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="sec-file" accept=".txt,.md,.pdf,.docx,.yaml,.json" onchange="uploadSecurityReview()" hidden />
+              Upload Architecture Doc
+            </label>
+          </div>
+        </div>
+        <div id="security-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Review History Page -->
+      <div id="page-history" class="page">
+        <div class="page-header">
+          <h1>Review History</h1>
+          <p class="subtitle">Full audit trail of all reviews and gate decisions</p>
+        </div>
+        <div id="history-list" class="reviews-table-wrap">
+          <div class="empty-state">Loading...</div>
+        </div>
+      </div>
+
+      <!-- Sensitive Data Detector Page -->
+      <div id="page-sensitive" class="page">
+        <div class="page-header">
+          <h1>Sensitive Data Detector</h1>
+          <p class="subtitle">Scan code, configs, and data models for PII, PHI, PCI, credentials, and privacy violations</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="sd-project" placeholder="e.g. Patient Portal API" />
+            </div>
+            <div class="form-group flex1">
+              <label>Context (optional)</label>
+              <input type="text" id="sd-context" placeholder="e.g. Healthcare SaaS, handles PHI, HIPAA environment" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Code / Config / Schema / Logs to Scan <span class="required">*</span></label>
+            <textarea id="sd-content" rows="14" placeholder="Paste code, database schema, API response, config file, or log sample.
+
+Examples:
+• Python model class with patient fields
+• SQL schema defining user/payment tables
+• API response JSON containing user data
+• Log output that may contain sensitive fields
+• .env or config.yaml with credentials"></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary btn-security" onclick="runSensitiveDataScan()">
+              <span class="btn-icon">🔍</span> Scan for Sensitive Data
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="sd-file" accept=".py,.js,.ts,.java,.go,.sql,.json,.yaml,.yml,.env,.txt,.md,.cs,.rb,.php" onchange="uploadSensitiveDataScan()" hidden />
+              Upload File
+            </label>
+          </div>
+        </div>
+        <div id="sd-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- AI Provenance Page -->
+      <div id="page-ai-provenance" class="page">
+        <div class="page-header">
+          <h1>AI Code Provenance &amp; Risk</h1>
+          <p class="subtitle">Direct AI-authorship detection is unreliable — this produces probabilistic evidence (likelihood + reasons), never a verdict, and recommends a review action scaled to the evidence.</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="ap-project" placeholder="e.g. Patient Portal API" />
+            </div>
+            <div class="form-group flex1">
+              <label>Context (optional)</label>
+              <input type="text" id="ap-context" placeholder="e.g. New auth module, single large commit" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Code / Diff to Assess <span class="required">*</span></label>
+            <textarea id="ap-code" rows="12" placeholder="Paste the code or diff to assess for AI-origin likelihood."></textarea>
+          </div>
+
+          <div class="section-title">Developer AI-Use Disclosure (optional)</div>
+          <p class="subtitle" style="margin-top:-6px;font-size:12px">One input into the score — never treated as proof on its own, in either direction.</p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Was AI used?</label>
+              <select id="ap-ai-used">
+                <option value="">Not specified</option>
+                <option value="Yes">Yes</option>
+                <option value="No">No</option>
+                <option value="Partially">Partially</option>
+              </select>
+            </div>
+            <div class="form-group flex1">
+              <label>Tool used</label>
+              <input type="text" id="ap-ai-tool" placeholder="e.g. GitHub Copilot, ChatGPT, Claude, Cursor" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Purpose</label>
+              <select id="ap-purpose">
+                <option value="">Not specified</option>
+                <option value="Generate">Generate</option>
+                <option value="Refactor">Refactor</option>
+                <option value="Debug">Debug</option>
+                <option value="Document">Document</option>
+                <option value="Test">Test</option>
+              </select>
+            </div>
+            <div class="form-group flex1">
+              <label>% AI-assisted</label>
+              <select id="ap-percent">
+                <option value="">Not specified</option>
+                <option value="0-25%">0-25%</option>
+                <option value="25-50%">25-50%</option>
+                <option value="50-75%">50-75%</option>
+                <option value=">75%">&gt;75%</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row" style="align-items:center">
+            <label style="font-size:13px"><input type="checkbox" id="ap-sensitive" /> Sensitive data was shared with the tool</label>
+            <label style="font-size:13px"><input type="checkbox" id="ap-prompt-stored" /> Prompt/session log stored</label>
+            <label style="font-size:13px"><input type="checkbox" id="ap-reviewed" /> Human review completed</label>
+          </div>
+
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runAIProvenanceScan()">
+              <span class="btn-icon">🧬</span> Assess AI-Origin Likelihood
+            </button>
+          </div>
+        </div>
+        <div id="ap-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- 21 CFR Part 11 Verification Page -->
+      <div id="page-cfr21" class="page">
+        <div class="page-header">
+          <h1>21 CFR Part 11 Verification</h1>
+          <p class="subtitle">Verifies a codebase against FDA 21 CFR Part 11 — audit trail, electronic signatures, access control, and data integrity (ALCOA+) — with evidence-cited findings, never a bare claim.</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="cfr-project" placeholder="e.g. Clinical Trial Data System" />
+            </div>
+            <div class="form-group flex1">
+              <label>System Description (optional)</label>
+              <input type="text" id="cfr-system-desc" placeholder="e.g. Lab data management system (LIMS) with approval workflow" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Upload Codebase (.zip) — recommended for a real multi-file scan</label>
+            <div style="display:flex;align-items:center;gap:10px">
+              <label class="btn btn-secondary file-upload-btn">
+                <input type="file" id="cfr-zip-input" accept=".zip" onchange="uploadCFR21Zip()" hidden />
+                📦 Upload .zip
+              </label>
+              <span style="font-size:11px;color:var(--text-muted)">Scans up to 60 source files (py/js/ts/java/go/rb/php/cs/sql/yaml/json/env/md/html). node_modules/.git/venv/dist/build etc. are skipped automatically.</span>
+            </div>
+          </div>
+
+          <div class="or-divider" style="margin:14px 0">or paste a single file</div>
+          <div class="form-group">
+            <label>Code / File Content</label>
+            <textarea id="cfr-code" rows="10" placeholder="Paste a single file to verify — e.g. the module handling record approvals or audit logging."></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runCFR21Verification()">
+              <span class="btn-icon">💊</span> Verify Pasted File
+            </button>
+          </div>
+        </div>
+        <div id="cfr21-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- GxP Document Check Page -->
+      <div id="page-gxp-docs" class="page">
+        <div class="page-header">
+          <h1>GxP Document Check</h1>
+          <p class="subtitle">Checks SOPs, validation protocols (IQ/OQ/PQ), batch records, deviations, CAPAs, change controls, and specifications against a type-specific required-elements checklist, signature/approval compliance, version control, and cross-document traceability.</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="gxp-project" placeholder="e.g. Clinical Trial Data System" />
+            </div>
+            <div class="form-group flex1">
+              <label>Document Type Hint (optional — verified, not just trusted)</label>
+              <input type="text" id="gxp-type-hint" placeholder="e.g. SOP, OQ Protocol, Batch Record, CAPA" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Upload Document(s) — PDF / DOCX / TXT / MD</label>
+            <div style="display:flex;align-items:center;gap:10px">
+              <label class="btn btn-secondary file-upload-btn">
+                <input type="file" id="gxp-upload-input" accept=".pdf,.docx,.doc,.txt,.md" multiple onchange="uploadGxPDocuments()" hidden />
+                📤 Upload Document(s)
+              </label>
+              <span style="font-size:11px;color:var(--text-muted)">Select multiple related files (e.g. a URS + its OQ protocol) to check traceability across them.</span>
+            </div>
+          </div>
+
+          <div class="or-divider" style="margin:14px 0">or paste text</div>
+          <div class="form-group">
+            <label>Document Text</label>
+            <textarea id="gxp-content" rows="10" placeholder="Paste the SOP, protocol, batch record, or other GxP document text."></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runGxPDocumentCheck()">
+              <span class="btn-icon">📑</span> Check Pasted Document
+            </button>
+          </div>
+        </div>
+        <div id="gxp-docs-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- GxP Document Generation Page -->
+      <div id="page-gxp-generate" class="page">
+        <div class="page-header">
+          <h1>GxP Document Generation</h1>
+          <p class="subtitle">Point at an application and generate its GxP validation package — GAMP 5 risk classification, then a complete, application-grounded URS, FRS, Risk Assessment, Validation Plan, IQ/OQ/PQ Protocols, Traceability Matrix, Validation Summary Report, and SOP.</p>
+        </div>
+
+        <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. Plan the Validation Package</div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name (optional)</label>
+              <input type="text" id="gxg-project" placeholder="e.g. Clinical Trial Data System" />
+            </div>
+            <div class="form-group flex1">
+              <label>System Description (optional)</label>
+              <input type="text" id="gxg-system-desc" placeholder="e.g. Lab data management system (LIMS) with approval workflow" />
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Upload Application (.zip) — recommended</label>
+            <div style="display:flex;align-items:center;gap:10px">
+              <label class="btn btn-secondary file-upload-btn">
+                <input type="file" id="gxg-zip-input" accept=".zip" onchange="uploadGxPPlanZip()" hidden />
+                📦 Upload .zip
+              </label>
+              <span style="font-size:11px;color:var(--text-muted)">Same extraction as 21 CFR Part 11 Verification — up to 60 source files, common noise directories skipped.</span>
+            </div>
+          </div>
+
+          <div class="or-divider" style="margin:14px 0">or paste a single file</div>
+          <div class="form-group">
+            <label>Code / Application Content</label>
+            <textarea id="gxg-code" rows="8" placeholder="Paste representative code, or leave blank and rely on the system description alone."></textarea>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runGxPPlan()">
+              <span class="btn-icon">🧭</span> Plan Validation Package
+            </button>
+          </div>
+        </div>
+        <div id="gxg-plan-result" class="result-area hidden"></div>
+
+        <div id="gxg-documents-result" class="result-area hidden" style="margin-top:20px"></div>
+      </div>
+
+      <!-- Agent Hub Page -->
+      <div id="page-agent-hub" class="page">
+        <div class="page-header">
+          <h1>Agent Hub</h1>
+          <p class="subtitle">Run any agent directly from a GitHub PR/issue/repo or Jira ticket — results post back automatically</p>
+        </div>
+        <div id="agent-hub-status" class="info-box" style="margin-bottom:16px"></div>
+        <div id="agent-cards" class="agent-grid"></div>
+        <div id="hub-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- AI Inventory Page -->
+      <div id="page-inventory" class="page">
+        <div class="page-header">
+          <h1>AI Use-Case Inventory</h1>
+          <p class="subtitle">Register, classify, and track every AI system in your organisation — CISO and CIO visibility</p>
+        </div>
+        <div class="inventory-stats" id="inventory-stats"></div>
+        <div class="users-toolbar" style="margin-top:16px;">
+          <button class="btn btn-primary" onclick="openRegisterSystem()">+ Register AI System</button>
+          <button class="btn btn-secondary" onclick="loadInventory()">↺ Refresh</button>
+        </div>
+        <div id="inventory-list" class="users-table-wrap" style="margin-top:12px;">
+          <div class="empty-state">Loading…</div>
+        </div>
+        <div id="register-system-panel" class="create-user-panel hidden" style="margin-top:20px">
+          <h3>Register New AI System</h3>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>System Name <span class="required">*</span></label>
+              <input type="text" id="inv-name" placeholder="e.g. Clinical Risk Scorer v2" />
+            </div>
+            <div class="form-group flex1">
+              <label>Use-Case Type</label>
+              <select id="inv-type">
+                <option>Decision Support</option><option>Automation</option>
+                <option>Content Generation</option><option>Classification</option>
+                <option>Recommendation</option><option>Prediction</option>
+                <option>NLP / Chatbot</option><option>Computer Vision</option>
+                <option>Code Generation</option><option>Fraud Detection</option>
+                <option>Other</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Description <span class="required">*</span></label>
+            <textarea id="inv-desc" rows="3" placeholder="What does this AI system do? Who uses it? What data does it process?"></textarea>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Risk Level</label>
+              <select id="inv-risk">
+                <option>Critical</option><option>High</option>
+                <option selected>Medium</option><option>Low</option>
+              </select>
+            </div>
+            <div class="form-group flex1">
+              <label>Status</label>
+              <select id="inv-status">
+                <option selected>Planning</option><option>Development</option>
+                <option>Testing</option><option>Production</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>AI Model</label>
+              <input type="text" id="inv-model" placeholder="e.g. claude-sonnet-4-6, gpt-4o" />
+            </div>
+            <div class="form-group flex1">
+              <label>Provider</label>
+              <input type="text" id="inv-provider" placeholder="e.g. Anthropic, OpenAI, In-house" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Owner</label>
+              <input type="text" id="inv-owner" placeholder="Product owner name" />
+            </div>
+            <div class="form-group flex1">
+              <label>Team</label>
+              <input type="text" id="inv-team" placeholder="Engineering team" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Data Classification</label>
+              <input type="text" id="inv-data-class" placeholder="e.g. PHI, PII, Public, Confidential" />
+            </div>
+            <div class="form-group flex1">
+              <label>Compliance Frameworks</label>
+              <input type="text" id="inv-compliance" placeholder="e.g. HIPAA, GDPR, SOC2, ISO27001" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Jira Project (optional)</label>
+              <input type="text" id="inv-jira" placeholder="e.g. PROJ" />
+            </div>
+            <div class="form-group flex1">
+              <label>GitHub Repo (optional)</label>
+              <input type="text" id="inv-github" placeholder="https://github.com/owner/repo" />
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="registerSystem()">Register System</button>
+            <button class="btn btn-secondary" onclick="closeRegisterSystem()">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Approvals Page -->
+      <div id="page-approvals" class="page">
+        <div class="page-header">
+          <h1>Approval Queue</h1>
+          <p class="subtitle">Reviews requiring human sign-off before release</p>
+        </div>
+        <div class="approval-filters">
+          <button class="filter-btn active" onclick="filterApprovals('pending', this)">Pending</button>
+          <button class="filter-btn" onclick="filterApprovals('approved', this)">Approved</button>
+          <button class="filter-btn" onclick="filterApprovals('rejected', this)">Rejected</button>
+          <button class="filter-btn" onclick="filterApprovals(null, this)">All</button>
+          <button class="btn btn-secondary" style="margin-left:auto" onclick="loadApprovals(_approvalFilter)">↺ Refresh</button>
+        </div>
+        <div id="approvals-list" class="approvals-list">
+          <div class="empty-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Audit Trail Page -->
+      <div id="page-audit" class="page">
+        <div class="page-header">
+          <h1>Audit Trail</h1>
+          <p class="subtitle">Immutable event log for all reviews, approvals, and user actions</p>
+        </div>
+        <div class="audit-filters">
+          <input type="text" id="audit-actor" placeholder="Filter by actor…" />
+          <select id="audit-event-type">
+            <option value="">All event types</option>
+            <option value="review_created">Review Created</option>
+            <option value="approval_created">Approval Created</option>
+            <option value="approval_decided">Approval Decided</option>
+            <option value="user_login">User Login</option>
+          </select>
+          <button class="btn btn-primary" onclick="loadAuditTrail()">Search</button>
+          <button class="btn btn-secondary" onclick="document.getElementById('audit-actor').value='';document.getElementById('audit-event-type').value='';loadAuditTrail()">Clear</button>
+        </div>
+        <div id="audit-list" class="audit-table-wrap">
+          <div class="empty-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- Users Page -->
+      <!-- Projects Page -->
+      <div id="page-projects" class="page">
+        <div class="page-header">
+          <h1>Projects</h1>
+          <p class="subtitle">Only a super admin can create a project or assign project admins to it. A project admin can then manage (but not create) API keys for their own project.</p>
+        </div>
+        <div class="users-toolbar">
+          <button class="btn btn-primary" onclick="openCreateProject()">+ Create Project</button>
+          <button class="btn btn-secondary" onclick="loadProjects()">↺ Refresh</button>
+        </div>
+        <div id="create-project-panel" class="create-user-panel hidden">
+          <h3>New Project</h3>
+          <div class="form-group">
+            <label>Project Name</label>
+            <input type="text" id="np-name" placeholder="e.g. Patient Portal API" />
+          </div>
+          <div class="form-group">
+            <label>Description (optional)</label>
+            <input type="text" id="np-description" placeholder="What this project is" />
+          </div>
+          <div class="form-group">
+            <label>Vertical</label>
+            <select id="np-vertical">
+              <option value="Hospital">🏥 Hospital</option>
+              <option value="Pharma">💊 Pharma (coming soon)</option>
+              <option value="BFSI">🏦 BFSI (coming soon)</option>
+              <option value="IT Services">💻 IT Services (coming soon)</option>
+              <option value="Generic" selected>🗂️ Generic</option>
+            </select>
+            <span style="font-size:11px;color:var(--text-muted)">Drives the Vertical Dashboard's stat tiles and quick launches for this project.</span>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="createProject()">Create Project</button>
+            <button class="btn btn-secondary" onclick="closeCreateProject()">Cancel</button>
+          </div>
+        </div>
+        <div id="projects-list" class="users-table-wrap">
+          <div class="empty-state">Loading…</div>
+        </div>
+
+        <!-- Manage admins panel -->
+        <div id="project-admins-panel" class="create-user-panel hidden" style="margin-top:20px">
+          <h3 id="project-admins-title">Project Admins</h3>
+          <div id="project-admins-list" style="margin-bottom:16px"></div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Assign by username</label>
+              <input type="text" id="pa-username" placeholder="e.g. alice" />
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="assignProjectAdmin()">Assign</button>
+            <button class="btn btn-secondary" onclick="closeProjectAdminsPanel()">Close</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Vertical Dashboard Page -->
+      <div id="page-vertical" class="page">
+        <div class="page-header">
+          <h1>Vertical Dashboard</h1>
+          <p class="subtitle">A curated view over the agents that already exist, per industry vertical — stat tiles pulled from a project's most recent reviews, plus quick-launch shortcuts. Pick a project to get started.</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project</label>
+            <select id="vd-project-select" onchange="onVerticalProjectSelected()">
+              <option value="">Select a project…</option>
+            </select>
+          </div>
+        </div>
+        <div id="vd-content" class="result-area hidden"></div>
+      </div>
+
+      <div id="page-users" class="page">
+        <div class="page-header">
+          <h1>User Management</h1>
+          <p class="subtitle">Manage accounts and role-based access control</p>
+        </div>
+        <div class="users-toolbar">
+          <button class="btn btn-primary" onclick="openCreateUser()">+ Add User</button>
+        </div>
+        <div id="users-list" class="users-table-wrap">
+          <div class="empty-state">Loading…</div>
+        </div>
+        <div id="create-user-panel" class="create-user-panel hidden">
+          <h3>Add New User</h3>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Username</label>
+              <input type="text" id="nu-username" placeholder="username" />
+            </div>
+            <div class="form-group flex1">
+              <label>Full Name</label>
+              <input type="text" id="nu-fullname" placeholder="Full Name" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Email</label>
+              <input type="email" id="nu-email" placeholder="email@company.com" />
+            </div>
+            <div class="form-group flex1">
+              <label>Role</label>
+              <select id="nu-role">
+                <option value="developer">Developer</option>
+                <option value="reviewer">Reviewer</option>
+                <option value="security">Security</option>
+                <option value="compliance">Compliance</option>
+                <option value="project_admin">Project Admin</option>
+                <option value="super_admin">Super Admin</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Password</label>
+            <input type="password" id="nu-password" placeholder="Minimum 8 characters" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="createUser()">Create User</button>
+            <button class="btn btn-secondary" onclick="closeCreateUser()">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- API Keys Page -->
+      <div id="page-api-keys" class="page">
+        <div class="page-header">
+          <h1>API Keys</h1>
+          <p class="subtitle">Issue keys so external teams can call any agent directly from their CI pipelines, Jira automations, or internal tools — no UI login required.</p>
+        </div>
+
+        <!-- Usage card -->
+        <div class="api-usage-card">
+          <div class="api-usage-title">How to call any agent</div>
+          <pre class="api-usage-code">curl -X POST https://your-domain/api/v1/agents/code \
+  -H "X-API-Key: lmsdlc_YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "github_pr_url": "https://github.com/owner/repo/pull/88",
+    "project_name": "My Project",
+    "post_back": true
+  }'</pre>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            Every response includes <code>X-RateLimit-Limit-Minute</code>, <code>X-RateLimit-Remaining-Minute</code>,
+            <code>X-RateLimit-Limit-Day</code> and <code>X-RateLimit-Remaining-Day</code> headers.
+            Exceeding a key's quota returns <code>429</code> with a <code>Retry-After</code> header.
+          </p>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Bring your own LLM:</strong> teams can route calls through their own Anthropic or
+            OpenAI-compatible credentials via <code>PUT /api/v1/llm-config</code> (X-API-Key auth), or
+            override a single call with <code>llm_provider</code> / <code>llm_api_key</code> /
+            <code>llm_base_url</code> / <code>llm_model</code> fields on any agent request.
+          </p>
+          <div class="api-usage-links">
+            <a href="/docs" target="_blank" class="btn btn-secondary" style="font-size:12px">📖 OpenAPI Docs</a>
+            <a href="/redoc" target="_blank" class="btn btn-secondary" style="font-size:12px">📄 ReDoc</a>
+          </div>
+        </div>
+
+        <div class="users-toolbar" style="margin-top:20px">
+          <button class="btn btn-primary" id="create-key-btn" onclick="openCreateKey()" style="display:none">+ Create API Key</button>
+          <button class="btn btn-secondary" onclick="loadApiKeys()">↺ Refresh</button>
+        </div>
+
+        <!-- Create key panel (super admin only) -->
+        <div id="create-key-panel" class="create-user-panel hidden" style="margin-top:16px">
+          <h3>New API Key</h3>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project <span class="required">*</span></label>
+              <select id="key-project"></select>
+              <span style="font-size:11px;color:var(--text-muted)">No project? Create one from the Projects page first.</span>
+            </div>
+            <div class="form-group flex1">
+              <label>Label (optional)</label>
+              <input type="text" id="key-team" placeholder="Defaults to the project name" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input type="text" id="key-desc" placeholder="What will this key be used for?" />
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Rate limit — requests / minute</label>
+              <input type="number" id="key-limit-minute" value="60" min="1" max="6000" />
+            </div>
+            <div class="form-group flex1">
+              <label>Rate limit — requests / day</label>
+              <input type="number" id="key-limit-day" value="2000" min="1" max="1000000" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Monthly budget cap (USD, optional)</label>
+              <input type="number" id="key-budget" placeholder="Unlimited" min="0" step="0.01" />
+              <span style="font-size:11px;color:var(--text-muted)">Once this month's estimated spend reaches the cap, further calls return 402 until next month's reset.</span>
+            </div>
+            <div class="form-group flex1">
+              <label>Scopes (optional)</label>
+              <input type="text" id="key-scopes" placeholder="all" />
+              <span style="font-size:11px;color:var(--text-muted)">"all", or a comma-separated agent list e.g. "code,vapt,requirement" — an out-of-scope call returns 403.</span>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="createApiKey()">Generate Key</button>
+            <button class="btn btn-secondary" onclick="closeCreateKey()">Cancel</button>
+          </div>
+        </div>
+
+        <!-- New key reveal -->
+        <div id="key-reveal-panel" class="key-reveal-panel hidden">
+          <div class="key-reveal-title">⚠️ Copy this key now — it will not be shown again</div>
+          <div class="key-reveal-box">
+            <code id="key-reveal-value"></code>
+            <button class="btn-copy" onclick="copyKey()" title="Copy to clipboard">📋</button>
+          </div>
+          <button class="btn btn-secondary" style="margin-top:12px" onclick="dismissKeyReveal()">I've copied it</button>
+        </div>
+
+        <!-- Keys table -->
+        <div id="api-keys-list" class="users-table-wrap" style="margin-top:20px">
+          <div class="empty-state">Loading…</div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Login Gate — full-screen, shown before the dashboard on initial load if not authenticated,
+       and reused as an overlay when a gated feature prompts re-auth mid-session. -->
+  <div id="login-gate" class="login-gate hidden">
+    <button class="login-gate-close" id="login-gate-close" onclick="closeLogin()" title="Continue as guest (Esc)">✕</button>
+    <div class="login-gate-panel login-gate-brand">
+      <div class="login-gate-brand-inner">
+        <div class="login-gate-logo"><span class="logo-icon">⚡</span> LM AI-SDLC</div>
+        <h1>Governance for AI-assisted delivery</h1>
+        <p class="login-gate-tagline">One control tower for requirement risk, code security, compliance mapping, and release gates — across every project.</p>
+        <ul class="login-gate-features">
+          <li><span class="login-gate-feature-icon">🛡️</span> Security &amp; compliance review agents for every SDLC stage</li>
+          <li><span class="login-gate-feature-icon">📋</span> Audit-ready evidence — NIST AI-RMF, OWASP LLM, HIPAA, GxP, 21 CFR Part 11</li>
+          <li><span class="login-gate-feature-icon">🚦</span> Green / Amber / Red release gates backed by real findings</li>
+        </ul>
+      </div>
+    </div>
+    <div class="login-gate-panel login-gate-form-panel">
+      <div class="login-gate-form-box">
+        <div class="login-gate-form-header">
+          <span class="logo-icon login-gate-mobile-logo">⚡</span>
+          <h2>Sign in</h2>
+          <p id="login-modal-reason">Enter your credentials to continue</p>
+        </div>
+        <div class="form-group">
+          <label>Username</label>
+          <input type="text" id="login-username" placeholder="Username" autocomplete="username" />
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="login-password" placeholder="Password" autocomplete="current-password"
+                 onkeydown="if(event.key==='Enter') submitLogin()" />
+        </div>
+        <div id="login-error" class="login-error hidden"></div>
+        <div class="form-actions" style="margin-top:8px;">
+          <button type="button" class="btn btn-primary" style="width:100%" onclick="submitLogin()">Sign In</button>
+        </div>
+        <p class="login-gate-default-creds">
+          Default: <code>admin</code> / <code>Admin@1234</code>
+        </p>
+        <div class="login-gate-guest-row">
+          <button class="btn-link" id="login-gate-guest-link" onclick="closeLogin()">Continue as guest →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- BYOL (Bring Your Own LLM) Modal -->
+  <div id="llm-config-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeLlmConfigModal()">
+    <div class="modal-box" style="width:560px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeLlmConfigModal()" title="Dismiss (Esc)">✕</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 style="margin-bottom:2px">Bring Your Own LLM</h2>
+        <p id="llm-config-team-label">—</p>
+      </div>
+
+      <div class="section-title" style="margin-top:0">Global Default</div>
+      <p class="subtitle" style="margin-top:-4px;font-size:12px">Applies to every agent this key calls, unless overridden below or in a specific request.</p>
+      <div id="llm-config-global-status" style="font-size:13px;margin-bottom:10px;color:var(--text-muted)">Loading…</div>
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Provider</label>
+          <select id="llm-global-provider">
+            <option value="anthropic">Anthropic</option>
+            <option value="openai">OpenAI-compatible</option>
+          </select>
+        </div>
+        <div class="form-group flex1">
+          <label>Model (optional)</label>
+          <input type="text" id="llm-global-model" placeholder="e.g. claude-opus-4-1, gpt-4o" />
+        </div>
+      </div>
+      <div class="form-group">
+        <label>API Key</label>
+        <input type="password" id="llm-global-apikey" placeholder="Their provider API key — encrypted at rest, never shown again" />
+      </div>
+      <div class="form-group">
+        <label>Base URL (optional)</label>
+        <input type="text" id="llm-global-baseurl" placeholder="e.g. a Bedrock/Vertex or Azure OpenAI gateway URL" />
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveGlobalLlmConfig()">Save Global Default</button>
+        <button class="btn btn-secondary" onclick="clearGlobalLlmConfig()">Clear</button>
+      </div>
+
+      <div class="section-title" style="margin-top:24px">Per-Agent Override</div>
+      <p class="subtitle" style="margin-top:-4px;font-size:12px">Takes precedence over the global default for one specific agent — e.g. use OpenAI for Code Review but Anthropic for everything else.</p>
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Agent</label>
+          <select id="llm-agent-name"></select>
+        </div>
+        <div class="form-group flex1">
+          <label>Provider</label>
+          <select id="llm-agent-provider">
+            <option value="anthropic">Anthropic</option>
+            <option value="openai">OpenAI-compatible</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>API Key</label>
+          <input type="password" id="llm-agent-apikey" placeholder="Provider API key for this agent" />
+        </div>
+        <div class="form-group flex1">
+          <label>Model (optional)</label>
+          <input type="text" id="llm-agent-model" placeholder="e.g. gpt-4o" />
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Base URL (optional)</label>
+        <input type="text" id="llm-agent-baseurl" placeholder="Custom endpoint" />
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary" onclick="saveAgentLlmConfig()">Save for this Agent</button>
+      </div>
+
+      <div id="llm-agent-overrides-list" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <div id="loading-overlay" class="loading-overlay hidden">
+    <div class="loading-box">
+      <div class="spinner"></div>
+      <div class="loading-text" id="loading-text">Running AI review...</div>
+      <div class="loading-sub">This may take 15–30 seconds</div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

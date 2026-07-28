@@ -1,0 +1,3735 @@
+const API = '';
+
+// ── Auth State ────────────────────────────────────────────────────────────
+
+let _authUser = null;
+
+function _loadAuthState() {
+  const token = localStorage.getItem('sdlc_token');
+  const user = localStorage.getItem('sdlc_user');
+  if (token && user) {
+    try { _authUser = JSON.parse(user); } catch { _authUser = null; }
+  }
+  updateAuthUI();
+  if (!_authUser) openLogin();
+}
+
+function isSuperAdmin() {
+  return !!_authUser && (_authUser.role === 'admin' || _authUser.role === 'super_admin');
+}
+
+function isProjectAdmin() {
+  return !!_authUser && _authUser.role === 'project_admin';
+}
+
+function updateAuthUI() {
+  const el = document.getElementById('sidebar-user');
+  const navUsers = document.getElementById('nav-users');
+  const navKeys = document.getElementById('nav-api-keys');
+  const navProjects = document.getElementById('nav-projects');
+  const navVertical = document.getElementById('nav-vertical');
+  if (_authUser) {
+    const initials = (_authUser.full_name || _authUser.username || 'U').charAt(0).toUpperCase();
+    el.innerHTML = `
+      <div class="user-badge">
+        <div class="user-avatar">${esc(initials)}</div>
+        <div class="user-info">
+          <div class="user-name">${esc(_authUser.username)}</div>
+          <div class="user-role">${esc(_authUser.role)}</div>
+        </div>
+        <button class="btn-logout" onclick="logout()" title="Sign out">↩</button>
+      </div>`;
+    navUsers.style.display = isSuperAdmin() ? '' : 'none';
+    if (navProjects) navProjects.style.display = isSuperAdmin() ? '' : 'none';
+    if (navKeys) navKeys.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
+    if (navVertical) navVertical.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
+  } else {
+    el.innerHTML = `<button class="btn-login" onclick="openLogin()">🔑 Sign In</button>`;
+    navUsers.style.display = 'none';
+    if (navProjects) navProjects.style.display = 'none';
+    if (navKeys) navKeys.style.display = 'none';
+    if (navVertical) navVertical.style.display = 'none';
+  }
+  refreshApprovalBadge();
+}
+
+function openLogin(reason) {
+  const gate = document.getElementById('login-gate');
+  gate.classList.remove('hidden');
+  const reasonEl = document.getElementById('login-modal-reason');
+  if (reasonEl) reasonEl.textContent = reason || 'Enter your credentials to continue';
+  setTimeout(() => document.getElementById('login-username').focus(), 50);
+}
+
+function closeLogin() {
+  document.getElementById('login-gate').classList.add('hidden');
+  document.getElementById('login-error').classList.add('hidden');
+}
+
+// Global Escape key handler for modals
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    const gate = document.getElementById('login-gate');
+    if (gate && !gate.classList.contains('hidden')) closeLogin();
+    const llmModal = document.getElementById('llm-config-modal');
+    if (llmModal && !llmModal.classList.contains('hidden')) closeLlmConfigModal();
+  }
+});
+
+async function submitLogin() {
+  const username = document.getElementById('login-username').value.trim();
+  const password = document.getElementById('login-password').value;
+  const errEl = document.getElementById('login-error');
+  errEl.classList.add('hidden');
+  if (!username || !password) { errEl.textContent = 'Enter username and password.'; errEl.classList.remove('hidden'); return; }
+  try {
+    const res = await fetch(API + '/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) { errEl.textContent = data.detail || 'Login failed.'; errEl.classList.remove('hidden'); return; }
+    localStorage.setItem('sdlc_token', data.token);
+    localStorage.setItem('sdlc_user', JSON.stringify(data.user));
+    _authUser = data.user;
+    closeLogin();
+    updateAuthUI();
+    loadDashboard();
+  } catch (e) {
+    errEl.textContent = 'Network error. Is the server running?';
+    errEl.classList.remove('hidden');
+  }
+}
+
+function logout() {
+  localStorage.removeItem('sdlc_token');
+  localStorage.removeItem('sdlc_user');
+  _authUser = null;
+  updateAuthUI();
+}
+
+async function refreshApprovalBadge() {
+  const badge = document.getElementById('approval-badge');
+  if (!badge) return;
+  try {
+    const data = await apiFetch('/api/approvals/stats', { _silent: true });
+    const count = data.pending || 0;
+    badge.textContent = count;
+    badge.classList.toggle('hidden', count === 0);
+  } catch { badge.classList.add('hidden'); }
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────
+
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    const page = item.dataset.page;
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    item.classList.add('active');
+    document.getElementById('page-' + page).classList.add('active');
+    if (page === 'dashboard') loadDashboard();
+    if (page === 'history') loadHistory();
+    if (page === 'knowledge-base') { loadKBCategories(); loadKnowledgeBase(); }
+    if (page === 'cost-optimization') loadCostOptimizationPage();
+    if (page === 'approvals') loadApprovals(_approvalFilter);
+    if (page === 'audit') loadAuditTrail();
+    if (page === 'users') loadUsers();
+    if (page === 'agent-hub') loadAgentHub();
+    if (page === 'inventory') loadInventory();
+    if (page === 'sensitive') { /* page ready, no auto-load */ }
+    if (page === 'ai-provenance') { /* page ready, no auto-load */ }
+    if (page === 'migration') { /* page ready, no auto-load */ }
+    if (page === 'issue-triage') { /* page ready, no auto-load */ }
+    if (page === 'test-scenario') { /* page ready, no auto-load */ }
+    if (page === 'test-case') { /* page ready, no auto-load */ }
+    if (page === 'cfr21') { /* page ready, no auto-load */ }
+    if (page === 'gxp-docs') { /* page ready, no auto-load */ }
+    if (page === 'gxp-generate') { /* page ready, no auto-load */ }
+    if (page === 'api-keys') loadApiKeys();
+    if (page === 'projects') loadProjects();
+    if (page === 'vertical') loadVerticalPage();
+  });
+});
+
+// ── Code Generation ─────────────────────────────────────────────────────────
+
+const CODEGEN_OPTIONS = {
+  language: ['Python', 'TypeScript', 'JavaScript', 'Java', 'Go', 'C#', 'Ruby', 'PHP', 'Rust', 'Kotlin'],
+  backend: ['FastAPI', 'Django', 'Flask', 'Express.js', 'NestJS', 'Spring Boot', 'ASP.NET Core', 'Ruby on Rails', 'Laravel', 'Gin', 'Actix Web', 'Ktor'],
+  frontend: ['React + TypeScript', 'Vue 3', 'Angular', 'Svelte/SvelteKit', 'Next.js', 'None (API-only)'],
+  database: ['PostgreSQL', 'MySQL', 'MongoDB', 'DynamoDB', 'Redis', 'SQLite', 'Cassandra', 'Elasticsearch'],
+  pattern: ['Modular Monolith', 'Traditional Monolith', 'Microservices', 'Event-Driven', 'Serverless / FaaS',
+            'Hexagonal / Clean Architecture', 'CQRS + Event Sourcing', 'N-Tier / Layered',
+            'Service-Oriented Architecture (SOA)', 'Data Mesh', 'AI Agent Architecture', 'Hybrid'],
+};
+
+function initCodegenDropdowns() {
+  const fillSelect = (id, values) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    values.forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v; opt.textContent = v;
+      el.appendChild(opt);
+    });
+  };
+  fillSelect('cg-pin-language', CODEGEN_OPTIONS.language);
+  fillSelect('cg-pin-backend', CODEGEN_OPTIONS.backend);
+  fillSelect('cg-pin-frontend', CODEGEN_OPTIONS.frontend);
+  fillSelect('cg-pin-database', CODEGEN_OPTIONS.database);
+  fillSelect('cg-pin-pattern', CODEGEN_OPTIONS.pattern);
+
+  const fillDatalist = (id, values) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.innerHTML = values.map(v => `<option value="${esc(v)}"></option>`).join('');
+  };
+  fillDatalist('cg-list-language', CODEGEN_OPTIONS.language);
+  fillDatalist('cg-list-backend', CODEGEN_OPTIONS.backend);
+  fillDatalist('cg-list-frontend', CODEGEN_OPTIONS.frontend);
+  fillDatalist('cg-list-database', CODEGEN_OPTIONS.database);
+  fillDatalist('cg-list-pattern', CODEGEN_OPTIONS.pattern);
+}
+initCodegenDropdowns();
+
+let _lastCodegenAdvisory = null;
+
+async function runCodegenAdvisory() {
+  const requirement = document.getElementById('cg-requirement').value.trim();
+  if (!requirement) { alert('Please describe the requirement.'); return; }
+
+  showLoading('Analyzing requirement and recommending a stack… this may take 15–30 seconds');
+  try {
+    const result = await apiFetch('/api/codegen/advisory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requirement,
+        constraints: document.getElementById('cg-constraints').value.trim(),
+        project_name: document.getElementById('cg-project').value.trim(),
+        pin_language: document.getElementById('cg-pin-language').value.trim() || null,
+        pin_backend_framework: document.getElementById('cg-pin-backend').value.trim() || null,
+        pin_frontend_framework: document.getElementById('cg-pin-frontend').value.trim() || null,
+        pin_database: document.getElementById('cg-pin-database').value.trim() || null,
+        pin_architecture_pattern: document.getElementById('cg-pin-pattern').value.trim() || null,
+      }),
+    });
+    _lastCodegenAdvisory = result;
+    renderCodegenAdvisory('codegen-advisory-result', result);
+    loadDashboard();
+  } catch (e) { showError('codegen-advisory-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderCodegenAdvisory(targetId, result) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const r = result.recommendation || {};
+  const suggestions = r.ranked_suggestions || [];
+  const patterns = r.design_patterns || [];
+  const alts = r.alternatives || [];
+  const compliance = r.compliance_considerations || [];
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Recommendation</h2>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${suggestions.length ? `
+    <div class="section-title" style="margin-top:20px">Suggested Stacks (${suggestions.length}) — pick one</div>
+    <div class="quality-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+      ${suggestions.map((s, i) => {
+        const fit = s.fit_score || 0;
+        const fitColor = fit >= 8 ? 'var(--green)' : fit >= 6 ? '#84cc16' : fit >= 4 ? 'var(--amber)' : 'var(--red)';
+        return `
+        <div class="antipattern-card" style="display:flex;flex-direction:column;gap:6px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span class="antipattern-name">${i === 0 ? '⭐ ' : ''}Option ${i + 1}</span>
+            <span style="font-size:12px;font-weight:600;padding:2px 8px;border-radius:10px;border:1px solid ${fitColor};color:${fitColor}">${s.fit_score ?? '—'}/10 fit</span>
+          </div>
+          <div style="font-size:13px;line-height:1.6">
+            <b>${esc(s.language||'')}</b> · ${esc(s.backend_framework||'')}${s.frontend_framework && !String(s.frontend_framework).toLowerCase().startsWith('none') ? ' + ' + esc(s.frontend_framework) : ''}<br/>
+            ${esc(s.database||'')} · ${esc(s.architecture_pattern||'')}
+          </div>
+          <div class="antipattern-desc">${esc(s.why||'')}</div>
+          <button class="btn btn-secondary" style="margin-top:4px" onclick="useCodegenSuggestion(${i})">↓ Use this stack for the scaffold</button>
+        </div>`;
+      }).join('')}
+    </div>` : `
+    <div class="quality-grid" style="margin-top:16px">
+      ${['language','backend_framework','frontend_framework','database','architecture_pattern','deployment_target'].map(k => `
+        <div class="quality-item">
+          <div class="quality-label"><span>${k.replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase())}</span></div>
+          <div style="font-weight:600;font-size:14px;margin-top:4px">${esc(r[k] || '—')}</div>
+        </div>`).join('')}
+    </div>
+    <div class="form-actions" style="margin-top:12px">
+      <button class="btn btn-secondary" onclick="applyCodegenRecommendation()">↓ Use this recommendation for the scaffold</button>
+    </div>`}
+
+    ${r.rationale ? `<div class="section-title" style="margin-top:20px">Rationale</div><div class="summary-box">${esc(r.rationale)}</div>` : ''}
+
+    ${patterns.length ? `
+    <div class="section-title" style="margin-top:20px">Design Patterns (${patterns.length})</div>
+    ${patterns.map(p => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(p.pattern)}</div>
+        <div class="antipattern-desc"><b>Where:</b> ${esc(p.where_applied || '')}</div>
+        <div class="antipattern-desc"><b>Why:</b> ${esc(p.why || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${alts.length ? `
+    <div class="section-title" style="margin-top:20px">Alternatives</div>
+    ${alts.map(a => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(a.option)}</div>
+        <div class="antipattern-desc">${esc(a.when_to_choose || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${compliance.length ? `
+    <div class="section-title" style="margin-top:20px">Compliance Considerations</div>
+    <ul class="rec-list">${compliance.map(c => `<li>${esc(c)}</li>`).join('')}</ul>` : ''}
+
+    ${r.scalability_notes ? `<div class="section-title" style="margin-top:20px">Scalability Notes</div><div class="summary-box">${esc(r.scalability_notes)}</div>` : ''}
+  `;
+}
+
+function applyCodegenRecommendation() {
+  if (!_lastCodegenAdvisory) return;
+  const r = _lastCodegenAdvisory.recommendation || {};
+  _fillCodegenScaffoldFields(r);
+}
+
+function useCodegenSuggestion(index) {
+  if (!_lastCodegenAdvisory) return;
+  const s = (_lastCodegenAdvisory.recommendation?.ranked_suggestions || [])[index];
+  if (!s) return;
+  _fillCodegenScaffoldFields(s);
+}
+
+function _fillCodegenScaffoldFields(s) {
+  document.getElementById('cg-s-language').value = s.language || '';
+  document.getElementById('cg-s-backend').value = s.backend_framework || '';
+  document.getElementById('cg-s-frontend').value = (s.frontend_framework || '').toLowerCase().startsWith('none') ? '' : (s.frontend_framework || '');
+  document.getElementById('cg-s-database').value = s.database || '';
+  document.getElementById('cg-s-pattern').value = s.architecture_pattern || 'Modular Monolith';
+  document.getElementById('cg-scaffold-card')?.scrollIntoView({ behavior: 'smooth' });
+}
+
+async function runCodegenScaffold() {
+  const language = document.getElementById('cg-s-language').value.trim();
+  const backend = document.getElementById('cg-s-backend').value.trim();
+  if (!language || !backend) { alert('Language and backend framework are required — get a recommendation above or fill them in directly.'); return; }
+  const projectName = document.getElementById('cg-project').value.trim() || 'generated-app';
+
+  showLoading('Generating starter project files… this may take 30–60 seconds');
+  try {
+    const result = await apiFetch('/api/codegen/scaffold', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_name: projectName,
+        language,
+        backend_framework: backend,
+        frontend_framework: document.getElementById('cg-s-frontend').value.trim() || null,
+        database: document.getElementById('cg-s-database').value.trim() || null,
+        architecture_pattern: document.getElementById('cg-s-pattern').value.trim() || 'Modular Monolith',
+        requirement: document.getElementById('cg-requirement').value.trim(),
+        include_auth: document.getElementById('cg-s-auth').checked,
+        include_docker: document.getElementById('cg-s-docker').checked,
+        include_tests: document.getElementById('cg-s-tests').checked,
+        auto_review: document.getElementById('cg-s-review').checked,
+      }),
+    });
+    renderCodegenScaffold('codegen-scaffold-result', result);
+    loadDashboard();
+  } catch (e) { showError('codegen-scaffold-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderCodegenScaffold(targetId, result) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const files = result.files || [];
+  const gov = result.governance_review;
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Scaffold — ${esc(result.project_name || '')}</h2>
+      ${result.review_id ? `<a class="btn btn-primary" href="${API}/api/codegen/scaffold/${result.review_id}/download">⬇ Download ZIP</a>` : ''}
+    </div>
+
+    ${gov ? `
+    <div class="section-title">Governance Pre-Check</div>
+    <div class="quality-grid">
+      <div class="quality-item"><div class="quality-label"><span>Code Review</span></div>
+        <div style="margin-top:4px">${gateStatusBadge(gov.code_review?.gate_status)} <span style="font-size:12px;color:var(--text-muted)">${gov.code_review?.findings?.length || 0} findings</span></div></div>
+      <div class="quality-item"><div class="quality-label"><span>Sensitive Data Scan</span></div>
+        <div style="margin-top:4px">${gateStatusBadge(gov.sensitive_data_scan?.gate_status)} <span style="font-size:12px;color:var(--text-muted)">${gov.sensitive_data_scan?.findings?.length || 0} findings</span></div></div>
+    </div>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Setup Instructions</div>
+    <pre class="api-usage-code">${esc(result.setup_instructions || '')}</pre>
+
+    ${result.included_controls?.length ? `
+    <div class="section-title">Governance Controls Included</div>
+    <ul class="rec-list">${result.included_controls.map(c => `<li>${esc(c)}</li>`).join('')}</ul>` : ''}
+
+    ${result.next_steps?.length ? `
+    <div class="section-title">Next Steps</div>
+    <ul class="rec-list">${result.next_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+
+    <div class="section-title">Files (${files.length})</div>
+    ${files.map(f => `
+      <details style="margin-bottom:8px">
+        <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">${esc(f.path)}${f.purpose ? ` — <span style="color:var(--text-muted);font-family:inherit">${esc(f.purpose)}</span>` : ''}</summary>
+        <pre class="api-usage-code" style="margin-top:8px">${esc(f.content || '')}</pre>
+      </details>`).join('')}
+  `;
+}
+
+// ── Code Migration ───────────────────────────────────────────────────────────
+
+let _lastMigrationAssessment = null;
+
+async function runMigrationAssessment() {
+  const source = document.getElementById('mg-source').value.trim();
+  const target = document.getElementById('mg-target').value.trim();
+  if (!source) { alert('Please paste the source code or artifact.'); return; }
+  if (!target) { alert('Please specify the migration target.'); return; }
+
+  showLoading('Assessing migration complexity and risk… this may take 20–40 seconds');
+  try {
+    const result = await apiFetch('/api/review/migration-assessment', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code: source,
+        migration_target: target,
+        constraints: document.getElementById('mg-constraints').value.trim(),
+        project_name: document.getElementById('mg-project').value.trim(),
+      }),
+    });
+    _lastMigrationAssessment = result;
+    renderMigrationAssessment('migration-assessment-result', result);
+    loadDashboard();
+  } catch (e) { showError('migration-assessment-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderMigrationAssessment(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const breaking = r.breaking_changes || [];
+  const risks = r.risk_areas || [];
+  const phases = r.phased_plan || [];
+  const complexityColor = {
+    'Low': 'var(--green)', 'Moderate': '#84cc16', 'High': 'var(--amber)', 'Very High': 'var(--red)',
+  }[r.complexity] || 'var(--text-muted)';
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Migration Assessment</h2>
+      <span class="risk-score">Complexity: <b style="color:${complexityColor}">${esc(r.complexity || '—')}</b></span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    <div class="quality-grid" style="margin-top:16px">
+      <div class="quality-item"><div class="quality-label"><span>Source Stack</span></div><div style="font-weight:600;font-size:14px;margin-top:4px">${esc(r.source_stack || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Target Stack</span></div><div style="font-weight:600;font-size:14px;margin-top:4px">${esc(r.target_stack || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Migration Type</span></div><div style="font-weight:600;font-size:14px;margin-top:4px">${esc(r.migration_type || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Estimated Effort</span></div><div style="font-weight:600;font-size:14px;margin-top:4px">${esc(r.estimated_effort || '—')}</div></div>
+    </div>
+
+    ${r.recommended_approach ? `<div class="section-title" style="margin-top:20px">Recommended Approach</div><div class="summary-box">${esc(r.recommended_approach)}</div>` : ''}
+
+    ${phases.length ? `
+    <div class="section-title" style="margin-top:20px">Phased Plan (${phases.length} phases)</div>
+    ${phases.map(p => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">Phase ${p.phase ?? ''}: ${esc(p.title || '')}</div>
+        <div class="antipattern-desc">${esc(p.description || '')}</div>
+        ${p.deliverables?.length ? `<ul class="rec-list">${p.deliverables.map(d => `<li>${esc(d)}</li>`).join('')}</ul>` : ''}
+      </div>`).join('')}` : ''}
+
+    ${breaking.length ? `
+    <div class="section-title" style="margin-top:20px">Breaking Changes (${breaking.length})</div>
+    ${breaking.map(b => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(b.area || '')}</div>
+        <span class="antipattern-sev" style="background:rgba(0,0,0,.3)">${esc(b.impact || '')}</span>
+        <div class="antipattern-desc">${esc(b.description || '')}</div>
+        ${b.mitigation ? `<div class="antipattern-rec">→ ${esc(b.mitigation)}</div>` : ''}
+      </div>`).join('')}` : ''}
+
+    ${risks.length ? `
+    <div class="section-title" style="margin-top:20px">Risk Areas (${risks.length})</div>
+    ${risks.map(rk => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(rk.area || '')}</div>
+        <span class="antipattern-sev" style="background:rgba(0,0,0,.3)">${esc(rk.risk_level || '')}</span>
+        <div class="antipattern-desc">${esc(rk.description || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${r.dependencies_affected?.length ? `
+    <div class="section-title" style="margin-top:20px">Dependencies Affected</div>
+    <ul class="rec-list">${r.dependencies_affected.map(d => `<li>${esc(d)}</li>`).join('')}</ul>` : ''}
+
+    ${r.rollback_strategy ? `<div class="section-title" style="margin-top:20px">Rollback Strategy</div><div class="summary-box">${esc(r.rollback_strategy)}</div>` : ''}
+
+    ${r.compliance_considerations?.length ? `
+    <div class="section-title" style="margin-top:20px">Compliance Considerations</div>
+    <ul class="rec-list">${r.compliance_considerations.map(c => `<li>${esc(c)}</li>`).join('')}</ul>` : ''}
+
+    <div class="form-actions" style="margin-top:20px">
+      <button class="btn btn-secondary" onclick="applyMigrationAssessment()">↓ Use this for Execution</button>
+    </div>
+  `;
+}
+
+function applyMigrationAssessment() {
+  if (!_lastMigrationAssessment) return;
+  document.getElementById('mg-e-target').value = document.getElementById('mg-target').value.trim();
+  document.getElementById('mg-e-source').value = document.getElementById('mg-source').value.trim();
+  document.getElementById('mg-execute-card')?.scrollIntoView({ behavior: 'smooth' });
+}
+
+async function runMigrationExecution() {
+  const source = document.getElementById('mg-e-source').value.trim();
+  const target = document.getElementById('mg-e-target').value.trim();
+  if (!source) { alert('Please paste the file content to migrate.'); return; }
+  if (!target) { alert('Please specify the migration target.'); return; }
+
+  showLoading('Migrating file to the target stack… this may take 30–60 seconds');
+  try {
+    const result = await apiFetch('/api/review/migration-execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code: source,
+        migration_target: target,
+        file_path: document.getElementById('mg-e-filepath').value.trim(),
+        project_name: document.getElementById('mg-project').value.trim(),
+        auto_review: document.getElementById('mg-e-review').checked,
+      }),
+    });
+    renderMigrationExecution('migration-execution-result', result);
+    loadDashboard();
+  } catch (e) { showError('migration-execution-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderMigrationExecution(targetId, result) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const files = result.files || [];
+  const changes = result.changes_summary || [];
+  const followup = result.manual_followup || [];
+  const gov = result.governance_review;
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Migration Result</h2>
+    </div>
+    <div class="summary-box">${esc(result.summary || '')}</div>
+
+    ${gov ? `
+    <div class="section-title">Governance Pre-Check</div>
+    <div class="quality-grid">
+      <div class="quality-item"><div class="quality-label"><span>Code Review</span></div>
+        <div style="margin-top:4px">${gateStatusBadge(gov.code_review?.gate_status)} <span style="font-size:12px;color:var(--text-muted)">${gov.code_review?.findings?.length || 0} findings</span></div></div>
+      <div class="quality-item"><div class="quality-label"><span>Sensitive Data Scan</span></div>
+        <div style="margin-top:4px">${gateStatusBadge(gov.sensitive_data_scan?.gate_status)} <span style="font-size:12px;color:var(--text-muted)">${gov.sensitive_data_scan?.findings?.length || 0} findings</span></div></div>
+    </div>` : ''}
+
+    ${followup.length ? `
+    <div class="section-title" style="margin-top:20px">⚠ Needs Manual Follow-Up</div>
+    <ul class="rec-list">${followup.map(f => `<li>${esc(f)}</li>`).join('')}</ul>` : '<div class="summary-box" style="color:var(--green);margin-top:16px">✓ No manual follow-up items flagged.</div>'}
+
+    ${result.risk_notes ? `<div class="section-title" style="margin-top:20px">Risk Notes</div><div class="summary-box">${esc(result.risk_notes)}</div>` : ''}
+
+    ${changes.length ? `
+    <div class="section-title" style="margin-top:20px">Changes Made (${changes.length})</div>
+    ${changes.map(c => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(c.change || '')}</div>
+        <div class="antipattern-desc">${esc(c.reason || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${result.test_recommendations?.length ? `
+    <div class="section-title" style="margin-top:20px">Test Recommendations</div>
+    <ul class="rec-list">${result.test_recommendations.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Migrated Files (${files.length})</div>
+    ${files.map(f => `
+      <details style="margin-bottom:8px" open>
+        <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">${esc(f.path)}${f.purpose ? ` — <span style="color:var(--text-muted);font-family:inherit">${esc(f.purpose)}</span>` : ''}</summary>
+        <pre class="api-usage-code" style="margin-top:8px">${esc(f.content || '')}</pre>
+      </details>`).join('')}
+  `;
+}
+
+// ── Issue Triaging Agent ─────────────────────────────────────────────────────
+
+async function runIssueTriage() {
+  const title = document.getElementById('it-title').value.trim();
+  const description = document.getElementById('it-description').value.trim();
+  const githubIssueUrl = document.getElementById('it-github-issue-url').value.trim();
+  if (!title && !description && !githubIssueUrl) {
+    alert('Provide a title/description, or a GitHub Issue URL.');
+    return;
+  }
+  showLoading('Triaging issue — classifying, checking for duplicates, and assessing severity/priority…');
+  try {
+    const result = await apiFetch('/api/review/issue-triage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title, description,
+        github_issue_url: githubIssueUrl,
+        environment: document.getElementById('it-environment').value,
+        application: document.getElementById('it-application').value.trim(),
+        module: document.getElementById('it-module').value.trim(),
+        build_version: document.getElementById('it-build-version').value.trim(),
+        reporter: document.getElementById('it-reporter').value.trim(),
+        error_code: document.getElementById('it-error-code').value.trim(),
+        test_case_ref: document.getElementById('it-test-case-ref').value.trim(),
+        customer_impact_notes: document.getElementById('it-customer-impact').value.trim(),
+        logs: document.getElementById('it-logs').value.trim(),
+        stack_trace: document.getElementById('it-stack-trace').value.trim(),
+        team_roster: document.getElementById('it-team-roster').value.trim(),
+        project_name: document.getElementById('it-project').value.trim(),
+      }),
+    });
+    renderIssueTriageReport('issue-triage-result', result);
+    loadDashboard();
+  } catch (e) { showError('issue-triage-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderIssueTriageReport(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const sevColor = { Critical: 'var(--red)', High: 'var(--amber)', Medium: '#84cc16', Low: 'var(--green)' }[r.severity] || 'var(--text-muted)';
+  const assignment = r.recommended_assignment || {};
+  const dup = r.duplicate_analysis || {};
+  const enrich = r.enrichment || {};
+  const rca = r.root_cause_analysis || {};
+  const rel = r.release_regression || {};
+  const esc_ = r.escalation || {};
+  const secImpact = r.security_compliance_impact || {};
+  const findings = r.findings || [];
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Issue Triage Report</h2>
+      ${gateStatusBadge(r.gate_status)}
+    </div>
+    <div class="summary-box">${esc(r.issue_summary || r.reasoning_summary || '')}</div>
+
+    <div class="quality-grid" style="margin-top:16px">
+      <div class="quality-item"><div class="quality-label"><span>Severity</span></div><div style="margin-top:4px;font-weight:700;color:${sevColor}">${esc(r.severity || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Priority</span></div><div style="margin-top:4px;font-weight:700">${esc(r.priority || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Category</span></div><div style="margin-top:4px">${esc(r.issue_category || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>SDLC Area</span></div><div style="margin-top:4px">${esc(r.sdlc_area || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Environment</span></div><div style="margin-top:4px">${esc(r.environment || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Confidence</span></div><div style="margin-top:4px;font-weight:700">${r.confidence_score ?? '—'}%</div></div>
+    </div>
+
+    ${r.human_approval_required ? `<div class="summary-box" style="margin-top:16px;border-left:3px solid var(--red);color:var(--red)">⛔ Mandatory human review required before this triage decision is acted on.</div>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Severity / Priority Reasoning</div>
+    <div class="summary-box">${esc(r.severity_priority_reasoning || 'Not provided.')}</div>
+    ${r.customer_impact ? `<div class="section-title" style="margin-top:16px">Customer Impact</div><div class="summary-box">${esc(r.customer_impact)}</div>` : ''}
+
+    ${secImpact.has_impact ? `
+    <div class="section-title" style="margin-top:20px">🔐 Security / Compliance Impact</div>
+    <div class="summary-box" style="border-left:3px solid var(--red)">${esc(secImpact.details || '')}
+      ${(secImpact.regulatory_frameworks || []).length ? `<div style="margin-top:8px">${secImpact.regulatory_frameworks.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join(' ')}</div>` : ''}
+    </div>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Duplicate Analysis</div>
+    <div class="summary-box">
+      <strong>${esc(dup.status || 'None found')}</strong>${dup.matched_review_id ? ` — matches <code>${esc(dup.matched_review_id)}</code>: ${esc(dup.matched_summary || '')}` : ''}
+      <div style="margin-top:6px;color:var(--text-muted);font-size:13px">${esc(dup.similarity_explanation || '')}</div>
+    </div>
+    ${(r.related_issues || []).length ? `
+    <div class="section-title" style="margin-top:16px">Related Issues</div>
+    ${r.related_issues.map(ri => `<div class="antipattern-card"><div class="antipattern-name">${esc(ri.review_id)} — ${esc(ri.relationship || '')}</div><div class="antipattern-desc">${esc(ri.summary || '')}</div></div>`).join('')}` : ''}
+
+    <div class="section-title" style="margin-top:20px">Recommended Assignment</div>
+    <div class="quality-grid">
+      <div class="quality-item"><div class="quality-label"><span>Team</span></div><div style="margin-top:4px">${esc(assignment.recommended_team || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Owner</span></div><div style="margin-top:4px">${esc(assignment.recommended_owner || '—')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Assignment Confidence</span></div><div style="margin-top:4px;font-weight:700">${assignment.assignment_confidence ?? '—'}%</div></div>
+    </div>
+    <div class="summary-box" style="margin-top:8px">${esc(assignment.reasoning || '')}${assignment.alternative_owner ? `<br><em>Alternative: ${esc(assignment.alternative_owner)}</em>` : ''}</div>
+
+    <div class="section-title" style="margin-top:20px">Enrichment</div>
+    <div class="form-row">
+      <div class="flex1"><strong>Expected Behavior:</strong> ${esc(enrich.expected_behavior || 'Unavailable')}</div>
+      <div class="flex1"><strong>Actual Behavior:</strong> ${esc(enrich.actual_behavior || 'Unavailable')}</div>
+    </div>
+    ${(enrich.reproduction_steps || []).length ? `<div style="margin-top:8px"><strong>Reproduction Steps</strong><ol>${enrich.reproduction_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ol></div>` : ''}
+    ${(enrich.suggested_labels || []).length ? `<div style="margin-top:8px">${enrich.suggested_labels.map(l => `<span class="compliance-chip">${esc(l)}</span>`).join(' ')}</div>` : ''}
+    ${(enrich.recommended_investigation_steps || []).length ? `<div class="section-title" style="margin-top:16px">Recommended Investigation Steps</div><ul class="rec-list">${enrich.recommended_investigation_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+    ${(enrich.missing_information || []).length ? `<div class="section-title" style="margin-top:16px">⚠ Missing Information</div><ul class="rec-list">${enrich.missing_information.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Root Cause Analysis</div>
+    ${(rca.confirmed_facts || []).length ? `<div><strong>Confirmed Facts</strong><ul class="rec-list">${rca.confirmed_facts.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
+    ${(rca.probable_causes || []).length ? `<div><strong>Probable Causes</strong><ul class="rec-list">${rca.probable_causes.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
+    ${(rca.possible_causes || []).length ? `<div><strong>Possible Causes</strong><ul class="rec-list">${rca.possible_causes.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
+    ${(rca.required_validation_steps || []).length ? `<div><strong>Required Validation Steps</strong><ul class="rec-list">${rca.required_validation_steps.map(s => `<li>${esc(s)}</li>`).join('')}</ul></div>` : ''}
+    <div class="summary-box" style="margin-top:8px;color:var(--text-muted);font-size:12px">An AI-generated root-cause suggestion is never grounds to close this issue without human validation.</div>
+
+    ${(rel.potential_regression || rel.first_affected_version) ? `
+    <div class="section-title" style="margin-top:20px">Release / Regression Analysis</div>
+    <div class="summary-box">
+      ${rel.first_affected_version ? `First affected: <strong>${esc(rel.first_affected_version)}</strong>. ` : ''}
+      ${rel.last_known_working_version ? `Last known working: <strong>${esc(rel.last_known_working_version)}</strong>. ` : ''}
+      ${rel.potential_regression ? '<span style="color:var(--amber)">⚠ Potential regression.</span> ' : ''}
+      ${esc(rel.regression_reasoning || '')}
+    </div>
+    ${(rel.areas_requiring_regression_testing || []).length ? `<ul class="rec-list">${rel.areas_requiring_regression_testing.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}` : ''}
+
+    ${esc_.required ? `
+    <div class="section-title" style="margin-top:20px">🚨 Escalation Required</div>
+    <div class="summary-box" style="border-left:3px solid var(--red)">
+      ${(esc_.reasons || []).map(r2 => `<div>• ${esc(r2)}</div>`).join('')}
+      ${(esc_.notify_channels || []).length ? `<div style="margin-top:8px"><strong>Notify:</strong> ${esc_.notify_channels.map(c => esc(c)).join(', ')}</div>` : ''}
+    </div>` : ''}
+
+    ${findings.length ? `<div class="section-title" style="margin-top:20px">Flags (${findings.length})</div>${findings.map(renderFinding).join('')}` : ''}
+
+    ${(r.suggested_next_actions || []).length ? `<div class="section-title" style="margin-top:20px">Suggested Next Actions</div><ul class="rec-list">${r.suggested_next_actions.map(s => `<li>${esc(s)}</li>`).join('')}</ul>` : ''}
+
+    <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
+  `;
+}
+
+async function runIssueTriageBatchGithub() {
+  const repoUrl = document.getElementById('it-batch-repo').value.trim();
+  if (!repoUrl) { alert('Please provide a GitHub repo URL.'); return; }
+  showLoading('Fetching open issues and triaging each one — this may take a while for larger batches…');
+  try {
+    const result = await apiFetch('/api/review/issue-triage/batch-github', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        github_repo_url: repoUrl,
+        limit: parseInt(document.getElementById('it-batch-limit').value, 10) || 10,
+        project_name: document.getElementById('it-batch-project').value.trim(),
+      }),
+    });
+    renderIssueTriageBatch('issue-triage-batch-result', result);
+    loadDashboard();
+  } catch (e) { showError('issue-triage-batch-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderIssueTriageBatch(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const results = r.results || [];
+  const sevBreakdown = r.severity_breakdown || {};
+
+  wrap.innerHTML = `
+    <div class="result-header"><h2>Batch Triage — ${esc(r.repo || '')}</h2></div>
+    <div class="summary-box">Fetched ${r.issues_fetched || 0} open issues, triaged ${r.issues_triaged || 0}. ${r.escalations_required || 0} require mandatory human review.</div>
+    <div class="quality-grid" style="margin-top:12px">
+      ${Object.entries(sevBreakdown).map(([sev, count]) => `<div class="quality-item"><div class="quality-label"><span>${esc(sev)}</span></div><div style="margin-top:4px;font-weight:700">${count}</div></div>`).join('')}
+    </div>
+    <div class="section-title" style="margin-top:20px">Per-Issue Reports (${results.length})</div>
+    ${results.map((res, i) => `
+      <details style="margin-bottom:10px">
+        <summary style="cursor:pointer;padding:8px 0">
+          ${gateStatusBadge(res.gate_status)}
+          <strong style="margin-left:8px">#${res.github_issue_number ?? i} — ${esc(res.issue_summary || '')}</strong>
+          <span style="color:var(--text-muted);font-size:12px;margin-left:8px">${esc(res.severity || '')}/${esc(res.priority || '')}</span>
+        </summary>
+        <div id="it-batch-item-${i}" style="margin-top:8px"></div>
+      </details>`).join('')}
+  `;
+  results.forEach((res, i) => renderIssueTriageReport(`it-batch-item-${i}`, res));
+}
+
+async function loadIssueTriageDashboard() {
+  const project = document.getElementById('it-dash-project').value.trim();
+  const target = document.getElementById('issue-triage-dashboard-result');
+  target.classList.remove('hidden');
+  target.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const qs = project ? `?project_name=${encodeURIComponent(project)}` : '';
+    const data = await apiFetch(`/api/v1/issue-triage/dashboard${qs}`);
+    renderIssueTriageDashboard('issue-triage-dashboard-result', data);
+  } catch (e) { showError('issue-triage-dashboard-result', e.message); }
+}
+
+function renderIssueTriageDashboard(targetId, d) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const sevColors = { Critical: 'var(--red)', High: 'var(--amber)', Medium: '#84cc16', Low: 'var(--green)' };
+
+  wrap.innerHTML = `
+    <div class="result-header"><h2>Triage Analytics${d.project_name ? ` — ${esc(d.project_name)}` : ' — All Projects'}</h2></div>
+    <div class="quality-grid">
+      <div class="quality-item"><div class="quality-label"><span>Total Issues</span></div><div style="margin-top:4px;font-weight:700">${d.total_issues}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Unassigned</span></div><div style="margin-top:4px;font-weight:700;color:${d.unassigned_count > 0 ? 'var(--amber)' : 'var(--green)'}">${d.unassigned_count}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Duplicate Rate</span></div><div style="margin-top:4px;font-weight:700">${d.duplicate_rate_pct}%</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Escalations Required</span></div><div style="margin-top:4px;font-weight:700;color:${d.escalations_required > 0 ? 'var(--red)' : 'var(--green)'}">${d.escalations_required}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Average Confidence</span></div><div style="margin-top:4px;font-weight:700">${d.average_confidence}%</div></div>
+    </div>
+
+    <div class="section-title" style="margin-top:20px">Severity Breakdown</div>
+    <div class="quality-grid">
+      ${Object.entries(d.severity_breakdown || {}).map(([s, c]) => `<div class="quality-item"><div class="quality-label"><span>${esc(s)}</span></div><div style="margin-top:4px;font-weight:700;color:${sevColors[s] || 'var(--text-muted)'}">${c}</div></div>`).join('')}
+    </div>
+
+    <div class="section-title" style="margin-top:20px">Priority Breakdown</div>
+    <div class="quality-grid">
+      ${Object.entries(d.priority_breakdown || {}).map(([p, c]) => `<div class="quality-item"><div class="quality-label"><span>${esc(p)}</span></div><div style="margin-top:4px;font-weight:700">${c}</div></div>`).join('')}
+    </div>
+
+    <div class="section-title" style="margin-top:20px">Gate Breakdown</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">${Object.entries(d.gate_breakdown || {}).map(([g, c]) => `${gateStatusBadge(g)} <span style="margin-right:12px">${c}</span>`).join('')}</div>
+
+    <div class="section-title" style="margin-top:20px">Team Workload</div>
+    <div class="quality-grid">
+      ${Object.entries(d.team_workload || {}).map(([t, c]) => `<div class="quality-item"><div class="quality-label"><span>${esc(t)}</span></div><div style="margin-top:4px;font-weight:700">${c}</div></div>`).join('')}
+    </div>
+
+    <div class="section-title" style="margin-top:20px">Recent Issues (${(d.recent_issues || []).length})</div>
+    <table class="users-table">
+      <thead><tr><th>Summary</th><th>Category</th><th>Severity/Priority</th><th>Gate</th><th>Confidence</th><th>Team</th></tr></thead>
+      <tbody>
+        ${(d.recent_issues || []).map(ri => `
+          <tr>
+            <td>${esc(ri.summary || '')}</td>
+            <td style="color:var(--text-muted);font-size:12px">${esc(ri.category || '')}</td>
+            <td style="font-size:12px">${esc(ri.severity || '')}/${esc(ri.priority || '')}</td>
+            <td>${gateStatusBadge(ri.gate_status)}</td>
+            <td>${ri.confidence_score}%</td>
+            <td style="font-size:12px">${esc(ri.recommended_team || '')}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+
+async function loadDashboard() {
+  try {
+    const data = await apiFetch('/api/dashboard');
+    document.getElementById('stat-total').textContent = data.total_reviews;
+    document.getElementById('stat-critical').textContent = data.open_critical;
+    document.getElementById('stat-high').textContent = data.open_high;
+    document.getElementById('stat-green').textContent = data.green_gates;
+    document.getElementById('stat-amber').textContent = data.amber_gates;
+    document.getElementById('stat-red').textContent = data.red_gates;
+
+    const wrap = document.getElementById('recent-reviews');
+    if (!data.recent_reviews || data.recent_reviews.length === 0) {
+      wrap.innerHTML = '<div class="empty-state">No reviews yet. Start by running a review above.</div>';
+      return;
+    }
+    wrap.innerHTML = renderReviewsTable(data.recent_reviews);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+// ── History ───────────────────────────────────────────────────────────────
+
+async function loadHistory() {
+  const wrap = document.getElementById('history-list');
+  wrap.innerHTML = '<div class="empty-state">Loading...</div>';
+  try {
+    const data = await apiFetch('/api/reviews?limit=50');
+    if (!data.reviews || data.reviews.length === 0) {
+      wrap.innerHTML = '<div class="empty-state">No reviews yet.</div>';
+      return;
+    }
+    wrap.innerHTML = renderReviewsTable(data.reviews);
+  } catch (e) {
+    wrap.innerHTML = '<div class="empty-state">Error loading reviews.</div>';
+  }
+}
+
+function renderReviewsTable(reviews) {
+  const rows = reviews.map(r => `
+    <tr onclick="viewReview('${r.id}')">
+      <td>${r.id.slice(0, 8)}...</td>
+      <td><span class="tag tag-${r.review_type}">${r.review_type}</span></td>
+      <td>${esc(r.project_name || '—')}</td>
+      <td>${r.findings_count} (${r.critical_count} crit, ${r.high_count} high)</td>
+      <td>${r.risk_score?.toFixed(0) ?? '—'}/100</td>
+      <td><span class="gate-dot ${r.gate_status}">${r.gate_status}</span></td>
+      <td>${r.created_at?.slice(0, 16).replace('T', ' ') || '—'}</td>
+    </tr>
+  `).join('');
+
+  return `
+    <table class="reviews-table">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Type</th>
+          <th>Project</th>
+          <th>Findings</th>
+          <th>Risk Score</th>
+          <th>Gate</th>
+          <th>Date</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+  `;
+}
+
+async function viewReview(id) {
+  try {
+    const data = await apiFetch(`/api/reviews/${id}`);
+    const result = data.result || {};
+    const findings = result.findings || [];
+    alert(`Review ${id.slice(0,8)}\nGate: ${data.gate_status}\nScore: ${data.risk_score}\nFindings: ${findings.length}\n\nSummary: ${result.summary || 'N/A'}`);
+  } catch (e) {
+    alert('Error loading review.');
+  }
+}
+
+// ── Requirement Review ────────────────────────────────────────────────────
+
+async function reviewRequirement() {
+  const content = document.getElementById('req-content').value.trim();
+  if (!content) { alert('Please enter requirement text.'); return; }
+  const project = document.getElementById('req-project').value.trim();
+  const context = document.getElementById('req-context').value.trim();
+
+  showLoading('Running Requirement Review...');
+  try {
+    const result = await apiFetch(`/api/review/requirement?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    renderResult('req-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('req-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function uploadRequirement() {
+  const file = document.getElementById('req-file').files[0];
+  if (!file) return;
+  const project = document.getElementById('req-project').value.trim();
+  const context = document.getElementById('req-context').value.trim();
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('project_name', project || file.name);
+  formData.append('context', context);
+
+  showLoading('Extracting and reviewing document...');
+  try {
+    const result = await apiFetch('/api/review/requirement/upload', {
+      method: 'POST',
+      body: formData,
+    });
+    renderResult('req-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('req-result', e.message);
+  } finally {
+    hideLoading();
+    document.getElementById('req-file').value = '';
+  }
+}
+
+// ── QA Intelligence — Test Scenario Generation ─────────────────────────────
+
+let _lastTestScenarioResult = null;
+
+async function runTestScenarioGeneration() {
+  const content = document.getElementById('ts-requirement').value.trim();
+  if (!content) { alert('Please enter a requirement or user story.'); return; }
+  const project = document.getElementById('ts-project').value.trim();
+  const context = document.getElementById('ts-context').value.trim();
+
+  showLoading('Generating test scenarios...');
+  try {
+    const result = await apiFetch(`/api/review/test-scenario?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    _lastTestScenarioResult = result;
+    renderTestScenarios('test-scenario-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('test-scenario-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+function renderTestScenarios(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const scenarios = r.scenarios || [];
+  const priorityColor = { Critical: 'var(--red)', High: 'var(--amber)', Medium: '#84cc16', Low: 'var(--green)' };
+  const typeIcon = {
+    'Happy Path': '✅', 'Negative': '🚫', 'Boundary Value': '📏', 'Role-Based': '👤',
+    'Integration': '🔗', 'Exception/Error Handling': '⚠️',
+  };
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Test Scenario Catalogue</h2>
+      <span style="color:var(--text-muted);font-size:13px">${r.total_scenarios || scenarios.length} scenarios · ${r.critical_count || 0} critical</span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${(r.missing_acceptance_criteria || []).length ? `
+    <div class="section-title" style="margin-top:20px">⚠ Missing Acceptance Criteria</div>
+    <ul class="rec-list">${r.missing_acceptance_criteria.map(m => `<li>${esc(m)}</li>`).join('')}</ul>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Scenarios (${scenarios.length})</div>
+    ${scenarios.map(s => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">
+          ${typeIcon[s.type] || '▪'} ${esc(s.scenario_id)} — ${esc(s.title)}
+          <span style="float:right;font-size:11px;font-weight:700;color:${priorityColor[s.priority] || 'var(--text-muted)'}">${esc(s.priority)}</span>
+        </div>
+        <div class="antipattern-desc">${esc(s.description)}</div>
+        <div style="font-size:12px;color:var(--text-muted);margin-top:6px">
+          <strong>${esc(s.type)}</strong> · traces to: ${esc(s.linked_requirement)}
+          ${s.roles_involved?.length ? ` · roles: ${s.roles_involved.map(esc).join(', ')}` : ''}
+        </div>
+      </div>`).join('')}
+
+    ${(r.test_data_requirements || []).length ? `
+    <div class="section-title" style="margin-top:20px">Test Data Requirements</div>
+    <ul class="rec-list">${r.test_data_requirements.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}
+
+    ${(r.requirement_coverage || []).length ? `
+    <div class="section-title" style="margin-top:20px">Requirement Coverage</div>
+    <table class="users-table">
+      <thead><tr><th>Requirement</th><th>Covered By</th><th>Status</th></tr></thead>
+      <tbody>
+        ${r.requirement_coverage.map(c => `
+          <tr>
+            <td>${esc(c.requirement_fragment)}</td>
+            <td style="font-size:12px">${(c.covered_by_scenarios || []).join(', ')}</td>
+            <td>${c.fully_covered ? '<span style="color:var(--green)">✓ Covered</span>' : '<span style="color:var(--red)">✗ Gap</span>'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : ''}
+
+    <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
+  `;
+}
+
+// ── QA Intelligence — Test Case Generation ─────────────────────────────────
+
+function useLastTestScenarioResult() {
+  if (!_lastTestScenarioResult) { alert('Run Test Scenario Generation first.'); return; }
+  document.getElementById('tc-scenarios-context').value = JSON.stringify(_lastTestScenarioResult.scenarios || [], null, 2);
+}
+
+async function runTestCaseGeneration() {
+  const content = document.getElementById('tc-requirement').value.trim();
+  if (!content) { alert('Please enter a requirement or user story.'); return; }
+  const project = document.getElementById('tc-project').value.trim();
+  const context = document.getElementById('tc-context').value.trim();
+  const scenariosContext = document.getElementById('tc-scenarios-context').value.trim();
+
+  showLoading('Generating test cases...');
+  try {
+    const result = await apiFetch('/api/review/test-case', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, scenarios_context: scenariosContext, context, project_name: project || 'Unnamed Project' }),
+    });
+    renderTestCases('test-case-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('test-case-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+function renderTestCases(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const cases = r.test_cases || [];
+  const priorityColor = { Critical: 'var(--red)', High: 'var(--amber)', Medium: '#84cc16', Low: 'var(--green)' };
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Test Cases</h2>
+      <span style="color:var(--text-muted);font-size:13px">${r.total_test_cases || cases.length} test cases · ${r.critical_count || 0} critical</span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${(r.untestable_items || []).length ? `
+    <div class="section-title" style="margin-top:20px">⚠ Untestable Items</div>
+    <ul class="rec-list">${r.untestable_items.map(m => `<li>${esc(m)}</li>`).join('')}</ul>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Test Cases (${cases.length})</div>
+    ${cases.map(tc => `
+      <details style="margin-bottom:10px">
+        <summary style="cursor:pointer;padding:8px 0">
+          <strong>${esc(tc.test_case_id)} — ${esc(tc.title)}</strong>
+          <span style="font-size:11px;font-weight:700;color:${priorityColor[tc.priority] || 'var(--text-muted)'};margin-left:8px">${esc(tc.priority)}</span>
+          <span style="font-size:12px;color:var(--text-muted);margin-left:8px">${esc(tc.type)}</span>
+        </summary>
+        <div style="margin-top:10px;padding-left:4px">
+          ${(tc.preconditions || []).length ? `<div><strong style="font-size:12px">Preconditions</strong><ul class="rec-list">${tc.preconditions.map(p => `<li>${esc(p)}</li>`).join('')}</ul></div>` : ''}
+          <table class="users-table" style="margin-top:8px">
+            <thead><tr><th style="width:40px">#</th><th>Action</th><th>Expected Result</th></tr></thead>
+            <tbody>
+              ${(tc.steps || []).map(s => `
+                <tr>
+                  <td>${s.step_number}</td>
+                  <td>${esc(s.action)}</td>
+                  <td>${esc(s.expected_result)}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+          ${(tc.test_data || []).length ? `<div style="margin-top:8px"><strong style="font-size:12px">Test Data</strong><ul class="rec-list">${tc.test_data.map(d => `<li><code>${esc(d)}</code></li>`).join('')}</ul></div>` : ''}
+          ${(tc.dependencies || []).length ? `<div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Depends on: ${tc.dependencies.map(esc).join(', ')}</div>` : ''}
+          <div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Traces to: ${esc(tc.requirement_ref || '')}</div>
+        </div>
+      </details>`).join('')}
+
+    <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
+  `;
+}
+
+// ── Code Review ───────────────────────────────────────────────────────────
+
+async function reviewCode() {
+  const code = document.getElementById('code-content').value.trim();
+  if (!code) { alert('Please enter code to review.'); return; }
+  const project = document.getElementById('code-project').value.trim();
+  const language = document.getElementById('code-language').value.trim();
+  const context = document.getElementById('code-context').value.trim();
+
+  showLoading('Running Code Security Review...');
+  try {
+    const result = await apiFetch(`/api/review/code?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, language, context }),
+    });
+    renderResult('code-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('code-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── Prompt Safety Review ──────────────────────────────────────────────────
+
+async function reviewPrompt() {
+  const system_prompt = document.getElementById('prompt-system').value.trim();
+  const tool_definitions = document.getElementById('prompt-tools').value.trim();
+  const rag_config = document.getElementById('prompt-rag').value.trim();
+  const user_prompt = document.getElementById('prompt-user').value.trim();
+  const project = document.getElementById('prompt-project').value.trim();
+
+  if (!system_prompt && !user_prompt && !tool_definitions) {
+    alert('Please enter at least a system prompt, user prompt, or tool definitions.');
+    return;
+  }
+
+  showLoading('Running Prompt & Agent Safety Review...');
+  try {
+    const result = await apiFetch(`/api/review/prompt?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ system_prompt, user_prompt, tool_definitions, rag_config }),
+    });
+    renderResult('prompt-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('prompt-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── Full SDLC Review ──────────────────────────────────────────────────────
+
+async function runFullReview() {
+  const project_name = document.getElementById('full-project').value.trim() || 'Unnamed Project';
+  const requirement = document.getElementById('full-req').value.trim();
+  const compliance_artifact = document.getElementById('full-compliance').value.trim();
+  const architecture = document.getElementById('full-arch').value.trim();
+  const code = document.getElementById('full-code').value.trim();
+  const prompt = document.getElementById('full-prompt').value.trim();
+  const test_evidence = document.getElementById('full-test').value.trim();
+
+  if (!requirement && !compliance_artifact && !architecture && !code && !prompt) {
+    alert('Please provide at least one artifact to review.');
+    return;
+  }
+
+  showLoading('Running Full SDLC Review (this may take 30–60 seconds)...');
+  try {
+    const result = await apiFetch('/api/review/full', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence }),
+    });
+    renderFullResult('full-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('full-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── GitHub PR Review ──────────────────────────────────────────────────────
+
+async function reviewGithubPR() {
+  const pr_url = document.getElementById('gh-url').value.trim();
+  if (!pr_url) { alert('Please enter a GitHub PR URL.'); return; }
+  const jira_ticket = document.getElementById('gh-jira').value.trim();
+  const include_prompt_review = document.getElementById('gh-prompt').checked;
+
+  showLoading('Fetching PR and running review...');
+  try {
+    const result = await apiFetch('/api/github/pr', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pr_url, jira_ticket, include_prompt_review }),
+    });
+    const wrap = document.getElementById('gh-result');
+    wrap.classList.remove('hidden');
+    const review = result.review_result || {};
+    wrap.innerHTML = `
+      <div style="margin-bottom:12px">
+        <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title)}
+        ${result.comment_posted ? '<span style="color:var(--green);margin-left:12px">✓ Comment posted to GitHub</span>' : ''}
+      </div>
+    `;
+    const el = document.createElement('div');
+    el.id = '_gh_result_inner';
+    wrap.appendChild(el);
+    renderResult('_gh_result_inner', review, false);
+    loadDashboard();
+  } catch (e) {
+    showError('gh-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function autoFixGithubPR() {
+  const pr_url = document.getElementById('gh-url').value.trim();
+  if (!pr_url) { alert('Please enter a GitHub PR URL.'); return; }
+  const jira_ticket = document.getElementById('gh-jira').value.trim();
+  const max_files = parseInt(document.getElementById('gh-max-files').value, 10) || 5;
+
+  if (!confirm('This will commit fixes to a new branch and open a real pull request on GitHub. Continue?')) return;
+
+  showLoading('Reviewing PR and generating fixes...');
+  try {
+    const result = await apiFetch('/api/github/pr/auto-fix', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pr_url, jira_ticket, max_files }),
+    });
+    const wrap = document.getElementById('gh-result');
+    wrap.classList.remove('hidden');
+
+    if (!result.fix_applied) {
+      wrap.innerHTML = `
+        <div style="margin-bottom:12px">
+          <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title)}
+          <div style="color:var(--text-muted);margin-top:6px">No fix opened — ${esc(result.reason || 'unknown reason')}</div>
+        </div>
+      `;
+    } else {
+      const files = (result.files_patched || [])
+        .map(f => `<li><code>${esc(f.path)}</code> — ${esc(f.explanation || '')}</li>`)
+        .join('');
+      wrap.innerHTML = `
+        <div style="margin-bottom:12px">
+          <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title)}
+          <div style="color:var(--green);margin-top:6px">
+            ✓ Opened <a href="${esc(result.fix_pr_url)}" target="_blank" rel="noopener">fix PR #${result.fix_pr_number}</a>
+            on branch <code>${esc(result.fix_branch)}</code>
+          </div>
+          <ul style="margin-top:8px">${files}</ul>
+        </div>
+      `;
+    }
+    const el = document.createElement('div');
+    el.id = '_gh_result_inner';
+    wrap.appendChild(el);
+    renderResult('_gh_result_inner', result.review_result || {}, false);
+    loadDashboard();
+  } catch (e) {
+    showError('gh-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── Release Gate ──────────────────────────────────────────────────────────
+
+async function runReleaseGate() {
+  const project_name = document.getElementById('gate-project').value.trim();
+  const release_version = document.getElementById('gate-version').value.trim();
+  const idsText = document.getElementById('gate-review-ids').value.trim();
+  const findingsText = document.getElementById('gate-findings').value.trim();
+
+  const body = { project_name, release_version };
+
+  if (idsText) {
+    body.review_ids = idsText.split('\n').map(s => s.trim()).filter(Boolean);
+  }
+
+  if (findingsText) {
+    try {
+      body.findings = JSON.parse(findingsText);
+    } catch {
+      alert('Invalid JSON in findings field.');
+      return;
+    }
+  }
+
+  showLoading('Evaluating Release Gate...');
+  try {
+    const result = await apiFetch('/api/release-gate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    renderResult('gate-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('gate-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── Render Results ────────────────────────────────────────────────────────
+
+function renderResult(targetId, result, clear = true) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+
+  const gate = result.gate_status || 'Unknown';
+  const score = result.risk_score ?? 0;
+  const findings = result.findings || [];
+  const summary = result.summary || '';
+  const recs = result.recommendations || [];
+  const flags = result.compliance_flags || [];
+
+  const gateIcon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[gate] || '❓';
+
+  let html = `
+    <div class="result-header">
+      <span class="gate-badge gate-${gate}">${gateIcon} Gate: ${gate}</span>
+      <span class="risk-score-badge">Risk Score: ${score.toFixed ? score.toFixed(0) : score}/100</span>
+      ${result.agent_name ? `<span style="color:var(--text-muted);font-size:12px">${esc(result.agent_name)}</span>` : ''}
+    </div>
+  `;
+
+  if (summary) {
+    html += `<div class="summary-box">${esc(summary)}</div>`;
+  }
+
+  if (flags.length) {
+    html += `<div class="compliance-chips">`;
+    flags.forEach(f => { html += `<span class="compliance-chip">${esc(f)}</span>`; });
+    html += `</div><br/>`;
+  }
+
+  if (findings.length) {
+    html += `<div class="findings-section"><h3>Findings (${findings.length})</h3>`;
+    const sorted = [...findings].sort((a, b) => (b.severity || 0) - (a.severity || 0));
+    sorted.forEach(f => {
+      html += renderFinding(f);
+    });
+    html += `</div>`;
+  } else {
+    html += `<div class="summary-box" style="color:var(--green)">✓ No findings identified.</div>`;
+  }
+
+  if (recs.length) {
+    html += `<div class="findings-section"><h3>Recommendations</h3><ol class="recs-list">`;
+    recs.forEach(r => { html += `<li>${esc(r)}</li>`; });
+    html += `</ol></div>`;
+  }
+
+  if (clear) wrap.innerHTML = html;
+  else wrap.insertAdjacentHTML('beforeend', html);
+}
+
+function renderFullResult(targetId, result) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+
+  const gate = result.gate_status || 'Unknown';
+  const score = result.overall_risk_score ?? 0;
+  const gateIcon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[gate] || '❓';
+  const subs = result.sub_reviews || [];
+
+  let html = `
+    <div class="result-header">
+      <span class="gate-badge gate-${gate}">${gateIcon} Gate: ${gate}</span>
+      <span class="risk-score-badge">Overall Risk: ${score.toFixed ? score.toFixed(0) : score}/100</span>
+      <span style="color:var(--text-muted);font-size:13px">${result.total_findings ?? 0} findings (${result.critical_count ?? 0} critical, ${result.high_count ?? 0} high)</span>
+    </div>
+  `;
+
+  if (result.summary) {
+    html += `<div class="summary-box">${esc(result.summary)}</div>`;
+  }
+
+  if (subs.length) {
+    html += `<div class="sub-reviews">`;
+    subs.forEach(s => {
+      const icon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[s.gate] || '❓';
+      html += `
+        <div class="sub-review-pill">
+          ${icon} <strong>${esc(s.source)}</strong>
+          <span style="color:var(--text-muted)">Score: ${Math.round(s.score)}/100 · ${s.findings} findings</span>
+        </div>
+      `;
+    });
+    html += `</div>`;
+  }
+
+  const findings = result.top_findings || [];
+  if (findings.length) {
+    html += `<div class="findings-section"><h3>Top Findings</h3>`;
+    findings.forEach(f => { html += renderFinding(f); });
+    html += `</div>`;
+  }
+
+  const recs = result.recommendations || [];
+  if (recs.length) {
+    html += `<div class="findings-section"><h3>Recommendations</h3><ol class="recs-list">`;
+    recs.forEach(r => { html += `<li>${esc(r)}</li>`; });
+    html += `</ol></div>`;
+  }
+
+  if (result.report_id) {
+    html += `
+      <div class="info-box" style="margin-top:16px">
+        📄 <strong>Governance Report generated</strong> — ID: <code>${result.report_id}</code>
+        <br/>Accessible at <code>/api/reports/${result.report_id}</code>
+      </div>
+    `;
+  }
+
+  wrap.innerHTML = html;
+}
+
+function renderFinding(f) {
+  const sev = f.severity || 1;
+  const blocking = f.is_blocking ? '<span class="blocking-badge">Blocking</span>' : '';
+  const owasp = f.owasp_ref ? `<span class="compliance-chip">${esc(f.owasp_ref)}</span>` : '';
+  const nist = f.nist_ref ? `<span class="compliance-chip">${esc(f.nist_ref)}</span>` : '';
+
+  return `
+    <div class="finding-card sev-${sev}">
+      <div class="finding-header">
+        <span class="sev-badge">${esc(f.risk_level || severityName(sev))}</span>
+        <span class="control-badge">${esc(f.control_id || 'N/A')}</span>
+        ${blocking}
+        ${owasp}${nist}
+      </div>
+      <div class="finding-title">${esc(f.title || 'Finding')}</div>
+      <div class="finding-desc">${esc(f.description || '')}</div>
+      ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+    </div>
+  `;
+}
+
+function severityName(n) {
+  return ['', 'Low', 'Minor', 'Moderate', 'High', 'Critical'][n] || 'Unknown';
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+
+function showLoading(text) {
+  document.getElementById('loading-text').textContent = text || 'Running AI review...';
+  document.getElementById('loading-overlay').classList.remove('hidden');
+}
+
+function hideLoading() {
+  document.getElementById('loading-overlay').classList.add('hidden');
+}
+
+function showError(targetId, message) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  wrap.innerHTML = `
+    <div class="summary-box" style="border-color:var(--red);color:var(--red)">
+      ⚠️ Error: ${esc(message || 'An unexpected error occurred.')}
+    </div>
+  `;
+}
+
+function esc(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+async function apiFetch(url, options = {}) {
+  const token = localStorage.getItem('sdlc_token');
+  const _silent = options._silent || false;
+  delete options._silent;
+  if (token) {
+    options.headers = options.headers || {};
+    options.headers['Authorization'] = 'Bearer ' + token;
+  }
+  const res = await fetch(API + url, options);
+  if (!res.ok) {
+    // Only log out and re-prompt when the user HAD a session that has now expired.
+    // If there was never a token, a 401 just means the feature needs login — show
+    // the modal so the user knows, but don't destroy state that isn't there.
+    if (res.status === 401 && !_silent) {
+      if (token) {
+        logout(); // session expired
+        openLogin('Your session has expired. Please sign in again.');
+      } else {
+        openLogin('Sign in to use this feature.');
+      }
+      throw new Error('Sign in required.');
+    }
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── Architecture Review ────────────────────────────────────────────────────
+
+async function runArchitectureReview() {
+  const artifact = document.getElementById('arch-artifact').value.trim();
+  if (!artifact) { alert('Please describe the architecture or requirements.'); return; }
+  const mode = document.getElementById('arch-mode').value;
+  const modeLabels = { review: 'Reviewing architecture', recommend: 'Generating architecture recommendations', compare: 'Comparing architecture options' };
+  showLoading(`${modeLabels[mode] || 'Running'}… this may take 20–40 seconds`);
+  try {
+    const result = await apiFetch('/api/review/architecture', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        artifact,
+        requirements: document.getElementById('arch-requirements').value.trim(),
+        review_mode:  mode,
+        context:      document.getElementById('arch-context').value.trim(),
+        project_name: document.getElementById('arch-project').value.trim(),
+      }),
+    });
+    renderArchitectureResult('arch-result', result);
+  } catch (e) { showError('arch-result', e.message); }
+  finally { hideLoading(); }
+}
+
+async function uploadArchitectureReview() {
+  const file = document.getElementById('arch-file').files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('requirements', document.getElementById('arch-requirements').value.trim());
+  fd.append('review_mode',  document.getElementById('arch-mode').value);
+  fd.append('context',      document.getElementById('arch-context').value.trim());
+  fd.append('project_name', document.getElementById('arch-project').value.trim());
+  showLoading(`Reviewing ${file.name}…`);
+  try {
+    const result = await apiFetch('/api/review/architecture/upload', { method: 'POST', body: fd });
+    renderArchitectureResult('arch-result', result);
+  } catch (e) { showError('arch-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderArchitectureResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const findings    = r.findings || [];
+  const antiPats    = r.anti_patterns || [];
+  const spofs       = r.single_points_of_failure || [];
+  const bottlenecks = r.scalability_bottlenecks || [];
+  const alts        = r.alternative_recommendations || [];
+  const scores      = r.quality_scores || {};
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Architecture Review ${gateStatusBadge(r.gate_status)}</h2>
+      <span class="risk-score">Risk Score: <b>${r.risk_score ?? '—'}</b>/100</span>
+    </div>
+
+    <span class="arch-type-badge">🏗️ ${esc(r.architecture_type || 'Unknown')}</span>
+    ${r.architecture_description ? `<div class="summary-box" style="margin-bottom:16px;">${esc(r.architecture_description)}</div>` : ''}
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${Object.keys(scores).length ? `
+    <div class="section-title" style="margin-top:20px;">Quality Dimensions</div>
+    <div class="quality-grid">${renderQualityScores(scores)}</div>` : ''}
+
+    ${antiPats.length ? `
+    <div class="section-title">Anti-Patterns Detected (${antiPats.length})</div>
+    ${antiPats.map(a => renderAntiPattern(a)).join('')}` : ''}
+
+    ${spofs.length ? `
+    <div class="section-title" style="margin-top:20px;">Single Points of Failure (${spofs.length})</div>
+    ${spofs.map(s => `
+      <div class="spof-card">
+        <div class="spof-icon">⚡</div>
+        <div>
+          <div class="spof-component">${esc(s.component)}</div>
+          <div class="spof-scenario">${esc(s.failure_scenario)}</div>
+          <div class="spof-mitigation">Mitigation: ${esc(s.mitigation)}</div>
+        </div>
+      </div>`).join('')}` : ''}
+
+    ${bottlenecks.length ? `
+    <div class="section-title" style="margin-top:20px;">Scalability Bottlenecks</div>
+    <ul class="rec-list">${bottlenecks.map(b => `<li>${esc(b)}</li>`).join('')}</ul>` : ''}
+
+    ${alts.length ? `
+    <div class="section-title" style="margin-top:20px;">Alternative Architectures (${alts.length})</div>
+    ${alts.map(a => renderArchitectureAlternative(a)).join('')}` : ''}
+
+    ${findings.length ? `
+    <div class="section-title" style="margin-top:20px;">Architecture Findings (${findings.length})</div>
+    ${findings.map(f => renderFindingCard(f)).join('')}` : ''}
+
+    ${r.recommendations?.length ? `
+    <div class="section-title" style="margin-top:20px;">Recommendations</div>
+    <ul class="rec-list">${r.recommendations.map(rec => `<li>${esc(rec)}</li>`).join('')}</ul>` : ''}
+
+    ${r.compliance_flags?.length ? `
+    <div class="section-title">Compliance Flags</div>
+    <div class="compliance-chips">${r.compliance_flags.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join('')}</div>` : ''}
+  `;
+}
+
+function renderQualityScores(scores) {
+  const labels = {
+    scalability:     'Scalability',
+    resilience:      'Resilience',
+    maintainability: 'Maintainability',
+    security:        'Security',
+    performance:     'Performance',
+    observability:   'Observability',
+    deployability:   'Deployability',
+    cost_efficiency: 'Cost Efficiency',
+  };
+  return Object.entries(labels).map(([key, label]) => {
+    const val = scores[key] ?? 0;
+    const pct = (val / 10) * 100;
+    const cls = val >= 8 ? 'qbar-excellent' : val >= 6 ? 'qbar-good' : val >= 4 ? 'qbar-fair' : val >= 2 ? 'qbar-poor' : 'qbar-critical';
+    return `
+      <div class="quality-item">
+        <div class="quality-label">
+          <span>${label}</span>
+          <span class="quality-score-num">${val}/10</span>
+        </div>
+        <div class="quality-bar-bg">
+          <div class="quality-bar-fill ${cls}" style="width:${pct}%"></div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderAntiPattern(a) {
+  const sev = (a.severity || '').toLowerCase();
+  const sevClass = sev === 'critical' || sev === 'high' ? '' : sev === 'moderate' ? 'severity-moderate' : 'severity-low';
+  const sevBgMap = { critical: '#3d0a0a', high: '#431407', moderate: '#2d1a00', low: '#052e16' };
+  const sevClrMap = { critical: '#f87171', high: '#fb923c', moderate: '#fbbf24', low: '#4ade80' };
+  const bg  = sevBgMap[sev] || '#2d1a00';
+  const clr = sevClrMap[sev] || '#fbbf24';
+  return `
+    <div class="antipattern-card ${sevClass}">
+      <div class="antipattern-name">${esc(a.name)}</div>
+      <span class="antipattern-sev" style="background:${bg};color:${clr};">${esc(a.severity)}</span>
+      <div class="antipattern-desc">${esc(a.description)}</div>
+      ${a.impact ? `<div class="antipattern-impact">⚠ Impact: ${esc(a.impact)}</div>` : ''}
+      ${a.recommendation ? `<div class="antipattern-rec">→ ${esc(a.recommendation)}</div>` : ''}
+    </div>`;
+}
+
+function renderArchitectureAlternative(a) {
+  const fit = a.fit_score ?? 5;
+  const fitClass = fit >= 8 ? 'fit-excellent' : fit >= 6 ? 'fit-good' : fit >= 4 ? 'fit-fair' : 'fit-poor';
+  const mig = (a.migration_complexity || '').toLowerCase().replace(' ', '-');
+  const migClass = mig.includes('very') ? 'mig-vh' : mig === 'high' ? 'mig-high' : mig === 'medium' ? 'mig-medium' : 'mig-low';
+  const pros = (a.advantages || []).map(p => `<li>${esc(p)}</li>`).join('');
+  const cons = (a.disadvantages || []).map(c => `<li>${esc(c)}</li>`).join('');
+  return `
+    <div class="alt-card">
+      <div class="alt-card-header">
+        <div class="alt-fit-score ${fitClass}">${fit}</div>
+        <div class="alt-pattern-name">${esc(a.pattern)}</div>
+        <span class="alt-migration ${migClass}">Migration: ${esc(a.migration_complexity || 'N/A')}</span>
+      </div>
+      <div style="font-size:13px;color:var(--text-muted);margin-bottom:10px;">${esc(a.justification || '')}</div>
+      <div class="alt-pros-cons">
+        <div class="alt-pros"><h4>Advantages</h4><ul>${pros}</ul></div>
+        <div class="alt-cons"><h4>Disadvantages</h4><ul>${cons}</ul></div>
+      </div>
+      ${a.when_to_choose ? `<div class="alt-when">💡 <b>When to choose:</b> ${esc(a.when_to_choose)}</div>` : ''}
+    </div>`;
+}
+
+// ── VAPT ──────────────────────────────────────────────────────────────────
+
+async function runVAPT() {
+  const artifact = document.getElementById('vapt-artifact').value.trim();
+  if (!artifact) { alert('Please enter an artifact to assess.'); return; }
+  showLoading('Running VAPT assessment… this may take 20–40 seconds');
+  try {
+    const result = await apiFetch('/api/review/vapt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        artifact,
+        scope:        document.getElementById('vapt-scope').value.trim(),
+        context:      document.getElementById('vapt-context').value.trim(),
+        project_name: document.getElementById('vapt-project').value.trim(),
+      }),
+    });
+    renderVAPTResult('vapt-result', result);
+  } catch (e) { showError('vapt-result', e.message); }
+  finally { hideLoading(); }
+}
+
+async function uploadVAPT() {
+  const file = document.getElementById('vapt-file').files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('scope',        document.getElementById('vapt-scope').value.trim());
+  fd.append('context',      document.getElementById('vapt-context').value.trim());
+  fd.append('project_name', document.getElementById('vapt-project').value.trim());
+  showLoading(`Assessing ${file.name}…`);
+  try {
+    const result = await apiFetch('/api/review/vapt/upload', { method: 'POST', body: fd });
+    renderVAPTResult('vapt-result', result);
+  } catch (e) { showError('vapt-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderVAPTResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const findings = r.findings || [];
+  const crit = findings.filter(f => f.severity === 5).length;
+  const high = findings.filter(f => f.severity === 4).length;
+  const med  = findings.filter(f => f.severity === 3).length;
+  const low  = findings.filter(f => f.severity <= 2).length;
+  const sorted = [...findings].sort((a, b) => (b.cvss_score || 0) - (a.cvss_score || 0));
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>VAPT Results ${gateStatusBadge(r.gate_status)}</h2>
+      <span class="risk-score">Risk Score: <b>${r.risk_score ?? '—'}</b>/100</span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+    <div class="vapt-summary-bar">
+      <div class="vapt-summary-card crit"><div class="count">${crit}</div><div class="label">Critical</div></div>
+      <div class="vapt-summary-card high"><div class="count">${high}</div><div class="label">High</div></div>
+      <div class="vapt-summary-card med"> <div class="count">${med}</div> <div class="label">Medium</div></div>
+      <div class="vapt-summary-card low"> <div class="count">${low}</div> <div class="label">Low/Info</div></div>
+      <div class="vapt-summary-card">    <div class="count" style="color:var(--accent)">${findings.length}</div><div class="label">Total</div></div>
+    </div>
+    ${r.attack_surface_summary ? `<div class="section-title">Attack Surface</div><div class="summary-box" style="margin-bottom:20px;">${esc(r.attack_surface_summary)}</div>` : ''}
+    <div class="section-title">Vulnerabilities (${findings.length})</div>
+    ${sorted.map(f => renderVAPTFinding(f)).join('')}
+    ${r.recommendations?.length ? `<div class="section-title" style="margin-top:20px;">Remediation Priorities</div><ul class="rec-list">${r.recommendations.map(rec => `<li>${esc(rec)}</li>`).join('')}</ul>` : ''}
+    ${r.compliance_flags?.length ? `<div class="section-title">Compliance Flags</div><div class="compliance-chips">${r.compliance_flags.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join('')}</div>` : ''}
+  `;
+}
+
+function renderVAPTFinding(f) {
+  const cvss = f.cvss_score ?? null;
+  const cvssClass = cvss === null ? 'cvss-info' : cvss >= 9 ? 'cvss-critical' : cvss >= 7 ? 'cvss-high' : cvss >= 4 ? 'cvss-medium' : 'cvss-low';
+  const cvssLabel = cvss !== null ? cvss.toFixed(1) : 'N/A';
+  const blocking = f.is_blocking ? '<span class="blocking-badge">BLOCKING</span>' : '';
+  const owasp = f.owasp_category ? `<span class="vapt-owasp">${esc(f.owasp_category)}</span>` : '';
+  const cwe   = f.cwe_id         ? `<span class="vapt-cwe">${esc(f.cwe_id)}</span>` : '';
+  const uid = `vapt-${f.vuln_id || Math.random().toString(36).slice(2)}`;
+  return `
+    <div class="vapt-finding">
+      <div class="vapt-finding-header" onclick="toggleVAPT('${uid}')">
+        <span class="cvss-badge ${cvssClass}">CVSS ${cvssLabel}</span>
+        <span class="vapt-finding-title">${esc(f.title || 'Finding')}</span>
+        <div class="vapt-finding-meta">
+          <span class="vapt-vuln-id">${esc(f.vuln_id || '')}</span>
+          ${owasp}${cwe}${blocking}
+        </div>
+      </div>
+      <div class="vapt-finding-body" id="${uid}">
+        <div class="vapt-detail-grid">
+          <div class="vapt-detail-block"><label>Description</label><p>${esc(f.description || '')}</p></div>
+          <div class="vapt-detail-block"><label>Affected Component</label><div class="vapt-affected">${esc(f.affected_component || 'N/A')}</div></div>
+          <div class="vapt-detail-block"><label>Attack Scenario</label><p>${esc(f.attack_scenario || '')}</p></div>
+          <div class="vapt-detail-block"><label>Remediation</label><p>${esc(f.recommendation || '')}</p></div>
+        </div>
+        ${f.proof_of_concept ? `<div style="margin-top:10px;"><label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-muted);letter-spacing:.05em;display:block;margin-bottom:4px;">Proof of Concept</label><div class="vapt-poc">${esc(f.proof_of_concept)}</div></div>` : ''}
+        ${f.cvss_vector ? `<div style="margin-top:8px;font-size:11px;color:var(--text-muted);font-family:monospace;">${esc(f.cvss_vector)}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+function toggleVAPT(id) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle('open');
+}
+
+// ── Security Review ────────────────────────────────────────────────────────
+
+async function runSecurityReview() {
+  const artifact = document.getElementById('sec-artifact').value.trim();
+  if (!artifact) { alert('Please describe the system architecture.'); return; }
+  showLoading('Running security architecture review… this may take 20–40 seconds');
+  try {
+    const result = await apiFetch('/api/review/security', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        artifact,
+        system_type:  document.getElementById('sec-type').value.trim(),
+        context:      document.getElementById('sec-context').value.trim(),
+        project_name: document.getElementById('sec-project').value.trim(),
+      }),
+    });
+    renderSecurityResult('security-result', result);
+  } catch (e) { showError('security-result', e.message); }
+  finally { hideLoading(); }
+}
+
+async function uploadSecurityReview() {
+  const file = document.getElementById('sec-file').files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('system_type',  document.getElementById('sec-type').value.trim());
+  fd.append('context',      document.getElementById('sec-context').value.trim());
+  fd.append('project_name', document.getElementById('sec-project').value.trim());
+  showLoading(`Reviewing ${file.name}…`);
+  try {
+    const result = await apiFetch('/api/review/security/upload', { method: 'POST', body: fd });
+    renderSecurityResult('security-result', result);
+  } catch (e) { showError('security-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderSecurityResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const findings = r.findings || [];
+  const stride   = r.stride_threats || [];
+  const bounds   = r.trust_boundaries || [];
+  const vectors  = r.attack_vectors || [];
+  const strideCls = { 'Spoofing':'stride-S','Tampering':'stride-T','Repudiation':'stride-R','Information Disclosure':'stride-I','Denial of Service':'stride-D','Elevation of Privilege':'stride-E' };
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Security Review Results ${gateStatusBadge(r.gate_status)}</h2>
+      <span class="risk-score">Risk Score: <b>${r.risk_score ?? '—'}</b>/100</span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+    ${findings.length ? `<div class="section-title">Architecture Findings (${findings.length})</div>${findings.map(f => renderFindingCard(f)).join('')}` : ''}
+    ${stride.length ? `
+    <div class="section-title" style="margin-top:20px;">STRIDE Threat Model (${stride.length})</div>
+    <div style="overflow-x:auto;"><table class="stride-table">
+      <thead><tr><th>Threat Type</th><th>Component</th><th>Threat</th><th>Mitigation</th><th>Risk</th></tr></thead>
+      <tbody>${stride.map(t => `<tr>
+        <td><span class="stride-tag ${strideCls[t.threat_type] || ''}">${esc(t.threat_type||'')}</span></td>
+        <td><code style="font-size:12px;color:#c084fc;">${esc(t.component||'')}</code></td>
+        <td>${esc(t.threat_description||'')}</td>
+        <td>${esc(t.mitigation||'')}</td>
+        <td><span class="sev-badge sev-${sevNum(t.risk_level)}">${esc(t.risk_level||'')}</span></td>
+      </tr>`).join('')}</tbody>
+    </table></div>` : ''}
+    ${bounds.length ? `
+    <div class="section-title" style="margin-top:20px;">Trust Boundaries (${bounds.length})</div>
+    ${bounds.map(b => `<div class="boundary-card">
+      <div class="boundary-flow">
+        <span class="boundary-zone">${esc(b.from_zone||'?')}</span>
+        <span class="boundary-arrow">→</span>
+        <span class="boundary-zone">${esc(b.to_zone||'?')}</span>
+        <span style="font-size:13px;color:var(--text-muted);font-weight:400;">via ${esc(b.boundary||'')}</span>
+      </div>
+      <div style="font-size:13px;color:var(--text-muted);margin-bottom:6px;">Data: ${esc(b.data_crossing||'')}</div>
+      ${b.controls_present?.length ? `<div style="font-size:12px;color:var(--green);margin-bottom:4px;">✓ ${b.controls_present.join(' · ')}</div>` : ''}
+      ${b.gaps?.length ? `<div class="boundary-gaps">${b.gaps.map(g=>`<div class="boundary-gap-item">${esc(g)}</div>`).join('')}</div>` : ''}
+    </div>`).join('')}` : ''}
+    ${vectors.length ? `<div class="section-title" style="margin-top:20px;">Attack Vectors</div><ul class="rec-list">${vectors.map(v=>`<li>${esc(v)}</li>`).join('')}</ul>` : ''}
+    ${r.recommendations?.length ? `<div class="section-title" style="margin-top:20px;">Recommendations</div><ul class="rec-list">${r.recommendations.map(rec=>`<li>${esc(rec)}</li>`).join('')}</ul>` : ''}
+    ${r.compliance_flags?.length ? `<div class="section-title">Compliance Flags</div><div class="compliance-chips">${r.compliance_flags.map(f=>`<span class="compliance-chip">${esc(f)}</span>`).join('')}</div>` : ''}
+  `;
+}
+
+function sevNum(level) {
+  return { Critical:5, High:4, Moderate:3, Minor:2, Low:1 }[level] || 1;
+}
+
+// ── Knowledge Base ─────────────────────────────────────────────────────────
+
+let _currentKBDoc = null; // { name, category, project_name }
+let _kbCategories = [];
+
+async function loadKBCategories() {
+  if (_kbCategories.length) return; // cached — categories are static for the session
+  try {
+    const data = await apiFetch('/api/knowledge-base/categories');
+    _kbCategories = data.categories || [];
+    const uploadSel = document.getElementById('kb-upload-category');
+    const filterSel = document.getElementById('kb-filter-category');
+    if (uploadSel) {
+      uploadSel.innerHTML = _kbCategories.map(c => `<option value="${esc(c.key)}">${esc(c.label)}</option>`).join('');
+    }
+    if (filterSel) {
+      filterSel.innerHTML = '<option value="">All categories</option>' +
+        _kbCategories.map(c => `<option value="${esc(c.key)}">${esc(c.label)}</option>`).join('');
+    }
+  } catch (e) { console.error('Failed to load KB categories:', e); }
+}
+
+function kbCategoryLabel(key) {
+  return _kbCategories.find(c => c.key === key)?.label || key;
+}
+
+async function loadKnowledgeBase() {
+  const wrap = document.getElementById('kb-doc-list');
+  if (!wrap) return;
+  const filterProject = document.getElementById('kb-filter-project')?.value.trim() || '';
+  const filterCategory = document.getElementById('kb-filter-category')?.value || '';
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const params = new URLSearchParams();
+    if (filterProject) params.set('project_name', filterProject);
+    if (filterCategory) params.set('category', filterCategory);
+    const qs = params.toString();
+    const data = await apiFetch(`/api/knowledge-base${qs ? '?' + qs : ''}`);
+    const docs = data.docs || [];
+    if (!docs.length) {
+      wrap.innerHTML = `<div class="empty-state">No documents found${filterProject ? ` for project "${esc(filterProject)}"` : ''}${filterCategory ? ` in category "${esc(kbCategoryLabel(filterCategory))}"` : ''}. Upload a .md file to get started.</div>`;
+      return;
+    }
+
+    const byCategory = {};
+    docs.forEach(d => {
+      if (!byCategory[d.category]) byCategory[d.category] = [];
+      byCategory[d.category].push(d);
+    });
+
+    const renderDocCard = (d, badge) => `
+      <div class="kb-doc-card" onclick="viewKBDoc('${esc(d.name)}','${esc(d.category)}','${esc(d.project_name||'')}')">
+        <div class="kb-doc-icon">📄</div>
+        <div class="kb-doc-info">
+          <div class="kb-doc-title">${esc(d.title || d.name)} ${badge || ''}</div>
+          <div class="kb-doc-meta">${esc(d.path)} · ${Math.ceil(d.size_chars / 1000)}k chars</div>
+          ${d.tags?.length ? `<div class="kb-doc-tags">${d.tags.slice(0,4).map(t => `<span class="kb-tag">${esc(t)}</span>`).join('')}</div>` : ''}
+        </div>
+      </div>`;
+
+    let html = '';
+    Object.keys(byCategory).sort().forEach(category => {
+      const catDocs = byCategory[category];
+      const globalDocs = catDocs.filter(d => !d.project_name);
+      const byProject = {};
+      catDocs.filter(d => d.project_name).forEach(d => {
+        if (!byProject[d.project_name]) byProject[d.project_name] = [];
+        byProject[d.project_name].push(d);
+      });
+      html += `<div class="kb-category-title">${esc(kbCategoryLabel(category))}</div><div class="kb-doc-grid">`;
+      html += globalDocs.map(d => renderDocCard(d)).join('');
+      Object.entries(byProject).forEach(([proj, projDocs]) => {
+        html += projDocs.map(d => renderDocCard(d, `<span class="role-badge role-reviewer" style="margin-left:6px">${esc(proj)}</span>`)).join('');
+      });
+      html += `</div>`;
+    });
+    wrap.innerHTML = html;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red);">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function viewKBDoc(name, category, projectName) {
+  try {
+    const params = new URLSearchParams({ category });
+    if (projectName) params.set('project_name', projectName);
+    const doc = await apiFetch(`/api/knowledge-base/${name}?${params.toString()}`);
+    _currentKBDoc = { name, category, project_name: projectName || '' };
+    document.getElementById('kb-viewer-title').textContent = (doc.title || doc.name) + ` — ${kbCategoryLabel(category)}` + (projectName ? ` (project: ${projectName})` : ' (shared/global)');
+    document.getElementById('kb-viewer-content').textContent = doc.content;
+    document.getElementById('kb-viewer').classList.remove('hidden');
+  } catch (e) {
+    alert(`Could not load document: ${e.message}`);
+  }
+}
+
+function closeKBViewer() {
+  document.getElementById('kb-viewer').classList.add('hidden');
+  _currentKBDoc = null;
+}
+
+async function deleteKBDoc() {
+  if (!_currentKBDoc) return;
+  if (!confirm(`Delete "${_currentKBDoc.name}"? This cannot be undone.`)) return;
+  try {
+    const params = new URLSearchParams({ category: _currentKBDoc.category });
+    if (_currentKBDoc.project_name) params.set('project_name', _currentKBDoc.project_name);
+    await apiFetch(`/api/knowledge-base/${_currentKBDoc.name}?${params.toString()}`, { method: 'DELETE' });
+    closeKBViewer();
+    loadKnowledgeBase();
+  } catch (e) {
+    alert(`Delete failed: ${e.message}`);
+  }
+}
+
+async function uploadKBDoc() {
+  const file = document.getElementById('kb-upload-input').files[0];
+  if (!file) return;
+  if (!file.name.endsWith('.md')) { alert('Only .md files are accepted.'); return; }
+  const category = document.getElementById('kb-upload-category')?.value || '';
+  if (!category) { alert('Please select a category (which agent this document is for).'); return; }
+  const projectName = document.getElementById('kb-upload-project')?.value.trim() || '';
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('category', category);
+  fd.append('project_name', projectName);
+  showLoading(`Uploading ${file.name}…`);
+  try {
+    const result = await apiFetch('/api/knowledge-base', { method: 'POST', body: fd });
+    hideLoading();
+    loadKnowledgeBase();
+    alert(`✓ Uploaded: ${result.title} (${kbCategoryLabel(category)})${projectName ? ` — scoped to project "${projectName}"` : ' — shared/global'}`);
+  } catch (e) {
+    hideLoading();
+    alert(`Upload failed: ${e.message}`);
+  }
+}
+
+// ── Cost Optimization ────────────────────────────────────────────────────────
+
+async function loadCostOptimizationPage() {
+  const label = document.getElementById('co-status-label');
+  const actions = document.getElementById('co-toggle-actions');
+  label.textContent = 'Loading…';
+  try {
+    const data = await apiFetch('/api/v1/cost-optimization/settings');
+    label.innerHTML = data.enabled
+      ? '<span style="color:var(--green)">● Enabled</span> — compressing prompt content for all non-regulated agents'
+      : '<span style="color:var(--text-muted)">○ Disabled</span> — every agent sends full, uncompressed content';
+    if (isSuperAdmin()) {
+      actions.style.display = '';
+      document.getElementById('co-enable-btn').disabled = data.enabled;
+      document.getElementById('co-disable-btn').disabled = !data.enabled;
+    } else {
+      actions.style.display = 'none';
+    }
+  } catch (e) {
+    label.innerHTML = `<span style="color:var(--red)">Error: ${esc(e.message)}</span>`;
+  }
+  loadCostOptimizationDashboard();
+}
+
+async function setCostOptimization(enabled) {
+  try {
+    await apiFetch('/api/v1/cost-optimization/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+    loadCostOptimizationPage();
+  } catch (e) {
+    alert(`Failed to update setting: ${e.message}`);
+  }
+}
+
+async function loadCostOptimizationDashboard() {
+  const project = document.getElementById('co-dash-project').value.trim();
+  const target = document.getElementById('co-dashboard-result');
+  target.classList.remove('hidden');
+  target.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const qs = project ? `?project_name=${encodeURIComponent(project)}` : '';
+    const data = await apiFetch(`/api/v1/cost-optimization/dashboard${qs}`);
+    renderCostOptimizationDashboard('co-dashboard-result', data);
+  } catch (e) {
+    showError('co-dashboard-result', e.message);
+  }
+}
+
+function renderCostOptimizationDashboard(targetId, d) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const pct = d.total_tokens_before ? Math.round((1 - d.average_compression_ratio) * 100) : 0;
+
+  wrap.innerHTML = `
+    <div class="result-header"><h2>Token &amp; Cost Savings${d.project_name ? ` — ${esc(d.project_name)}` : ' — All Projects'}</h2></div>
+    <div class="quality-grid">
+      <div class="quality-item"><div class="quality-label"><span>Tokens Saved</span></div><div style="margin-top:4px;font-weight:700;color:var(--green)">${d.total_tokens_saved.toLocaleString()}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Estimated $ Saved</span></div><div style="margin-top:4px;font-weight:700;color:var(--green)">$${d.estimated_cost_saved_usd.toFixed(2)}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Avg. Compression</span></div><div style="margin-top:4px;font-weight:700">${pct}%</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Compressed Calls</span></div><div style="margin-top:4px;font-weight:700">${d.compressed_calls}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Exempt Calls</span></div><div style="margin-top:4px;font-weight:700;color:var(--text-muted)">${d.exempt_calls}</div></div>
+    </div>
+    <div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Based on the last ${d.reviews_considered} review(s). Exempt calls are 21 CFR Part 11 / GxP document agents (always uncompressed) plus any calls made while cost optimization was disabled.</div>
+
+    ${d.by_agent.length ? `
+    <div class="section-title" style="margin-top:20px">Savings by Agent</div>
+    <table class="users-table">
+      <thead><tr><th>Agent</th><th>Calls</th><th>Tokens Saved</th><th>$ Saved</th></tr></thead>
+      <tbody>
+        ${d.by_agent.map(a => `
+          <tr>
+            <td>${esc(a.review_type)}</td>
+            <td>${a.calls}</td>
+            <td>${a.tokens_saved.toLocaleString()}</td>
+            <td>$${a.cost_saved_usd.toFixed(2)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : '<div class="empty-state" style="margin-top:16px">No compressed calls yet.</div>'}
+
+    ${d.by_day.length ? `
+    <div class="section-title" style="margin-top:20px">Savings by Day</div>
+    <table class="users-table">
+      <thead><tr><th>Day</th><th>Tokens Saved</th><th>$ Saved</th></tr></thead>
+      <tbody>
+        ${d.by_day.map(row => `
+          <tr>
+            <td>${esc(row.day)}</td>
+            <td>${row.tokens_saved.toLocaleString()}</td>
+            <td>$${row.cost_saved_usd.toFixed(2)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : ''}
+  `;
+}
+
+// ── Sensitive Data Detector ───────────────────────────────────────────────
+
+async function runSensitiveDataScan() {
+  const content = document.getElementById('sd-content').value.trim();
+  if (!content) { alert('Please paste content to scan.'); return; }
+  showLoading('Scanning for sensitive data… PII / PHI / PCI / Credentials');
+  try {
+    const result = await apiFetch('/api/review/sensitive-data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content,
+        context: document.getElementById('sd-context').value.trim(),
+        project_name: document.getElementById('sd-project').value.trim(),
+      }),
+    });
+    renderSensitiveDataResult('sd-result', result);
+    loadDashboard();
+  } catch (e) { showError('sd-result', e.message); }
+  finally { hideLoading(); }
+}
+
+async function uploadSensitiveDataScan() {
+  const file = document.getElementById('sd-file').files[0];
+  if (!file) return;
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('context', document.getElementById('sd-context').value.trim());
+  fd.append('project_name', document.getElementById('sd-project').value.trim());
+  showLoading(`Scanning ${file.name} for sensitive data…`);
+  try {
+    const result = await apiFetch('/api/review/sensitive-data/upload', { method: 'POST', body: fd });
+    renderSensitiveDataResult('sd-result', result);
+    loadDashboard();
+  } catch (e) { showError('sd-result', e.message); }
+  finally { hideLoading(); document.getElementById('sd-file').value = ''; }
+}
+
+function renderSensitiveDataResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const findings = r.findings || [];
+  const catCounts = { PII: r.pii_count || 0, PHI: r.phi_count || 0, PCI: r.pci_count || 0, Credential: r.credential_count || 0 };
+  const catColors = { PII: '#60a5fa', PHI: '#f87171', PCI: '#fbbf24', Credential: '#f97316', Location: '#a78bfa', Other: '#94a3b8' };
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Sensitive Data Scan ${gateStatusBadge(r.gate_status)}</h2>
+      <span class="risk-score">Risk Score: <b>${r.risk_score ?? '—'}</b>/100</span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+    <div class="sd-category-bar">
+      ${Object.entries(catCounts).map(([cat, cnt]) => `
+        <div class="sd-cat-card" style="border-color:${catColors[cat]||'#94a3b8'}">
+          <div class="sd-cat-count" style="color:${catColors[cat]||'#94a3b8'}">${cnt}</div>
+          <div class="sd-cat-label">${cat}</div>
+        </div>`).join('')}
+      <div class="sd-cat-card">
+        <div class="sd-cat-count" style="color:var(--accent)">${findings.length}</div>
+        <div class="sd-cat-label">Total</div>
+      </div>
+    </div>
+    ${findings.length ? `
+    <div class="section-title">Findings (${findings.length})</div>
+    ${findings.sort((a,b)=>(b.severity||0)-(a.severity||0)).map(f => {
+      const col = catColors[f.category] || '#94a3b8';
+      const regs = (f.regulation_refs || []).map(r => `<span class="compliance-chip">${esc(r)}</span>`).join('');
+      return `<div class="finding-card sev-${f.severity||1}">
+        <div class="finding-header">
+          <span class="sev-badge">${esc(f.risk_level||'')}</span>
+          <span style="background:rgba(0,0,0,.3);border:1px solid ${col};color:${col};border-radius:4px;padding:1px 8px;font-size:11px;font-weight:700">${esc(f.category||'')}</span>
+          <span class="control-badge">${esc(f.control_id||'N/A')}</span>
+          ${f.is_blocking ? '<span class="blocking-badge">Blocking</span>' : ''}
+          ${regs}
+        </div>
+        <div class="finding-title">${esc(f.title||'')}</div>
+        <div class="finding-desc">${esc(f.description||'')}</div>
+        ${f.location ? `<div style="font-size:11px;color:var(--text-muted);margin:4px 0">📍 Location: <code>${esc(f.location)}</code></div>` : ''}
+        ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+      </div>`;
+    }).join('')}` : '<div class="summary-box" style="color:var(--green)">✓ No sensitive data issues detected.</div>'}
+    ${r.recommendations?.length ? `<div class="section-title" style="margin-top:20px">Recommendations</div>
+    <ol class="recs-list">${r.recommendations.map(rec=>`<li>${esc(rec)}</li>`).join('')}</ol>` : ''}
+    ${r.compliance_flags?.length ? `<div class="compliance-chips" style="margin-top:12px">${r.compliance_flags.map(f=>`<span class="compliance-chip">${esc(f)}</span>`).join('')}</div>` : ''}
+  `;
+}
+
+// ── AI Code Provenance & Risk ─────────────────────────────────────────────
+
+async function runAIProvenanceScan() {
+  const code = document.getElementById('ap-code').value.trim();
+  if (!code) { alert('Please paste code or a diff to assess.'); return; }
+  showLoading('Assessing AI-origin likelihood… this is evidence, not a verdict');
+  try {
+    const result = await apiFetch('/api/review/ai-provenance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code,
+        context: document.getElementById('ap-context').value.trim(),
+        project_name: document.getElementById('ap-project').value.trim(),
+        ai_used: document.getElementById('ap-ai-used').value || null,
+        ai_tool: document.getElementById('ap-ai-tool').value.trim() || null,
+        purpose: document.getElementById('ap-purpose').value || null,
+        percent_ai_assisted: document.getElementById('ap-percent').value || null,
+        sensitive_data_shared: document.getElementById('ap-sensitive').checked,
+        prompt_stored: document.getElementById('ap-prompt-stored').checked,
+        human_review_completed: document.getElementById('ap-reviewed').checked,
+      }),
+    });
+    renderAIProvenanceResult('ap-result', result);
+    loadDashboard();
+  } catch (e) { showError('ap-result', e.message); }
+  finally { hideLoading(); }
+}
+
+function renderAIProvenanceResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const breakdown = r.score_breakdown || [];
+  const signals = r.style_signals || [];
+  const likelihoodColor = {
+    'Low': 'var(--green)', 'Possible': '#84cc16', 'Likely': 'var(--amber)', 'Strong evidence': 'var(--red)',
+  }[r.ai_origin_likelihood] || 'var(--text-muted)';
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>AI-Origin Likelihood:
+        <span style="color:${likelihoodColor}">${esc(r.ai_origin_likelihood || 'Unknown')}</span>
+      </h2>
+      <span class="risk-score">Score: <b>${r.score ?? '—'}</b>/100 · Confidence: ${esc(r.confidence || '—')}</span>
+    </div>
+
+    <div class="summary-box" style="border-left:3px solid ${likelihoodColor}">${esc(r.summary || '')}</div>
+
+    <div class="antipattern-card" style="margin-top:14px">
+      <div class="antipattern-name">Recommended Action</div>
+      <div class="antipattern-desc">${esc(r.recommended_action || '—')}</div>
+    </div>
+
+    ${r.declared_vs_observed_note ? `
+    <div class="section-title" style="margin-top:20px">Declared vs. Observed</div>
+    <div class="summary-box">${esc(r.declared_vs_observed_note)}</div>` : ''}
+
+    ${breakdown.length ? `
+    <div class="section-title" style="margin-top:20px">Score Breakdown — the evidence</div>
+    <table class="reviews-table">
+      <thead><tr><th>Factor</th><th>Points</th><th>Evidence</th></tr></thead>
+      <tbody>
+        ${breakdown.map(b => `
+          <tr>
+            <td>${esc(b.factor || '')}</td>
+            <td style="color:${(b.points||0) >= 0 ? 'var(--red)' : 'var(--green)'};font-weight:600">${b.points > 0 ? '+' : ''}${b.points ?? 0}</td>
+            <td style="color:var(--text-muted);font-size:12px">${esc(b.evidence || '')}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>` : ''}
+
+    ${signals.length ? `
+    <div class="section-title" style="margin-top:20px">Style Signals Checked</div>
+    ${signals.map(s => `
+      <div class="antipattern-card" style="opacity:${s.present ? 1 : 0.55}">
+        <div class="antipattern-name">${s.present ? '●' : '○'} ${esc((s.signal||'').replace(/_/g,' ').replace(/\b\w/g, c => c.toUpperCase()))}</div>
+        <div class="antipattern-desc">${esc(s.detail || '')}</div>
+      </div>`).join('')}` : ''}
+
+    <div class="section-title" style="margin-top:20px">Disclosure on Record</div>
+    <div class="quality-grid">
+      <div class="quality-item"><div class="quality-label"><span>AI Used</span></div><div style="margin-top:4px">${esc(r.declared_ai_use || 'Not specified')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Tool</span></div><div style="margin-top:4px">${esc(r.declared_tool || 'Not specified')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Est. % AI-Assisted</span></div><div style="margin-top:4px">${esc(r.estimated_percent_ai_assisted || 'Unknown')}</div></div>
+      <div class="quality-item"><div class="quality-label"><span>Est. AI-Generated Lines</span></div><div style="margin-top:4px">${r.estimated_ai_generated_lines ?? '—'}</div></div>
+    </div>
+
+    <p style="font-size:11px;color:var(--text-muted);margin-top:16px">
+      This is probabilistic evidence, not proof of authorship. Human-written code can be refactored by AI and
+      AI-generated code can be edited by a human — treat this as one input into your review process, alongside
+      developer disclosure and, where available, IDE/Git provenance.
+    </p>
+  `;
+}
+
+// ── 21 CFR Part 11 Verification ───────────────────────────────────────────
+
+async function runCFR21Verification() {
+  const code = document.getElementById('cfr-code').value.trim();
+  if (!code) { alert('Please paste a file to verify, or upload a .zip above.'); return; }
+  showLoading('Verifying against 21 CFR Part 11… this may take 30–60 seconds');
+  try {
+    const result = await apiFetch('/api/review/cfr21-verification', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code,
+        system_description: document.getElementById('cfr-system-desc').value.trim(),
+        project_name: document.getElementById('cfr-project').value.trim(),
+      }),
+    });
+    renderCFR21Result('cfr21-result', result);
+    loadDashboard();
+  } catch (e) { showError('cfr21-result', e.message); }
+  finally { hideLoading(); }
+}
+
+async function uploadCFR21Zip() {
+  const file = document.getElementById('cfr-zip-input').files[0];
+  if (!file) return;
+  if (!file.name.endsWith('.zip')) { alert('Only .zip files are accepted.'); return; }
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('system_description', document.getElementById('cfr-system-desc').value.trim());
+  fd.append('project_name', document.getElementById('cfr-project').value.trim());
+  showLoading(`Extracting and verifying ${file.name}… this may take 1-2 minutes for a full codebase`);
+  try {
+    const result = await apiFetch('/api/review/cfr21-verification/upload-zip', { method: 'POST', body: fd });
+    renderCFR21Result('cfr21-result', result);
+    loadDashboard();
+  } catch (e) { showError('cfr21-result', e.message); }
+  finally { hideLoading(); document.getElementById('cfr-zip-input').value = ''; }
+}
+
+function renderCFR21Result(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const findings = (r.findings || []).sort((a, b) => (b.severity || 0) - (a.severity || 0));
+  const scanned = r.files_scanned || [];
+
+  const renderAssessment = (title, a) => {
+    if (!a) return '';
+    if (a.applicable === false) {
+      return `<div class="antipattern-card"><div class="antipattern-name">${esc(title)}</div><div class="antipattern-desc">Not applicable — no signature/approval workflow found in what was scanned.</div></div>`;
+    }
+    const badge = a.compliant
+      ? '<span style="color:var(--green);font-weight:600">✓ Compliant</span>'
+      : '<span style="color:var(--red);font-weight:600">✗ Gaps found</span>';
+    return `
+      <div class="antipattern-card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span class="antipattern-name">${esc(title)}</span>${badge}
+        </div>
+        <div class="antipattern-desc">${esc(a.findings_summary || a.alcoa_plus_notes || '')}</div>
+        ${a.gaps?.length ? `<div class="antipattern-impact">⚠ Gaps: ${a.gaps.map(g => esc(g)).join('; ')}</div>` : ''}
+        ${a.strengths?.length ? `<div class="antipattern-rec">✓ Strengths: ${a.strengths.map(s => esc(s)).join('; ')}</div>` : ''}
+      </div>`;
+  };
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>21 CFR Part 11 Verification ${gateStatusBadge(r.overall_gate_status)}</h2>
+      <span class="risk-score">Risk Score: <b>${r.overall_risk_score ?? '—'}</b>/100</span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${scanned.length ? `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">Files scanned (${scanned.length}): ${scanned.map(esc).join(', ')}</p>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Assessments</div>
+    ${renderAssessment('Audit Trail (§11.10(e))', r.audit_trail_assessment)}
+    ${renderAssessment('Electronic Signatures (§11.50/70/100/200)', r.esignature_assessment)}
+    ${renderAssessment('Access Control (§11.10(d)/(g), §11.300)', r.access_control_assessment)}
+    ${renderAssessment('Data Integrity — ALCOA+ (§11.10(a)-(c))', r.data_integrity_assessment)}
+
+    ${r.validation_readiness_notes ? `
+    <div class="section-title" style="margin-top:20px">Validation Readiness (process-only — needs documentation evidence)</div>
+    <div class="summary-box">${esc(r.validation_readiness_notes)}</div>` : ''}
+
+    ${findings.length ? `
+    <div class="section-title" style="margin-top:20px">Findings (${findings.length})</div>
+    ${findings.map(f => `
+      <div class="finding-card sev-${f.severity||1}">
+        <div class="finding-header">
+          <span class="sev-badge">${esc(f.risk_level||'')}</span>
+          <span class="control-badge">${esc(f.control_id||'')}</span>
+          <span class="control-badge">${esc(f.cfr_section||'')}</span>
+          ${f.is_blocking ? '<span class="blocking-badge">Blocking</span>' : ''}
+        </div>
+        <div class="finding-title">${esc(f.title||'')}</div>
+        <div class="finding-desc">${esc(f.description||'')}</div>
+        ${f.evidence ? `<div style="font-size:11px;color:var(--text-muted);margin:4px 0">📍 Evidence: <code>${esc(f.evidence)}</code></div>` : ''}
+        ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+      </div>`).join('')}` : '<div class="summary-box" style="color:var(--green);margin-top:16px">✓ No findings.</div>'}
+
+    ${r.recommendations?.length ? `
+    <div class="section-title" style="margin-top:20px">Recommendations</div>
+    <ol class="recs-list">${r.recommendations.map(rec => `<li>${esc(rec)}</li>`).join('')}</ol>` : ''}
+
+    ${r.compliance_flags?.length ? `<div class="compliance-chips" style="margin-top:12px">${r.compliance_flags.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join('')}</div>` : ''}
+  `;
+}
+
+// ── GxP Document Check ────────────────────────────────────────────────────
+
+async function runGxPDocumentCheck() {
+  const content = document.getElementById('gxp-content').value.trim();
+  if (!content) { alert('Please paste a document, or upload files above.'); return; }
+  showLoading('Checking document against GxP requirements… this may take 30–60 seconds');
+  try {
+    const result = await apiFetch('/api/review/gxp-document-check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content,
+        document_type_hint: document.getElementById('gxp-type-hint').value.trim(),
+        project_name: document.getElementById('gxp-project').value.trim(),
+      }),
+    });
+    renderGxPDocumentResult('gxp-docs-result', result);
+    loadDashboard();
+  } catch (e) { showError('gxp-docs-result', e.message); }
+  finally { hideLoading(); }
+}
+
+async function uploadGxPDocuments() {
+  const files = document.getElementById('gxp-upload-input').files;
+  if (!files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  fd.append('document_type_hint', document.getElementById('gxp-type-hint').value.trim());
+  fd.append('project_name', document.getElementById('gxp-project').value.trim());
+  showLoading(`Extracting and checking ${files.length} document(s)…`);
+  try {
+    const result = await apiFetch('/api/review/gxp-document-check/upload', { method: 'POST', body: fd });
+    renderGxPDocumentResult('gxp-docs-result', result);
+    loadDashboard();
+  } catch (e) { showError('gxp-docs-result', e.message); }
+  finally { hideLoading(); document.getElementById('gxp-upload-input').value = ''; }
+}
+
+function renderGxPDocumentResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const elements = r.required_elements || [];
+  const findings = (r.findings || []).sort((a, b) => (b.severity || 0) - (a.severity || 0));
+
+  const renderAssessment = (title, a) => {
+    if (!a) return '';
+    const badge = a.compliant
+      ? '<span style="color:var(--green);font-weight:600">✓ Compliant</span>'
+      : '<span style="color:var(--red);font-weight:600">✗ Gaps found</span>';
+    return `
+      <div class="antipattern-card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span class="antipattern-name">${esc(title)}</span>${badge}
+        </div>
+        <div class="antipattern-desc">${esc(a.findings_summary || '')}</div>
+        ${a.gaps?.length ? `<div class="antipattern-impact">⚠ Gaps: ${a.gaps.map(g => esc(g)).join('; ')}</div>` : ''}
+        ${a.strengths?.length ? `<div class="antipattern-rec">✓ Strengths: ${a.strengths.map(s => esc(s)).join('; ')}</div>` : ''}
+      </div>`;
+  };
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>${esc(r.document_type || 'Document')} ${gateStatusBadge(r.overall_gate_status)}</h2>
+      <span class="risk-score">Completeness: <b>${r.completeness_score ?? '—'}</b>% · Risk: <b>${r.overall_risk_score ?? '—'}</b>/100</span>
+    </div>
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${elements.length ? `
+    <div class="section-title" style="margin-top:20px">Required Elements Checklist (${elements.length})</div>
+    <div class="quality-grid" style="grid-template-columns:repeat(auto-fit,minmax(240px,1fr))">
+      ${elements.map(e => `
+        <div class="quality-item">
+          <div class="quality-label">
+            <span>${e.present ? '✓' : '✗'} ${esc(e.element)}</span>
+          </div>
+          <div style="font-size:12px;color:${e.present ? 'var(--text-muted)' : 'var(--red)'};margin-top:4px">${esc(e.detail || '')}</div>
+        </div>`).join('')}
+    </div>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Assessments</div>
+    ${renderAssessment('Signature / Approval (21 CFR 11.50)', r.signature_approval_check)}
+    ${renderAssessment('Version Control', r.version_control_check)}
+    ${renderAssessment('Traceability', r.traceability_check)}
+
+    ${r.missing_sections?.length ? `
+    <div class="section-title" style="margin-top:20px">Missing Sections</div>
+    <ul class="rec-list">${r.missing_sections.map(m => `<li>${esc(m)}</li>`).join('')}</ul>` : ''}
+
+    ${findings.length ? `
+    <div class="section-title" style="margin-top:20px">Findings (${findings.length})</div>
+    ${findings.map(f => `
+      <div class="finding-card sev-${f.severity||1}">
+        <div class="finding-header">
+          <span class="sev-badge">${esc(f.risk_level||'')}</span>
+          <span class="control-badge">${esc(f.control_id||'')}</span>
+          <span class="control-badge">${esc(f.gxp_reference||'')}</span>
+          ${f.is_blocking ? '<span class="blocking-badge">Blocking</span>' : ''}
+        </div>
+        <div class="finding-title">${esc(f.title||'')}</div>
+        <div class="finding-desc">${esc(f.description||'')}</div>
+        ${f.evidence ? `<div style="font-size:11px;color:var(--text-muted);margin:4px 0">📍 Evidence: <code>${esc(f.evidence)}</code></div>` : ''}
+        ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+      </div>`).join('')}` : '<div class="summary-box" style="color:var(--green);margin-top:16px">✓ No findings.</div>'}
+
+    ${r.recommendations?.length ? `
+    <div class="section-title" style="margin-top:20px">Recommendations</div>
+    <ol class="recs-list">${r.recommendations.map(rec => `<li>${esc(rec)}</li>`).join('')}</ol>` : ''}
+
+    ${r.compliance_flags?.length ? `<div class="compliance-chips" style="margin-top:12px">${r.compliance_flags.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join('')}</div>` : ''}
+  `;
+}
+
+// ── GxP Document Generation ──────────────────────────────────────────────
+
+const _gxgState = { files: [], code: '', systemDescription: '', projectName: '', plan: null, generatedDocs: [] };
+
+async function runGxPPlan() {
+  const code = document.getElementById('gxg-code').value.trim();
+  _gxgState.code = code;
+  _gxgState.files = [];
+  _gxgState.systemDescription = document.getElementById('gxg-system-desc').value.trim();
+  _gxgState.projectName = document.getElementById('gxg-project').value.trim();
+  _gxgState.generatedDocs = [];
+  document.getElementById('gxg-documents-result').classList.add('hidden');
+
+  if (!code && !_gxgState.files.length) { alert('Paste some code, or upload a .zip above.'); return; }
+  showLoading('Classifying GxP relevance and planning the validation package…');
+  try {
+    const result = await apiFetch('/api/review/gxp-generate-plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        code,
+        system_description: _gxgState.systemDescription,
+        project_name: _gxgState.projectName,
+      }),
+    });
+    _gxgState.plan = result;
+    renderGxPPlan('gxg-plan-result', result);
+  } catch (e) { showError('gxg-plan-result', e.message); }
+  finally { hideLoading(); }
+}
+
+async function uploadGxPPlanZip() {
+  const file = document.getElementById('gxg-zip-input').files[0];
+  if (!file) return;
+  if (!file.name.endsWith('.zip')) { alert('Only .zip files are accepted.'); return; }
+  _gxgState.systemDescription = document.getElementById('gxg-system-desc').value.trim();
+  _gxgState.projectName = document.getElementById('gxg-project').value.trim();
+  _gxgState.code = '';
+  _gxgState.generatedDocs = [];
+  document.getElementById('gxg-documents-result').classList.add('hidden');
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('system_description', _gxgState.systemDescription);
+  fd.append('project_name', _gxgState.projectName);
+  showLoading(`Extracting ${file.name} and planning the validation package…`);
+  try {
+    const result = await apiFetch('/api/review/gxp-generate-plan/upload-zip', { method: 'POST', body: fd });
+    _gxgState.files = result.files_extracted || [];
+    _gxgState.plan = result;
+    renderGxPPlan('gxg-plan-result', result);
+  } catch (e) { showError('gxg-plan-result', e.message); }
+  finally { hideLoading(); document.getElementById('gxg-zip-input').value = ''; }
+}
+
+function renderGxPPlan(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const docs = r.applicable_documents || [];
+  const applicableDocs = docs.filter(d => d.applicable);
+  const classColor = { 'GxP-Critical': 'var(--red)', 'GxP-Supporting': 'var(--amber)', 'Not GxP-Relevant': 'var(--green)' }[r.gxp_classification] || 'var(--text-muted)';
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Validation Plan — <span style="color:${classColor}">${esc(r.gxp_classification || 'Unknown')}</span></h2>
+    </div>
+    <div class="summary-box">${esc(r.classification_rationale || '')}</div>
+    ${r.system_summary ? `<div class="section-title" style="margin-top:16px">System Summary</div><div class="summary-box">${esc(r.system_summary)}</div>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Documents (${applicableDocs.length} applicable of ${docs.length})</div>
+    ${docs.map(d => `
+      <div class="antipattern-card" style="opacity:${d.applicable ? 1 : 0.55}">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span class="antipattern-name">${d.applicable ? '✓' : '✗'} ${esc(d.document_type)}</span>
+          ${d.applicable ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick='generateOneGxPDocument(${JSON.stringify(d.document_type)}, ${JSON.stringify(d.outline||[])})'>Generate</button>` : ''}
+        </div>
+        <div class="antipattern-desc">${esc(d.why || '')}</div>
+        ${d.outline?.length ? `<ul class="rec-list">${d.outline.map(o => `<li>${esc(o)}</li>`).join('')}</ul>` : ''}
+      </div>`).join('')}
+
+    <div class="form-actions" style="margin-top:16px">
+      <button class="btn btn-primary" onclick="generateAllGxPDocuments()">⚙️ Generate All Applicable Documents</button>
+    </div>
+  `;
+}
+
+async function generateOneGxPDocument(documentType, outline) {
+  showLoading(`Generating ${documentType}…`);
+  try {
+    const result = await apiFetch('/api/review/gxp-generate-document', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        document_type: documentType,
+        code: _gxgState.code,
+        files: _gxgState.files,
+        outline,
+        plan_context: _gxgState.plan?.system_summary || '',
+        system_description: _gxgState.systemDescription,
+        project_name: _gxgState.projectName,
+      }),
+    });
+    _gxgState.generatedDocs = _gxgState.generatedDocs.filter(d => d.document_type !== result.document_type);
+    _gxgState.generatedDocs.push(result);
+    renderGxPGeneratedDocuments();
+  } catch (e) {
+    alert(`Failed to generate ${documentType}: ${e.message}`);
+  } finally { hideLoading(); }
+}
+
+async function generateAllGxPDocuments() {
+  if (!_gxgState.plan) return;
+  const order = _gxgState.plan.recommended_generation_order?.length
+    ? _gxgState.plan.recommended_generation_order
+    : (_gxgState.plan.applicable_documents || []).filter(d => d.applicable).map(d => d.document_type);
+  const byType = {};
+  (_gxgState.plan.applicable_documents || []).forEach(d => { byType[d.document_type] = d; });
+
+  for (const docType of order) {
+    const doc = byType[docType];
+    if (!doc || !doc.applicable) continue;
+    showLoading(`Generating ${docType}… (${_gxgState.generatedDocs.length + 1} of ${order.length})`);
+    try {
+      const result = await apiFetch('/api/review/gxp-generate-document', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          document_type: docType,
+          code: _gxgState.code,
+          files: _gxgState.files,
+          outline: doc.outline || [],
+          plan_context: _gxgState.plan?.system_summary || '',
+          system_description: _gxgState.systemDescription,
+          project_name: _gxgState.projectName,
+        }),
+      });
+      _gxgState.generatedDocs = _gxgState.generatedDocs.filter(d => d.document_type !== result.document_type);
+      _gxgState.generatedDocs.push(result);
+      renderGxPGeneratedDocuments();
+    } catch (e) {
+      console.error(`Failed to generate ${docType}:`, e.message);
+    }
+  }
+  hideLoading();
+}
+
+function _downloadTextAsFile(filename, text) {
+  const blob = new Blob([text], { type: 'text/markdown' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function downloadGxPDocument(index) {
+  const doc = _gxgState.generatedDocs[index];
+  if (!doc) return;
+  const filename = `${(doc.document_type || 'document').replace(/[^a-z0-9]+/gi, '_')}.md`;
+  _downloadTextAsFile(filename, `# ${doc.title || doc.document_type}\n\n${doc.content || ''}`);
+}
+
+function downloadGxPTestScript(docIndex, tcIndex) {
+  const doc = _gxgState.generatedDocs[docIndex];
+  const tc = doc?.test_cases?.[tcIndex];
+  if (!tc || !tc.script_content) return;
+  const filename = tc.script_path || `${(tc.test_case_id || 'test').replace(/[^a-z0-9]+/gi, '_')}.txt`;
+  _downloadTextAsFile(filename, tc.script_content);
+}
+
+function renderGxPGeneratedDocuments() {
+  const wrap = document.getElementById('gxg-documents-result');
+  wrap.classList.remove('hidden');
+  const docs = _gxgState.generatedDocs;
+
+  wrap.innerHTML = `
+    <div class="result-header"><h2>Generated Documents (${docs.length})</h2></div>
+    ${docs.map((doc, i) => {
+      const testCases = doc.test_cases || [];
+      const automatable = testCases.filter(t => t.automatable);
+      return `
+      <details style="margin-bottom:12px" ${i === docs.length - 1 ? 'open' : ''}>
+        <summary style="cursor:pointer;font-size:14px;font-weight:600;color:var(--accent)">${esc(doc.title || doc.document_type)}${testCases.length ? ` <span style="color:var(--text-muted);font-size:12px;font-weight:400">(${automatable.length}/${testCases.length} test cases scripted)</span>` : ''}</summary>
+        <div style="margin-top:10px">
+          <div class="summary-box">${esc(doc.summary || '')}</div>
+          ${doc.open_items?.length ? `
+          <div class="section-title" style="margin-top:12px">⚠ Open Items (needs human input)</div>
+          <ul class="rec-list">${doc.open_items.map(o => `<li>${esc(o)}</li>`).join('')}</ul>` : ''}
+          ${doc.traceability_refs?.length ? `
+          <div class="section-title" style="margin-top:12px">Traceability</div>
+          <ul class="rec-list">${doc.traceability_refs.map(t => `<li>${esc(t)}</li>`).join('')}</ul>` : ''}
+          ${doc.included_controls?.length ? `<div class="compliance-chips" style="margin-top:8px">${doc.included_controls.map(c => `<span class="compliance-chip">${esc(c)}</span>`).join('')}</div>` : ''}
+
+          ${testCases.length ? `
+          <div class="section-title" style="margin-top:16px">Test Cases (${testCases.length})</div>
+          <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">Scripts still require a human to run them and witness the result — that's validation evidence, not this file.</p>
+          ${testCases.map((tc, ti) => `
+            <div class="antipattern-card">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <span class="antipattern-name">${esc(tc.test_case_id || '')} — ${esc(tc.objective || '')}</span>
+                ${tc.automatable
+                  ? '<span style="color:var(--green);font-weight:600;font-size:12px">✓ Scripted</span>'
+                  : '<span style="color:var(--amber);font-weight:600;font-size:12px">Manual only</span>'}
+              </div>
+              <div class="antipattern-desc">Verifies: ${esc(tc.requirement_ref || '—')}</div>
+              ${!tc.automatable && tc.why_not_automatable ? `<div class="antipattern-impact">⚠ ${esc(tc.why_not_automatable)}</div>` : ''}
+              ${tc.automatable && tc.script_content ? `
+              <details style="margin-top:8px">
+                <summary style="cursor:pointer;font-family:monospace;font-size:12px;color:var(--accent)">${esc(tc.script_path || 'script')} (${esc(tc.script_framework || '')})</summary>
+                <pre class="api-usage-code" style="margin-top:6px">${esc(tc.script_content)}</pre>
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px" onclick="downloadGxPTestScript(${i},${ti})">⬇ Download script</button>
+              </details>` : ''}
+            </div>`).join('')}` : ''}
+
+          <div class="form-actions" style="margin-top:10px">
+            <button class="btn btn-secondary" onclick="downloadGxPDocument(${i})">⬇ Download .md</button>
+          </div>
+          <details style="margin-top:10px">
+            <summary style="cursor:pointer;font-size:12px;color:var(--text-muted)">View full document text</summary>
+            <pre class="api-usage-code" style="margin-top:10px;white-space:pre-wrap">${esc(doc.content || '')}</pre>
+          </details>
+        </div>
+      </details>`;
+    }).join('')}
+  `;
+}
+
+// ── Agent Hub ─────────────────────────────────────────────────────────────
+
+const AGENT_DEFS = [
+  { name:'requirement', icon:'📋', title:'Requirement Reviewer', desc:'Reviews user stories, BRDs, FRDs for risk, ambiguity, and compliance gaps', sources:['jira','github','text'] },
+  { name:'code',        icon:'💻', title:'Code Reviewer',        desc:'Security scan of code, PRs, diffs — OWASP, secrets, injection, PHI exposure', sources:['github','text'] },
+  { name:'prompt',      icon:'🤖', title:'Prompt Safety',        desc:'Scans system prompts, tool definitions, RAG configs for AI safety risks', sources:['github','text'] },
+  { name:'vapt',        icon:'🛡️', title:'VAPT Assessment',      desc:'Full vulnerability assessment with CVSS scoring and OWASP mapping', sources:['github','text'] },
+  { name:'security',    icon:'🔐', title:'Security Review',      desc:'STRIDE threat model, trust boundaries, attack surface analysis', sources:['github','jira','text'] },
+  { name:'architecture',icon:'🏗️', title:'Architecture Review',  desc:'Quality scores, anti-patterns, SPOFs, and alternative recommendations', sources:['github','jira','text'] },
+  { name:'compliance',  icon:'📜', title:'Compliance Mapper',    desc:'Maps artifacts to NIST, OWASP, HIPAA, GDPR, ISO27001, GxP controls', sources:['jira','text'] },
+  { name:'full',        icon:'🚀', title:'Full SDLC Review',     desc:'All agents in one pass — requirement, code, compliance, release gate', sources:['github','jira','text'] },
+];
+
+let _hubActive = null;
+
+async function loadAgentHub() {
+  const statusEl = document.getElementById('agent-hub-status');
+  try {
+    const info = await apiFetch('/api/agents/info');
+    const gh = info.github_configured ? '<span style="color:var(--green)">✓ GitHub</span>' : '<span style="color:var(--text-muted)">✗ GitHub (add GITHUB_TOKEN)</span>';
+    const jr = info.jira_configured ? '<span style="color:var(--green)">✓ Jira</span>' : '<span style="color:var(--text-muted)">✗ Jira (add JIRA_URL/EMAIL/TOKEN)</span>';
+    const ai = info.anthropic_configured ? '<span style="color:var(--green)">✓ Anthropic API</span>' : '<span style="color:var(--red)">✗ Anthropic API key missing</span>';
+    statusEl.innerHTML = `Connections: ${ai} &nbsp;|&nbsp; ${gh} &nbsp;|&nbsp; ${jr}`;
+  } catch { statusEl.innerHTML = 'Could not fetch connection status.'; }
+
+  const grid = document.getElementById('agent-cards');
+  grid.innerHTML = AGENT_DEFS.map(a => `
+    <div class="agent-card" id="agent-card-${a.name}">
+      <div class="agent-card-header" onclick="toggleHubPanel('${a.name}')">
+        <span class="agent-icon">${a.icon}</span>
+        <div class="agent-meta">
+          <div class="agent-name">${esc(a.title)}</div>
+          <div class="agent-desc">${esc(a.desc)}</div>
+        </div>
+        <div class="agent-sources">
+          ${a.sources.includes('github') ? '<span class="source-tag github">GitHub</span>' : ''}
+          ${a.sources.includes('jira')   ? '<span class="source-tag jira">Jira</span>' : ''}
+          ${a.sources.includes('text')   ? '<span class="source-tag text">Text</span>' : ''}
+        </div>
+      </div>
+      <div class="hub-panel hidden" id="hub-panel-${a.name}">
+        <div class="hub-source-tabs">
+          ${a.sources.includes('github') ? `<button class="hub-tab active" onclick="setHubSource('${a.name}','github',this)">GitHub URL</button>` : ''}
+          ${a.sources.includes('jira')   ? `<button class="hub-tab ${!a.sources.includes('github')?'active':''}" onclick="setHubSource('${a.name}','jira',this)">Jira Ticket</button>` : ''}
+          ${a.sources.includes('text')   ? `<button class="hub-tab ${a.sources.length===1?'active':''}" onclick="setHubSource('${a.name}','text',this)">Text</button>` : ''}
+        </div>
+        <div class="hub-source-hint" id="hub-hint-${a.name}"></div>
+        <textarea class="hub-ref-input" id="hub-ref-${a.name}" rows="3"
+          placeholder="GitHub PR/issue/file/repo URL, Jira ticket ID, or paste content…"></textarea>
+        <div class="form-row" style="gap:8px;margin-top:8px">
+          <div class="form-group flex1" style="margin:0">
+            <input type="text" id="hub-project-${a.name}" placeholder="Project name (optional)" style="width:100%" />
+          </div>
+          <div class="form-group" style="margin:0;display:flex;align-items:center;gap:6px;flex-shrink:0">
+            <input type="checkbox" id="hub-postback-${a.name}" />
+            <label for="hub-postback-${a.name}" style="font-size:12px;color:var(--text-muted);white-space:nowrap">Post results back</label>
+          </div>
+        </div>
+        <button class="btn btn-primary" style="margin-top:10px;width:100%" onclick="runHubAgent('${a.name}')">
+          ${a.icon} Run ${esc(a.title)}
+        </button>
+        <div id="hub-result-${a.name}" class="hub-agent-result hidden"></div>
+      </div>
+    </div>`).join('');
+
+  // Set initial source hints
+  AGENT_DEFS.forEach(a => {
+    const src = a.sources[0];
+    setHubSourceHint(a.name, src);
+  });
+}
+
+function toggleHubPanel(name) {
+  if (_hubActive && _hubActive !== name) {
+    document.getElementById('hub-panel-' + _hubActive).classList.add('hidden');
+  }
+  const panel = document.getElementById('hub-panel-' + name);
+  panel.classList.toggle('hidden');
+  _hubActive = panel.classList.contains('hidden') ? null : name;
+}
+
+function setHubSource(name, source, btn) {
+  document.querySelectorAll(`#hub-panel-${name} .hub-tab`).forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('hub-panel-' + name).dataset.source = source;
+  setHubSourceHint(name, source);
+}
+
+function setHubSourceHint(name, source) {
+  const el = document.getElementById('hub-hint-' + name);
+  if (!el) return;
+  const hints = {
+    github: 'e.g. https://github.com/owner/repo/pull/123 &nbsp;|&nbsp; /issues/45 &nbsp;|&nbsp; /blob/main/file.py &nbsp;|&nbsp; /owner/repo',
+    jira: 'e.g. PROJ-123 &nbsp;or&nbsp; https://company.atlassian.net/browse/PROJ-123',
+    text: 'Paste code, architecture description, requirement text, or any artifact…',
+  };
+  el.innerHTML = hints[source] || '';
+  const ta = document.getElementById('hub-ref-' + name);
+  if (ta) ta.rows = source === 'text' ? 6 : 2;
+}
+
+async function runHubAgent(name) {
+  const panel = document.getElementById('hub-panel-' + name);
+  const source = panel.dataset.source || AGENT_DEFS.find(a => a.name === name)?.sources[0] || 'text';
+  const ref = document.getElementById('hub-ref-' + name).value.trim();
+  if (!ref) { alert('Please enter a GitHub URL, Jira ticket ID, or content.'); return; }
+  const project_name = document.getElementById('hub-project-' + name).value.trim();
+  const post_back = document.getElementById('hub-postback-' + name).checked;
+  const resultEl = document.getElementById('hub-result-' + name);
+  resultEl.innerHTML = '<div class="empty-state">Running…</div>';
+  resultEl.classList.remove('hidden');
+  try {
+    const result = await apiFetch(`/api/agents/${name}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, ref, project_name, post_back }),
+    });
+    const review = result.findings ? result : (result.review_result || result);
+    let html = '';
+    if (result.source) {
+      const s = result.source;
+      html += `<div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">
+        Source: <strong>${esc(s.type||s.fetch_type||'')}</strong> — ${esc(s.title||s.ref||'')}
+        ${result.post_back_status && result.post_back_status !== 'not_requested'
+          ? ` &nbsp;| Post-back: <span style="color:${result.post_back_status==='posted'?'var(--green)':'var(--red)'}">${esc(result.post_back_status)}</span>`
+          : ''}
+      </div>`;
+    }
+    if (review.gate_status) {
+      resultEl.innerHTML = html;
+      const inner = document.createElement('div');
+      inner.id = '_hub_inner_' + name;
+      resultEl.appendChild(inner);
+      renderResult('_hub_inner_' + name, review, false);
+    } else {
+      resultEl.innerHTML = html + `<pre style="font-size:12px;color:var(--text-muted);white-space:pre-wrap">${esc(JSON.stringify(result, null, 2))}</pre>`;
+    }
+    loadDashboard();
+    refreshApprovalBadge();
+  } catch (e) {
+    resultEl.innerHTML = `<div class="summary-box" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+// ── AI Inventory ──────────────────────────────────────────────────────────
+
+async function loadInventory() {
+  const wrap = document.getElementById('inventory-list');
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const [data, stats] = await Promise.all([
+      apiFetch('/api/inventory'),
+      apiFetch('/api/inventory/stats'),
+    ]);
+    renderInventoryStats(stats);
+    const systems = data.systems || [];
+    if (!systems.length) {
+      wrap.innerHTML = '<div class="empty-state">No AI systems registered yet. Click "Register AI System" to add one.</div>';
+      return;
+    }
+    const RISK_COLORS = { Critical:'#f87171', High:'#f97316', Medium:'#fbbf24', Low:'#4ade80' };
+    const STATUS_COLORS = { Production:'#22c55e', Testing:'#f59e0b', Development:'#60a5fa', Planning:'#a78bfa', Decommissioned:'#94a3b8' };
+    const rows = systems.map(s => `
+      <tr>
+        <td><strong>${esc(s.name)}</strong></td>
+        <td style="font-size:12px;color:var(--text-muted);max-width:220px">${esc((s.description||'').slice(0,80))}${s.description?.length>80?'…':''}</td>
+        <td style="font-size:12px">${esc(s.use_case_type||'—')}</td>
+        <td><span style="border-radius:10px;padding:2px 8px;font-size:11px;font-weight:700;background:rgba(0,0,0,.3);color:${RISK_COLORS[s.risk_level]||'#94a3b8'}">${esc(s.risk_level)}</span></td>
+        <td><span style="border-radius:10px;padding:2px 8px;font-size:11px;font-weight:700;background:rgba(0,0,0,.3);color:${STATUS_COLORS[s.status]||'#94a3b8'}">${esc(s.status)}</span></td>
+        <td style="font-size:12px;color:var(--text-muted)">${esc(s.model_name||'—')}</td>
+        <td style="font-size:12px;color:var(--text-muted)">${esc(s.owner||'—')}</td>
+        <td style="font-size:12px;color:var(--text-muted)">${esc(s.data_classification||'—')}</td>
+        <td style="font-size:12px;color:var(--text-muted);white-space:nowrap">${(s.created_at||'').slice(0,10)}</td>
+      </tr>`).join('');
+    wrap.innerHTML = `
+      <table class="users-table">
+        <thead><tr>
+          <th>Name</th><th>Description</th><th>Use Case</th><th>Risk</th>
+          <th>Status</th><th>Model</th><th>Owner</th><th>Data Class</th><th>Registered</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderInventoryStats(stats) {
+  const el = document.getElementById('inventory-stats');
+  if (!el) return;
+  const risk = stats.by_risk || {};
+  const status = stats.by_status || {};
+  el.innerHTML = `
+    <div class="inventory-stat-bar">
+      <div class="inv-stat"><span class="inv-stat-num">${stats.total||0}</span><span>Total Systems</span></div>
+      <div class="inv-stat"><span class="inv-stat-num" style="color:#f87171">${risk.Critical||0}</span><span>Critical Risk</span></div>
+      <div class="inv-stat"><span class="inv-stat-num" style="color:#f97316">${risk.High||0}</span><span>High Risk</span></div>
+      <div class="inv-stat"><span class="inv-stat-num" style="color:#22c55e">${status.Production||0}</span><span>In Production</span></div>
+      <div class="inv-stat"><span class="inv-stat-num" style="color:#60a5fa">${status.Development||0}</span><span>In Development</span></div>
+    </div>`;
+}
+
+function openRegisterSystem() {
+  document.getElementById('register-system-panel').classList.remove('hidden');
+  document.getElementById('inv-name').focus();
+}
+
+function closeRegisterSystem() {
+  document.getElementById('register-system-panel').classList.add('hidden');
+  ['inv-name','inv-desc','inv-model','inv-provider','inv-owner','inv-team','inv-data-class','inv-compliance','inv-jira','inv-github']
+    .forEach(id => { const el = document.getElementById(id); if(el) el.value = ''; });
+}
+
+async function registerSystem() {
+  const name = document.getElementById('inv-name').value.trim();
+  const description = document.getElementById('inv-desc').value.trim();
+  if (!name || !description) { alert('Name and description are required.'); return; }
+  try {
+    await apiFetch('/api/inventory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name, description,
+        use_case_type:        document.getElementById('inv-type').value,
+        risk_level:           document.getElementById('inv-risk').value,
+        status:               document.getElementById('inv-status').value,
+        model_name:           document.getElementById('inv-model').value.trim(),
+        model_provider:       document.getElementById('inv-provider').value.trim(),
+        owner:                document.getElementById('inv-owner').value.trim(),
+        team:                 document.getElementById('inv-team').value.trim(),
+        data_classification:  document.getElementById('inv-data-class').value.trim(),
+        compliance_frameworks:document.getElementById('inv-compliance').value.trim(),
+        jira_project:         document.getElementById('inv-jira').value.trim(),
+        github_repo:          document.getElementById('inv-github').value.trim(),
+      }),
+    });
+    closeRegisterSystem();
+    loadInventory();
+    alert(`✓ AI system "${name}" registered.`);
+  } catch (e) { alert('Registration failed: ' + e.message); }
+}
+
+// ── API Keys ──────────────────────────────────────────────────────────────
+
+async function loadApiKeys() {
+  const wrap = document.getElementById('api-keys-list');
+  if (!wrap) return;
+  const createBtn = document.getElementById('create-key-btn');
+  if (createBtn) createBtn.style.display = isSuperAdmin() ? '' : 'none';
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const data = await apiFetch('/api/v1/keys', { _silent: true });
+    const keys = data.keys || [];
+    if (!keys.length) {
+      wrap.innerHTML = `<div class="empty-state">No API keys yet.${isSuperAdmin() ? ' Click "Create API Key" to issue one.' : ' Ask a super admin to create one for your project.'}</div>`;
+      return;
+    }
+    wrap.innerHTML = `
+      <table class="users-table">
+        <thead><tr>
+          <th>Prefix</th><th>Project</th><th>Description</th>
+          <th>Scopes</th><th>Status</th><th>Rate Limit</th><th>Budget</th><th>Usage</th><th>LLM</th><th>Last Used</th><th>Created</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${keys.map(k => `
+            <tr>
+              <td><code style="font-size:12px;color:var(--accent)">${esc(k.prefix)}…</code></td>
+              <td><strong>${esc(k.project_name_resolved || k.team_name)}</strong>${k.project_name_resolved && k.team_name !== k.project_name_resolved ? `<div style="font-size:11px;color:var(--text-muted)">${esc(k.team_name)}</div>` : ''}</td>
+              <td style="font-size:12px;color:var(--text-muted)">${esc(k.description||'—')}</td>
+              <td><span class="role-badge role-reviewer">${esc(k.scopes||'all')}</span></td>
+              <td><span class="${k.is_active ? 'user-status-active' : 'user-status-inactive'}">${k.is_active ? 'Active' : 'Revoked'}</span></td>
+              <td style="font-size:12px;color:var(--text-muted)">${k.rate_limit_per_minute||60}/min · ${k.rate_limit_per_day||2000}/day</td>
+              <td style="font-size:12px;color:var(--text-muted)">${k.monthly_budget_usd != null ? `$${Number(k.budget_used_usd||0).toFixed(2)} / $${Number(k.monthly_budget_usd).toFixed(2)}` : 'Unlimited'}</td>
+              <td style="font-size:12px;color:var(--text-muted)">${k.calls_today||0} today (${k.calls_last_minute||0}/min now) · ${k.usage_count||0} total</td>
+              <td style="font-size:12px;color:var(--text-muted)">${k.llm_configured ? `Own: ${esc(k.llm_provider||'')}${k.llm_model ? ' / ' + esc(k.llm_model) : ''}` : 'Platform default'}</td>
+              <td style="font-size:12px;color:var(--text-muted)">${(k.last_used_at||'Never').slice(0,16).replace('T',' ')}</td>
+              <td style="font-size:12px;color:var(--text-muted)">${(k.created_at||'').slice(0,10)}</td>
+              <td>
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="editApiKeyLimits('${esc(k.id)}','${esc(k.team_name)}',${k.rate_limit_per_minute||60},${k.rate_limit_per_day||2000})">Edit limits</button>
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="editApiKeyBudget('${esc(k.id)}','${esc(k.team_name)}',${k.monthly_budget_usd != null ? k.monthly_budget_usd : 'null'})">Edit budget</button>
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="openLlmConfigModal('${esc(k.id)}','${esc(k.team_name)}')">Manage LLM</button>
+                ${k.is_active ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="revokeApiKey('${esc(k.id)}','${esc(k.team_name)}')">Revoke</button>` : ''}
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function openCreateKey() {
+  const select = document.getElementById('key-project');
+  select.innerHTML = '<option value="">Loading projects…</option>';
+  document.getElementById('create-key-panel').classList.remove('hidden');
+  document.getElementById('key-reveal-panel').classList.add('hidden');
+  try {
+    const data = await apiFetch('/api/v1/projects');
+    const projects = (data.projects || []).filter(p => p.is_active);
+    select.innerHTML = projects.length
+      ? projects.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')
+      : '<option value="">No projects yet — create one first</option>';
+  } catch (e) {
+    select.innerHTML = '<option value="">Could not load projects</option>';
+  }
+}
+
+function closeCreateKey() {
+  document.getElementById('create-key-panel').classList.add('hidden');
+  document.getElementById('key-team').value = '';
+  document.getElementById('key-desc').value = '';
+  document.getElementById('key-limit-minute').value = '60';
+  document.getElementById('key-limit-day').value = '2000';
+  document.getElementById('key-budget').value = '';
+  document.getElementById('key-scopes').value = '';
+}
+
+async function createApiKey() {
+  const projectId = document.getElementById('key-project').value;
+  if (!projectId) { alert('Select a project — create one from the Projects page if none exist yet.'); return; }
+  const budgetRaw = document.getElementById('key-budget').value.trim();
+  const scopesRaw = document.getElementById('key-scopes').value.trim();
+  try {
+    const data = await apiFetch('/api/v1/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        project_id: projectId,
+        team_name: document.getElementById('key-team').value.trim() || null,
+        description: document.getElementById('key-desc').value.trim(),
+        rate_limit_per_minute: parseInt(document.getElementById('key-limit-minute').value, 10) || 60,
+        rate_limit_per_day: parseInt(document.getElementById('key-limit-day').value, 10) || 2000,
+        monthly_budget_usd: budgetRaw ? parseFloat(budgetRaw) : null,
+        scopes: scopesRaw || 'all',
+      }),
+    });
+    closeCreateKey();
+    const raw = data.key?.raw_key || '';
+    document.getElementById('key-reveal-value').textContent = raw;
+    document.getElementById('key-reveal-panel').classList.remove('hidden');
+    loadApiKeys();
+  } catch (e) { alert('Failed to create key: ' + e.message); }
+}
+
+async function editApiKeyLimits(id, team, currentMinute, currentDay) {
+  const perMinute = prompt(`Requests per minute for "${team}":`, currentMinute);
+  if (perMinute === null) return;
+  const perDay = prompt(`Requests per day for "${team}":`, currentDay);
+  if (perDay === null) return;
+  const minuteNum = parseInt(perMinute, 10);
+  const dayNum = parseInt(perDay, 10);
+  if (!Number.isFinite(minuteNum) || minuteNum < 1 || !Number.isFinite(dayNum) || dayNum < 1) {
+    alert('Enter valid positive numbers for both limits.');
+    return;
+  }
+  try {
+    await apiFetch(`/api/v1/keys/${id}/limits`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rate_limit_per_minute: minuteNum, rate_limit_per_day: dayNum }),
+    });
+    loadApiKeys();
+  } catch (e) { alert('Failed to update limits: ' + e.message); }
+}
+
+async function editApiKeyBudget(id, team, currentBudget) {
+  const input = prompt(
+    `Monthly budget cap (USD) for "${team}" — leave blank for unlimited:`,
+    currentBudget != null ? String(currentBudget) : ''
+  );
+  if (input === null) return;
+  const trimmed = input.trim();
+  const value = trimmed ? parseFloat(trimmed) : null;
+  if (trimmed && (!Number.isFinite(value) || value < 0)) {
+    alert('Enter a valid non-negative number, or leave blank for unlimited.');
+    return;
+  }
+  try {
+    await apiFetch(`/api/v1/keys/${id}/budget`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ monthly_budget_usd: value }),
+    });
+    loadApiKeys();
+  } catch (e) { alert('Failed to update budget: ' + e.message); }
+}
+
+function copyKey() {
+  const val = document.getElementById('key-reveal-value').textContent;
+  navigator.clipboard.writeText(val).then(() => {
+    const btn = document.querySelector('.btn-copy');
+    if (btn) { btn.textContent = '✓'; setTimeout(() => btn.textContent = '📋', 1500); }
+  });
+}
+
+function dismissKeyReveal() {
+  document.getElementById('key-reveal-panel').classList.add('hidden');
+}
+
+async function revokeApiKey(id, team) {
+  if (!confirm(`Revoke key for "${team}"? All requests using this key will immediately fail.`)) return;
+  try {
+    await apiFetch(`/api/v1/keys/${id}`, { method: 'DELETE' });
+    loadApiKeys();
+  } catch (e) { alert('Failed to revoke: ' + e.message); }
+}
+
+// ── Bring Your Own LLM (per API key) ────────────────────────────────────────
+
+const LLM_AGENT_LABELS = {
+  'requirement': 'Requirement Review', 'code': 'Code Review', 'prompt': 'Prompt Safety',
+  'compliance': 'Compliance Mapper', 'vapt': 'VAPT', 'security': 'Security Review',
+  'architecture': 'Architecture Review', 'sensitive-data': 'Sensitive Data',
+  'release-gate': 'Release Gate', 'full': 'Full SDLC Review',
+  'codegen-advisory': 'Codegen Advisory', 'codegen-scaffold': 'Codegen Scaffold',
+};
+
+let _llmConfigKeyId = null;
+
+function openLlmConfigModal(id, team) {
+  _llmConfigKeyId = id;
+  document.getElementById('llm-config-team-label').textContent = team;
+  const agentSelect = document.getElementById('llm-agent-name');
+  agentSelect.innerHTML = Object.entries(LLM_AGENT_LABELS)
+    .map(([name, label]) => `<option value="${name}">${esc(label)}</option>`).join('');
+  document.getElementById('llm-global-provider').value = 'anthropic';
+  document.getElementById('llm-global-model').value = '';
+  document.getElementById('llm-global-apikey').value = '';
+  document.getElementById('llm-global-baseurl').value = '';
+  document.getElementById('llm-agent-provider').value = 'anthropic';
+  document.getElementById('llm-agent-apikey').value = '';
+  document.getElementById('llm-agent-model').value = '';
+  document.getElementById('llm-agent-baseurl').value = '';
+  document.getElementById('llm-config-modal').classList.remove('hidden');
+  loadLlmConfigStatus();
+}
+
+function closeLlmConfigModal() {
+  document.getElementById('llm-config-modal').classList.add('hidden');
+  _llmConfigKeyId = null;
+}
+
+async function loadLlmConfigStatus() {
+  const statusEl = document.getElementById('llm-config-global-status');
+  const listEl = document.getElementById('llm-agent-overrides-list');
+  statusEl.textContent = 'Loading…';
+  try {
+    const data = await apiFetch(`/api/v1/keys/${_llmConfigKeyId}/llm-config/agents`);
+    const g = data.global_default || {};
+    statusEl.innerHTML = g.configured
+      ? `<span style="color:var(--green)">Custom:</span> ${esc(g.provider||'')}${g.model ? ' / ' + esc(g.model) : ''}${g.base_url ? ` (${esc(g.base_url)})` : ''}`
+      : 'Platform default (no BYOL configured for this key)';
+
+    const configured = (data.agents || []).filter(a => a.configured);
+    listEl.innerHTML = configured.length
+      ? `<div class="section-title" style="margin-top:0">Active Per-Agent Overrides</div>` +
+        configured.map(a => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px">
+            <span><strong>${esc(LLM_AGENT_LABELS[a.agent_name] || a.agent_name)}</strong> — ${esc(a.provider||'')}${a.model ? ' / ' + esc(a.model) : ''}</span>
+            <button class="btn btn-secondary" style="font-size:11px;padding:2px 8px" onclick="clearAgentLlmConfig('${esc(a.agent_name)}')">Clear</button>
+          </div>`).join('')
+      : '<div style="font-size:12px;color:var(--text-muted)">No per-agent overrides set.</div>';
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message;
+  }
+}
+
+async function saveGlobalLlmConfig() {
+  const apiKey = document.getElementById('llm-global-apikey').value.trim();
+  if (!apiKey) { alert('API key is required.'); return; }
+  try {
+    await apiFetch(`/api/v1/keys/${_llmConfigKeyId}/llm-config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: document.getElementById('llm-global-provider').value,
+        api_key: apiKey,
+        base_url: document.getElementById('llm-global-baseurl').value.trim() || null,
+        model: document.getElementById('llm-global-model').value.trim() || null,
+      }),
+    });
+    document.getElementById('llm-global-apikey').value = '';
+    loadLlmConfigStatus();
+    loadApiKeys();
+  } catch (e) { alert('Failed to save: ' + e.message); }
+}
+
+async function clearGlobalLlmConfig() {
+  if (!confirm('Revert this key to the platform default LLM?')) return;
+  try {
+    await apiFetch(`/api/v1/keys/${_llmConfigKeyId}/llm-config`, { method: 'DELETE' });
+    loadLlmConfigStatus();
+    loadApiKeys();
+  } catch (e) { alert('Failed to clear: ' + e.message); }
+}
+
+async function saveAgentLlmConfig() {
+  const agentName = document.getElementById('llm-agent-name').value;
+  const apiKey = document.getElementById('llm-agent-apikey').value.trim();
+  if (!apiKey) { alert('API key is required.'); return; }
+  try {
+    await apiFetch(`/api/v1/keys/${_llmConfigKeyId}/llm-config/agents/${agentName}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: document.getElementById('llm-agent-provider').value,
+        api_key: apiKey,
+        base_url: document.getElementById('llm-agent-baseurl').value.trim() || null,
+        model: document.getElementById('llm-agent-model').value.trim() || null,
+      }),
+    });
+    document.getElementById('llm-agent-apikey').value = '';
+    loadLlmConfigStatus();
+  } catch (e) { alert('Failed to save: ' + e.message); }
+}
+
+async function clearAgentLlmConfig(agentName) {
+  try {
+    await apiFetch(`/api/v1/keys/${_llmConfigKeyId}/llm-config/agents/${agentName}`, { method: 'DELETE' });
+    loadLlmConfigStatus();
+  } catch (e) { alert('Failed to clear: ' + e.message); }
+}
+
+// ── Bug fixes: missing helpers used by existing render functions ──────────
+
+function gateStatusBadge(status) {
+  const icon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[status] || '❓';
+  return `<span class="gate-badge gate-${status || ''}">${icon} ${esc(status || 'Unknown')}</span>`;
+}
+
+function renderFindingCard(f) { return renderFinding(f); }
+
+// ── Approvals Page ────────────────────────────────────────────────────────
+
+let _approvalFilter = 'pending';
+
+async function loadApprovals(status) {
+  _approvalFilter = status || null;
+  const wrap = document.getElementById('approvals-list');
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const qs = status ? `?status=${status}` : '';
+    const data = await apiFetch('/api/approvals' + qs);
+    const items = data.approvals || [];
+    if (!items.length) {
+      wrap.innerHTML = `<div class="empty-state">No ${status || ''} approval requests.</div>`;
+      return;
+    }
+    wrap.innerHTML = items.map(a => renderApprovalCard(a)).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red);">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function filterApprovals(status, btn) {
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadApprovals(status);
+}
+
+function renderApprovalCard(a) {
+  const statusCls = a.status || 'pending';
+  const priCls = a.priority || 'normal';
+  const gateIcon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[a.review_gate] || '❓';
+  const dateStr = (a.created_at || '').slice(0, 16).replace('T', ' ');
+  const pendingActions = a.status === 'pending' ? `
+    <textarea class="approval-comment-input" id="comment-${a.id}" placeholder="Decision comment (optional)…" rows="2"></textarea>
+    <div class="approval-actions">
+      <button class="btn-approve" onclick="approveItem('${a.id}')">✓ Approve</button>
+      <button class="btn-reject" onclick="rejectItem('${a.id}')">✗ Reject</button>
+    </div>` : `
+    <div class="approval-decision-info">
+      ${a.status === 'approved' ? '✓' : '✗'} <strong>${esc(a.decision_by || '—')}</strong>
+      on ${(a.decision_at || '').slice(0, 16).replace('T', ' ')}
+      ${a.decision_comment ? ` — "${esc(a.decision_comment)}"` : ''}
+    </div>`;
+
+  return `
+    <div class="approval-card priority-${priCls} status-${statusCls}">
+      <div class="approval-card-header">
+        <div class="approval-card-meta">
+          <div class="approval-project-name">${esc(a.project_name || 'Unnamed Project')}</div>
+          <div class="approval-sub-meta">
+            Review ID: ${(a.review_id || '').slice(0, 8)}… · Requested by: ${esc(a.requested_by || 'system')} · ${dateStr}
+          </div>
+        </div>
+        <span class="approval-status-badge ${statusCls}">${statusCls}</span>
+        <span class="approval-priority-badge ${priCls}">${priCls}</span>
+      </div>
+      <div class="approval-review-info">
+        <span>${gateIcon} Gate: <strong>${esc(a.review_gate || '—')}</strong></span>
+        <span>Type: <strong>${esc(a.review_type || '—')}</strong></span>
+        <span>Risk: <strong>${a.risk_score ?? '—'}/100</strong></span>
+        <span>Findings: <strong>${a.findings_count ?? 0}</strong> (${a.critical_count ?? 0} critical)</span>
+      </div>
+      ${pendingActions}
+    </div>`;
+}
+
+async function approveItem(id) {
+  const comment = (document.getElementById('comment-' + id) || {}).value || '';
+  try {
+    await apiFetch(`/api/approvals/${id}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment }),
+    });
+    loadApprovals(_approvalFilter);
+    refreshApprovalBadge();
+  } catch (e) { alert('Approve failed: ' + e.message); }
+}
+
+async function rejectItem(id) {
+  const comment = (document.getElementById('comment-' + id) || {}).value || '';
+  if (!comment.trim()) { alert('Please provide a rejection reason.'); return; }
+  try {
+    await apiFetch(`/api/approvals/${id}/reject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ comment }),
+    });
+    loadApprovals(_approvalFilter);
+    refreshApprovalBadge();
+  } catch (e) { alert('Reject failed: ' + e.message); }
+}
+
+// ── Audit Trail Page ──────────────────────────────────────────────────────
+
+async function loadAuditTrail() {
+  const wrap = document.getElementById('audit-list');
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  const actor = (document.getElementById('audit-actor') || {}).value || '';
+  const eventType = (document.getElementById('audit-event-type') || {}).value || '';
+  const qs = new URLSearchParams({ limit: 100 });
+  if (actor) qs.set('actor', actor);
+  if (eventType) qs.set('event_type', eventType);
+  try {
+    const data = await apiFetch('/api/audit?' + qs);
+    const events = data.events || [];
+    if (!events.length) { wrap.innerHTML = '<div class="empty-state">No audit events found.</div>'; return; }
+    const rows = events.map(e => `
+      <tr>
+        <td><span class="audit-event-badge">${esc(e.event_type || '')}</span></td>
+        <td><span class="audit-actor">${esc(e.actor || 'system')}</span></td>
+        <td style="color:var(--text-muted)">${esc(e.entity_type || '')} <code style="font-size:11px">${esc((e.entity_id || '').slice(0, 8))}</code></td>
+        <td style="color:var(--text-muted);font-size:12px">${esc(e.details || '')}</td>
+        <td style="color:var(--text-muted);white-space:nowrap;font-size:12px">${(e.created_at || '').slice(0, 16).replace('T', ' ')}</td>
+      </tr>`).join('');
+    wrap.innerHTML = `
+      <table class="audit-table">
+        <thead>
+          <tr><th>Event</th><th>Actor</th><th>Entity</th><th>Details</th><th>Timestamp</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red);">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+// ── Users Page ────────────────────────────────────────────────────────────
+
+async function loadUsers() {
+  const wrap = document.getElementById('users-list');
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const data = await apiFetch('/api/auth/users');
+    const users = data.users || [];
+    if (!users.length) { wrap.innerHTML = '<div class="empty-state">No users found.</div>'; return; }
+    const rows = users.map(u => `
+      <tr>
+        <td><strong>${esc(u.username)}</strong></td>
+        <td>${esc(u.full_name || '—')}</td>
+        <td style="color:var(--text-muted)">${esc(u.email)}</td>
+        <td><span class="role-badge role-${u.role}">${esc(u.role)}</span></td>
+        <td><span class="${u.is_active ? 'user-status-active' : 'user-status-inactive'}">${u.is_active ? '● Active' : '○ Inactive'}</span></td>
+        <td style="color:var(--text-muted);font-size:12px">${(u.last_login || '').slice(0, 16).replace('T', ' ') || '—'}</td>
+        <td>${u.username !== 'admin' ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="deactivateUser('${u.id}','${esc(u.username)}')">Deactivate</button>` : ''}</td>
+      </tr>`).join('');
+    wrap.innerHTML = `
+      <table class="users-table">
+        <thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last Login</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red);">Error: ${esc(e.message)} — Admin login required.</div>`;
+  }
+}
+
+function openCreateUser() {
+  document.getElementById('create-user-panel').classList.remove('hidden');
+}
+
+function closeCreateUser() {
+  document.getElementById('create-user-panel').classList.add('hidden');
+  ['nu-username', 'nu-fullname', 'nu-email', 'nu-password'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+}
+
+async function createUser() {
+  const username = document.getElementById('nu-username').value.trim();
+  const full_name = document.getElementById('nu-fullname').value.trim();
+  const email = document.getElementById('nu-email').value.trim();
+  const password = document.getElementById('nu-password').value;
+  const role = document.getElementById('nu-role').value;
+  if (!username || !email || !password) { alert('Username, email, and password are required.'); return; }
+  if (password.length < 8) { alert('Password must be at least 8 characters.'); return; }
+  try {
+    await apiFetch('/api/auth/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, full_name, email, password, role }),
+    });
+    closeCreateUser();
+    loadUsers();
+    alert(`✓ User "${username}" created successfully.`);
+  } catch (e) { alert('Create failed: ' + e.message); }
+}
+
+async function deactivateUser(id, username) {
+  if (!confirm(`Deactivate user "${username}"? They will no longer be able to log in.`)) return;
+  try {
+    await apiFetch(`/api/auth/users/${id}`, { method: 'DELETE' });
+    loadUsers();
+  } catch (e) { alert('Deactivate failed: ' + e.message); }
+}
+
+// ── Projects (RBAC) ──────────────────────────────────────────────────────────
+
+let _currentProjectId = null;
+const VERTICAL_ICONS = { Hospital: '🏥', Pharma: '💊', BFSI: '🏦', 'IT Services': '💻', Generic: '🗂️' };
+
+async function loadProjects() {
+  const wrap = document.getElementById('projects-list');
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const data = await apiFetch('/api/v1/projects');
+    const projects = data.projects || [];
+    if (!projects.length) {
+      wrap.innerHTML = '<div class="empty-state">No projects yet. Click "Create Project" to provision one.</div>';
+      return;
+    }
+    const rows = projects.map(p => `
+      <tr>
+        <td><strong>${esc(p.name)}</strong></td>
+        <td style="color:var(--text-muted)">${esc(p.description || '—')}</td>
+        <td>${esc(VERTICAL_ICONS[p.vertical] || '🗂️')} ${esc(p.vertical || 'Generic')}</td>
+        <td style="color:var(--text-muted);font-size:12px">${esc(p.created_by)}</td>
+        <td><span class="${p.is_active ? 'user-status-active' : 'user-status-inactive'}">${p.is_active ? '● Active' : '○ Inactive'}</span></td>
+        <td style="color:var(--text-muted);font-size:12px">${(p.created_at || '').slice(0, 10)}</td>
+        <td>
+          <button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="openProjectAdminsPanel('${esc(p.id)}','${esc(p.name)}')">Manage Admins</button>
+          ${isSuperAdmin() && p.is_active ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="deactivateProject('${esc(p.id)}','${esc(p.name)}')">Deactivate</button>` : ''}
+        </td>
+      </tr>`).join('');
+    wrap.innerHTML = `
+      <table class="users-table">
+        <thead><tr><th>Name</th><th>Description</th><th>Vertical</th><th>Created By</th><th>Status</th><th>Created</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red);">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function openCreateProject() {
+  document.getElementById('create-project-panel').classList.remove('hidden');
+}
+
+function closeCreateProject() {
+  document.getElementById('create-project-panel').classList.add('hidden');
+  document.getElementById('np-name').value = '';
+  document.getElementById('np-description').value = '';
+  document.getElementById('np-vertical').value = 'Generic';
+}
+
+async function createProject() {
+  const name = document.getElementById('np-name').value.trim();
+  const description = document.getElementById('np-description').value.trim();
+  const vertical = document.getElementById('np-vertical').value;
+  if (!name) { alert('Project name is required.'); return; }
+  try {
+    await apiFetch('/api/v1/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, description, vertical }),
+    });
+    closeCreateProject();
+    loadProjects();
+    alert(`✓ Project "${name}" created. Create an API key for it from the API Keys page, and assign a project admin from "Manage Admins".`);
+  } catch (e) { alert('Create failed: ' + e.message); }
+}
+
+async function deactivateProject(id, name) {
+  if (!confirm(`Deactivate project "${name}"? Its existing API keys keep working but no new ones can reference it.`)) return;
+  try {
+    await apiFetch(`/api/v1/projects/${id}`, { method: 'DELETE' });
+    loadProjects();
+  } catch (e) { alert('Deactivate failed: ' + e.message); }
+}
+
+async function openProjectAdminsPanel(projectId, projectName) {
+  _currentProjectId = projectId;
+  document.getElementById('project-admins-title').textContent = `Admins — ${projectName}`;
+  document.getElementById('project-admins-panel').classList.remove('hidden');
+  document.getElementById('pa-username').value = '';
+  await loadProjectAdmins();
+}
+
+function closeProjectAdminsPanel() {
+  document.getElementById('project-admins-panel').classList.add('hidden');
+  _currentProjectId = null;
+}
+
+async function loadProjectAdmins() {
+  const wrap = document.getElementById('project-admins-list');
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const data = await apiFetch(`/api/v1/projects/${_currentProjectId}/admins`);
+    const admins = data.admins || [];
+    wrap.innerHTML = admins.length
+      ? admins.map(a => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px">
+            <span><strong>${esc(a.username)}</strong> ${a.full_name ? `(${esc(a.full_name)})` : ''} — ${esc(a.email)}</span>
+            ${isSuperAdmin() ? `<button class="btn btn-secondary" style="font-size:11px;padding:2px 8px" onclick="unassignProjectAdmin('${esc(a.user_id)}','${esc(a.username)}')">Unassign</button>` : ''}
+          </div>`).join('')
+      : '<div class="empty-state">No project admins assigned yet.</div>';
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function assignProjectAdmin() {
+  const username = document.getElementById('pa-username').value.trim();
+  if (!username) { alert('Enter a username.'); return; }
+  try {
+    await apiFetch(`/api/v1/projects/${_currentProjectId}/admins`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    document.getElementById('pa-username').value = '';
+    loadProjectAdmins();
+  } catch (e) { alert('Assign failed: ' + e.message); }
+}
+
+async function unassignProjectAdmin(userId, username) {
+  if (!confirm(`Remove "${username}" as an admin of this project?`)) return;
+  try {
+    await apiFetch(`/api/v1/projects/${_currentProjectId}/admins/${userId}`, { method: 'DELETE' });
+    loadProjectAdmins();
+  } catch (e) { alert('Unassign failed: ' + e.message); }
+}
+
+// ── Vertical Dashboard ───────────────────────────────────────────────────────
+
+async function loadVerticalPage() {
+  const select = document.getElementById('vd-project-select');
+  const content = document.getElementById('vd-content');
+  content.classList.add('hidden');
+  select.innerHTML = '<option value="">Loading projects…</option>';
+  try {
+    const data = await apiFetch('/api/v1/projects');
+    const projects = (data.projects || []).filter(p => p.is_active);
+    if (!projects.length) {
+      select.innerHTML = '<option value="">No projects available</option>';
+      return;
+    }
+    select.innerHTML = '<option value="">Select a project…</option>' +
+      projects.map(p => `<option value="${esc(p.id)}">${esc(VERTICAL_ICONS[p.vertical] || '🗂️')} ${esc(p.name)} — ${esc(p.vertical || 'Generic')}</option>`).join('');
+  } catch (e) {
+    select.innerHTML = '<option value="">Error loading projects</option>';
+  }
+}
+
+async function onVerticalProjectSelected() {
+  const projectId = document.getElementById('vd-project-select').value;
+  const content = document.getElementById('vd-content');
+  if (!projectId) { content.classList.add('hidden'); return; }
+  content.classList.remove('hidden');
+  content.innerHTML = '<div class="empty-state">Loading dashboard…</div>';
+  try {
+    const data = await apiFetch(`/api/v1/verticals/${projectId}/stats`);
+    renderVerticalDashboard(data);
+  } catch (e) {
+    content.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderVerticalDashboard(data) {
+  const content = document.getElementById('vd-content');
+  const { project, vertical, stat_tiles, quick_launches } = data;
+
+  const tileHtml = (stat_tiles || []).map(t => {
+    let display = '—';
+    let color = 'var(--text-muted)';
+    if (t.value !== null && t.value !== undefined) {
+      if (t.kind === 'gate') {
+        display = String(t.value).toUpperCase();
+        color = String(t.value).toLowerCase() === 'pass' ? 'var(--green)' : (String(t.value).toLowerCase() === 'fail' ? 'var(--red)' : 'var(--amber)');
+      } else if (t.kind === 'percent') {
+        display = `${t.value}%`;
+        color = t.value >= 80 ? 'var(--green)' : (t.value >= 50 ? 'var(--amber)' : 'var(--red)');
+      } else {
+        display = String(t.value);
+        color = Number(t.value) > 0 ? 'var(--amber)' : 'var(--green)';
+      }
+    }
+    return `
+      <div class="stat-card" style="min-width:180px">
+        <div style="font-size:12px;color:var(--text-muted);margin-bottom:6px">${esc(t.label)}</div>
+        <div style="font-size:24px;font-weight:700;color:${color}">${esc(display)}</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:4px">${t.as_of ? 'As of ' + esc(t.as_of.slice(0, 10)) : 'No scan yet'}</div>
+      </div>`;
+  }).join('');
+
+  const launchHtml = (quick_launches || []).map(q => `
+    <button class="btn btn-secondary" style="text-align:left;padding:12px 16px;display:flex;align-items:center;gap:8px"
+      onclick="launchVerticalQuickAction('${esc(q.page)}', ${q.project_field ? `'${esc(q.project_field)}'` : 'null'}, '${esc(project.name)}')">
+      <span style="font-size:18px">${q.icon || '▶'}</span> ${esc(q.label)}
+    </button>`).join('');
+
+  content.innerHTML = `
+    <div class="form-card" style="margin-bottom:16px">
+      <h3 style="margin:0 0 4px 0">${vertical.icon || ''} ${esc(project.name)} — ${esc(vertical.name)} Dashboard</h3>
+      <p style="color:var(--text-muted);font-size:13px;margin:0">${esc(vertical.description || '')}</p>
+      ${(vertical.frameworks || []).length ? `<div style="margin-top:8px">${vertical.frameworks.map(f => `<span class="tag" style="margin-right:6px;background:rgba(99,102,241,0.15);color:var(--accent-hover)">${esc(f)}</span>`).join('')}</div>` : ''}
+    </div>
+    ${tileHtml ? `<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px">${tileHtml}</div>` : '<div class="empty-state">No stat tiles configured for this vertical yet.</div>'}
+    ${launchHtml ? `<h3 style="margin-bottom:10px">Quick Launch</h3><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px">${launchHtml}</div>` : ''}
+  `;
+}
+
+function launchVerticalQuickAction(page, projectField, projectName) {
+  const navItem = document.querySelector(`.nav-item[data-page="${page}"]`);
+  if (!navItem) return;
+  navItem.click();
+  if (projectField) {
+    const field = document.getElementById(projectField);
+    if (field) field.value = projectName;
+  }
+}
+
+// ── Collapsible nav sections ────────────────────────────────────────────────
+
+const NAV_COLLAPSED_KEY = 'sdlc_nav_collapsed';
+
+function toggleNavSection(headerEl) {
+  const section = headerEl.closest('.nav-section');
+  if (!section) return;
+  section.classList.toggle('collapsed');
+
+  const key = section.dataset.section;
+  const collapsed = JSON.parse(localStorage.getItem(NAV_COLLAPSED_KEY) || '[]');
+  const idx = collapsed.indexOf(key);
+  if (section.classList.contains('collapsed')) {
+    if (idx === -1) collapsed.push(key);
+  } else if (idx !== -1) {
+    collapsed.splice(idx, 1);
+  }
+  localStorage.setItem(NAV_COLLAPSED_KEY, JSON.stringify(collapsed));
+}
+
+function _restoreNavSectionState() {
+  let collapsed = [];
+  try { collapsed = JSON.parse(localStorage.getItem(NAV_COLLAPSED_KEY) || '[]'); } catch { collapsed = []; }
+  collapsed.forEach(key => {
+    const section = document.querySelector(`.nav-section[data-section="${key}"]`);
+    if (section) section.classList.add('collapsed');
+  });
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+
+_restoreNavSectionState();
+_loadAuthState();
+loadDashboard();
