@@ -1,7 +1,10 @@
 import base64
+import logging
 from typing import Dict, Any, Optional
 import httpx
 from backend import config
+
+logger = logging.getLogger(__name__)
 
 
 class JiraService:
@@ -33,6 +36,7 @@ class JiraService:
         if not self.is_configured():
             raise ValueError("Jira not configured. Set JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN in .env")
         key = self._parse_ticket_key(ticket_ref)
+        logger.info("Fetching Jira issue %s", key)
         with httpx.Client(headers=self.headers, timeout=30) as client:
             resp = client.get(
                 f"{self.base_url}/rest/api/3/issue/{key}",
@@ -126,6 +130,7 @@ class JiraService:
                 resp.raise_for_status()
             return True
         except Exception:
+            logger.exception("Failed to post Jira comment on %s", ticket_ref)
             return False
 
     def search_issues(self, jql: str, max_results: int = 20) -> list:
@@ -150,6 +155,7 @@ class JiraService:
                 for issue in data.get("issues", [])
             ]
         except Exception:
+            logger.exception("Jira search failed for jql=%s", jql)
             return []
 
     def _extract_adf(self, node: Any) -> str:

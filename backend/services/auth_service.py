@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import logging
 import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -7,6 +8,8 @@ from typing import Optional, Dict, Any
 import jwt as pyjwt
 
 from backend.config import SECRET_KEY, JWT_EXPIRY_HOURS
+
+logger = logging.getLogger(__name__)
 
 
 def hash_password(password: str) -> str:
@@ -40,6 +43,8 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
     try:
         return pyjwt.decode(token, SECRET_KEY, algorithms=["HS256"])
     except pyjwt.ExpiredSignatureError:
+        logger.info("JWT rejected: expired")
         return None
-    except pyjwt.InvalidTokenError:
+    except pyjwt.InvalidTokenError as e:
+        logger.warning("JWT rejected: invalid (%s)", e)
         return None

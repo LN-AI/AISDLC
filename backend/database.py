@@ -1,9 +1,12 @@
+import logging
 import sqlite3
 import json
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from backend.config import DATABASE_PATH
+
+logger = logging.getLogger(__name__)
 
 
 def get_connection():
@@ -13,6 +16,7 @@ def get_connection():
 
 
 def init_db():
+    logger.info("Initializing database at %s", DATABASE_PATH)
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -231,6 +235,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    logger.info("Database ready")
 
 
 def save_review(

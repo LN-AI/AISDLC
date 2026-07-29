@@ -18,6 +18,7 @@ for the duration of that request. This keeps ~10 agent classes and the
 orchestrator free of any BYOL-specific plumbing.
 """
 import json
+import logging
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -28,6 +29,8 @@ import openai
 
 from backend import config
 from backend.services.guardrail_service import enforce_input_limit, scan_for_injection_markers
+
+logger = logging.getLogger(__name__)
 
 _default_anthropic_client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -98,6 +101,7 @@ def _call_anthropic(
     resolved_model = model or config.MODEL
     last_err = None
     response = None
+    start = time.perf_counter()
     for attempt in range(config.LLM_MAX_RETRIES + 1):
         try:
             response = client.messages.create(
@@ -113,18 +117,30 @@ def _call_anthropic(
         except _RETRYABLE_ANTHROPIC as e:
             last_err = e
             if attempt < config.LLM_MAX_RETRIES:
+                logger.warning(
+                    "Anthropic call for tool '%s' failed (attempt %d/%d): %s — retrying",
+                    tool_schema["name"], attempt + 1, config.LLM_MAX_RETRIES + 1, e,
+                )
                 time.sleep(2 ** attempt)
                 continue
+            logger.error(
+                "Anthropic call for tool '%s' failed after %d attempts: %s",
+                tool_schema["name"], config.LLM_MAX_RETRIES + 1, e,
+            )
             raise
+    duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
-    _record_usage(
-        "anthropic", resolved_model,
-        int(getattr(usage, "input_tokens", 0) or 0),
-        int(getattr(usage, "output_tokens", 0) or 0),
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    _record_usage("anthropic", resolved_model, input_tokens, output_tokens)
+    logger.info(
+        "Anthropic call tool='%s' model=%s tokens_in=%d tokens_out=%d duration=%.1fms",
+        tool_schema["name"], resolved_model, input_tokens, output_tokens, duration_ms,
     )
     for block in response.content:
         if block.type == "tool_use" and block.name == tool_schema["name"]:
             return block.input
+    logger.error("Anthropic call for tool '%s' returned no matching tool_use block", tool_schema["name"])
     raise ValueError(f"Anthropic call did not return structured output for tool '{tool_schema['name']}'")
 
 
@@ -136,6 +152,7 @@ def _call_openai(
     client = openai.OpenAI(api_key=api_key, base_url=base_url or None)
     resolved_model = model or "gpt-4o"
     response = None
+    start = time.perf_counter()
     for attempt in range(config.LLM_MAX_RETRIES + 1):
         try:
             response = client.chat.completions.create(
@@ -159,19 +176,31 @@ def _call_openai(
             break
         except _RETRYABLE_OPENAI as e:
             if attempt < config.LLM_MAX_RETRIES:
+                logger.warning(
+                    "OpenAI call for tool '%s' failed (attempt %d/%d): %s — retrying",
+                    tool_schema["name"], attempt + 1, config.LLM_MAX_RETRIES + 1, e,
+                )
                 time.sleep(2 ** attempt)
                 continue
+            logger.error(
+                "OpenAI call for tool '%s' failed after %d attempts: %s",
+                tool_schema["name"], config.LLM_MAX_RETRIES + 1, e,
+            )
             raise
+    duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
-    _record_usage(
-        "openai", resolved_model,
-        int(getattr(usage, "prompt_tokens", 0) or 0),
-        int(getattr(usage, "completion_tokens", 0) or 0),
+    input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    _record_usage("openai", resolved_model, input_tokens, output_tokens)
+    logger.info(
+        "OpenAI call tool='%s' model=%s tokens_in=%d tokens_out=%d duration=%.1fms",
+        tool_schema["name"], resolved_model, input_tokens, output_tokens, duration_ms,
     )
     message = response.choices[0].message
     for call in (message.tool_calls or []):
         if call.function.name == tool_schema["name"]:
             return json.loads(call.function.arguments)
+    logger.error("OpenAI call for tool '%s' returned no matching tool_call", tool_schema["name"])
     raise ValueError(f"OpenAI call did not return structured output for tool '{tool_schema['name']}'")
 
 
@@ -220,8 +249,10 @@ def call_tool(
         result = _call_anthropic(api_key, base_url, model, system_prompt, user_content, tool_schema, max_tokens)
 
     flags = scan_for_injection_markers(user_content)
-    if flags and isinstance(result, dict):
-        result["guardrail_flags"] = flags
+    if flags:
+        logger.warning("Injection markers flagged for tool '%s': %s", tool_schema["name"], flags)
+        if isinstance(result, dict):
+            result["guardrail_flags"] = flags
     return result
 
 

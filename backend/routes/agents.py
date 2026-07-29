@@ -3,6 +3,7 @@
 Every agent is reachable from GitHub (PR / issue / file / repo) or Jira ticket,
 in addition to plain text input.
 """
+import logging
 from typing import Optional
 from fastapi import APIRouter, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,6 +15,8 @@ from backend.services.jira_service import JiraService
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services.auth_service import decode_token
 from backend import config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["Agent Hub"])
 
@@ -142,6 +145,7 @@ def run_agent(agent_name: str, req: AgentRunRequest, user=Depends(_get_user)):
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Failed to fetch from source=%s ref=%s", req.source, req.ref)
         raise HTTPException(status_code=502, detail=f"Failed to fetch from source: {str(e)}")
 
     project_name = (req.project_name or source_info.get("title", ""))[:120] or "Unnamed"
@@ -159,6 +163,7 @@ def run_agent(agent_name: str, req: AgentRunRequest, user=Depends(_get_user)):
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Agent '%s' dispatch failed for project=%s", agent_name, project_name)
         raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
     # ── 3. Optionally post results back to GitHub / Jira ─────────────────
@@ -176,6 +181,7 @@ def run_agent(agent_name: str, req: AgentRunRequest, user=Depends(_get_user)):
                 ok = _jira.post_comment(target_ref, plain)
                 post_back_status = "posted" if ok else "failed"
         except Exception as e:
+            logger.exception("Post-back to %s failed for %s", kind, target_ref)
             post_back_status = f"failed: {str(e)[:100]}"
 
     return {

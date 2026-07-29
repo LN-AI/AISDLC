@@ -1,4 +1,7 @@
+import functools
 import json
+import logging
+import time
 from typing import Dict, Any, List, Optional
 from backend.agents.requirement_intelligence.requirement_reviewer import RequirementReviewAgent
 from backend.agents.architecture_intelligence.architecture_agent import ArchitectureAgent
@@ -25,6 +28,35 @@ from backend.services.knowledge_base import knowledge_base
 from backend.services import cost_optimization_service
 from backend.services import guardrail_service
 from backend import config, database
+
+logger = logging.getLogger(__name__)
+
+
+def _log_call(method):
+    """Logs entry, duration, review_id, and failures for every orchestrator method —
+    the one chokepoint every route/agent invocation in the app passes through."""
+    @functools.wraps(method)
+    def _wrapper(self, *args, **kwargs):
+        name = method.__name__
+        project_name = kwargs.get("project_name") or (args[-1] if args and isinstance(args[-1], str) else "")
+        start = time.perf_counter()
+        logger.info("orchestrator.%s started (project=%s)", name, project_name)
+        try:
+            result = method(self, *args, **kwargs)
+        except Exception:
+            logger.exception(
+                "orchestrator.%s failed after %.1fms (project=%s)",
+                name, (time.perf_counter() - start) * 1000, project_name,
+            )
+            raise
+        duration_ms = (time.perf_counter() - start) * 1000
+        review_id = result.get("review_id") if isinstance(result, dict) else None
+        logger.info(
+            "orchestrator.%s completed in %.1fms (project=%s, review_id=%s)",
+            name, duration_ms, project_name, review_id,
+        )
+        return result
+    return _wrapper
 
 
 class SDLCOrchestrator:
@@ -72,6 +104,7 @@ class SDLCOrchestrator:
         compressed, stats = cost_optimization_service.compress_content(content, config.MODEL)
         return compressed, (stats if stats.get("compressed") else None)
 
+    @_log_call
     def review_requirement(self, content: str, context: str = "", project_name: str = "") -> Dict[str, Any]:
         context = self._kb("requirement", context, content, project_name)
         compressed_content, cost_stats = self._compress(content)
@@ -88,6 +121,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def review_code(self, code: str, language: str = "", context: str = "", project_name: str = "", pr_url: str = "") -> Dict[str, Any]:
         context = self._kb("code-review", context, code, project_name)
         compressed_code, cost_stats = self._compress(code)
@@ -104,6 +138,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def review_prompt(
         self,
         system_prompt: str = "",
@@ -127,6 +162,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def review_compliance(self, content: str, frameworks: list = None, context: str = "", project_name: str = "") -> Dict[str, Any]:
         context = self._kb("compliance", context, content, project_name)
         compressed_content, cost_stats = self._compress(content)
@@ -143,6 +179,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def full_review(
         self,
         requirement: Optional[str] = None,
@@ -267,6 +304,7 @@ class SDLCOrchestrator:
             "recommendations": gate_result.get("recommendations", []),
         }
 
+    @_log_call
     def review_vapt(
         self,
         artifact: str,
@@ -293,6 +331,7 @@ class SDLCOrchestrator:
         result["total_findings"] = len(findings)
         return result
 
+    @_log_call
     def review_security(
         self,
         artifact: str,
@@ -320,6 +359,7 @@ class SDLCOrchestrator:
         result["boundary_count"] = len(result.get("trust_boundaries", []))
         return result
 
+    @_log_call
     def review_architecture(
         self,
         artifact: str,
@@ -348,6 +388,7 @@ class SDLCOrchestrator:
         result["alternative_count"] = len(result.get("alternative_recommendations", []))
         return result
 
+    @_log_call
     def scan_sensitive_data(
         self,
         content: str,
@@ -373,6 +414,7 @@ class SDLCOrchestrator:
         result["high_count"] = sum(1 for f in findings if f.get("severity") == 4)
         return result
 
+    @_log_call
     def generate_codegen_advisory(
         self,
         requirement: str,
@@ -392,6 +434,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def generate_codegen_scaffold(
         self,
         project_name: str,
@@ -452,6 +495,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def analyze_ai_provenance(
         self,
         artifact: str,
@@ -475,6 +519,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def assess_migration(
         self,
         source: str,
@@ -498,6 +543,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def execute_migration(
         self,
         source: str,
@@ -542,6 +588,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def verify_cfr21(
         self,
         files: Optional[List[Dict[str, str]]] = None,
@@ -569,6 +616,7 @@ class SDLCOrchestrator:
         result["total_findings"] = len(findings)
         return result
 
+    @_log_call
     def check_gxp_documents(
         self,
         documents: Optional[List[Dict[str, str]]] = None,
@@ -596,6 +644,7 @@ class SDLCOrchestrator:
         result["total_findings"] = len(findings)
         return result
 
+    @_log_call
     def plan_gxp_validation_package(
         self,
         files: Optional[List[Dict[str, str]]] = None,
@@ -618,6 +667,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def generate_gxp_document(
         self,
         document_type: str,
@@ -754,6 +804,7 @@ class SDLCOrchestrator:
             "human_approval_required": mandatory_human,
         }
 
+    @_log_call
     def triage_issue(
         self,
         title: str = "", description: str = "", logs: str = "", stack_trace: str = "",
@@ -799,6 +850,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def triage_github_repo_issues(
         self,
         github_repo_url: str,
@@ -836,6 +888,7 @@ class SDLCOrchestrator:
 
     # ── QA Intelligence ──────────────────────────────────────────────────
 
+    @_log_call
     def generate_test_scenarios(
         self,
         requirement: str,
@@ -860,6 +913,7 @@ class SDLCOrchestrator:
         result["critical_count"] = sum(1 for s in scenarios if s.get("priority") == "Critical")
         return result
 
+    @_log_call
     def generate_test_cases(
         self,
         requirement: str,
@@ -885,6 +939,7 @@ class SDLCOrchestrator:
         result["critical_count"] = sum(1 for tc in test_cases if tc.get("priority") == "Critical")
         return result
 
+    @_log_call
     def generate_standalone_report(
         self,
         project_name: str,
@@ -929,6 +984,7 @@ class SDLCOrchestrator:
         report["report_id"] = report_id
         return report
 
+    @_log_call
     def run_release_gate(
         self,
         project_name: str,
@@ -966,6 +1022,7 @@ class SDLCOrchestrator:
         result["aggregated_reviews"] = len(review_ids) if review_ids else 0
         return result
 
+    @_log_call
     def review_github_pr(self, pr_url: str, jira_ticket: str = "", include_prompt_review: bool = False) -> Dict[str, Any]:
         pr_data = self.github.get_pr_diff(pr_url)
 
@@ -998,6 +1055,7 @@ class SDLCOrchestrator:
             "comment_posted": posted,
         }
 
+    @_log_call
     def auto_fix_github_pr(self, pr_url: str, jira_ticket: str = "", max_files: int = 5) -> Dict[str, Any]:
         """Review a GitHub PR, then commit fixes for its findings to a new branch off the PR's head branch
         and open a follow-up PR (head_branch -> lm-autofix/pr-N -> new PR back into head_branch)."""

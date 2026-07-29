@@ -19,6 +19,7 @@ POST /api/v1/agents/release-gate — release readiness decision
 POST /api/v1/agents/full         — full SDLC review (all agents, one call)
 """
 import io
+import logging
 import zipfile
 from datetime import datetime, timezone
 from typing import Optional
@@ -66,6 +67,8 @@ from backend.services.auth_service import decode_token
 from backend.services.github_service import GitHubService
 from backend.services.jira_service import JiraService
 from backend.services.orchestrator import SDLCOrchestrator
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/agents", tags=["Agents v1"])
 
@@ -290,6 +293,7 @@ def get_caller(
     if api_key:
         record = validate_api_key(api_key)
         if not record:
+            logger.warning("Rejected invalid/revoked API key on %s", request.url.path)
             raise HTTPException(status_code=401, detail="Invalid or revoked API key.")
 
         rl = check_and_record_rate_limit(record, request.url.path)
@@ -298,6 +302,7 @@ def get_caller(
         response.headers["X-RateLimit-Limit-Day"] = str(rl["limit_per_day"])
         response.headers["X-RateLimit-Remaining-Day"] = str(rl["remaining_per_day"])
         if not rl["allowed"]:
+            logger.warning("Rate limit exceeded for team '%s' on %s", record["team_name"], request.url.path)
             raise HTTPException(
                 status_code=429,
                 detail=(
@@ -312,6 +317,7 @@ def get_caller(
         user = decode_token(bearer.credentials)
         if user:
             return {"type": "jwt", "team": user.get("username", "ui"), "username": user.get("username")}
+    logger.warning("Rejected unauthenticated request on %s", request.url.path)
     raise HTTPException(
         status_code=401,
         detail="Authentication required. Supply 'X-API-Key: lmsdlc_...' or 'Authorization: Bearer <jwt>'.",
@@ -331,6 +337,7 @@ def _resolve(req) -> tuple:
         try:
             return _github.fetch_for_agent(url, hint)
         except Exception as e:
+            logger.exception("GitHub fetch failed for %s", url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
 
     def _jr(ref):
@@ -339,6 +346,7 @@ def _resolve(req) -> tuple:
         try:
             return _jira.get_issue(ref)
         except Exception as e:
+            logger.exception("Jira fetch failed for %s", ref)
             raise HTTPException(502, f"Jira fetch failed: {e}")
 
     pr  = getattr(req, "github_pr_url",    None)
@@ -404,6 +412,7 @@ def _do_postback(source_type: str, ref: str, result: dict) -> str:
             ok = _jira.post_comment(ref, "\n".join(lines))
             return "posted" if ok else "failed"
     except Exception as e:
+        logger.exception("Post-back to %s failed for %s", source_type, ref)
         return f"failed: {str(e)[:100]}"
     return "not_requested"
 
@@ -565,6 +574,7 @@ def run_prompt(req: PromptSafetyRequest, caller: dict = Depends(get_caller)):
             src_ref  = d.get("name", req.github_file_url)
             artifact_used = True
         except Exception as e:
+            logger.exception("GitHub file fetch failed for %s", req.github_file_url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
 
     if not any([req.system_prompt, req.user_prompt, req.tool_definitions, req.rag_config]):
@@ -816,6 +826,7 @@ def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
             code = d.get("diff") or d.get("content", "")
             src_type, src_ref, pb_ref = "github_pr", d.get("title", req.github_pr_url), req.github_pr_url
         except Exception as e:
+            logger.exception("GitHub PR fetch failed for %s", req.github_pr_url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
 
     elif req.jira_ticket:
@@ -826,6 +837,7 @@ def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
             requirement = issue.get("content", "")
             src_type, src_ref, pb_ref = "jira", issue.get("title", req.jira_ticket), req.jira_ticket
         except Exception as e:
+            logger.exception("Jira fetch failed for %s", req.jira_ticket)
             raise HTTPException(502, f"Jira fetch failed: {e}")
 
     elif req.text:
@@ -1423,6 +1435,7 @@ def run_issue_triage(req: IssueTriageRequest, caller: dict = Depends(get_caller)
         try:
             gh = _github.get_issue(req.github_issue_url)
         except Exception as e:
+            logger.exception("GitHub issue fetch failed for %s", req.github_issue_url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
         title, description = gh.get("title", ""), gh.get("body", "")
         src_type, src_ref = "github_issue", title[:80]
@@ -1479,6 +1492,7 @@ def run_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest, caller: di
     except (HTTPException, ScopeDeniedError, BudgetExceededError):
         raise
     except Exception as e:
+        logger.exception("GitHub repo issue batch fetch failed for %s", req.github_repo_url)
         raise HTTPException(502, f"GitHub fetch failed: {e}")
     return {
         "success": True,

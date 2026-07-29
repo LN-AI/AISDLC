@@ -1,15 +1,23 @@
 import os
 import io
 import json
+import logging
+import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+
+from backend.logging_config import configure_logging, request_id_ctx
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 from backend import database, config
 from backend.routes.auth import router as auth_router
@@ -67,10 +75,13 @@ def _init_default_admin():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting up - env=%s model=%s", config.APP_ENV, config.MODEL)
     database.init_db()
     _init_default_admin()
     knowledge_base.load()  # preload all docs/ markdown files into memory
+    logger.info("Startup complete")
     yield
+    logger.info("Shutting down")
 
 
 app = FastAPI(
@@ -91,17 +102,45 @@ app.add_middleware(
 
 @app.exception_handler(GuardrailViolation)
 async def _guardrail_violation_handler(request, exc: GuardrailViolation):
+    logger.warning("Guardrail violation on %s %s: %s", request.method, request.url.path, exc)
     return JSONResponse(status_code=413, content={"detail": str(exc)})
 
 
 @app.exception_handler(ScopeDeniedError)
 async def _scope_denied_handler(request, exc: ScopeDeniedError):
+    logger.warning("Scope denied on %s %s: %s", request.method, request.url.path, exc)
     return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
 @app.exception_handler(BudgetExceededError)
 async def _budget_exceeded_handler(request, exc: BudgetExceededError):
+    logger.warning("Budget exceeded on %s %s: %s", request.method, request.url.path, exc)
     return JSONResponse(status_code=402, content={"detail": str(exc), **exc.budget})
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc: Exception):
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    token = request_id_ctx.set(request_id)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "%s %s -> %s (%.1fms) client=%s",
+            request.method, request.url.path, response.status_code, duration_ms,
+            request.client.host if request.client else "-",
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        request_id_ctx.reset(token)
 
 
 app.include_router(auth_router)
@@ -194,6 +233,7 @@ async def review_requirement(req: ReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -215,6 +255,7 @@ async def review_requirement_file(
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -236,6 +277,7 @@ async def review_code(req: CodeReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -258,6 +300,7 @@ async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -287,6 +330,7 @@ async def full_review(req: FullReviewRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -310,6 +354,7 @@ async def review_github_pr(req: GithubPRRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -331,6 +376,7 @@ async def auto_fix_github_pr(req: GithubAutoFixRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -358,6 +404,7 @@ async def release_gate(req: ReleaseGateRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -381,6 +428,7 @@ async def review_architecture(req: ArchitectureReviewRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -408,6 +456,7 @@ async def review_architecture_file(
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -428,6 +477,7 @@ async def review_vapt(req: VAPTReviewRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -453,6 +503,7 @@ async def review_vapt_file(
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -473,6 +524,7 @@ async def review_security(req: SecurityReviewRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -498,6 +550,7 @@ async def review_security_file(
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -526,6 +579,7 @@ async def codegen_advisory(req: CodeGenAdvisoryRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -550,6 +604,7 @@ async def codegen_scaffold(req: CodeGenScaffoldRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -600,6 +655,7 @@ async def review_ai_provenance(req: AIProvenanceRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -623,6 +679,7 @@ async def review_migration_assessment(req: MigrationAssessmentRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -646,6 +703,7 @@ async def review_migration_execute(req: MigrationExecutionRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -708,6 +766,7 @@ async def review_cfr21_verification(req: CFR21VerificationRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -739,6 +798,7 @@ async def review_cfr21_verification_upload_zip(
         result["files_extracted"] = len(files)
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -761,6 +821,7 @@ async def review_gxp_document_check(req: GxPDocumentCheckRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -791,6 +852,7 @@ async def review_gxp_document_check_upload(
         result["files_uploaded"] = len(documents)
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -813,6 +875,7 @@ async def review_gxp_generate_plan(req: GxPValidationPlanRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -846,6 +909,7 @@ async def review_gxp_generate_plan_upload_zip(
         result["files_extracted"] = files
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -871,6 +935,7 @@ async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -886,6 +951,7 @@ async def review_issue_triage(req: IssueTriageRequest):
         try:
             gh = GitHubService().get_issue(req.github_issue_url)
         except Exception as e:
+            logger.exception("GitHub issue fetch failed for %s", req.github_issue_url)
             raise HTTPException(status_code=502, detail=f"GitHub fetch failed: {e}")
         title, description = gh.get("title", ""), gh.get("body", "")
     if not (title.strip() or description.strip()):
@@ -903,6 +969,7 @@ async def review_issue_triage(req: IssueTriageRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -921,6 +988,7 @@ async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -938,6 +1006,7 @@ async def review_test_scenario(req: ReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -961,6 +1030,7 @@ async def review_test_case(req: TestCaseInternalRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -984,6 +1054,7 @@ async def review_sensitive_data(req: SensitiveDataRequest):
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1005,6 +1076,7 @@ async def review_sensitive_data_file(
         )
         return result
     except Exception as e:
+        logger.exception("Unhandled error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

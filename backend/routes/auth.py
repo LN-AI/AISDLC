@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
@@ -5,6 +7,8 @@ from pydantic import BaseModel
 
 from backend.services.auth_service import hash_password, verify_password, create_token, decode_token
 import backend.database as database
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 _security = HTTPBearer(auto_error=False)
@@ -55,11 +59,14 @@ def require_admin(user=Depends(require_auth)):
 def login(req: LoginRequest):
     user = database.get_user_by_username(req.username)
     if not user or not verify_password(req.password, user["password_hash"]):
+        logger.warning("Login failed for username=%s", req.username)
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not user.get("is_active"):
+        logger.warning("Login rejected for deactivated account username=%s", req.username)
         raise HTTPException(status_code=403, detail="Account is deactivated")
     database.update_last_login(user["id"])
     token = create_token(user["id"], user["username"], user["role"])
+    logger.info("Login succeeded for username=%s role=%s", user["username"], user["role"])
     return {
         "token": token,
         "user": {
@@ -100,6 +107,7 @@ def create_user(req: CreateUserRequest, user=Depends(require_admin)):
         raise HTTPException(status_code=400, detail="Username already exists")
     pw_hash = hash_password(req.password)
     new_user = database.create_user(req.username, req.email, pw_hash, req.role, req.full_name)
+    logger.info("User created: username=%s role=%s by=%s", req.username, req.role, user["username"])
     return {"message": "User created", "user": new_user}
 
 
@@ -110,4 +118,5 @@ def deactivate_user(user_id: str, user=Depends(require_admin)):
     if not database.get_user_by_id(user_id):
         raise HTTPException(status_code=404, detail="User not found")
     database.deactivate_user(user_id)
+    logger.info("User deactivated: user_id=%s by=%s", user_id, user["username"])
     return {"message": "User deactivated"}

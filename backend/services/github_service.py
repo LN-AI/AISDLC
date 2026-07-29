@@ -1,6 +1,10 @@
+import logging
+
 import httpx
 from typing import Dict, Any, Optional
 from backend import config
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubService:
@@ -32,6 +36,7 @@ class GitHubService:
             raise ValueError("GITHUB_TOKEN is not configured")
 
         owner, repo, pr_number = self._parse_pr_url(pr_url)
+        logger.info("Fetching PR diff: %s/%s#%d", owner, repo, pr_number)
 
         with httpx.Client(headers=self.headers, timeout=30) as client:
             pr_resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}")
@@ -87,8 +92,10 @@ class GitHubService:
                 json={"ref": f"refs/heads/{new_branch}", "sha": sha},
             )
             if resp.status_code == 422 and "already exists" in resp.text:
+                logger.info("Branch %s/%s:%s already exists - reusing", owner, repo, new_branch)
                 return {"branch": new_branch, "sha": sha, "already_existed": True}
             resp.raise_for_status()
+        logger.info("Created branch %s/%s:%s from %s", owner, repo, new_branch, from_branch)
         return {"branch": new_branch, "sha": sha, "already_existed": False}
 
     def get_file_content_at_ref(self, owner: str, repo: str, path: str, ref: str) -> Dict[str, Any]:
@@ -133,6 +140,7 @@ class GitHubService:
             resp.raise_for_status()
             data = resp.json()
 
+        logger.info("Committed file %s to %s/%s:%s", path, owner, repo, branch)
         return {
             "path": path,
             "commit_sha": data.get("commit", {}).get("sha", ""),
@@ -150,6 +158,7 @@ class GitHubService:
             )
             resp.raise_for_status()
             data = resp.json()
+        logger.info("Opened PR %s/%s#%s: %s -> %s", owner, repo, data.get("number"), head, base)
         return {"number": data.get("number"), "url": data.get("html_url", ""), "state": data.get("state", "")}
 
     def post_pr_comment(self, pr_url: str, comment_body: str) -> bool:
@@ -167,6 +176,7 @@ class GitHubService:
                 resp.raise_for_status()
             return True
         except Exception:
+            logger.exception("Failed to post PR comment on %s", pr_url)
             return False
 
     def _parse_url_type(self, url: str) -> Dict[str, Any]:
@@ -294,6 +304,7 @@ class GitHubService:
             )
             resp.raise_for_status()
             data = resp.json()
+        logger.info("Fetched %d open issues from %s/%s", len(data), owner, repo)
         issues = []
         for item in data:
             if "pull_request" in item:
@@ -314,6 +325,7 @@ class GitHubService:
         """Detect URL type and return the right content dict for any agent."""
         p = self._parse_url_type(ref)
         t = p["type"]
+        logger.info("fetch_for_agent: ref=%s type=%s agent=%s", ref, t, agent_name)
         if t == "pr":
             return {**self.get_pr_diff(ref), "fetch_type": "pr"}
         if t == "issue":
@@ -339,6 +351,7 @@ class GitHubService:
                 resp.raise_for_status()
             return True
         except Exception:
+            logger.exception("Failed to post issue comment on %s", issue_url)
             return False
 
     def format_pr_review_comment(self, review_result: Dict[str, Any]) -> str:
