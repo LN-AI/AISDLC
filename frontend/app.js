@@ -73,6 +73,8 @@ document.addEventListener('keydown', e => {
     if (gate && !gate.classList.contains('hidden')) closeLogin();
     const llmModal = document.getElementById('llm-config-modal');
     if (llmModal && !llmModal.classList.contains('hidden')) closeLlmConfigModal();
+    const reviewModal = document.getElementById('review-detail-modal');
+    if (reviewModal && !reviewModal.classList.contains('hidden')) closeReviewDetail();
   }
 });
 
@@ -359,7 +361,7 @@ function renderCodegenScaffold(targetId, result) {
   wrap.innerHTML = `
     <div class="result-header">
       <h2>Scaffold — ${esc(result.project_name || '')}</h2>
-      ${result.review_id ? `<a class="btn btn-primary" href="${API}/api/codegen/scaffold/${result.review_id}/download">⬇ Download ZIP</a>` : ''}
+      ${result.review_id && files.length ? `<a class="btn btn-primary" href="${API}/api/codegen/scaffold/${result.review_id}/download">⬇ Download ZIP</a>` : ''}
     </div>
 
     ${gov ? `
@@ -891,14 +893,35 @@ function renderReviewsTable(reviews) {
 }
 
 async function viewReview(id) {
+  const modal = document.getElementById('review-detail-modal');
+  const body = document.getElementById('review-detail-body');
+  const titleEl = document.getElementById('review-detail-title');
+  const subtitleEl = document.getElementById('review-detail-subtitle');
+  modal.classList.remove('hidden');
+  body.innerHTML = '<div class="empty-state">Loading…</div>';
+  titleEl.textContent = 'Review Detail';
+  subtitleEl.textContent = '—';
   try {
     const data = await apiFetch(`/api/reviews/${id}`);
     const result = data.result || {};
-    const findings = result.findings || [];
-    alert(`Review ${id.slice(0,8)}\nGate: ${data.gate_status}\nScore: ${data.risk_score}\nFindings: ${findings.length}\n\nSummary: ${result.summary || 'N/A'}`);
+    const typeLabel = (data.review_type || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || 'Review';
+    titleEl.textContent = `${typeLabel} — ${esc(data.project_name || 'Unnamed Project')}`;
+    subtitleEl.textContent = `${id} · ${data.created_at?.slice(0, 16).replace('T', ' ') || ''}`;
+    body.innerHTML = '';
+    if (data.review_type === 'vapt') {
+      renderVAPTResult('review-detail-body', result);
+    } else if (data.review_type === 'full') {
+      renderFullResult('review-detail-body', result);
+    } else {
+      renderResult('review-detail-body', result);
+    }
   } catch (e) {
-    alert('Error loading review.');
+    body.innerHTML = `<div class="summary-box" style="color:var(--red)">Error loading review: ${esc(e.message)}</div>`;
   }
+}
+
+function closeReviewDetail() {
+  document.getElementById('review-detail-modal').classList.add('hidden');
 }
 
 // ── Requirement Review ────────────────────────────────────────────────────
@@ -2895,7 +2918,8 @@ async function runHubAgent(name) {
       const inner = document.createElement('div');
       inner.id = '_hub_inner_' + name;
       resultEl.appendChild(inner);
-      renderResult('_hub_inner_' + name, review, false);
+      if (name === 'vapt') renderVAPTResult('_hub_inner_' + name, review);
+      else renderResult('_hub_inner_' + name, review, false);
     } else {
       resultEl.innerHTML = html + `<pre style="font-size:12px;color:var(--text-muted);white-space:pre-wrap">${esc(JSON.stringify(result, null, 2))}</pre>`;
     }

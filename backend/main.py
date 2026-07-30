@@ -342,8 +342,6 @@ async def full_review(req: FullReviewRequest):
 async def review_github_pr(req: GithubPRRequest):
     if not req.pr_url:
         raise HTTPException(status_code=400, detail="PR URL is required")
-    if not config.GITHUB_TOKEN:
-        raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
     if not config.ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
     try:
@@ -947,8 +945,6 @@ async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
 async def review_issue_triage(req: IssueTriageRequest):
     title, description = req.title or "", req.description or ""
     if req.github_issue_url and not (title.strip() or description.strip()):
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
         from backend.services.github_service import GitHubService
         try:
             gh = GitHubService().get_issue(req.github_issue_url)
@@ -979,8 +975,6 @@ async def review_issue_triage(req: IssueTriageRequest):
 async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
     if not req.github_repo_url.strip():
         raise HTTPException(status_code=400, detail="github_repo_url is required")
-    if not config.GITHUB_TOKEN:
-        raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
     if not config.ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
     try:

@@ -332,8 +332,6 @@ def _resolve(req) -> tuple:
     Priority: github_pr > github_file > github_repo > jira > github_issue > text fields.
     """
     def _gh(url, hint):
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured in .env")
         try:
             return _github.fetch_for_agent(url, hint)
         except Exception as e:
@@ -563,8 +561,6 @@ def run_prompt(req: PromptSafetyRequest, caller: dict = Depends(get_caller)):
     artifact_used = False
 
     if req.github_file_url:
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured")
         try:
             d = _github.fetch_for_agent(req.github_file_url, "code")
             # Treat file content as system_prompt if not already set
@@ -819,8 +815,6 @@ def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
     pb_ref = ""
 
     if req.github_pr_url:
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured")
         try:
             d = _github.fetch_for_agent(req.github_pr_url, "code")
             code = d.get("diff") or d.get("content", "")
@@ -1430,8 +1424,6 @@ def run_issue_triage(req: IssueTriageRequest, caller: dict = Depends(get_caller)
     title, description = req.title or "", req.description or ""
     src_type, src_ref = "text", title[:80]
     if req.github_issue_url and not (title.strip() or description.strip()):
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured in .env")
         try:
             gh = _github.get_issue(req.github_issue_url)
         except Exception as e:
@@ -1477,8 +1469,6 @@ one report per issue plus a severity breakdown and escalation count.
 """,
 )
 def run_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest, caller: dict = Depends(get_caller)):
-    if not config.GITHUB_TOKEN:
-        raise HTTPException(503, "GITHUB_TOKEN not configured in .env")
     override = _effective_llm_override(req, caller, "issue-triage-batch-github")
     try:
         result = agent_guard.guarded_call(

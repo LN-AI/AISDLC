@@ -262,8 +262,11 @@ the requirement.
 
 Generate the starter project files now.
 """
+        # 8000 tokens was observed truncating multi-file scaffolds down to an
+        # empty `files: []` response — a real scaffold (8-16 files with actual
+        # content) needs substantially more headroom than a findings list.
         result = llm_gateway.call_tool(
-            SCAFFOLD_SYSTEM_PROMPT, prompt, CODEGEN_SCAFFOLD_TOOL_SCHEMA, max_tokens=8000,
+            SCAFFOLD_SYSTEM_PROMPT, prompt, CODEGEN_SCAFFOLD_TOOL_SCHEMA, max_tokens=16000,
         )
         result["agent_name"] = self.agent_name
         return result

@@ -531,7 +531,14 @@ textarea { font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; }
 .tag-prompt { background: rgba(34,197,94,0.12); color: var(--green); }
 .tag-compliance { background: rgba(249,115,22,0.12); color: var(--orange); }
 .tag-full { background: rgba(168,85,247,0.15); color: #c084fc; }
-.tag-release { background: rgba(239,68,68,0.12); color: var(--red); }
+.tag-release, .tag-release_gate { background: rgba(239,68,68,0.12); color: var(--red); }
+.tag-vapt { background: rgba(236,72,153,0.15); color: #f472b6; }
+.tag-security { background: rgba(220,38,38,0.12); color: #f87171; }
+.tag-architecture { background: rgba(14,165,233,0.15); color: #38bdf8; }
+.tag-sensitive_data { background: rgba(245,158,11,0.15); color: #fbbf24; }
+.tag-codegen_scaffold, .tag-codegen_advisory { background: rgba(20,184,166,0.15); color: #2dd4bf; }
+.tag-gxp_document_check, .tag-cfr21_verification { background: rgba(139,92,246,0.15); color: #a78bfa; }
+.tag-swarm { background: rgba(107,114,128,0.2); color: #9ca3af; }
 
 /* ── Loading ── */
 .loading-overlay {

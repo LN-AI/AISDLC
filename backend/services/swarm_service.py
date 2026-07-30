@@ -99,22 +99,16 @@ class _SourceResolver:
     def resolve(self, req: SwarmRequest) -> Tuple[str, str, str, str]:
         """Return (artifact_text, source_type, display_ref, postback_ref)."""
         if req.github_pr_url:
-            if not config.GITHUB_TOKEN:
-                raise ValueError("GITHUB_TOKEN not configured in .env")
             d = self._github.fetch_for_agent(req.github_pr_url, "code")
             artifact = d.get("diff") or d.get("content", "")
             return artifact, "github_pr", d.get("title", req.github_pr_url), req.github_pr_url
 
         if req.github_file_url:
-            if not config.GITHUB_TOKEN:
-                raise ValueError("GITHUB_TOKEN not configured in .env")
             d = self._github.fetch_for_agent(req.github_file_url, "code")
             artifact = d.get("content", "")
             return artifact, "github_file", d.get("name", req.github_file_url), ""
 
         if req.github_repo_url:
-            if not config.GITHUB_TOKEN:
-                raise ValueError("GITHUB_TOKEN not configured in .env")
             d = self._github.fetch_for_agent(req.github_repo_url, "architecture")
             artifact = d.get("content", "")
             return artifact, "github_repo", d.get("repo", req.github_repo_url), ""

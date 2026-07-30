@@ -315,9 +315,15 @@ class SDLCOrchestrator:
         context = self._kb("vapt", context, artifact, project_name)
         compressed_artifact, cost_stats = self._compress(artifact)
         result = self.vapt_agent.run_vapt(compressed_artifact, context, scope)
+        findings = result.get("findings", [])
+        if not findings and not (result.get("summary") or "").strip():
+            raise RuntimeError(
+                "VAPT agent returned an empty assessment (no findings and no summary) — "
+                "this usually means the LLM response was truncated or malformed rather than "
+                "a genuine clean result. Try again or narrow the artifact/scope."
+            )
         if cost_stats:
             result["_cost_stats"] = cost_stats
-        findings = result.get("findings", [])
         review_id = database.save_review(
             review_type="vapt",
             project_name=project_name,
@@ -465,6 +471,12 @@ class SDLCOrchestrator:
         )
 
         files = result.get("files", [])
+        if not files:
+            raise RuntimeError(
+                "Scaffold generation returned no files — this usually means the LLM response "
+                "was truncated or malformed rather than a deliberate empty scaffold. Try again "
+                "with a narrower scope (fewer options, e.g. skip docker/tests) or retry."
+            )
         if auto_review and files:
             combined = "\n\n".join(f"# ── {f.get('path', '')} ──\n{f.get('content', '')}" for f in files)
             code_review = self.code_agent.review_code(combined, language, "Generated scaffold — pre-release governance check")

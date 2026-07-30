@@ -213,7 +213,12 @@ SECURITY_REVIEW_TOOL_SCHEMA = {
 
 class VAPTBaseAgent(BaseAgent):
     def _call_claude_vapt(self, user_content: str, llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return llm_gateway.call_tool(self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override)
+        # VAPT's schema is verbose (per-finding attack_scenario/proof_of_concept/
+        # cvss_vector plus a top-level attack_surface_summary) — the platform
+        # default max_tokens (4096) was observed truncating this call down to an
+        # empty findings/summary response (false "Green, 0 findings"), so this
+        # call needs more headroom than the generic REVIEW_TOOL_SCHEMA agents.
+        return llm_gateway.call_tool(self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override, max_tokens=8000)
 
     def review_vapt(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content

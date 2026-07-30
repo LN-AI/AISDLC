@@ -96,8 +96,6 @@ def run_agent(agent_name: str, req: AgentRunRequest, user=Depends(_get_user)):
     # ── 1. Fetch content from source ─────────────────────────────────────
     try:
         if req.source == "github":
-            if not config.GITHUB_TOKEN:
-                raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured in .env")
             fetched = _github.fetch_for_agent(req.ref, agent_name)
             ft = fetched.get("fetch_type", "")
             if ft == "pr":

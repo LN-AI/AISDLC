@@ -134,9 +134,14 @@ def _call_anthropic(
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
     _record_usage("anthropic", resolved_model, input_tokens, output_tokens)
     logger.info(
-        "Anthropic call tool='%s' model=%s tokens_in=%d tokens_out=%d duration=%.1fms",
-        tool_schema["name"], resolved_model, input_tokens, output_tokens, duration_ms,
+        "Anthropic call tool='%s' model=%s tokens_in=%d tokens_out=%d duration=%.1fms stop_reason=%s",
+        tool_schema["name"], resolved_model, input_tokens, output_tokens, duration_ms, response.stop_reason,
     )
+    if response.stop_reason == "max_tokens":
+        logger.warning(
+            "Anthropic call for tool '%s' hit max_tokens (%d) — response is likely truncated/incomplete",
+            tool_schema["name"], max_tokens or config.MAX_TOKENS,
+        )
     for block in response.content:
         if block.type == "tool_use" and block.name == tool_schema["name"]:
             return block.input
@@ -192,10 +197,16 @@ def _call_openai(
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
     output_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
     _record_usage("openai", resolved_model, input_tokens, output_tokens)
+    finish_reason = response.choices[0].finish_reason if response.choices else None
     logger.info(
-        "OpenAI call tool='%s' model=%s tokens_in=%d tokens_out=%d duration=%.1fms",
-        tool_schema["name"], resolved_model, input_tokens, output_tokens, duration_ms,
+        "OpenAI call tool='%s' model=%s tokens_in=%d tokens_out=%d duration=%.1fms finish_reason=%s",
+        tool_schema["name"], resolved_model, input_tokens, output_tokens, duration_ms, finish_reason,
     )
+    if finish_reason == "length":
+        logger.warning(
+            "OpenAI call for tool '%s' hit the token limit (%d) — response is likely truncated/incomplete",
+            tool_schema["name"], max_tokens or 4096,
+        )
     message = response.choices[0].message
     for call in (message.tool_calls or []):
         if call.function.name == tool_schema["name"]:
