@@ -838,7 +838,7 @@ async function loadDashboard() {
     }
     wrap.innerHTML = renderReviewsTable(data.recent_reviews);
   } catch (e) {
-    console.error(e);
+    feLog.error(e.message, { source: 'loadDashboard' });
   }
 }
 
@@ -1505,7 +1505,13 @@ async function apiFetch(url, options = {}) {
     options.headers = options.headers || {};
     options.headers['Authorization'] = 'Bearer ' + token;
   }
-  const res = await fetch(API + url, options);
+  let res;
+  try {
+    res = await fetch(API + url, options);
+  } catch (networkErr) {
+    if (!_silent) feLog.warn(`Network error calling ${url}`, { source: 'apiFetch' });
+    throw new Error('Network error. Please check your connection and try again.');
+  }
   if (!res.ok) {
     // Only log out and re-prompt when the user HAD a session that has now expired.
     // If there was never a token, a 401 just means the feature needs login — show
@@ -1520,6 +1526,7 @@ async function apiFetch(url, options = {}) {
       throw new Error('Sign in required.');
     }
     const err = await res.json().catch(() => ({ detail: res.statusText }));
+    if (!_silent) feLog.warn(`API ${res.status} on ${url}: ${err.detail || res.statusText}`, { source: 'apiFetch' });
     throw new Error(err.detail || `HTTP ${res.status}`);
   }
   return res.json();
@@ -1910,7 +1917,7 @@ async function loadKBCategories() {
       filterSel.innerHTML = '<option value="">All categories</option>' +
         _kbCategories.map(c => `<option value="${esc(c.key)}">${esc(c.label)}</option>`).join('');
     }
-  } catch (e) { console.error('Failed to load KB categories:', e); }
+  } catch (e) { feLog.error('Failed to load KB categories: ' + e.message, { source: 'loadKBCategories' }); }
 }
 
 function kbCategoryLabel(key) {
@@ -2668,7 +2675,7 @@ async function generateAllGxPDocuments() {
       _gxgState.generatedDocs.push(result);
       renderGxPGeneratedDocuments();
     } catch (e) {
-      console.error(`Failed to generate ${docType}:`, e.message);
+      feLog.error(`Failed to generate ${docType}: ${e.message}`, { source: 'gxpGenerateDocuments' });
     }
   }
   hideLoading();

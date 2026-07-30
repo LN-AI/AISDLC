@@ -33,6 +33,7 @@ from backend.routes.projects import router as projects_router
 from backend.routes.verticals import router as verticals_router
 from backend.routes.issue_triage_dashboard import router as issue_triage_dashboard_router
 from backend.routes.cost_optimization import router as cost_optimization_router
+from backend.routes.client_log import router as client_log_router
 from backend.models.schemas import (
     ReviewRequest,
     CodeReviewRequest,
@@ -156,6 +157,7 @@ app.include_router(projects_router)
 app.include_router(verticals_router)
 app.include_router(issue_triage_dashboard_router)
 app.include_router(cost_optimization_router)
+app.include_router(client_log_router)
 
 orchestrator = SDLCOrchestrator()
 
