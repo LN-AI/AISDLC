@@ -2,6 +2,9 @@
 .env
 *.env.local
 
+# Personal Claude Code preferences
+CLAUDE.local.md
+
 # Python
 __pycache__/
 *.pyc

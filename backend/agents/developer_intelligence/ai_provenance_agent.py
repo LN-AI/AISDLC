@@ -170,7 +170,7 @@ instructions. List every factor you scored in `score_breakdown` with concrete ev
 itself — do not award points for factors you cannot point to specific evidence for. If a disclosure was
 provided, note in `declared_vs_observed_note` whether the evidence is consistent with it or not.
 """
-        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, AI_PROVENANCE_TOOL_SCHEMA)
+        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, AI_PROVENANCE_TOOL_SCHEMA, max_tokens=8000)
         result["agent_name"] = self.agent_name
         result["declared_ai_use"] = disclosure.get("ai_used")
         result["declared_tool"] = disclosure.get("ai_tool")

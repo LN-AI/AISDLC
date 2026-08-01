@@ -77,13 +77,48 @@ REVIEW_TOOL_SCHEMA = {
 }
 
 
+GOVERNANCE_SUMMARY_TOOL_SCHEMA = {
+    "name": "submit_governance_summary",
+    "description": "Submit an executive summary and recommendations for a gate decision that has already been computed deterministically — do not re-derive or echo back the underlying findings.",
+    "input_schema": {
+        "type": "object",
+        "required": ["summary", "recommendations", "compliance_flags"],
+        "properties": {
+            "summary": {
+                "type": "string",
+                "description": "Executive summary explaining the already-computed gate decision, 2-4 sentences",
+            },
+            "recommendations": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Top 3-5 prioritized recommendations",
+            },
+            "compliance_flags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Compliance frameworks triggered e.g. HIPAA, GDPR, OWASP-LLM01",
+            },
+        },
+    },
+}
+
+
 class BaseAgent:
     def __init__(self, agent_name: str, system_prompt: str):
         self.agent_name = agent_name
         self.system_prompt = system_prompt
 
     def _call_claude(self, user_content: str, llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return llm_gateway.call_tool(self.system_prompt, user_content, REVIEW_TOOL_SCHEMA, llm_override)
+        # This is the shared path for every plain reviewer (requirement, code, compliance,
+        # prompt, sensitive-data, etc.) — REVIEW_TOOL_SCHEMA requires a full per-finding
+        # object (control_id/severity/risk_level/title/description/recommendation/is_blocking)
+        # for every finding plus summary/recommendations/compliance_flags. At the old 4096
+        # default, any review with a realistic number of findings (~10+) could truncate — this
+        # was previously invisible because a truncated response silently rendered as an empty
+        # "clean" result; now that truncation raises instead of swallowing, it surfaced as a
+        # real 502 on a requirement review with 12 findings. 8000 matches the floor already
+        # established for VAPT/security's comparably-sized schemas.
+        return llm_gateway.call_tool(self.system_prompt, user_content, REVIEW_TOOL_SCHEMA, llm_override, max_tokens=8000)
 
     def review(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content
@@ -91,6 +126,20 @@ class BaseAgent:
             user_content = f"Context:\n{context}\n\n---\n\nContent to Review:\n{content}"
 
         result = self._call_claude(user_content, llm_override)
+        result["agent_name"] = self.agent_name
+        return result
+
+    def prose_summary(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """For agents whose gate_status/risk_score/findings are computed deterministically
+        in Python (release-gate, report-generate) — asks the model only for prose (summary,
+        recommendations, compliance_flags) via GOVERNANCE_SUMMARY_TOOL_SCHEMA, instead of
+        REVIEW_TOOL_SCHEMA which forces a full findings re-echo the caller would discard
+        anyway. 4096 gives real margin over the schema's actual size (3 small fields) rather
+        than being tuned to exactly fit today's typical response."""
+        user_content = content
+        if context:
+            user_content = f"Context:\n{context}\n\n---\n\nContent to Review:\n{content}"
+        result = llm_gateway.call_tool(self.system_prompt, user_content, GOVERNANCE_SUMMARY_TOOL_SCHEMA, llm_override, max_tokens=4096)
         result["agent_name"] = self.agent_name
         return result
 
@@ -213,7 +262,14 @@ SECURITY_REVIEW_TOOL_SCHEMA = {
 
 class VAPTBaseAgent(BaseAgent):
     def _call_claude_vapt(self, user_content: str, llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return llm_gateway.call_tool(self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override)
+        # VAPT's schema is verbose (per-finding attack_scenario/proof_of_concept/
+        # cvss_vector plus a top-level attack_surface_summary) — the platform
+        # default max_tokens (4096) was observed truncating this call down to an
+        # empty findings/summary response (false "Green, 0 findings"), so this
+        # call needs more headroom than the generic REVIEW_TOOL_SCHEMA agents.
+        # 8000 was still observed truncating (confirmed via the new truncation-raising
+        # error path rather than a silent empty result) — bumped further to 14000.
+        return llm_gateway.call_tool(self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override, max_tokens=14000)
 
     def review_vapt(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content
@@ -334,7 +390,13 @@ ARCHITECTURE_TOOL_SCHEMA = {
 
 class ArchitectureBaseAgent(BaseAgent):
     def _call_claude_architecture(self, user_content: str, llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return llm_gateway.call_tool(self.system_prompt, user_content, ARCHITECTURE_TOOL_SCHEMA, llm_override)
+        # This is the most deeply-nested schema in the codebase (quality_scores +
+        # anti_patterns[] + single_points_of_failure[] + alternative_recommendations[],
+        # each with their own sub-arrays) with risk_score/gate_status/summary near the
+        # end — the platform default max_tokens (4096) was observed truncating the
+        # response after the specialized arrays but before those tail fields, giving a
+        # false "Green, 0 findings" gate despite real anti-patterns/SPOFs being found.
+        return llm_gateway.call_tool(self.system_prompt, user_content, ARCHITECTURE_TOOL_SCHEMA, llm_override, max_tokens=16000)
 
     def review_architecture(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content
@@ -347,7 +409,11 @@ class ArchitectureBaseAgent(BaseAgent):
 
 class SecurityReviewBaseAgent(BaseAgent):
     def _call_claude_security(self, user_content: str, llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return llm_gateway.call_tool(self.system_prompt, user_content, SECURITY_REVIEW_TOOL_SCHEMA, llm_override)
+        # SECURITY_REVIEW_TOOL_SCHEMA adds stride_threats[]/trust_boundaries[] on top of
+        # the generic findings[], comparable per-finding verbosity to VAPT_TOOL_SCHEMA —
+        # 8000 still truncated in practice (confirmed via the truncation-raising error,
+        # not silently), so this matches VAPT's proven 14000 level.
+        return llm_gateway.call_tool(self.system_prompt, user_content, SECURITY_REVIEW_TOOL_SCHEMA, llm_override, max_tokens=14000)
 
     def review_security(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content

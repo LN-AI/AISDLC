@@ -73,6 +73,8 @@ document.addEventListener('keydown', e => {
     if (gate && !gate.classList.contains('hidden')) closeLogin();
     const llmModal = document.getElementById('llm-config-modal');
     if (llmModal && !llmModal.classList.contains('hidden')) closeLlmConfigModal();
+    const reviewModal = document.getElementById('review-detail-modal');
+    if (reviewModal && !reviewModal.classList.contains('hidden')) closeReviewDetail();
   }
 });
 
@@ -359,7 +361,7 @@ function renderCodegenScaffold(targetId, result) {
   wrap.innerHTML = `
     <div class="result-header">
       <h2>Scaffold — ${esc(result.project_name || '')}</h2>
-      ${result.review_id ? `<a class="btn btn-primary" href="${API}/api/codegen/scaffold/${result.review_id}/download">⬇ Download ZIP</a>` : ''}
+      ${result.review_id && files.length ? `<a class="btn btn-primary" href="${API}/api/codegen/scaffold/${result.review_id}/download">⬇ Download ZIP</a>` : ''}
     </div>
 
     ${gov ? `
@@ -838,7 +840,7 @@ async function loadDashboard() {
     }
     wrap.innerHTML = renderReviewsTable(data.recent_reviews);
   } catch (e) {
-    console.error(e);
+    feLog.error(e.message, { source: 'loadDashboard' });
   }
 }
 
@@ -891,14 +893,35 @@ function renderReviewsTable(reviews) {
 }
 
 async function viewReview(id) {
+  const modal = document.getElementById('review-detail-modal');
+  const body = document.getElementById('review-detail-body');
+  const titleEl = document.getElementById('review-detail-title');
+  const subtitleEl = document.getElementById('review-detail-subtitle');
+  modal.classList.remove('hidden');
+  body.innerHTML = '<div class="empty-state">Loading…</div>';
+  titleEl.textContent = 'Review Detail';
+  subtitleEl.textContent = '—';
   try {
     const data = await apiFetch(`/api/reviews/${id}`);
     const result = data.result || {};
-    const findings = result.findings || [];
-    alert(`Review ${id.slice(0,8)}\nGate: ${data.gate_status}\nScore: ${data.risk_score}\nFindings: ${findings.length}\n\nSummary: ${result.summary || 'N/A'}`);
+    const typeLabel = (data.review_type || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || 'Review';
+    titleEl.textContent = `${typeLabel} — ${esc(data.project_name || 'Unnamed Project')}`;
+    subtitleEl.textContent = `${id} · ${data.created_at?.slice(0, 16).replace('T', ' ') || ''}`;
+    body.innerHTML = '';
+    if (data.review_type === 'vapt') {
+      renderVAPTResult('review-detail-body', result);
+    } else if (data.review_type === 'full') {
+      renderFullResult('review-detail-body', result);
+    } else {
+      renderResult('review-detail-body', result);
+    }
   } catch (e) {
-    alert('Error loading review.');
+    body.innerHTML = `<div class="summary-box" style="color:var(--red)">Error loading review: ${esc(e.message)}</div>`;
   }
+}
+
+function closeReviewDetail() {
+  document.getElementById('review-detail-modal').classList.add('hidden');
 }
 
 // ── Requirement Review ────────────────────────────────────────────────────
@@ -1184,19 +1207,39 @@ async function runFullReview() {
     return;
   }
 
-  showLoading('Running Full SDLC Review (this may take 30–60 seconds)...');
+  showLoading('Submitting Full SDLC Review…');
   try {
-    const result = await apiFetch('/api/review/full', {
+    const submitResp = await apiFetch('/api/review/full', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence }),
     });
+    const result = await pollFullReviewJob(submitResp.job_id);
     renderFullResult('full-result', result);
     loadDashboard();
   } catch (e) {
     showError('full-result', e.message);
   } finally {
     hideLoading();
+  }
+}
+
+// full_review chains up to 7 sequential LLM calls and can run 300s+, so the
+// backend returns a job_id immediately (202) instead of blocking the request —
+// poll for progress and show the live step label instead of a static message.
+async function pollFullReviewJob(jobId) {
+  while (true) {
+    const job = await apiFetch(`/api/review/full/jobs/${jobId}`, { _silent: true });
+    if (job.status === 'completed') return job.result;
+    if (job.status === 'failed') {
+      const err = job.error || {};
+      throw new Error(err.detail || 'Full SDLC Review failed.');
+    }
+    const label = job.step_label
+      ? `Running Full SDLC Review — step ${job.current_step}/${job.total_steps}: ${job.step_label}…`
+      : 'Running Full SDLC Review…';
+    showLoading(label);
+    await new Promise(resolve => setTimeout(resolve, 2500));
   }
 }
 
@@ -1505,7 +1548,13 @@ async function apiFetch(url, options = {}) {
     options.headers = options.headers || {};
     options.headers['Authorization'] = 'Bearer ' + token;
   }
-  const res = await fetch(API + url, options);
+  let res;
+  try {
+    res = await fetch(API + url, options);
+  } catch (networkErr) {
+    if (!_silent) feLog.warn(`Network error calling ${url}`, { source: 'apiFetch' });
+    throw new Error('Network error. Please check your connection and try again.');
+  }
   if (!res.ok) {
     // Only log out and re-prompt when the user HAD a session that has now expired.
     // If there was never a token, a 401 just means the feature needs login — show
@@ -1520,7 +1569,12 @@ async function apiFetch(url, options = {}) {
       throw new Error('Sign in required.');
     }
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    // Legacy routes now nest a structured error body inside `detail` (see
+    // backend/services/error_utils.py) — {detail: {detail: "...", error_type, ...}} —
+    // so unwrap one level when detail isn't already a plain string.
+    const detailMsg = (err.detail && typeof err.detail === 'object') ? (err.detail.detail || JSON.stringify(err.detail)) : err.detail;
+    if (!_silent) feLog.warn(`API ${res.status} on ${url}: ${detailMsg || res.statusText}`, { source: 'apiFetch' });
+    throw new Error(detailMsg || `HTTP ${res.status}`);
   }
   return res.json();
 }
@@ -1910,7 +1964,7 @@ async function loadKBCategories() {
       filterSel.innerHTML = '<option value="">All categories</option>' +
         _kbCategories.map(c => `<option value="${esc(c.key)}">${esc(c.label)}</option>`).join('');
     }
-  } catch (e) { console.error('Failed to load KB categories:', e); }
+  } catch (e) { feLog.error('Failed to load KB categories: ' + e.message, { source: 'loadKBCategories' }); }
 }
 
 function kbCategoryLabel(key) {
@@ -2668,7 +2722,7 @@ async function generateAllGxPDocuments() {
       _gxgState.generatedDocs.push(result);
       renderGxPGeneratedDocuments();
     } catch (e) {
-      console.error(`Failed to generate ${docType}:`, e.message);
+      feLog.error(`Failed to generate ${docType}: ${e.message}`, { source: 'gxpGenerateDocuments' });
     }
   }
   hideLoading();
@@ -2888,7 +2942,8 @@ async function runHubAgent(name) {
       const inner = document.createElement('div');
       inner.id = '_hub_inner_' + name;
       resultEl.appendChild(inner);
-      renderResult('_hub_inner_' + name, review, false);
+      if (name === 'vapt') renderVAPTResult('_hub_inner_' + name, review);
+      else renderResult('_hub_inner_' + name, review, false);
     } else {
       resultEl.innerHTML = html + `<pre style="font-size:12px;color:var(--text-muted);white-space:pre-wrap">${esc(JSON.stringify(result, null, 2))}</pre>`;
     }

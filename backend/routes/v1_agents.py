@@ -19,6 +19,7 @@ POST /api/v1/agents/release-gate — release readiness decision
 POST /api/v1/agents/full         — full SDLC review (all agents, one call)
 """
 import io
+import logging
 import zipfile
 from datetime import datetime, timezone
 from typing import Optional
@@ -55,7 +56,7 @@ from backend.models.api_models import (
     TestScenarioRequest,
     VAPTRequest,
 )
-from backend.services import agent_guard, llm_gateway
+from backend.services import agent_guard, llm_gateway, job_service
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
     check_and_record_rate_limit,
@@ -66,6 +67,8 @@ from backend.services.auth_service import decode_token
 from backend.services.github_service import GitHubService
 from backend.services.jira_service import JiraService
 from backend.services.orchestrator import SDLCOrchestrator
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/agents", tags=["Agents v1"])
 
@@ -290,6 +293,7 @@ def get_caller(
     if api_key:
         record = validate_api_key(api_key)
         if not record:
+            logger.warning("Rejected invalid/revoked API key on %s", request.url.path)
             raise HTTPException(status_code=401, detail="Invalid or revoked API key.")
 
         rl = check_and_record_rate_limit(record, request.url.path)
@@ -298,6 +302,7 @@ def get_caller(
         response.headers["X-RateLimit-Limit-Day"] = str(rl["limit_per_day"])
         response.headers["X-RateLimit-Remaining-Day"] = str(rl["remaining_per_day"])
         if not rl["allowed"]:
+            logger.warning("Rate limit exceeded for team '%s' on %s", record["team_name"], request.url.path)
             raise HTTPException(
                 status_code=429,
                 detail=(
@@ -312,6 +317,7 @@ def get_caller(
         user = decode_token(bearer.credentials)
         if user:
             return {"type": "jwt", "team": user.get("username", "ui"), "username": user.get("username")}
+    logger.warning("Rejected unauthenticated request on %s", request.url.path)
     raise HTTPException(
         status_code=401,
         detail="Authentication required. Supply 'X-API-Key: lmsdlc_...' or 'Authorization: Bearer <jwt>'.",
@@ -326,11 +332,10 @@ def _resolve(req) -> tuple:
     Priority: github_pr > github_file > github_repo > jira > github_issue > text fields.
     """
     def _gh(url, hint):
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured in .env")
         try:
             return _github.fetch_for_agent(url, hint)
         except Exception as e:
+            logger.exception("GitHub fetch failed for %s", url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
 
     def _jr(ref):
@@ -339,6 +344,7 @@ def _resolve(req) -> tuple:
         try:
             return _jira.get_issue(ref)
         except Exception as e:
+            logger.exception("Jira fetch failed for %s", ref)
             raise HTTPException(502, f"Jira fetch failed: {e}")
 
     pr  = getattr(req, "github_pr_url",    None)
@@ -404,13 +410,23 @@ def _do_postback(source_type: str, ref: str, result: dict) -> str:
             ok = _jira.post_comment(ref, "\n".join(lines))
             return "posted" if ok else "failed"
     except Exception as e:
+        logger.exception("Post-back to %s failed for %s", source_type, ref)
         return f"failed: {str(e)[:100]}"
     return "not_requested"
 
 
 def _wrap(agent: str, result: dict, source_type: str, source_ref: str,
           pb_status: str, project_name: str, llm_used: Optional[dict] = None) -> dict:
-    findings = result.get("findings", [])
+    # `full` (orchestrator.full_review) returns `top_findings` (top 10 only) /
+    # `overall_risk_score` instead of `findings`/`risk_score` — every other agent
+    # returns `findings`/`risk_score` directly, so the fallback only kicks in for
+    # `full`. Without it, `total_findings`/`risk_score` silently reset to 0/0 here
+    # even when the underlying review found real Critical findings — this was
+    # invisible before because `full` never completed under the old synchronous
+    # endpoint (always timed out), so this branch was never actually exercised.
+    findings = result.get("findings", result.get("top_findings", []))
+    risk_score = result.get("risk_score", result.get("overall_risk_score", 0))
+    total_findings = result.get("total_findings", len(findings))
     CORE = {"findings", "risk_score", "gate_status", "summary", "recommendations",
             "compliance_flags", "review_id", "agent_name", "critical_count",
             "high_count", "total_findings"}
@@ -423,8 +439,8 @@ def _wrap(agent: str, result: dict, source_type: str, source_ref: str,
         "review_id": result.get("review_id"),
         "project_name": project_name or "",
         "gate_status": result.get("gate_status", "Green"),
-        "risk_score": float(result.get("risk_score", 0)),
-        "total_findings": len(findings),
+        "risk_score": float(risk_score),
+        "total_findings": total_findings,
         "critical_count": result.get("critical_count", sum(1 for f in findings if f.get("severity") == 5)),
         "high_count": result.get("high_count",    sum(1 for f in findings if f.get("severity") == 4)),
         "summary": result.get("summary", ""),
@@ -554,8 +570,6 @@ def run_prompt(req: PromptSafetyRequest, caller: dict = Depends(get_caller)):
     artifact_used = False
 
     if req.github_file_url:
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured")
         try:
             d = _github.fetch_for_agent(req.github_file_url, "code")
             # Treat file content as system_prompt if not already set
@@ -565,6 +579,7 @@ def run_prompt(req: PromptSafetyRequest, caller: dict = Depends(get_caller)):
             src_ref  = d.get("name", req.github_file_url)
             artifact_used = True
         except Exception as e:
+            logger.exception("GitHub file fetch failed for %s", req.github_file_url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
 
     if not any([req.system_prompt, req.user_prompt, req.tool_definitions, req.rag_config]):
@@ -798,10 +813,15 @@ def run_release_gate(req: ReleaseGateRequest, caller: dict = Depends(get_caller)
 
 All findings are aggregated and passed to the Release Gate agent. A consolidated report is generated.
 
-**Returns:** Gate decision, sub-review summary, top 10 findings, report ID.
+This chains up to 7 sequential LLM calls (each potentially 60-150s+), so it does not run
+synchronously — it returns a `job_id` immediately (202 Accepted). Poll
+`GET /api/v1/agents/jobs/{job_id}` for live step progress (`current_step`/`total_steps`/
+`step_label`) and, once `status` is `completed` or `failed`, the same result/error shape
+this endpoint used to return directly.
 """,
+    status_code=202,
 )
-def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
+async def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
     requirement = None
     code = None
     src_type = "text"
@@ -809,13 +829,12 @@ def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
     pb_ref = ""
 
     if req.github_pr_url:
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured")
         try:
             d = _github.fetch_for_agent(req.github_pr_url, "code")
             code = d.get("diff") or d.get("content", "")
             src_type, src_ref, pb_ref = "github_pr", d.get("title", req.github_pr_url), req.github_pr_url
         except Exception as e:
+            logger.exception("GitHub PR fetch failed for %s", req.github_pr_url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
 
     elif req.jira_ticket:
@@ -826,6 +845,7 @@ def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
             requirement = issue.get("content", "")
             src_type, src_ref, pb_ref = "jira", issue.get("title", req.jira_ticket), req.jira_ticket
         except Exception as e:
+            logger.exception("Jira fetch failed for %s", req.jira_ticket)
             raise HTTPException(502, f"Jira fetch failed: {e}")
 
     elif req.text:
@@ -838,21 +858,52 @@ def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
 
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
     override = _effective_llm_override(req, caller, "full")
-    result = agent_guard.guarded_call(
-        caller, "full", override,
-        lambda: _orch.full_review(
-            requirement=requirement,
-            compliance_artifact=req.compliance_artifact,
-            architecture=req.architecture,
-            code=code,
-            prompt_config=req.prompt_config,
-            test_evidence=req.test_evidence or "",
-            project_name=req.project_name or src_ref[:60] or "Full Review",
-            context=ctx,
-        ),
-    )
-    pb = _do_postback(src_type, pb_ref, result) if req.post_back and pb_ref else "not_requested"
-    return _wrap("full", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+    total_steps = sum([
+        bool(requirement), bool(req.compliance_artifact), bool(req.architecture),
+        bool(code), bool(req.prompt_config),
+    ]) + 2  # release gate + report generation always run
+
+    def _run(on_progress):
+        result = agent_guard.guarded_call(
+            caller, "full", override,
+            lambda: _orch.full_review(
+                requirement=requirement,
+                compliance_artifact=req.compliance_artifact,
+                architecture=req.architecture,
+                code=code,
+                prompt_config=req.prompt_config,
+                test_evidence=req.test_evidence or "",
+                project_name=req.project_name or src_ref[:60] or "Full Review",
+                context=ctx,
+                on_progress=on_progress,
+            ),
+        )
+        pb = _do_postback(src_type, pb_ref, result) if req.post_back and pb_ref else "not_requested"
+        return _wrap("full", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+    job_id = job_service.start_job("full", total_steps, _run)
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/api/v1/agents/jobs/{job_id}"}
+
+
+@router.get(
+    "/jobs/{job_id}",
+    summary="Poll status/progress of a background agent job (currently only /full uses this)",
+    description="""Returns the current status of a job created by `POST /api/v1/agents/full`.
+
+`status` is one of `queued` / `running` / `completed` / `failed`. While running,
+`current_step`/`total_steps`/`step_label` show which of the sequential sub-agent
+calls is in flight (e.g. "3 of 7: Architecture Review"). Once `completed`, `result`
+holds the same payload the endpoint used to return directly. Once `failed`, `error`
+holds a structured error body (same shape as the platform's other error responses:
+`detail`, `error_type`, `request_id`, etc.).
+""",
+)
+def get_job(job_id: str, caller: dict = Depends(get_caller)):
+    job = job_service.get_job_status(job_id)
+    if not job:
+        raise HTTPException(404, f"No job found with id '{job_id}'")
+    return job
 
 
 # ── 11. Code Generation — Advisory ────────────────────────────────────────
@@ -1418,11 +1469,10 @@ def run_issue_triage(req: IssueTriageRequest, caller: dict = Depends(get_caller)
     title, description = req.title or "", req.description or ""
     src_type, src_ref = "text", title[:80]
     if req.github_issue_url and not (title.strip() or description.strip()):
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(503, "GITHUB_TOKEN not configured in .env")
         try:
             gh = _github.get_issue(req.github_issue_url)
         except Exception as e:
+            logger.exception("GitHub issue fetch failed for %s", req.github_issue_url)
             raise HTTPException(502, f"GitHub fetch failed: {e}")
         title, description = gh.get("title", ""), gh.get("body", "")
         src_type, src_ref = "github_issue", title[:80]
@@ -1464,8 +1514,6 @@ one report per issue plus a severity breakdown and escalation count.
 """,
 )
 def run_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest, caller: dict = Depends(get_caller)):
-    if not config.GITHUB_TOKEN:
-        raise HTTPException(503, "GITHUB_TOKEN not configured in .env")
     override = _effective_llm_override(req, caller, "issue-triage-batch-github")
     try:
         result = agent_guard.guarded_call(
@@ -1479,6 +1527,7 @@ def run_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest, caller: di
     except (HTTPException, ScopeDeniedError, BudgetExceededError):
         raise
     except Exception as e:
+        logger.exception("GitHub repo issue batch fetch failed for %s", req.github_repo_url)
         raise HTTPException(502, f"GitHub fetch failed: {e}")
     return {
         "success": True,

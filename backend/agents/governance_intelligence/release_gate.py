@@ -1,6 +1,9 @@
+import logging
 from backend.agents.base_agent import BaseAgent
 from backend.controls.control_library import ALL_CONTROLS
 from typing import Dict, Any, List
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """You are the LM AI-SDLC Release Gate Agent — the final governance checkpoint before a feature moves to production.
@@ -87,6 +90,20 @@ class ReleaseGateAgent(BaseAgent):
         release_version: str = "",
         evidence_summary: str = "",
     ) -> Dict[str, Any]:
+        # A sub-agent's findings array is not schema-enforced by Anthropic's tool-use —
+        # it has been observed containing plain strings instead of finding objects,
+        # which crashes _format_findings/_compute_gate's f.get(...) calls with
+        # AttributeError. Drop non-dict entries defensively rather than crash the
+        # whole gate evaluation over one malformed upstream finding.
+        dict_findings = [f for f in all_findings if isinstance(f, dict)]
+        dropped = len(all_findings) - len(dict_findings)
+        if dropped:
+            logger.warning(
+                "release_gate.evaluate_gate: dropped %d non-dict finding(s) from all_findings "
+                "(project=%s, release_version=%s)", dropped, project_name, release_version,
+            )
+        all_findings = dict_findings
+
         findings_text = self._format_findings(all_findings)
 
         blocking_controls = [c for c in ALL_CONTROLS.values() if c.blocking]
@@ -94,7 +111,18 @@ class ReleaseGateAgent(BaseAgent):
             f"- {c.id}: {c.title}" for c in blocking_controls
         )
 
-        prompt = f"""Please evaluate the release gate for the following project.
+        # The gate decision itself must never depend on the model correctly
+        # echoing back every aggregated finding it was shown — with dozens of
+        # findings from multiple prior reviews, that echo can silently
+        # truncate under the token budget and produce a false "Green, 0
+        # findings" gate. Compute gate_status/risk_score/findings
+        # deterministically from the real data instead (same approach as
+        # report_generator.py), and only ask the model for prose.
+        gate_status, risk_score = self._compute_gate(all_findings)
+
+        prompt = f"""The release gate decision has already been computed deterministically from the
+underlying findings: {gate_status} (risk score {risk_score:.1f}/100). Do not re-decide the gate status
+or risk score — your job is only to explain it and recommend next steps.
 
 PROJECT: {project_name or 'Unnamed'}
 VERSION: {release_version or 'Unknown'}
@@ -108,18 +136,45 @@ EVIDENCE PROVIDED:
 MANDATORY BLOCKING CONTROLS (any violation = Red gate):
 {blocking_list}
 
-Based on all findings and evidence, make a final release gate decision:
-- Determine: Green / Amber / Red
-- List every blocking issue (for Red) or approval condition (for Amber)
-- State which approvers are required
-- Provide overall risk score
-- Give a clear executive summary of the release readiness
+Given the computed gate status of {gate_status}, provide:
+- A clear executive summary explaining why this gate status was reached, suitable for a dashboard
+- Top 3-5 prioritized recommendations to move toward Green
+- Which approvers are required for this gate status
+- Any compliance frameworks flagged by the findings
 
 Be decisive and specific.
 """
-        result = self.review(prompt)
-        result["review_type"] = "release"
-        return result
+        llm_result = self.prose_summary(prompt)
+        return {
+            "gate_status": gate_status,
+            "risk_score": risk_score,
+            "findings": all_findings,
+            "total_findings": len(all_findings),
+            "summary": llm_result.get("summary", ""),
+            "recommendations": llm_result.get("recommendations", []),
+            "compliance_flags": llm_result.get("compliance_flags", []),
+            "agent_name": llm_result.get("agent_name", self.agent_name),
+            "review_type": "release",
+        }
+
+    @staticmethod
+    def _compute_gate(all_findings: List[Dict[str, Any]]) -> "tuple[str, float]":
+        """Deterministic gate decision from real findings — never left to the
+        model's own echo. Mirrors orchestrator._calculate_overall_risk's
+        max*0.5 + avg*0.5 weighting so there's one risk-scoring philosophy
+        across the platform."""
+        if not all_findings:
+            return "Green", 0.0
+        if any(f.get("severity") == 5 or f.get("is_blocking") for f in all_findings):
+            gate_status = "Red"
+        elif any(f.get("severity") == 4 for f in all_findings):
+            gate_status = "Amber"
+        else:
+            gate_status = "Green"
+        scores = [f.get("severity", 1) * 20 for f in all_findings]
+        weighted = max(scores) * 0.5 + sum(scores) / len(scores) * 0.5
+        risk_score = round(min(weighted, 100.0), 1)
+        return gate_status, risk_score
 
     def _format_findings(self, findings: List[Dict[str, Any]]) -> str:
         if not findings:

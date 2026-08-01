@@ -115,7 +115,7 @@ class SensitiveDataAgent(BaseAgent):
         )
 
     def _call_claude(self, user_content: str):
-        return llm_gateway.call_tool(self.system_prompt, user_content, SENSITIVE_DATA_TOOL_SCHEMA)
+        return llm_gateway.call_tool(self.system_prompt, user_content, SENSITIVE_DATA_TOOL_SCHEMA, max_tokens=8000)
 
     def scan(self, content: str, context: str = "", project_name: str = "") -> dict:
         controls_summary = "\n".join(

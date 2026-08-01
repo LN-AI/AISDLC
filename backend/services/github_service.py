@@ -1,6 +1,10 @@
+import logging
+
 import httpx
 from typing import Dict, Any, Optional
 from backend import config
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubService:
@@ -9,10 +13,26 @@ class GitHubService:
     def __init__(self):
         self.token = config.GITHUB_TOKEN
         self.headers = {
-            "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github.v3+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
+        if self.token:
+            self.headers["Authorization"] = f"Bearer {self.token}"
+
+    def _raise_friendly(self, resp: httpx.Response) -> None:
+        """Like resp.raise_for_status(), but explains 403/404s that are likely
+        caused by GitHub's unauthenticated rate limit or a private repo when no
+        GITHUB_TOKEN is configured, instead of a bare GitHub error body."""
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            if not self.token and resp.status_code in (401, 403, 404):
+                raise ValueError(
+                    f"GitHub request failed (status {resp.status_code}) without GITHUB_TOKEN — "
+                    "this may be a private repo or GitHub's unauthenticated rate limit (60 req/hr) "
+                    "was hit. Set GITHUB_TOKEN in .env for private repos or higher limits."
+                ) from e
+            raise
 
     def _parse_pr_url(self, pr_url: str) -> tuple[str, str, int]:
         """Parse https://github.com/owner/repo/pull/123 into (owner, repo, pr_number)."""
@@ -27,15 +47,14 @@ class GitHubService:
             raise ValueError(f"Invalid GitHub PR URL: {pr_url}") from e
 
     def get_pr_diff(self, pr_url: str) -> Dict[str, Any]:
-        """Fetch PR metadata and diff content."""
-        if not self.token:
-            raise ValueError("GITHUB_TOKEN is not configured")
-
+        """Fetch PR metadata and diff content. Works unauthenticated for public
+        repos (GitHub allows anonymous reads at a lower rate limit)."""
         owner, repo, pr_number = self._parse_pr_url(pr_url)
+        logger.info("Fetching PR diff: %s/%s#%d", owner, repo, pr_number)
 
         with httpx.Client(headers=self.headers, timeout=30) as client:
             pr_resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}")
-            pr_resp.raise_for_status()
+            self._raise_friendly(pr_resp)
             pr_data = pr_resp.json()
 
             diff_headers = {**self.headers, "Accept": "application/vnd.github.v3.diff"}
@@ -43,13 +62,13 @@ class GitHubService:
                 f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}",
                 headers=diff_headers,
             )
-            diff_resp.raise_for_status()
+            self._raise_friendly(diff_resp)
             diff_content = diff_resp.text
 
             files_resp = client.get(
                 f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}/files"
             )
-            files_resp.raise_for_status()
+            self._raise_friendly(files_resp)
             files_data = files_resp.json()
 
         return {
@@ -87,8 +106,10 @@ class GitHubService:
                 json={"ref": f"refs/heads/{new_branch}", "sha": sha},
             )
             if resp.status_code == 422 and "already exists" in resp.text:
+                logger.info("Branch %s/%s:%s already exists - reusing", owner, repo, new_branch)
                 return {"branch": new_branch, "sha": sha, "already_existed": True}
             resp.raise_for_status()
+        logger.info("Created branch %s/%s:%s from %s", owner, repo, new_branch, from_branch)
         return {"branch": new_branch, "sha": sha, "already_existed": False}
 
     def get_file_content_at_ref(self, owner: str, repo: str, path: str, ref: str) -> Dict[str, Any]:
@@ -133,6 +154,7 @@ class GitHubService:
             resp.raise_for_status()
             data = resp.json()
 
+        logger.info("Committed file %s to %s/%s:%s", path, owner, repo, branch)
         return {
             "path": path,
             "commit_sha": data.get("commit", {}).get("sha", ""),
@@ -150,6 +172,7 @@ class GitHubService:
             )
             resp.raise_for_status()
             data = resp.json()
+        logger.info("Opened PR %s/%s#%s: %s -> %s", owner, repo, data.get("number"), head, base)
         return {"number": data.get("number"), "url": data.get("html_url", ""), "state": data.get("state", "")}
 
     def post_pr_comment(self, pr_url: str, comment_body: str) -> bool:
@@ -167,6 +190,7 @@ class GitHubService:
                 resp.raise_for_status()
             return True
         except Exception:
+            logger.exception("Failed to post PR comment on %s", pr_url)
             return False
 
     def _parse_url_type(self, url: str) -> Dict[str, Any]:
@@ -190,14 +214,13 @@ class GitHubService:
         return {"type": "repo", "owner": owner, "repo": repo}
 
     def get_issue(self, issue_url: str) -> Dict[str, Any]:
-        """Fetch a GitHub issue (title, body, comments)."""
-        if not self.token:
-            raise ValueError("GITHUB_TOKEN is not configured")
+        """Fetch a GitHub issue (title, body, comments). Works unauthenticated
+        for public repos."""
         p = self._parse_url_type(issue_url)
         owner, repo, number = p["owner"], p["repo"], p["number"]
         with httpx.Client(headers=self.headers, timeout=30) as client:
             resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/issues/{number}")
-            resp.raise_for_status()
+            self._raise_friendly(resp)
             data = resp.json()
             cr = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/issues/{number}/comments")
             comments = cr.json() if cr.is_success else []
@@ -219,9 +242,8 @@ class GitHubService:
         }
 
     def get_file_content(self, file_url: str) -> Dict[str, Any]:
-        """Fetch a single file from a GitHub repo."""
-        if not self.token:
-            raise ValueError("GITHUB_TOKEN is not configured")
+        """Fetch a single file from a GitHub repo. Works unauthenticated for
+        public repos."""
         import base64
         p = self._parse_url_type(file_url)
         owner, repo = p["owner"], p["repo"]
@@ -232,7 +254,7 @@ class GitHubService:
                 f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{path}",
                 params={"ref": branch},
             )
-            resp.raise_for_status()
+            self._raise_friendly(resp)
             data = resp.json()
         content = base64.b64decode(data["content"]).decode("utf-8", errors="ignore")
         return {
@@ -242,9 +264,8 @@ class GitHubService:
         }
 
     def get_repo_overview(self, repo_url: str) -> Dict[str, Any]:
-        """Fetch README + architecture docs from a repo for architecture/security review."""
-        if not self.token:
-            raise ValueError("GITHUB_TOKEN is not configured")
+        """Fetch README + architecture docs from a repo for architecture/security
+        review. Works unauthenticated for public repos."""
         import base64
         p = self._parse_url_type(repo_url)
         owner, repo = p["owner"], p["repo"]
@@ -281,9 +302,8 @@ class GitHubService:
         }
 
     def list_open_issues(self, repo_url: str, limit: int = 10) -> list:
-        """List open issues (not PRs) for a repo, most recently updated first."""
-        if not self.token:
-            raise ValueError("GITHUB_TOKEN is not configured")
+        """List open issues (not PRs) for a repo, most recently updated first.
+        Works unauthenticated for public repos."""
         p = self._parse_url_type(repo_url)
         owner, repo = p["owner"], p["repo"]
         limit = max(1, min(limit, 25))
@@ -292,8 +312,9 @@ class GitHubService:
                 f"{self.BASE_URL}/repos/{owner}/{repo}/issues",
                 params={"state": "open", "sort": "updated", "direction": "desc", "per_page": limit},
             )
-            resp.raise_for_status()
+            self._raise_friendly(resp)
             data = resp.json()
+        logger.info("Fetched %d open issues from %s/%s", len(data), owner, repo)
         issues = []
         for item in data:
             if "pull_request" in item:
@@ -314,6 +335,7 @@ class GitHubService:
         """Detect URL type and return the right content dict for any agent."""
         p = self._parse_url_type(ref)
         t = p["type"]
+        logger.info("fetch_for_agent: ref=%s type=%s agent=%s", ref, t, agent_name)
         if t == "pr":
             return {**self.get_pr_diff(ref), "fetch_type": "pr"}
         if t == "issue":
@@ -339,6 +361,7 @@ class GitHubService:
                 resp.raise_for_status()
             return True
         except Exception:
+            logger.exception("Failed to post issue comment on %s", issue_url)
             return False
 
     def format_pr_review_comment(self, review_result: Dict[str, Any]) -> str:

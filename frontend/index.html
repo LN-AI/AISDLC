@@ -1766,6 +1766,18 @@ Examples:
     </div>
   </div>
 
+  <!-- Review Detail Modal -->
+  <div id="review-detail-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeReviewDetail()">
+    <div class="modal-box" style="width:720px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeReviewDetail()" title="Dismiss (Esc)">✕</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 id="review-detail-title" style="margin-bottom:2px">Review Detail</h2>
+        <p id="review-detail-subtitle">—</p>
+      </div>
+      <div id="review-detail-body"></div>
+    </div>
+  </div>
+
   <!-- BYOL (Bring Your Own LLM) Modal -->
   <div id="llm-config-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeLlmConfigModal()">
     <div class="modal-box" style="width:560px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
@@ -1849,6 +1861,7 @@ Examples:
     </div>
   </div>
 
+  <script src="/static/logger.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

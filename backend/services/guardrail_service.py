@@ -18,10 +18,13 @@ different points and have different failure modes:
      GitHub). Unlike #2, this one does block: refusing to introduce a new
      secret has real teeth and no legitimate-use downside.
 """
+import logging
 import re
 from typing import List
 
 from backend import config
+
+logger = logging.getLogger(__name__)
 
 
 class GuardrailViolation(Exception):
@@ -31,6 +34,7 @@ class GuardrailViolation(Exception):
 def enforce_input_limit(content: str, max_chars: int = None) -> None:
     limit = max_chars if max_chars is not None else config.MAX_AGENT_INPUT_CHARS
     if content and len(content) > limit:
+        logger.warning("Input limit exceeded: %d chars > %d limit", len(content), limit)
         raise GuardrailViolation(
             f"Input too large: {len(content):,} characters exceeds the {limit:,} character limit "
             f"for a single agent call. Split the artifact into smaller pieces."
@@ -97,4 +101,6 @@ def scan_for_hardcoded_secrets(content: str) -> List[str]:
             snippet = m.group(0)
             redacted = snippet[:6] + "…" + snippet[-4:] if len(snippet) > 12 else "…"
             hits.append(redacted)
+    if hits:
+        logger.warning("Hardcoded secret pattern(s) detected: %d match(es)", len(hits))
     return hits

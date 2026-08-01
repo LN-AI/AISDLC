@@ -17,11 +17,14 @@ checks run before the LLM call, one bookkeeping step runs after:
 JWT/UI callers have no `_record` and therefore no budget — the cap is an
 external-API-key concept only, matching how rate limiting already works.
 """
+import logging
 from typing import Any, Callable, Dict, Optional
 
 from backend import config, database
 from backend.services import llm_gateway
 from backend.services.cost_optimization_service import DEFAULT_PRICING, MODEL_PRICING_PER_MILLION_TOKENS
+
+logger = logging.getLogger(__name__)
 
 
 class ScopeDeniedError(Exception):
@@ -52,6 +55,7 @@ def check_scope(caller: dict, agent_name: str) -> None:
         return
     allowed = {s.strip() for s in scopes.split(",") if s.strip()}
     if agent_name not in allowed:
+        logger.warning("Scope denied: key=%s agent=%s scopes=%s", record.get("id"), agent_name, scopes)
         raise ScopeDeniedError(agent_name, scopes)
 
 
@@ -71,15 +75,25 @@ def guarded_call(caller: dict, agent_name: str, override: Optional[dict], fn: Ca
     check_scope(caller, agent_name)
 
     record = (caller or {}).get("_record")
+    caller_id = record["id"] if record else caller.get("username", "ui")
     if record:
         budget = database.get_api_key_budget(record["id"])
         cap = budget["monthly_budget_usd"]
         if cap is not None and budget["budget_used_usd"] >= cap:
+            logger.warning(
+                "Budget exceeded: key=%s agent=%s used=$%.2f cap=$%.2f",
+                record["id"], agent_name, budget["budget_used_usd"], cap,
+            )
             raise BudgetExceededError(budget)
 
-    with llm_gateway.track_usage():
-        with llm_gateway.with_override(override):
-            result = fn()
+    logger.info("Agent call started: caller=%s agent=%s", caller_id, agent_name)
+    try:
+        with llm_gateway.track_usage():
+            with llm_gateway.with_override(override):
+                result = fn()
+    except Exception:
+        logger.exception("Agent call failed: caller=%s agent=%s", caller_id, agent_name)
+        raise
     usage = llm_gateway.get_tracked_usage()
 
     if record and usage["calls"]:
@@ -87,6 +101,10 @@ def guarded_call(caller: dict, agent_name: str, override: Optional[dict], fn: Ca
         cost_usd = _price_usage(usage, model)
         database.record_api_key_cost(record["id"], cost_usd)
         database.log_api_key_cost(record["id"], agent_name, usage["input_tokens"], usage["output_tokens"], cost_usd)
+        logger.info(
+            "Agent call cost: caller=%s agent=%s tokens_in=%d tokens_out=%d cost=$%.4f",
+            caller_id, agent_name, usage["input_tokens"], usage["output_tokens"], cost_usd,
+        )
         if isinstance(result, dict):
             fresh_budget = database.get_api_key_budget(record["id"])
             result["_budget_stats"] = {

@@ -1,15 +1,23 @@
 import os
 import io
 import json
+import logging
+import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+
+from backend.logging_config import configure_logging, request_id_ctx
+
+configure_logging()
+logger = logging.getLogger(__name__)
 
 from backend import database, config
 from backend.routes.auth import router as auth_router
@@ -25,6 +33,7 @@ from backend.routes.projects import router as projects_router
 from backend.routes.verticals import router as verticals_router
 from backend.routes.issue_triage_dashboard import router as issue_triage_dashboard_router
 from backend.routes.cost_optimization import router as cost_optimization_router
+from backend.routes.client_log import router as client_log_router
 from backend.models.schemas import (
     ReviewRequest,
     CodeReviewRequest,
@@ -53,9 +62,12 @@ from backend.models.api_models import (
     TestScenarioRequest,
 )
 from backend.services.orchestrator import SDLCOrchestrator
+from backend.services import job_service
 from backend.services.knowledge_base import knowledge_base
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.guardrail_service import GuardrailViolation
+from backend.services.llm_gateway import LLMTruncatedResponseError, LLMProviderError
+from backend.services.error_utils import format_error_response, _RETRYABLE_PROVIDER_ERRORS
 
 
 def _init_default_admin():
@@ -67,10 +79,13 @@ def _init_default_admin():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting up - env=%s model=%s", config.APP_ENV, config.MODEL)
     database.init_db()
     _init_default_admin()
     knowledge_base.load()  # preload all docs/ markdown files into memory
+    logger.info("Startup complete")
     yield
+    logger.info("Shutting down")
 
 
 app = FastAPI(
@@ -91,17 +106,75 @@ app.add_middleware(
 
 @app.exception_handler(GuardrailViolation)
 async def _guardrail_violation_handler(request, exc: GuardrailViolation):
-    return JSONResponse(status_code=413, content={"detail": str(exc)})
+    logger.warning("Guardrail violation on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
 
 
 @app.exception_handler(ScopeDeniedError)
 async def _scope_denied_handler(request, exc: ScopeDeniedError):
-    return JSONResponse(status_code=403, content={"detail": str(exc)})
+    logger.warning("Scope denied on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
 
 
 @app.exception_handler(BudgetExceededError)
 async def _budget_exceeded_handler(request, exc: BudgetExceededError):
-    return JSONResponse(status_code=402, content={"detail": str(exc), **exc.budget})
+    logger.warning("Budget exceeded on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.exception_handler(LLMTruncatedResponseError)
+async def _llm_truncated_handler(request, exc: LLMTruncatedResponseError):
+    logger.warning("LLM response truncated on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.exception_handler(LLMProviderError)
+async def _llm_provider_error_handler(request, exc: LLMProviderError):
+    logger.warning("LLM provider error on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+async def _retryable_sdk_error_handler(request, exc):
+    # Backstop for a retryable SDK exception reaching here un-wrapped (i.e. not via
+    # llm_gateway.call_tool, which now wraps these as LLMProviderError at the source).
+    logger.warning("LLM provider error on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+for _exc_type in _RETRYABLE_PROVIDER_ERRORS:
+    app.add_exception_handler(_exc_type, _retryable_sdk_error_handler)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request, exc: Exception):
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    token = request_id_ctx.set(request_id)
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "%s %s -> %s (%.1fms) client=%s",
+            request.method, request.url.path, response.status_code, duration_ms,
+            request.client.host if request.client else "-",
+        )
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        request_id_ctx.reset(token)
 
 
 app.include_router(auth_router)
@@ -117,6 +190,7 @@ app.include_router(projects_router)
 app.include_router(verticals_router)
 app.include_router(issue_triage_dashboard_router)
 app.include_router(cost_optimization_router)
+app.include_router(client_log_router)
 
 orchestrator = SDLCOrchestrator()
 
@@ -194,7 +268,9 @@ async def review_requirement(req: ReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/requirement/upload")
@@ -215,7 +291,9 @@ async def review_requirement_file(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Code Review ────────────────────────────────────────────────────────────
@@ -236,7 +314,9 @@ async def review_code(req: CodeReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Prompt Safety Review ───────────────────────────────────────────────────
@@ -258,12 +338,18 @@ async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Full SDLC Review ───────────────────────────────────────────────────────
+# Chains up to 7 sequential LLM calls (60-150s+ each) — runs as a background job
+# rather than blocking this HTTP request, since it has failed/timed out under a
+# synchronous request in every test run to date. Returns a job_id immediately;
+# poll GET /api/v1/agents/jobs/{job_id} for step progress and the final result.
 
-@app.post("/api/review/full")
+@app.post("/api/review/full", status_code=202)
 async def full_review(req: FullReviewRequest):
     if not any([req.requirement, req.compliance_artifact, req.architecture, req.code, req.prompt]):
         raise HTTPException(status_code=400, detail="At least one artifact is required")
@@ -274,8 +360,13 @@ async def full_review(req: FullReviewRequest):
     if req.prompt:
         prompt_config = {"system_prompt": req.prompt}
 
-    try:
-        result = orchestrator.full_review(
+    total_steps = sum([
+        bool(req.requirement), bool(req.compliance_artifact), bool(req.architecture),
+        bool(req.code), bool(prompt_config),
+    ]) + 2  # release gate + report generation always run
+
+    def _run(on_progress):
+        return orchestrator.full_review(
             requirement=req.requirement,
             compliance_artifact=req.compliance_artifact,
             architecture=req.architecture,
@@ -284,10 +375,21 @@ async def full_review(req: FullReviewRequest):
             test_evidence=req.test_evidence,
             project_name=req.project_name or "Unnamed Project",
             context=req.context or "",
+            on_progress=on_progress,
         )
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    logger.warning("DIAG: about to call job_service.start_job")
+    job_id = job_service.start_job("full", total_steps, _run)
+    logger.warning("DIAG: start_job returned job_id=%s, about to return response", job_id)
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/api/v1/agents/jobs/{job_id}"}
+
+
+@app.get("/api/review/full/jobs/{job_id}")
+async def full_review_job_status(job_id: str):
+    job = job_service.get_job_status(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"No job found with id '{job_id}'")
+    return job
 
 
 # ── GitHub PR Review ───────────────────────────────────────────────────────
@@ -296,8 +398,6 @@ async def full_review(req: FullReviewRequest):
 async def review_github_pr(req: GithubPRRequest):
     if not req.pr_url:
         raise HTTPException(status_code=400, detail="PR URL is required")
-    if not config.GITHUB_TOKEN:
-        raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
     if not config.ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
     try:
@@ -310,7 +410,9 @@ async def review_github_pr(req: GithubPRRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/github/pr/auto-fix")
@@ -331,7 +433,9 @@ async def auto_fix_github_pr(req: GithubAutoFixRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Release Gate ───────────────────────────────────────────────────────────
@@ -358,7 +462,9 @@ async def release_gate(req: ReleaseGateRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Architecture Review ────────────────────────────────────────────────────
@@ -381,7 +487,9 @@ async def review_architecture(req: ArchitectureReviewRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/architecture/upload")
@@ -408,7 +516,9 @@ async def review_architecture_file(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── VAPT ──────────────────────────────────────────────────────────────────
@@ -428,7 +538,9 @@ async def review_vapt(req: VAPTReviewRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/vapt/upload")
@@ -453,7 +565,9 @@ async def review_vapt_file(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Security Review ────────────────────────────────────────────────────────
@@ -473,7 +587,9 @@ async def review_security(req: SecurityReviewRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/security/upload")
@@ -498,7 +614,9 @@ async def review_security_file(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Code Generation ─────────────────────────────────────────────────────────
@@ -526,7 +644,9 @@ async def codegen_advisory(req: CodeGenAdvisoryRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/codegen/scaffold")
@@ -550,7 +670,9 @@ async def codegen_scaffold(req: CodeGenScaffoldRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.get("/api/codegen/scaffold/{review_id}/download")
@@ -600,7 +722,9 @@ async def review_ai_provenance(req: AIProvenanceRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Code Migration ─────────────────────────────────────────────────────────
@@ -623,7 +747,9 @@ async def review_migration_assessment(req: MigrationAssessmentRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/migration-execute")
@@ -646,7 +772,9 @@ async def review_migration_execute(req: MigrationExecutionRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── 21 CFR Part 11 Verification ──────────────────────────────────────────────
@@ -708,7 +836,9 @@ async def review_cfr21_verification(req: CFR21VerificationRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/cfr21-verification/upload-zip")
@@ -739,7 +869,9 @@ async def review_cfr21_verification_upload_zip(
         result["files_extracted"] = len(files)
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── GxP Document Check ────────────────────────────────────────────────────────
@@ -761,7 +893,9 @@ async def review_gxp_document_check(req: GxPDocumentCheckRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/gxp-document-check/upload")
@@ -791,7 +925,9 @@ async def review_gxp_document_check_upload(
         result["files_uploaded"] = len(documents)
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── GxP Validation Document Generation ───────────────────────────────────────
@@ -813,7 +949,9 @@ async def review_gxp_generate_plan(req: GxPValidationPlanRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/gxp-generate-plan/upload-zip")
@@ -846,7 +984,9 @@ async def review_gxp_generate_plan_upload_zip(
         result["files_extracted"] = files
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/gxp-generate-document")
@@ -871,7 +1011,9 @@ async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Issue Triaging Agent ─────────────────────────────────────────────────────
@@ -880,12 +1022,11 @@ async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
 async def review_issue_triage(req: IssueTriageRequest):
     title, description = req.title or "", req.description or ""
     if req.github_issue_url and not (title.strip() or description.strip()):
-        if not config.GITHUB_TOKEN:
-            raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
         from backend.services.github_service import GitHubService
         try:
             gh = GitHubService().get_issue(req.github_issue_url)
         except Exception as e:
+            logger.exception("GitHub issue fetch failed for %s", req.github_issue_url)
             raise HTTPException(status_code=502, detail=f"GitHub fetch failed: {e}")
         title, description = gh.get("title", ""), gh.get("body", "")
     if not (title.strip() or description.strip()):
@@ -903,15 +1044,15 @@ async def review_issue_triage(req: IssueTriageRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/issue-triage/batch-github")
 async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
     if not req.github_repo_url.strip():
         raise HTTPException(status_code=400, detail="github_repo_url is required")
-    if not config.GITHUB_TOKEN:
-        raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
     if not config.ANTHROPIC_API_KEY:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
     try:
@@ -921,7 +1062,9 @@ async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── QA Intelligence — Test Scenario / Test Case Generation ──────────────────
@@ -938,7 +1081,9 @@ async def review_test_scenario(req: ReviewRequest, project_name: str = ""):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 class TestCaseInternalRequest(BaseModel):
@@ -961,7 +1106,9 @@ async def review_test_case(req: TestCaseInternalRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── Sensitive Data Detector ────────────────────────────────────────────────
@@ -984,7 +1131,9 @@ async def review_sensitive_data(req: SensitiveDataRequest):
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 @app.post("/api/review/sensitive-data/upload")
@@ -1005,7 +1154,9 @@ async def review_sensitive_data_file(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
 
 
 # ── AI Inventory check (integration status) ────────────────────────────────

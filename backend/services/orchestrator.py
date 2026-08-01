@@ -1,4 +1,7 @@
+import functools
 import json
+import logging
+import time
 from typing import Dict, Any, List, Optional
 from backend.agents.requirement_intelligence.requirement_reviewer import RequirementReviewAgent
 from backend.agents.architecture_intelligence.architecture_agent import ArchitectureAgent
@@ -25,6 +28,35 @@ from backend.services.knowledge_base import knowledge_base
 from backend.services import cost_optimization_service
 from backend.services import guardrail_service
 from backend import config, database
+
+logger = logging.getLogger(__name__)
+
+
+def _log_call(method):
+    """Logs entry, duration, review_id, and failures for every orchestrator method —
+    the one chokepoint every route/agent invocation in the app passes through."""
+    @functools.wraps(method)
+    def _wrapper(self, *args, **kwargs):
+        name = method.__name__
+        project_name = kwargs.get("project_name") or (args[-1] if args and isinstance(args[-1], str) else "")
+        start = time.perf_counter()
+        logger.info("orchestrator.%s started (project=%s)", name, project_name)
+        try:
+            result = method(self, *args, **kwargs)
+        except Exception:
+            logger.exception(
+                "orchestrator.%s failed after %.1fms (project=%s)",
+                name, (time.perf_counter() - start) * 1000, project_name,
+            )
+            raise
+        duration_ms = (time.perf_counter() - start) * 1000
+        review_id = result.get("review_id") if isinstance(result, dict) else None
+        logger.info(
+            "orchestrator.%s completed in %.1fms (project=%s, review_id=%s)",
+            name, duration_ms, project_name, review_id,
+        )
+        return result
+    return _wrapper
 
 
 class SDLCOrchestrator:
@@ -72,6 +104,7 @@ class SDLCOrchestrator:
         compressed, stats = cost_optimization_service.compress_content(content, config.MODEL)
         return compressed, (stats if stats.get("compressed") else None)
 
+    @_log_call
     def review_requirement(self, content: str, context: str = "", project_name: str = "") -> Dict[str, Any]:
         context = self._kb("requirement", context, content, project_name)
         compressed_content, cost_stats = self._compress(content)
@@ -88,6 +121,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def review_code(self, code: str, language: str = "", context: str = "", project_name: str = "", pr_url: str = "") -> Dict[str, Any]:
         context = self._kb("code-review", context, code, project_name)
         compressed_code, cost_stats = self._compress(code)
@@ -104,6 +138,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def review_prompt(
         self,
         system_prompt: str = "",
@@ -127,6 +162,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def review_compliance(self, content: str, frameworks: list = None, context: str = "", project_name: str = "") -> Dict[str, Any]:
         context = self._kb("compliance", context, content, project_name)
         compressed_content, cost_stats = self._compress(content)
@@ -143,6 +179,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def full_review(
         self,
         requirement: Optional[str] = None,
@@ -153,17 +190,43 @@ class SDLCOrchestrator:
         test_evidence: Optional[str] = None,
         project_name: str = "Unnamed Project",
         context: str = "",
+        on_progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        """`on_progress`, if given, is called as `on_progress(step_index, total_steps,
+        step_label)` immediately before each of this method's sequential sub-agent
+        calls — used by the job-status endpoint (see job_service.py) so a client
+        polling a long-running `full` review can see which of the (up to 7)
+        sequential LLM calls is currently in flight rather than just "still
+        running". Total_steps only counts steps that will actually execute for this
+        particular request (i.e. conditional sub-reviews the caller didn't provide
+        content for are not counted)."""
         review_results: List[Dict[str, Any]] = []
         all_findings: List[Dict[str, Any]] = []
 
+        steps = [("Requirement Review", bool(requirement))]
+        steps.append(("Compliance Mapping", bool(compliance_artifact)))
+        steps.append(("Architecture Review", bool(architecture)))
+        steps.append(("Code Review", bool(code)))
+        steps.append(("Prompt Safety Review", bool(prompt_config)))
+        steps.append(("Release Gate Evaluation", True))
+        steps.append(("Report Generation", True))
+        total_steps = sum(1 for _, will_run in steps if will_run)
+        step_counter = [0]
+
+        def _progress(label: str) -> None:
+            step_counter[0] += 1
+            if on_progress:
+                on_progress(step_counter[0], total_steps, label)
+
         if requirement:
+            _progress("Requirement Review")
             req_result = self.req_agent.review_requirement(requirement, context)
             req_result["source"] = "requirement"
             review_results.append(req_result)
             all_findings.extend(req_result.get("findings", []))
 
         if compliance_artifact:
+            _progress("Compliance Mapping")
             compliance_context = self._kb("compliance", context, compliance_artifact, project_name)
             compliance_result = self.compliance_agent.map_compliance(
                 compliance_artifact, context=compliance_context
@@ -173,18 +236,21 @@ class SDLCOrchestrator:
             all_findings.extend(compliance_result.get("findings", []))
 
         if architecture:
+            _progress("Architecture Review")
             arch_result = self.arch_agent.run_architecture_review(architecture, context, project_name=project_name)
             arch_result["source"] = "architecture"
             review_results.append(arch_result)
             all_findings.extend(arch_result.get("findings", []))
 
         if code:
+            _progress("Code Review")
             code_result = self.code_agent.review_code(code, context=context)
             code_result["source"] = "code"
             review_results.append(code_result)
             all_findings.extend(code_result.get("findings", []))
 
         if prompt_config:
+            _progress("Prompt Safety Review")
             prompt_result = self.prompt_agent.review_prompt(
                 system_prompt=prompt_config.get("system_prompt", ""),
                 user_prompt=prompt_config.get("user_prompt", ""),
@@ -197,6 +263,7 @@ class SDLCOrchestrator:
             all_findings.extend(prompt_result.get("findings", []))
 
         overall_risk = self._calculate_overall_risk(review_results)
+        _progress("Release Gate Evaluation")
         gate_result = self.gate_agent.evaluate_gate(
             all_findings=all_findings,
             project_name=project_name,
@@ -207,6 +274,7 @@ class SDLCOrchestrator:
 
         final_gate = gate_result.get("gate_status", "Red")
 
+        _progress("Report Generation")
         report = self.report_agent.generate_report(
             project_name=project_name,
             all_findings=all_findings,
@@ -267,6 +335,7 @@ class SDLCOrchestrator:
             "recommendations": gate_result.get("recommendations", []),
         }
 
+    @_log_call
     def review_vapt(
         self,
         artifact: str,
@@ -277,9 +346,15 @@ class SDLCOrchestrator:
         context = self._kb("vapt", context, artifact, project_name)
         compressed_artifact, cost_stats = self._compress(artifact)
         result = self.vapt_agent.run_vapt(compressed_artifact, context, scope)
+        findings = result.get("findings", [])
+        if not findings and not (result.get("summary") or "").strip():
+            raise RuntimeError(
+                "VAPT agent returned an empty assessment (no findings and no summary) — "
+                "this usually means the LLM response was truncated or malformed rather than "
+                "a genuine clean result. Try again or narrow the artifact/scope."
+            )
         if cost_stats:
             result["_cost_stats"] = cost_stats
-        findings = result.get("findings", [])
         review_id = database.save_review(
             review_type="vapt",
             project_name=project_name,
@@ -293,6 +368,7 @@ class SDLCOrchestrator:
         result["total_findings"] = len(findings)
         return result
 
+    @_log_call
     def review_security(
         self,
         artifact: str,
@@ -305,6 +381,9 @@ class SDLCOrchestrator:
         result = self.security_agent.run_security_review(compressed_artifact, context, system_type)
         if cost_stats:
             result["_cost_stats"] = cost_stats
+        self._fallback_gate_from_specialized(
+            result, [t.get("risk_level", "Low") for t in result.get("stride_threats", [])]
+        )
         findings = result.get("findings", [])
         review_id = database.save_review(
             review_type="security",
@@ -320,6 +399,7 @@ class SDLCOrchestrator:
         result["boundary_count"] = len(result.get("trust_boundaries", []))
         return result
 
+    @_log_call
     def review_architecture(
         self,
         artifact: str,
@@ -332,6 +412,10 @@ class SDLCOrchestrator:
         result = self.arch_agent.run_architecture_review(compressed_artifact, context, requirements, review_mode, project_name)
         if cost_stats:
             result["_cost_stats"] = cost_stats
+        anti_pattern_severities = [p.get("severity", "Low") for p in result.get("anti_patterns", [])]
+        if result.get("single_points_of_failure"):
+            anti_pattern_severities.append("Critical")
+        self._fallback_gate_from_specialized(result, anti_pattern_severities)
         findings = result.get("findings", [])
         review_id = database.save_review(
             review_type="architecture",
@@ -348,6 +432,7 @@ class SDLCOrchestrator:
         result["alternative_count"] = len(result.get("alternative_recommendations", []))
         return result
 
+    @_log_call
     def scan_sensitive_data(
         self,
         content: str,
@@ -373,6 +458,7 @@ class SDLCOrchestrator:
         result["high_count"] = sum(1 for f in findings if f.get("severity") == 4)
         return result
 
+    @_log_call
     def generate_codegen_advisory(
         self,
         requirement: str,
@@ -392,6 +478,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def generate_codegen_scaffold(
         self,
         project_name: str,
@@ -422,6 +509,12 @@ class SDLCOrchestrator:
         )
 
         files = result.get("files", [])
+        if not files:
+            raise RuntimeError(
+                "Scaffold generation returned no files — this usually means the LLM response "
+                "was truncated or malformed rather than a deliberate empty scaffold. Try again "
+                "with a narrower scope (fewer options, e.g. skip docker/tests) or retry."
+            )
         if auto_review and files:
             combined = "\n\n".join(f"# ── {f.get('path', '')} ──\n{f.get('content', '')}" for f in files)
             code_review = self.code_agent.review_code(combined, language, "Generated scaffold — pre-release governance check")
@@ -452,6 +545,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def analyze_ai_provenance(
         self,
         artifact: str,
@@ -475,6 +569,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def assess_migration(
         self,
         source: str,
@@ -498,6 +593,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def execute_migration(
         self,
         source: str,
@@ -542,6 +638,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def verify_cfr21(
         self,
         files: Optional[List[Dict[str, str]]] = None,
@@ -569,6 +666,7 @@ class SDLCOrchestrator:
         result["total_findings"] = len(findings)
         return result
 
+    @_log_call
     def check_gxp_documents(
         self,
         documents: Optional[List[Dict[str, str]]] = None,
@@ -596,6 +694,7 @@ class SDLCOrchestrator:
         result["total_findings"] = len(findings)
         return result
 
+    @_log_call
     def plan_gxp_validation_package(
         self,
         files: Optional[List[Dict[str, str]]] = None,
@@ -618,6 +717,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def generate_gxp_document(
         self,
         document_type: str,
@@ -754,6 +854,7 @@ class SDLCOrchestrator:
             "human_approval_required": mandatory_human,
         }
 
+    @_log_call
     def triage_issue(
         self,
         title: str = "", description: str = "", logs: str = "", stack_trace: str = "",
@@ -799,6 +900,7 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         return result
 
+    @_log_call
     def triage_github_repo_issues(
         self,
         github_repo_url: str,
@@ -836,6 +938,7 @@ class SDLCOrchestrator:
 
     # ── QA Intelligence ──────────────────────────────────────────────────
 
+    @_log_call
     def generate_test_scenarios(
         self,
         requirement: str,
@@ -860,6 +963,7 @@ class SDLCOrchestrator:
         result["critical_count"] = sum(1 for s in scenarios if s.get("priority") == "Critical")
         return result
 
+    @_log_call
     def generate_test_cases(
         self,
         requirement: str,
@@ -870,9 +974,15 @@ class SDLCOrchestrator:
         context = self._kb("qa", context, requirement, project_name)
         compressed_requirement, cost_stats = self._compress(requirement)
         result = self.test_case_agent.generate(compressed_requirement, scenarios_context, context)
+        test_cases = result.get("test_cases", [])
+        if not test_cases and not (result.get("summary") or "").strip():
+            raise RuntimeError(
+                "Test case generation returned no test cases (no test_cases and no summary) — "
+                "this usually means the LLM response was truncated or malformed rather than "
+                "a genuine empty result. Try again or reduce scope (e.g. fewer scenarios at once)."
+            )
         if cost_stats:
             result["_cost_stats"] = cost_stats
-        test_cases = result.get("test_cases", [])
         review_id = database.save_review(
             review_type="test_cases",
             project_name=project_name,
@@ -885,6 +995,7 @@ class SDLCOrchestrator:
         result["critical_count"] = sum(1 for tc in test_cases if tc.get("priority") == "Critical")
         return result
 
+    @_log_call
     def generate_standalone_report(
         self,
         project_name: str,
@@ -929,6 +1040,7 @@ class SDLCOrchestrator:
         report["report_id"] = report_id
         return report
 
+    @_log_call
     def run_release_gate(
         self,
         project_name: str,
@@ -966,6 +1078,7 @@ class SDLCOrchestrator:
         result["aggregated_reviews"] = len(review_ids) if review_ids else 0
         return result
 
+    @_log_call
     def review_github_pr(self, pr_url: str, jira_ticket: str = "", include_prompt_review: bool = False) -> Dict[str, Any]:
         pr_data = self.github.get_pr_diff(pr_url)
 
@@ -998,6 +1111,7 @@ class SDLCOrchestrator:
             "comment_posted": posted,
         }
 
+    @_log_call
     def auto_fix_github_pr(self, pr_url: str, jira_ticket: str = "", max_files: int = 5) -> Dict[str, Any]:
         """Review a GitHub PR, then commit fixes for its findings to a new branch off the PR's head branch
         and open a follow-up PR (head_branch -> lm-autofix/pr-N -> new PR back into head_branch)."""
@@ -1097,6 +1211,27 @@ class SDLCOrchestrator:
             "fix_pr_url": new_pr.get("url", ""),
             "fix_pr_number": new_pr.get("number"),
         }
+
+    @staticmethod
+    def _fallback_gate_from_specialized(result: Dict[str, Any], specialized_severities: List[str]) -> None:
+        """Safety net for security/architecture reviews: their tool schemas put
+        risk_score/gate_status after large specialized arrays (stride_threats,
+        anti_patterns, single_points_of_failure), so a response truncated by the
+        token budget can populate real specialized findings while leaving
+        gate_status/risk_score at their untouched schema default (Green/0). If
+        that exact signature shows up — default Green, no generic findings, but
+        real specialized data — recompute the gate deterministically from the
+        specialized severities instead of trusting the (likely truncated) default.
+        A genuinely clean review (nothing found anywhere) is left untouched.
+        """
+        if result.get("gate_status", "Green") != "Green" or result.get("findings") or not specialized_severities:
+            return
+        if "Critical" in specialized_severities:
+            result["gate_status"], result["risk_score"] = "Red", 95.0
+        elif "High" in specialized_severities:
+            result["gate_status"], result["risk_score"] = "Amber", 70.0
+        else:
+            result["gate_status"], result["risk_score"] = "Amber", 40.0
 
     def _calculate_overall_risk(self, results: List[Dict[str, Any]]) -> float:
         if not results:
