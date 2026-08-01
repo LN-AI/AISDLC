@@ -190,17 +190,43 @@ class SDLCOrchestrator:
         test_evidence: Optional[str] = None,
         project_name: str = "Unnamed Project",
         context: str = "",
+        on_progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        """`on_progress`, if given, is called as `on_progress(step_index, total_steps,
+        step_label)` immediately before each of this method's sequential sub-agent
+        calls — used by the job-status endpoint (see job_service.py) so a client
+        polling a long-running `full` review can see which of the (up to 7)
+        sequential LLM calls is currently in flight rather than just "still
+        running". Total_steps only counts steps that will actually execute for this
+        particular request (i.e. conditional sub-reviews the caller didn't provide
+        content for are not counted)."""
         review_results: List[Dict[str, Any]] = []
         all_findings: List[Dict[str, Any]] = []
 
+        steps = [("Requirement Review", bool(requirement))]
+        steps.append(("Compliance Mapping", bool(compliance_artifact)))
+        steps.append(("Architecture Review", bool(architecture)))
+        steps.append(("Code Review", bool(code)))
+        steps.append(("Prompt Safety Review", bool(prompt_config)))
+        steps.append(("Release Gate Evaluation", True))
+        steps.append(("Report Generation", True))
+        total_steps = sum(1 for _, will_run in steps if will_run)
+        step_counter = [0]
+
+        def _progress(label: str) -> None:
+            step_counter[0] += 1
+            if on_progress:
+                on_progress(step_counter[0], total_steps, label)
+
         if requirement:
+            _progress("Requirement Review")
             req_result = self.req_agent.review_requirement(requirement, context)
             req_result["source"] = "requirement"
             review_results.append(req_result)
             all_findings.extend(req_result.get("findings", []))
 
         if compliance_artifact:
+            _progress("Compliance Mapping")
             compliance_context = self._kb("compliance", context, compliance_artifact, project_name)
             compliance_result = self.compliance_agent.map_compliance(
                 compliance_artifact, context=compliance_context
@@ -210,18 +236,21 @@ class SDLCOrchestrator:
             all_findings.extend(compliance_result.get("findings", []))
 
         if architecture:
+            _progress("Architecture Review")
             arch_result = self.arch_agent.run_architecture_review(architecture, context, project_name=project_name)
             arch_result["source"] = "architecture"
             review_results.append(arch_result)
             all_findings.extend(arch_result.get("findings", []))
 
         if code:
+            _progress("Code Review")
             code_result = self.code_agent.review_code(code, context=context)
             code_result["source"] = "code"
             review_results.append(code_result)
             all_findings.extend(code_result.get("findings", []))
 
         if prompt_config:
+            _progress("Prompt Safety Review")
             prompt_result = self.prompt_agent.review_prompt(
                 system_prompt=prompt_config.get("system_prompt", ""),
                 user_prompt=prompt_config.get("user_prompt", ""),
@@ -234,6 +263,7 @@ class SDLCOrchestrator:
             all_findings.extend(prompt_result.get("findings", []))
 
         overall_risk = self._calculate_overall_risk(review_results)
+        _progress("Release Gate Evaluation")
         gate_result = self.gate_agent.evaluate_gate(
             all_findings=all_findings,
             project_name=project_name,
@@ -244,6 +274,7 @@ class SDLCOrchestrator:
 
         final_gate = gate_result.get("gate_status", "Red")
 
+        _progress("Report Generation")
         report = self.report_agent.generate_report(
             project_name=project_name,
             all_findings=all_findings,
@@ -350,6 +381,9 @@ class SDLCOrchestrator:
         result = self.security_agent.run_security_review(compressed_artifact, context, system_type)
         if cost_stats:
             result["_cost_stats"] = cost_stats
+        self._fallback_gate_from_specialized(
+            result, [t.get("risk_level", "Low") for t in result.get("stride_threats", [])]
+        )
         findings = result.get("findings", [])
         review_id = database.save_review(
             review_type="security",
@@ -378,6 +412,10 @@ class SDLCOrchestrator:
         result = self.arch_agent.run_architecture_review(compressed_artifact, context, requirements, review_mode, project_name)
         if cost_stats:
             result["_cost_stats"] = cost_stats
+        anti_pattern_severities = [p.get("severity", "Low") for p in result.get("anti_patterns", [])]
+        if result.get("single_points_of_failure"):
+            anti_pattern_severities.append("Critical")
+        self._fallback_gate_from_specialized(result, anti_pattern_severities)
         findings = result.get("findings", [])
         review_id = database.save_review(
             review_type="architecture",
@@ -936,9 +974,15 @@ class SDLCOrchestrator:
         context = self._kb("qa", context, requirement, project_name)
         compressed_requirement, cost_stats = self._compress(requirement)
         result = self.test_case_agent.generate(compressed_requirement, scenarios_context, context)
+        test_cases = result.get("test_cases", [])
+        if not test_cases and not (result.get("summary") or "").strip():
+            raise RuntimeError(
+                "Test case generation returned no test cases (no test_cases and no summary) — "
+                "this usually means the LLM response was truncated or malformed rather than "
+                "a genuine empty result. Try again or reduce scope (e.g. fewer scenarios at once)."
+            )
         if cost_stats:
             result["_cost_stats"] = cost_stats
-        test_cases = result.get("test_cases", [])
         review_id = database.save_review(
             review_type="test_cases",
             project_name=project_name,
@@ -1167,6 +1211,27 @@ class SDLCOrchestrator:
             "fix_pr_url": new_pr.get("url", ""),
             "fix_pr_number": new_pr.get("number"),
         }
+
+    @staticmethod
+    def _fallback_gate_from_specialized(result: Dict[str, Any], specialized_severities: List[str]) -> None:
+        """Safety net for security/architecture reviews: their tool schemas put
+        risk_score/gate_status after large specialized arrays (stride_threats,
+        anti_patterns, single_points_of_failure), so a response truncated by the
+        token budget can populate real specialized findings while leaving
+        gate_status/risk_score at their untouched schema default (Green/0). If
+        that exact signature shows up — default Green, no generic findings, but
+        real specialized data — recompute the gate deterministically from the
+        specialized severities instead of trusting the (likely truncated) default.
+        A genuinely clean review (nothing found anywhere) is left untouched.
+        """
+        if result.get("gate_status", "Green") != "Green" or result.get("findings") or not specialized_severities:
+            return
+        if "Critical" in specialized_severities:
+            result["gate_status"], result["risk_score"] = "Red", 95.0
+        elif "High" in specialized_severities:
+            result["gate_status"], result["risk_score"] = "Amber", 70.0
+        else:
+            result["gate_status"], result["risk_score"] = "Amber", 40.0
 
     def _calculate_overall_risk(self, results: List[Dict[str, Any]]) -> float:
         if not results:

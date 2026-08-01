@@ -209,7 +209,7 @@ and 3-8 concrete design patterns for this system. Provide 2-3 ranked, meaningful
 and list 1-3 prose alternatives with switch conditions. Flag any compliance-driven build requirements implied by
 the requirement.
 """
-        result = llm_gateway.call_tool(ADVISORY_SYSTEM_PROMPT, prompt, CODEGEN_ADVISORY_TOOL_SCHEMA)
+        result = llm_gateway.call_tool(ADVISORY_SYSTEM_PROMPT, prompt, CODEGEN_ADVISORY_TOOL_SCHEMA, max_tokens=6000)
         result["agent_name"] = self.agent_name
         return result
 

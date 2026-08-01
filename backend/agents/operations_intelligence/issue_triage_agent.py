@@ -196,6 +196,6 @@ class IssueTriageAgent(BaseAgent):
 
 Triage this issue now.
 """
-        result = llm_gateway.call_tool(ISSUE_TRIAGE_SYSTEM_PROMPT, prompt, ISSUE_TRIAGE_TOOL_SCHEMA, llm_override, max_tokens=6000)
+        result = llm_gateway.call_tool(ISSUE_TRIAGE_SYSTEM_PROMPT, prompt, ISSUE_TRIAGE_TOOL_SCHEMA, llm_override, max_tokens=8000)
         result["agent_name"] = self.agent_name
         return result

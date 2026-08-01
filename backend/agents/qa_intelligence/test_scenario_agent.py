@@ -92,6 +92,6 @@ Generate the full test scenario catalogue for this requirement now — happy pat
 role-based, integration, and exception handling. Map every scenario back to the specific requirement text it
 covers, and flag any acceptance criteria gaps rather than inventing them.
 """
-        result = llm_gateway.call_tool(TEST_SCENARIO_SYSTEM_PROMPT, prompt, TEST_SCENARIO_TOOL_SCHEMA, max_tokens=6000)
+        result = llm_gateway.call_tool(TEST_SCENARIO_SYSTEM_PROMPT, prompt, TEST_SCENARIO_TOOL_SCHEMA, max_tokens=8000)
         result["agent_name"] = self.agent_name
         return result

@@ -47,6 +47,59 @@ _RETRYABLE_OPENAI = (openai.APIConnectionError, openai.APITimeoutError,
                      openai.RateLimitError, openai.InternalServerError)
 
 
+class LLMTruncatedResponseError(RuntimeError):
+    """Raised when the provider's stop_reason/finish_reason indicates the tool-call
+    response was cut off by the max_tokens budget before it finished — the returned
+    tool input (if any) is structurally incomplete and must not be trusted as a
+    genuine result."""
+
+    def __init__(
+        self, tool_name: str, max_tokens: int, *,
+        elapsed_ms: Optional[float] = None, input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None, model: Optional[str] = None,
+        provider: Optional[str] = None,
+    ):
+        self.tool_name = tool_name
+        self.max_tokens = max_tokens
+        self.elapsed_ms = elapsed_ms
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.model = model
+        self.provider = provider
+        detail = f"LLM response for '{tool_name}' was truncated at the {max_tokens}-token limit before it finished generating"
+        if elapsed_ms is not None:
+            detail += f" (after {elapsed_ms:.0f}ms"
+            if output_tokens is not None:
+                detail += f", {output_tokens} output tokens generated"
+            detail += ")"
+        detail += " — retry, or increase max_tokens for this call."
+        super().__init__(detail)
+
+
+class LLMProviderError(RuntimeError):
+    """Raised when the LLM provider's SDK reported a retryable failure (connection,
+    timeout, rate limit, or 5xx) and every retry attempt was exhausted. Wraps the raw
+    SDK exception so callers get consistent, informative attributes instead of a
+    provider-specific exception type."""
+
+    def __init__(
+        self, provider: str, tool_name: str, attempts: int, original: Exception, *,
+        elapsed_ms: Optional[float] = None,
+    ):
+        self.provider = provider
+        self.tool_name = tool_name
+        self.attempts = attempts
+        self.original = original
+        self.elapsed_ms = elapsed_ms
+        detail = (
+            f"{provider} provider call for '{tool_name}' failed after {attempts} attempt(s)"
+        )
+        if elapsed_ms is not None:
+            detail += f" ({elapsed_ms:.0f}ms elapsed)"
+        detail += f": {type(original).__name__}: {original}"
+        super().__init__(detail)
+
+
 @contextmanager
 def track_usage():
     """Every call_tool() invocation inside this block records its token usage;
@@ -123,11 +176,14 @@ def _call_anthropic(
                 )
                 time.sleep(2 ** attempt)
                 continue
+            elapsed_ms = (time.perf_counter() - start) * 1000
             logger.error(
-                "Anthropic call for tool '%s' failed after %d attempts: %s",
-                tool_schema["name"], config.LLM_MAX_RETRIES + 1, e,
+                "Anthropic call for tool '%s' failed after %d attempts (%.0fms): %s",
+                tool_schema["name"], config.LLM_MAX_RETRIES + 1, elapsed_ms, e,
             )
-            raise
+            raise LLMProviderError(
+                "anthropic", tool_schema["name"], config.LLM_MAX_RETRIES + 1, e, elapsed_ms=elapsed_ms,
+            ) from e
     duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
@@ -141,6 +197,11 @@ def _call_anthropic(
         logger.warning(
             "Anthropic call for tool '%s' hit max_tokens (%d) — response is likely truncated/incomplete",
             tool_schema["name"], max_tokens or config.MAX_TOKENS,
+        )
+        raise LLMTruncatedResponseError(
+            tool_schema["name"], max_tokens or config.MAX_TOKENS,
+            elapsed_ms=duration_ms, input_tokens=input_tokens, output_tokens=output_tokens,
+            model=resolved_model, provider="anthropic",
         )
     for block in response.content:
         if block.type == "tool_use" and block.name == tool_schema["name"]:
@@ -187,11 +248,14 @@ def _call_openai(
                 )
                 time.sleep(2 ** attempt)
                 continue
+            elapsed_ms = (time.perf_counter() - start) * 1000
             logger.error(
-                "OpenAI call for tool '%s' failed after %d attempts: %s",
-                tool_schema["name"], config.LLM_MAX_RETRIES + 1, e,
+                "OpenAI call for tool '%s' failed after %d attempts (%.0fms): %s",
+                tool_schema["name"], config.LLM_MAX_RETRIES + 1, elapsed_ms, e,
             )
-            raise
+            raise LLMProviderError(
+                "openai", tool_schema["name"], config.LLM_MAX_RETRIES + 1, e, elapsed_ms=elapsed_ms,
+            ) from e
     duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -206,6 +270,11 @@ def _call_openai(
         logger.warning(
             "OpenAI call for tool '%s' hit the token limit (%d) — response is likely truncated/incomplete",
             tool_schema["name"], max_tokens or 4096,
+        )
+        raise LLMTruncatedResponseError(
+            tool_schema["name"], max_tokens or 4096,
+            elapsed_ms=duration_ms, input_tokens=input_tokens, output_tokens=output_tokens,
+            model=resolved_model, provider="openai",
         )
     message = response.choices[0].message
     for call in (message.tool_calls or []):

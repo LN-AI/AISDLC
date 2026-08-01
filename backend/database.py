@@ -100,6 +100,20 @@ def init_db():
             FOREIGN KEY (review_id) REFERENCES reviews(id)
         );
 
+        CREATE TABLE IF NOT EXISTS agent_jobs (
+            id TEXT PRIMARY KEY,
+            agent_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            current_step INTEGER DEFAULT 0,
+            total_steps INTEGER DEFAULT 1,
+            step_label TEXT,
+            result_json TEXT,
+            error_json TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS ai_systems (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -1227,3 +1241,72 @@ def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, detail
         conn.close()
     except Exception:
         pass
+
+
+# ── Agent jobs (async/progress-pollable long-running agent runs) ───────────
+
+def create_job(agent_name: str, total_steps: int = 1) -> str:
+    job_id = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO agent_jobs (id, agent_name, status, current_step, total_steps, created_at) "
+        "VALUES (?, ?, 'queued', 0, ?, ?)",
+        (job_id, agent_name, total_steps, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+def update_job(
+    job_id: str,
+    status: Optional[str] = None,
+    current_step: Optional[int] = None,
+    total_steps: Optional[int] = None,
+    step_label: Optional[str] = None,
+    result: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None,
+) -> None:
+    fields: Dict[str, Any] = {}
+    now = datetime.utcnow().isoformat()
+    if status is not None:
+        fields["status"] = status
+        if status == "running":
+            fields["started_at"] = now
+        elif status in ("completed", "failed"):
+            fields["finished_at"] = now
+    if current_step is not None:
+        fields["current_step"] = current_step
+    if total_steps is not None:
+        fields["total_steps"] = total_steps
+    if step_label is not None:
+        fields["step_label"] = step_label
+    if result is not None:
+        fields["result_json"] = json.dumps(result)
+    if error is not None:
+        fields["error_json"] = json.dumps(error)
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    vals = list(fields.values()) + [job_id]
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE agent_jobs SET {cols} WHERE id = ?", vals)
+    conn.commit()
+    conn.close()
+
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM agent_jobs WHERE id = ?", (job_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    data = dict(row)
+    data["result"] = json.loads(data["result_json"]) if data["result_json"] else None
+    data["error"] = json.loads(data["error_json"]) if data["error_json"] else None
+    del data["result_json"], data["error_json"]
+    return data

@@ -1207,19 +1207,39 @@ async function runFullReview() {
     return;
   }
 
-  showLoading('Running Full SDLC Review (this may take 30–60 seconds)...');
+  showLoading('Submitting Full SDLC Review…');
   try {
-    const result = await apiFetch('/api/review/full', {
+    const submitResp = await apiFetch('/api/review/full', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence }),
     });
+    const result = await pollFullReviewJob(submitResp.job_id);
     renderFullResult('full-result', result);
     loadDashboard();
   } catch (e) {
     showError('full-result', e.message);
   } finally {
     hideLoading();
+  }
+}
+
+// full_review chains up to 7 sequential LLM calls and can run 300s+, so the
+// backend returns a job_id immediately (202) instead of blocking the request —
+// poll for progress and show the live step label instead of a static message.
+async function pollFullReviewJob(jobId) {
+  while (true) {
+    const job = await apiFetch(`/api/review/full/jobs/${jobId}`, { _silent: true });
+    if (job.status === 'completed') return job.result;
+    if (job.status === 'failed') {
+      const err = job.error || {};
+      throw new Error(err.detail || 'Full SDLC Review failed.');
+    }
+    const label = job.step_label
+      ? `Running Full SDLC Review — step ${job.current_step}/${job.total_steps}: ${job.step_label}…`
+      : 'Running Full SDLC Review…';
+    showLoading(label);
+    await new Promise(resolve => setTimeout(resolve, 2500));
   }
 }
 
@@ -1549,8 +1569,12 @@ async function apiFetch(url, options = {}) {
       throw new Error('Sign in required.');
     }
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    if (!_silent) feLog.warn(`API ${res.status} on ${url}: ${err.detail || res.statusText}`, { source: 'apiFetch' });
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    // Legacy routes now nest a structured error body inside `detail` (see
+    // backend/services/error_utils.py) — {detail: {detail: "...", error_type, ...}} —
+    // so unwrap one level when detail isn't already a plain string.
+    const detailMsg = (err.detail && typeof err.detail === 'object') ? (err.detail.detail || JSON.stringify(err.detail)) : err.detail;
+    if (!_silent) feLog.warn(`API ${res.status} on ${url}: ${detailMsg || res.statusText}`, { source: 'apiFetch' });
+    throw new Error(detailMsg || `HTTP ${res.status}`);
   }
   return res.json();
 }

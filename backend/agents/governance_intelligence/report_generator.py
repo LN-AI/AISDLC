@@ -119,7 +119,13 @@ ALL FINDINGS:
 Generate a complete audit-ready governance report covering all sections.
 The report should be suitable for presenting to a CISO, compliance officer, or enterprise client.
 """
-        result = self.review(prompt, context)
+        # gate_status/overall_risk_score/findings_by_category below are all computed
+        # deterministically from the real all_findings/gate_status/overall_risk_score
+        # arguments — the LLM is only asked for prose via prose_summary (a small,
+        # dedicated schema), not the generic REVIEW_TOOL_SCHEMA, which used to force a
+        # full findings re-echo under a 4096-token budget and truncate on any
+        # non-trivial finding count.
+        result = self.prose_summary(prompt, context)
         result["review_type"] = "report"
 
         report_doc = self._build_report_document(

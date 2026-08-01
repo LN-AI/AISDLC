@@ -14,6 +14,7 @@ from backend.services.github_service import GitHubService
 from backend.services.jira_service import JiraService
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services.auth_service import decode_token
+from backend.services.error_utils import format_error_response
 from backend import config
 
 logger = logging.getLogger(__name__)
@@ -162,7 +163,8 @@ def run_agent(agent_name: str, req: AgentRunRequest, user=Depends(_get_user)):
         raise
     except Exception as e:
         logger.exception("Agent '%s' dispatch failed for project=%s", agent_name, project_name)
-        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+        status, body = format_error_response(e, agent_name=agent_name)
+        raise HTTPException(status_code=status, detail=body)
 
     # ── 3. Optionally post results back to GitHub / Jira ─────────────────
     post_back_status = "not_requested"

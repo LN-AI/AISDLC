@@ -56,7 +56,7 @@ from backend.models.api_models import (
     TestScenarioRequest,
     VAPTRequest,
 )
-from backend.services import agent_guard, llm_gateway
+from backend.services import agent_guard, llm_gateway, job_service
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
     check_and_record_rate_limit,
@@ -417,7 +417,16 @@ def _do_postback(source_type: str, ref: str, result: dict) -> str:
 
 def _wrap(agent: str, result: dict, source_type: str, source_ref: str,
           pb_status: str, project_name: str, llm_used: Optional[dict] = None) -> dict:
-    findings = result.get("findings", [])
+    # `full` (orchestrator.full_review) returns `top_findings` (top 10 only) /
+    # `overall_risk_score` instead of `findings`/`risk_score` — every other agent
+    # returns `findings`/`risk_score` directly, so the fallback only kicks in for
+    # `full`. Without it, `total_findings`/`risk_score` silently reset to 0/0 here
+    # even when the underlying review found real Critical findings — this was
+    # invisible before because `full` never completed under the old synchronous
+    # endpoint (always timed out), so this branch was never actually exercised.
+    findings = result.get("findings", result.get("top_findings", []))
+    risk_score = result.get("risk_score", result.get("overall_risk_score", 0))
+    total_findings = result.get("total_findings", len(findings))
     CORE = {"findings", "risk_score", "gate_status", "summary", "recommendations",
             "compliance_flags", "review_id", "agent_name", "critical_count",
             "high_count", "total_findings"}
@@ -430,8 +439,8 @@ def _wrap(agent: str, result: dict, source_type: str, source_ref: str,
         "review_id": result.get("review_id"),
         "project_name": project_name or "",
         "gate_status": result.get("gate_status", "Green"),
-        "risk_score": float(result.get("risk_score", 0)),
-        "total_findings": len(findings),
+        "risk_score": float(risk_score),
+        "total_findings": total_findings,
         "critical_count": result.get("critical_count", sum(1 for f in findings if f.get("severity") == 5)),
         "high_count": result.get("high_count",    sum(1 for f in findings if f.get("severity") == 4)),
         "summary": result.get("summary", ""),
@@ -804,10 +813,15 @@ def run_release_gate(req: ReleaseGateRequest, caller: dict = Depends(get_caller)
 
 All findings are aggregated and passed to the Release Gate agent. A consolidated report is generated.
 
-**Returns:** Gate decision, sub-review summary, top 10 findings, report ID.
+This chains up to 7 sequential LLM calls (each potentially 60-150s+), so it does not run
+synchronously — it returns a `job_id` immediately (202 Accepted). Poll
+`GET /api/v1/agents/jobs/{job_id}` for live step progress (`current_step`/`total_steps`/
+`step_label`) and, once `status` is `completed` or `failed`, the same result/error shape
+this endpoint used to return directly.
 """,
+    status_code=202,
 )
-def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
+async def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
     requirement = None
     code = None
     src_type = "text"
@@ -844,21 +858,52 @@ def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
 
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
     override = _effective_llm_override(req, caller, "full")
-    result = agent_guard.guarded_call(
-        caller, "full", override,
-        lambda: _orch.full_review(
-            requirement=requirement,
-            compliance_artifact=req.compliance_artifact,
-            architecture=req.architecture,
-            code=code,
-            prompt_config=req.prompt_config,
-            test_evidence=req.test_evidence or "",
-            project_name=req.project_name or src_ref[:60] or "Full Review",
-            context=ctx,
-        ),
-    )
-    pb = _do_postback(src_type, pb_ref, result) if req.post_back and pb_ref else "not_requested"
-    return _wrap("full", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+    total_steps = sum([
+        bool(requirement), bool(req.compliance_artifact), bool(req.architecture),
+        bool(code), bool(req.prompt_config),
+    ]) + 2  # release gate + report generation always run
+
+    def _run(on_progress):
+        result = agent_guard.guarded_call(
+            caller, "full", override,
+            lambda: _orch.full_review(
+                requirement=requirement,
+                compliance_artifact=req.compliance_artifact,
+                architecture=req.architecture,
+                code=code,
+                prompt_config=req.prompt_config,
+                test_evidence=req.test_evidence or "",
+                project_name=req.project_name or src_ref[:60] or "Full Review",
+                context=ctx,
+                on_progress=on_progress,
+            ),
+        )
+        pb = _do_postback(src_type, pb_ref, result) if req.post_back and pb_ref else "not_requested"
+        return _wrap("full", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+    job_id = job_service.start_job("full", total_steps, _run)
+    return {"job_id": job_id, "status": "queued", "poll_url": f"/api/v1/agents/jobs/{job_id}"}
+
+
+@router.get(
+    "/jobs/{job_id}",
+    summary="Poll status/progress of a background agent job (currently only /full uses this)",
+    description="""Returns the current status of a job created by `POST /api/v1/agents/full`.
+
+`status` is one of `queued` / `running` / `completed` / `failed`. While running,
+`current_step`/`total_steps`/`step_label` show which of the sequential sub-agent
+calls is in flight (e.g. "3 of 7: Architecture Review"). Once `completed`, `result`
+holds the same payload the endpoint used to return directly. Once `failed`, `error`
+holds a structured error body (same shape as the platform's other error responses:
+`detail`, `error_type`, `request_id`, etc.).
+""",
+)
+def get_job(job_id: str, caller: dict = Depends(get_caller)):
+    job = job_service.get_job_status(job_id)
+    if not job:
+        raise HTTPException(404, f"No job found with id '{job_id}'")
+    return job
 
 
 # ── 11. Code Generation — Advisory ────────────────────────────────────────
