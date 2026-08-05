@@ -83,6 +83,8 @@ document.addEventListener('keydown', e => {
     if (llmModal && !llmModal.classList.contains('hidden')) closeLlmConfigModal();
     const reviewModal = document.getElementById('review-detail-modal');
     if (reviewModal && !reviewModal.classList.contains('hidden')) closeReviewDetail();
+    const keyModal = document.getElementById('key-edit-modal');
+    if (keyModal && !keyModal.classList.contains('hidden')) closeKeyEditor();
   }
 });
 
@@ -3064,6 +3066,8 @@ async function registerSystem() {
 
 // ── API Keys ──────────────────────────────────────────────────────────────
 
+let _apiKeys = [];
+
 async function loadApiKeys() {
   const wrap = document.getElementById('api-keys-list');
   if (!wrap) return;
@@ -3073,6 +3077,9 @@ async function loadApiKeys() {
   try {
     const data = await apiFetch('/api/v1/keys', { _silent: true });
     const keys = data.keys || [];
+    // Cached so the editor can read a key's current values by id, instead of threading
+    // every field through an onclick attribute.
+    _apiKeys = keys;
     // Plan names aren't on the key record, only plan_id — resolve them for display. Only
     // super admins can list plans, so this stays best-effort for project admins.
     let planNames = {};
@@ -3109,11 +3116,7 @@ async function loadApiKeys() {
               <td style="font-size:12px;color:var(--text-muted)">${(k.last_used_at||'Never').slice(0,16).replace('T',' ')}</td>
               <td style="font-size:12px;color:var(--text-muted)">${(k.created_at||'').slice(0,10)}</td>
               <td>
-                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="editApiKeyLimits('${esc(k.id)}','${esc(k.team_name)}',${k.rate_limit_per_minute||60},${k.rate_limit_per_day||2000})">Edit limits</button>
-                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="editApiKeyBudget('${esc(k.id)}','${esc(k.team_name)}',${k.monthly_budget_usd != null ? k.monthly_budget_usd : 'null'})">Edit budget</button>
-                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="openLlmConfigModal('${esc(k.id)}','${esc(k.team_name)}')">Manage LLM</button>
-                ${isSuperAdmin() ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="openAssignPlan('${esc(k.id)}','${esc(k.team_name)}','${esc(k.plan_id||'')}')">Assign plan</button>` : ''}
-                ${k.is_active ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="revokeApiKey('${esc(k.id)}','${esc(k.team_name)}')">Revoke</button>` : ''}
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 12px" onclick="openKeyEditor('${esc(k.id)}')">Edit</button>
               </td>
             </tr>`).join('')}
         </tbody>
@@ -3176,47 +3179,148 @@ async function createApiKey() {
   } catch (e) { alert('Failed to create key: ' + e.message); }
 }
 
-async function editApiKeyLimits(id, team, currentMinute, currentDay) {
-  const perMinute = prompt(`Requests per minute for "${team}":`, currentMinute);
-  if (perMinute === null) return;
-  const perDay = prompt(`Requests per day for "${team}":`, currentDay);
-  if (perDay === null) return;
-  const minuteNum = parseInt(perMinute, 10);
-  const dayNum = parseInt(perDay, 10);
-  if (!Number.isFinite(minuteNum) || minuteNum < 1 || !Number.isFinite(dayNum) || dayNum < 1) {
-    alert('Enter valid positive numbers for both limits.');
-    return;
-  }
-  try {
-    await apiFetch(`/api/v1/keys/${id}/limits`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rate_limit_per_minute: minuteNum, rate_limit_per_day: dayNum }),
-    });
-    loadApiKeys();
-  } catch (e) { alert('Failed to update limits: ' + e.message); }
+// ── Edit an API key ───────────────────────────────────────────────────────
+//
+// Rate limits, budget and plan used to be three separate buttons, each a chain of
+// prompt() dialogs with no visible current value. They are one pre-filled form now.
+// The three settings live behind three endpoints (/limits, /budget, /plan), so Save
+// issues only the calls whose values actually changed — which also keeps a project
+// admin off /plan, since that route is super-admin only.
+
+let _editingKey = null;
+
+function openKeyEditor(keyId) {
+  const key = (_apiKeys || []).find(k => k.id === keyId);
+  if (!key) return alert('That key is no longer in the list — refresh and try again.');
+  _editingKey = key;
+
+  document.getElementById('key-edit-subtitle').textContent =
+    `${key.prefix}… — ${key.project_name_resolved || key.team_name}`;
+  document.getElementById('key-edit-error').classList.add('hidden');
+
+  const used = Number(key.budget_used_usd || 0);
+  document.getElementById('key-edit-summary').innerHTML = `
+    <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:12px;color:var(--text-muted)">
+      <div><strong style="color:var(--text)">${key.is_active ? 'Active' : 'Revoked'}</strong><br />status</div>
+      <div><strong style="color:var(--text)">${key.usage_count || 0}</strong><br />calls all-time</div>
+      <div><strong style="color:var(--text)">${key.calls_today || 0}</strong><br />today</div>
+      <div><strong style="color:var(--text)">$${used.toFixed(2)}</strong><br />spent this period</div>
+      <div><strong style="color:var(--text)">${key.llm_configured ? esc(key.llm_provider || 'own') : 'Platform'}</strong><br />LLM</div>
+      <div><strong style="color:var(--text)">${(key.created_at || '').slice(0, 10)}</strong><br />created</div>
+    </div>`;
+
+  document.getElementById('key-edit-limit-minute').value = key.rate_limit_per_minute || 60;
+  document.getElementById('key-edit-limit-day').value = key.rate_limit_per_day || 2000;
+  document.getElementById('key-edit-budget').value =
+    key.monthly_budget_usd != null ? key.monthly_budget_usd : '';
+  document.getElementById('key-edit-budget-hint').textContent =
+    `$${used.toFixed(2)} spent this period. Once spend reaches the cap, calls return 402 until next month.`;
+
+  const revoke = document.getElementById('key-edit-revoke');
+  revoke.style.display = key.is_active ? '' : 'none';
+
+  _populateKeyPlanSelect(key);
+  document.getElementById('key-edit-modal').classList.remove('hidden');
 }
 
-async function editApiKeyBudget(id, team, currentBudget) {
-  const input = prompt(
-    `Monthly budget cap (USD) for "${team}" — leave blank for unlimited:`,
-    currentBudget != null ? String(currentBudget) : ''
-  );
-  if (input === null) return;
-  const trimmed = input.trim();
-  const value = trimmed ? parseFloat(trimmed) : null;
-  if (trimmed && (!Number.isFinite(value) || value < 0)) {
-    alert('Enter a valid non-negative number, or leave blank for unlimited.');
+async function _populateKeyPlanSelect(key) {
+  const select = document.getElementById('key-edit-plan');
+  const hint = document.getElementById('key-edit-plan-hint');
+  if (!isSuperAdmin()) {
+    select.innerHTML = '<option value="">—</option>';
+    select.disabled = true;
+    hint.textContent = 'Only a super admin can change a key\'s plan.';
     return;
   }
+  select.disabled = false;
+  select.innerHTML = '<option value="">Loading plans…</option>';
   try {
-    await apiFetch(`/api/v1/keys/${id}/budget`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ monthly_budget_usd: value }),
-    });
+    const plans = ((await apiFetch('/api/v1/plans', { _silent: true })).plans || []).filter(p => p.is_active);
+    select.innerHTML =
+      `<option value="">No plan — fall back to scopes (${esc(key.scopes || 'all')})</option>` +
+      plans.map(p => {
+        const count = (p.products || []).length;
+        return `<option value="${esc(p.id)}">${esc(p.name)} — ${count} product${count === 1 ? '' : 's'}</option>`;
+      }).join('');
+    select.value = key.plan_id || '';
+    hint.textContent = plans.length
+      ? 'Changing this takes effect on the key\'s very next call.'
+      : 'No active plans yet — create one on the Plans page.';
+  } catch (e) {
+    select.innerHTML = '<option value="">Could not load plans</option>';
+    hint.textContent = e.message;
+  }
+}
+
+function closeKeyEditor() {
+  document.getElementById('key-edit-modal').classList.add('hidden');
+  _editingKey = null;
+}
+
+function _showKeyEditError(message) {
+  const el = document.getElementById('key-edit-error');
+  el.textContent = message;
+  el.classList.remove('hidden');
+}
+
+async function saveKeyEdits() {
+  const key = _editingKey;
+  if (!key) return;
+  document.getElementById('key-edit-error').classList.add('hidden');
+
+  const perMinute = parseInt(document.getElementById('key-edit-limit-minute').value, 10);
+  const perDay = parseInt(document.getElementById('key-edit-limit-day').value, 10);
+  if (!Number.isFinite(perMinute) || perMinute < 1 || !Number.isFinite(perDay) || perDay < 1) {
+    return _showKeyEditError('Both rate limits must be positive whole numbers.');
+  }
+
+  const budgetRaw = document.getElementById('key-edit-budget').value.trim();
+  const budget = budgetRaw === '' ? null : parseFloat(budgetRaw);
+  if (budgetRaw !== '' && (!Number.isFinite(budget) || budget < 0)) {
+    return _showKeyEditError('The budget cap must be a non-negative number, or blank for unlimited.');
+  }
+
+  const planId = isSuperAdmin() ? (document.getElementById('key-edit-plan').value || null) : undefined;
+
+  const calls = [];
+  if (perMinute !== (key.rate_limit_per_minute || 60) || perDay !== (key.rate_limit_per_day || 2000)) {
+    calls.push(['limits', { rate_limit_per_minute: perMinute, rate_limit_per_day: perDay }]);
+  }
+  if (budget !== (key.monthly_budget_usd != null ? key.monthly_budget_usd : null)) {
+    calls.push(['budget', { monthly_budget_usd: budget }]);
+  }
+  if (planId !== undefined && planId !== (key.plan_id || null)) {
+    calls.push(['plan', { plan_id: planId }]);
+  }
+  if (!calls.length) return closeKeyEditor();
+
+  try {
+    for (const [path, body] of calls) {
+      await apiFetch(`/api/v1/keys/${key.id}/${path}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    }
+    closeKeyEditor();
     loadApiKeys();
-  } catch (e) { alert('Failed to update budget: ' + e.message); }
+  } catch (e) {
+    _showKeyEditError(e.message);
+  }
+}
+
+function openLlmConfigFromEditor() {
+  const key = _editingKey;
+  if (!key) return;
+  closeKeyEditor();
+  openLlmConfigModal(key.id, key.team_name);
+}
+
+async function revokeFromEditor() {
+  const key = _editingKey;
+  if (!key) return;
+  closeKeyEditor();
+  await revokeApiKey(key.id, key.team_name);
 }
 
 function copyKey() {
@@ -4142,41 +4246,6 @@ async function deletePlan(planId, name) {
     await apiFetch(`/api/v1/plans/${planId}`, { method: 'DELETE' });
     loadPlans();
   } catch (e) { alert('Could not delete plan: ' + e.message); }
-}
-
-// ── Assign a plan to an API key ───────────────────────────────────────────
-
-async function openAssignPlan(keyId, teamName, currentPlanId) {
-  let plans = [];
-  try {
-    plans = (await apiFetch('/api/v1/plans')).plans || [];
-  } catch (e) {
-    return alert('Could not load plans: ' + e.message);
-  }
-  const options = plans.filter(p => p.is_active)
-    .map(p => `${p.id === currentPlanId ? '*' : ' '} ${p.name}`).join('\n');
-  const choice = prompt(
-    `Assign a plan to "${teamName}".\n\n` +
-    `Type a plan name exactly, or leave blank for no plan (the key falls back to its scopes column).\n\n` +
-    `Available:\n${options || '  (none — create one on the Plans page)'}`,
-    plans.find(p => p.id === currentPlanId)?.name || ''
-  );
-  if (choice === null) return;
-  const wanted = choice.trim();
-  let planId = null;
-  if (wanted) {
-    const match = plans.find(p => p.name.toLowerCase() === wanted.toLowerCase());
-    if (!match) return alert(`No plan named "${wanted}".`);
-    planId = match.id;
-  }
-  try {
-    await apiFetch(`/api/v1/keys/${keyId}/plan`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ plan_id: planId }),
-    });
-    loadApiKeys();
-  } catch (e) { alert('Could not assign plan: ' + e.message); }
 }
 
 // ── Usage & Metering ──────────────────────────────────────────────────────

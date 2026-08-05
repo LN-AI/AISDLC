@@ -1899,6 +1899,66 @@ Examples:
   </div>
 
   <!-- BYOL (Bring Your Own LLM) Modal -->
+  <!-- ── Edit API key ──────────────────────────────────────────────────── -->
+  <div id="key-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeKeyEditor()">
+    <div class="modal-box" style="width:620px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeKeyEditor()" title="Dismiss (Esc)">✕</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 style="margin-bottom:2px">Edit API Key</h2>
+        <p id="key-edit-subtitle">—</p>
+      </div>
+
+      <div id="key-edit-summary" style="margin-bottom:18px"></div>
+
+      <div class="section-title" style="margin-top:0">Entitlement</div>
+      <p class="subtitle" style="margin-top:-4px;font-size:12px">
+        A plan decides which agents and workflows this key may call. Without one the key falls back to its
+        scopes column, which today means unrestricted.
+      </p>
+      <div class="form-group">
+        <label>Plan</label>
+        <select id="key-edit-plan"></select>
+        <span id="key-edit-plan-hint" style="font-size:11px;color:var(--text-muted)"></span>
+      </div>
+
+      <div class="section-title" style="margin-top:20px">Rate limits</div>
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Requests / minute</label>
+          <input type="number" id="key-edit-limit-minute" min="1" max="6000" />
+        </div>
+        <div class="form-group flex1">
+          <label>Requests / day</label>
+          <input type="number" id="key-edit-limit-day" min="1" max="1000000" />
+        </div>
+      </div>
+
+      <div class="section-title" style="margin-top:20px">Monthly budget</div>
+      <div class="form-group">
+        <label>Cap in USD — blank for unlimited</label>
+        <input type="number" id="key-edit-budget" min="0" step="0.01" placeholder="Unlimited" />
+        <span id="key-edit-budget-hint" style="font-size:11px;color:var(--text-muted)"></span>
+      </div>
+
+      <div id="key-edit-error" class="login-error hidden" style="margin-top:12px"></div>
+
+      <div class="form-actions" style="margin-top:18px">
+        <button class="btn btn-primary" onclick="saveKeyEdits()">Save Changes</button>
+        <button class="btn btn-secondary" onclick="closeKeyEditor()">Cancel</button>
+        <span style="flex:1"></span>
+        <button class="btn btn-secondary" onclick="openLlmConfigFromEditor()">Manage LLM…</button>
+      </div>
+
+      <div class="section-title" style="margin-top:24px;color:var(--red)">Danger zone</div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-size:12px;color:var(--text-muted);flex:1">
+          Revoking is immediate and cannot be undone — every request using this key starts failing.
+        </span>
+        <button class="btn btn-secondary" id="key-edit-revoke" onclick="revokeFromEditor()">Revoke key</button>
+      </div>
+    </div>
+  </div>
+
   <div id="llm-config-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeLlmConfigModal()">
     <div class="modal-box" style="width:560px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
       <button class="modal-close-btn" onclick="closeLlmConfigModal()" title="Dismiss (Esc)">✕</button>
