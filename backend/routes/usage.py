@@ -41,6 +41,7 @@ def _filters(
     key_id: Optional[str] = Query(None),
     product_id: Optional[str] = Query(None),
     caller_type: Optional[str] = Query(None, description="api_key | ui | anonymous"),
+    project_id: Optional[str] = Query(None, description="Attributed from the calling key's project."),
     end: Optional[str] = Query(None, description="ISO upper bound, exclusive of nothing — used as <=."),
 ) -> dict:
     return {
@@ -49,6 +50,7 @@ def _filters(
         "key_id": key_id,
         "product_id": product_id,
         "caller_type": caller_type,
+        "project_id": project_id,
     }
 
 

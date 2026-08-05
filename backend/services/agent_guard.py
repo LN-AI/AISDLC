@@ -167,6 +167,9 @@ def guarded_call(
 
     caller_type, caller_ref, key_id = _caller_identity(caller)
     caller_id = key_id or caller_ref or "ui"
+    # Keys belong to a project, so a metered call can be attributed to one. UI and
+    # anonymous callers have no key and therefore no project — those rows stay unattributed.
+    project_id = ((caller or {}).get("_record") or {}).get("project_id")
     product = registry.get(agent_name)
     product_kind = product.kind if product else "agent"
 
@@ -221,14 +224,14 @@ def guarded_call(
         product_id=agent_name, product_kind=product_kind, usage=usage,
         cost_usd=cost_usd, model=model, provider=provider, billable=billable,
         cost_estimated=bool(usage["calls"]) and _is_estimated(model),
-        project_name=project_name, result=result, status=status,
+        project_id=project_id, project_name=project_name, result=result, status=status,
     )
     return result
 
 
 def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_kind,
                         usage, cost_usd, model, provider, billable, cost_estimated,
-                        project_name, result, status) -> None:
+                        project_id, project_name, result, status) -> None:
     """Write the billing-ledger row. Never lets a metering failure break the response —
     the caller already has a valid result at this point."""
     try:
@@ -246,6 +249,7 @@ def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_
             provider=provider,
             billable=billable,
             cost_estimated=cost_estimated,
+            project_id=project_id,
             project_name=project_name or (result.get("project_name", "") if isinstance(result, dict) else ""),
             review_id=result.get("review_id") if isinstance(result, dict) else None,
             status=status,

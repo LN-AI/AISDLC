@@ -360,6 +360,12 @@ def main_():
     check("by_product costs sum to the total",
           abs(sum(p["cost_usd"] for p in summary["by_product"]) - summary["totals"]["cost_usd"]) < 1e-6,
           f"{sum(p['cost_usd'] for p in summary['by_product'])} vs {summary['totals']['cost_usd']}")
+    check("by_project costs sum to the total",
+          abs(sum(p["cost_usd"] for p in summary["by_project"]) - summary["totals"]["cost_usd"]) < 1e-6,
+          f"{sum(p['cost_usd'] for p in summary['by_project'])} vs {summary['totals']['cost_usd']}")
+    check("by_project resolves real project names",
+          any(p["label"] not in ("Unattributed", "") for p in summary["by_project"]),
+          str(summary["by_project"])[:200])
     check("by_key costs sum to the total",
           abs(sum(k["cost_usd"] for k in summary["by_key"]) - summary["totals"]["cost_usd"]) < 1e-6,
           f"{sum(k['cost_usd'] for k in summary['by_key'])} vs {summary['totals']['cost_usd']}")
@@ -368,6 +374,10 @@ def main_():
           f"billable={summary['totals']['billable_cost_usd']} gross={summary['totals']['cost_usd']}")
     check("by_key rows carry a readable label, not just a UUID",
           all(k.get("label") for k in summary["by_key"]), str(summary["by_key"])[:200])
+    keyed = [e for e in ledger if e["key_id"]]
+    check("API-key calls are attributed to the key's project",
+          keyed and all(e["project_id"] for e in keyed),
+          f"{sum(1 for e in keyed if not e['project_id'])} of {len(keyed)} key-authenticated rows have no project")
 
     r = client.get("/api/v1/usage/summary?product_id=code", headers=admin)
     check("summary honours the product_id filter",

@@ -4153,6 +4153,7 @@ async function loadUsage() {
     _renderUsageStats(summary);
     _renderUsageByProduct(summary.by_product || []);
     _renderUsageByKey(summary.by_key || []);
+    _renderUsageByProject(summary.by_project || []);
     _renderUsageEvents(recent.events || [], recent.total || 0);
   } catch (e) {
     stats.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
@@ -4214,6 +4215,24 @@ function _renderUsageByKey(rows) {
           <tr>
             <td><strong>${esc(r.label || '—')}</strong></td>
             <td><span class="role-badge role-reviewer">${esc(r.caller_type)}</span></td>
+            <td>${r.events}</td>
+            <td>${_money(r.cost_usd)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function _renderUsageByProject(rows) {
+  const wrap = document.getElementById('usage-by-project');
+  if (!wrap) return;
+  if (!rows.length) return void (wrap.innerHTML = '<div class="empty-state">No usage in this period.</div>');
+  wrap.innerHTML = `
+    <table class="users-table">
+      <thead><tr><th>Project</th><th>Calls</th><th>Cost</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `
+          <tr>
+            <td><strong>${esc(r.label)}</strong>${r.project_id ? '' : '<div style="font-size:11px;color:var(--text-muted)">UI / anonymous calls</div>'}</td>
             <td>${r.events}</td>
             <td>${_money(r.cost_usd)}</td>
           </tr>`).join('')}

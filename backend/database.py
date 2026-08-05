@@ -1521,6 +1521,7 @@ def _usage_filters(
     key_id: Optional[str] = None,
     product_id: Optional[str] = None,
     caller_type: Optional[str] = None,
+    project_id: Optional[str] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
 ) -> tuple:
@@ -1536,6 +1537,9 @@ def _usage_filters(
     if caller_type:
         clauses.append("e.caller_type = ?")
         params.append(caller_type)
+    if project_id:
+        clauses.append("e.project_id = ?")
+        params.append(project_id)
     if start:
         clauses.append("e.created_at >= ?")
         params.append(start)
@@ -1573,8 +1577,18 @@ def get_usage_summary(**filters) -> Dict[str, Any]:
     )
     by_key = [dict(r) for r in cursor.fetchall()]
 
+    # Keys belong to projects, so key-authenticated usage rolls up to a project. UI and
+    # anonymous rows have no key and land under "Unattributed".
+    cursor.execute(
+        f"SELECT e.project_id, COALESCE(NULLIF(p.name, ''), NULLIF(e.project_name, ''), 'Unattributed') AS label, "
+        f"{_USAGE_SUMS} FROM usage_events e LEFT JOIN projects p ON p.id = e.project_id{where} "
+        "GROUP BY e.project_id, label ORDER BY cost_usd DESC",
+        params,
+    )
+    by_project = [dict(r) for r in cursor.fetchall()]
+
     conn.close()
-    return {"totals": totals, "by_product": by_product, "by_key": by_key}
+    return {"totals": totals, "by_product": by_product, "by_key": by_key, "by_project": by_project}
 
 
 def list_usage_events(limit: int = 100, offset: int = 0, **filters) -> Dict[str, Any]:

@@ -158,6 +158,9 @@ async def legacy_product_guard(request, call_next):
     if not usage["calls"]:
         return response  # nothing reached an LLM (validation error, cache hit, 4xx)
 
+    # The legacy handlers never call resolve_effective_override, so a BYOL config cannot
+    # apply on these routes — the platform always pays, and `billable` is always true here.
+    # If BYOL is ever wired into /api/review/*, this has to derive it the way guarded_call does.
     model = config.MODEL
     cost_usd = agent_guard._price_usage(usage, model)
     if key_id:
@@ -176,6 +179,10 @@ async def legacy_product_guard(request, call_next):
             output_tokens=usage["output_tokens"],
             cost_usd=cost_usd,
             model=model,
+            provider="anthropic",
+            billable=True,
+            cost_estimated=agent_guard._is_estimated(model),
+            project_id=(caller.get("_record") or {}).get("project_id"),
             status="ok" if response.status_code < 400 else "error",
         )
     except Exception:
