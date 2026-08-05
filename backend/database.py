@@ -251,6 +251,9 @@ def init_db():
             output_tokens INTEGER DEFAULT 0,
             cost_usd REAL DEFAULT 0,
             model TEXT,
+            provider TEXT,
+            billable INTEGER DEFAULT 1,
+            cost_estimated INTEGER DEFAULT 0,
             status TEXT DEFAULT 'ok',
             created_at TEXT NOT NULL
         );
@@ -279,6 +282,20 @@ def init_db():
         try:
             cursor.execute(
                 f"ALTER TABLE api_keys ADD COLUMN {column} {ddl_type} DEFAULT {default}"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # Same for usage_events: CREATE TABLE IF NOT EXISTS won't add columns to the table
+    # as it already stands in a database created before BYOL billing was separated out.
+    for column, ddl_type, default in (
+        ("provider", "TEXT", "NULL"),
+        ("billable", "INTEGER", 1),
+        ("cost_estimated", "INTEGER", 0),
+    ):
+        try:
+            cursor.execute(
+                f"ALTER TABLE usage_events ADD COLUMN {column} {ddl_type} DEFAULT {default}"
             )
         except sqlite3.OperationalError:
             pass  # column already exists
@@ -1439,20 +1456,27 @@ def record_usage_event(
     output_tokens: int = 0,
     cost_usd: float = 0.0,
     model: str = "",
+    provider: str = "",
+    billable: bool = True,
+    cost_estimated: bool = False,
     project_id: Optional[str] = None,
     project_name: str = "",
     review_id: Optional[str] = None,
     status: str = "ok",
 ) -> str:
+    """`billable` is False when the caller supplied their own LLM credentials — the row is
+    still recorded, but that spend must not count against the platform's budget caps."""
     event_id = str(uuid.uuid4())
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO usage_events (id, key_id, caller_type, caller_ref, product_id, product_kind, "
         "project_id, project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model, "
-        "status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "provider, billable, cost_estimated, status, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (event_id, key_id, caller_type, caller_ref, product_id, product_kind, project_id,
          project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model,
+         provider, 1 if billable else 0, 1 if cost_estimated else 0,
          status, datetime.utcnow().isoformat()),
     )
     conn.commit()
@@ -1461,32 +1485,120 @@ def record_usage_event(
 
 
 def get_usage_totals(key_id: str, product_id: str, since_iso: str) -> Dict[str, Any]:
-    """Calls and spend for one key+product since `since_iso` — the quota check's input."""
+    """Calls and spend for one key+product since `since_iso` — the quota check's input.
+
+    `cost_usd` is everything; `billable_cost_usd` excludes calls the caller paid for with
+    their own LLM credentials. Call quotas use the former, spend quotas the latter.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT COUNT(*) AS events, COALESCE(SUM(cost_usd), 0) AS cost_usd "
+        "SELECT COUNT(*) AS events, COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+        "COALESCE(SUM(CASE WHEN billable = 1 THEN cost_usd ELSE 0 END), 0) AS billable_cost_usd "
         "FROM usage_events WHERE key_id = ? AND product_id = ? AND created_at >= ?",
         (key_id, product_id, since_iso),
     )
     row = cursor.fetchone()
     conn.close()
-    return {"events": row["events"] or 0, "cost_usd": row["cost_usd"] or 0.0}
+    return {
+        "events": row["events"] or 0,
+        "cost_usd": row["cost_usd"] or 0.0,
+        "billable_cost_usd": row["billable_cost_usd"] or 0.0,
+    }
+
+
+_USAGE_SUMS = (
+    "COUNT(*) AS events, "
+    "COALESCE(SUM(calls), 0) AS calls, "
+    "COALESCE(SUM(input_tokens), 0) AS input_tokens, "
+    "COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+    "COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+    "COALESCE(SUM(CASE WHEN billable = 1 THEN cost_usd ELSE 0 END), 0) AS billable_cost_usd"
+)
+
+
+def _usage_filters(
+    key_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    caller_type: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> tuple:
+    """Build the shared WHERE clause for every usage query. Values are always bound, never
+    interpolated — `product_id` and `caller_type` arrive straight from query strings."""
+    clauses, params = [], []
+    if key_id:
+        clauses.append("e.key_id = ?")
+        params.append(key_id)
+    if product_id:
+        clauses.append("e.product_id = ?")
+        params.append(product_id)
+    if caller_type:
+        clauses.append("e.caller_type = ?")
+        params.append(caller_type)
+    if start:
+        clauses.append("e.created_at >= ?")
+        params.append(start)
+    if end:
+        clauses.append("e.created_at <= ?")
+        params.append(end)
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def get_usage_summary(**filters) -> Dict[str, Any]:
+    """Period totals plus by-product and by-key breakdowns — the Usage page's payload."""
+    where, params = _usage_filters(**filters)
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        f"SELECT {_USAGE_SUMS}, COUNT(DISTINCT e.key_id) AS keys FROM usage_events e{where}",
+        params,
+    )
+    totals = dict(cursor.fetchone() or {})
+
+    cursor.execute(
+        f"SELECT e.product_id, e.product_kind, {_USAGE_SUMS} FROM usage_events e{where} "
+        "GROUP BY e.product_id, e.product_kind ORDER BY cost_usd DESC",
+        params,
+    )
+    by_product = [dict(r) for r in cursor.fetchall()]
+
+    # Join api_keys so the UI can show a team name instead of a bare UUID.
+    cursor.execute(
+        f"SELECT e.key_id, e.caller_type, COALESCE(NULLIF(k.team_name, ''), NULLIF(e.caller_ref, ''), e.caller_type) AS label, "
+        f"{_USAGE_SUMS} FROM usage_events e LEFT JOIN api_keys k ON k.id = e.key_id{where} "
+        "GROUP BY e.key_id, e.caller_type, label ORDER BY cost_usd DESC",
+        params,
+    )
+    by_key = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+    return {"totals": totals, "by_product": by_product, "by_key": by_key}
+
+
+def list_usage_events(limit: int = 100, offset: int = 0, **filters) -> Dict[str, Any]:
+    """Raw ledger rows, newest first, with the total matching count for pagination."""
+    where, params = _usage_filters(**filters)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) AS n FROM usage_events e{where}", params)
+    total = (cursor.fetchone() or {"n": 0})["n"]
+    cursor.execute(
+        f"SELECT e.*, COALESCE(NULLIF(k.team_name, ''), NULLIF(e.caller_ref, ''), e.caller_type) AS label "
+        f"FROM usage_events e LEFT JOIN api_keys k ON k.id = e.key_id{where} "
+        "ORDER BY e.created_at DESC, e.rowid DESC LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return {"events": rows, "total": total, "limit": limit, "offset": offset}
 
 
 def get_usage_breakdown(key_id: str, since_iso: str) -> List[Dict[str, Any]]:
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT product_id, product_kind, COUNT(*) AS events, COALESCE(SUM(calls), 0) AS calls, "
-        "COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, "
-        "COALESCE(SUM(cost_usd), 0) AS cost_usd FROM usage_events "
-        "WHERE key_id = ? AND created_at >= ? GROUP BY product_id, product_kind ORDER BY cost_usd DESC",
-        (key_id, since_iso),
-    )
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    """Per-product usage for one key. Thin wrapper over get_usage_summary so there is only
+    one place where the aggregate columns are defined."""
+    return get_usage_summary(key_id=key_id, start=since_iso)["by_product"]
 
 
 def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, details: str = ""):

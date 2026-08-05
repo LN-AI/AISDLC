@@ -158,6 +158,12 @@
             <li class="nav-item" data-page="api-keys" id="nav-api-keys" style="display:none">
               <span class="nav-icon">🔑</span> API Keys
             </li>
+            <li class="nav-item" data-page="plans" id="nav-plans" style="display:none">
+              <span class="nav-icon">📦</span> Plans
+            </li>
+            <li class="nav-item" data-page="usage" id="nav-usage" style="display:none">
+              <span class="nav-icon">📊</span> Usage &amp; Metering
+            </li>
           </ul>
         </li>
 
@@ -1716,6 +1722,114 @@ Examples:
         <div id="api-keys-list" class="users-table-wrap" style="margin-top:20px">
           <div class="empty-state">Loading…</div>
         </div>
+      </div>
+
+      <!-- ── Plans ────────────────────────────────────────────────────────── -->
+      <div id="page-plans" class="page">
+        <div class="page-header">
+          <h1>Plans</h1>
+          <p class="subtitle">A plan bundles products — single agents and multi-agent workflows alike — into a tier you can assign to an API key. A key with no plan keeps its legacy scopes, so assigning plans is opt-in and nothing changes until you do it.</p>
+        </div>
+
+        <div class="users-toolbar" style="margin-top:20px">
+          <button class="btn btn-primary" onclick="openPlanEditor()">+ New Plan</button>
+          <button class="btn btn-secondary" onclick="loadPlans()">↺ Refresh</button>
+        </div>
+
+        <div id="plan-editor-panel" class="create-user-panel hidden" style="margin-top:16px">
+          <h3 id="plan-editor-title">New Plan</h3>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Name <span class="required">*</span></label>
+              <input type="text" id="plan-name" placeholder="e.g. Starter, Security Suite" />
+            </div>
+            <div class="form-group flex1">
+              <label>Description</label>
+              <input type="text" id="plan-description" placeholder="Who is this tier for?" />
+            </div>
+          </div>
+
+          <div class="section-title" style="margin-top:18px">Products in this plan</div>
+          <p class="subtitle" style="margin-top:-4px;font-size:12px">
+            Leave a quota blank for unlimited. Entitlement to a workflow does <strong>not</strong> grant its
+            constituent agents — a key entitled to Full Review can run the workflow end to end but cannot call
+            Code Review on its own.
+          </p>
+          <div id="plan-selected-products" style="margin-bottom:12px"></div>
+
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Filter by type</label>
+              <select id="plan-filter-kind" onchange="renderProductCatalogue()">
+                <option value="">All types</option>
+                <option value="agent">Agents only</option>
+                <option value="workflow">Workflows only</option>
+              </select>
+            </div>
+            <div class="form-group flex1">
+              <label>Filter by module</label>
+              <select id="plan-filter-module" onchange="renderProductCatalogue()"></select>
+            </div>
+            <div class="form-group flex1">
+              <label>Search</label>
+              <input type="text" id="plan-filter-text" placeholder="Name or id…" oninput="renderProductCatalogue()" />
+            </div>
+          </div>
+          <div id="plan-product-catalogue" class="users-table-wrap" style="max-height:340px;overflow:auto"></div>
+
+          <div id="plan-editor-error" class="login-error hidden" style="margin-top:12px"></div>
+          <div class="form-actions" style="margin-top:14px">
+            <button class="btn btn-primary" onclick="savePlan()">Save Plan</button>
+            <button class="btn btn-secondary" onclick="closePlanEditor()">Cancel</button>
+          </div>
+        </div>
+
+        <div id="plans-list" class="users-table-wrap" style="margin-top:20px">
+          <div class="empty-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- ── Usage & Metering ─────────────────────────────────────────────── -->
+      <div id="page-usage" class="page">
+        <div class="page-header">
+          <h1>Usage &amp; Metering</h1>
+          <p class="subtitle">Every agent and workflow call writes one row to the billing ledger, including calls made from this UI. A workflow is recorded once as itself, not smeared across the agents it runs.</p>
+        </div>
+
+        <div class="users-toolbar" style="margin-top:20px;flex-wrap:wrap;gap:8px">
+          <select id="usage-filter-period" onchange="loadUsage()">
+            <option value="">This month</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="all">All time</option>
+          </select>
+          <select id="usage-filter-product" onchange="loadUsage()"></select>
+          <select id="usage-filter-caller" onchange="loadUsage()">
+            <option value="">All callers</option>
+            <option value="api_key">API key</option>
+            <option value="ui">UI (signed in)</option>
+            <option value="anonymous">Anonymous</option>
+          </select>
+          <button class="btn btn-secondary" onclick="loadUsage()">↺ Refresh</button>
+          <button class="btn btn-secondary" onclick="downloadUsageCsv()">⭳ Export CSV</button>
+        </div>
+
+        <div id="usage-stats" class="stats-grid" style="margin-top:20px"></div>
+
+        <div class="form-row" style="margin-top:20px;align-items:flex-start">
+          <div class="flex1">
+            <div class="section-title">By product</div>
+            <div id="usage-by-product" class="users-table-wrap"></div>
+          </div>
+          <div class="flex1">
+            <div class="section-title">By key</div>
+            <div id="usage-by-key" class="users-table-wrap"></div>
+          </div>
+        </div>
+
+        <div class="section-title" style="margin-top:24px">Recent activity</div>
+        <div id="usage-events" class="users-table-wrap"></div>
       </div>
     </main>
   </div>

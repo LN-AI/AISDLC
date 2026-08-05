@@ -305,6 +305,143 @@ def main_():
               swarm_events[0]["input_tokens"] > 0,
               f"input_tokens={swarm_events[0]['input_tokens']} — worker-thread context not propagated")
 
+    # ── 10. BYOL spend is recorded but not charged to the platform budget ──
+    section("10. BYOL billing separation")
+    budget_before = database.get_api_key_budget(open_key_id)["budget_used_usd"]
+    r = client.post("/api/v1/agents/code", headers=hdr(open_key), json={
+        "code": "x = 1",
+        # A caller-supplied credential: their own account pays, not ours.
+        "llm_provider": "anthropic", "llm_api_key": "sk-ant-caller-own-key",
+    })
+    check("BYOL call succeeds", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+    byol = [e for e in _usage_events() if e["key_id"] == open_key_id and e["product_id"] == "code"][-1:]
+    if byol:
+        check("BYOL call is recorded as non-billable", byol[0]["billable"] == 0,
+              f"billable={byol[0]['billable']}")
+        check("BYOL call still records real cost and tokens for visibility",
+              byol[0]["cost_usd"] > 0 and byol[0]["input_tokens"] == STUB_INPUT_TOKENS,
+              f"cost={byol[0]['cost_usd']} tokens={byol[0]['input_tokens']}")
+        check("BYOL provider is recorded", byol[0]["provider"] == "anthropic",
+              str(byol[0]["provider"]))
+    budget_after = database.get_api_key_budget(open_key_id)["budget_used_usd"]
+    check("BYOL spend does NOT move the platform budget counter",
+          abs(budget_after - budget_before) < 1e-9, f"{budget_before} -> {budget_after}")
+
+    # A platform-paid call on the same key must still move it, or the check above
+    # would pass simply because budget accrual is broken again.
+    client.post("/api/v1/agents/code", json={"code": "y = 2"}, headers=hdr(open_key))
+    check("a platform-paid call on the same key DOES move the budget counter",
+          database.get_api_key_budget(open_key_id)["budget_used_usd"] > budget_after,
+          f"still {budget_after}")
+
+    # Call quotas must still bite for BYOL — otherwise BYOL is unlimited use.
+    byol_key, byol_key_id = new_key("byol-quota-key")
+    bq_plan = client.post("/api/v1/plans", json={
+        "name": "BYOL One Call", "products": [{"product_id": "code", "quota_calls_per_month": 1}],
+    }, headers=admin)
+    client.patch(f"/api/v1/keys/{byol_key_id}/plan",
+                 json={"plan_id": bq_plan.json()["id"]}, headers=admin)
+    byol_body = {"code": "x = 1", "llm_provider": "anthropic", "llm_api_key": "sk-ant-caller-own-key"}
+    first = client.post("/api/v1/agents/code", json=byol_body, headers=hdr(byol_key))
+    second = client.post("/api/v1/agents/code", json=byol_body, headers=hdr(byol_key))
+    check("first BYOL call within call quota (200)", first.status_code == 200, first.text[:200])
+    check("BYOL call still counts toward a CALL quota (429)", second.status_code == 429,
+          f"{second.status_code} {second.text[:200]}")
+
+    # ── 11. usage / metering API ───────────────────────────────────────────
+    section("11. Usage & metering API")
+    r = client.get("/api/v1/usage/summary", headers=admin)
+    check("GET /api/v1/usage/summary responds", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+    summary = r.json() if r.status_code == 200 else {"totals": {}, "by_product": [], "by_key": []}
+    ledger = _usage_events()
+    check("summary totals match the ledger row count",
+          summary["totals"].get("events") == len(ledger),
+          f"{summary['totals'].get('events')} vs {len(ledger)}")
+    check("by_product costs sum to the total",
+          abs(sum(p["cost_usd"] for p in summary["by_product"]) - summary["totals"]["cost_usd"]) < 1e-6,
+          f"{sum(p['cost_usd'] for p in summary['by_product'])} vs {summary['totals']['cost_usd']}")
+    check("by_key costs sum to the total",
+          abs(sum(k["cost_usd"] for k in summary["by_key"]) - summary["totals"]["cost_usd"]) < 1e-6,
+          f"{sum(k['cost_usd'] for k in summary['by_key'])} vs {summary['totals']['cost_usd']}")
+    check("billable total is below the gross total (BYOL excluded)",
+          summary["totals"]["billable_cost_usd"] < summary["totals"]["cost_usd"],
+          f"billable={summary['totals']['billable_cost_usd']} gross={summary['totals']['cost_usd']}")
+    check("by_key rows carry a readable label, not just a UUID",
+          all(k.get("label") for k in summary["by_key"]), str(summary["by_key"])[:200])
+
+    r = client.get("/api/v1/usage/summary?product_id=code", headers=admin)
+    check("summary honours the product_id filter",
+          r.status_code == 200 and all(p["product_id"] == "code" for p in r.json()["by_product"]),
+          r.text[:200])
+
+    r = client.get("/api/v1/usage/events?limit=5", headers=admin)
+    check("GET /api/v1/usage/events paginates",
+          r.status_code == 200 and len(r.json()["events"]) == 5 and r.json()["total"] == len(ledger),
+          f"{r.status_code} {r.text[:200]}")
+    check("events are newest first",
+          r.status_code == 200 and r.json()["events"][0]["created_at"] >= r.json()["events"][-1]["created_at"],
+          "ordering")
+
+    r = client.get("/api/v1/usage/events.csv", headers=admin)
+    check("CSV export downloads", r.status_code == 200 and "attachment" in r.headers.get("content-disposition", ""),
+          f"{r.status_code} {r.headers.get('content-disposition')}")
+    check("CSV has a header row and one line per event",
+          r.status_code == 200 and len(r.text.strip().splitlines()) == len(ledger) + 1,
+          f"{len(r.text.strip().splitlines())} lines for {len(ledger)} events")
+
+    check("usage API rejects an unauthenticated caller (401)",
+          client.get("/api/v1/usage/summary").status_code == 401)
+    check("usage API rejects an API key (bearer JWT only)",
+          client.get("/api/v1/usage/summary", headers=hdr(open_key)).status_code == 401)
+
+    # ── 12. plan editing, as the admin UI drives it ────────────────────────
+    section("12. Plan editing (the paths the Plans screen uses)")
+    edit_key, edit_key_id = new_key("plan-edit-key")
+    created = client.post("/api/v1/plans", json={
+        "name": "Editable", "description": "before",
+        "products": [{"product_id": "code"}],
+    }, headers=admin)
+    plan_id = created.json()["id"]
+    client.patch(f"/api/v1/keys/{edit_key_id}/plan", json={"plan_id": plan_id}, headers=admin)
+
+    r = client.patch(f"/api/v1/plans/{plan_id}",
+                     json={"name": "Editable", "description": "after"}, headers=admin)
+    check("PATCH /plans/{id} updates name and description",
+          r.status_code == 200 and r.json()["description"] == "after", r.text[:200])
+
+    r = client.put(f"/api/v1/plans/{plan_id}/products", headers=admin, json={
+        "products": [{"product_id": "requirement", "quota_calls_per_month": 5}],
+    })
+    check("PUT /plans/{id}/products replaces the product list",
+          r.status_code == 200 and [p["product_id"] for p in r.json()["products"]] == ["requirement"],
+          r.text[:200])
+    newly_added = client.post("/api/v1/agents/requirement",
+                              json={"text": "As a user I want to log in"}, headers=hdr(edit_key))
+    newly_removed = client.post("/api/v1/agents/code", json={"code": "x=1"}, headers=hdr(edit_key))
+    check("a product added by the edit becomes callable (200)",
+          newly_added.status_code == 200, f"{newly_added.status_code} {newly_added.text[:200]}")
+    check("a product removed by the edit becomes denied (403)",
+          newly_removed.status_code == 403, f"{newly_removed.status_code} {newly_removed.text[:200]}")
+
+    r = client.patch(f"/api/v1/plans/{plan_id}", json={"is_active": False}, headers=admin)
+    check("deactivating a plan drops its entitlements to the scopes fallback",
+          r.status_code == 200
+          and client.post("/api/v1/agents/code", json={"code": "x=1"}, headers=hdr(edit_key)).status_code == 200,
+          "an inactive plan should not keep restricting the key")
+
+    r = client.get(f"/api/v1/keys/{edit_key_id}/entitlements", headers=admin)
+    check("GET /keys/{id}/entitlements responds", r.status_code == 200, r.text[:200])
+
+    client.patch(f"/api/v1/plans/{plan_id}", json={"is_active": True}, headers=admin)
+    r = client.delete(f"/api/v1/plans/{plan_id}", headers=admin)
+    check("DELETE /plans/{id} removes the plan", r.status_code == 200, r.text[:200])
+    check("a key whose plan was deleted falls back to scopes, not lockout",
+          client.post("/api/v1/agents/code", json={"code": "x=1"}, headers=hdr(edit_key)).status_code == 200,
+          "deleting a plan locked the key out")
+
+    check("plans API rejects a non-super-admin",
+          client.get("/api/v1/plans").status_code == 401)
+
     stack.close()
 
     print(f"\n{'-' * 60}")

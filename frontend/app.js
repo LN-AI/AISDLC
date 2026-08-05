@@ -28,6 +28,10 @@ function updateAuthUI() {
   const navKeys = document.getElementById('nav-api-keys');
   const navProjects = document.getElementById('nav-projects');
   const navVertical = document.getElementById('nav-vertical');
+  // Plans define what customers can reach and the usage ledger spans every project, so
+  // both are super-admin only — matching /api/v1/plans and /api/v1/usage on the server.
+  const navPlans = document.getElementById('nav-plans');
+  const navUsage = document.getElementById('nav-usage');
   if (_authUser) {
     const initials = (_authUser.full_name || _authUser.username || 'U').charAt(0).toUpperCase();
     el.innerHTML = `
@@ -43,12 +47,16 @@ function updateAuthUI() {
     if (navProjects) navProjects.style.display = isSuperAdmin() ? '' : 'none';
     if (navKeys) navKeys.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navVertical) navVertical.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
+    if (navPlans) navPlans.style.display = isSuperAdmin() ? '' : 'none';
+    if (navUsage) navUsage.style.display = isSuperAdmin() ? '' : 'none';
   } else {
     el.innerHTML = `<button class="btn-login" onclick="openLogin()">🔑 Sign In</button>`;
     navUsers.style.display = 'none';
     if (navProjects) navProjects.style.display = 'none';
     if (navKeys) navKeys.style.display = 'none';
     if (navVertical) navVertical.style.display = 'none';
+    if (navPlans) navPlans.style.display = 'none';
+    if (navUsage) navUsage.style.display = 'none';
   }
   refreshApprovalBadge();
 }
@@ -150,6 +158,8 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'gxp-docs') { /* page ready, no auto-load */ }
     if (page === 'gxp-generate') { /* page ready, no auto-load */ }
     if (page === 'api-keys') loadApiKeys();
+    if (page === 'plans') loadPlans();
+    if (page === 'usage') loadUsage();
     if (page === 'projects') loadProjects();
     if (page === 'vertical') loadVerticalPage();
   });
@@ -3063,6 +3073,15 @@ async function loadApiKeys() {
   try {
     const data = await apiFetch('/api/v1/keys', { _silent: true });
     const keys = data.keys || [];
+    // Plan names aren't on the key record, only plan_id — resolve them for display. Only
+    // super admins can list plans, so this stays best-effort for project admins.
+    let planNames = {};
+    if (isSuperAdmin()) {
+      try {
+        ((await apiFetch('/api/v1/plans?include_inactive=true', { _silent: true })).plans || [])
+          .forEach(p => { planNames[p.id] = p.name; });
+      } catch { /* leave ids unresolved rather than failing the whole page */ }
+    }
     if (!keys.length) {
       wrap.innerHTML = `<div class="empty-state">No API keys yet.${isSuperAdmin() ? ' Click "Create API Key" to issue one.' : ' Ask a super admin to create one for your project.'}</div>`;
       return;
@@ -3071,7 +3090,7 @@ async function loadApiKeys() {
       <table class="users-table">
         <thead><tr>
           <th>Prefix</th><th>Project</th><th>Description</th>
-          <th>Scopes</th><th>Status</th><th>Rate Limit</th><th>Budget</th><th>Usage</th><th>LLM</th><th>Last Used</th><th>Created</th><th></th>
+          <th>Entitlement</th><th>Status</th><th>Rate Limit</th><th>Budget</th><th>Usage</th><th>LLM</th><th>Last Used</th><th>Created</th><th></th>
         </tr></thead>
         <tbody>
           ${keys.map(k => `
@@ -3079,7 +3098,9 @@ async function loadApiKeys() {
               <td><code style="font-size:12px;color:var(--accent)">${esc(k.prefix)}…</code></td>
               <td><strong>${esc(k.project_name_resolved || k.team_name)}</strong>${k.project_name_resolved && k.team_name !== k.project_name_resolved ? `<div style="font-size:11px;color:var(--text-muted)">${esc(k.team_name)}</div>` : ''}</td>
               <td style="font-size:12px;color:var(--text-muted)">${esc(k.description||'—')}</td>
-              <td><span class="role-badge role-reviewer">${esc(k.scopes||'all')}</span></td>
+              <td>${k.plan_id
+                    ? `<span class="role-badge role-compliance">${esc(planNames[k.plan_id] || 'Plan')}</span>`
+                    : `<span class="role-badge role-reviewer">Scopes: ${esc(k.scopes||'all')}</span>`}</td>
               <td><span class="${k.is_active ? 'user-status-active' : 'user-status-inactive'}">${k.is_active ? 'Active' : 'Revoked'}</span></td>
               <td style="font-size:12px;color:var(--text-muted)">${k.rate_limit_per_minute||60}/min · ${k.rate_limit_per_day||2000}/day</td>
               <td style="font-size:12px;color:var(--text-muted)">${k.monthly_budget_usd != null ? `$${Number(k.budget_used_usd||0).toFixed(2)} / $${Number(k.monthly_budget_usd).toFixed(2)}` : 'Unlimited'}</td>
@@ -3091,6 +3112,7 @@ async function loadApiKeys() {
                 <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="editApiKeyLimits('${esc(k.id)}','${esc(k.team_name)}',${k.rate_limit_per_minute||60},${k.rate_limit_per_day||2000})">Edit limits</button>
                 <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="editApiKeyBudget('${esc(k.id)}','${esc(k.team_name)}',${k.monthly_budget_usd != null ? k.monthly_budget_usd : 'null'})">Edit budget</button>
                 <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="openLlmConfigModal('${esc(k.id)}','${esc(k.team_name)}')">Manage LLM</button>
+                ${isSuperAdmin() ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="openAssignPlan('${esc(k.id)}','${esc(k.team_name)}','${esc(k.plan_id||'')}')">Assign plan</button>` : ''}
                 ${k.is_active ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="revokeApiKey('${esc(k.id)}','${esc(k.team_name)}')">Revoke</button>` : ''}
               </td>
             </tr>`).join('')}
@@ -3781,6 +3803,471 @@ function _restoreNavSectionState() {
     const section = document.querySelector(`.nav-section[data-section="${key}"]`);
     if (section) section.classList.add('collapsed');
   });
+}
+
+// ── Plans ─────────────────────────────────────────────────────────────────
+//
+// A plan is a set of products with optional monthly quotas. Keys point at a plan via
+// api_keys.plan_id; a key with no plan falls back to its legacy `scopes` column, which is
+// why the table below says "Scopes: all" rather than "none" for unplanned keys — they are
+// unrestricted, not locked out.
+
+let _products = [];          // the full catalogue from GET /api/v1/products
+let _planDraft = {};         // product_id -> {quota_calls_per_month, quota_usd_per_month}
+let _editingPlanId = null;
+
+async function loadPlans() {
+  const wrap = document.getElementById('plans-list');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const data = await apiFetch('/api/v1/plans?include_inactive=true', { _silent: true });
+    const plans = data.plans || [];
+    if (!plans.length) {
+      wrap.innerHTML = '<div class="empty-state">No plans yet. Click "New Plan" to create one — until then every key keeps its existing scopes.</div>';
+      return;
+    }
+    wrap.innerHTML = `
+      <table class="users-table">
+        <thead><tr>
+          <th>Name</th><th>Description</th><th>Products</th><th>Status</th><th>Created</th><th></th>
+        </tr></thead>
+        <tbody>
+          ${plans.map(p => {
+            const products = p.products || [];
+            const quotaCount = products.filter(x => x.quota_calls_per_month != null || x.quota_usd_per_month != null).length;
+            return `
+            <tr>
+              <td><strong>${esc(p.name)}</strong></td>
+              <td style="font-size:12px;color:var(--text-muted)">${esc(p.description || '—')}</td>
+              <td style="font-size:12px">
+                ${products.length} product${products.length === 1 ? '' : 's'}
+                ${quotaCount ? `<div style="font-size:11px;color:var(--text-muted)">${quotaCount} with a quota</div>` : ''}
+              </td>
+              <td><span class="${p.is_active ? 'user-status-active' : 'user-status-inactive'}">${p.is_active ? 'Active' : 'Inactive'}</span></td>
+              <td style="font-size:12px;color:var(--text-muted)">${(p.created_at || '').slice(0, 10)}</td>
+              <td>
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="openPlanEditor('${esc(p.id)}')">Edit</button>
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="togglePlanActive('${esc(p.id)}',${p.is_active ? 'false' : 'true'})">${p.is_active ? 'Deactivate' : 'Activate'}</button>
+                <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="deletePlan('${esc(p.id)}','${esc(p.name)}')">Delete</button>
+              </td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function _ensureProducts() {
+  if (_products.length) return _products;
+  const data = await apiFetch('/api/v1/products');
+  _products = data.products || [];
+  const select = document.getElementById('plan-filter-module');
+  if (select) {
+    const modules = [...new Set(_products.map(p => p.module).filter(Boolean))].sort();
+    select.innerHTML = '<option value="">All modules</option>' +
+      modules.map(m => `<option value="${esc(m)}">${esc(_moduleLabel(m))}</option>`).join('');
+  }
+  return _products;
+}
+
+function _moduleLabel(module) {
+  return (module || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+
+async function openPlanEditor(planId) {
+  _editingPlanId = planId || null;
+  _planDraft = {};
+  document.getElementById('plan-editor-title').textContent = planId ? 'Edit Plan' : 'New Plan';
+  document.getElementById('plan-editor-panel').classList.remove('hidden');
+  document.getElementById('plan-editor-error').classList.add('hidden');
+  document.getElementById('plan-name').value = '';
+  document.getElementById('plan-description').value = '';
+  document.getElementById('plan-filter-text').value = '';
+
+  try {
+    await _ensureProducts();
+    if (planId) {
+      const plan = await apiFetch(`/api/v1/plans/${planId}`);
+      document.getElementById('plan-name').value = plan.name || '';
+      document.getElementById('plan-description').value = plan.description || '';
+      (plan.products || []).forEach(p => {
+        _planDraft[p.product_id] = {
+          quota_calls_per_month: p.quota_calls_per_month,
+          quota_usd_per_month: p.quota_usd_per_month,
+        };
+      });
+    }
+  } catch (e) {
+    _showPlanError(e.message);
+  }
+  renderProductCatalogue();
+  renderSelectedProducts();
+}
+
+function closePlanEditor() {
+  document.getElementById('plan-editor-panel').classList.add('hidden');
+  _editingPlanId = null;
+  _planDraft = {};
+}
+
+function renderProductCatalogue() {
+  const wrap = document.getElementById('plan-product-catalogue');
+  if (!wrap) return;
+  const kind = document.getElementById('plan-filter-kind').value;
+  const module = document.getElementById('plan-filter-module').value;
+  const text = (document.getElementById('plan-filter-text').value || '').toLowerCase();
+
+  const rows = _products.filter(p =>
+    (!kind || p.kind === kind) &&
+    (!module || p.module === module) &&
+    (!text || p.id.toLowerCase().includes(text) || (p.title || '').toLowerCase().includes(text))
+  );
+
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty-state">No products match these filters.</div>';
+    return;
+  }
+  wrap.innerHTML = `
+    <table class="users-table">
+      <thead><tr><th>Product</th><th>Type</th><th>Module</th><th></th></tr></thead>
+      <tbody>
+        ${rows.map(p => `
+          <tr>
+            <td>
+              <strong>${esc(p.title || p.id)}</strong>
+              <div style="font-size:11px;color:var(--text-muted)"><code>${esc(p.id)}</code></div>
+            </td>
+            <td><span class="role-badge ${p.kind === 'workflow' ? 'role-security' : 'role-reviewer'}">${esc(p.kind)}</span></td>
+            <td style="font-size:12px;color:var(--text-muted)">${esc(_moduleLabel(p.module))}</td>
+            <td>
+              ${_planDraft[p.id]
+                ? '<span style="font-size:11px;color:var(--green)">✓ in plan</span>'
+                : `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="addProductToPlan('${esc(p.id)}')">Add</button>`}
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function addProductToPlan(productId) {
+  _planDraft[productId] = { quota_calls_per_month: null, quota_usd_per_month: null };
+  renderProductCatalogue();
+  renderSelectedProducts();
+}
+
+function removeProductFromPlan(productId) {
+  delete _planDraft[productId];
+  renderProductCatalogue();
+  renderSelectedProducts();
+}
+
+function setPlanQuota(productId, field, value) {
+  if (!_planDraft[productId]) return;
+  const trimmed = (value || '').trim();
+  _planDraft[productId][field] = trimmed === '' ? null : Number(trimmed);
+}
+
+function renderSelectedProducts() {
+  const wrap = document.getElementById('plan-selected-products');
+  if (!wrap) return;
+  const ids = Object.keys(_planDraft);
+  if (!ids.length) {
+    wrap.innerHTML = '<div class="empty-state" style="padding:14px">No products selected yet — a plan with no products entitles a key to nothing.</div>';
+    return;
+  }
+  wrap.innerHTML = `
+    <table class="users-table">
+      <thead><tr><th>Product</th><th>Calls / month</th><th>USD / month</th><th></th></tr></thead>
+      <tbody>
+        ${ids.map(id => {
+          const product = _products.find(p => p.id === id) || { id, title: id, kind: '' };
+          const draft = _planDraft[id];
+          return `
+          <tr>
+            <td>
+              <strong>${esc(product.title || id)}</strong>
+              <span class="role-badge ${product.kind === 'workflow' ? 'role-security' : 'role-reviewer'}" style="margin-left:6px">${esc(product.kind)}</span>
+            </td>
+            <td><input type="number" min="1" style="width:110px" placeholder="Unlimited"
+                       value="${draft.quota_calls_per_month != null ? draft.quota_calls_per_month : ''}"
+                       onchange="setPlanQuota('${esc(id)}','quota_calls_per_month',this.value)" /></td>
+            <td><input type="number" min="0" step="0.01" style="width:110px" placeholder="Unlimited"
+                       value="${draft.quota_usd_per_month != null ? draft.quota_usd_per_month : ''}"
+                       onchange="setPlanQuota('${esc(id)}','quota_usd_per_month',this.value)" /></td>
+            <td><button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="removeProductFromPlan('${esc(id)}')">Remove</button></td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:6px">
+      Spend quotas count only calls the platform paid for — a team using their own LLM credentials
+      consumes call quota but not spend quota.
+    </p>`;
+}
+
+function _showPlanError(message) {
+  const el = document.getElementById('plan-editor-error');
+  el.textContent = message;
+  el.classList.remove('hidden');
+}
+
+async function savePlan() {
+  const name = document.getElementById('plan-name').value.trim();
+  if (!name) return _showPlanError('A plan needs a name.');
+  const products = Object.keys(_planDraft).map(id => ({
+    product_id: id,
+    quota_calls_per_month: _planDraft[id].quota_calls_per_month,
+    quota_usd_per_month: _planDraft[id].quota_usd_per_month,
+  }));
+  const description = document.getElementById('plan-description').value.trim();
+
+  try {
+    if (_editingPlanId) {
+      await apiFetch(`/api/v1/plans/${_editingPlanId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description }),
+      });
+      await apiFetch(`/api/v1/plans/${_editingPlanId}/products`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ products }),
+      });
+    } else {
+      await apiFetch('/api/v1/plans', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description, products }),
+      });
+    }
+    closePlanEditor();
+    loadPlans();
+  } catch (e) {
+    // 400 (unknown product id) and 409 (duplicate name) are both actionable — show them
+    // inline rather than as an alert the user has to dismiss before fixing the form.
+    _showPlanError(e.message);
+  }
+}
+
+async function togglePlanActive(planId, makeActive) {
+  try {
+    await apiFetch(`/api/v1/plans/${planId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_active: makeActive }),
+    });
+    loadPlans();
+  } catch (e) { alert('Could not update plan: ' + e.message); }
+}
+
+async function deletePlan(planId, name) {
+  if (!confirm(`Delete the plan "${name}"?\n\nKeys assigned to it fall back to their scopes column rather than losing access.`)) return;
+  try {
+    await apiFetch(`/api/v1/plans/${planId}`, { method: 'DELETE' });
+    loadPlans();
+  } catch (e) { alert('Could not delete plan: ' + e.message); }
+}
+
+// ── Assign a plan to an API key ───────────────────────────────────────────
+
+async function openAssignPlan(keyId, teamName, currentPlanId) {
+  let plans = [];
+  try {
+    plans = (await apiFetch('/api/v1/plans')).plans || [];
+  } catch (e) {
+    return alert('Could not load plans: ' + e.message);
+  }
+  const options = plans.filter(p => p.is_active)
+    .map(p => `${p.id === currentPlanId ? '*' : ' '} ${p.name}`).join('\n');
+  const choice = prompt(
+    `Assign a plan to "${teamName}".\n\n` +
+    `Type a plan name exactly, or leave blank for no plan (the key falls back to its scopes column).\n\n` +
+    `Available:\n${options || '  (none — create one on the Plans page)'}`,
+    plans.find(p => p.id === currentPlanId)?.name || ''
+  );
+  if (choice === null) return;
+  const wanted = choice.trim();
+  let planId = null;
+  if (wanted) {
+    const match = plans.find(p => p.name.toLowerCase() === wanted.toLowerCase());
+    if (!match) return alert(`No plan named "${wanted}".`);
+    planId = match.id;
+  }
+  try {
+    await apiFetch(`/api/v1/keys/${keyId}/plan`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan_id: planId }),
+    });
+    loadApiKeys();
+  } catch (e) { alert('Could not assign plan: ' + e.message); }
+}
+
+// ── Usage & Metering ──────────────────────────────────────────────────────
+
+function _usageQuery() {
+  const params = new URLSearchParams();
+  const period = document.getElementById('usage-filter-period').value;
+  if (period === 'all') {
+    params.set('period', '1970-01-01T00:00:00');
+  } else if (period) {
+    const since = new Date(Date.now() - Number(period) * 86400000);
+    params.set('period', since.toISOString().slice(0, 19));
+  } // blank => server default, the current budget period
+  const product = document.getElementById('usage-filter-product').value;
+  if (product) params.set('product_id', product);
+  const caller = document.getElementById('usage-filter-caller').value;
+  if (caller) params.set('caller_type', caller);
+  return params.toString();
+}
+
+function _money(value) {
+  const n = Number(value || 0);
+  return n < 0.01 && n > 0 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
+}
+
+async function loadUsage() {
+  const stats = document.getElementById('usage-stats');
+  if (!stats) return;
+
+  // Populate the product filter once, from the same registry the plans page uses.
+  const productSelect = document.getElementById('usage-filter-product');
+  if (productSelect && !productSelect.options.length) {
+    try {
+      await _ensureProducts();
+      productSelect.innerHTML = '<option value="">All products</option>' +
+        _products.map(p => `<option value="${esc(p.id)}">${esc(p.title || p.id)}</option>`).join('');
+    } catch { productSelect.innerHTML = '<option value="">All products</option>'; }
+  }
+
+  stats.innerHTML = '<div class="empty-state">Loading…</div>';
+  const query = _usageQuery();
+  try {
+    const [summary, recent] = await Promise.all([
+      apiFetch(`/api/v1/usage/summary?${query}`, { _silent: true }),
+      apiFetch(`/api/v1/usage/events?limit=50&${query}`, { _silent: true }),
+    ]);
+    _renderUsageStats(summary);
+    _renderUsageByProduct(summary.by_product || []);
+    _renderUsageByKey(summary.by_key || []);
+    _renderUsageEvents(recent.events || [], recent.total || 0);
+  } catch (e) {
+    stats.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function _renderUsageStats(summary) {
+  const t = summary.totals || {};
+  const gross = Number(t.cost_usd || 0);
+  const billable = Number(t.billable_cost_usd || 0);
+  const byol = gross - billable;
+  const card = (label, value, sub) => `
+    <div class="stat-card">
+      <div class="stat-value">${esc(value)}</div>
+      <div class="stat-label">${esc(label)}</div>
+      ${sub ? `<div style="font-size:11px;color:var(--text-muted);margin-top:4px">${esc(sub)}</div>` : ''}
+    </div>`;
+  document.getElementById('usage-stats').innerHTML =
+    card('Platform spend', _money(billable), 'Counts against budgets') +
+    card('Customer-paid', _money(byol), 'Own LLM credentials') +
+    card('Calls', String(t.events || 0), `${t.calls || 0} LLM calls`) +
+    card('Tokens in', Number(t.input_tokens || 0).toLocaleString(), `${Number(t.output_tokens || 0).toLocaleString()} out`) +
+    card('Keys active', String(t.keys || 0), '') +
+    card('Period from', (summary.period_start || '').slice(0, 10), '');
+}
+
+function _renderUsageByProduct(rows) {
+  const wrap = document.getElementById('usage-by-product');
+  if (!rows.length) return void (wrap.innerHTML = '<div class="empty-state">No usage in this period.</div>');
+  wrap.innerHTML = `
+    <table class="users-table">
+      <thead><tr><th>Product</th><th>Type</th><th>Calls</th><th>Tokens</th><th>Cost</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `
+          <tr>
+            <td><strong>${esc(_productTitle(r.product_id))}</strong></td>
+            <td><span class="role-badge ${r.product_kind === 'workflow' ? 'role-security' : 'role-reviewer'}">${esc(r.product_kind)}</span></td>
+            <td>${r.events}</td>
+            <td style="font-size:12px;color:var(--text-muted)">${Number(r.input_tokens || 0).toLocaleString()} / ${Number(r.output_tokens || 0).toLocaleString()}</td>
+            <td>${_money(r.cost_usd)}${r.cost_usd > r.billable_cost_usd ? `<div style="font-size:11px;color:var(--text-muted)">${_money(r.billable_cost_usd)} billable</div>` : ''}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function _productTitle(productId) {
+  const found = _products.find(p => p.id === productId);
+  return found ? (found.title || productId) : productId;
+}
+
+function _renderUsageByKey(rows) {
+  const wrap = document.getElementById('usage-by-key');
+  if (!rows.length) return void (wrap.innerHTML = '<div class="empty-state">No usage in this period.</div>');
+  wrap.innerHTML = `
+    <table class="users-table">
+      <thead><tr><th>Caller</th><th>Type</th><th>Calls</th><th>Cost</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `
+          <tr>
+            <td><strong>${esc(r.label || '—')}</strong></td>
+            <td><span class="role-badge role-reviewer">${esc(r.caller_type)}</span></td>
+            <td>${r.events}</td>
+            <td>${_money(r.cost_usd)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function _renderUsageEvents(events, total) {
+  const wrap = document.getElementById('usage-events');
+  if (!events.length) return void (wrap.innerHTML = '<div class="empty-state">No events in this period.</div>');
+  wrap.innerHTML = `
+    <table class="users-table">
+      <thead><tr>
+        <th>When</th><th>Caller</th><th>Product</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Status</th>
+      </tr></thead>
+      <tbody>
+        ${events.map(e => `
+          <tr>
+            <td style="font-size:12px;color:var(--text-muted)">${esc((e.created_at || '').slice(0, 19).replace('T', ' '))}</td>
+            <td>${esc(e.label || e.caller_type)}<div style="font-size:11px;color:var(--text-muted)">${esc(e.caller_type)}</div></td>
+            <td>${esc(_productTitle(e.product_id))}
+              <span class="role-badge ${e.product_kind === 'workflow' ? 'role-security' : 'role-reviewer'}" style="margin-left:6px">${esc(e.product_kind)}</span></td>
+            <td style="font-size:12px;color:var(--text-muted)">${esc(e.model || '—')}${e.billable ? '' : `<div style="font-size:11px;color:var(--amber)">BYOL ${esc(e.provider || '')}</div>`}</td>
+            <td style="font-size:12px;color:var(--text-muted)">${Number(e.input_tokens || 0).toLocaleString()} / ${Number(e.output_tokens || 0).toLocaleString()}</td>
+            <td title="${e.cost_estimated ? 'Estimated — this model is not in the pricing table' : 'Priced from the model pricing table'}">${e.cost_estimated ? '~' : ''}${_money(e.cost_usd)}</td>
+            <td><span class="${e.status === 'ok' ? 'user-status-active' : 'user-status-inactive'}">${esc(e.status || 'ok')}</span></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:8px">
+      Showing ${events.length} of ${total} events. A <code>~</code> marks a cost priced with the fallback rate
+      because the model is not in the pricing table. Export the CSV for the full set.
+    </p>`;
+}
+
+async function downloadUsageCsv() {
+  // apiFetch adds the bearer token as a header, so a plain <a href> would 401 — fetch the
+  // CSV as a blob and hand it to the browser through an object URL instead.
+  try {
+    const token = localStorage.getItem('sdlc_token');
+    const res = await fetch(`${API}/api/v1/usage/events.csv?${_usageQuery()}`, {
+      headers: token ? { Authorization: 'Bearer ' + token } : {},
+    });
+    if (!res.ok) throw new Error(`Export failed (${res.status})`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `usage-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) { alert('Could not export CSV: ' + e.message); }
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────

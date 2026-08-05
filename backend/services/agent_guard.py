@@ -14,6 +14,15 @@ the LLM call, two bookkeeping steps after:
   5. Every call — including UI and anonymous ones with no API key — also writes a row to
      `usage_events`, the never-purged billing ledger.
 
+Who pays decides what counts
+----------------------------
+When a caller supplies their own LLM credentials (BYOL), their own provider account is
+billed, not the platform's. Such calls are recorded with `billable=0`: the spend stays
+visible in the ledger and the cost log, but it does not accumulate against
+`monthly_budget_usd` and does not count toward a plan's `quota_usd_per_month`, both of
+which exist to cap the platform's own bill. Call-count quotas still apply to every call,
+since a BYOL customer is still consuming platform capacity.
+
 Guard at the API boundary only, never inside a workflow
 -------------------------------------------------------
 `llm_gateway.track_usage()` accumulates through a contextvar, so ONE `guarded_call`
@@ -94,6 +103,12 @@ def _price_usage(usage: Dict[str, int], model: str) -> float:
     )
 
 
+def _is_estimated(model: str) -> bool:
+    """True when we priced with DEFAULT_PRICING because the model isn't in the table —
+    a BYOL caller can name any model, and a guess must not be shown as a measurement."""
+    return model not in MODEL_PRICING_PER_MILLION_TOKENS
+
+
 def _caller_identity(caller: Optional[dict]) -> tuple:
     """-> (caller_type, caller_ref, key_id)"""
     caller = caller or {}
@@ -172,14 +187,23 @@ def guarded_call(
         raise
 
     model = (override or {}).get("model") or config.MODEL
+    provider = (override or {}).get("provider") or "anthropic"
     cost_usd = _price_usage(usage, model) if usage["calls"] else 0.0
 
+    # A caller-supplied api_key means the caller's own LLM account paid for this call, not
+    # the platform's. The spend is still recorded for visibility, but it must not consume
+    # a budget cap that exists to protect *our* bill. Call quotas still apply — see
+    # entitlement_service.check_quota.
+    billable = not (override or {}).get("api_key")
+
     if key_id and usage["calls"]:
-        database.record_api_key_cost(key_id, cost_usd)
+        if billable:
+            database.record_api_key_cost(key_id, cost_usd)
         database.log_api_key_cost(key_id, agent_name, usage["input_tokens"], usage["output_tokens"], cost_usd)
         logger.info(
-            "Agent call cost: caller=%s product=%s tokens_in=%d tokens_out=%d cost=$%.4f",
+            "Agent call cost: caller=%s product=%s tokens_in=%d tokens_out=%d cost=$%.4f%s",
             caller_id, agent_name, usage["input_tokens"], usage["output_tokens"], cost_usd,
+            "" if billable else f" (BYOL {provider}, not charged to budget)",
         )
         if isinstance(result, dict):
             fresh_budget = database.get_api_key_budget(key_id)
@@ -187,6 +211,7 @@ def guarded_call(
                 "input_tokens": usage["input_tokens"],
                 "output_tokens": usage["output_tokens"],
                 "cost_usd": cost_usd,
+                "billable": billable,
                 "monthly_budget_usd": fresh_budget["monthly_budget_usd"],
                 "budget_used_usd": fresh_budget["budget_used_usd"],
             }
@@ -194,14 +219,16 @@ def guarded_call(
     _record_usage_event(
         key_id=key_id, caller_type=caller_type, caller_ref=caller_ref,
         product_id=agent_name, product_kind=product_kind, usage=usage,
-        cost_usd=cost_usd, model=model, project_name=project_name,
-        result=result, status=status,
+        cost_usd=cost_usd, model=model, provider=provider, billable=billable,
+        cost_estimated=bool(usage["calls"]) and _is_estimated(model),
+        project_name=project_name, result=result, status=status,
     )
     return result
 
 
 def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_kind,
-                        usage, cost_usd, model, project_name, result, status) -> None:
+                        usage, cost_usd, model, provider, billable, cost_estimated,
+                        project_name, result, status) -> None:
     """Write the billing-ledger row. Never lets a metering failure break the response —
     the caller already has a valid result at this point."""
     try:
@@ -216,6 +243,9 @@ def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=cost_usd,
             model=model,
+            provider=provider,
+            billable=billable,
+            cost_estimated=cost_estimated,
             project_name=project_name or (result.get("project_name", "") if isinstance(result, dict) else ""),
             review_id=result.get("review_id") if isinstance(result, dict) else None,
             status=status,

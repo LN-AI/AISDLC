@@ -31,6 +31,7 @@ from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.api_keys import router as api_keys_router
 from backend.routes.plans import router as plans_router
 from backend.routes.products import router as products_router
+from backend.routes.usage import router as usage_router
 from backend.routes.swarm import router as swarm_router
 from backend.routes.llm_config import router as llm_config_router
 from backend.routes.projects import router as projects_router
@@ -205,6 +206,7 @@ app.include_router(v1_agents_router)
 app.include_router(api_keys_router)
 app.include_router(plans_router)
 app.include_router(products_router)
+app.include_router(usage_router)
 app.include_router(swarm_router)
 app.include_router(llm_config_router)
 app.include_router(projects_router)

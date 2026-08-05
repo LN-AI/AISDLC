@@ -24,6 +24,24 @@ def is_super_admin(user: Optional[dict]) -> bool:
     return bool(user) and user.get("role") in SUPER_ADMIN_ROLES
 
 
+def require_super_admin(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(_security),
+) -> dict:
+    """FastAPI dependency for super-admin-only routers.
+
+    `routes/api_keys.py` and `routes/plans.py` each grew their own private copy of this
+    before it lived anywhere shared; new routers should depend on this one.
+    """
+    if not creds:
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    user = decode_token(creds.credentials)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if not is_super_admin(user):
+        raise HTTPException(status_code=403, detail="Super admin role required")
+    return user
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str

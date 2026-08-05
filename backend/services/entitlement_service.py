@@ -104,6 +104,11 @@ def check_quota(caller: Optional[dict], product_id: str, entitlement: Optional[E
 
     Like the budget cap, this is a pre-check only: a single call can overshoot the limit,
     but the next one is refused.
+
+    Calls count regardless of who paid for the LLM; spend counts only what the platform
+    actually paid for. A BYOL caller is still consuming platform capacity, so their calls
+    must be capped, but charging their own provider spend against our USD quota would be
+    billing them twice. See agent_guard for where `billable` is decided.
     """
     record = (caller or {}).get("_record")
     if not record:
@@ -117,11 +122,15 @@ def check_quota(caller: Optional[dict], product_id: str, entitlement: Optional[E
 
     period = database._current_budget_period()
     totals = database.get_usage_totals(record["id"], product_id, period)
-    used_calls, used_usd = totals["events"], totals["cost_usd"]
+    used_calls = totals["events"]
+    used_usd = totals["billable_cost_usd"]
 
-    if (max_calls is not None and used_calls >= max_calls) or (max_usd is not None and used_usd >= max_usd):
+    over_calls = max_calls is not None and used_calls >= max_calls
+    over_usd = max_usd is not None and used_usd >= max_usd
+    if over_calls or over_usd:
         logger.warning(
-            "Quota exceeded: key=%s product=%s calls=%s/%s usd=%.4f/%s",
+            "Quota exceeded (%s): key=%s product=%s calls=%s/%s billable_usd=%.4f/%s",
+            "calls" if over_calls else "spend",
             record["id"], product_id, used_calls, max_calls, used_usd, max_usd,
         )
         raise QuotaExceededError(product_id, {
