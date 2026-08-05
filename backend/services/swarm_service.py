@@ -19,6 +19,7 @@ Policy enforcement:
     all pass, avg score > policy.min_passing_score → swarm_gate = AMBER
     all pass, avg score <= policy.min_passing_score → swarm_gate = GREEN
 """
+import contextvars
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -334,9 +335,18 @@ class SwarmService:
 
         # Each agent resolves and applies its own BYOL override inside _run_one_agent
         # (request-level override applies uniformly; otherwise per-agent > per-key > platform).
+        # Worker threads start with a fresh, empty context, so llm_gateway's
+        # `_usage_accumulator` contextvar would be unset inside them and every token this
+        # swarm spends would go unrecorded. Copying the calling context into each worker
+        # is what makes `guarded_call(caller, "swarm", ...)` in routes/swarm.py meter a
+        # real number instead of $0.00.
+        parent_context = contextvars.copy_context()
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as pool:
             future_to_agent = {
-                pool.submit(_run_one_agent, name, artifact, req, orch, ctx, caller): name
+                pool.submit(
+                    parent_context.copy().run,
+                    _run_one_agent, name, artifact, req, orch, ctx, caller,
+                ): name
                 for name in agents_to_run
             }
             for future in as_completed(future_to_agent):

@@ -215,6 +215,51 @@ def init_db():
             updated_by TEXT,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS plans (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT DEFAULT '',
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS plan_products (
+            id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            product_id TEXT NOT NULL,
+            quota_calls_per_month INTEGER,
+            quota_usd_per_month REAL,
+            UNIQUE(plan_id, product_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_plan_products_plan
+            ON plan_products(plan_id);
+
+        CREATE TABLE IF NOT EXISTS usage_events (
+            id TEXT PRIMARY KEY,
+            key_id TEXT,
+            caller_type TEXT NOT NULL,
+            caller_ref TEXT,
+            product_id TEXT NOT NULL,
+            product_kind TEXT NOT NULL,
+            project_id TEXT,
+            project_name TEXT,
+            review_id TEXT,
+            calls INTEGER DEFAULT 0,
+            input_tokens INTEGER DEFAULT 0,
+            output_tokens INTEGER DEFAULT 0,
+            cost_usd REAL DEFAULT 0,
+            model TEXT,
+            status TEXT DEFAULT 'ok',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_usage_events_key_time
+            ON usage_events(key_id, created_at);
+
+        CREATE INDEX IF NOT EXISTS idx_usage_events_product_time
+            ON usage_events(product_id, created_at);
     """)
 
     # Migration: add columns for DBs created before these features existed.
@@ -229,6 +274,7 @@ def init_db():
         ("monthly_budget_usd", "REAL", "NULL"),
         ("budget_used_usd", "REAL", 0),
         ("budget_period_start", "TEXT", "NULL"),
+        ("plan_id", "TEXT", "NULL"),
     ):
         try:
             cursor.execute(
@@ -949,7 +995,7 @@ def list_api_keys(project_ids: Optional[List[str]] = None) -> List[Dict[str, Any
         "SELECT id, prefix, team_name, description, scopes, created_by, project_id, is_active, usage_count, "
         "rate_limit_per_minute, rate_limit_per_day, llm_provider, llm_model, llm_base_url, "
         "(llm_api_key_encrypted IS NOT NULL AND llm_api_key_encrypted != '') AS llm_configured, "
-        "monthly_budget_usd, budget_used_usd, "
+        "monthly_budget_usd, budget_used_usd, plan_id, "
         "last_used_at, created_at "
         "FROM api_keys"
     )
@@ -1222,6 +1268,220 @@ def get_api_key_cost_breakdown(key_id: str, since_iso: str) -> List[Dict[str, An
         "SELECT agent_name, COUNT(*) as calls, SUM(input_tokens) as input_tokens, "
         "SUM(output_tokens) as output_tokens, SUM(cost_usd) as cost_usd FROM api_key_cost_log "
         "WHERE key_id = ? AND created_at >= ? GROUP BY agent_name ORDER BY cost_usd DESC",
+        (key_id, since_iso),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── Plans, entitlements and the usage ledger ───────────────────────────────
+#
+# A plan bundles products (agents and workflows) with optional per-product quotas; an
+# API key points at a plan via `api_keys.plan_id`. Keys with no plan fall back to the
+# older `api_keys.scopes` column, so nothing that exists today stops working.
+#
+# `usage_events` is the billing ledger and is deliberately never purged — unlike
+# `api_key_usage` (2-day retention) and `api_key_cost_log` (90-day), both of which stay
+# as-is for the dashboards that read them.
+
+def create_plan(name: str, description: str = "", products: Optional[List[Dict[str, Any]]] = None,
+                actor: str = "admin") -> str:
+    plan_id = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO plans (id, name, description, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
+        (plan_id, name, description, datetime.utcnow().isoformat()),
+    )
+    _replace_plan_products(cursor, plan_id, products or [])
+    conn.commit()
+    conn.close()
+    _audit("plan_created", "plan", plan_id, actor, f"name={name} products={len(products or [])}")
+    return plan_id
+
+
+def _replace_plan_products(cursor, plan_id: str, products: List[Dict[str, Any]]) -> None:
+    cursor.execute("DELETE FROM plan_products WHERE plan_id = ?", (plan_id,))
+    for entry in products:
+        cursor.execute(
+            "INSERT INTO plan_products (id, plan_id, product_id, quota_calls_per_month, quota_usd_per_month) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), plan_id, entry["product_id"],
+             entry.get("quota_calls_per_month"), entry.get("quota_usd_per_month")),
+        )
+
+
+def set_plan_products(plan_id: str, products: List[Dict[str, Any]], actor: str = "admin") -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM plans WHERE id = ?", (plan_id,))
+    if not cursor.fetchone():
+        conn.close()
+        return False
+    _replace_plan_products(cursor, plan_id, products)
+    conn.commit()
+    conn.close()
+    _audit("plan_products_updated", "plan", plan_id, actor, f"products={len(products)}")
+    return True
+
+
+def get_plan(plan_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM plans WHERE id = ?", (plan_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+    plan = dict(row)
+    cursor.execute(
+        "SELECT product_id, quota_calls_per_month, quota_usd_per_month FROM plan_products WHERE plan_id = ?",
+        (plan_id,),
+    )
+    plan["products"] = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return plan
+
+
+def list_plans(include_inactive: bool = False) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = "SELECT * FROM plans"
+    if not include_inactive:
+        query += " WHERE is_active = 1"
+    query += " ORDER BY created_at DESC"
+    cursor.execute(query)
+    plans = [dict(r) for r in cursor.fetchall()]
+    for plan in plans:
+        cursor.execute(
+            "SELECT product_id, quota_calls_per_month, quota_usd_per_month FROM plan_products WHERE plan_id = ?",
+            (plan["id"],),
+        )
+        plan["products"] = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return plans
+
+
+def update_plan(plan_id: str, name: Optional[str] = None, description: Optional[str] = None,
+                is_active: Optional[bool] = None, actor: str = "admin") -> bool:
+    sets, params = [], []
+    if name is not None:
+        sets.append("name = ?"); params.append(name)
+    if description is not None:
+        sets.append("description = ?"); params.append(description)
+    if is_active is not None:
+        sets.append("is_active = ?"); params.append(1 if is_active else 0)
+    if not sets:
+        return False
+    conn = get_connection()
+    cursor = conn.cursor()
+    params.append(plan_id)
+    cursor.execute(f"UPDATE plans SET {', '.join(sets)} WHERE id = ?", tuple(params))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if changed:
+        _audit("plan_updated", "plan", plan_id, actor, ", ".join(sets))
+    return changed
+
+
+def delete_plan(plan_id: str, actor: str = "admin") -> bool:
+    """Removes the plan and its products, and unassigns any key pointing at it —
+    those keys fall back to their `scopes` column rather than losing all access."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM plan_products WHERE plan_id = ?", (plan_id,))
+    cursor.execute("UPDATE api_keys SET plan_id = NULL WHERE plan_id = ?", (plan_id,))
+    cursor.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if changed:
+        _audit("plan_deleted", "plan", plan_id, actor)
+    return changed
+
+
+def set_api_key_plan(key_id: str, plan_id: Optional[str], actor: str = "admin") -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE api_keys SET plan_id = ? WHERE id = ?", (plan_id, key_id))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if changed:
+        _audit("plan_assigned", "api_key", key_id, actor, f"plan_id={plan_id}")
+    return changed
+
+
+def get_plan_for_key(key_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT plan_id FROM api_keys WHERE id = ?", (key_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row or not row["plan_id"]:
+        return None
+    plan = get_plan(row["plan_id"])
+    if plan and not plan.get("is_active"):
+        return None
+    return plan
+
+
+def record_usage_event(
+    key_id: Optional[str],
+    caller_type: str,
+    caller_ref: str,
+    product_id: str,
+    product_kind: str,
+    calls: int = 0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cost_usd: float = 0.0,
+    model: str = "",
+    project_id: Optional[str] = None,
+    project_name: str = "",
+    review_id: Optional[str] = None,
+    status: str = "ok",
+) -> str:
+    event_id = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO usage_events (id, key_id, caller_type, caller_ref, product_id, product_kind, "
+        "project_id, project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model, "
+        "status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (event_id, key_id, caller_type, caller_ref, product_id, product_kind, project_id,
+         project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model,
+         status, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return event_id
+
+
+def get_usage_totals(key_id: str, product_id: str, since_iso: str) -> Dict[str, Any]:
+    """Calls and spend for one key+product since `since_iso` — the quota check's input."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COUNT(*) AS events, COALESCE(SUM(cost_usd), 0) AS cost_usd "
+        "FROM usage_events WHERE key_id = ? AND product_id = ? AND created_at >= ?",
+        (key_id, product_id, since_iso),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return {"events": row["events"] or 0, "cost_usd": row["cost_usd"] or 0.0}
+
+
+def get_usage_breakdown(key_id: str, since_iso: str) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT product_id, product_kind, COUNT(*) AS events, COALESCE(SUM(calls), 0) AS calls, "
+        "COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, "
+        "COALESCE(SUM(cost_usd), 0) AS cost_usd FROM usage_events "
+        "WHERE key_id = ? AND created_at >= ? GROUP BY product_id, product_kind ORDER BY cost_usd DESC",
         (key_id, since_iso),
     )
     rows = cursor.fetchall()

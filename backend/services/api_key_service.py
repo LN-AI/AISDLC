@@ -10,20 +10,15 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 import backend.database as database
+from backend.products import registry
 from backend.services import crypto_service
 
 VALID_LLM_PROVIDERS = ("anthropic", "openai")
 
-# Kept in sync with AGENT_CATALOG in backend/routes/v1_agents.py — the set of
-# agent names a per-agent BYOL override can target.
-VALID_AGENT_NAMES = (
-    "requirement", "code", "prompt", "compliance", "vapt", "security",
-    "architecture", "sensitive-data", "release-gate", "full",
-    "codegen-advisory", "codegen-scaffold", "ai-provenance",
-    "migration-assessment", "migration-execute", "cfr21-verification", "gxp-document-check",
-    "gxp-generate-plan", "gxp-generate-document", "issue-triage", "issue-triage-batch-github",
-    "test-scenario", "test-case", "auto-fix", "report-generate",
-)
+# The set of product names a per-agent BYOL override can target. Derived from the
+# product registry rather than hand-maintained — this tuple and AGENT_CATALOG used to
+# be kept in sync by comment alone, which is exactly the drift the registry removes.
+VALID_AGENT_NAMES = tuple(registry.all_ids())
 
 PREFIX = "lmsdlc_"
 _KEY_BYTES = 32  # 64 hex chars after prefix

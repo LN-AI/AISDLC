@@ -1,5 +1,4 @@
 import functools
-import json
 import logging
 import time
 from typing import Dict, Any, List, Optional
@@ -26,8 +25,17 @@ from backend.agents.qa_intelligence.test_case_agent import TestCaseAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
 from backend.services import cost_optimization_service
-from backend.services import guardrail_service
 from backend import config, database
+from backend.workflows import shared as workflow_shared
+from backend.workflows import autofix_pr as autofix_pr_workflow
+from backend.workflows import codegen_scaffold as codegen_scaffold_workflow
+from backend.workflows import full_review as full_review_workflow
+from backend.workflows import issue_triage as issue_triage_workflow
+from backend.workflows import issue_triage_batch as issue_triage_batch_workflow
+from backend.workflows import migration_execute as migration_execute_workflow
+from backend.workflows import release_gate as release_gate_workflow
+from backend.workflows import review_pr as review_pr_workflow
+from backend.workflows import standalone_report as standalone_report_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -193,148 +201,20 @@ class SDLCOrchestrator:
         on_progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """`on_progress`, if given, is called as `on_progress(step_index, total_steps,
-        step_label)` immediately before each of this method's sequential sub-agent
-        calls — used by the job-status endpoint (see job_service.py) so a client
-        polling a long-running `full` review can see which of the (up to 7)
-        sequential LLM calls is currently in flight rather than just "still
-        running". Total_steps only counts steps that will actually execute for this
-        particular request (i.e. conditional sub-reviews the caller didn't provide
-        content for are not counted)."""
-        review_results: List[Dict[str, Any]] = []
-        all_findings: List[Dict[str, Any]] = []
-
-        steps = [("Requirement Review", bool(requirement))]
-        steps.append(("Compliance Mapping", bool(compliance_artifact)))
-        steps.append(("Architecture Review", bool(architecture)))
-        steps.append(("Code Review", bool(code)))
-        steps.append(("Prompt Safety Review", bool(prompt_config)))
-        steps.append(("Release Gate Evaluation", True))
-        steps.append(("Report Generation", True))
-        total_steps = sum(1 for _, will_run in steps if will_run)
-        step_counter = [0]
-
-        def _progress(label: str) -> None:
-            step_counter[0] += 1
-            if on_progress:
-                on_progress(step_counter[0], total_steps, label)
-
-        if requirement:
-            _progress("Requirement Review")
-            req_result = self.req_agent.review_requirement(requirement, context)
-            req_result["source"] = "requirement"
-            review_results.append(req_result)
-            all_findings.extend(req_result.get("findings", []))
-
-        if compliance_artifact:
-            _progress("Compliance Mapping")
-            compliance_context = self._kb("compliance", context, compliance_artifact, project_name)
-            compliance_result = self.compliance_agent.map_compliance(
-                compliance_artifact, context=compliance_context
-            )
-            compliance_result["source"] = "compliance"
-            review_results.append(compliance_result)
-            all_findings.extend(compliance_result.get("findings", []))
-
-        if architecture:
-            _progress("Architecture Review")
-            arch_result = self.arch_agent.run_architecture_review(architecture, context, project_name=project_name)
-            arch_result["source"] = "architecture"
-            review_results.append(arch_result)
-            all_findings.extend(arch_result.get("findings", []))
-
-        if code:
-            _progress("Code Review")
-            code_result = self.code_agent.review_code(code, context=context)
-            code_result["source"] = "code"
-            review_results.append(code_result)
-            all_findings.extend(code_result.get("findings", []))
-
-        if prompt_config:
-            _progress("Prompt Safety Review")
-            prompt_result = self.prompt_agent.review_prompt(
-                system_prompt=prompt_config.get("system_prompt", ""),
-                user_prompt=prompt_config.get("user_prompt", ""),
-                tool_definitions=prompt_config.get("tool_definitions", ""),
-                rag_config=prompt_config.get("rag_config", ""),
-                context=context,
-            )
-            prompt_result["source"] = "prompt"
-            review_results.append(prompt_result)
-            all_findings.extend(prompt_result.get("findings", []))
-
-        overall_risk = self._calculate_overall_risk(review_results)
-        _progress("Release Gate Evaluation")
-        gate_result = self.gate_agent.evaluate_gate(
-            all_findings=all_findings,
+        step_label)` immediately before each sequential sub-agent call — used by the
+        job-status endpoint (see job_service.py). See backend/workflows/full_review.py."""
+        return full_review_workflow.run(
+            self,
+            requirement=requirement,
+            compliance_artifact=compliance_artifact,
+            architecture=architecture,
+            code=code,
+            prompt_config=prompt_config,
+            test_evidence=test_evidence,
             project_name=project_name,
-            evidence_summary=test_evidence or "",
-        )
-        gate_result["source"] = "release_gate"
-        review_results.append(gate_result)
-
-        final_gate = gate_result.get("gate_status", "Red")
-
-        _progress("Report Generation")
-        report = self.report_agent.generate_report(
-            project_name=project_name,
-            all_findings=all_findings,
-            review_results=review_results,
-            gate_status=final_gate,
-            overall_risk_score=overall_risk,
             context=context,
+            on_progress=on_progress,
         )
-
-        report_id = database.save_report(
-            review_id=None,
-            project_name=project_name,
-            report=report,
-        )
-
-        review_id = database.save_review(
-            review_type="full",
-            project_name=project_name,
-            input_summary=f"Full SDLC review — {len(review_results)} sub-reviews, {len(all_findings)} findings",
-            input_content=requirement or compliance_artifact or architecture or code or "",
-            result={
-                "findings": all_findings,
-                "risk_score": overall_risk,
-                "gate_status": final_gate,
-                "summary": gate_result.get("summary", ""),
-                "compliance_flags": list({
-                    flag
-                    for r in review_results
-                    for flag in r.get("compliance_flags", [])
-                }),
-                "recommendations": gate_result.get("recommendations", []),
-                "review_results": review_results,
-                "report_id": report_id,
-            },
-        )
-
-        return {
-            "review_id": review_id,
-            "report_id": report_id,
-            "project_name": project_name,
-            "gate_status": final_gate,
-            "overall_risk_score": overall_risk,
-            "total_findings": len(all_findings),
-            "critical_count": sum(1 for f in all_findings if f.get("severity") == 5),
-            "high_count": sum(1 for f in all_findings if f.get("severity") == 4),
-            "sub_reviews": [
-                {
-                    "source": r.get("source", "unknown"),
-                    "agent": r.get("agent_name", ""),
-                    "gate": r.get("gate_status", ""),
-                    "score": r.get("risk_score", 0),
-                    "findings": len(r.get("findings", [])),
-                }
-                for r in review_results
-            ],
-            "summary": gate_result.get("summary", ""),
-            "top_findings": sorted(all_findings, key=lambda f: f.get("severity", 0), reverse=True)[:10],
-            "recommendations": gate_result.get("recommendations", []),
-        }
-
     @_log_call
     def review_vapt(
         self,
@@ -494,57 +374,21 @@ class SDLCOrchestrator:
         auto_review: bool = False,
         context: str = "",
     ) -> Dict[str, Any]:
-        result = self.codegen_agent.generate_scaffold(
+        return codegen_scaffold_workflow.run(
+            self,
             project_name=project_name,
             language=language,
             backend_framework=backend_framework,
             frontend_framework=frontend_framework,
-            database=database_choice,
+            database_choice=database_choice,
             architecture_pattern=architecture_pattern,
             requirement=requirement,
             include_auth=include_auth,
             include_docker=include_docker,
             include_tests=include_tests,
+            auto_review=auto_review,
             context=context,
         )
-
-        files = result.get("files", [])
-        if not files:
-            raise RuntimeError(
-                "Scaffold generation returned no files — this usually means the LLM response "
-                "was truncated or malformed rather than a deliberate empty scaffold. Try again "
-                "with a narrower scope (fewer options, e.g. skip docker/tests) or retry."
-            )
-        if auto_review and files:
-            combined = "\n\n".join(f"# ── {f.get('path', '')} ──\n{f.get('content', '')}" for f in files)
-            code_review = self.code_agent.review_code(combined, language, "Generated scaffold — pre-release governance check")
-            sensitive_scan = self.sensitive_agent.scan(combined, "Generated scaffold", project_name)
-            result["governance_review"] = {
-                "code_review": {
-                    "gate_status": code_review.get("gate_status", "Green"),
-                    "risk_score": code_review.get("risk_score", 0),
-                    "findings": code_review.get("findings", []),
-                    "summary": code_review.get("summary", ""),
-                },
-                "sensitive_data_scan": {
-                    "gate_status": sensitive_scan.get("gate_status", "Green"),
-                    "risk_score": sensitive_scan.get("risk_score", 0),
-                    "findings": sensitive_scan.get("findings", []),
-                    "summary": sensitive_scan.get("summary", ""),
-                },
-            }
-
-        review_id = database.save_review(
-            review_type="codegen_scaffold",
-            project_name=project_name,
-            input_summary=f"Codegen scaffold — {language}/{backend_framework}"
-                          f"{'/' + frontend_framework if frontend_framework else ''} ({len(files)} files)",
-            input_content=requirement[:5000],
-            result=result,
-        )
-        result["review_id"] = review_id
-        return result
-
     @_log_call
     def analyze_ai_provenance(
         self,
@@ -604,40 +448,16 @@ class SDLCOrchestrator:
         context: str = "",
         project_name: str = "Unnamed Project",
     ) -> Dict[str, Any]:
-        # Not compressed: this generates replacement code 1:1 from `source` — exact
-        # source fidelity matters more here than for a review-only agent.
-        result = self.migration_agent.execute(source, migration_target, file_path, requirement, context, project_name)
-
-        files = result.get("files", [])
-        if auto_review and files:
-            combined = "\n\n".join(f"# ── {f.get('path', '')} ──\n{f.get('content', '')}" for f in files)
-            code_review = self.code_agent.review_code(combined, "", "Migrated code — pre-release governance check")
-            sensitive_scan = self.sensitive_agent.scan(combined, "Migrated code", project_name)
-            result["governance_review"] = {
-                "code_review": {
-                    "gate_status": code_review.get("gate_status", "Green"),
-                    "risk_score": code_review.get("risk_score", 0),
-                    "findings": code_review.get("findings", []),
-                    "summary": code_review.get("summary", ""),
-                },
-                "sensitive_data_scan": {
-                    "gate_status": sensitive_scan.get("gate_status", "Green"),
-                    "risk_score": sensitive_scan.get("risk_score", 0),
-                    "findings": sensitive_scan.get("findings", []),
-                    "summary": sensitive_scan.get("summary", ""),
-                },
-            }
-
-        review_id = database.save_review(
-            review_type="migration_execution",
+        return migration_execute_workflow.run(
+            self,
+            source=source,
+            migration_target=migration_target,
+            file_path=file_path,
+            requirement=requirement,
+            auto_review=auto_review,
+            context=context,
             project_name=project_name,
-            input_summary=f"Migration execution — {migration_target} ({len(files)} files)",
-            input_content=source[:5000],
-            result=result,
         )
-        result["review_id"] = review_id
-        return result
-
     @_log_call
     def verify_cfr21(
         self,
@@ -746,114 +566,6 @@ class SDLCOrchestrator:
 
     # ── Issue Triaging ────────────────────────────────────────────────────
 
-    @staticmethod
-    def _build_issue_content(
-        title: str = "", description: str = "", logs: str = "", stack_trace: str = "",
-        error_code: str = "", environment: str = "", application: str = "", module: str = "",
-        reporter: str = "", build_version: str = "", test_case_ref: str = "",
-        customer_impact_notes: str = "",
-    ) -> str:
-        parts = [f"**Title:** {title}" if title else "**Title:** Unavailable"]
-        parts.append(f"**Description:** {description}" if description else "**Description:** Unavailable")
-        if application:
-            parts.append(f"**Application:** {application}")
-        if module:
-            parts.append(f"**Module:** {module}")
-        if environment:
-            parts.append(f"**Environment:** {environment}")
-        if build_version:
-            parts.append(f"**Build/Release Version:** {build_version}")
-        if reporter:
-            parts.append(f"**Reporter:** {reporter}")
-        if error_code:
-            parts.append(f"**Error Code:** {error_code}")
-        if test_case_ref:
-            parts.append(f"**Related Test Case / Requirement:** {test_case_ref}")
-        if customer_impact_notes:
-            parts.append(f"**Customer Impact Notes:** {customer_impact_notes}")
-        if stack_trace:
-            parts.append(f"**Stack Trace:**\n```\n{stack_trace[:4000]}\n```")
-        if logs:
-            parts.append(f"**Logs:**\n```\n{logs[:4000]}\n```")
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _build_known_issues_context(project_name: str, exclude_review_id: str = "") -> str:
-        prior = database.list_reviews_by_type("issue_triage", project_name, limit=25)
-        lines = []
-        for row in prior:
-            if row["id"] == exclude_review_id:
-                continue
-            result = row.get("result", {})
-            summary = (result.get("issue_summary") or row.get("input_summary") or "")[:150]
-            lines.append(
-                f"- [{row['id']}] {result.get('issue_category', '?')} | "
-                f"{result.get('affected_application', '?')}/{result.get('affected_module', '?')} | "
-                f"{result.get('environment', '?')} | {result.get('severity', '?')}/{result.get('priority', '?')} | {summary}"
-            )
-        return "\n".join(lines)
-
-    @staticmethod
-    def _compute_triage_gate(result: Dict[str, Any]) -> Dict[str, Any]:
-        """Deterministic human-in-the-loop policy — never left to the model's judgment.
-
-        >90% confidence, non-critical, non-security -> Green (auto-classify/assign)
-        70-90% confidence -> Amber (recommend + request confirmation)
-        <70% confidence, OR Critical severity, OR P0/P1 priority, OR security/compliance impact -> Red (mandatory human validation)
-        """
-        severity = result.get("severity", "Low")
-        priority = result.get("priority", "P3 - Low priority")
-        confidence = result.get("confidence_score", 0)
-        sec_impact = result.get("security_compliance_impact", {}) or {}
-        is_security_category = result.get("issue_category") == "Security vulnerability"
-
-        mandatory_human = (
-            severity == "Critical"
-            or priority.startswith("P0") or priority.startswith("P1")
-            or bool(sec_impact.get("has_impact"))
-            or is_security_category
-            or confidence < 70
-        )
-        if mandatory_human:
-            gate_status = "Red"
-        elif confidence < 90:
-            gate_status = "Amber"
-        else:
-            gate_status = "Green"
-
-        risk_score = {"Critical": 95, "High": 70, "Medium": 40, "Low": 15}.get(severity, 15)
-
-        findings = []
-        for item in (result.get("enrichment", {}) or {}).get("missing_information", []):
-            findings.append({
-                "control_id": "TRIAGE-INFO", "severity": 2, "risk_level": "Minor",
-                "title": "Missing information", "description": item,
-                "recommendation": "Request this information from the reporter before further investigation.",
-                "is_blocking": False,
-            })
-        if sec_impact.get("has_impact"):
-            findings.append({
-                "control_id": "TRIAGE-SEC", "severity": 5, "risk_level": "Critical",
-                "title": "Security/compliance impact flagged", "description": sec_impact.get("details", ""),
-                "recommendation": "Route to the security team for validation before any public disclosure or fix rollout.",
-                "is_blocking": True,
-            })
-        escalation = result.get("escalation", {}) or {}
-        if escalation.get("required"):
-            findings.append({
-                "control_id": "TRIAGE-ESC", "severity": 4, "risk_level": "High",
-                "title": "Escalation required", "description": "; ".join(escalation.get("reasons", [])) or "Escalation criteria met.",
-                "recommendation": "Notify: " + (", ".join(escalation.get("notify_channels", [])) or "the responsible on-call/lead."),
-                "is_blocking": True,
-            })
-
-        return {
-            "gate_status": gate_status,
-            "risk_score": risk_score,
-            "findings": findings,
-            "human_approval_required": mandatory_human,
-        }
-
     @_log_call
     def triage_issue(
         self,
@@ -863,43 +575,15 @@ class SDLCOrchestrator:
         customer_impact_notes: str = "", team_roster: str = "", context: str = "",
         project_name: str = "Unnamed Project", llm_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        # Compress logs/stack_trace in ISOLATION, before they're folded into the mixed
-        # prose+data issue_content blob below — Headroom's router only compresses
-        # messages that are purely log/JSON/code content, not prose-wrapped mixes.
-        compressed_logs, logs_stats = self._compress(logs) if logs else (logs, None)
-        compressed_stack_trace, stack_stats = self._compress(stack_trace) if stack_trace else (stack_trace, None)
-        cost_stats = logs_stats or stack_stats
-        if logs_stats and stack_stats:
-            cost_stats = {
-                k: (logs_stats[k] + stack_stats[k]) if k in ("tokens_before", "tokens_after", "tokens_saved", "cost_saved_usd") else logs_stats[k]
-                for k in logs_stats
-            }
-
-        issue_content = self._build_issue_content(
-            title, description, compressed_logs, compressed_stack_trace, error_code, environment, application,
-            module, reporter, build_version, test_case_ref, customer_impact_notes,
+        return issue_triage_workflow.run(
+            self,
+            title=title, description=description, logs=logs, stack_trace=stack_trace,
+            error_code=error_code, environment=environment, application=application,
+            module=module, reporter=reporter, build_version=build_version,
+            test_case_ref=test_case_ref, customer_impact_notes=customer_impact_notes,
+            team_roster=team_roster, context=context, project_name=project_name,
+            llm_override=llm_override,
         )
-        known_issues_context = self._build_known_issues_context(project_name)
-        context = self._kb("issue-triage", context, issue_content, project_name)
-        result = self.issue_triage_agent.triage(issue_content, known_issues_context, team_roster, context, llm_override)
-
-        gate = self._compute_triage_gate(result)
-        result.update(gate)
-        if cost_stats:
-            result["_cost_stats"] = cost_stats
-
-        review_id = database.save_review(
-            review_type="issue_triage",
-            project_name=project_name,
-            input_summary=f"Issue triage — {result.get('issue_category', '?')} — "
-                          f"{result.get('severity', '?')}/{result.get('priority', '?')} — "
-                          f"{(title or result.get('issue_summary', ''))[:80]}",
-            input_content=issue_content[:5000],
-            result=result,
-        )
-        result["review_id"] = review_id
-        return result
-
     @_log_call
     def triage_github_repo_issues(
         self,
@@ -910,34 +594,15 @@ class SDLCOrchestrator:
         project_name: str = "Unnamed Project",
         llm_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        issues = self.github.list_open_issues(github_repo_url, limit)
-        results = []
-        for issue in issues:
-            r = self.triage_issue(
-                title=issue.get("title", ""),
-                description=issue.get("body", ""),
-                context=f"GitHub issue #{issue.get('number')} — {issue.get('url', '')}\n{context}".strip(),
-                team_roster=team_roster,
-                project_name=project_name,
-                llm_override=llm_override,
-            )
-            r["github_issue_number"] = issue.get("number")
-            r["github_issue_url"] = issue.get("url", "")
-            results.append(r)
-
-        return {
-            "repo": github_repo_url,
-            "issues_fetched": len(issues),
-            "issues_triaged": len(results),
-            "results": results,
-            "severity_breakdown": {
-                s: sum(1 for r in results if r.get("severity") == s) for s in ("Critical", "High", "Medium", "Low")
-            },
-            "escalations_required": sum(1 for r in results if r.get("human_approval_required")),
-        }
-
-    # ── QA Intelligence ──────────────────────────────────────────────────
-
+        return issue_triage_batch_workflow.run(
+            self,
+            github_repo_url=github_repo_url,
+            limit=limit,
+            team_roster=team_roster,
+            context=context,
+            project_name=project_name,
+            llm_override=llm_override,
+        )
     @_log_call
     def generate_test_scenarios(
         self,
@@ -1006,40 +671,16 @@ class SDLCOrchestrator:
         context: str = "",
     ) -> Dict[str, Any]:
         """Synthesize prior findings into an audit-ready governance report, without
-        re-running a full review. Mirrors run_release_gate's review_ids aggregation."""
-        all_findings: List[Dict[str, Any]] = list(findings or [])
-        review_results: List[Dict[str, Any]] = []
-        if review_ids:
-            for rid in review_ids:
-                review = database.get_review(rid)
-                if review:
-                    result_data = json.loads(review.get("result_json", "{}"))
-                    all_findings.extend(result_data.get("findings", []))
-                    review_results.append(result_data)
-
-        if not gate_status:
-            gate_status = "Red" if any(f.get("severity") == 5 for f in all_findings) else (
-                "Amber" if any(f.get("severity") == 4 for f in all_findings) else "Green"
-            )
-        if overall_risk_score is None:
-            overall_risk_score = self._calculate_overall_risk(review_results) if review_results else 0.0
-
-        report = self.report_agent.generate_report(
+        re-running a full review. See backend/workflows/standalone_report.py."""
+        return standalone_report_workflow.run(
+            self,
             project_name=project_name,
-            all_findings=all_findings,
-            review_results=review_results,
+            review_ids=review_ids,
+            findings=findings,
             gate_status=gate_status,
             overall_risk_score=overall_risk_score,
             context=context,
         )
-        report_id = database.save_report(
-            review_id=None,
-            project_name=project_name,
-            report=report,
-        )
-        report["report_id"] = report_id
-        return report
-
     @_log_call
     def run_release_gate(
         self,
@@ -1049,169 +690,25 @@ class SDLCOrchestrator:
         evidence_summary: str = "",
         context: str = "",
     ) -> Dict[str, Any]:
-        all_findings: list = []
-        if review_ids:
-            for rid in review_ids:
-                review = database.get_review(rid)
-                if review:
-                    result_data = __import__("json").loads(review.get("result_json", "{}"))
-                    all_findings.extend(result_data.get("findings", []))
-
-        result = self.gate_agent.evaluate_gate(
-            all_findings=all_findings,
+        # `context` is accepted for backwards compatibility with existing callers but is
+        # not used — the gate agent takes its input from findings and evidence only.
+        return release_gate_workflow.run(
+            self,
             project_name=project_name,
+            review_ids=review_ids,
             release_version=release_version,
             evidence_summary=evidence_summary,
         )
-        findings = result.get("findings", [])
-        review_id = database.save_review(
-            review_type="release_gate",
-            project_name=project_name,
-            input_summary=f"Release Gate — {project_name} {release_version}",
-            input_content=evidence_summary[:2000],
-            result=result,
-        )
-        result["review_id"] = review_id
-        result["total_findings"] = len(findings)
-        result["critical_count"] = sum(1 for f in findings if f.get("severity") == 5)
-        result["high_count"] = sum(1 for f in findings if f.get("severity") == 4)
-        result["aggregated_reviews"] = len(review_ids) if review_ids else 0
-        return result
-
     @_log_call
     def review_github_pr(self, pr_url: str, jira_ticket: str = "", include_prompt_review: bool = False) -> Dict[str, Any]:
-        pr_data = self.github.get_pr_diff(pr_url)
-
-        context = f"GitHub PR: {pr_data['title']}\nBranch: {pr_data['head_branch']} → {pr_data['base_branch']}"
-        if jira_ticket:
-            context += f"\nJira ticket: {jira_ticket}"
-
-        code_result = self.code_agent.review_code(
-            code=guardrail_service.wrap_untrusted_content(pr_data["diff"], "GITHUB_PR_DIFF"),
-            language="",
-            context=context,
-        )
-
-        database.save_review(
-            review_type="code",
-            project_name=pr_data["title"],
-            input_summary=f"PR #{pr_data['pr_number']}: {pr_data['title']}",
-            input_content=pr_data["diff"][:5000],
-            result=code_result,
-        )
-
-        comment = self.github.format_pr_review_comment(code_result)
-        posted = self.github.post_pr_comment(pr_url, comment)
-
-        return {
-            "pr_url": pr_url,
-            "pr_title": pr_data["title"],
-            "pr_number": pr_data["pr_number"],
-            "review_result": code_result,
-            "comment_posted": posted,
-        }
-
+        # `include_prompt_review` has never been implemented; kept so existing callers
+        # that pass it keep working.
+        return review_pr_workflow.run(self, pr_url=pr_url, jira_ticket=jira_ticket)
     @_log_call
     def auto_fix_github_pr(self, pr_url: str, jira_ticket: str = "", max_files: int = 5) -> Dict[str, Any]:
         """Review a GitHub PR, then commit fixes for its findings to a new branch off the PR's head branch
         and open a follow-up PR (head_branch -> lm-autofix/pr-N -> new PR back into head_branch)."""
-        pr_data = self.github.get_pr_diff(pr_url)
-        owner, repo, pr_number = self.github.parse_pr_url(pr_url)
-
-        context = f"GitHub PR: {pr_data['title']}\nBranch: {pr_data['head_branch']} -> {pr_data['base_branch']}"
-        if jira_ticket:
-            context += f"\nJira ticket: {jira_ticket}"
-
-        code_result = self.code_agent.review_code(
-            code=guardrail_service.wrap_untrusted_content(pr_data["diff"], "GITHUB_PR_DIFF"),
-            language="", context=context,
-        )
-
-        base_result = {
-            "pr_url": pr_url,
-            "pr_title": pr_data["title"],
-            "pr_number": pr_data["pr_number"],
-            "review_result": code_result,
-            "fix_applied": False,
-        }
-
-        findings = code_result.get("findings", [])
-        fixable_findings = [f for f in findings if f.get("is_blocking")] or findings
-        if not fixable_findings:
-            return {**base_result, "reason": "No findings to fix."}
-
-        files = []
-        for path in pr_data.get("files_changed", [])[:max_files]:
-            try:
-                fd = self.github.get_file_content_at_ref(owner, repo, path, pr_data["head_branch"])
-                files.append({"path": path, "content": fd["content"]})
-            except Exception:
-                continue
-        if not files:
-            return {**base_result, "reason": "Could not fetch content for any changed file (deleted/binary/renamed)."}
-
-        fix_result = self.autofix_agent.generate_fix(files=files, findings=fixable_findings, context=context)
-        patches = fix_result.get("patches", [])
-        if not patches:
-            return {**base_result, "fix_result": fix_result, "reason": "Auto-Fix Agent produced no patches for these findings."}
-
-        # Content/data safety guardrail: never commit a patch that introduces a new hardcoded
-        # secret, regardless of what finding it was meant to fix.
-        safe_patches, blocked_patches = [], []
-        for p in patches:
-            secret_hits = guardrail_service.scan_for_hardcoded_secrets(p.get("fixed_content", ""))
-            if secret_hits:
-                blocked_patches.append({"path": p["path"], "reason": "Blocked: patch appears to introduce a hardcoded secret.", "matches": secret_hits})
-            else:
-                safe_patches.append(p)
-
-        if not safe_patches:
-            return {
-                **base_result, "fix_result": fix_result, "blocked_patches": blocked_patches,
-                "reason": "Every generated patch was blocked by the secret-scan guardrail — nothing committed.",
-            }
-
-        fix_branch = f"lm-autofix/pr-{pr_number}"
-        self.github.create_branch(owner, repo, fix_branch, pr_data["head_branch"])
-
-        commit_message = fix_result.get("commit_message") or f"fix: auto-remediate findings from PR #{pr_number}"
-        files_patched = []
-        for p in safe_patches:
-            committed = self.github.commit_file(owner, repo, fix_branch, p["path"], p["fixed_content"], commit_message)
-            files_patched.append({**committed, "explanation": p.get("explanation", "")})
-
-        pr_body = (
-            f"{fix_result.get('pr_description', '')}\n\n---\n"
-            f"*Auto-generated by [LM AI-SDLC ReviewOps Agent](https://learnedmachine.ai) to remediate findings "
-            f"from #{pr_number}.*"
-        )
-        new_pr = self.github.create_pull_request(
-            owner, repo,
-            title=fix_result.get("pr_title") or f"Auto-fix: remediate findings from PR #{pr_number}",
-            body=pr_body,
-            head=fix_branch,
-            base=pr_data["head_branch"],
-        )
-
-        database.save_review(
-            review_type="code",
-            project_name=pr_data["title"],
-            input_summary=f"Auto-fix for PR #{pr_number}: {pr_data['title']}",
-            input_content=pr_data["diff"][:5000],
-            result=code_result,
-        )
-
-        return {
-            **base_result,
-            "fix_applied": True,
-            "fix_result": fix_result,
-            "fix_branch": fix_branch,
-            "files_patched": files_patched,
-            "blocked_patches": blocked_patches,
-            "fix_pr_url": new_pr.get("url", ""),
-            "fix_pr_number": new_pr.get("number"),
-        }
-
+        return autofix_pr_workflow.run(self, pr_url=pr_url, jira_ticket=jira_ticket, max_files=max_files)
     @staticmethod
     def _fallback_gate_from_specialized(result: Dict[str, Any], specialized_severities: List[str]) -> None:
         """Safety net for security/architecture reviews: their tool schemas put
@@ -1234,10 +731,4 @@ class SDLCOrchestrator:
             result["gate_status"], result["risk_score"] = "Amber", 40.0
 
     def _calculate_overall_risk(self, results: List[Dict[str, Any]]) -> float:
-        if not results:
-            return 0.0
-        scores = [r.get("risk_score", 0) for r in results if r.get("risk_score") is not None]
-        if not scores:
-            return 0.0
-        weighted = max(scores) * 0.5 + sum(scores) / len(scores) * 0.5
-        return round(min(weighted, 100.0), 1)
+        return workflow_shared.calculate_overall_risk(results)

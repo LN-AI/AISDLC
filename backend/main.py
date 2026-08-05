@@ -20,6 +20,8 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 from backend import database, config
+from backend.workflows import full_review as full_review_workflow
+from backend.workflows.base import count_steps
 from backend.routes.auth import router as auth_router
 from backend.routes.approvals import router as approvals_router
 from backend.routes.audit_trail import router as audit_router
@@ -27,6 +29,8 @@ from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
 from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.api_keys import router as api_keys_router
+from backend.routes.plans import router as plans_router
+from backend.routes.products import router as products_router
 from backend.routes.swarm import router as swarm_router
 from backend.routes.llm_config import router as llm_config_router
 from backend.routes.projects import router as projects_router
@@ -64,7 +68,8 @@ from backend.models.api_models import (
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services import job_service
 from backend.services.knowledge_base import knowledge_base
-from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
+from backend.services import agent_guard, legacy_guard
+from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
 from backend.services.guardrail_service import GuardrailViolation
 from backend.services.llm_gateway import LLMTruncatedResponseError, LLMProviderError
 from backend.services.error_utils import format_error_response, _RETRYABLE_PROVIDER_ERRORS
@@ -125,6 +130,13 @@ async def _budget_exceeded_handler(request, exc: BudgetExceededError):
     return JSONResponse(status_code=status, content=body)
 
 
+@app.exception_handler(QuotaExceededError)
+async def _quota_exceeded_handler(request, exc: QuotaExceededError):
+    logger.warning("Quota exceeded on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
 @app.exception_handler(LLMTruncatedResponseError)
 async def _llm_truncated_handler(request, exc: LLMTruncatedResponseError):
     logger.warning("LLM response truncated on %s %s: %s", request.method, request.url.path, exc)
@@ -159,6 +171,13 @@ async def _unhandled_exception_handler(request, exc: Exception):
 
 
 @app.middleware("http")
+async def legacy_product_guard(request: Request, call_next):
+    """Entitlement + metering for the legacy /api/review/* surface — see
+    backend/services/legacy_guard.py for why this is a middleware."""
+    return await legacy_guard.legacy_product_guard(request, call_next)
+
+
+@app.middleware("http")
 async def log_requests(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
     token = request_id_ctx.set(request_id)
@@ -184,6 +203,8 @@ app.include_router(agents_router)
 app.include_router(inventory_router)
 app.include_router(v1_agents_router)
 app.include_router(api_keys_router)
+app.include_router(plans_router)
+app.include_router(products_router)
 app.include_router(swarm_router)
 app.include_router(llm_config_router)
 app.include_router(projects_router)
@@ -350,7 +371,7 @@ async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
 # poll GET /api/v1/agents/jobs/{job_id} for step progress and the final result.
 
 @app.post("/api/review/full", status_code=202)
-async def full_review(req: FullReviewRequest):
+async def full_review(req: FullReviewRequest, request: Request):
     if not any([req.requirement, req.compliance_artifact, req.architecture, req.code, req.prompt]):
         raise HTTPException(status_code=400, detail="At least one artifact is required")
     if not config.ANTHROPIC_API_KEY:
@@ -360,27 +381,39 @@ async def full_review(req: FullReviewRequest):
     if req.prompt:
         prompt_config = {"system_prompt": req.prompt}
 
-    total_steps = sum([
-        bool(req.requirement), bool(req.compliance_artifact), bool(req.architecture),
-        bool(req.code), bool(prompt_config),
-    ]) + 2  # release gate + report generation always run
+    # Step plan comes from the workflow itself, so this can't drift from what it runs.
+    total_steps = count_steps(full_review_workflow.plan_steps(
+        requirement=req.requirement, compliance_artifact=req.compliance_artifact,
+        architecture=req.architecture, code=req.code, prompt_config=prompt_config,
+    ))
+
+    # Guarded here rather than by the legacy middleware: this returns 202 and does its
+    # LLM work in a background job, so there is nothing request-scoped left to meter.
+    # The preflight runs before the 202 so a denied caller gets 403/402/429, not an
+    # accepted job that later fails.
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    agent_guard.preflight(caller, "full")
 
     def _run(on_progress):
-        return orchestrator.full_review(
-            requirement=req.requirement,
-            compliance_artifact=req.compliance_artifact,
-            architecture=req.architecture,
-            code=req.code,
-            prompt_config=prompt_config,
-            test_evidence=req.test_evidence,
+        return agent_guard.guarded_call(
+            caller, "full", None, skip_preflight=True,
             project_name=req.project_name or "Unnamed Project",
-            context=req.context or "",
-            on_progress=on_progress,
+            fn=lambda: orchestrator.full_review(
+                requirement=req.requirement,
+                compliance_artifact=req.compliance_artifact,
+                architecture=req.architecture,
+                code=req.code,
+                prompt_config=prompt_config,
+                test_evidence=req.test_evidence,
+                project_name=req.project_name or "Unnamed Project",
+                context=req.context or "",
+                on_progress=on_progress,
+            ),
         )
 
-    logger.warning("DIAG: about to call job_service.start_job")
     job_id = job_service.start_job("full", total_steps, _run)
-    logger.warning("DIAG: start_job returned job_id=%s, about to return response", job_id)
     return {"job_id": job_id, "status": "queued", "poll_url": f"/api/v1/agents/jobs/{job_id}"}
 
 

@@ -21,6 +21,12 @@ JIRA_PROJECT = os.getenv("JIRA_PROJECT", "")
 # runtime via PUT /api/v1/cost-optimization/settings, persisted in the DB.
 COST_OPTIMIZATION_ENABLED_DEFAULT = os.getenv("COST_OPTIMIZATION_ENABLED", "true").lower() == "true"
 
+# The legacy /api/review/* endpoints (which frontend/app.js uses) have never required
+# auth. They are now metered and entitlement-checked, but callers without credentials
+# still resolve to "unrestricted" so nothing that works today breaks. Flip this to true
+# once you've confirmed the UI always sends a token; then they return 401 instead.
+LEGACY_ROUTES_REQUIRE_AUTH = os.getenv("LEGACY_ROUTES_REQUIRE_AUTH", "false").lower() == "true"
+
 # Guardrails — applied uniformly to every agent call inside llm_gateway.call_tool().
 MAX_AGENT_INPUT_CHARS = int(os.getenv("MAX_AGENT_INPUT_CHARS", "400000"))
 # Several agents now request up to 16000 tokens (architecture, codegen-scaffold) or
