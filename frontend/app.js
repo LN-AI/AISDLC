@@ -3820,6 +3820,9 @@ async function loadPlans() {
   const wrap = document.getElementById('plans-list');
   if (!wrap) return;
   wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  // Warm the catalogue now so opening the editor shows the list instantly, and so a
+  // catalogue failure surfaces on this page rather than inside the editor.
+  _ensureProducts();
   try {
     const data = await apiFetch('/api/v1/plans?include_inactive=true', { _silent: true });
     const plans = data.plans || [];
@@ -3860,21 +3863,38 @@ async function loadPlans() {
   }
 }
 
-async function _ensureProducts() {
-  if (_products.length) return _products;
-  const data = await apiFetch('/api/v1/products');
-  _products = data.products || [];
-  const select = document.getElementById('plan-filter-module');
-  if (select) {
-    const modules = [...new Set(_products.map(p => p.module).filter(Boolean))].sort();
-    select.innerHTML = '<option value="">All modules</option>' +
-      modules.map(m => `<option value="${esc(m)}">${esc(_moduleLabel(m))}</option>`).join('');
+// Tracked separately from `_products.length` so a failed fetch can be reported as a
+// failure. Before, an empty catalogue rendered as "No products match these filters",
+// which is indistinguishable from a filter that legitimately matches nothing.
+let _productsError = '';
+
+async function _ensureProducts(force) {
+  if (_products.length && !force) return _products;
+  try {
+    const data = await apiFetch('/api/v1/products', { _silent: true });
+    _products = data.products || [];
+    _productsError = _products.length ? '' : 'The product catalogue came back empty.';
+  } catch (e) {
+    _products = [];
+    _productsError = e.message || 'Could not load the product catalogue.';
   }
+  _populateModuleFilter();
   return _products;
 }
 
+function _populateModuleFilter() {
+  const select = document.getElementById('plan-filter-module');
+  if (!select) return;
+  const modules = [...new Set(_products.map(p => p.module).filter(Boolean))].sort();
+  const current = select.value;
+  select.innerHTML = '<option value="">All modules</option>' +
+    modules.map(m => `<option value="${esc(m)}">${esc(_moduleLabel(m))}</option>`).join('');
+  if (current) select.value = current;
+}
+
 function _moduleLabel(module) {
-  return (module || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  if (!module) return 'Other';
+  return module.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 
 async function openPlanEditor(planId) {
@@ -3886,7 +3906,10 @@ async function openPlanEditor(planId) {
   document.getElementById('plan-name').value = '';
   document.getElementById('plan-description').value = '';
   document.getElementById('plan-filter-text').value = '';
+  document.getElementById('plan-filter-kind').value = '';
 
+  // Render immediately so the panel never looks empty while the catalogue loads.
+  renderProductCatalogue();
   try {
     await _ensureProducts();
     if (planId) {
@@ -3913,53 +3936,115 @@ function closePlanEditor() {
   _planDraft = {};
 }
 
+function _visibleProducts() {
+  const kind = (document.getElementById('plan-filter-kind') || {}).value || '';
+  const module = (document.getElementById('plan-filter-module') || {}).value || '';
+  const text = ((document.getElementById('plan-filter-text') || {}).value || '').trim().toLowerCase();
+  return _products.filter(p =>
+    (!kind || p.kind === kind) &&
+    (!module || p.module === module) &&
+    (!text
+      || (p.id || '').toLowerCase().includes(text)
+      || (p.title || '').toLowerCase().includes(text)
+      || (p.description || '').toLowerCase().includes(text))
+  );
+}
+
+// One list, everything visible by default, grouped by module. Checking a row adds it to
+// the plan and reveals its quota inputs — no separate "add then configure" step.
 function renderProductCatalogue() {
   const wrap = document.getElementById('plan-product-catalogue');
   if (!wrap) return;
-  const kind = document.getElementById('plan-filter-kind').value;
-  const module = document.getElementById('plan-filter-module').value;
-  const text = (document.getElementById('plan-filter-text').value || '').toLowerCase();
 
-  const rows = _products.filter(p =>
-    (!kind || p.kind === kind) &&
-    (!module || p.module === module) &&
-    (!text || p.id.toLowerCase().includes(text) || (p.title || '').toLowerCase().includes(text))
-  );
-
-  if (!rows.length) {
-    wrap.innerHTML = '<div class="empty-state">No products match these filters.</div>';
+  if (_productsError) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">
+      Could not load the product catalogue: ${esc(_productsError)}<br />
+      <button class="btn btn-secondary" style="margin-top:10px;font-size:12px" onclick="reloadProductCatalogue()">Retry</button>
+    </div>`;
     return;
   }
-  wrap.innerHTML = `
+  if (!_products.length) {
+    wrap.innerHTML = '<div class="empty-state">Loading the product catalogue…</div>';
+    return;
+  }
+
+  const rows = _visibleProducts();
+  if (!rows.length) {
+    wrap.innerHTML = `<div class="empty-state">
+      None of the ${_products.length} products match these filters.
+      <button class="btn btn-secondary" style="margin-left:10px;font-size:11px;padding:3px 8px" onclick="clearProductFilters()">Clear filters</button>
+    </div>`;
+    return;
+  }
+
+  const groups = {};
+  rows.forEach(p => { (groups[p.module || ''] = groups[p.module || ''] || []).push(p); });
+
+  wrap.innerHTML = Object.keys(groups).sort().map(module => `
+    <div class="section-title" style="margin:14px 0 6px">${esc(_moduleLabel(module))}</div>
     <table class="users-table">
-      <thead><tr><th>Product</th><th>Type</th><th>Module</th><th></th></tr></thead>
       <tbody>
-        ${rows.map(p => `
+        ${groups[module].map(p => {
+          const draft = _planDraft[p.id];
+          return `
           <tr>
+            <td style="width:30px">
+              <input type="checkbox" ${draft ? 'checked' : ''}
+                     onchange="toggleProductInPlan('${esc(p.id)}', this.checked)" />
+            </td>
             <td>
               <strong>${esc(p.title || p.id)}</strong>
-              <div style="font-size:11px;color:var(--text-muted)"><code>${esc(p.id)}</code></div>
+              <span class="role-badge ${p.kind === 'workflow' ? 'role-security' : 'role-reviewer'}" style="margin-left:6px">${esc(p.kind)}</span>
+              <div style="font-size:11px;color:var(--text-muted)"><code>${esc(p.id)}</code> — ${esc((p.description || '').slice(0, 110))}</div>
             </td>
-            <td><span class="role-badge ${p.kind === 'workflow' ? 'role-security' : 'role-reviewer'}">${esc(p.kind)}</span></td>
-            <td style="font-size:12px;color:var(--text-muted)">${esc(_moduleLabel(p.module))}</td>
-            <td>
-              ${_planDraft[p.id]
-                ? '<span style="font-size:11px;color:var(--green)">✓ in plan</span>'
-                : `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="addProductToPlan('${esc(p.id)}')">Add</button>`}
+            <td style="width:230px;text-align:right">
+              ${draft ? `
+                <input type="number" min="1" style="width:92px" placeholder="calls ∞"
+                       title="Max calls per month — blank for unlimited"
+                       value="${draft.quota_calls_per_month != null ? draft.quota_calls_per_month : ''}"
+                       onchange="setPlanQuota('${esc(p.id)}','quota_calls_per_month',this.value)" />
+                <input type="number" min="0" step="0.01" style="width:92px" placeholder="USD ∞"
+                       title="Max spend per month — blank for unlimited"
+                       value="${draft.quota_usd_per_month != null ? draft.quota_usd_per_month : ''}"
+                       onchange="setPlanQuota('${esc(p.id)}','quota_usd_per_month',this.value)" />
+              ` : ''}
             </td>
-          </tr>`).join('')}
+          </tr>`;
+        }).join('')}
       </tbody>
-    </table>`;
+    </table>`).join('');
 }
 
-function addProductToPlan(productId) {
-  _planDraft[productId] = { quota_calls_per_month: null, quota_usd_per_month: null };
+async function reloadProductCatalogue() {
+  await _ensureProducts(true);
   renderProductCatalogue();
   renderSelectedProducts();
 }
 
-function removeProductFromPlan(productId) {
-  delete _planDraft[productId];
+function clearProductFilters() {
+  document.getElementById('plan-filter-kind').value = '';
+  document.getElementById('plan-filter-module').value = '';
+  document.getElementById('plan-filter-text').value = '';
+  renderProductCatalogue();
+}
+
+function toggleProductInPlan(productId, checked) {
+  if (checked) _planDraft[productId] = { quota_calls_per_month: null, quota_usd_per_month: null };
+  else delete _planDraft[productId];
+  renderProductCatalogue();
+  renderSelectedProducts();
+}
+
+function selectAllShown() {
+  _visibleProducts().forEach(p => {
+    if (!_planDraft[p.id]) _planDraft[p.id] = { quota_calls_per_month: null, quota_usd_per_month: null };
+  });
+  renderProductCatalogue();
+  renderSelectedProducts();
+}
+
+function clearPlanSelection() {
+  _planDraft = {};
   renderProductCatalogue();
   renderSelectedProducts();
 }
@@ -3973,39 +4058,27 @@ function setPlanQuota(productId, field, value) {
 function renderSelectedProducts() {
   const wrap = document.getElementById('plan-selected-products');
   if (!wrap) return;
-  const ids = Object.keys(_planDraft);
-  if (!ids.length) {
-    wrap.innerHTML = '<div class="empty-state" style="padding:14px">No products selected yet — a plan with no products entitles a key to nothing.</div>';
-    return;
-  }
+  const chosen = Object.keys(_planDraft).length;
+  const shown = _visibleProducts().length;
+  const quotas = Object.values(_planDraft)
+    .filter(d => d.quota_calls_per_month != null || d.quota_usd_per_month != null).length;
+
   wrap.innerHTML = `
-    <table class="users-table">
-      <thead><tr><th>Product</th><th>Calls / month</th><th>USD / month</th><th></th></tr></thead>
-      <tbody>
-        ${ids.map(id => {
-          const product = _products.find(p => p.id === id) || { id, title: id, kind: '' };
-          const draft = _planDraft[id];
-          return `
-          <tr>
-            <td>
-              <strong>${esc(product.title || id)}</strong>
-              <span class="role-badge ${product.kind === 'workflow' ? 'role-security' : 'role-reviewer'}" style="margin-left:6px">${esc(product.kind)}</span>
-            </td>
-            <td><input type="number" min="1" style="width:110px" placeholder="Unlimited"
-                       value="${draft.quota_calls_per_month != null ? draft.quota_calls_per_month : ''}"
-                       onchange="setPlanQuota('${esc(id)}','quota_calls_per_month',this.value)" /></td>
-            <td><input type="number" min="0" step="0.01" style="width:110px" placeholder="Unlimited"
-                       value="${draft.quota_usd_per_month != null ? draft.quota_usd_per_month : ''}"
-                       onchange="setPlanQuota('${esc(id)}','quota_usd_per_month',this.value)" /></td>
-            <td><button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="removeProductFromPlan('${esc(id)}')">Remove</button></td>
-          </tr>`;
-        }).join('')}
-      </tbody>
-    </table>
-    <p style="font-size:11px;color:var(--text-muted);margin-top:6px">
-      Spend quotas count only calls the platform paid for — a team using their own LLM credentials
-      consumes call quota but not spend quota.
-    </p>`;
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius)">
+      <strong style="font-size:13px;color:${chosen ? 'var(--green)' : 'var(--text-muted)'}">
+        ${chosen} of ${_products.length} selected
+      </strong>
+      ${quotas ? `<span style="font-size:12px;color:var(--text-muted)">${quotas} with a quota</span>` : ''}
+      <span style="flex:1"></span>
+      <button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="selectAllShown()">Select all ${shown} shown</button>
+      <button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="clearPlanSelection()">Clear selection</button>
+    </div>
+    ${chosen ? `<p style="font-size:11px;color:var(--text-muted);margin:6px 2px 0">
+      Quota boxes appear next to a product once it is ticked. Blank means unlimited. Spend quotas count only
+      calls the platform paid for — a team on their own LLM credentials consumes call quota but not spend quota.
+    </p>` : `<p style="font-size:11px;color:var(--amber);margin:6px 2px 0">
+      Tick at least one product — a plan with none entitles a key to nothing.
+    </p>`}`;
 }
 
 function _showPlanError(message) {

@@ -1755,27 +1755,29 @@ Examples:
             constituent agents — a key entitled to Full Review can run the workflow end to end but cannot call
             Code Review on its own.
           </p>
-          <div id="plan-selected-products" style="margin-bottom:12px"></div>
-
-          <div class="form-row">
+          <div class="form-row" style="align-items:flex-end">
             <div class="form-group flex1">
-              <label>Filter by type</label>
+              <label>Show</label>
               <select id="plan-filter-kind" onchange="renderProductCatalogue()">
-                <option value="">All types</option>
+                <option value="">Agents and workflows</option>
                 <option value="agent">Agents only</option>
                 <option value="workflow">Workflows only</option>
               </select>
             </div>
             <div class="form-group flex1">
-              <label>Filter by module</label>
-              <select id="plan-filter-module" onchange="renderProductCatalogue()"></select>
+              <label>Module</label>
+              <select id="plan-filter-module" onchange="renderProductCatalogue()">
+                <option value="">All modules</option>
+              </select>
             </div>
             <div class="form-group flex1">
               <label>Search</label>
               <input type="text" id="plan-filter-text" placeholder="Name or id…" oninput="renderProductCatalogue()" />
             </div>
           </div>
-          <div id="plan-product-catalogue" class="users-table-wrap" style="max-height:340px;overflow:auto"></div>
+
+          <div id="plan-selected-products" style="margin:10px 0"></div>
+          <div id="plan-product-catalogue" class="users-table-wrap" style="max-height:420px;overflow:auto"></div>
 
           <div id="plan-editor-error" class="login-error hidden" style="margin-top:12px"></div>
           <div class="form-actions" style="margin-top:14px">
