@@ -13,15 +13,17 @@ so usage recorded deep inside an orchestrator call still reaches the accumulator
 
 What it does and does not change
 --------------------------------
-* Entitlement is enforced only for callers presenting an API key. UI (JWT) and
-  unauthenticated callers resolve to unrestricted, exactly as before, so **no request that
-  works today starts failing**. Set `LEGACY_ROUTES_REQUIRE_AUTH=true` to require
-  credentials once you've confirmed the UI always sends a token.
-* Every mapped call now writes a `usage_events` row, with `caller_type` of
-  `api_key` / `ui` / `anonymous`.
-* Per-minute/per-day rate limiting is deliberately NOT applied here. That is a separate
-  concern from entitlement, and switching it on for the UI would be a behaviour change
-  well beyond metering.
+* This is where the UI is governed. Every agent screen in `app.js` posts to one of these
+  routes, so the entitlement, budget and quota checks a browser call passes through are
+  the ones below — resolved against the project the user selected (`X-Project-Id`), the
+  same project an API key would resolve to. See subject_service.
+* A caller with no project and no key resolves to unrestricted, so **no request that works
+  today starts failing** until an admin puts a project on a plan.
+* Every mapped call writes a `usage_events` row, with `caller_type` of
+  `api_key` / `ui` / `anonymous`, attributed to the resolved project.
+* Per-minute/per-day rate limiting applies only when the project carries a limit, which
+  defaults to unset. An API key's own rate limit is still applied at the v1 surface only —
+  these legacy routes never rate-limited keys and that is left alone.
 
 `/api/review/full` is deliberately absent from the map below: it returns 202 and does its
 LLM work in a background job after the response is sent, so there is nothing for a
@@ -33,7 +35,7 @@ from typing import Optional, Tuple
 
 from starlette.responses import JSONResponse
 
-from backend import config, database
+from backend import config, context, database
 from backend.products import registry
 from backend.services import agent_guard, llm_gateway
 from backend.services.agent_guard import (
@@ -41,9 +43,14 @@ from backend.services.agent_guard import (
     QuotaExceededError,
     ScopeDeniedError,
 )
-from backend.services.api_key_service import validate_api_key
+from backend.services.api_key_service import (
+    RateLimitExceeded,
+    check_project_rate_limit,
+    validate_api_key,
+)
 from backend.services.auth_service import decode_token
 from backend.services.error_utils import format_error_response
+from backend.services.subject_service import ProjectBindingError, resolve_subject
 
 logger = logging.getLogger(__name__)
 
@@ -115,8 +122,10 @@ def resolve_caller(headers) -> Tuple[dict, Optional[JSONResponse]]:
     if authorization.lower().startswith("bearer "):
         user = decode_token(authorization.split(" ", 1)[1])
         if user:
+            # `_user` carries the decoded claims (id + role) so subject_service can check
+            # whether this person may bind the request to the project they asked for.
             return {"type": "jwt", "team": user.get("username", "ui"),
-                    "username": user.get("username")}, None
+                    "username": user.get("username"), "_user": user}, None
 
     if config.LEGACY_ROUTES_REQUIRE_AUTH:
         return {}, JSONResponse(
@@ -140,20 +149,45 @@ async def legacy_product_guard(request, call_next):
         return rejection
 
     try:
-        agent_guard.preflight(caller, product_id)
+        # Resolve once and stash it: `guarded_call` runs deeper in the stack with no access
+        # to request headers, and without this a UI call would be metered with no project.
+        subject = resolve_subject(caller, request.headers)
+        caller["_subject"] = subject
+        rate = check_project_rate_limit(subject, request.url.path)
+        agent_guard.preflight(subject, product_id)
+    except ProjectBindingError as exc:
+        status, body = format_error_response(exc, agent_name=product_id)
+        return JSONResponse(status_code=status, content=body)
+    except RateLimitExceeded as exc:
+        status, body = format_error_response(exc, agent_name=product_id)
+        return JSONResponse(status_code=status, content=body,
+                            headers={"Retry-After": str(exc.retry_after_seconds)})
     except (ScopeDeniedError, BudgetExceededError, QuotaExceededError) as exc:
         # Raising here would bypass main.py's exception handlers — those sit inside the
         # middleware stack — so the response is formatted directly.
         status, body = format_error_response(exc, agent_name=product_id)
-        logger.warning("Legacy route denied: path=%s product=%s", request.url.path, product_id)
+        logger.warning("Legacy route denied: path=%s product=%s subject=%s",
+                       request.url.path, product_id, subject.describe())
         return JSONResponse(status_code=status, content=body)
 
     caller_type, caller_ref, key_id = agent_guard._caller_identity(caller)
     product = registry.get(product_id)
 
-    with llm_gateway.track_usage():
+    # Same reservation the v1 surface takes (see agent_guard.hold_budget_reservation):
+    # without it two browser calls starting together both pass the budget check against the
+    # same pre-call total and both spend. `bind_project` publishes the project so the
+    # review row this produces is attributed to it (see backend/context.py).
+    with context.bind_project(subject.project_id, subject.project_name), \
+            agent_guard.hold_budget_reservation(subject), \
+            llm_gateway.track_usage():
         response = await call_next(request)
         usage = llm_gateway.get_tracked_usage()
+
+    if rate:
+        response.headers["X-RateLimit-Limit-Minute"] = str(rate["limit_per_minute"])
+        response.headers["X-RateLimit-Remaining-Minute"] = str(rate["remaining_per_minute"])
+        response.headers["X-RateLimit-Limit-Day"] = str(rate["limit_per_day"])
+        response.headers["X-RateLimit-Remaining-Day"] = str(rate["remaining_per_day"])
 
     if not usage["calls"]:
         return response  # nothing reached an LLM (validation error, cache hit, 4xx)
@@ -163,6 +197,8 @@ async def legacy_product_guard(request, call_next):
     # If BYOL is ever wired into /api/review/*, this has to derive it the way guarded_call does.
     model = config.MODEL
     cost_usd = agent_guard._price_usage(usage, model)
+    if subject.project_id:
+        database.record_project_cost(subject.project_id, cost_usd)
     if key_id:
         database.record_api_key_cost(key_id, cost_usd)
         database.log_api_key_cost(key_id, product_id, usage["input_tokens"],
@@ -182,15 +218,16 @@ async def legacy_product_guard(request, call_next):
             provider="anthropic",
             billable=True,
             cost_estimated=agent_guard._is_estimated(model),
-            project_id=(caller.get("_record") or {}).get("project_id"),
+            project_id=subject.project_id,
+            project_name=subject.project_name,
             status="ok" if response.status_code < 400 else "error",
         )
     except Exception:
         logger.exception("Failed to record legacy usage event for %s", product_id)
 
     logger.info(
-        "Legacy call metered: path=%s product=%s caller=%s tokens_in=%d tokens_out=%d cost=$%.4f",
-        request.url.path, product_id, caller_ref or caller_type,
+        "Legacy call metered: path=%s product=%s caller=%s %s tokens_in=%d tokens_out=%d cost=$%.4f",
+        request.url.path, product_id, caller_ref or caller_type, subject.describe(),
         usage["input_tokens"], usage["output_tokens"], cost_usd,
     )
     return response

@@ -11,7 +11,8 @@ function _loadAuthState() {
     try { _authUser = JSON.parse(user); } catch { _authUser = null; }
   }
   updateAuthUI();
-  if (!_authUser) openLogin();
+  if (!_authUser) { openLogin(); return; }
+  loadProjectSelector();
 }
 
 function isSuperAdmin() {
@@ -44,7 +45,13 @@ function updateAuthUI() {
         <button class="btn-logout" onclick="logout()" title="Sign out">↩</button>
       </div>`;
     navUsers.style.display = isSuperAdmin() ? '' : 'none';
-    if (navProjects) navProjects.style.display = isSuperAdmin() ? '' : 'none';
+    // Project admins get here too, read-only: the server already returns only their own
+    // projects, and without this the only place they could see their plan, cap and rate
+    // limit was the one-line summary under the sidebar picker — so "why was I refused?"
+    // had no answer they could look up themselves.
+    if (navProjects) navProjects.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
+    const btnCreateProject = document.getElementById('btn-create-project');
+    if (btnCreateProject) btnCreateProject.style.display = isSuperAdmin() ? '' : 'none';
     if (navKeys) navKeys.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navVertical) navVertical.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navPlans) navPlans.style.display = isSuperAdmin() ? '' : 'none';
@@ -85,6 +92,8 @@ document.addEventListener('keydown', e => {
     if (reviewModal && !reviewModal.classList.contains('hidden')) closeReviewDetail();
     const keyModal = document.getElementById('key-edit-modal');
     if (keyModal && !keyModal.classList.contains('hidden')) closeKeyEditor();
+    const projectModal = document.getElementById('project-edit-modal');
+    if (projectModal && !projectModal.classList.contains('hidden')) closeProjectEditor();
   }
 });
 
@@ -107,6 +116,7 @@ async function submitLogin() {
     _authUser = data.user;
     closeLogin();
     updateAuthUI();
+    loadProjectSelector();
     loadDashboard();
   } catch (e) {
     errEl.textContent = 'Network error. Is the server running?';
@@ -117,8 +127,180 @@ async function submitLogin() {
 function logout() {
   localStorage.removeItem('sdlc_token');
   localStorage.removeItem('sdlc_user');
+  // The project selection belongs to the session, not the browser — leaving it behind
+  // would silently attribute the next person's work to the previous user's project.
+  localStorage.removeItem('sdlc_project_id');
   _authUser = null;
+  _activeProject = null;
+  _projects = [];
+  _entitledProducts = null;
   updateAuthUI();
+  renderProjectSelector();
+}
+
+// ── Active project ────────────────────────────────────────────────────────
+//
+// Governance attaches to a project, not to the person signed in. An API key carries its
+// project; a browser session sends the one picked here as `X-Project-Id` on every call
+// (see apiFetch). Both then draw down the same plan, budget and quotas, so a customer's
+// allowance means the same thing whichever door the work came through.
+//
+// Picking nothing is allowed and means ungoverned — exactly how the whole UI behaved
+// before this existed. A deployment that wants every call attributed sets
+// UI_REQUIRE_PROJECT=true on the server, and unbound calls are then refused with a 403.
+
+let _projects = [];
+let _activeProject = null;
+let _entitledProducts = null;   // Set of product ids, or null when unrestricted
+
+function getActiveProjectId() {
+  return _activeProject ? _activeProject.id : '';
+}
+
+async function loadProjectSelector() {
+  try {
+    const data = await apiFetch('/api/v1/projects', { _silent: true });
+    _projects = (data.projects || []).filter(p => p.is_active);
+  } catch {
+    _projects = [];   // not fatal: the app stays usable, just ungoverned
+  }
+  const saved = localStorage.getItem('sdlc_project_id');
+  _activeProject = _projects.find(p => p.id === saved) || null;
+  // A remembered project the user has since lost access to must not linger.
+  if (saved && !_activeProject) localStorage.removeItem('sdlc_project_id');
+  renderProjectSelector();
+  await refreshEntitlements();
+}
+
+function renderProjectSelector() {
+  const wrap = document.getElementById('sidebar-project');
+  const select = document.getElementById('active-project');
+  if (!wrap || !select) return;
+
+  if (!_authUser || !_projects.length) {
+    wrap.style.display = 'none';
+    _syncProjectInputs();
+    return;
+  }
+  wrap.style.display = '';
+  select.innerHTML = ['<option value="">No project</option>']
+    .concat(_projects.map(p =>
+      `<option value="${esc(p.id)}"${p.id === getActiveProjectId() ? ' selected' : ''}>${esc(p.name)}</option>`))
+    .join('');
+  select.value = getActiveProjectId();
+  renderProjectMeta();
+  _syncProjectInputs();
+}
+
+function renderProjectMeta() {
+  const el = document.getElementById('active-project-meta');
+  if (!el) return;
+  const p = _activeProject;
+  if (!p) {
+    el.innerHTML = _projects.length
+      ? '<span title="Nothing is attributed to a project or counted against a plan until you pick one">Not attributed to a project</span>'
+      : '';
+    return;
+  }
+  const bits = [];
+  if (p.plan_name) bits.push(`<span class="plan-chip">${esc(p.plan_name)}</span>`);
+  const cap = p.monthly_budget_usd;
+  if (cap != null) {
+    const used = p.budget_used_usd || 0;
+    const left = Math.max(0, cap - used);
+    bits.push(`<span class="${left <= 0 ? 'over-budget' : ''}">$${left.toFixed(2)} of $${cap.toFixed(2)} left this month</span>`);
+  }
+  el.innerHTML = bits.join('<br>') || '<span>No plan or budget set</span>';
+}
+
+async function setActiveProject(projectId) {
+  _activeProject = _projects.find(p => p.id === projectId) || null;
+  if (_activeProject) localStorage.setItem('sdlc_project_id', _activeProject.id);
+  else localStorage.removeItem('sdlc_project_id');
+  renderProjectSelector();
+  await refreshEntitlements();
+  // History and the Dashboard are scoped to the selected project, so whichever of them is
+  // on screen is now showing the previous project's work.
+  const active = document.querySelector('.page.active');
+  if (active && active.id === 'page-history') loadHistory();
+  if (active && active.id === 'page-dashboard') loadDashboard();
+}
+
+/**
+ * Fill every per-form project box from the selector.
+ *
+ * The boxes keep their existing ids, so the ~19 call sites that read
+ * `getElementById('x-project').value` are untouched — this only changes where the value
+ * comes from. With no project selected they stay editable and free-text, which is how
+ * the app worked before, so nothing regresses for a deployment that doesn't use projects.
+ */
+function _syncProjectInputs() {
+  const name = _activeProject ? _activeProject.name : '';
+  document.querySelectorAll('input.project-bound').forEach(input => {
+    if (name) {
+      input.value = name;
+      input.readOnly = true;
+    } else {
+      input.readOnly = false;
+    }
+  });
+}
+
+/**
+ * Which products the active project's plan allows, so the nav can show the rest as locked.
+ * Null means unrestricted — either no plan, or no project selected.
+ */
+async function refreshEntitlements() {
+  try {
+    const data = await apiFetch('/api/v1/products', { _silent: true });
+    const ent = data.entitlement || {};
+    _entitledProducts = ent.unlimited
+      ? null
+      : new Set((data.products || []).filter(p => p.entitled).map(p => p.id));
+    if (_activeProject && data.project) {
+      // The server is authoritative on spend — it has just priced calls this page hasn't seen.
+      _activeProject.monthly_budget_usd = data.project.monthly_budget_usd;
+      _activeProject.budget_used_usd = data.project.budget_used_usd;
+      renderProjectMeta();
+    }
+  } catch {
+    _entitledProducts = null;   // never lock the UI down because a lookup failed
+  }
+  applyEntitlementsToNav();
+}
+
+function _notEntitledReason() {
+  return `Not included in ${_activeProject && _activeProject.plan_name
+    ? `the "${_activeProject.plan_name}" plan` : 'this project’s plan'}`;
+}
+
+/**
+ * Mark every product the active project can't run as locked.
+ *
+ * Covers three kinds of element, all tagged with `data-product`:
+ *   - sidebar nav items      → dimmed, padlock, and non-clickable (see styles.css)
+ *   - in-page action buttons → disabled, with the reason as a tooltip
+ *   - Agent Hub cards        → dimmed, and their Run button disabled
+ *
+ * The buttons matter as much as the nav does. Several products are actions *inside* a
+ * page rather than pages of their own — Generate Scaffold, Auto-Fix, Execute Migration —
+ * so a plan that grants Codegen Advisory but not Codegen Scaffold used to show a fully
+ * enabled button that only failed once clicked. The server refuses either way; this is
+ * about telling people before they spend the time, not about enforcement.
+ */
+function applyEntitlementsToNav() {
+  const reason = _notEntitledReason();
+  document.querySelectorAll('[data-product]').forEach(el => {
+    const allowed = !_entitledProducts || _entitledProducts.has(el.dataset.product);
+    el.classList.toggle('not-entitled', !allowed);
+    el.title = allowed ? '' : reason;
+    if (el.tagName === 'BUTTON') el.disabled = !allowed;
+    // An Agent Hub card is a container; its Run button is what needs disabling.
+    el.querySelectorAll?.('button.hub-run').forEach(btn => {
+      btn.disabled = !allowed;
+      btn.title = allowed ? '' : reason;
+    });
+  });
 }
 
 async function refreshApprovalBadge() {
@@ -364,6 +546,49 @@ async function runCodegenScaffold() {
   finally { hideLoading(); }
 }
 
+/**
+ * Fetch a generated scaffold as a zip and save it.
+ *
+ * This was a plain `<a href>`, which the browser follows with no Authorization header —
+ * fine while the endpoint was open, and a 401 now that it isn't. A generated scaffold is
+ * someone's source code, so the fix is to carry the token rather than to reopen the route:
+ * fetch the bytes, hand them to the browser as a blob, and revoke the object URL after.
+ */
+async function downloadScaffold(reviewId, btn) {
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Preparing…'; }
+  try {
+    const token = localStorage.getItem('sdlc_token');
+    const headers = {};
+    if (token) headers['Authorization'] = 'Bearer ' + token;
+    const projectId = getActiveProjectId();
+    if (projectId) headers['X-Project-Id'] = projectId;
+
+    const res = await fetch(`${API}/api/codegen/scaffold/${reviewId}/download`, { headers });
+    if (res.status === 401) { openLogin('Sign in to download this scaffold.'); return; }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    // The filename the server chose, so the download matches the v1 endpoint's.
+    const disposition = res.headers.get('Content-Disposition') || '';
+    const match = /filename="?([^"]+)"?/.exec(disposition);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = match ? match[1] : 'scaffold.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Could not download the scaffold: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label; }
+  }
+}
+
 function renderCodegenScaffold(targetId, result) {
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
@@ -373,7 +598,7 @@ function renderCodegenScaffold(targetId, result) {
   wrap.innerHTML = `
     <div class="result-header">
       <h2>Scaffold — ${esc(result.project_name || '')}</h2>
-      ${result.review_id && files.length ? `<a class="btn btn-primary" href="${API}/api/codegen/scaffold/${result.review_id}/download">⬇ Download ZIP</a>` : ''}
+      ${result.review_id && files.length ? `<button class="btn btn-primary" onclick="downloadScaffold('${esc(result.review_id)}', this)">⬇ Download ZIP</button>` : ''}
     </div>
 
     ${gov ? `
@@ -1560,6 +1785,14 @@ async function apiFetch(url, options = {}) {
     options.headers = options.headers || {};
     options.headers['Authorization'] = 'Bearer ' + token;
   }
+  // Which project this call is charged to. Sent as a header rather than a body field so
+  // one line covers every endpoint — including the multipart upload routes, where adding
+  // a field would have meant touching each FormData call site.
+  const projectId = getActiveProjectId();
+  if (projectId) {
+    options.headers = options.headers || {};
+    options.headers['X-Project-Id'] = projectId;
+  }
   let res;
   try {
     res = await fetch(API + url, options);
@@ -1586,6 +1819,11 @@ async function apiFetch(url, options = {}) {
     // so unwrap one level when detail isn't already a plain string.
     const detailMsg = (err.detail && typeof err.detail === 'object') ? (err.detail.detail || JSON.stringify(err.detail)) : err.detail;
     if (!_silent) feLog.warn(`API ${res.status} on ${url}: ${detailMsg || res.statusText}`, { source: 'apiFetch' });
+    // A governance refusal means the sidebar's remaining-budget figure and the locked-agent
+    // markers are stale — the server knows something this page doesn't. The server's own
+    // message is already plain English ("Monthly budget of $50.00 for project 'Acme'
+    // exhausted…"), so it is passed through unchanged to whatever screen raised the call.
+    if ([402, 403, 429].includes(res.status) && !_silent) refreshEntitlements();
     throw new Error(detailMsg || `HTTP ${res.status}`);
   }
   return res.json();
@@ -2668,16 +2906,18 @@ function renderGxPPlan(targetId, r) {
       <div class="antipattern-card" style="opacity:${d.applicable ? 1 : 0.55}">
         <div style="display:flex;justify-content:space-between;align-items:center">
           <span class="antipattern-name">${d.applicable ? '✓' : '✗'} ${esc(d.document_type)}</span>
-          ${d.applicable ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick='generateOneGxPDocument(${JSON.stringify(d.document_type)}, ${JSON.stringify(d.outline||[])})'>Generate</button>` : ''}
+          ${d.applicable ? `<button class="btn btn-secondary" data-product="gxp-generate-document" style="font-size:11px;padding:3px 8px" onclick='generateOneGxPDocument(${JSON.stringify(d.document_type)}, ${JSON.stringify(d.outline||[])})'>Generate</button>` : ''}
         </div>
         <div class="antipattern-desc">${esc(d.why || '')}</div>
         ${d.outline?.length ? `<ul class="rec-list">${d.outline.map(o => `<li>${esc(o)}</li>`).join('')}</ul>` : ''}
       </div>`).join('')}
 
     <div class="form-actions" style="margin-top:16px">
-      <button class="btn btn-primary" onclick="generateAllGxPDocuments()">⚙️ Generate All Applicable Documents</button>
+      <button class="btn btn-primary" data-product="gxp-generate-document" onclick="generateAllGxPDocuments()">⚙️ Generate All Applicable Documents</button>
     </div>
   `;
+  // Rendered after the page-load pass, so the lock has to be applied to it here.
+  applyEntitlementsToNav();
 }
 
 async function generateOneGxPDocument(documentType, outline) {
@@ -2848,7 +3088,7 @@ async function loadAgentHub() {
 
   const grid = document.getElementById('agent-cards');
   grid.innerHTML = AGENT_DEFS.map(a => `
-    <div class="agent-card" id="agent-card-${a.name}">
+    <div class="agent-card" id="agent-card-${a.name}" data-product="${esc(a.name)}">
       <div class="agent-card-header" onclick="toggleHubPanel('${a.name}')">
         <span class="agent-icon">${a.icon}</span>
         <div class="agent-meta">
@@ -2872,14 +3112,15 @@ async function loadAgentHub() {
           placeholder="GitHub PR/issue/file/repo URL, Jira ticket ID, or paste content…"></textarea>
         <div class="form-row" style="gap:8px;margin-top:8px">
           <div class="form-group flex1" style="margin:0">
-            <input type="text" id="hub-project-${a.name}" placeholder="Project name (optional)" style="width:100%" />
+            <input type="text" id="hub-project-${a.name}" class="project-bound" placeholder="Project name (optional)"
+              title="Set by the project selector in the sidebar" style="width:100%" />
           </div>
           <div class="form-group" style="margin:0;display:flex;align-items:center;gap:6px;flex-shrink:0">
             <input type="checkbox" id="hub-postback-${a.name}" />
             <label for="hub-postback-${a.name}" style="font-size:12px;color:var(--text-muted);white-space:nowrap">Post results back</label>
           </div>
         </div>
-        <button class="btn btn-primary" style="margin-top:10px;width:100%" onclick="runHubAgent('${a.name}')">
+        <button class="btn btn-primary hub-run" style="margin-top:10px;width:100%" onclick="runHubAgent('${a.name}')">
           ${a.icon} Run ${esc(a.title)}
         </button>
         <div id="hub-result-${a.name}" class="hub-agent-result hidden"></div>
@@ -2891,6 +3132,12 @@ async function loadAgentHub() {
     const src = a.sources[0];
     setHubSourceHint(a.name, src);
   });
+
+  // These cards and their project boxes are built here, after the page-load pass over the
+  // static markup has already run — so they need the same treatment applied again or the
+  // hub would be the one screen that ignores the active project and its plan.
+  _syncProjectInputs();
+  applyEntitlementsToNav();
 }
 
 function toggleHubPanel(name) {
@@ -3669,6 +3916,147 @@ async function deactivateUser(id, username) {
 let _currentProjectId = null;
 const VERTICAL_ICONS = { Hospital: '🏥', Pharma: '💊', BFSI: '🏦', 'IT Services': '💻', Generic: '🗂️' };
 
+// ── Project governance (plan, budget, rate limits) ────────────────────────
+//
+// A project is the shared allowance: an API key for this project and a browser session
+// working in it draw down the same plan and the same budget. That is what makes "what did
+// this customer cost us" one number instead of a reconciliation exercise.
+
+let _projectsById = {};
+let _editingProjectId = null;
+
+function _projectGovernanceCell(p) {
+  const bits = [];
+  bits.push(p.plan_name
+    ? `<span class="role-badge">${esc(p.plan_name)}</span>`
+    : '<span style="color:var(--text-muted);font-size:12px">No plan — unrestricted</span>');
+  if (p.monthly_budget_usd != null) {
+    const used = p.budget_used_usd || 0;
+    const over = used >= p.monthly_budget_usd;
+    bits.push(`<div style="font-size:11px;margin-top:3px;${over ? 'color:var(--red)' : 'color:var(--text-muted)'}">`
+      + `$${used.toFixed(2)} of $${p.monthly_budget_usd.toFixed(2)} used${over ? ' — exhausted' : ''}</div>`);
+  }
+  const rl = [];
+  if (p.rate_limit_per_minute) rl.push(`${p.rate_limit_per_minute}/min`);
+  if (p.rate_limit_per_day) rl.push(`${p.rate_limit_per_day}/day`);
+  if (rl.length) bits.push(`<div style="font-size:11px;color:var(--text-muted)">${rl.join(' · ')}</div>`);
+  return bits.join('');
+}
+
+async function openProjectEditor(projectId) {
+  const p = _projectsById[projectId];
+  if (!p) return;
+  _editingProjectId = projectId;
+
+  document.getElementById('project-edit-subtitle').textContent =
+    `${p.name}${p.vertical ? ` — ${p.vertical}` : ''}`;
+  document.getElementById('project-edit-summary').innerHTML = `
+    <div class="stat-row" style="font-size:12px;color:var(--text-muted)">
+      Created by ${esc(p.created_by || '—')} on ${(p.created_at || '').slice(0, 10)} ·
+      ${p.is_active ? 'Active' : 'Inactive'}
+    </div>`;
+
+  document.getElementById('project-edit-budget').value =
+    p.monthly_budget_usd != null ? p.monthly_budget_usd : '';
+  document.getElementById('project-edit-limit-minute').value = p.rate_limit_per_minute || '';
+  document.getElementById('project-edit-limit-day').value = p.rate_limit_per_day || '';
+
+  const used = p.budget_used_usd || 0;
+  document.getElementById('project-edit-budget-hint').textContent =
+    p.monthly_budget_usd != null
+      ? `$${used.toFixed(2)} used this month.`
+      : `$${used.toFixed(2)} spent this month with no cap.`;
+
+  document.getElementById('project-edit-error').classList.add('hidden');
+  document.getElementById('project-edit-modal').classList.remove('hidden');
+  await _populateProjectPlanSelect(p);
+}
+
+async function _populateProjectPlanSelect(project) {
+  const select = document.getElementById('project-edit-plan');
+  const hint = document.getElementById('project-edit-plan-hint');
+  try {
+    const plans = ((await apiFetch('/api/v1/plans', { _silent: true })).plans || [])
+      .filter(pl => pl.is_active);
+    select.innerHTML = ['<option value="">No plan — project imposes no entitlement</option>']
+      .concat(plans.map(pl =>
+        `<option value="${esc(pl.id)}">${esc(pl.name)} (${(pl.products || []).length} products)</option>`))
+      .join('');
+    select.value = project.plan_id || '';
+    hint.textContent = plans.length ? '' : 'No active plans yet — create one on the Plans page.';
+  } catch (e) {
+    select.innerHTML = '<option value="">Could not load plans</option>';
+    hint.textContent = e.message;
+  }
+}
+
+function closeProjectEditor() {
+  document.getElementById('project-edit-modal').classList.add('hidden');
+  _editingProjectId = null;
+}
+
+async function saveProjectEdits() {
+  const p = _projectsById[_editingProjectId];
+  if (!p) return;
+  const errEl = document.getElementById('project-edit-error');
+  const showError = msg => { errEl.textContent = msg; errEl.classList.remove('hidden'); };
+  errEl.classList.add('hidden');
+
+  const num = (id, label, { integer = false } = {}) => {
+    const raw = String(document.getElementById(id).value).trim();
+    if (raw === '') return null;
+    const value = Number(raw);
+    if (!isFinite(value) || value <= 0 || (integer && !Number.isInteger(value))) {
+      throw new Error(`${label} must be a positive ${integer ? 'whole number' : 'amount'}, or blank for unlimited.`);
+    }
+    return value;
+  };
+
+  let budget, perMinute, perDay;
+  try {
+    budget = num('project-edit-budget', 'Monthly budget');
+    perMinute = num('project-edit-limit-minute', 'Requests / minute', { integer: true });
+    perDay = num('project-edit-limit-day', 'Requests / day', { integer: true });
+  } catch (e) {
+    return showError(e.message);
+  }
+
+  const planId = document.getElementById('project-edit-plan').value || null;
+  const calls = [];
+  if (planId !== (p.plan_id || null)) {
+    calls.push(['plan', { plan_id: planId }]);
+  }
+  if (budget !== (p.monthly_budget_usd ?? null)
+      || perMinute !== (p.rate_limit_per_minute ?? null)
+      || perDay !== (p.rate_limit_per_day ?? null)) {
+    // The budget endpoint sets all three together, so send the current value of each —
+    // omitting one would clear it.
+    calls.push(['budget', {
+      monthly_budget_usd: budget,
+      rate_limit_per_minute: perMinute,
+      rate_limit_per_day: perDay,
+    }]);
+  }
+  if (!calls.length) return closeProjectEditor();
+
+  try {
+    for (const [path, body] of calls) {
+      await apiFetch(`/api/v1/projects/${_editingProjectId}/${path}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    }
+  } catch (e) {
+    return showError(e.message);
+  }
+  closeProjectEditor();
+  await loadProjects();
+  // The sidebar shows this project's remaining budget and drives entitlement greying,
+  // so it has to pick up a change made here.
+  await loadProjectSelector();
+}
+
 async function loadProjects() {
   const wrap = document.getElementById('projects-list');
   wrap.innerHTML = '<div class="empty-state">Loading…</div>';
@@ -3679,22 +4067,26 @@ async function loadProjects() {
       wrap.innerHTML = '<div class="empty-state">No projects yet. Click "Create Project" to provision one.</div>';
       return;
     }
+    _projectsById = {};
+    projects.forEach(p => { _projectsById[p.id] = p; });
     const rows = projects.map(p => `
       <tr>
         <td><strong>${esc(p.name)}</strong></td>
         <td style="color:var(--text-muted)">${esc(p.description || '—')}</td>
         <td>${esc(VERTICAL_ICONS[p.vertical] || '🗂️')} ${esc(p.vertical || 'Generic')}</td>
-        <td style="color:var(--text-muted);font-size:12px">${esc(p.created_by)}</td>
+        <td>${_projectGovernanceCell(p)}</td>
         <td><span class="${p.is_active ? 'user-status-active' : 'user-status-inactive'}">${p.is_active ? '● Active' : '○ Inactive'}</span></td>
         <td style="color:var(--text-muted);font-size:12px">${(p.created_at || '').slice(0, 10)}</td>
         <td>
-          <button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="openProjectAdminsPanel('${esc(p.id)}','${esc(p.name)}')">Manage Admins</button>
+          ${isSuperAdmin() ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="openProjectEditor('${esc(p.id)}')">Limits</button>` : ''}
+          <button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="openProjectMembersPanel('${esc(p.id)}','${esc(p.name)}')">Members</button>
+          ${isSuperAdmin() ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="openProjectAdminsPanel('${esc(p.id)}','${esc(p.name)}')">Manage Admins</button>` : ''}
           ${isSuperAdmin() && p.is_active ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="deactivateProject('${esc(p.id)}','${esc(p.name)}')">Deactivate</button>` : ''}
         </td>
       </tr>`).join('');
     wrap.innerHTML = `
       <table class="users-table">
-        <thead><tr><th>Name</th><th>Description</th><th>Vertical</th><th>Created By</th><th>Status</th><th>Created</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Description</th><th>Vertical</th><th>Plan &amp; budget</th><th>Status</th><th>Created</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   } catch (e) {
@@ -3726,7 +4118,7 @@ async function createProject() {
     });
     closeCreateProject();
     loadProjects();
-    alert(`✓ Project "${name}" created. Create an API key for it from the API Keys page, and assign a project admin from "Manage Admins".`);
+    alert(`✓ Project "${name}" created.\n\nNext: add the people who will work in it under "Members" — until you do, their calls run outside this project's plan and budget. Put it on a plan under "Limits", and create any API keys it needs from the API Keys page.`);
   } catch (e) { alert('Create failed: ' + e.message); }
 }
 
@@ -3739,6 +4131,7 @@ async function deactivateProject(id, name) {
 }
 
 async function openProjectAdminsPanel(projectId, projectName) {
+  document.getElementById('project-members-panel').classList.add('hidden');
   _currentProjectId = projectId;
   document.getElementById('project-admins-title').textContent = `Admins — ${projectName}`;
   document.getElementById('project-admins-panel').classList.remove('hidden');
@@ -3789,6 +4182,93 @@ async function unassignProjectAdmin(userId, username) {
     await apiFetch(`/api/v1/projects/${_currentProjectId}/admins/${userId}`, { method: 'DELETE' });
     loadProjectAdmins();
   } catch (e) { alert('Unassign failed: ' + e.message); }
+}
+
+// ── Project members ───────────────────────────────────────────────────────
+//
+// Membership is the right to work in a project; being an admin of it is a separate,
+// larger right. Admins appear in this list flagged as such, because an admin can work in
+// their own project without a membership row and would otherwise look absent from the
+// list of people who can use it.
+//
+// A project admin manages their own project's members — that is the whole point of
+// splitting the two rights — so this panel is not super-admin-only.
+
+async function openProjectMembersPanel(projectId, projectName) {
+  // Both panels share _currentProjectId, so only one may be open at a time — otherwise
+  // an action in the stale one would target whichever project was opened last.
+  document.getElementById('project-admins-panel').classList.add('hidden');
+  _currentProjectId = projectId;
+  document.getElementById('project-members-title').textContent = `Members — ${projectName}`;
+  document.getElementById('project-members-panel').classList.remove('hidden');
+  document.getElementById('pm-username').value = '';
+  _showMemberError('');
+  await loadProjectMembers();
+}
+
+function closeProjectMembersPanel() {
+  document.getElementById('project-members-panel').classList.add('hidden');
+  _currentProjectId = null;
+}
+
+function _showMemberError(message) {
+  const el = document.getElementById('pm-error');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.toggle('hidden', !message);
+}
+
+async function loadProjectMembers() {
+  const wrap = document.getElementById('project-members-list');
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const data = await apiFetch(`/api/v1/projects/${_currentProjectId}/members`);
+    const members = data.members || [];
+    wrap.innerHTML = members.length
+      ? members.map(m => `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:13px">
+            <span>
+              <strong>${esc(m.username)}</strong> ${m.full_name ? `(${esc(m.full_name)})` : ''}
+              <span style="color:var(--text-muted)">— ${esc(m.role || '')}</span>
+              ${m.is_admin ? '<span class="plan-chip" title="Admins can work in the project without a separate membership">admin</span>' : ''}
+            </span>
+            ${m.is_admin
+              ? '<span style="color:var(--text-muted);font-size:11px">via admin assignment</span>'
+              : `<button class="btn btn-secondary" style="font-size:11px;padding:2px 8px" onclick="removeProjectMember('${esc(m.user_id)}','${esc(m.username)}')">Remove</button>`}
+          </div>`).join('')
+      : `<div class="empty-state">No one can work in this project yet. Until someone is
+          added, their calls run outside any plan or budget — or are refused outright if
+          the server has UI_REQUIRE_PROJECT turned on.</div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+async function addProjectMember() {
+  const username = document.getElementById('pm-username').value.trim();
+  if (!username) { _showMemberError('Enter a username.'); return; }
+  try {
+    await apiFetch(`/api/v1/projects/${_currentProjectId}/members`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username }),
+    });
+    document.getElementById('pm-username').value = '';
+    _showMemberError('');
+    await loadProjectMembers();
+  } catch (e) {
+    // Inline rather than an alert: "no such user" is a typo to correct in the field
+    // that is already open, not something to dismiss first.
+    _showMemberError(e.message);
+  }
+}
+
+async function removeProjectMember(userId, username) {
+  if (!confirm(`Remove "${username}" from this project?\n\nWork they have already done stays in the history and the usage ledger.`)) return;
+  try {
+    await apiFetch(`/api/v1/projects/${_currentProjectId}/members/${userId}`, { method: 'DELETE' });
+    await loadProjectMembers();
+  } catch (e) { _showMemberError(e.message); }
 }
 
 // ── Vertical Dashboard ───────────────────────────────────────────────────────
@@ -4245,7 +4725,23 @@ async function deletePlan(planId, name) {
   try {
     await apiFetch(`/api/v1/plans/${planId}`, { method: 'DELETE' });
     loadPlans();
-  } catch (e) { alert('Could not delete plan: ' + e.message); }
+  } catch (e) {
+    // The server refuses while projects or keys are still on the plan, because deleting it
+    // leaves them with NO plan — which means unrestricted, not blocked. It names them, so
+    // the admin can see exactly what they would be opening up before confirming.
+    if (/still on this plan/i.test(e.message)) {
+      if (!confirm(`${e.message}\n\nDelete anyway?`)) return;
+      try {
+        await apiFetch(`/api/v1/plans/${planId}?force=true`, { method: 'DELETE' });
+        loadPlans();
+        // Those projects just lost their entitlement — the sidebar's lock markers and
+        // budget line are now wrong for anyone working in one of them.
+        await loadProjectSelector();
+      } catch (forced) { alert('Could not delete plan: ' + forced.message); }
+      return;
+    }
+    alert('Could not delete plan: ' + e.message);
+  }
 }
 
 // ── Usage & Metering ──────────────────────────────────────────────────────
@@ -4261,6 +4757,8 @@ function _usageQuery() {
   } // blank => server default, the current budget period
   const product = document.getElementById('usage-filter-product').value;
   if (product) params.set('product_id', product);
+  const project = document.getElementById('usage-filter-project')?.value;
+  if (project) params.set('project_id', project);
   const caller = document.getElementById('usage-filter-caller').value;
   if (caller) params.set('caller_type', caller);
   return params.toString();
@@ -4283,6 +4781,17 @@ async function loadUsage() {
       productSelect.innerHTML = '<option value="">All products</option>' +
         _products.map(p => `<option value="${esc(p.id)}">${esc(p.title || p.id)}</option>`).join('');
     } catch { productSelect.innerHTML = '<option value="">All products</option>'; }
+  }
+
+  // Same, for projects. This page is super-admin only, so the list is every project —
+  // which is the point: it is the one screen that spans customers.
+  const projectSelect = document.getElementById('usage-filter-project');
+  if (projectSelect && !projectSelect.options.length) {
+    try {
+      const data = await apiFetch('/api/v1/projects', { _silent: true });
+      projectSelect.innerHTML = '<option value="">All projects</option>' +
+        (data.projects || []).map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+    } catch { projectSelect.innerHTML = '<option value="">All projects</option>'; }
   }
 
   stats.innerHTML = '<div class="empty-state">Loading…</div>';

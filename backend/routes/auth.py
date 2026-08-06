@@ -5,7 +5,15 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 from pydantic import BaseModel
 
-from backend.services.auth_service import hash_password, verify_password, create_token, decode_token
+from backend.services.auth_service import (
+    SUPER_ADMIN_ROLES,
+    VALID_ROLES,
+    create_token,
+    decode_token,
+    hash_password,
+    is_super_admin,
+    verify_password,
+)
 import backend.database as database
 
 logger = logging.getLogger(__name__)
@@ -13,15 +21,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
 _security = HTTPBearer(auto_error=False)
 
-# "admin" is kept only as a legacy alias for "super_admin" (pre-existing installs already
-# have a seed user with role "admin") — new users should be created as "super_admin" or
-# "project_admin" going forward. See is_super_admin() below.
-VALID_ROLES = ("super_admin", "project_admin", "admin", "reviewer", "security", "compliance", "developer")
-SUPER_ADMIN_ROLES = ("super_admin", "admin")
-
-
-def is_super_admin(user: Optional[dict]) -> bool:
-    return bool(user) and user.get("role") in SUPER_ADMIN_ROLES
+# VALID_ROLES / SUPER_ADMIN_ROLES / is_super_admin now live in services/auth_service.py so
+# the governance guards can use them without a service importing a router. Re-exported
+# here because several routers import them from this module.
+__all__ = ["router", "VALID_ROLES", "SUPER_ADMIN_ROLES", "is_super_admin", "require_super_admin"]
 
 
 def require_super_admin(

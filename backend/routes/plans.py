@@ -129,9 +129,38 @@ def set_products(plan_id: str, req: SetProductsRequest, user: dict = Depends(_re
     return database.get_plan(plan_id)
 
 
-@router.delete("/{plan_id}", summary="Delete a plan")
-def delete_plan(plan_id: str, user: dict = Depends(_require_super_admin)):
+@router.delete(
+    "/{plan_id}",
+    summary="Delete a plan",
+    description="Refuses with 409 while projects or keys are still on this plan, listing "
+                "them — deleting it drops them to no plan, which means *unrestricted*, and "
+                "that is not something to do by accident. Pass `force=true` to go ahead.",
+)
+def delete_plan(plan_id: str, force: bool = False, user: dict = Depends(_require_super_admin)):
+    if not database.get_plan(plan_id):
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    subjects = database.plan_subjects(plan_id)
+    if not force and (subjects["projects"] or subjects["api_keys"]):
+        names = [p["name"] for p in subjects["projects"]] + [k["name"] for k in subjects["api_keys"]]
+        raise HTTPException(
+            status_code=409,
+            detail={
+                # Keyed `detail` so app.js's apiFetch unwraps it to plain text like every
+                # other structured error body (see services/error_utils.py).
+                "detail": (
+                    f"{len(names)} subject(s) are still on this plan: {', '.join(names)}. "
+                    f"Deleting it would leave them with no plan — which means unrestricted "
+                    f"access, not less. Move them to another plan first, or delete with "
+                    f"force=true if that is what you want."
+                ),
+                "error_type": "plan_in_use",
+                **subjects,
+            },
+        )
+
     if not database.delete_plan(plan_id, actor=user.get("username", "admin")):
         raise HTTPException(status_code=404, detail="Plan not found")
-    # Keys that pointed here fall back to their `scopes` column rather than losing access.
-    return {"deleted": True, "plan_id": plan_id}
+    # Both pointers are cleared: keys fall back to their `scopes` column, projects to no
+    # plan. Neither is left dangling at a plan that no longer exists.
+    return {"deleted": True, "plan_id": plan_id, "released": subjects}

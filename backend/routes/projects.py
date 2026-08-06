@@ -48,14 +48,64 @@ class AssignAdminRequest(BaseModel):
     username: str = Field(..., description="Username of the user to make a project admin for this project")
 
 
+class AddMemberRequest(BaseModel):
+    username: str = Field(
+        ..., description="Username of the user who may work in this project. This grants the "
+                         "right to run agents against it — governed by its plan and budget — "
+                         "and nothing else.",
+        examples=["dev1"],
+    )
+
+
+class AssignProjectPlanRequest(BaseModel):
+    plan_id: Optional[str] = Field(
+        None, description="Plan id to put this project on, or null to remove it (the project "
+                          "then imposes no entitlement of its own)",
+    )
+
+
+class ProjectBudgetRequest(BaseModel):
+    monthly_budget_usd: Optional[float] = Field(
+        None, description="Hard monthly spend cap in USD for everything run in this project — "
+                          "browser and API key alike. Null means unlimited.",
+    )
+    rate_limit_per_minute: Optional[int] = Field(
+        None, description="Requests per minute across the whole project. Null means unlimited.",
+    )
+    rate_limit_per_day: Optional[int] = Field(
+        None, description="Requests per day across the whole project. Null means unlimited.",
+    )
+
+
+def _decorate(project: dict) -> dict:
+    """Attach the plan name and a period-correct budget figure.
+
+    `budget_used_usd` is zeroed for display when the stored period is last month — the
+    real reset happens lazily in `database.get_project_budget()` on the next guarded call,
+    and doing a write inside a GET just to render a number would be worse.
+    """
+    project = dict(project)
+    plan = database.get_plan_for_project(project["id"]) if project.get("plan_id") else None
+    project["plan_name"] = plan["name"] if plan else ""
+    project["plan_active"] = bool(plan)
+    if project.get("budget_period_start") != database._current_budget_period():
+        project["budget_used_usd"] = 0.0
+    return project
+
+
 @router.get(
     "",
     summary="List projects",
-    description="Super admins see every project. Project admins see only the project(s) they're assigned to.",
+    description="Super admins see every project. Project admins see only the project(s) they're "
+                "assigned to. Each entry carries its plan and budget — the allowance shared by "
+                "browser sessions and API keys working in that project.",
 )
 def list_projects(user: dict = Depends(_require_auth)):
-    project_ids = None if is_super_admin(user) else database.list_project_ids_for_user(user["sub"])
-    return {"projects": database.list_projects(project_ids=project_ids)}
+    # Membership, not administration — this is what fills the "Working in" picker, and a
+    # developer who has been added to a project must find it there without being made an
+    # admin of it.
+    project_ids = None if is_super_admin(user) else database.list_member_project_ids(user["sub"])
+    return {"projects": [_decorate(p) for p in database.list_projects(project_ids=project_ids)]}
 
 
 @router.post(
@@ -80,9 +130,54 @@ def get_project(project_id: str, user: dict = Depends(_require_auth)):
     project = database.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if not is_super_admin(user) and project_id not in database.list_project_ids_for_user(user["sub"]):
-        raise HTTPException(status_code=403, detail="You are not an admin of this project")
-    return project
+    if not is_super_admin(user) and project_id not in database.list_member_project_ids(user["sub"]):
+        raise HTTPException(status_code=403, detail="You do not have access to this project")
+    return _decorate(project)
+
+
+@router.patch(
+    "/{project_id}/plan",
+    summary="Put a project on a plan (super admin only)",
+    description="The plan decides which agents and workflows can be run in this project, by "
+                "anyone — a browser session or an API key. Removing the plan makes the project "
+                "impose no entitlement of its own; an API key's own plan or scopes still apply.",
+)
+def set_project_plan(project_id: str, req: AssignProjectPlanRequest,
+                     user: dict = Depends(_require_super_admin)):
+    if not database.get_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if req.plan_id and not database.get_plan(req.plan_id):
+        raise HTTPException(status_code=404, detail=f"Plan '{req.plan_id}' not found")
+    database.set_project_plan(project_id, req.plan_id, user.get("username", "admin"))
+    return {
+        "message": "Plan assigned" if req.plan_id else "Plan removed",
+        "project_id": project_id,
+        "plan": database.get_plan_for_project(project_id),
+    }
+
+
+@router.patch(
+    "/{project_id}/budget",
+    summary="Set a project's spend cap and rate limits (super admin only)",
+    description="One cap covering everything run in this project, however it was called. An API "
+                "key's own cap still applies as a ceiling within this one — whichever runs out "
+                "first stops the call.",
+)
+def set_project_budget(project_id: str, req: ProjectBudgetRequest,
+                       user: dict = Depends(_require_super_admin)):
+    if not database.get_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    for label, value in (("monthly_budget_usd", req.monthly_budget_usd),
+                         ("rate_limit_per_minute", req.rate_limit_per_minute),
+                         ("rate_limit_per_day", req.rate_limit_per_day)):
+        if value is not None and value <= 0:
+            raise HTTPException(status_code=400, detail=f"{label} must be positive, or null for unlimited")
+
+    actor = user.get("username", "admin")
+    database.update_project_budget(project_id, req.monthly_budget_usd, actor)
+    database.update_project_rate_limits(project_id, req.rate_limit_per_minute,
+                                        req.rate_limit_per_day, actor)
+    return {"message": "Project limits updated", "project": _decorate(database.get_project(project_id))}
 
 
 @router.delete(
@@ -102,8 +197,8 @@ def deactivate_project(project_id: str, user: dict = Depends(_require_super_admi
 def list_project_admins(project_id: str, user: dict = Depends(_require_auth)):
     if not database.get_project(project_id):
         raise HTTPException(status_code=404, detail="Project not found")
-    if not is_super_admin(user) and project_id not in database.list_project_ids_for_user(user["sub"]):
-        raise HTTPException(status_code=403, detail="You are not an admin of this project")
+    if not is_super_admin(user) and project_id not in database.list_member_project_ids(user["sub"]):
+        raise HTTPException(status_code=403, detail="You do not have access to this project")
     return {"admins": database.list_project_admins(project_id)}
 
 
@@ -132,3 +227,79 @@ def unassign_project_admin(project_id: str, user_id: str, user: dict = Depends(_
     if not database.unassign_project_admin(project_id, user_id):
         raise HTTPException(status_code=404, detail="That user is not an admin of this project")
     return {"message": "Project admin unassigned", "project_id": project_id, "user_id": user_id}
+
+
+# ── Members ───────────────────────────────────────────────────────────────
+#
+# Membership is the right to *work in* a project: it appears in the member's "Working in"
+# picker, and everything they run there is governed by its plan and spends its budget.
+# It grants nothing else — not the project's API keys, not its limits, not its admin list.
+#
+# This exists because it previously didn't. `project_admins` was the only relationship, so
+# a developer who needed to run agents against a project had to be made an admin of it,
+# which also handed them its credentials. Deployments that left them unassigned instead
+# ended up with users running against no project at all, and therefore under no plan,
+# no budget and no quota — the ungoverned case UI_REQUIRE_PROJECT exists to refuse.
+#
+# A project admin manages their own project's members; that is the point of separating the
+# two rights. Assigning admins stays super-admin only.
+
+def _require_project_admin(project_id: str, user: dict) -> None:
+    if is_super_admin(user):
+        return
+    if project_id not in database.list_admin_project_ids(user["sub"]):
+        raise HTTPException(status_code=403, detail="You are not an admin of this project")
+
+
+@router.get(
+    "/{project_id}/members",
+    summary="List everyone who may work in this project",
+    description="Includes the project's admins, flagged with `is_admin`, since an admin can "
+                "work in their own project without a separate membership row.",
+)
+def list_project_members(project_id: str, user: dict = Depends(_require_auth)):
+    if not database.get_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not is_super_admin(user) and project_id not in database.list_member_project_ids(user["sub"]):
+        raise HTTPException(status_code=403, detail="You do not have access to this project")
+    return {"members": database.list_project_members(project_id)}
+
+
+@router.post(
+    "/{project_id}/members",
+    summary="Add a member (super admin, or an admin of this project)",
+    description="Grants the right to work in this project and nothing more. The user must "
+                "already exist — create them via POST /api/auth/users first.",
+)
+def add_project_member(project_id: str, req: AddMemberRequest, user: dict = Depends(_require_auth)):
+    if not database.get_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    _require_project_admin(project_id, user)
+    target = database.get_user_by_username(req.username)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"User '{req.username}' not found")
+    if not target.get("is_active"):
+        raise HTTPException(status_code=400, detail=f"User '{req.username}' is deactivated")
+    membership = database.add_project_member(project_id, target["id"], user.get("username", "admin"))
+    return {"message": f"'{req.username}' can now work in this project", "member": membership}
+
+
+@router.delete(
+    "/{project_id}/members/{user_id}",
+    summary="Remove a member (super admin, or an admin of this project)",
+    description="Removing someone stops new work being attributed to this project on their "
+                "behalf. Work they already did stays in the ledger and in the review history.",
+)
+def remove_project_member(project_id: str, user_id: str, user: dict = Depends(_require_auth)):
+    if not database.get_project(project_id):
+        raise HTTPException(status_code=404, detail="Project not found")
+    _require_project_admin(project_id, user)
+    if not database.remove_project_member(project_id, user_id):
+        # An admin's implicit membership can't be removed here — unassign the admin instead,
+        # or the two lists would disagree about who may work in the project.
+        raise HTTPException(
+            status_code=404,
+            detail="That user is not a member of this project. If they appear as an admin, "
+                   "remove the admin assignment instead.",
+        )
+    return {"message": "Member removed", "project_id": project_id, "user_id": user_id}

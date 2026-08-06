@@ -59,10 +59,11 @@ from backend.models.api_models import (
     TestScenarioRequest,
     VAPTRequest,
 )
-from backend.services import agent_guard, llm_gateway, job_service
+from backend.services import agent_guard, llm_gateway, job_service, subject_service
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
     check_and_record_rate_limit,
+    check_project_rate_limit,
     resolve_effective_override,
     validate_api_key,
 )
@@ -94,6 +95,46 @@ AGENT_CATALOG = [
 
 # ── Auth ──────────────────────────────────────────────────────────────────
 
+def _with_subject(caller: dict, request: Request, response: Response) -> dict:
+    """Attach what this request is governed against, and apply the project's rate limit.
+
+    Resolved here, at the only point that still has the request headers: `guarded_call`
+    runs deeper in the stack (and, for the async job endpoints, on another thread), so
+    without stashing it a browser call would be metered with no project and draw down no
+    budget. See subject_service.
+
+    The project rate limit runs on both credentials. It used to exist only in
+    `legacy_guard`, which meant which endpoint you called changed your limits: a login
+    token had no limit at all here, and an API key was held to its own but not to the
+    project's. Same allowance, whichever door — that applies to rate limits too.
+
+    A key's own limit has already been applied and has written its headers by this point;
+    the project's are only reported when it didn't, so the numbers a client reads always
+    belong to one limiter rather than being silently overwritten by the other.
+
+    POST only, matching `legacy_guard.product_for_request`. This dependency is also what
+    guards `GET /api/v1/products` and the job-status polls, and counting those would let
+    the UI's own catalogue refresh eat the allowance meant for agent runs — a 10/min
+    project would start refusing work because a page reloaded.
+    """
+    try:
+        subject = subject_service.resolve_subject(caller, request.headers)
+    except subject_service.ProjectBindingError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    caller["_subject"] = subject
+
+    if request.method != "POST":
+        return caller
+
+    rate = check_project_rate_limit(subject, request.url.path)
+    if rate and "X-RateLimit-Limit-Minute" not in response.headers:
+        response.headers["X-RateLimit-Limit-Minute"] = str(rate["limit_per_minute"])
+        response.headers["X-RateLimit-Remaining-Minute"] = str(rate["remaining_per_minute"])
+        response.headers["X-RateLimit-Limit-Day"] = str(rate["limit_per_day"])
+        response.headers["X-RateLimit-Remaining-Day"] = str(rate["remaining_per_day"])
+    return caller
+
+
 def get_caller(
     request: Request,
     response: Response,
@@ -122,11 +163,17 @@ def get_caller(
                 ),
                 headers={"Retry-After": str(rl["retry_after_seconds"])},
             )
-        return {"type": "api_key", "team": record["team_name"], "key_id": record["id"], "_record": record}
+        caller = {"type": "api_key", "team": record["team_name"], "key_id": record["id"],
+                  "_record": record}
+        return _with_subject(caller, request, response)
     if bearer:
         user = decode_token(bearer.credentials)
         if user:
-            return {"type": "jwt", "team": user.get("username", "ui"), "username": user.get("username")}
+            # `_user` carries the decoded claims (id + role) so subject_service can check
+            # whether this person may bind the request to the project they asked for.
+            caller = {"type": "jwt", "team": user.get("username", "ui"),
+                      "username": user.get("username"), "_user": user}
+            return _with_subject(caller, request, response)
     logger.warning("Rejected unauthenticated request on %s", request.url.path)
     raise HTTPException(
         status_code=401,

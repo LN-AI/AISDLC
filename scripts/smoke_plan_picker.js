@@ -15,13 +15,51 @@ const vm = require('vm');
 
 const payload = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 const els = {};
+// Stand-ins for the markup that querySelectorAll reaches: the ~19 per-form project boxes
+// now filled from the sidebar selector, and the nav items tagged with the product they run.
+const projectInputs = [makeEl('_pb1'), makeEl('_pb2')];
+
+function makeProductEl(id, product, tagName) {
+  const el = makeEl(id);   // already carries a real classList
+  el.dataset = { product };
+  el.tagName = tagName;
+  return el;
+}
+
+const navItems = ['code', 'requirement', 'vapt'].map(
+  p => makeProductEl('_nav_' + p, p, 'LI'));
+// Several products are buttons inside a page rather than pages of their own — Generate
+// Scaffold, Auto-Fix, Execute Migration. They were entitlement-blind until they were
+// tagged, so a plan granting codegen-advisory but not codegen-scaffold showed a live
+// button that only failed on click.
+const actionButtons = ['codegen-scaffold', 'auto-fix'].map(
+  p => makeProductEl('_btn_' + p, p, 'BUTTON'));
+// An Agent Hub card is a container: the card dims, the Run button inside it disables.
+const hubRunButton = makeEl('_hub_run');
+const hubCard = makeProductEl('_card_compliance', 'compliance', 'DIV');
+hubCard.querySelectorAll = (sel) => (sel === 'button.hub-run' ? [hubRunButton] : []);
+const productEls = [...navItems, ...actionButtons, hubCard];
+
 function makeEl(id) {
   if (els[id]) return els[id];
   const el = {
-    id, innerHTML: '', textContent: '', options: [], disabled: false,
-    style: {}, classList: { add() {}, remove() {}, contains: () => false },
+    id, innerHTML: '', textContent: '', options: [], disabled: false, readOnly: false,
+    title: '', dataset: {},
+    style: {},
     appendChild() {}, remove() {}, click() {}, focus() {}, blur() {},
     addEventListener() {}, removeEventListener() {},
+  };
+  // A real classList, so `add('hidden')` is observable by a later `contains('hidden')`.
+  // It used to be a set of no-ops, which quietly made every "is this panel hidden?"
+  // assertion pass regardless of what the code did.
+  el._classes = new Set();
+  el.classList = {
+    add: c => el._classes.add(c),
+    remove: c => el._classes.delete(c),
+    toggle: (c, on) => (on === undefined
+      ? (el._classes.has(c) ? el._classes.delete(c) : el._classes.add(c))
+      : (on ? el._classes.add(c) : el._classes.delete(c))),
+    contains: c => el._classes.has(c),
   };
   // A real input coerces .value to a string. Without this the stub hands back numbers
   // and string methods like .trim() blow up in code that is correct against a browser.
@@ -36,15 +74,24 @@ function makeEl(id) {
 const doc = {
   getElementById: makeEl,
   querySelector: () => null,
-  querySelectorAll: () => [],
+  querySelectorAll: (sel) => {
+    if (sel === 'input.project-bound') return projectInputs;
+    if (sel === '[data-product]') return productEls;
+    return [];
+  },
   createElement: () => makeEl('_tmp'),
   addEventListener: () => {},
   body: { appendChild() {}, remove() {} },
 };
+const store = { sdlc_token: 'faketoken' };
 const sandbox = {
   document: doc,
   window: { location: { origin: 'http://localhost:8000' }, addEventListener() {} },
-  localStorage: { getItem: () => 'faketoken', setItem() {}, removeItem() {} },
+  localStorage: {
+    getItem: k => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+    removeItem: k => { delete store[k]; },
+  },
   console,
   setTimeout, clearTimeout, setInterval, clearInterval,
   URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} },
@@ -53,17 +100,59 @@ const sandbox = {
   alert: (m) => { sandbox._lastAlert = m; },
   confirm: () => true,
   prompt: () => { throw new Error('prompt() should not be used — these flows must be forms'); },
-  fetch: async (url) => {
-    sandbox._calls.push({ url: String(url) });
+  fetch: async (url, options) => {
+    // Options are recorded too: the whole point of the header approach is that ONE line
+    // in apiFetch attributes every call, so the assertion has to see what was sent.
+    sandbox._calls.push({ url: String(url), headers: (options || {}).headers || {} });
     const u = String(url);
     let body = {};
-    if (u.includes('/api/v1/products')) body = payload;
+    if (sandbox._nextError) {
+      const err = sandbox._nextError;
+      sandbox._nextError = null;
+      return { ok: false, status: err.status, json: async () => ({ detail: err.detail }),
+               text: async () => err.detail };
+    }
+    if (u.includes('/api/v1/products')) body = sandbox._productsResponse || payload;
     else if (u.includes('/api/v1/plans')) body = { plans: FAKE_PLANS };
     else if (u.includes('/api/v1/keys')) body = { keys: FAKE_KEYS };
+    else if (u.includes('/members')) body = { members: FAKE_MEMBERS };
+    else if (u.includes('/api/v1/projects')) body = { projects: FAKE_PROJECTS };
     return { ok: true, status: 200, json: async () => body, text: async () => '' };
   },
 };
 sandbox._calls = [];
+sandbox._productsResponse = null;
+
+const FAKE_PROJECTS = [
+  {
+    id: 'proj-acme', name: 'Acme Platform', vertical: 'Generic', is_active: true,
+    created_by: 'admin', created_at: '2026-07-01T09:00:00',
+    plan_id: 'plan-a', plan_name: 'Starter',
+    monthly_budget_usd: 50, budget_used_usd: 12.5,
+    rate_limit_per_minute: null, rate_limit_per_day: null,
+  },
+  {
+    id: 'proj-open', name: 'Sandbox', vertical: 'Generic', is_active: true,
+    created_by: 'admin', created_at: '2026-07-02T09:00:00',
+    plan_id: null, plan_name: '', monthly_budget_usd: null, budget_used_usd: 0,
+    rate_limit_per_minute: null, rate_limit_per_day: null,
+  },
+  {
+    id: 'proj-dead', name: 'Retired Project', vertical: 'Generic', is_active: false,
+    created_by: 'admin', created_at: '2026-01-02T09:00:00',
+    plan_id: null, plan_name: '', monthly_budget_usd: null, budget_used_usd: 0,
+  },
+];
+
+// An admin and a plain member. The admin has no membership row of their own — they can
+// work in the project by virtue of administering it — so the list has to include them or
+// it would look like nobody but the developer can use the project.
+const FAKE_MEMBERS = [
+  { user_id: 'u-admin', username: 'rafe', full_name: 'Rafe', email: 'r@x.com',
+    role: 'project_admin', is_admin: true, created_at: '2026-07-01T09:00:00' },
+  { user_id: 'u-dev', username: 'dev1', full_name: '', email: 'd@x.com',
+    role: 'developer', is_admin: false, created_at: '2026-07-02T09:00:00' },
+];
 
 const FAKE_PLANS = [
   { id: 'plan-a', name: 'Starter', is_active: true, products: [{ product_id: 'code' }] },
@@ -93,7 +182,9 @@ try {
 
 (async () => {
   let failures = 0;
+  let _checks = 0;
   const ok = (label, cond, detail = '') => {
+    _checks++;
     console.log(`  ${cond ? 'PASS' : 'FAIL'}  ${label}${cond ? '' : '  -> ' + detail}`);
     if (!cond) failures++;
   };
@@ -231,6 +322,142 @@ try {
   ok('no prompt()-driven key flows remain', !/[^.\w]prompt\(/.test(keySection),
      'a prompt() call still exists in the API-keys section');
 
-  console.log(failures ? `\nFAILED: ${failures}` : `\nOK: all ${'' + (14 + 12)} checks passed`);
+  // ── Project selector ────────────────────────────────────────────────────
+  // Everything the browser runs is attributed to the project picked here, and that is
+  // what the server reads limits from. If the header stops being sent, the UI silently
+  // goes back to being ungoverned — which is the regression worth guarding.
+  console.log('\n  -- project selector --');
+  setAuthUser('admin');
+  await sandbox.loadProjectSelector();
+
+  const options = els['active-project'].innerHTML;
+  ok('selector lists the active projects', options.includes('Acme Platform') && options.includes('Sandbox'),
+     options.slice(0, 200));
+  ok('selector excludes inactive projects', !options.includes('Retired Project'));
+  ok('selector offers an explicit no-project option', options.includes('>No project<'));
+  ok('selector is shown once projects exist', els['sidebar-project'].style.display === '');
+
+  sandbox._calls = [];
+  await sandbox.setActiveProject('proj-acme');
+  ok('picking a project sends X-Project-Id on subsequent calls',
+     sandbox._calls.length > 0 && sandbox._calls.every(c => c.headers['X-Project-Id'] === 'proj-acme'),
+     JSON.stringify(sandbox._calls.map(c => [c.url, c.headers['X-Project-Id']])));
+  ok('the choice survives a reload', store['sdlc_project_id'] === 'proj-acme', store['sdlc_project_id']);
+  ok('remaining budget is shown, not just the cap',
+     els['active-project-meta'].innerHTML.includes('37.50') && els['active-project-meta'].innerHTML.includes('50.00'),
+     els['active-project-meta'].innerHTML);
+  ok('the plan name is shown', els['active-project-meta'].innerHTML.includes('Starter'));
+
+  ok('per-form project boxes are filled from the selector',
+     projectInputs.every(i => i.value === 'Acme Platform' && i.readOnly === true),
+     JSON.stringify(projectInputs.map(i => [i.value, i.readOnly])));
+
+  // Entitlement greying, driven by the same /products flags the guard enforces.
+  sandbox._productsResponse = {
+    ...payload,
+    products: payload.products.map(p => ({ ...p, entitled: p.id === 'code' })),
+    entitlement: { unlimited: false, source: 'plan', plan_id: 'plan-a', plan_name: 'Starter' },
+    project: { id: 'proj-acme', name: 'Acme Platform', monthly_budget_usd: 50, budget_used_usd: 12.5 },
+  };
+  await sandbox.refreshEntitlements();
+  const locked = navItems.filter(n => n.classList.contains('not-entitled')).map(n => n.dataset.product);
+  ok('agents outside the plan are marked locked',
+     locked.sort().join(',') === 'requirement,vapt', locked.join(','));
+  ok('an entitled agent is not locked',
+     !navItems.find(n => n.dataset.product === 'code').classList.contains('not-entitled'));
+  ok('a locked agent explains itself rather than just going grey',
+     navItems.find(n => n.dataset.product === 'vapt').title.includes('Starter'),
+     navItems.find(n => n.dataset.product === 'vapt').title);
+
+  // The buttons matter as much as the nav: these products have no page of their own, so
+  // before they were tagged the only feedback was a 403 after the click.
+  const scaffoldBtn = actionButtons.find(b => b.dataset.product === 'codegen-scaffold');
+  ok('an in-page action button for a non-entitled product is disabled',
+     scaffoldBtn.disabled === true, `disabled=${scaffoldBtn.disabled}`);
+  ok('the disabled button says why', scaffoldBtn.title.includes('Starter'), scaffoldBtn.title);
+  ok('an Agent Hub card for a non-entitled product is marked locked',
+     hubCard.classList.contains('not-entitled'));
+  ok('and its Run button is disabled, not just the card dimmed',
+     hubRunButton.disabled === true, `disabled=${hubRunButton.disabled}`);
+
+  // Unrestricted must never render as locked — that would make the app look broken for
+  // every deployment that doesn't use plans at all.
+  sandbox._productsResponse = { ...payload, entitlement: { unlimited: true, source: 'unrestricted' } };
+  await sandbox.refreshEntitlements();
+  ok('nothing is locked when the caller is unrestricted',
+     navItems.every(n => !n.classList.contains('not-entitled')));
+  ok('buttons are re-enabled when the caller is unrestricted',
+     actionButtons.every(b => b.disabled === false) && hubRunButton.disabled === false);
+
+  // Deselecting hands control back to the user, so a deployment with no projects works
+  // exactly as it did before any of this existed.
+  sandbox._calls = [];
+  await sandbox.setActiveProject('');
+  ok('deselecting stops sending the header',
+     sandbox._calls.every(c => !c.headers['X-Project-Id']),
+     JSON.stringify(sandbox._calls.map(c => c.headers)));
+  ok('deselecting makes the project boxes editable again',
+     projectInputs.every(i => i.readOnly === false));
+  ok('deselecting clears the remembered project', !('sdlc_project_id' in store));
+
+  // Signing out must not leave the next person attributed to this project.
+  await sandbox.setActiveProject('proj-acme');
+  sandbox.logout();
+  ok('logout clears the project selection', !('sdlc_project_id' in store), JSON.stringify(store));
+  sandbox._calls = [];
+  await sandbox.apiFetch('/api/v1/plans', { _silent: true });
+  ok('logout stops the header being sent', !sandbox._calls[0].headers['X-Project-Id'],
+     JSON.stringify(sandbox._calls[0].headers));
+
+  // The scaffold download was a plain <a href>, which carries no Authorization header.
+  // Now that the endpoint requires a credential that would be a silent 401 on a button
+  // the user just clicked, so it goes through fetch with the token attached.
+  // logout() above cleared the session and the project list, so sign back in before
+  // asserting on what an authenticated download sends.
+  store.sdlc_token = 'faketoken';
+  vm.runInContext(`_authUser = ${JSON.stringify({ username: 'admin', role: 'admin' })};`, sandbox);
+  await sandbox.loadProjectSelector();
+  await sandbox.setActiveProject('proj-acme');
+  sandbox._calls = [];
+  await sandbox.downloadScaffold('review-123', null);
+  const dl = sandbox._calls.find(c => c.url.includes('/download'));
+  ok('the scaffold download is fetched, not linked', !!dl,
+     JSON.stringify(sandbox._calls.map(c => c.url)));
+  ok('the scaffold download carries the bearer token',
+     !!dl && dl.headers['Authorization'] === 'Bearer faketoken',
+     JSON.stringify(dl && dl.headers));
+  ok('the scaffold download carries the active project',
+     !!dl && dl.headers['X-Project-Id'] === 'proj-acme',
+     JSON.stringify(dl && dl.headers));
+
+  // ── Members panel ───────────────────────────────────────────────────────
+  // Membership is the right to work in a project. The panel has to make the distinction
+  // from administering one visible, or an admin will grant the wrong thing.
+  await sandbox.openProjectMembersPanel('proj-acme', 'Acme Platform');
+  const membersHtml = els['project-members-list'].innerHTML;
+  ok('the members list renders both members', /dev1/.test(membersHtml) && /rafe/.test(membersHtml),
+     membersHtml.slice(0, 200));
+  ok('an admin is labelled as one', /admin</.test(membersHtml), membersHtml.slice(0, 300));
+  ok('a plain member can be removed', /removeProjectMember\('u-dev'/.test(membersHtml));
+  ok("an admin's implicit membership offers no Remove button",
+     !/removeProjectMember\('u-admin'/.test(membersHtml));
+  ok('opening Members closes the Admins panel so actions target one project',
+     els['project-admins-panel'].classList.contains('hidden'));
+
+  // A typo in the username is a field to correct, not an alert to dismiss.
+  sandbox._lastAlert = null;
+  els['pm-username'].value = 'nosuchuser';
+  sandbox._nextError = { status: 404, detail: "User 'nosuchuser' not found" };
+  await sandbox.addProjectMember();
+  ok('a failed add reports inline, not as an alert',
+     /not found/.test(els['pm-error'].textContent) && sandbox._lastAlert === null,
+     `${els['pm-error'].textContent} / alert=${sandbox._lastAlert}`);
+
+  els['pm-username'].value = '';
+  await sandbox.addProjectMember();
+  ok('adding with an empty username is caught before the request',
+     /Enter a username/.test(els['pm-error'].textContent), els['pm-error'].textContent);
+
+  console.log(failures ? `\nFAILED: ${failures}` : `\nOK: all ${'' + _checks} checks passed`);
   process.exit(failures ? 1 : 0);
 })();

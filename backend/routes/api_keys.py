@@ -64,7 +64,9 @@ def _authorize_key(key_id: str, user: dict) -> dict:
     if is_super_admin(user):
         return key
     project_id = key.get("project_id")
-    if project_id and project_id in database.list_project_ids_for_user(user["sub"]):
+    # Administration, not membership: a key is a credential that spends the project's
+    # budget, so managing one is an admin right. Plain members are deliberately excluded.
+    if project_id and project_id in database.list_admin_project_ids(user["sub"]):
         return key
     raise HTTPException(status_code=403, detail="You are not an admin of this key's project")
 
@@ -122,7 +124,7 @@ class SetLLMConfigRequest(BaseModel):
                 "The raw key is never returned after creation.",
 )
 def get_keys(user: dict = Depends(_require_auth)):
-    project_ids = None if is_super_admin(user) else database.list_project_ids_for_user(user["sub"])
+    project_ids = None if is_super_admin(user) else database.list_admin_project_ids(user["sub"])
     keys = list_api_keys(project_ids=project_ids)
     for k in keys:
         usage = get_usage_summary(k["id"])
