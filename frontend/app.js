@@ -335,6 +335,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'sensitive') { /* page ready, no auto-load */ }
     if (page === 'ai-provenance') { /* page ready, no auto-load */ }
     if (page === 'migration') { /* page ready, no auto-load */ }
+    if (page === 'modernization') loadModernizationRuns();
     if (page === 'issue-triage') { /* page ready, no auto-load */ }
     if (page === 'test-scenario') { /* page ready, no auto-load */ }
     if (page === 'test-case') { /* page ready, no auto-load */ }
@@ -1727,20 +1728,84 @@ function renderFinding(f) {
   const blocking = f.is_blocking ? '<span class="blocking-badge">Blocking</span>' : '';
   const owasp = f.owasp_ref ? `<span class="compliance-chip">${esc(f.owasp_ref)}</span>` : '';
   const nist = f.nist_ref ? `<span class="compliance-chip">${esc(f.nist_ref)}</span>` : '';
+  // "Seen before" is the difference between a review a team acts on and one they mute.
+  const age = f.is_new === false
+    ? '<span class="compliance-chip" title="This project has seen this finding before">Pre-existing</span>'
+    : (f.is_new === true ? '<span class="compliance-chip">New</span>' : '');
+  const where = f.file_path
+    ? `<div class="finding-loc">${esc(f.file_path)}${f.line_start ? ':' + f.line_start : ''}</div>` : '';
+  const evidence = f.evidence
+    ? `<pre class="finding-evidence">${esc(String(f.evidence).slice(0, 400))}</pre>` : '';
 
   return `
-    <div class="finding-card sev-${sev}">
+    <div class="finding-card sev-${sev}" id="finding-${esc(f.id || '')}">
       <div class="finding-header">
         <span class="sev-badge">${esc(f.risk_level || severityName(sev))}</span>
         <span class="control-badge">${esc(f.control_id || 'N/A')}</span>
         ${blocking}
+        ${age}
         ${owasp}${nist}
       </div>
       <div class="finding-title">${esc(f.title || 'Finding')}</div>
+      ${where}
       <div class="finding-desc">${esc(f.description || '')}</div>
+      ${evidence}
       ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+      ${f.id ? renderWaiveControl(f) : ''}
     </div>
   `;
+}
+
+// ── Waiving a finding ─────────────────────────────────────────────────────
+//
+// The `findings` table has always had status/resolved_by/resolved_at and the API to write
+// them, but there was no way to reach it from a browser — so on any codebase with history
+// the first review was Red and every review after it was identically Red. This is the
+// control that lets a team say "we know, we accept this", after which the finding drops
+// out of future reviews *of that project* and stops blocking.
+
+function renderWaiveControl(f) {
+  const waived = f.status && f.status !== 'open';
+  if (waived) {
+    return `<div class="finding-waived">
+      Waived as <strong>${esc(f.status)}</strong>${f.resolved_by ? ' by ' + esc(f.resolved_by) : ''}
+      ${f.resolution_comment ? '— ' + esc(f.resolution_comment) : ''}
+      <button class="btn btn-link" onclick="waiveFinding('${esc(f.id)}', 'open')">Reopen</button>
+    </div>`;
+  }
+  return `<div class="finding-actions">
+    <select id="waive-status-${esc(f.id)}" class="waive-select">
+      <option value="waived">Waive — known and accepted</option>
+      <option value="accepted_risk">Accepted risk</option>
+      <option value="false_positive">False positive — the tool was wrong</option>
+      <option value="resolved">Resolved — fixed in code</option>
+    </select>
+    <button class="btn btn-secondary btn-sm" onclick="waiveFinding('${esc(f.id)}')">Apply</button>
+  </div>`;
+}
+
+async function waiveFinding(findingId, forcedStatus) {
+  const select = document.getElementById('waive-status-' + findingId);
+  const status = forcedStatus || (select && select.value) || 'waived';
+  // A waiver is a governance decision and lands in the audit trail with a name against it,
+  // so it is worth one confirmation rather than being a single misclick.
+  const verb = status === 'open' ? 'Reopen' : 'Waive';
+  const comment = prompt(`${verb} this finding — why? (recorded in the audit trail)`, '');
+  if (comment === null) return;
+  try {
+    const updated = await apiFetch(`/api/v1/findings/${findingId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status, comment }),
+    });
+    const card = document.getElementById('finding-' + findingId);
+    if (card) {
+      const holder = card.querySelector('.finding-actions, .finding-waived');
+      if (holder) holder.outerHTML = renderWaiveControl({ ...updated, id: findingId });
+    }
+  } catch (e) {
+    alert('Could not update the finding: ' + (e.message || e));
+  }
 }
 
 function severityName(n) {
@@ -4945,3 +5010,281 @@ async function downloadUsageCsv() {
 _restoreNavSectionState();
 _loadAuthState();
 loadDashboard();
+
+// ── Legacy Modernization ───────────────────────────────────────────────────
+//
+// A run dashboard rather than a form. The distinction is the whole product: a
+// modernization is a process with durable state, so every panel here reads the run row
+// instead of holding anything in the page. Reload mid-run, come back tomorrow, or open it
+// as a different person, and you see the same thing — including a run whose worker process
+// died, which shows as `paused` with a Resume button rather than a spinner that never ends.
+
+let _modRunId = null;
+let _modPollTimer = null;
+let _modCharterFields = null;
+
+async function loadModernizationRuns() {
+  const box = document.getElementById('mod-runs');
+  if (!box) return;
+  try {
+    const data = await apiFetch('/api/v1/modernization/runs');
+    if (!data.runs.length) {
+      box.innerHTML = '<div class="empty-state">No runs yet. Upload a zip above to build an inventory — nothing is billed until you approve a plan.</div>';
+      return;
+    }
+    box.innerHTML = data.runs.map(r => `
+      <div class="mod-run-card" onclick="openModernizationRun('${esc(r.id)}')">
+        <div class="mod-run-head">
+          <span class="mod-run-name">${esc(r.name || 'Untitled run')}</span>
+          <span class="mod-status ${esc(r.status)}">${esc(r.status)}</span>
+          <span class="compliance-chip">${esc(r.target_stack || '')}</span>
+        </div>
+        <div class="mod-meta">${esc(r.source_kind || '')} · created ${esc((r.created_at || '').slice(0, 16).replace('T', ' '))}
+          ${r.spent_usd ? ' · $' + Number(r.spent_usd).toFixed(2) + ' spent' : ''}</div>
+      </div>`).join('');
+  } catch (e) {
+    box.innerHTML = `<div class="empty-state">Could not load runs: ${esc(e.message)}</div>`;
+  }
+}
+
+async function createModernizationRun() {
+  const name = document.getElementById('mod-name').value.trim();
+  const target = document.getElementById('mod-target').value.trim();
+  const fileInput = document.getElementById('mod-zip');
+  const cap = document.getElementById('mod-cap').value;
+  const ext = document.getElementById('mod-ext').value.trim();
+  if (!name || !target) { alert('Run name and target stack are required.'); return; }
+  if (!fileInput.files.length) { alert('Choose a zip of the source repository.'); return; }
+
+  const form = new FormData();
+  form.append('file', fileInput.files[0]);
+  form.append('name', name);
+  form.append('target_stack', target);
+  if (ext) form.append('extensions', ext);
+  if (cap) form.append('budget_cap_usd', cap);
+
+  showLoading('Reading the archive, redacting secrets and building the dependency graph…');
+  try {
+    // FormData sets its own multipart boundary — never set Content-Type by hand here.
+    const run = await apiFetch('/api/v1/modernization/runs/upload', { method: 'POST', body: form });
+    await loadModernizationRuns();
+    openModernizationRun(run.id);
+  } catch (e) {
+    alert('Could not start the run: ' + e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function openModernizationRun(runId) {
+  _modRunId = runId;
+  await refreshModernizationRun();
+  // Poll only while there is something to watch. A completed or cancelled run never
+  // changes again, and a paused one only changes when someone acts on this page.
+  clearInterval(_modPollTimer);
+  _modPollTimer = setInterval(async () => {
+    const run = await refreshModernizationRun();
+    if (!run || run.status !== 'converting') clearInterval(_modPollTimer);
+  }, 4000);
+}
+
+async function refreshModernizationRun() {
+  if (!_modRunId) return null;
+  const box = document.getElementById('mod-detail');
+  try {
+    const run = await apiFetch(`/api/v1/modernization/runs/${_modRunId}`, { _silent: true });
+    const checkpoints = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/checkpoints?status=open`, { _silent: true });
+    const units = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/units`, { _silent: true });
+    box.classList.remove('hidden');
+    box.innerHTML = renderModernizationRun(run, checkpoints.checkpoints || [], units.units || []);
+    return run;
+  } catch (e) {
+    box.classList.remove('hidden');
+    box.innerHTML = `<div class="mod-panel">Could not load this run: ${esc(e.message)}</div>`;
+    return null;
+  }
+}
+
+function renderModernizationRun(run, checkpoints, units) {
+  const u = run.units || {};
+  const blocking = checkpoints.filter(c => c.blocking);
+  const needsCharter = run.status === 'awaiting_charter';
+  const canStart = run.status === 'awaiting_approval' && blocking.length === 0;
+  const canResume = run.status === 'paused';
+  const running = run.status === 'converting';
+  const terminal = ['completed', 'cancelled', 'failed'].includes(run.status);
+
+  return `
+    <div class="mod-panel">
+      <div class="mod-run-head">
+        <h2 style="margin:0">${esc(run.name || 'Run')}</h2>
+        <span class="mod-status ${esc(run.status)}">${esc(run.status)}</span>
+        <span class="compliance-chip">${esc(run.target_stack || '')}</span>
+      </div>
+      <div class="mod-bar"><span style="width:${run.progress_pct || 0}%"></span></div>
+      <div class="mod-meta">
+        ${u.converted || 0} of ${u.total || 0} converted
+        ${u.failed ? ` · ${u.failed} failed` : ''}
+        ${u.blocked ? ` · ${u.blocked} waiting on dependencies` : ''}
+        · $${Number(run.spent_usd || 0).toFixed(2)} spent${run.budget_cap_usd ? ' of $' + Number(run.budget_cap_usd).toFixed(2) + ' cap' : ''}
+        ${run.redaction_count ? ` · ${run.redaction_count} secret(s) redacted at ingest` : ''}
+      </div>
+      ${run.paused_reason ? `<div class="mod-alert">${esc(run.paused_reason)}</div>` : ''}
+      <div class="form-actions" style="margin-top:12px">
+        ${canStart ? '<button class="btn btn-primary" onclick="startModernizationRun()">Start conversion</button>' : ''}
+        ${canResume ? '<button class="btn btn-primary" onclick="resumeModernizationRun()">Resume</button>' : ''}
+        ${running ? '<button class="btn btn-secondary" onclick="pauseModernizationRun()">Pause</button>' : ''}
+        ${u.converted ? '<button class="btn btn-secondary" onclick="exportModernizationRun()">Download converted code</button>' : ''}
+        ${terminal ? '' : '<button class="btn btn-link" onclick="cancelModernizationRun()">Cancel run</button>'}
+      </div>
+    </div>
+
+    ${needsCharter ? renderCharterForm(run) : ''}
+    ${checkpoints.length ? renderModernizationCheckpoints(checkpoints) : ''}
+    ${renderModernizationUnits(units)}
+  `;
+}
+
+function renderModernizationCheckpoints(checkpoints) {
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Waiting on you (${checkpoints.length})</div>
+    ${checkpoints.map(c => `
+      <div class="mod-alert">
+        <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks conversion' : ' — informational'}
+        <div style="margin-top:6px">${esc(c.detail || '')}</div>
+        <button class="btn btn-secondary btn-sm" style="margin-top:8px"
+                onclick="answerModernizationCheckpoint('${esc(c.id)}')">Acknowledge</button>
+      </div>`).join('')}
+  </div>`;
+}
+
+function renderModernizationUnits(units) {
+  if (!units.length) return '';
+  // Ordered by the topological sort, so reading top to bottom is reading the conversion
+  // order. `level` is a proof of independence rather than a guess: everything at one level
+  // can convert without waiting for anything else at that level.
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Files (${units.length}), in conversion order</div>
+    <div style="max-height:460px;overflow:auto">
+      <table class="mod-unit-table">
+        <thead><tr><th>#</th><th>Level</th><th>File</th><th>Role</th><th>Deps</th><th>Status</th></tr></thead>
+        <tbody>
+        ${units.map(x => `<tr>
+          <td>${x.order_index}</td>
+          <td>${x.topo_level}</td>
+          <td class="mod-unit-path">${esc(x.path)}${(x.scc_group !== null && x.scc_group !== undefined) ? ' <span class="compliance-chip">cycle</span>' : ''}</td>
+          <td>${esc(x.module_type || '')}</td>
+          <td>${(x.depends_on || []).length}</td>
+          <td><span class="mod-status ${esc(x.status)}">${esc(x.status)}</span>${x.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
+        </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function renderCharterForm(run) {
+  // Field definitions come from the server so this form cannot drift from what
+  // `charter.validate()` actually enforces — a screen missing a required field would
+  // produce runs rejected at submit for no visible reason.
+  if (!_modCharterFields) {
+    apiFetch('/api/v1/modernization/charter-fields', { _silent: true })
+      .then(d => { _modCharterFields = d.fields; refreshModernizationRun(); })
+      .catch(() => {});
+    return '<div class="mod-panel">Loading the charter form…</div>';
+  }
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Conversion charter</div>
+    <p class="subtitle" style="margin-top:-6px">Decided once, applied to every file. This is what stops file 1 using EF Core and file 90 using raw ADO.NET — the inconsistency nothing could detect before, because nothing compared them.</p>
+    <div class="mod-charter-grid">
+      ${_modCharterFields.map(f => `
+        <div class="form-group">
+          <label>${esc(f.label)}${f.required ? ' <span class="required">*</span>' : ''}</label>
+          <textarea id="charter-${esc(f.key)}" rows="2" placeholder="${esc(f.help)}">${esc(f.key === 'target_stack' ? (run.target_stack || '') : '')}</textarea>
+        </div>`).join('')}
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="saveModernizationCharter()">Save charter and review the plan</button>
+    </div>
+  </div>`;
+}
+
+async function saveModernizationCharter() {
+  const charter = {};
+  (_modCharterFields || []).forEach(f => {
+    const el = document.getElementById('charter-' + f.key);
+    if (el) charter[f.key] = el.value.trim();
+  });
+  try {
+    await apiFetch(`/api/v1/modernization/runs/${_modRunId}/charter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ charter }),
+    });
+    await refreshModernizationRun();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function _modAction(path, body) {
+  try {
+    await apiFetch(`/api/v1/modernization/runs/${_modRunId}/${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    await openModernizationRun(_modRunId);
+    loadModernizationRuns();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+function startModernizationRun()  { _modAction('start'); }
+function resumeModernizationRun() { _modAction('resume'); }
+function pauseModernizationRun()  { _modAction('pause', { reason: 'Paused from the dashboard' }); }
+
+function cancelModernizationRun() {
+  // Terminal, and it stops a run someone may be paying for — worth one confirmation.
+  if (!confirm('Cancel this run? Converted files are kept and stay downloadable, but conversion stops for good.')) return;
+  _modAction('cancel', { reason: 'Cancelled from the dashboard' });
+}
+
+async function answerModernizationCheckpoint(checkpointId) {
+  const decision = prompt('Record your decision (kept in the run log):', 'Reviewed and approved');
+  if (decision === null) return;
+  try {
+    await apiFetch(`/api/v1/modernization/checkpoints/${checkpointId}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    });
+    await refreshModernizationRun();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function exportModernizationRun() {
+  // Streams a zip, so this uses fetch directly rather than apiFetch (which parses JSON).
+  // The archive carries a MODERNIZATION_REPORT.md saying what was skipped, what failed,
+  // and which configuration keys the redactions left somebody to supply.
+  const token = localStorage.getItem('sdlc_token');
+  const headers = token ? { Authorization: 'Bearer ' + token } : {};
+  const projectId = getActiveProjectId();
+  if (projectId) headers['X-Project-Id'] = projectId;
+  try {
+    const res = await fetch(`${API}/api/v1/modernization/runs/${_modRunId}/export`, { headers });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'modernized.zip';
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Could not download the converted code: ' + e.message);
+  }
+}

@@ -1478,3 +1478,69 @@ button.not-entitled::after {
 }
 .modal-close-btn:hover { color: var(--text); background: var(--surface2); }
 .modal-box { position: relative; }
+
+/* ── Finding provenance & waiving ─────────────────────────────────────── */
+/* A finding is only actionable if you can see where it is, what proves it, and say
+   "we accept this". The first two are read-only; the third writes an audit row. */
+.finding-loc {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; color: var(--text-muted); margin-bottom: 6px;
+}
+.finding-evidence {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 8px 10px; margin: 0 0 8px; overflow-x: auto;
+  white-space: pre; color: var(--text);
+}
+.finding-actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+.waive-select {
+  font-size: 12px; padding: 4px 8px; border-radius: 4px;
+  background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+}
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.finding-waived {
+  margin-top: 10px; font-size: 12px; color: var(--text-muted);
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 10px;
+}
+.field-hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
+
+/* ── Modernization run dashboard ──────────────────────────────────────── */
+.mod-run-card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; margin-bottom: 10px; cursor: pointer; transition: border-color .15s;
+}
+.mod-run-card:hover { border-color: var(--accent); }
+.mod-run-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.mod-run-name { font-weight: 600; }
+.mod-status {
+  font-size: 11px; padding: 3px 8px; border-radius: 4px; text-transform: uppercase;
+  letter-spacing: .04em; border: 1px solid var(--border); background: var(--surface2);
+}
+.mod-status.converting { border-color: var(--accent); color: var(--accent); }
+.mod-status.completed  { border-color: #16a34a; color: #16a34a; }
+.mod-status.paused     { border-color: #d97706; color: #d97706; }
+.mod-status.failed,
+.mod-status.cancelled  { border-color: #dc2626; color: #dc2626; }
+.mod-bar {
+  height: 6px; border-radius: 3px; background: var(--surface2);
+  overflow: hidden; margin-top: 10px;
+}
+.mod-bar > span { display: block; height: 100%; background: var(--accent); }
+.mod-meta { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+.mod-panel {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px; margin-bottom: 16px;
+}
+.mod-alert {
+  border-left: 3px solid #d97706; background: rgba(217,119,6,.08);
+  padding: 10px 14px; border-radius: 0 4px 4px 0; font-size: 13px; margin-bottom: 12px;
+}
+.mod-unit-table { width: 100%; font-size: 12px; border-collapse: collapse; }
+.mod-unit-table th, .mod-unit-table td {
+  text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
+}
+.mod-unit-table th { color: var(--text-muted); font-weight: 600; }
+.mod-unit-path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.mod-charter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 900px) { .mod-charter-grid { grid-template-columns: 1fr; } }
