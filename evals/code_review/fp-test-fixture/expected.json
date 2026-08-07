@@ -1,0 +1,13 @@
+{
+  "must_find": [],
+  "must_not_find": [
+    {
+      "control_id": "SEC-003",
+      "note": "publishable test key in a test file"
+    }
+  ],
+  "expected_gate": [
+    "Green"
+  ],
+  "case": "fp-test-fixture"
+}

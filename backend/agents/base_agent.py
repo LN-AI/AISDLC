@@ -77,6 +77,57 @@ REVIEW_TOOL_SCHEMA = {
 }
 
 
+def _code_review_schema() -> Dict[str, Any]:
+    """REVIEW_TOOL_SCHEMA plus the fields a code finding needs to be checkable.
+
+    A fork rather than an edit: REVIEW_TOOL_SCHEMA is shared with the requirement,
+    compliance and prompt-safety agents (`self.review(...)`), and none of them review
+    something with files and line numbers, so requiring evidence of them would be asking
+    for a field they cannot fill.
+
+    The added fields exist so `finding_pipeline.verify_evidence` can check the finding
+    against the artifact in Python: `evidence` must be a verbatim quote, which either
+    appears in the reviewed text or does not.
+    """
+    import copy
+    schema = copy.deepcopy(REVIEW_TOOL_SCHEMA)
+    schema["name"] = "submit_code_review"
+    schema["description"] = (
+        "Submit code review findings. Every finding must quote the exact offending line(s) "
+        "from the code you were shown."
+    )
+    props = schema["input_schema"]["properties"]["findings"]["items"]["properties"]
+    props.update({
+        "file_path": {
+            "type": "string",
+            "description": "Path of the file this finding is in, exactly as shown in the chunk header or diff. Empty if the artifact had no file structure.",
+        },
+        "line_start": {"type": "integer", "description": "First line of the offending code, using the absolute line numbers shown to you — not renumbered from the top of the chunk."},
+        "line_end": {"type": "integer", "description": "Last line of the offending code."},
+        "evidence": {
+            "type": "string",
+            "description": "The offending code, quoted VERBATIM from what you were shown — up to 3 lines. This is checked against the source: a quote that does not appear in the reviewed code causes the finding to be discarded. Never paraphrase, never reconstruct from memory.",
+        },
+        "confidence": {
+            "type": "string",
+            "enum": ["High", "Medium", "Low"],
+            "description": "High only when the code shown is sufficient to prove the issue. Use Low if you are inferring from code you cannot see.",
+        },
+        "is_pre_existing": {
+            "type": "boolean",
+            "description": "True if this problem is on an unchanged context line in a diff rather than introduced by the change under review.",
+        },
+    })
+    schema["input_schema"]["properties"]["findings"]["items"]["required"] = [
+        "control_id", "severity", "risk_level", "title", "description",
+        "recommendation", "is_blocking", "evidence", "confidence",
+    ]
+    return schema
+
+
+CODE_REVIEW_TOOL_SCHEMA = _code_review_schema()
+
+
 GOVERNANCE_SUMMARY_TOOL_SCHEMA = {
     "name": "submit_governance_summary",
     "description": "Submit an executive summary and recommendations for a gate decision that has already been computed deterministically — do not re-derive or echo back the underlying findings.",

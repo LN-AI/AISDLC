@@ -50,3 +50,21 @@ MAX_AGENT_INPUT_CHARS = int(os.getenv("MAX_AGENT_INPUT_CHARS", "400000"))
 # endpoint used by the `full` review), so a generous value here is safe.
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "360"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+
+# Anthropic prompt caching — marks the system prompt + tool schema (a byte-identical
+# prefix across every call to the same agent) as cacheable. Output is unchanged; only
+# billing differs: a cache write costs 1.25x and a read 0.1x, so break-even is two
+# calls within the 5-minute TTL. `full` (7 calls) and `swarm` (6 agents on one
+# artifact) profit immediately. No effect on the OpenAI/BYOL path. Set false to
+# disable if a provider or gateway rejects the cache_control block.
+PROMPT_CACHE_ENABLED = os.getenv("PROMPT_CACHE_ENABLED", "true").lower() == "true"
+
+# SQLite concurrency. Swarm runs 6 worker threads and background jobs run on their
+# own threads, all opening separate connections to one file — without a busy timeout
+# those collide as "database is locked" instead of waiting their turn.
+SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
+
+# Background jobs are scheduled in-process (asyncio.create_task), so a restart
+# orphans every in-flight job as status='running' forever. On startup we reap jobs
+# that belong to a dead process. See database.recover_orphaned_jobs().
+JOB_STALE_MINUTES = int(os.getenv("JOB_STALE_MINUTES", "30"))

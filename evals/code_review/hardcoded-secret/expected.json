@@ -1,0 +1,17 @@
+{
+  "must_find": [
+    {
+      "control_id": "SEC-003",
+      "line_range": [
+        1,
+        4
+      ],
+      "note": "real-shaped AWS secret in source"
+    }
+  ],
+  "must_not_find": [],
+  "expected_gate": [
+    "Red"
+  ],
+  "case": "hardcoded-secret"
+}

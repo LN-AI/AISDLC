@@ -1,0 +1,13 @@
+{
+  "must_find": [],
+  "must_not_find": [
+    {
+      "control_id": "SEC-002",
+      "note": "Django's CsrfViewMiddleware handles CSRF; @login_required handles auth"
+    }
+  ],
+  "expected_gate": [
+    "Green"
+  ],
+  "case": "fp-framework-csrf"
+}

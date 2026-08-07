@@ -28,6 +28,7 @@ from backend.routes.approvals import router as approvals_router
 from backend.routes.audit_trail import router as audit_router
 from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
+from backend.routes.findings import router as findings_router
 from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.api_keys import router as api_keys_router
 from backend.routes.plans import router as plans_router
@@ -95,6 +96,10 @@ def _init_default_admin():
 async def lifespan(app: FastAPI):
     logger.info("Starting up - env=%s model=%s", config.APP_ENV, config.MODEL)
     database.init_db()
+    # Background jobs live in this process only, so anything still marked running
+    # belongs to a process that no longer exists. Without this they stay 'running'
+    # forever and the client polls a job that will never finish.
+    database.recover_orphaned_jobs()
     _init_default_admin()
     knowledge_base.load()  # preload all docs/ markdown files into memory
     logger.info("Startup complete")
@@ -226,6 +231,7 @@ app.include_router(audit_router)
 app.include_router(agents_router)
 app.include_router(inventory_router)
 app.include_router(v1_agents_router)
+app.include_router(findings_router)
 app.include_router(api_keys_router)
 app.include_router(plans_router)
 app.include_router(products_router)

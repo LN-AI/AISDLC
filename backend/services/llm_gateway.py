@@ -117,15 +117,24 @@ def get_tracked_usage() -> Dict[str, int]:
         "calls": len(calls),
         "input_tokens": sum(c["input_tokens"] for c in calls),
         "output_tokens": sum(c["output_tokens"] for c in calls),
+        # Cache tokens are reported separately by the provider and are NOT included in
+        # input_tokens. They are surfaced here for visibility; billing (agent_guard)
+        # deliberately does not price them yet — see the note in _call_anthropic.
+        "cache_write_tokens": sum(c.get("cache_write_tokens", 0) for c in calls),
+        "cache_read_tokens": sum(c.get("cache_read_tokens", 0) for c in calls),
     }
 
 
-def _record_usage(provider: str, model: str, input_tokens: int, output_tokens: int) -> None:
+def _record_usage(
+    provider: str, model: str, input_tokens: int, output_tokens: int,
+    cache_write_tokens: int = 0, cache_read_tokens: int = 0,
+) -> None:
     acc = _usage_accumulator.get()
     if acc is not None:
         acc.append({
             "provider": provider, "model": model,
             "input_tokens": input_tokens, "output_tokens": output_tokens,
+            "cache_write_tokens": cache_write_tokens, "cache_read_tokens": cache_read_tokens,
         })
 
 
@@ -143,6 +152,24 @@ def get_override() -> Optional[Dict[str, Any]]:
     return _current_override.get()
 
 
+def _cacheable_system(system_prompt: str):
+    """Return the `system` parameter, marked cacheable when prompt caching is on.
+
+    Anthropic assembles the prompt as tools -> system -> messages, so a single
+    cache_control breakpoint on the last system block covers the tool schema *and* the
+    system prompt — the part of every agent call that is byte-identical across calls.
+    The per-request artifact stays in `messages`, after the breakpoint, so it never
+    invalidates the cached prefix.
+
+    Nothing about the model's output changes; only billing does. Prefixes shorter than
+    the model's minimum cacheable length (1024 tokens on Sonnet) are silently not
+    cached rather than rejected, so short system prompts are safe to send this way.
+    """
+    if not config.PROMPT_CACHE_ENABLED:
+        return system_prompt
+    return [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+
+
 def _call_anthropic(
     api_key: Optional[str], base_url: Optional[str], model: Optional[str],
     system_prompt: str, user_content: str, tool_schema: Dict[str, Any],
@@ -155,12 +182,13 @@ def _call_anthropic(
     last_err = None
     response = None
     start = time.perf_counter()
+    system_param = _cacheable_system(system_prompt)
     for attempt in range(config.LLM_MAX_RETRIES + 1):
         try:
             response = client.messages.create(
                 model=resolved_model,
                 max_tokens=max_tokens or config.MAX_TOKENS,
-                system=system_prompt,
+                system=system_param,
                 tools=[tool_schema],
                 tool_choice={"type": "tool", "name": tool_schema["name"]},
                 messages=[{"role": "user", "content": user_content}],
@@ -188,10 +216,19 @@ def _call_anthropic(
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
     output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
-    _record_usage("anthropic", resolved_model, input_tokens, output_tokens)
+    # Reported separately from input_tokens by the API. A write costs 1.25x an input
+    # token and a read 0.1x; agent_guard prices only input/output, so a cached call is
+    # currently costed slightly *under* its true price rather than over. Logged here so
+    # the effect is visible: if cache_read stays 0 across a multi-call run, something in
+    # the prefix is changing between calls and the cache is never being hit.
+    cache_write = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    _record_usage("anthropic", resolved_model, input_tokens, output_tokens, cache_write, cache_read)
     logger.info(
-        "Anthropic call tool='%s' model=%s tokens_in=%d tokens_out=%d duration=%.1fms stop_reason=%s",
-        tool_schema["name"], resolved_model, input_tokens, output_tokens, duration_ms, response.stop_reason,
+        "Anthropic call tool='%s' model=%s tokens_in=%d tokens_out=%d cache_write=%d cache_read=%d "
+        "duration=%.1fms stop_reason=%s",
+        tool_schema["name"], resolved_model, input_tokens, output_tokens, cache_write, cache_read,
+        duration_ms, response.stop_reason,
     )
     if response.stop_reason == "max_tokens":
         logger.warning(
@@ -334,6 +371,53 @@ def call_tool(
         if isinstance(result, dict):
             result["guardrail_flags"] = flags
     return result
+
+
+def count_tokens(
+    system_prompt: str,
+    user_content: str,
+    tool_schema: Optional[Dict[str, Any]] = None,
+    llm_override: Optional[Dict[str, Any]] = None,
+) -> int:
+    """How many input tokens this exact turn would cost, before sending it.
+
+    The platform has only ever sized inputs by character count (MAX_AGENT_INPUT_CHARS),
+    which cannot answer "will this fit" or "how should this be split" — characters per
+    token vary by more than 2x between prose and minified code. Callers that need to
+    budget or chunk should use this instead of len().
+
+    Uses Anthropic's own count_tokens endpoint, so it is exact for the Anthropic path.
+    For OpenAI-compatible BYOL there is no equivalent free endpoint, so it falls back to
+    a documented ~3.5 chars/token estimate. Deliberately NOT tiktoken: it is OpenAI's
+    tokenizer and materially undercounts Claude tokens on code.
+
+    Never raises — a token count is an optimisation input, not a correctness one, so any
+    failure degrades to the character estimate rather than breaking the caller.
+    """
+    override = llm_override if llm_override is not None else get_override()
+    provider = (override or {}).get("provider") or "anthropic"
+    combined = f"{system_prompt}\n{user_content}"
+    estimate = int(len(combined) / 3.5) + 1
+
+    if provider != "anthropic":
+        return estimate
+    try:
+        api_key = (override or {}).get("api_key")
+        base_url = (override or {}).get("base_url")
+        client = _default_anthropic_client if not api_key else anthropic.Anthropic(
+            api_key=api_key, base_url=base_url or None
+        )
+        kwargs: Dict[str, Any] = {
+            "model": (override or {}).get("model") or config.MODEL,
+            "system": system_prompt,
+            "messages": [{"role": "user", "content": user_content}],
+        }
+        if tool_schema:
+            kwargs["tools"] = [tool_schema]
+        return int(client.messages.count_tokens(**kwargs).input_tokens)
+    except Exception as e:
+        logger.warning("count_tokens failed, falling back to character estimate: %s", e)
+        return estimate
 
 
 def describe(llm_override: Optional[Dict[str, Any]]) -> Dict[str, str]:

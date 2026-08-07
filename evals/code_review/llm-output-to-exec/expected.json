@@ -1,0 +1,18 @@
+{
+  "must_find": [
+    {
+      "control_id": "AI-002",
+      "line_range": [
+        1,
+        3
+      ],
+      "note": "model output passed to exec()"
+    }
+  ],
+  "must_not_find": [],
+  "expected_gate": [
+    "Red",
+    "Amber"
+  ],
+  "case": "llm-output-to-exec"
+}

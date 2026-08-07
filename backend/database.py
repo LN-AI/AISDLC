@@ -1,11 +1,12 @@
 import logging
+import os
 import sqlite3
 import json
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from backend import context
-from backend.config import DATABASE_PATH
+from backend.config import DATABASE_PATH, JOB_STALE_MINUTES, SQLITE_BUSY_TIMEOUT_MS
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +14,12 @@ logger = logging.getLogger(__name__)
 def get_connection():
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
+    # Per-connection, and it has to be set every time: without it a writer that finds
+    # the database locked raises "database is locked" immediately instead of waiting.
+    # Swarm opens 6 worker threads and background jobs run on their own thread, all
+    # against this one file, so contention is normal rather than exceptional here.
+    # (journal_mode=WAL is set once in init_db() — it persists in the file itself.)
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
     return conn
 
 
@@ -20,6 +27,19 @@ def init_db():
     logger.info("Initializing database at %s", DATABASE_PATH)
     conn = get_connection()
     cursor = conn.cursor()
+
+    # WAL lets readers and one writer proceed concurrently instead of blocking each
+    # other, which is what the swarm's 6 threads and the job threads actually do. It
+    # is a property of the database file, not of a connection, so setting it once
+    # here is enough — every later get_connection() inherits it. Returns "memory"
+    # (not "wal") for an in-memory DATABASE_PATH, which is fine and not an error.
+    try:
+        mode = cursor.execute("PRAGMA journal_mode = WAL").fetchone()[0]
+        logger.info("SQLite journal_mode=%s busy_timeout=%dms", mode, SQLITE_BUSY_TIMEOUT_MS)
+    except sqlite3.Error as e:
+        # A network filesystem can refuse WAL. Journal mode then stays as it was,
+        # which is exactly today's behaviour — not worth failing startup over.
+        logger.warning("Could not enable WAL journal mode (continuing without it): %s", e)
 
     cursor.executescript("""
         CREATE TABLE IF NOT EXISTS reviews (
@@ -342,6 +362,52 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # column already exists
 
+    # Background jobs are scheduled with asyncio.create_task and hold their work in a
+    # Python closure, so nothing about a running job survives the process that started
+    # it. These columns record *whose* process a job belongs to and when it last showed
+    # signs of life, which is the minimum needed to tell "still working" apart from
+    # "died in a deploy" — see recover_orphaned_jobs(). payload_json/run_id are written
+    # by nothing yet; they are the hook for re-dispatching a job after a restart rather
+    # than only reaping it, and cost nothing to add now.
+    for column, ddl_type, default in (
+        ("heartbeat_at", "TEXT", "NULL"),
+        ("attempts", "INTEGER", 0),
+        ("owner_pid", "INTEGER", "NULL"),
+        ("payload_json", "TEXT", "NULL"),
+        ("run_id", "TEXT", "NULL"),
+    ):
+        try:
+            cursor.execute(
+                f"ALTER TABLE agent_jobs ADD COLUMN {column} {ddl_type} DEFAULT {default}"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # A finding's identity across runs, plus where it is. `fingerprint` deliberately does
+    # NOT include the line number (see finding_pipeline.fingerprint) so a finding survives
+    # code moving up or down its file; without that every baseline would break on the first
+    # unrelated edit above it. NULL on rows written before this existed, and on agents that
+    # don't produce per-file findings — a NULL fingerprint never matches, so they are
+    # unaffected.
+    for column, ddl_type, default in (
+        ("fingerprint", "TEXT", "NULL"),
+        ("file_path", "TEXT", "NULL"),
+        ("line_start", "INTEGER", "NULL"),
+        ("evidence", "TEXT", "NULL"),
+        ("project_id", "TEXT", "NULL"),
+        ("resolution_comment", "TEXT", "NULL"),
+    ):
+        try:
+            cursor.execute(
+                f"ALTER TABLE findings ADD COLUMN {column} {ddl_type} DEFAULT {default}"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_findings_baseline "
+        "ON findings(project_id, fingerprint, status)"
+    )
+
     # Which project produced a review. Without it the usage ledger could say what a
     # customer cost while History could not say what they produced, and no screen could be
     # scoped to one customer's work. NULL on every pre-existing row — those stay visible
@@ -374,6 +440,12 @@ def save_review(
     project_id = context.current_project_id()
 
     findings = result.get("findings", [])
+    # Stamp the row id onto each finding *before* the result is serialized, so the id
+    # travels back to the caller and is also in `result_json` for History. Without it a
+    # client can see a finding but has nothing to name in `PATCH /api/v1/findings/{id}` —
+    # which is why waiving was API-only and had no UI.
+    for finding in findings:
+        finding["id"] = str(uuid.uuid4())
     findings_count = len(findings)
     critical_count = sum(1 for f in findings if f.get("severity") == 5)
     high_count = sum(1 for f in findings if f.get("severity") == 4)
@@ -399,13 +471,14 @@ def save_review(
     )
 
     for finding in findings:
-        finding_id = str(uuid.uuid4())
+        finding_id = finding["id"]
         cursor.execute(
             """
             INSERT INTO findings
                 (id, review_id, control_id, severity, risk_level, title,
-                 description, recommendation, is_blocking, owasp_ref, nist_ref)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 description, recommendation, is_blocking, owasp_ref, nist_ref,
+                 fingerprint, file_path, line_start, evidence, project_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 finding_id, review_id,
@@ -418,6 +491,14 @@ def save_review(
                 1 if finding.get("is_blocking") else 0,
                 finding.get("owasp_ref"),
                 finding.get("nist_ref"),
+                # Written by the code-review pipeline; NULL for agents that don't produce
+                # per-file findings. A NULL fingerprint simply never matches a baseline,
+                # so those agents behave exactly as they do today.
+                finding.get("fingerprint"),
+                finding.get("file_path"),
+                finding.get("line_start"),
+                (finding.get("evidence") or "")[:500] or None,
+                project_id,
             ),
         )
 
@@ -1970,12 +2051,13 @@ def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, detail
 
 def create_job(agent_name: str, total_steps: int = 1) -> str:
     job_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO agent_jobs (id, agent_name, status, current_step, total_steps, created_at) "
-        "VALUES (?, ?, 'queued', 0, ?, ?)",
-        (job_id, agent_name, total_steps, datetime.utcnow().isoformat()),
+        "INSERT INTO agent_jobs (id, agent_name, status, current_step, total_steps, created_at, "
+        "owner_pid, heartbeat_at) VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)",
+        (job_id, agent_name, total_steps, now, os.getpid(), now),
     )
     conn.commit()
     conn.close()
@@ -1992,10 +2074,18 @@ def update_job(
     error: Optional[Dict[str, Any]] = None,
 ) -> None:
     fields: Dict[str, Any] = {}
+    raw_sql: Dict[str, str] = {}
     now = datetime.utcnow().isoformat()
+    # Any update at all is a sign of life — job_service calls this before each step,
+    # so a job that stops updating has stopped working. recover_orphaned_jobs() reads it.
+    fields["heartbeat_at"] = now
     if status is not None:
         fields["status"] = status
         if status == "running":
+            # COALESCE, not a plain assignment: on_progress() reports status="running"
+            # before every step, so assigning here overwrote started_at with the time of
+            # the *latest* step and made true job duration unrecoverable.
+            raw_sql["started_at"] = "started_at = COALESCE(started_at, ?)"
             fields["started_at"] = now
         elif status in ("completed", "failed"):
             fields["finished_at"] = now
@@ -2011,13 +2101,134 @@ def update_job(
         fields["error_json"] = json.dumps(error)
     if not fields:
         return
-    cols = ", ".join(f"{k} = ?" for k in fields)
+    cols = ", ".join(raw_sql.get(k, f"{k} = ?") for k in fields)
     vals = list(fields.values()) + [job_id]
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(f"UPDATE agent_jobs SET {cols} WHERE id = ?", vals)
     conn.commit()
     conn.close()
+
+
+def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Look up what this project already knows about these findings.
+
+    Returns {fingerprint: {status, resolved_by, resolved_at, resolution_comment, first_seen}}
+    for fingerprints seen before. Used to answer the question that makes a review usable on
+    a legacy codebase: which of these are *new*? Without it the first run is Red and every
+    run after it is identically Red, and nobody reads the second one.
+
+    Scoped to the project, so one team's decision to waive something never silently
+    suppresses it for another.
+    """
+    if not fingerprints:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    conn = get_connection()
+    cursor = conn.cursor()
+    # Chunked to stay under SQLite's variable limit on a large review.
+    unique = list(dict.fromkeys(fp for fp in fingerprints if fp))
+    for i in range(0, len(unique), 400):
+        batch = unique[i:i + 400]
+        placeholders = ",".join("?" * len(batch))
+        if project_id:
+            sql = (
+                f"SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
+                f"f.resolution_comment, MIN(r.created_at) AS first_seen "
+                f"FROM findings f JOIN reviews r ON r.id = f.review_id "
+                f"WHERE f.fingerprint IN ({placeholders}) AND f.project_id = ? "
+                f"GROUP BY f.fingerprint"
+            )
+            params = batch + [project_id]
+        else:
+            sql = (
+                f"SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
+                f"f.resolution_comment, MIN(r.created_at) AS first_seen "
+                f"FROM findings f JOIN reviews r ON r.id = f.review_id "
+                f"WHERE f.fingerprint IN ({placeholders}) AND f.project_id IS NULL "
+                f"GROUP BY f.fingerprint"
+            )
+            params = batch
+        for row in cursor.execute(sql, params):
+            out[row["fingerprint"]] = dict(row)
+    conn.close()
+    return out
+
+
+def set_finding_status(
+    finding_id: str, status: str, actor: str = "system", comment: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Waive, dismiss or reopen a finding. Returns the updated row, or None if unknown.
+
+    These columns (`status`/`resolved_by`/`resolved_at`) have existed since the first
+    schema and nothing ever wrote to them, which is why there was no way to tell the
+    platform "we know, we accept this" — and therefore no way for a gate to ever go green
+    on a codebase with history.
+    """
+    now = datetime.utcnow().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM findings WHERE id = ?", (finding_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        return None
+    resolved_by = actor if status != "open" else None
+    resolved_at = now if status != "open" else None
+    cursor.execute(
+        "UPDATE findings SET status = ?, resolved_by = ?, resolved_at = ?, resolution_comment = ? "
+        "WHERE id = ?",
+        (status, resolved_by, resolved_at, comment or None, finding_id),
+    )
+    log_audit(
+        cursor, "finding_status_changed", "finding", finding_id, actor,
+        json.dumps({"status": status, "comment": comment, "control_id": row["control_id"],
+                    "fingerprint": row["fingerprint"]}),
+    )
+    conn.commit()
+    cursor.execute("SELECT * FROM findings WHERE id = ?", (finding_id,))
+    updated = dict(cursor.fetchone())
+    conn.close()
+    return updated
+
+
+def recover_orphaned_jobs() -> int:
+    """Mark jobs left behind by a dead process as failed. Returns how many were reaped.
+
+    Jobs are scheduled with asyncio.create_task inside the API process and nothing about
+    them is persisted, so a restart (deploy, crash, reload) leaves every in-flight job
+    stuck at status='running' forever with no runner behind it. Called once at startup.
+
+    A job is orphaned if it is still queued/running AND either it belongs to a different
+    OS process (this process is brand new, so nothing can legitimately be ours yet) or it
+    stopped heartbeating longer ago than JOB_STALE_MINUTES.
+
+    Caveat: this assumes one API process. Under multiple uvicorn workers each worker's
+    startup would reap the others' live jobs, because owner_pid would not match. Run a
+    single worker, or gate this on a leader election, before scaling out.
+    """
+    cutoff = (datetime.utcnow() - timedelta(minutes=JOB_STALE_MINUTES)).isoformat()
+    error = json.dumps({
+        "error": "job_orphaned",
+        "message": (
+            "This job was still running when the server process it belonged to stopped. "
+            "Background jobs do not survive a restart — re-run the request."
+        ),
+    })
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE agent_jobs SET status = 'failed', error_json = ?, finished_at = ? "
+        "WHERE status IN ('queued', 'running') "
+        "  AND (owner_pid IS NULL OR owner_pid != ? OR heartbeat_at IS NULL OR heartbeat_at < ?)",
+        (error, datetime.utcnow().isoformat(), os.getpid(), cutoff),
+    )
+    reaped = cursor.rowcount
+    conn.commit()
+    conn.close()
+    if reaped:
+        logger.warning("Reaped %d orphaned background job(s) left by a previous process", reaped)
+    return reaped
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:

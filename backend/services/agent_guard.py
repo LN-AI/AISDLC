@@ -48,6 +48,7 @@ those instead of letting them run ungoverned.
 import logging
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Optional
 
 from backend import config, context, database
@@ -70,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ScopeDeniedError", "BudgetExceededError", "QuotaExceededError", "ProjectBindingError",
-    "check_scope", "preflight", "guarded_call", "hold_budget_reservation",
+    "check_scope", "preflight", "guarded_call", "hold_budget_reservation", "expect_calls",
 ]
 
 
@@ -166,12 +167,68 @@ _reservations: Dict[str, float] = {}
 _reservations_lock = threading.Lock()
 
 
-def _estimated_call_cost(model: str) -> float:
-    """An upper bound on what one call can cost: every token it is allowed to generate,
-    priced as output. Deliberately pessimistic — reserving too little would let the race
-    back in, while reserving too much only refuses a call that was already at the edge."""
+def _estimated_call_cost(model: str, expected_calls: int = 1) -> float:
+    """An upper bound on what one guarded run can cost: every token it is allowed to
+    generate, priced as output. Deliberately pessimistic — reserving too little lets the
+    race back in, while reserving too much only refuses a call that was already at the edge.
+
+    `RESERVATION_MAX_TOKENS`, not `config.MAX_TOKENS`: the latter is 8000, but architecture
+    requests 16000 and VAPT/security 14000, so reserving against it under-estimated the
+    expensive calls by roughly 2x — precisely the ones worth protecting against.
+
+    `expected_calls` covers the composite products. `full` is one guarded_call wrapping
+    seven sequential LLM calls, so a reservation for one of them bounded about a seventh
+    of what the run could spend.
+    """
     pricing = MODEL_PRICING_PER_MILLION_TOKENS.get(model, DEFAULT_PRICING)
-    return (config.MAX_TOKENS / 1_000_000) * pricing["output"]
+    return (RESERVATION_MAX_TOKENS * max(expected_calls, 1) / 1_000_000) * pricing["output"]
+
+
+# The largest max_tokens any agent actually asks for (architecture; VAPT and security use
+# 14000). Kept here rather than imported from base_agent to avoid the agent layer becoming
+# a dependency of the billing layer — but it must be raised if any agent goes higher.
+RESERVATION_MAX_TOKENS = 16000
+
+# How many LLM calls one guarded_call can make. A plain agent is one; a workflow chains
+# several behind a single guard, and `full` chains the most. Only used for sizing the
+# in-flight reservation, so being roughly right is enough — the real cost is metered
+# afterwards from actual token counts.
+_EXPECTED_CALLS_BY_KIND = {"agent": 1, "workflow": 3, "swarm": 6}
+# `modernization` is a workflow by kind but is guarded *per converted file*, so one
+# guarded_call is exactly one LLM call — see services/modernization/runner.py's docstring
+# for why that product meters per unit instead of once per run.
+_EXPECTED_CALLS_BY_PRODUCT = {"full": 7, "swarm": 6, "modernization": 1}
+
+# A chunked code review is N calls under one guard, and N is only known once the artifact
+# has been split. The route computes it and passes it through `expected_calls`; without
+# that, a 40-chunk review reserved for one call and could outspend its own reservation.
+_CALL_ESTIMATE: ContextVar[Optional[int]] = ContextVar("guard_expected_calls", default=None)
+
+
+@contextmanager
+def expect_calls(count: int):
+    """Tell the next `guarded_call` how many LLM calls it is actually about to make.
+
+    A contextvar rather than a parameter because the number is discovered deep inside the
+    agent (after chunking) while the guard is taken at the route — and threading it back up
+    would mean every caller of every chunkable agent learning about reservations.
+    """
+    token = _CALL_ESTIMATE.set(max(int(count or 1), 1))
+    try:
+        yield
+    finally:
+        _CALL_ESTIMATE.reset(token)
+
+
+def _expected_calls(product) -> int:
+    override = _CALL_ESTIMATE.get()
+    if override:
+        return override
+    if product is None:
+        return 1
+    return _EXPECTED_CALLS_BY_PRODUCT.get(
+        getattr(product, "id", ""), _EXPECTED_CALLS_BY_KIND.get(getattr(product, "kind", ""), 1)
+    )
 
 
 def _reservation_keys(subject: Subject) -> list:
@@ -184,13 +241,13 @@ def _reservation_keys(subject: Subject) -> list:
 
 
 @contextmanager
-def hold_budget_reservation(subject: Subject, model: str = ""):
-    """Reserve one call's worth of budget for the duration of the call.
+def hold_budget_reservation(subject: Subject, model: str = "", expected_calls: int = 1):
+    """Reserve one run's worth of budget for the duration of the call.
 
     Wraps the LLM work on every path that spends money — `guarded_call` here, and
     `call_next` in the legacy middleware.
     """
-    amount = _estimated_call_cost(model or config.MODEL)
+    amount = _estimated_call_cost(model or config.MODEL, expected_calls)
     keys = _reservation_keys(subject)
     with _reservations_lock:
         for key in keys:
@@ -297,6 +354,7 @@ def guarded_call(
     logger.info("Agent call started: caller=%s product=%s", caller_id, agent_name)
     status = "ok"
     model_for_reservation = (override or {}).get("model") or config.MODEL
+    failed_usage = None
     try:
         # Held for the duration of the call so a concurrent request sees this one's
         # potential spend as already committed. Released in every case, including failure.
@@ -304,18 +362,36 @@ def guarded_call(
         # attribute whatever this produces without every orchestrator method having to
         # pass it down — see backend/context.py.
         with context.bind_project(project_id, project_name), \
-                hold_budget_reservation(subject, model_for_reservation), \
+                hold_budget_reservation(subject, model_for_reservation, _expected_calls(product)), \
                 llm_gateway.track_usage():
-            with llm_gateway.with_override(override):
-                result = fn()
+            try:
+                with llm_gateway.with_override(override):
+                    result = fn()
+            except Exception:
+                # Read the tally before unwinding. A failure is not the same as no spend:
+                # a truncated response, or step 7 of a 7-step run, fires *after* the
+                # provider generated (and billed us for) thousands of tokens. Those used
+                # to be recorded nowhere at all, so repeated failures could overrun a cap
+                # invisibly.
+                failed_usage = llm_gateway.get_tracked_usage()
+                raise
             # Read the tally INSIDE the block. `track_usage()` resets the contextvar on
             # exit, so reading it afterwards always reported zero — which meant no cost
             # was ever recorded against a key and no budget ever accumulated.
             usage = llm_gateway.get_tracked_usage()
     except Exception:
         logger.exception("Agent call failed: caller=%s product=%s", caller_id, agent_name)
-        # Metering a failed run would charge for output the caller never received; the
-        # exception path is already logged and surfaced as an error response.
+        # The caller is still not *charged* for a failed run — the ledger row is written
+        # with billable=0 — but the tokens it actually burned are now visible instead of
+        # silently absent. Making them billable is a pricing decision, not a code one.
+        if failed_usage and failed_usage.get("calls"):
+            try:
+                _record_failed_usage(
+                    failed_usage, subject, key_id, caller_id, agent_name,
+                    product_kind, project_id, override,
+                )
+            except Exception:
+                logger.exception("Could not record usage for the failed call (continuing)")
         raise
 
     model = (override or {}).get("model") or config.MODEL
@@ -372,6 +448,42 @@ def guarded_call(
         project_id=project_id, project_name=project_name, result=result, status=status,
     )
     return result
+
+
+def _record_failed_usage(usage, subject, key_id, caller_id, agent_name, product_kind,
+                         project_id, override) -> None:
+    """Ledger row for a call that burned tokens and then failed.
+
+    Written with `billable=0` and `status="failed"`, so it shows up in usage reporting and
+    in per-key cost history without moving any budget cap or invoice. The point is
+    visibility: before this, a run that failed after generating 14,000 output tokens left
+    no trace of the spend anywhere, so a customer whose calls kept truncating looked free.
+    """
+    model = (override or {}).get("model") or config.MODEL
+    provider = (override or {}).get("provider") or "anthropic"
+    cost_usd = _price_usage(usage, model)
+    logger.warning(
+        "Failed call still consumed tokens: caller=%s product=%s tokens_in=%d tokens_out=%d "
+        "unbilled_cost=$%.4f",
+        caller_id, agent_name, usage.get("input_tokens", 0), usage.get("output_tokens", 0), cost_usd,
+    )
+    _record_usage_event(
+        key_id=key_id,
+        caller_type="api_key" if key_id else "ui",
+        caller_ref=caller_id,
+        product_id=agent_name,
+        product_kind=product_kind,
+        usage=usage,
+        cost_usd=cost_usd,
+        model=model,
+        provider=provider,
+        billable=False,
+        cost_estimated=_is_estimated(model),
+        project_id=project_id,
+        project_name=subject.project_name,
+        result=None,
+        status="failed",
+    )
 
 
 def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_kind,

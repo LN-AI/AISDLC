@@ -9,6 +9,10 @@ logger = logging.getLogger(__name__)
 
 class GitHubService:
     BASE_URL = "https://api.github.com"
+    # Nothing downstream chunks a diff yet, so a very large PR still has to be cut to fit
+    # one agent call. Raise this only once the reviewer can split its input — a bigger
+    # slice on its own just moves the cut, it doesn't make the review complete.
+    MAX_DIFF_CHARS = 50000
 
     def __init__(self):
         self.token = config.GITHUB_TOKEN
@@ -71,6 +75,25 @@ class GitHubService:
             self._raise_friendly(files_resp)
             files_data = files_resp.json()
 
+        # A diff over the cap used to be sliced silently, so a large PR was reviewed on
+        # its first 50k characters and the result was reported as covering the whole PR
+        # — a clean gate on code nobody looked at. The cut is still made (nothing
+        # downstream chunks yet), but it is now announced in the text the model sees and
+        # flagged on the payload so callers can refuse to report Green over it.
+        diff_full_chars = len(diff_content)
+        diff_truncated = diff_full_chars > self.MAX_DIFF_CHARS
+        diff_text = diff_content[:self.MAX_DIFF_CHARS]
+        if diff_truncated:
+            logger.warning(
+                "PR #%s diff truncated for review: %d of %d characters kept",
+                pr_number, self.MAX_DIFF_CHARS, diff_full_chars,
+            )
+            diff_text += (
+                f"\n\n[TRUNCATED: this diff was cut off at {self.MAX_DIFF_CHARS:,} of "
+                f"{diff_full_chars:,} characters. The remainder has NOT been provided — "
+                f"do not treat anything below this point as reviewed or absent.]"
+            )
+
         return {
             "pr_number": pr_number,
             "title": pr_data.get("title", ""),
@@ -78,7 +101,9 @@ class GitHubService:
             "author": pr_data.get("user", {}).get("login", ""),
             "base_branch": pr_data.get("base", {}).get("ref", ""),
             "head_branch": pr_data.get("head", {}).get("ref", ""),
-            "diff": diff_content[:50000],  # limit diff size
+            "diff": diff_text,
+            "diff_truncated": diff_truncated,
+            "diff_full_chars": diff_full_chars,
             "files_changed": [f["filename"] for f in files_data],
             "additions": pr_data.get("additions", 0),
             "deletions": pr_data.get("deletions", 0),
@@ -300,6 +325,36 @@ class GitHubService:
             "url": repo_url,
             "fetch_type": "repo",
         }
+
+    # A modernization run needs the whole tree, not a handful of docs. One zipball request
+    # beats walking the trees API file by file (hundreds of requests against a 60/hr
+    # unauthenticated limit), and it hands back exactly the shape `repo_ingest.from_zip`
+    # already reads. The archive is held in memory — see MAX_REPO_ZIP_BYTES.
+    MAX_REPO_ZIP_BYTES = 200_000_000
+
+    def get_repo_zipball(self, repo_url: str, ref: str = "") -> bytes:
+        """Download a repository as a zip. Returns the raw archive bytes."""
+        p = self._parse_url_type(repo_url)
+        owner, repo = p["owner"], p["repo"]
+        url = f"{self.BASE_URL}/repos/{owner}/{repo}/zipball"
+        if ref:
+            url = f"{url}/{ref}"
+        # Long timeout and follow_redirects: GitHub answers this with a 302 to a
+        # codeload.github.com URL, and a large repository takes real time to stream.
+        with httpx.Client(headers=self.headers, timeout=300, follow_redirects=True) as client:
+            with client.stream("GET", url) as resp:
+                self._raise_friendly(resp)
+                chunks, total = [], 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > self.MAX_REPO_ZIP_BYTES:
+                        raise ValueError(
+                            f"{owner}/{repo} is larger than the {self.MAX_REPO_ZIP_BYTES // 1_000_000} MB "
+                            f"import limit. Upload a zip of the subtree you want to convert instead."
+                        )
+                    chunks.append(chunk)
+        logger.info("Fetched %s/%s zipball (%d bytes)", owner, repo, total)
+        return b"".join(chunks)
 
     def list_open_issues(self, repo_url: str, limit: int = 10) -> list:
         """List open issues (not PRs) for a repo, most recently updated first.

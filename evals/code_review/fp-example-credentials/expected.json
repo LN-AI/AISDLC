@@ -1,0 +1,13 @@
+{
+  "must_find": [],
+  "must_not_find": [
+    {
+      "control_id": "SEC-003",
+      "note": "documented placeholder values in a .env.example"
+    }
+  ],
+  "expected_gate": [
+    "Green"
+  ],
+  "case": "fp-example-credentials"
+}
