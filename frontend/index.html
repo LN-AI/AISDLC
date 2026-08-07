@@ -17,6 +17,17 @@
           <div class="logo-sub">ReviewOps Agent</div>
         </div>
       </div>
+
+      <!-- Active project. Everything you run is attributed to it and draws down its plan
+           and budget — the same allowance an API key for this project draws down. -->
+      <div class="sidebar-project" id="sidebar-project" style="display:none">
+        <label class="sidebar-project-label" for="active-project">Working in</label>
+        <select id="active-project" onchange="setActiveProject(this.value)">
+          <option value="">No project</option>
+        </select>
+        <div class="sidebar-project-meta" id="active-project-meta"></div>
+      </div>
+
       <ul class="nav-list">
         <li class="nav-item active" data-page="dashboard">
           <span class="nav-icon">📊</span> Dashboard
@@ -28,7 +39,7 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="requirement">
+            <li class="nav-item" data-page="requirement" data-product="requirement">
               <span class="nav-icon">📋</span> Requirement Review
             </li>
           </ul>
@@ -40,10 +51,10 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="architecture">
+            <li class="nav-item" data-page="architecture" data-product="architecture">
               <span class="nav-icon">🏗️</span> Architecture Review
             </li>
-            <li class="nav-item" data-page="security">
+            <li class="nav-item" data-page="security" data-product="security">
               <span class="nav-icon">🔐</span> Security Review (Threat Model)
             </li>
           </ul>
@@ -55,19 +66,19 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="code">
+            <li class="nav-item" data-page="code" data-product="code">
               <span class="nav-icon">💻</span> Code Review
             </li>
-            <li class="nav-item" data-page="codegen">
+            <li class="nav-item" data-page="codegen" data-product="codegen-advisory">
               <span class="nav-icon">🧩</span> Code Generation
             </li>
-            <li class="nav-item" data-page="migration">
+            <li class="nav-item" data-page="migration" data-product="migration-assessment">
               <span class="nav-icon">🔀</span> Code Migration
             </li>
-            <li class="nav-item" data-page="ai-provenance">
+            <li class="nav-item" data-page="ai-provenance" data-product="ai-provenance">
               <span class="nav-icon">🧬</span> AI Provenance
             </li>
-            <li class="nav-item" data-page="github">
+            <li class="nav-item" data-page="github" data-product="github-pr-review">
               <span class="nav-icon">🐙</span> GitHub PR Review
             </li>
           </ul>
@@ -79,10 +90,10 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="test-scenario">
+            <li class="nav-item" data-page="test-scenario" data-product="test-scenario">
               <span class="nav-icon">🧪</span> Test Scenario Generation
             </li>
-            <li class="nav-item" data-page="test-case">
+            <li class="nav-item" data-page="test-case" data-product="test-case">
               <span class="nav-icon">📝</span> Test Case Generation
             </li>
           </ul>
@@ -94,22 +105,22 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="vapt">
+            <li class="nav-item" data-page="vapt" data-product="vapt">
               <span class="nav-icon">🛡️</span> VAPT
             </li>
-            <li class="nav-item" data-page="sensitive">
+            <li class="nav-item" data-page="sensitive" data-product="sensitive-data">
               <span class="nav-icon">🔍</span> Sensitive Data
             </li>
-            <li class="nav-item" data-page="prompt">
+            <li class="nav-item" data-page="prompt" data-product="prompt">
               <span class="nav-icon">🤖</span> Prompt Safety
             </li>
-            <li class="nav-item" data-page="cfr21">
+            <li class="nav-item" data-page="cfr21" data-product="cfr21-verification">
               <span class="nav-icon">💊</span> 21 CFR Part 11
             </li>
-            <li class="nav-item" data-page="gxp-docs">
+            <li class="nav-item" data-page="gxp-docs" data-product="gxp-document-check">
               <span class="nav-icon">📑</span> GxP Document Check
             </li>
-            <li class="nav-item" data-page="gxp-generate">
+            <li class="nav-item" data-page="gxp-generate" data-product="gxp-generate-plan">
               <span class="nav-icon">🏭</span> GxP Document Generation
             </li>
           </ul>
@@ -121,7 +132,7 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="issue-triage">
+            <li class="nav-item" data-page="issue-triage" data-product="issue-triage">
               <span class="nav-icon">🧯</span> Issue Triage
             </li>
           </ul>
@@ -133,10 +144,10 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="full">
+            <li class="nav-item" data-page="full" data-product="full">
               <span class="nav-icon">🔍</span> Full SDLC Review
             </li>
-            <li class="nav-item" data-page="gate">
+            <li class="nav-item" data-page="gate" data-product="release-gate">
               <span class="nav-icon">🚦</span> Release Gate
             </li>
             <li class="nav-item" data-page="inventory">
@@ -158,6 +169,12 @@
             <li class="nav-item" data-page="api-keys" id="nav-api-keys" style="display:none">
               <span class="nav-icon">🔑</span> API Keys
             </li>
+            <li class="nav-item" data-page="plans" id="nav-plans" style="display:none">
+              <span class="nav-icon">📦</span> Plans
+            </li>
+            <li class="nav-item" data-page="usage" id="nav-usage" style="display:none">
+              <span class="nav-icon">📊</span> Usage &amp; Metering
+            </li>
           </ul>
         </li>
 
@@ -167,7 +184,7 @@
             <span class="nav-section-chevron"></span>
           </div>
           <ul class="nav-section-items">
-            <li class="nav-item" data-page="agent-hub">
+            <li class="nav-item" data-page="agent-hub" data-product="swarm">
               <span class="nav-icon">⚡</span> Agent Hub
             </li>
             <li class="nav-item" data-page="knowledge-base">
@@ -239,7 +256,7 @@
         <div class="form-card">
           <div class="form-group">
             <label>Project Name (optional)</label>
-            <input type="text" id="req-project" placeholder="e.g. Patient Portal AI Feature" />
+            <input type="text" id="req-project" class="project-bound" placeholder="e.g. Patient Portal AI Feature" title="Set by the project selector in the sidebar" />
           </div>
           <div class="form-group">
             <label>Requirement Text <span class="required">*</span></label>
@@ -279,7 +296,7 @@ Acceptance Criteria:
         <div class="form-card">
           <div class="form-group">
             <label>Project Name (optional)</label>
-            <input type="text" id="ts-project" placeholder="e.g. Patient Portal API" />
+            <input type="text" id="ts-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
           </div>
           <div class="form-group">
             <label>Requirement / User Story <span class="required">*</span></label>
@@ -310,7 +327,7 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
         <div class="form-card">
           <div class="form-group">
             <label>Project Name (optional)</label>
-            <input type="text" id="tc-project" placeholder="e.g. Patient Portal API" />
+            <input type="text" id="tc-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
           </div>
           <div class="form-group">
             <label>Requirement / User Story <span class="required">*</span></label>
@@ -346,7 +363,7 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name</label>
-              <input type="text" id="code-project" placeholder="Project name" />
+              <input type="text" id="code-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>Language (optional)</label>
@@ -386,7 +403,7 @@ def get_patient_data(patient_id, query):
         <div class="form-card">
           <div class="form-group">
             <label>Project Name</label>
-            <input type="text" id="prompt-project" placeholder="e.g. Clinical AI Assistant" />
+            <input type="text" id="prompt-project" class="project-bound" placeholder="e.g. Clinical AI Assistant" title="Set by the project selector in the sidebar" />
           </div>
           <div class="form-group">
             <label>System Prompt</label>
@@ -429,7 +446,7 @@ Answer questions about patients based on the provided context."></textarea>
         <div class="form-card">
           <div class="form-group">
             <label>Project Name <span class="required">*</span></label>
-            <input type="text" id="full-project" placeholder="e.g. AI Patient Risk Scoring Feature v2.1" />
+            <input type="text" id="full-project" class="project-bound" placeholder="e.g. AI Patient Risk Scoring Feature v2.1" title="Set by the project selector in the sidebar" />
           </div>
           <div class="form-group">
             <label>Requirement / User Story</label>
@@ -493,7 +510,7 @@ Answer questions about patients based on the provided context."></textarea>
             <button class="btn btn-primary" onclick="reviewGithubPR()">
               <span class="btn-icon">🐙</span> Review PR
             </button>
-            <button class="btn btn-secondary" onclick="autoFixGithubPR()">
+            <button class="btn btn-secondary" data-product="auto-fix" onclick="autoFixGithubPR()">
               <span class="btn-icon">🛠️</span> Auto-Fix &amp; Open PR
             </button>
           </div>
@@ -517,7 +534,7 @@ Answer questions about patients based on the provided context."></textarea>
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name</label>
-              <input type="text" id="gate-project" placeholder="Project name" />
+              <input type="text" id="gate-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>Release Version</label>
@@ -627,7 +644,7 @@ Answer questions about patients based on the provided context."></textarea>
           <div class="form-row">
             <div class="form-group">
               <label>Project Name (optional)</label>
-              <input type="text" id="arch-project" placeholder="e.g. Clinical AI Platform" />
+              <input type="text" id="arch-project" class="project-bound" placeholder="e.g. Clinical AI Platform" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group">
               <label>Review Mode</label>
@@ -685,7 +702,7 @@ e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI feature
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="cg-project" placeholder="e.g. Patient Portal API" />
+              <input type="text" id="cg-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
               <span style="font-size:11px;color:var(--text-muted)">Matches this name against the Knowledge Base — any docs uploaded there under the same project are used as authoritative context.</span>
             </div>
           </div>
@@ -774,7 +791,7 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             <label style="font-size:13px"><input type="checkbox" id="cg-s-review" /> Auto-review generated code</label>
           </div>
           <div class="form-actions">
-            <button class="btn btn-primary" onclick="runCodegenScaffold()">
+            <button class="btn btn-primary" data-product="codegen-scaffold" onclick="runCodegenScaffold()">
               <span class="btn-icon">⚙️</span> Generate Scaffold
             </button>
           </div>
@@ -794,7 +811,7 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="mg-project" placeholder="e.g. Patient Portal API" />
+              <input type="text" id="mg-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>Migration Target <span class="required">*</span></label>
@@ -838,7 +855,7 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             <label style="font-size:13px"><input type="checkbox" id="mg-e-review" /> Auto-review migrated code (Code Review + Sensitive Data)</label>
           </div>
           <div class="form-actions">
-            <button class="btn btn-primary" onclick="runMigrationExecution()">
+            <button class="btn btn-primary" data-product="migration-execute" onclick="runMigrationExecution()">
               <span class="btn-icon">⚙️</span> Execute Migration
             </button>
           </div>
@@ -858,7 +875,7 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="it-project" placeholder="e.g. Patient Portal API" />
+              <input type="text" id="it-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>Environment</label>
@@ -952,11 +969,11 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             </div>
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="it-batch-project" placeholder="e.g. Patient Portal API" />
+              <input type="text" id="it-batch-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
             </div>
           </div>
           <div class="form-actions">
-            <button class="btn btn-primary" onclick="runIssueTriageBatchGithub()">
+            <button class="btn btn-primary" data-product="issue-triage-batch-github" onclick="runIssueTriageBatchGithub()">
               <span class="btn-icon">🐙</span> Fetch &amp; Triage Open Issues
             </button>
           </div>
@@ -990,7 +1007,7 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div class="form-row">
             <div class="form-group">
               <label>Project Name (optional)</label>
-              <input type="text" id="vapt-project" placeholder="e.g. Patient Portal API" />
+              <input type="text" id="vapt-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group">
               <label>Scope (optional)</label>
@@ -1036,7 +1053,7 @@ Examples:
           <div class="form-row">
             <div class="form-group">
               <label>Project Name (optional)</label>
-              <input type="text" id="sec-project" placeholder="e.g. Clinical AI Platform" />
+              <input type="text" id="sec-project" class="project-bound" placeholder="e.g. Clinical AI Platform" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group">
               <label>System Type (optional)</label>
@@ -1096,7 +1113,7 @@ Examples:
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="sd-project" placeholder="e.g. Patient Portal API" />
+              <input type="text" id="sd-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>Context (optional)</label>
@@ -1138,7 +1155,7 @@ Examples:
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="ap-project" placeholder="e.g. Patient Portal API" />
+              <input type="text" id="ap-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>Context (optional)</label>
@@ -1215,7 +1232,7 @@ Examples:
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="cfr-project" placeholder="e.g. Clinical Trial Data System" />
+              <input type="text" id="cfr-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>System Description (optional)</label>
@@ -1258,7 +1275,7 @@ Examples:
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="gxp-project" placeholder="e.g. Clinical Trial Data System" />
+              <input type="text" id="gxp-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>Document Type Hint (optional — verified, not just trusted)</label>
@@ -1303,7 +1320,7 @@ Examples:
           <div class="form-row">
             <div class="form-group flex1">
               <label>Project Name (optional)</label>
-              <input type="text" id="gxg-project" placeholder="e.g. Clinical Trial Data System" />
+              <input type="text" id="gxg-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
             </div>
             <div class="form-group flex1">
               <label>System Description (optional)</label>
@@ -1498,7 +1515,9 @@ Examples:
           <p class="subtitle">Only a super admin can create a project or assign project admins to it. A project admin can then manage (but not create) API keys for their own project.</p>
         </div>
         <div class="users-toolbar">
-          <button class="btn btn-primary" onclick="openCreateProject()">+ Create Project</button>
+          <!-- Hidden for project admins, who reach this page to see their own project's
+               plan and budget but cannot create one (the server refuses too). -->
+          <button class="btn btn-primary" id="btn-create-project" onclick="openCreateProject()">+ Create Project</button>
           <button class="btn btn-secondary" onclick="loadProjects()">↺ Refresh</button>
         </div>
         <div id="create-project-panel" class="create-user-panel hidden">
@@ -1544,6 +1563,31 @@ Examples:
           <div class="form-actions">
             <button class="btn btn-primary" onclick="assignProjectAdmin()">Assign</button>
             <button class="btn btn-secondary" onclick="closeProjectAdminsPanel()">Close</button>
+          </div>
+        </div>
+
+        <!-- Members: the right to *work in* a project, as opposed to administering it.
+             Without this the only way to let a developer run agents against a project was
+             to make them an admin, which also handed them its API keys. -->
+        <div id="project-members-panel" class="create-user-panel hidden" style="margin-top:20px">
+          <h3 id="project-members-title">Members</h3>
+          <p class="subtitle" style="margin-top:-8px">
+            Members can select this project in the sidebar and run agents against it. Everything
+            they run is governed by its plan and spends its budget. They cannot manage its API
+            keys, limits or admins.
+          </p>
+          <div id="project-members-list" style="margin-bottom:16px"></div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Add by username</label>
+              <input type="text" id="pm-username" placeholder="e.g. dev1"
+                onkeydown="if(event.key==='Enter')addProjectMember()" />
+            </div>
+          </div>
+          <div id="pm-error" class="hidden" style="color:var(--red);font-size:12px;margin-bottom:8px"></div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="addProjectMember()">Add member</button>
+            <button class="btn btn-secondary" onclick="closeProjectMembersPanel()">Close</button>
           </div>
         </div>
       </div>
@@ -1717,6 +1761,123 @@ Examples:
           <div class="empty-state">Loading…</div>
         </div>
       </div>
+
+      <!-- ── Plans ────────────────────────────────────────────────────────── -->
+      <div id="page-plans" class="page">
+        <div class="page-header">
+          <h1>Plans</h1>
+          <p class="subtitle">A plan bundles products — single agents and multi-agent workflows alike — into a tier you can assign to an API key. A key with no plan keeps its legacy scopes, so assigning plans is opt-in and nothing changes until you do it.</p>
+        </div>
+
+        <div class="users-toolbar" style="margin-top:20px">
+          <button class="btn btn-primary" onclick="openPlanEditor()">+ New Plan</button>
+          <button class="btn btn-secondary" onclick="loadPlans()">↺ Refresh</button>
+        </div>
+
+        <div id="plan-editor-panel" class="create-user-panel hidden" style="margin-top:16px">
+          <h3 id="plan-editor-title">New Plan</h3>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Name <span class="required">*</span></label>
+              <input type="text" id="plan-name" placeholder="e.g. Starter, Security Suite" />
+            </div>
+            <div class="form-group flex1">
+              <label>Description</label>
+              <input type="text" id="plan-description" placeholder="Who is this tier for?" />
+            </div>
+          </div>
+
+          <div class="section-title" style="margin-top:18px">Products in this plan</div>
+          <p class="subtitle" style="margin-top:-4px;font-size:12px">
+            Leave a quota blank for unlimited. Entitlement to a workflow does <strong>not</strong> grant its
+            constituent agents — a key entitled to Full Review can run the workflow end to end but cannot call
+            Code Review on its own.
+          </p>
+          <div class="form-row" style="align-items:flex-end">
+            <div class="form-group flex1">
+              <label>Show</label>
+              <select id="plan-filter-kind" onchange="renderProductCatalogue()">
+                <option value="">Agents and workflows</option>
+                <option value="agent">Agents only</option>
+                <option value="workflow">Workflows only</option>
+              </select>
+            </div>
+            <div class="form-group flex1">
+              <label>Module</label>
+              <select id="plan-filter-module" onchange="renderProductCatalogue()">
+                <option value="">All modules</option>
+              </select>
+            </div>
+            <div class="form-group flex1">
+              <label>Search</label>
+              <input type="text" id="plan-filter-text" placeholder="Name or id…" oninput="renderProductCatalogue()" />
+            </div>
+          </div>
+
+          <div id="plan-selected-products" style="margin:10px 0"></div>
+          <div id="plan-product-catalogue" class="users-table-wrap" style="max-height:420px;overflow:auto"></div>
+
+          <div id="plan-editor-error" class="login-error hidden" style="margin-top:12px"></div>
+          <div class="form-actions" style="margin-top:14px">
+            <button class="btn btn-primary" onclick="savePlan()">Save Plan</button>
+            <button class="btn btn-secondary" onclick="closePlanEditor()">Cancel</button>
+          </div>
+        </div>
+
+        <div id="plans-list" class="users-table-wrap" style="margin-top:20px">
+          <div class="empty-state">Loading…</div>
+        </div>
+      </div>
+
+      <!-- ── Usage & Metering ─────────────────────────────────────────────── -->
+      <div id="page-usage" class="page">
+        <div class="page-header">
+          <h1>Usage &amp; Metering</h1>
+          <p class="subtitle">Every agent and workflow call writes one row to the billing ledger, including calls made from this UI. A workflow is recorded once as itself, not smeared across the agents it runs.</p>
+        </div>
+
+        <div class="users-toolbar" style="margin-top:20px;flex-wrap:wrap;gap:8px">
+          <select id="usage-filter-period" onchange="loadUsage()">
+            <option value="">This month</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="all">All time</option>
+          </select>
+          <select id="usage-filter-product" onchange="loadUsage()"></select>
+          <!-- "What did this customer cost us" is the question this page exists to answer,
+               and the server has always accepted a project_id filter. -->
+          <select id="usage-filter-project" onchange="loadUsage()"></select>
+          <select id="usage-filter-caller" onchange="loadUsage()">
+            <option value="">All callers</option>
+            <option value="api_key">API key</option>
+            <option value="ui">UI (signed in)</option>
+            <option value="anonymous">Anonymous</option>
+          </select>
+          <button class="btn btn-secondary" onclick="loadUsage()">↺ Refresh</button>
+          <button class="btn btn-secondary" onclick="downloadUsageCsv()">⭳ Export CSV</button>
+        </div>
+
+        <div id="usage-stats" class="stats-grid" style="margin-top:20px"></div>
+
+        <div class="form-row" style="margin-top:20px;align-items:flex-start">
+          <div class="flex1">
+            <div class="section-title">By product</div>
+            <div id="usage-by-product" class="users-table-wrap"></div>
+          </div>
+          <div class="flex1">
+            <div class="section-title">By key</div>
+            <div id="usage-by-key" class="users-table-wrap"></div>
+          </div>
+          <div class="flex1">
+            <div class="section-title">By project</div>
+            <div id="usage-by-project" class="users-table-wrap"></div>
+          </div>
+        </div>
+
+        <div class="section-title" style="margin-top:24px">Recent activity</div>
+        <div id="usage-events" class="users-table-wrap"></div>
+      </div>
     </main>
   </div>
 
@@ -1779,6 +1940,122 @@ Examples:
   </div>
 
   <!-- BYOL (Bring Your Own LLM) Modal -->
+  <!-- ── Edit API key ──────────────────────────────────────────────────── -->
+  <div id="key-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeKeyEditor()">
+    <div class="modal-box" style="width:620px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeKeyEditor()" title="Dismiss (Esc)">✕</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 style="margin-bottom:2px">Edit API Key</h2>
+        <p id="key-edit-subtitle">—</p>
+      </div>
+
+      <div id="key-edit-summary" style="margin-bottom:18px"></div>
+
+      <div class="section-title" style="margin-top:0">Entitlement</div>
+      <p class="subtitle" style="margin-top:-4px;font-size:12px">
+        A plan decides which agents and workflows this key may call. Without one the key falls back to its
+        scopes column, which today means unrestricted.
+      </p>
+      <div class="form-group">
+        <label>Plan</label>
+        <select id="key-edit-plan"></select>
+        <span id="key-edit-plan-hint" style="font-size:11px;color:var(--text-muted)"></span>
+      </div>
+
+      <div class="section-title" style="margin-top:20px">Rate limits</div>
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Requests / minute</label>
+          <input type="number" id="key-edit-limit-minute" min="1" max="6000" />
+        </div>
+        <div class="form-group flex1">
+          <label>Requests / day</label>
+          <input type="number" id="key-edit-limit-day" min="1" max="1000000" />
+        </div>
+      </div>
+
+      <div class="section-title" style="margin-top:20px">Monthly budget</div>
+      <div class="form-group">
+        <label>Cap in USD — blank for unlimited</label>
+        <input type="number" id="key-edit-budget" min="0" step="0.01" placeholder="Unlimited" />
+        <span id="key-edit-budget-hint" style="font-size:11px;color:var(--text-muted)"></span>
+      </div>
+
+      <div id="key-edit-error" class="login-error hidden" style="margin-top:12px"></div>
+
+      <div class="form-actions" style="margin-top:18px">
+        <button class="btn btn-primary" onclick="saveKeyEdits()">Save Changes</button>
+        <button class="btn btn-secondary" onclick="closeKeyEditor()">Cancel</button>
+        <span style="flex:1"></span>
+        <button class="btn btn-secondary" onclick="openLlmConfigFromEditor()">Manage LLM…</button>
+      </div>
+
+      <div class="section-title" style="margin-top:24px;color:var(--red)">Danger zone</div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-size:12px;color:var(--text-muted);flex:1">
+          Revoking is immediate and cannot be undone — every request using this key starts failing.
+        </span>
+        <button class="btn btn-secondary" id="key-edit-revoke" onclick="revokeFromEditor()">Revoke key</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="project-edit-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeProjectEditor()">
+    <div class="modal-box" style="width:620px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeProjectEditor()" title="Dismiss (Esc)">✕</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 style="margin-bottom:2px">Project limits</h2>
+        <p id="project-edit-subtitle">—</p>
+      </div>
+
+      <div id="project-edit-summary" style="margin-bottom:18px"></div>
+
+      <div class="section-title" style="margin-top:0">Entitlement</div>
+      <p class="subtitle" style="margin-top:-4px;font-size:12px">
+        The plan decides which agents and workflows can be run in this project — by anyone, through the
+        browser or through an API key. Without a plan the project imposes nothing of its own.
+      </p>
+      <div class="form-group">
+        <label>Plan</label>
+        <select id="project-edit-plan"></select>
+        <span id="project-edit-plan-hint" style="font-size:11px;color:var(--text-muted)"></span>
+      </div>
+
+      <div class="section-title" style="margin-top:20px">Monthly budget</div>
+      <p class="subtitle" style="margin-top:-4px;font-size:12px">
+        One cap for everything run in this project. An API key's own cap still applies as a ceiling
+        inside this one — whichever runs out first stops the call.
+      </p>
+      <div class="form-group">
+        <label>Cap in USD — blank for unlimited</label>
+        <input type="number" id="project-edit-budget" min="0" step="0.01" placeholder="Unlimited" />
+        <span id="project-edit-budget-hint" style="font-size:11px;color:var(--text-muted)"></span>
+      </div>
+
+      <div class="section-title" style="margin-top:20px">Rate limits</div>
+      <p class="subtitle" style="margin-top:-4px;font-size:12px">
+        Requests across the whole project. Leave blank for unlimited, which is the default.
+      </p>
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Requests / minute</label>
+          <input type="number" id="project-edit-limit-minute" min="1" max="6000" placeholder="Unlimited" />
+        </div>
+        <div class="form-group flex1">
+          <label>Requests / day</label>
+          <input type="number" id="project-edit-limit-day" min="1" max="1000000" placeholder="Unlimited" />
+        </div>
+      </div>
+
+      <div id="project-edit-error" class="login-error hidden" style="margin-top:12px"></div>
+
+      <div class="form-actions" style="margin-top:18px">
+        <button class="btn btn-primary" onclick="saveProjectEdits()">Save Changes</button>
+        <button class="btn btn-secondary" onclick="closeProjectEditor()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <div id="llm-config-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeLlmConfigModal()">
     <div class="modal-box" style="width:560px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
       <button class="modal-close-btn" onclick="closeLlmConfigModal()" title="Dismiss (Esc)">✕</button>

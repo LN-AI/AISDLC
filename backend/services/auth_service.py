@@ -11,6 +11,20 @@ from backend.config import SECRET_KEY, JWT_EXPIRY_HOURS
 
 logger = logging.getLogger(__name__)
 
+# Roles live here rather than in routes/auth.py because services need them too — the
+# governance guards check them to decide who may bind a request to a project — and a
+# service importing a router would invert the layering. routes/auth.py re-exports these,
+# so `from backend.routes.auth import is_super_admin` keeps working.
+#
+# "admin" is a legacy alias for "super_admin": pre-existing installs seeded a user with
+# that role, so both must be accepted.
+VALID_ROLES = ("super_admin", "project_admin", "admin", "reviewer", "security", "compliance", "developer")
+SUPER_ADMIN_ROLES = ("super_admin", "admin")
+
+
+def is_super_admin(user: Optional[Dict[str, Any]]) -> bool:
+    return bool(user) and user.get("role") in SUPER_ADMIN_ROLES
+
 
 def hash_password(password: str) -> str:
     salt = os.urandom(32)

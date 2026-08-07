@@ -10,20 +10,15 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Optional
 import backend.database as database
+from backend.products import registry
 from backend.services import crypto_service
 
 VALID_LLM_PROVIDERS = ("anthropic", "openai")
 
-# Kept in sync with AGENT_CATALOG in backend/routes/v1_agents.py — the set of
-# agent names a per-agent BYOL override can target.
-VALID_AGENT_NAMES = (
-    "requirement", "code", "prompt", "compliance", "vapt", "security",
-    "architecture", "sensitive-data", "release-gate", "full",
-    "codegen-advisory", "codegen-scaffold", "ai-provenance",
-    "migration-assessment", "migration-execute", "cfr21-verification", "gxp-document-check",
-    "gxp-generate-plan", "gxp-generate-document", "issue-triage", "issue-triage-batch-github",
-    "test-scenario", "test-case", "auto-fix", "report-generate",
-)
+# The set of product names a per-agent BYOL override can target. Derived from the
+# product registry rather than hand-maintained — this tuple and AGENT_CATALOG used to
+# be kept in sync by comment alone, which is exactly the drift the registry removes.
+VALID_AGENT_NAMES = tuple(registry.all_ids())
 
 PREFIX = "lmsdlc_"
 _KEY_BYTES = 32  # 64 hex chars after prefix
@@ -135,6 +130,71 @@ def check_and_record_rate_limit(record: dict, endpoint: str) -> dict:
     database.record_api_usage(key_id, endpoint)
     return {
         "allowed": True,
+        "limit_per_minute": limit_minute, "remaining_per_minute": max(0, limit_minute - used_minute - 1),
+        "limit_per_day": limit_day, "remaining_per_day": max(0, limit_day - used_day - 1),
+    }
+
+
+class RateLimitExceeded(Exception):
+    """Raised instead of returned when the caller isn't an API key, so the guard can let it
+    travel up to `format_error_response` like every other governance denial."""
+
+    def __init__(self, scope_label: str, result: dict):
+        self.result = result
+        self.retry_after_seconds = result["retry_after_seconds"]
+        super().__init__(
+            f"Rate limit exceeded for {scope_label}: "
+            f"{result['limit_per_minute']} req/min, {result['limit_per_day']} req/day. "
+            f"Retry after {result['retry_after_seconds']}s."
+        )
+
+
+def check_project_rate_limit(subject, endpoint: str) -> Optional[dict]:
+    """Per-project rate limit, covering browser sessions and API keys alike.
+
+    Returns None when the project has no limit configured — which is the default, so this
+    changes nothing until an admin sets one. The counter is stored in `api_key_usage`
+    under a synthetic `project:<id>` id: that column is plain TEXT with no foreign key, so
+    it needs no schema change and `count_api_usage_since` works unmodified.
+
+    An API key's *own* per-minute/per-day limit is unaffected and still applied where it
+    always was, in `get_caller` on the v1 surface.
+    """
+    project_id = getattr(subject, "project_id", None)
+    if not project_id:
+        return None
+
+    project = database.get_project(project_id) or {}
+    limit_minute = project.get("rate_limit_per_minute")
+    limit_day = project.get("rate_limit_per_day")
+    if not limit_minute and not limit_day:
+        return None
+
+    now = datetime.utcnow()
+    counter_id = f"project:{project_id}"
+    used_minute = database.count_api_usage_since(counter_id, (now - timedelta(seconds=60)).isoformat())
+    used_day = database.count_api_usage_since(counter_id, now.strftime("%Y-%m-%dT00:00:00"))
+
+    limit_minute = limit_minute or DEFAULT_RATE_LIMIT_PER_MINUTE
+    limit_day = limit_day or DEFAULT_RATE_LIMIT_PER_DAY
+    label = f"project '{getattr(subject, 'project_name', '') or project_id}'"
+
+    if used_minute >= limit_minute:
+        raise RateLimitExceeded(label, {
+            "scope": "minute", "retry_after_seconds": 60,
+            "limit_per_minute": limit_minute, "remaining_per_minute": 0,
+            "limit_per_day": limit_day, "remaining_per_day": max(0, limit_day - used_day),
+        })
+    if used_day >= limit_day:
+        tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        raise RateLimitExceeded(label, {
+            "scope": "day", "retry_after_seconds": int((tomorrow - now).total_seconds()),
+            "limit_per_minute": limit_minute, "remaining_per_minute": max(0, limit_minute - used_minute),
+            "limit_per_day": limit_day, "remaining_per_day": 0,
+        })
+
+    database.record_api_usage(counter_id, endpoint)
+    return {
         "limit_per_minute": limit_minute, "remaining_per_minute": max(0, limit_minute - used_minute - 1),
         "limit_per_day": limit_day, "remaining_per_day": max(0, limit_day - used_day - 1),
     }

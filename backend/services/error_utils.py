@@ -13,8 +13,10 @@ which route it surfaced on.
 from typing import Any, Dict, Optional, Tuple
 
 from backend.logging_config import request_id_ctx
-from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
+from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
+from backend.services.api_key_service import RateLimitExceeded
 from backend.services.guardrail_service import GuardrailViolation
+from backend.services.subject_service import ProjectBindingError
 from backend.services.llm_gateway import LLMProviderError, LLMTruncatedResponseError
 
 try:
@@ -50,9 +52,26 @@ def format_error_response(exc: Exception, agent_name: Optional[str] = None) -> T
         body.update(detail=str(exc), error_type="scope_denied")
         return 403, body
 
+    if isinstance(exc, ProjectBindingError):
+        # 403, not 401: the credential is valid, the project the caller asked to act in
+        # isn't theirs (or none was selected where one is required).
+        body.update(detail=str(exc), error_type="project_binding_denied")
+        return 403, body
+
     if isinstance(exc, BudgetExceededError):
         body.update(detail=str(exc), error_type="budget_exceeded", **exc.budget)
         return 402, body
+
+    if isinstance(exc, RateLimitExceeded):
+        body.update(detail=str(exc), error_type="rate_limit_exceeded", **exc.result)
+        return 429, body
+
+    if isinstance(exc, QuotaExceededError):
+        # 429 rather than 402: a quota is a rate/allowance limit that resets next period,
+        # which is what the existing per-minute/per-day rate limiter already returns.
+        body.update(detail=str(exc), error_type="quota_exceeded",
+                    product_id=exc.product_id, **exc.quota)
+        return 429, body
 
     if isinstance(exc, LLMTruncatedResponseError):
         body.update(

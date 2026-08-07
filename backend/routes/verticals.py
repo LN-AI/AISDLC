@@ -40,8 +40,8 @@ def get_vertical_stats(project_id: str, user: dict = Depends(_require_auth)):
     project = database.get_project(project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
-    if not is_super_admin(user) and project_id not in database.list_project_ids_for_user(user["sub"]):
-        raise HTTPException(status_code=403, detail="You are not an admin of this project")
+    if not is_super_admin(user) and project_id not in database.list_member_project_ids(user["sub"]):
+        raise HTTPException(status_code=403, detail="You do not have access to this project")
 
     vertical = get_vertical(project.get("vertical"))
     tiles = []

@@ -29,6 +29,9 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from backend import config, database
+from backend.products import registry
+from backend.workflows import full_review as full_review_workflow
+from backend.workflows.base import count_steps
 from backend.models.api_models import (
     AIProvenanceRequest,
     ArchitectureReviewRequest,
@@ -56,10 +59,11 @@ from backend.models.api_models import (
     TestScenarioRequest,
     VAPTRequest,
 )
-from backend.services import agent_guard, llm_gateway, job_service
+from backend.services import agent_guard, llm_gateway, job_service, subject_service
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
     check_and_record_rate_limit,
+    check_project_rate_limit,
     resolve_effective_override,
     validate_api_key,
 )
@@ -78,211 +82,58 @@ _jira = JiraService()
 _api_key_hdr = APIKeyHeader(name="X-API-Key", auto_error=False)
 _bearer = HTTPBearer(auto_error=False)
 
+# The v1 agent catalogue, derived from the product registry rather than hand-written.
+# Filtered to products actually mounted under /api/v1/agents so this endpoint's contract
+# is unchanged — `swarm` and `github-pr-review` live elsewhere and appear only in
+# GET /api/v1/products.
 AGENT_CATALOG = [
-    {
-        "name": "requirement",
-        "title": "Requirement Risk Reviewer",
-        "endpoint": "POST /api/v1/agents/requirement",
-        "description": "Reviews user stories, BRDs, and acceptance criteria for risk, ambiguity, and compliance gaps.",
-        "sources": ["text", "jira_ticket", "github_issue_url"],
-        "frameworks": ["NIST-AI-RMF", "OWASP-LLM", "HIPAA", "GDPR"],
-    },
-    {
-        "name": "code",
-        "title": "Code & PR Security Reviewer",
-        "endpoint": "POST /api/v1/agents/code",
-        "description": "Security and quality review of code, git diffs, and pull requests (OWASP, CWE, injection, secrets).",
-        "sources": ["code", "github_pr_url", "github_file_url"],
-        "frameworks": ["OWASP-Web-Top10", "OWASP-LLM", "CWE", "NIST-AI-RMF"],
-    },
-    {
-        "name": "prompt",
-        "title": "Prompt & Agent Safety Reviewer",
-        "endpoint": "POST /api/v1/agents/prompt",
-        "description": "Reviews AI system prompts, tool definitions, and RAG configs for injection and safety risks.",
-        "sources": ["system_prompt", "github_file_url"],
-        "frameworks": ["OWASP-LLM", "NIST-AI-RMF"],
-    },
-    {
-        "name": "compliance",
-        "title": "Compliance Mapper",
-        "endpoint": "POST /api/v1/agents/compliance",
-        "description": "Maps any artifact to NIST AI-RMF, OWASP LLM, HIPAA, GDPR, ISO 27001, GxP, PCI DSS controls.",
-        "sources": ["text", "jira_ticket"],
-        "frameworks": ["NIST-AI-RMF", "OWASP-LLM", "HIPAA", "GDPR", "ISO27001", "GxP", "PCI-DSS"],
-    },
-    {
-        "name": "vapt",
-        "title": "VAPT — Vulnerability Assessment",
-        "endpoint": "POST /api/v1/agents/vapt",
-        "description": "Full vulnerability assessment with CVSS v3.1 scoring, OWASP API Top 10, and PoC attack scenarios.",
-        "sources": ["code", "github_pr_url", "github_file_url", "github_repo_url"],
-        "frameworks": ["OWASP-Web-Top10", "OWASP-API-Top10", "CWE", "CVSS-3.1"],
-    },
-    {
-        "name": "security",
-        "title": "Security Architecture Review",
-        "endpoint": "POST /api/v1/agents/security",
-        "description": "STRIDE threat modelling, trust boundary analysis, and attack surface assessment.",
-        "sources": ["artifact", "github_repo_url", "github_file_url", "jira_ticket"],
-        "frameworks": ["STRIDE", "NIST-AI-RMF", "HIPAA", "GDPR", "SOC2"],
-    },
-    {
-        "name": "architecture",
-        "title": "Architecture Review",
-        "endpoint": "POST /api/v1/agents/architecture",
-        "description": "Quality dimension scoring (8 axes), anti-pattern detection, SPOF analysis, and architectural alternatives.",
-        "sources": ["artifact", "github_repo_url", "github_file_url", "jira_ticket"],
-        "frameworks": ["NIST-AI-RMF", "SOC2"],
-    },
-    {
-        "name": "sensitive-data",
-        "title": "Sensitive Data Detector",
-        "endpoint": "POST /api/v1/agents/sensitive-data",
-        "description": "Scans code, configs, schemas, and logs for PII, PHI, PCI data, credentials, and location data.",
-        "sources": ["content", "github_file_url"],
-        "frameworks": ["HIPAA", "GDPR", "PCI-DSS", "NIST-AI-RMF"],
-    },
-    {
-        "name": "release-gate",
-        "title": "Release Gate",
-        "endpoint": "POST /api/v1/agents/release-gate",
-        "description": "Evaluates release readiness: aggregates prior findings, checks mandatory controls, issues Red/Amber/Green gate decision.",
-        "sources": ["review_ids", "evidence_summary"],
-        "frameworks": ["NIST-AI-RMF", "SOC2", "HIPAA"],
-    },
-    {
-        "name": "full",
-        "title": "Full SDLC Review",
-        "endpoint": "POST /api/v1/agents/full",
-        "description": "Runs requirement, code, compliance (via `compliance_artifact`), architecture (via `architecture`), and release gate agents in one call. Returns a consolidated gate decision.",
-        "sources": ["text", "github_pr_url", "jira_ticket", "compliance_artifact", "architecture"],
-        "frameworks": ["NIST-AI-RMF", "OWASP-LLM", "HIPAA", "GDPR", "ISO27001"],
-    },
-    {
-        "name": "codegen-advisory",
-        "title": "Code Generation Advisor",
-        "endpoint": "POST /api/v1/agents/codegen-advisory",
-        "description": "Recommends language, backend/frontend framework, database, architecture pattern, and design patterns for a new system given its requirement. Any field can be pinned to force that choice.",
-        "sources": ["requirement"],
-        "frameworks": ["NIST-AI-RMF"],
-    },
-    {
-        "name": "codegen-scaffold",
-        "title": "Code Generation Scaffold",
-        "endpoint": "POST /api/v1/agents/codegen-scaffold",
-        "description": "Generates a minimal, runnable starter project (8-16 files) for a chosen language/framework/pattern. Optionally auto-runs Code Review and Sensitive Data agents against the output before returning it.",
-        "sources": ["project_name", "language", "backend_framework"],
-        "frameworks": ["NIST-AI-RMF", "OWASP-LLM"],
-    },
-    {
-        "name": "ai-provenance",
-        "title": "AI Code Provenance & Risk",
-        "endpoint": "POST /api/v1/agents/ai-provenance",
-        "description": "Assesses the AI-origin likelihood of a code artifact as probabilistic evidence (Low/Possible/Likely/Strong evidence), never a verdict — combines an optional developer disclosure with LLM-based style-signal analysis into a scored, evidence-backed report.",
-        "sources": ["code", "github_pr_url", "github_file_url"],
-        "frameworks": ["NIST-AI-RMF"],
-    },
-    {
-        "name": "migration-assessment",
-        "title": "Migration Assessment",
-        "endpoint": "POST /api/v1/agents/migration-assessment",
-        "description": "Assesses migration complexity, breaking changes, risk areas, and a phased plan for moving code from a source stack to a target stack (language upgrade, framework swap, database migration, monolith-to-microservices, cloud migration).",
-        "sources": ["code", "github_pr_url", "github_file_url"],
-        "frameworks": ["NIST-AI-RMF"],
-    },
-    {
-        "name": "migration-execute",
-        "title": "Migration Execution",
-        "endpoint": "POST /api/v1/agents/migration-execute",
-        "description": "Transforms a specific file/artifact from its current stack to a target stack, preserving behavior. Lists every change and everything needing manual follow-up. Optionally auto-runs Code Review and Sensitive Data agents against the migrated output.",
-        "sources": ["code", "github_pr_url", "github_file_url"],
-        "frameworks": ["NIST-AI-RMF", "OWASP-LLM"],
-    },
-    {
-        "name": "cfr21-verification",
-        "title": "21 CFR Part 11 Verification",
-        "endpoint": "POST /api/v1/agents/cfr21-verification",
-        "description": "Verifies a codebase (multiple files, or a single snippet/PR/file) against FDA 21 CFR Part 11 — audit trail (§11.10(e)), electronic signatures (§11.50/70/100/200), access control (§11.10(d)/(g)/§11.300), and data integrity (ALCOA+). Returns exhaustive, evidence-cited findings plus a validation-readiness note for process-only controls.",
-        "sources": ["files", "code", "github_pr_url", "github_file_url"],
-        "frameworks": ["21CFR11", "GxP"],
-    },
-    {
-        "name": "gxp-document-check",
-        "title": "GxP Document Check",
-        "endpoint": "POST /api/v1/agents/gxp-document-check",
-        "description": "Checks GxP documents (SOPs, validation protocols IQ/OQ/PQ, batch records, deviations, CAPAs, change controls, risk assessments, URS/specifications, training records) for completeness against a type-specific required-elements checklist, signature/approval compliance (21 CFR 11.50), version control, and cross-document traceability. Accepts multiple related documents checked as a set.",
-        "sources": ["documents", "content"],
-        "frameworks": ["21CFR11", "GxP"],
-    },
-    {
-        "name": "gxp-generate-plan",
-        "title": "GxP Validation Plan",
-        "endpoint": "POST /api/v1/agents/gxp-generate-plan",
-        "description": "Points at an application (files/code/PR) and plans its GxP validation document package — GAMP 5 risk classification, which documents apply (URS, FRS, Risk Assessment, Validation Plan, IQ/OQ/PQ Protocols, Traceability Matrix, Validation Summary Report, SOP), and an application-specific outline for each, in generation order.",
-        "sources": ["files", "code", "github_pr_url", "github_file_url"],
-        "frameworks": ["21CFR11", "GxP"],
-    },
-    {
-        "name": "gxp-generate-document",
-        "title": "GxP Document Generation",
-        "endpoint": "POST /api/v1/agents/gxp-generate-document",
-        "description": "Generates one complete GxP validation document (URS, FRS, Risk Assessment, Validation Plan, IQ/OQ/PQ Protocol, Traceability Matrix, Validation Summary Report, or SOP) grounded in the actual application given. Call once per document type, typically driven by the plan from gxp-generate-plan.",
-        "sources": ["files", "code", "github_pr_url", "github_file_url"],
-        "frameworks": ["21CFR11", "GxP"],
-    },
-    {
-        "name": "issue-triage",
-        "title": "Issue Triaging Agent",
-        "endpoint": "POST /api/v1/agents/issue-triage",
-        "description": "Classifies, prioritizes, and recommends assignment for a defect/incident/support ticket/security finding/test failure. Detects duplicates against this project's own triage history, enriches incomplete tickets without inventing facts, and flags mandatory human review for Critical/P0/P1/security cases per a confidence-based operating model.",
-        "sources": ["title", "description", "github_issue_url"],
-        "frameworks": ["NIST-AI-RMF"],
-    },
-    {
-        "name": "issue-triage-batch-github",
-        "title": "Issue Triaging — GitHub Batch",
-        "endpoint": "POST /api/v1/agents/issue-triage/batch-github",
-        "description": "Pulls open issues from a GitHub repo (most recently updated first) and triages each one, returning per-issue reports plus a severity/escalation summary.",
-        "sources": ["github_repo_url"],
-        "frameworks": ["NIST-AI-RMF"],
-    },
-    {
-        "name": "test-scenario",
-        "title": "Test Scenario Generation",
-        "endpoint": "POST /api/v1/agents/test-scenario",
-        "description": "Converts a requirement/user story into a business-level test scenario catalogue — happy path, negative, boundary value, role-based, integration, and exception handling — each traced back to the requirement text it covers.",
-        "sources": ["text", "jira_ticket", "github_issue_url"],
-        "frameworks": [],
-    },
-    {
-        "name": "test-case",
-        "title": "Test Case Generation",
-        "endpoint": "POST /api/v1/agents/test-case",
-        "description": "Generates detailed, executable manual test cases — step-by-step actions, expected results, concrete test data — from a requirement, or from a prior Test Scenario catalogue via `scenarios_context`.",
-        "sources": ["text", "jira_ticket", "github_issue_url", "scenarios_context"],
-        "frameworks": [],
-    },
-    {
-        "name": "auto-fix",
-        "title": "Auto-Fix & Open PR",
-        "endpoint": "POST /api/v1/agents/auto-fix",
-        "description": "Reviews a GitHub PR, generates fixes for its findings, commits them to a new branch off the PR's head branch, and opens a follow-up PR back into it. Writes to a real repository — requires a GITHUB_TOKEN with write (repo) scope. Refuses to commit any file where its own secret scanner detects a newly-introduced hardcoded credential.",
-        "sources": ["pr_url"],
-        "frameworks": ["OWASP-Web-Top10", "CWE"],
-    },
-    {
-        "name": "report-generate",
-        "title": "Governance Report Generator",
-        "endpoint": "POST /api/v1/agents/report-generate",
-        "description": "Synthesizes prior review findings (by review_ids or supplied directly) into a comprehensive, audit-ready governance report — executive summary, findings by category, compliance coverage matrix, controls assessment, and release decision — without re-running a full review.",
-        "sources": ["review_ids", "findings"],
-        "frameworks": ["NIST-AI-RMF", "OWASP-LLM", "HIPAA", "GDPR", "ISO27001", "GxP"],
-    },
+    {k: v for k, v in registry.to_public_dict(p).items() if k not in ("id", "kind", "module")}
+    for p in registry.PRODUCTS
+    if p.endpoint.startswith("POST /api/v1/agents")
 ]
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
+
+def _with_subject(caller: dict, request: Request, response: Response) -> dict:
+    """Attach what this request is governed against, and apply the project's rate limit.
+
+    Resolved here, at the only point that still has the request headers: `guarded_call`
+    runs deeper in the stack (and, for the async job endpoints, on another thread), so
+    without stashing it a browser call would be metered with no project and draw down no
+    budget. See subject_service.
+
+    The project rate limit runs on both credentials. It used to exist only in
+    `legacy_guard`, which meant which endpoint you called changed your limits: a login
+    token had no limit at all here, and an API key was held to its own but not to the
+    project's. Same allowance, whichever door — that applies to rate limits too.
+
+    A key's own limit has already been applied and has written its headers by this point;
+    the project's are only reported when it didn't, so the numbers a client reads always
+    belong to one limiter rather than being silently overwritten by the other.
+
+    POST only, matching `legacy_guard.product_for_request`. This dependency is also what
+    guards `GET /api/v1/products` and the job-status polls, and counting those would let
+    the UI's own catalogue refresh eat the allowance meant for agent runs — a 10/min
+    project would start refusing work because a page reloaded.
+    """
+    try:
+        subject = subject_service.resolve_subject(caller, request.headers)
+    except subject_service.ProjectBindingError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    caller["_subject"] = subject
+
+    if request.method != "POST":
+        return caller
+
+    rate = check_project_rate_limit(subject, request.url.path)
+    if rate and "X-RateLimit-Limit-Minute" not in response.headers:
+        response.headers["X-RateLimit-Limit-Minute"] = str(rate["limit_per_minute"])
+        response.headers["X-RateLimit-Remaining-Minute"] = str(rate["remaining_per_minute"])
+        response.headers["X-RateLimit-Limit-Day"] = str(rate["limit_per_day"])
+        response.headers["X-RateLimit-Remaining-Day"] = str(rate["remaining_per_day"])
+    return caller
+
 
 def get_caller(
     request: Request,
@@ -312,11 +163,17 @@ def get_caller(
                 ),
                 headers={"Retry-After": str(rl["retry_after_seconds"])},
             )
-        return {"type": "api_key", "team": record["team_name"], "key_id": record["id"], "_record": record}
+        caller = {"type": "api_key", "team": record["team_name"], "key_id": record["id"],
+                  "_record": record}
+        return _with_subject(caller, request, response)
     if bearer:
         user = decode_token(bearer.credentials)
         if user:
-            return {"type": "jwt", "team": user.get("username", "ui"), "username": user.get("username")}
+            # `_user` carries the decoded claims (id + role) so subject_service can check
+            # whether this person may bind the request to the project they asked for.
+            caller = {"type": "jwt", "team": user.get("username", "ui"),
+                      "username": user.get("username"), "_user": user}
+            return _with_subject(caller, request, response)
     logger.warning("Rejected unauthenticated request on %s", request.url.path)
     raise HTTPException(
         status_code=401,
@@ -434,7 +291,7 @@ def _wrap(agent: str, result: dict, source_type: str, source_ref: str,
         "llm_used": llm_used or llm_gateway.describe(None),
         "success": True,
         "agent": agent,
-        "agent_title": next((a["title"] for a in AGENT_CATALOG if a["name"] == agent), agent),
+        "agent_title": (registry.get(agent).title if registry.exists(agent) else agent),
         "agent_version": "1.0",
         "review_id": result.get("review_id"),
         "project_name": project_name or "",
@@ -859,15 +716,19 @@ async def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
     override = _effective_llm_override(req, caller, "full")
 
-    total_steps = sum([
-        bool(requirement), bool(req.compliance_artifact), bool(req.architecture),
-        bool(code), bool(req.prompt_config),
-    ]) + 2  # release gate + report generation always run
+    # Step plan comes from the workflow itself, so this can't drift from what it runs.
+    total_steps = count_steps(full_review_workflow.plan_steps(
+        requirement=requirement, compliance_artifact=req.compliance_artifact,
+        architecture=req.architecture, code=code, prompt_config=req.prompt_config,
+    ))
+
+    # Entitlement/budget/quota BEFORE the 202 — otherwise a rejected caller gets an
+    # accepted job that later fails, instead of a 403/402/429 on this request.
+    agent_guard.preflight(caller, "full")
 
     def _run(on_progress):
         result = agent_guard.guarded_call(
-            caller, "full", override,
-            lambda: _orch.full_review(
+            caller, "full", override, skip_preflight=True, fn=lambda: _orch.full_review(
                 requirement=requirement,
                 compliance_artifact=req.compliance_artifact,
                 architecture=req.architecture,

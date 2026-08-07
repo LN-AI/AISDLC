@@ -9,8 +9,7 @@ Authentication: X-API-Key header (API key) or Authorization: Bearer <JWT>
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
-from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import APIRouter, Depends, HTTPException
 
 from backend import config
 from backend.models.swarm_models import (
@@ -19,13 +18,14 @@ from backend.models.swarm_models import (
     SwarmRequest,
     SwarmResponse,
 )
-from backend.services import llm_gateway
-from backend.services.api_key_service import (
-    check_and_record_rate_limit,
-    has_any_byol,
-    validate_api_key,
+from backend.services import agent_guard, llm_gateway
+from backend.services.agent_guard import (
+    BudgetExceededError,
+    QuotaExceededError,
+    ScopeDeniedError,
 )
-from backend.services.auth_service import decode_token
+from backend.services.api_key_service import has_any_byol
+from backend.routes.v1_agents import get_caller
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services.swarm_service import BUILTIN_POLICIES, DEFAULT_POLICY, SwarmService
 
@@ -35,55 +35,9 @@ router = APIRouter(prefix="/api/v1/swarm", tags=["Agent Swarm"])
 _orch = SDLCOrchestrator()
 _swarm_svc = SwarmService()
 
-_api_key_hdr = APIKeyHeader(name="X-API-Key", auto_error=False)
-_bearer = HTTPBearer(auto_error=False)
 
-
-# ── Auth (identical pattern to v1_agents.get_caller) ─────────────────────
-
-def get_caller(
-    request: Request,
-    response: Response,
-    api_key: Optional[str] = Security(_api_key_hdr),
-    bearer: Optional[HTTPAuthorizationCredentials] = Security(_bearer),
-) -> dict:
-    if api_key:
-        record = validate_api_key(api_key)
-        if not record:
-            raise HTTPException(status_code=401, detail="Invalid or revoked API key.")
-
-        rl = check_and_record_rate_limit(record, request.url.path)
-        response.headers["X-RateLimit-Limit-Minute"] = str(rl["limit_per_minute"])
-        response.headers["X-RateLimit-Remaining-Minute"] = str(rl["remaining_per_minute"])
-        response.headers["X-RateLimit-Limit-Day"] = str(rl["limit_per_day"])
-        response.headers["X-RateLimit-Remaining-Day"] = str(rl["remaining_per_day"])
-        if not rl["allowed"]:
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Rate limit exceeded for team '{record['team_name']}': "
-                    f"{rl['limit_per_minute']} req/min, {rl['limit_per_day']} req/day. "
-                    f"Retry after {rl['retry_after_seconds']}s."
-                ),
-                headers={"Retry-After": str(rl["retry_after_seconds"])},
-            )
-        return {"type": "api_key", "team": record["team_name"], "key_id": record["id"], "_record": record}
-    if bearer:
-        user = decode_token(bearer.credentials)
-        if user:
-            return {
-                "type": "jwt",
-                "team": user.get("username", "ui"),
-                "username": user.get("username"),
-            }
-    raise HTTPException(
-        status_code=401,
-        detail=(
-            "Authentication required. "
-            "Supply 'X-API-Key: lmsdlc_...' or 'Authorization: Bearer <jwt>'."
-        ),
-        headers={"WWW-Authenticate": 'Bearer realm="LM AI-SDLC API v1"'},
-    )
+# Auth is the one in v1_agents — this module used to carry a verbatim copy of it,
+# so a change to rate-limit headers or the 401 body had to be made in two places.
 
 
 # ── POST /api/v1/swarm ────────────────────────────────────────────────────
@@ -162,8 +116,20 @@ def run_swarm(req: SwarmRequest, caller: dict = Depends(get_caller)) -> SwarmRes
             ),
         )
 
+    # A swarm run fans out to 3-5 agents in parallel and was previously the platform's
+    # single biggest metering hole: authenticated and rate-limited, but never scoped,
+    # budgeted or costed. It is entitled and metered as one product, "swarm" — the
+    # per-agent BYOL overrides each agent resolves for itself are unaffected.
+    # (SwarmService copies the calling context into its worker threads so the token
+    # usage from those threads actually reaches this call's accumulator.)
     try:
-        response = _swarm_svc.run_swarm(req, _orch, caller)
+        response = agent_guard.guarded_call(
+            caller, "swarm", None,
+            lambda: _swarm_svc.run_swarm(req, _orch, caller),
+            project_name=req.project_name or "",
+        )
+    except (ScopeDeniedError, BudgetExceededError, QuotaExceededError):
+        raise  # handled by the global handlers in main.py (403 / 402 / 429)
     except ValueError as exc:
         # Source resolution failures (missing token, jira not configured, etc.)
         status = 503 if "not configured" in str(exc).lower() else 400

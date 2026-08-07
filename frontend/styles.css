@@ -1050,6 +1050,87 @@ select:focus { border-color: var(--accent); }
   border-top: 1px solid var(--border);
   flex-shrink: 0;
 }
+
+/* ── Active project selector ───────────────────────────────────────────── */
+.sidebar-project {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.sidebar-project-label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.sidebar-project select {
+  width: 100%;
+  background: var(--bg-input, rgba(255,255,255,.04));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.sidebar-project-meta {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.sidebar-project-meta .over-budget { color: var(--danger, #ef4444); font-weight: 600; }
+.sidebar-project-meta .plan-chip {
+  display: inline-block;
+  background: rgba(99,102,241,.12);
+  border: 1px solid rgba(99,102,241,.3);
+  border-radius: 999px;
+  padding: 1px 7px;
+  color: var(--accent);
+  font-size: 10px;
+}
+
+/* A project input filled from the selector rather than typed. Stays editable when no
+   project is selected, so a deployment that doesn't use projects behaves as it always did. */
+input.project-bound[readonly] {
+  opacity: .75;
+  cursor: not-allowed;
+}
+
+/* Agents the active project's plan doesn't include. Still visible — hiding them makes
+   the platform look broken; greyed out with a reason is self-explanatory. */
+.nav-item.not-entitled {
+  opacity: .4;
+  /* Locked items were dimmed but still clickable, so the page opened and the Run button
+     worked right up until the server refused. The server is still the enforcement point;
+     this just stops the UI inviting a click it knows will fail. */
+  pointer-events: none;
+}
+.nav-item.not-entitled::after {
+  content: "🔒";
+  margin-left: auto;
+  font-size: 10px;
+}
+/* Several products are actions inside a page rather than pages of their own — Generate
+   Scaffold, Auto-Fix, Execute Migration. Same lock, applied to the button itself. */
+button.not-entitled,
+button[data-product]:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+button.not-entitled::after {
+  content: " 🔒";
+  font-size: 10px;
+}
+.agent-card.not-entitled {
+  opacity: .5;
+}
+.agent-card.not-entitled .agent-name::after {
+  content: " 🔒";
+  font-size: 10px;
+}
 .btn-login {
   width: 100%;
   background: rgba(99,102,241,.12);

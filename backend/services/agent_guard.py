@@ -1,62 +1,125 @@
-"""Per-call agent guard: RBAC scope gating + hard cost-budget enforcement.
+"""Per-call product guard: entitlement gating, cost budget, quota, and usage metering.
 
-Wraps a single agent invocation from a v1 route handler. Two independent
-checks run before the LLM call, one bookkeeping step runs after:
+Wraps a single agent or workflow invocation from a route handler. Three checks run before
+the LLM call, two bookkeeping steps after:
 
-  1. `check_scope` — an API key's `scopes` column (comma-separated agent names,
-     or the literal "all") gates which agents it may call at all. UI/JWT
-     callers are unrestricted here (unchanged from prior behavior) — this is
-     specifically the external-team access control the caller asked for.
-  2. Budget pre-check — if the key has a `monthly_budget_usd` cap and has
-     already used it up this calendar month, the call is rejected before an
-     LLM call is even made (no point spending more once over budget).
-  3. After the call, actual token usage (captured by llm_gateway.track_usage)
-     is priced using the same per-model table the Cost Optimization dashboard
-     already uses, and added to the key's running monthly total.
+  1. Entitlement — which products this caller may invoke at all, resolved from the
+     project's plan and, for API keys, the key's own plan or legacy `scopes` column.
+     See entitlement_service.
+  2. Budget pre-check — if the project or the key has a `monthly_budget_usd` cap already
+     spent this calendar month, reject before spending more.
+  3. Quota pre-check — per-product call/spend limits from the plans.
+  4. After the call, real token usage (captured by llm_gateway.track_usage) is priced with
+     the same per-model table the Cost Optimization dashboard uses, added to the project's
+     and the key's running monthly totals, and written to `api_key_cost_log`.
+  5. Every call — including UI and anonymous ones with no API key — also writes a row to
+     `usage_events`, the never-purged billing ledger.
 
-JWT/UI callers have no `_record` and therefore no budget — the cap is an
-external-API-key concept only, matching how rate limiting already works.
+One allowance, two doors
+------------------------
+Limits live on the **project**, so an API key and a browser session working in the same
+project draw down the same budget and the same quotas. A key's own budget and plan survive
+as a ceiling inside that envelope: both are checked, and cost accrues to both. See
+subject_service for how a request is mapped to what governs it.
+
+Who pays decides what counts
+----------------------------
+When a caller supplies their own LLM credentials (BYOL), their own provider account is
+billed, not the platform's. Such calls are recorded with `billable=0`: the spend stays
+visible in the ledger and the cost log, but it does not accumulate against
+`monthly_budget_usd` and does not count toward a plan's `quota_usd_per_month`, both of
+which exist to cap the platform's own bill. Call-count quotas still apply to every call,
+since a BYOL customer is still consuming platform capacity.
+
+Guard at the API boundary only, never inside a workflow
+-------------------------------------------------------
+`llm_gateway.track_usage()` accumulates through a contextvar, so ONE `guarded_call`
+wrapping `full_review` already captures all seven of its nested agent LLM calls. If a
+workflow's internals also called `guarded_call`, the inner `track_usage()` would reset the
+accumulator and the outer total would be lost. It also gives the right entitlement
+semantics for free: being entitled to the `full` workflow lets you run it end to end
+without separately holding `code`, `requirement` and so on.
+
+A caller with neither a project nor a key — an unbound UI session, or an anonymous legacy
+caller where that is still permitted — has nothing to read a limit from and resolves to
+unrestricted, exactly as the whole UI did before. Set `UI_REQUIRE_PROJECT=true` to refuse
+those instead of letting them run ungoverned.
 """
 import logging
+import threading
+from contextlib import contextmanager
 from typing import Any, Callable, Dict, Optional
 
-from backend import config, database
+from backend import config, context, database
+from backend.products import registry
 from backend.services import llm_gateway
 from backend.services.cost_optimization_service import DEFAULT_PRICING, MODEL_PRICING_PER_MILLION_TOKENS
+from backend.services.entitlement_service import (
+    QuotaExceededError,
+    check_quota,
+    resolve_entitlements,
+)
+from backend.services.subject_service import (
+    ProjectBindingError,
+    Subject,
+    require_project,
+    subject_from_caller,
+)
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "ScopeDeniedError", "BudgetExceededError", "QuotaExceededError", "ProjectBindingError",
+    "check_scope", "preflight", "guarded_call", "hold_budget_reservation",
+]
+
 
 class ScopeDeniedError(Exception):
-    def __init__(self, agent_name: str, scopes: str):
+    def __init__(self, agent_name: str, scopes: str, scope_label: str = ""):
         self.agent_name = agent_name
         self.scopes = scopes
+        self.scope_label = scope_label
+        subject = scope_label or "This API key"
         super().__init__(
-            f"This API key's scopes ('{scopes}') do not permit calling agent '{agent_name}'."
+            f"{subject[0].upper()}{subject[1:]}'s entitlements ('{scopes}') do not permit "
+            f"calling '{agent_name}'."
         )
 
 
 class BudgetExceededError(Exception):
-    def __init__(self, budget: Dict[str, Any]):
+    def __init__(self, budget: Dict[str, Any], scope_label: str = ""):
         self.budget = budget
+        self.scope_label = scope_label
         super().__init__(
-            f"Monthly budget of ${budget['monthly_budget_usd']:.2f} exhausted "
+            f"Monthly budget of ${budget['monthly_budget_usd']:.2f}"
+            f"{f' for {scope_label}' if scope_label else ''} exhausted "
             f"(${budget['budget_used_usd']:.2f} used this period). "
             f"Contact your admin to raise the cap or wait for next month's reset."
         )
 
 
-def check_scope(caller: dict, agent_name: str) -> None:
-    record = (caller or {}).get("_record")
-    if not record:
-        return  # JWT/UI caller — unrestricted, same as before this change
-    scopes = (record.get("scopes") or "all").strip()
-    if scopes == "all":
+def check_scope(caller_or_subject, agent_name: str) -> None:
+    """Entitlement gate. Kept under its original name — it is imported by name elsewhere,
+    and an agent's product id is still its agent name.
+
+    Accepts a resolved Subject or a legacy caller dict; a caller dict resolves without
+    request headers, so it can only pick up a project from an API key.
+    """
+    subject = (caller_or_subject if isinstance(caller_or_subject, Subject)
+               else subject_from_caller(caller_or_subject))
+    entitlement = resolve_entitlements(subject)
+    denying = entitlement.denied_by(agent_name)
+    if denying is None:
         return
-    allowed = {s.strip() for s in scopes.split(",") if s.strip()}
-    if agent_name not in allowed:
-        logger.warning("Scope denied: key=%s agent=%s scopes=%s", record.get("id"), agent_name, scopes)
-        raise ScopeDeniedError(agent_name, scopes)
+    described = (
+        f"plan:{denying.plan_name}" if denying.source == "plan"
+        else ((subject.key_record or {}).get("scopes") or "all")
+    )
+    logger.warning(
+        "Entitlement denied: %s product=%s scope=%s source=%s",
+        subject.describe(), agent_name, denying.scope_label, denying.source,
+    )
+    raise ScopeDeniedError(agent_name, described, denying.scope_label)
 
 
 def _price_usage(usage: Dict[str, int], model: str) -> float:
@@ -68,51 +131,273 @@ def _price_usage(usage: Dict[str, int], model: str) -> float:
     )
 
 
-def guarded_call(caller: dict, agent_name: str, override: Optional[dict], fn: Callable[[], Any]) -> Any:
-    """Check scope + budget, run `fn()` under `override` with usage tracking,
-    record actual cost against the caller's key, and attach `_budget_stats` to
-    the result when it's a dict. Raises ScopeDeniedError / BudgetExceededError."""
-    check_scope(caller, agent_name)
+def _is_estimated(model: str) -> bool:
+    """True when we priced with DEFAULT_PRICING because the model isn't in the table —
+    a BYOL caller can name any model, and a guess must not be shown as a measurement."""
+    return model not in MODEL_PRICING_PER_MILLION_TOKENS
 
-    record = (caller or {}).get("_record")
-    caller_id = record["id"] if record else caller.get("username", "ui")
+
+def _caller_identity(caller: Optional[dict]) -> tuple:
+    """-> (caller_type, caller_ref, key_id)"""
+    caller = caller or {}
+    record = caller.get("_record")
     if record:
-        budget = database.get_api_key_budget(record["id"])
-        cap = budget["monthly_budget_usd"]
-        if cap is not None and budget["budget_used_usd"] >= cap:
-            logger.warning(
-                "Budget exceeded: key=%s agent=%s used=$%.2f cap=$%.2f",
-                record["id"], agent_name, budget["budget_used_usd"], cap,
-            )
-            raise BudgetExceededError(budget)
+        return "api_key", caller.get("team") or record.get("team_name") or "", record["id"]
+    if caller.get("type") == "jwt":
+        return "ui", caller.get("username") or caller.get("team") or "ui", None
+    return "anonymous", "", None
 
-    logger.info("Agent call started: caller=%s agent=%s", caller_id, agent_name)
+
+# ── In-flight budget reservations ─────────────────────────────────────────
+#
+# The budget check reads a total, then the call runs, then the cost is written. Two calls
+# starting together therefore both saw the pre-call total and both passed — a $1.00 cap
+# could be overshot by however many calls were in flight at once.
+#
+# Each in-flight call now holds a reservation for what it might cost, and the check counts
+# reservations as if already spent. The cap stops being a number you can race past.
+#
+# Deliberately in memory, not in the database. A reservation must be released even if the
+# process dies mid-call; a persisted one would leave a customer's budget permanently
+# consumed by a call that no longer exists, which is a far worse failure than the overshoot
+# it prevents. The cost of that choice is that this holds per process — with several
+# uvicorn workers each has its own view, so the bound is per worker rather than global.
+_reservations: Dict[str, float] = {}
+_reservations_lock = threading.Lock()
+
+
+def _estimated_call_cost(model: str) -> float:
+    """An upper bound on what one call can cost: every token it is allowed to generate,
+    priced as output. Deliberately pessimistic — reserving too little would let the race
+    back in, while reserving too much only refuses a call that was already at the edge."""
+    pricing = MODEL_PRICING_PER_MILLION_TOKENS.get(model, DEFAULT_PRICING)
+    return (config.MAX_TOKENS / 1_000_000) * pricing["output"]
+
+
+def _reservation_keys(subject: Subject) -> list:
+    keys = []
+    if subject.project_id:
+        keys.append(f"project:{subject.project_id}")
+    if subject.key_id:
+        keys.append(f"key:{subject.key_id}")
+    return keys
+
+
+@contextmanager
+def hold_budget_reservation(subject: Subject, model: str = ""):
+    """Reserve one call's worth of budget for the duration of the call.
+
+    Wraps the LLM work on every path that spends money — `guarded_call` here, and
+    `call_next` in the legacy middleware.
+    """
+    amount = _estimated_call_cost(model or config.MODEL)
+    keys = _reservation_keys(subject)
+    with _reservations_lock:
+        for key in keys:
+            _reservations[key] = _reservations.get(key, 0.0) + amount
     try:
-        with llm_gateway.track_usage():
+        yield
+    finally:
+        with _reservations_lock:
+            for key in keys:
+                remaining = _reservations.get(key, 0.0) - amount
+                if remaining > 1e-9:
+                    _reservations[key] = remaining
+                else:
+                    _reservations.pop(key, None)
+
+
+def _reserved_for(key: str) -> float:
+    with _reservations_lock:
+        return _reservations.get(key, 0.0)
+
+
+def _check_budget(budget: Dict[str, Any], product_id: str, scope_label: str, who: str,
+                  reservation_key: str = "") -> None:
+    cap = budget["monthly_budget_usd"]
+    if cap is None:
+        return
+    reserved = _reserved_for(reservation_key) if reservation_key else 0.0
+    committed = budget["budget_used_usd"] + reserved
+    if committed >= cap:
+        logger.warning(
+            "Budget exceeded: %s product=%s used=$%.2f reserved=$%.2f cap=$%.2f",
+            who, product_id, budget["budget_used_usd"], reserved, cap,
+        )
+        # The error reports spend, not reservations — "$0.94 used of $1.00, and $0.10 is
+        # committed to calls still running" is not a distinction the caller can act on.
+        raise BudgetExceededError(budget, scope_label)
+
+
+def preflight(caller_or_subject, product_id: str) -> None:
+    """Entitlement + budget + quota, with no LLM call and no side effects.
+
+    Split out of `guarded_call` so async endpoints can reject *before* returning 202.
+    `/api/v1/agents/full` used to run its budget check inside the background job thread,
+    so an over-budget caller got a 202 followed by a failed job instead of an HTTP 402.
+
+    Both caps are enforced: the project's envelope and, for an API key, the key's own
+    ceiling within it. Whichever is exhausted first blocks the call.
+    """
+    subject = (caller_or_subject if isinstance(caller_or_subject, Subject)
+               else subject_from_caller(caller_or_subject))
+    require_project(subject)
+    check_scope(subject, product_id)
+
+    if subject.project_id:
+        _check_budget(
+            database.get_project_budget(subject.project_id), product_id,
+            f"project '{subject.project_name or subject.project_id}'",
+            f"project={subject.project_id}",
+            reservation_key=f"project:{subject.project_id}",
+        )
+
+    record = subject.key_record
+    if record:
+        _check_budget(
+            database.get_api_key_budget(record["id"]), product_id,
+            "this API key", f"key={record['id']}",
+            reservation_key=f"key:{record['id']}",
+        )
+
+    check_quota(subject, product_id)
+
+
+def guarded_call(
+    caller: dict,
+    agent_name: str,
+    override: Optional[dict],
+    fn: Callable[[], Any],
+    *,
+    skip_preflight: bool = False,
+    project_name: str = "",
+) -> Any:
+    """Run `fn()` under `override` with usage tracking, then record what it cost.
+
+    `agent_name` is the product id — an agent id like "code" or a workflow id like "full".
+    Pass `skip_preflight=True` when `preflight()` has already run for this request (the
+    async job endpoints do this so the 402/403/429 lands on the HTTP response).
+
+    Raises ScopeDeniedError / BudgetExceededError / QuotaExceededError.
+    """
+    subject = subject_from_caller(caller)
+    if not skip_preflight:
+        preflight(subject, agent_name)
+
+    caller_type, caller_ref, key_id = _caller_identity(caller)
+    caller_id = key_id or caller_ref or "ui"
+    # The project the call is charged to: an API key's own project, or the one a browser
+    # session selected (stashed on the caller as `_subject` at request time). Without it a
+    # UI call lands in the ledger unattributed and no project budget can move.
+    project_id = subject.project_id
+    project_name = project_name or subject.project_name
+    product = registry.get(agent_name)
+    product_kind = product.kind if product else "agent"
+
+    logger.info("Agent call started: caller=%s product=%s", caller_id, agent_name)
+    status = "ok"
+    model_for_reservation = (override or {}).get("model") or config.MODEL
+    try:
+        # Held for the duration of the call so a concurrent request sees this one's
+        # potential spend as already committed. Released in every case, including failure.
+        # `bind_project` publishes the governing project so `database.save_review` can
+        # attribute whatever this produces without every orchestrator method having to
+        # pass it down — see backend/context.py.
+        with context.bind_project(project_id, project_name), \
+                hold_budget_reservation(subject, model_for_reservation), \
+                llm_gateway.track_usage():
             with llm_gateway.with_override(override):
                 result = fn()
+            # Read the tally INSIDE the block. `track_usage()` resets the contextvar on
+            # exit, so reading it afterwards always reported zero — which meant no cost
+            # was ever recorded against a key and no budget ever accumulated.
+            usage = llm_gateway.get_tracked_usage()
     except Exception:
-        logger.exception("Agent call failed: caller=%s agent=%s", caller_id, agent_name)
+        logger.exception("Agent call failed: caller=%s product=%s", caller_id, agent_name)
+        # Metering a failed run would charge for output the caller never received; the
+        # exception path is already logged and surfaced as an error response.
         raise
-    usage = llm_gateway.get_tracked_usage()
 
-    if record and usage["calls"]:
-        model = (override or {}).get("model") or config.MODEL
-        cost_usd = _price_usage(usage, model)
-        database.record_api_key_cost(record["id"], cost_usd)
-        database.log_api_key_cost(record["id"], agent_name, usage["input_tokens"], usage["output_tokens"], cost_usd)
+    model = (override or {}).get("model") or config.MODEL
+    provider = (override or {}).get("provider") or "anthropic"
+    cost_usd = _price_usage(usage, model) if usage["calls"] else 0.0
+
+    # A caller-supplied api_key means the caller's own LLM account paid for this call, not
+    # the platform's. The spend is still recorded for visibility, but it must not consume
+    # a budget cap that exists to protect *our* bill. Call quotas still apply — see
+    # entitlement_service.check_quota.
+    billable = not (override or {}).get("api_key")
+
+    if usage["calls"]:
+        # Cost accrues to every cap that applies. The project envelope is what makes a
+        # browser call and a key call draw down one shared allowance; the key's own
+        # counter stays in step so its sub-ceiling keeps working.
+        if billable:
+            if project_id:
+                database.record_project_cost(project_id, cost_usd)
+            if key_id:
+                database.record_api_key_cost(key_id, cost_usd)
+        if key_id:
+            database.log_api_key_cost(
+                key_id, agent_name, usage["input_tokens"], usage["output_tokens"], cost_usd
+            )
         logger.info(
-            "Agent call cost: caller=%s agent=%s tokens_in=%d tokens_out=%d cost=$%.4f",
-            caller_id, agent_name, usage["input_tokens"], usage["output_tokens"], cost_usd,
+            "Agent call cost: caller=%s %s product=%s tokens_in=%d tokens_out=%d cost=$%.4f%s",
+            caller_id, subject.describe(), agent_name,
+            usage["input_tokens"], usage["output_tokens"], cost_usd,
+            "" if billable else f" (BYOL {provider}, not charged to budget)",
         )
         if isinstance(result, dict):
-            fresh_budget = database.get_api_key_budget(record["id"])
-            result["_budget_stats"] = {
+            stats = {
                 "input_tokens": usage["input_tokens"],
                 "output_tokens": usage["output_tokens"],
                 "cost_usd": cost_usd,
-                "monthly_budget_usd": fresh_budget["monthly_budget_usd"],
-                "budget_used_usd": fresh_budget["budget_used_usd"],
+                "billable": billable,
             }
+            if key_id:
+                fresh = database.get_api_key_budget(key_id)
+                stats["monthly_budget_usd"] = fresh["monthly_budget_usd"]
+                stats["budget_used_usd"] = fresh["budget_used_usd"]
+            if project_id:
+                fresh_project = database.get_project_budget(project_id)
+                stats["project_monthly_budget_usd"] = fresh_project["monthly_budget_usd"]
+                stats["project_budget_used_usd"] = fresh_project["budget_used_usd"]
+            result["_budget_stats"] = stats
 
+    _record_usage_event(
+        key_id=key_id, caller_type=caller_type, caller_ref=caller_ref,
+        product_id=agent_name, product_kind=product_kind, usage=usage,
+        cost_usd=cost_usd, model=model, provider=provider, billable=billable,
+        cost_estimated=bool(usage["calls"]) and _is_estimated(model),
+        project_id=project_id, project_name=project_name, result=result, status=status,
+    )
     return result
+
+
+def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_kind,
+                        usage, cost_usd, model, provider, billable, cost_estimated,
+                        project_id, project_name, result, status) -> None:
+    """Write the billing-ledger row. Never lets a metering failure break the response —
+    the caller already has a valid result at this point."""
+    try:
+        database.record_usage_event(
+            key_id=key_id,
+            caller_type=caller_type,
+            caller_ref=caller_ref,
+            product_id=product_id,
+            product_kind=product_kind,
+            calls=usage.get("calls", 0),
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cost_usd=cost_usd,
+            model=model,
+            provider=provider,
+            billable=billable,
+            cost_estimated=cost_estimated,
+            project_id=project_id,
+            project_name=project_name or (result.get("project_name", "") if isinstance(result, dict) else ""),
+            review_id=result.get("review_id") if isinstance(result, dict) else None,
+            status=status,
+        )
+    except Exception:
+        logger.exception("Failed to record usage event for product=%s", product_id)

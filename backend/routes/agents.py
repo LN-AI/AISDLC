@@ -10,6 +10,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Depends
 from pydantic import BaseModel
 
+from backend.products import registry
 from backend.services.github_service import GitHubService
 from backend.services.jira_service import JiraService
 from backend.services.orchestrator import SDLCOrchestrator
@@ -26,16 +27,14 @@ _github = GitHubService()
 _jira = JiraService()
 _security = HTTPBearer(auto_error=False)
 
-VALID_AGENTS = {
-    "requirement": "Requirement Risk Reviewer",
-    "code":        "Code & PR Security Reviewer",
-    "prompt":      "Prompt & Agent Safety Reviewer",
-    "compliance":  "Compliance Mapper",
-    "vapt":        "VAPT — Vulnerability Assessment",
-    "security":    "Security Architecture Review",
-    "architecture":"Architecture Review",
-    "full":        "Full SDLC Review",
-}
+# The subset of products this universal runner knows how to dispatch (see `_run` below).
+# Titles come from the product registry so they can't drift from the rest of the app.
+SUPPORTED_AGENTS = (
+    "requirement", "code", "prompt", "compliance",
+    "vapt", "security", "architecture", "full",
+)
+
+VALID_AGENTS = {pid: registry.require(pid).title for pid in SUPPORTED_AGENTS}
 
 # Which sources each agent supports
 AGENT_SOURCES = {

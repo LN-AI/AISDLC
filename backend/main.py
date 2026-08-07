@@ -8,9 +8,10 @@ import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, UploadFile, File, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
@@ -20,6 +21,8 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 from backend import database, config
+from backend.workflows import full_review as full_review_workflow
+from backend.workflows.base import count_steps
 from backend.routes.auth import router as auth_router
 from backend.routes.approvals import router as approvals_router
 from backend.routes.audit_trail import router as audit_router
@@ -27,6 +30,9 @@ from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
 from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.api_keys import router as api_keys_router
+from backend.routes.plans import router as plans_router
+from backend.routes.products import router as products_router
+from backend.routes.usage import router as usage_router
 from backend.routes.swarm import router as swarm_router
 from backend.routes.llm_config import router as llm_config_router
 from backend.routes.projects import router as projects_router
@@ -64,8 +70,16 @@ from backend.models.api_models import (
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services import job_service
 from backend.services.knowledge_base import knowledge_base
-from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
+from backend.services import agent_guard, legacy_guard, subject_service
+from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
+from backend.services.api_key_service import (
+    RateLimitExceeded,
+    check_project_rate_limit,
+    validate_api_key,
+)
+from backend.services.auth_service import decode_token, is_super_admin
 from backend.services.guardrail_service import GuardrailViolation
+from backend.services.subject_service import ProjectBindingError
 from backend.services.llm_gateway import LLMTruncatedResponseError, LLMProviderError
 from backend.services.error_utils import format_error_response, _RETRYABLE_PROVIDER_ERRORS
 
@@ -125,6 +139,28 @@ async def _budget_exceeded_handler(request, exc: BudgetExceededError):
     return JSONResponse(status_code=status, content=body)
 
 
+@app.exception_handler(QuotaExceededError)
+async def _quota_exceeded_handler(request, exc: QuotaExceededError):
+    logger.warning("Quota exceeded on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.exception_handler(ProjectBindingError)
+async def _project_binding_handler(request, exc: ProjectBindingError):
+    logger.warning("Project binding denied on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body)
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_handler(request, exc: RateLimitExceeded):
+    logger.warning("Rate limit exceeded on %s %s: %s", request.method, request.url.path, exc)
+    status, body = format_error_response(exc)
+    return JSONResponse(status_code=status, content=body,
+                        headers={"Retry-After": str(exc.retry_after_seconds)})
+
+
 @app.exception_handler(LLMTruncatedResponseError)
 async def _llm_truncated_handler(request, exc: LLMTruncatedResponseError):
     logger.warning("LLM response truncated on %s %s: %s", request.method, request.url.path, exc)
@@ -159,6 +195,13 @@ async def _unhandled_exception_handler(request, exc: Exception):
 
 
 @app.middleware("http")
+async def legacy_product_guard(request: Request, call_next):
+    """Entitlement + metering for the legacy /api/review/* surface — see
+    backend/services/legacy_guard.py for why this is a middleware."""
+    return await legacy_guard.legacy_product_guard(request, call_next)
+
+
+@app.middleware("http")
 async def log_requests(request: Request, call_next):
     request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
     token = request_id_ctx.set(request_id)
@@ -184,6 +227,9 @@ app.include_router(agents_router)
 app.include_router(inventory_router)
 app.include_router(v1_agents_router)
 app.include_router(api_keys_router)
+app.include_router(plans_router)
+app.include_router(products_router)
+app.include_router(usage_router)
 app.include_router(swarm_router)
 app.include_router(llm_config_router)
 app.include_router(projects_router)
@@ -193,6 +239,11 @@ app.include_router(cost_optimization_router)
 app.include_router(client_log_router)
 
 orchestrator = SDLCOrchestrator()
+
+# Security schemes for the read endpoints below. `auto_error=False` on both so a missing
+# credential falls through to require_reader's own 401 rather than FastAPI's terser one.
+_read_api_key_hdr = APIKeyHeader(name="X-API-Key", auto_error=False)
+_read_bearer = HTTPBearer(auto_error=False)
 
 class _NoCacheStaticFiles(StaticFiles):
     """Forces browsers to revalidate (If-None-Match/ETag) on every load instead of
@@ -222,33 +273,115 @@ async def health():
     return {"status": "ok", "model": config.MODEL, "env": config.APP_ENV}
 
 
+# ── Reading stored work ────────────────────────────────────────────────────
+#
+# Plans, budgets and quotas govern what a caller may *spend*. They say nothing about what
+# a caller may *read*, and these endpoints return the actual submitted artifacts and the
+# findings produced from them — source code, architecture documents, security results.
+# They answered to no credential at all, and LEGACY_ROUTES_REQUIRE_AUTH does not cover
+# them because that flag (and the middleware behind it) only matches POST.
+#
+# Any valid credential is accepted, key or login, because an integration polling a job or
+# fetching its own scaffold is a legitimate reader. What is refused is *no* credential.
+# This is deliberately not behind a config flag: spend limits are a business policy and
+# can sensibly be switched off, but "strangers may read customer source code" is not a
+# mode worth offering.
+
+def require_reader(
+    api_key: Optional[str] = Security(_read_api_key_hdr),
+    creds: Optional[HTTPAuthorizationCredentials] = Security(_read_bearer),
+) -> dict:
+    if api_key:
+        record = validate_api_key(api_key)
+        if record:
+            return {"type": "api_key", "team": record["team_name"], "_record": record}
+    if creds:
+        user = decode_token(creds.credentials)
+        if user:
+            return {"type": "jwt", "username": user.get("username"), "_user": user}
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required. Supply 'X-API-Key: lmsdlc_...' or 'Authorization: Bearer <jwt>'.",
+        headers={"WWW-Authenticate": 'Bearer realm="LM AI-SDLC"'},
+    )
+
+
+def _visible_project_ids(reader: dict, request: Request) -> Optional[List[str]]:
+    """Which projects' reviews this caller may read. None means every project.
+
+    Selecting a project narrows these screens to it, for everyone. "Working in: Acme"
+    has to mean the same thing on every screen, or the picker means one thing for spend
+    and another for history.
+
+    With nothing selected:
+      * super admin — everything, including the unattributed rows from before reviews
+        carried a project;
+      * anyone else — every project they are a member of;
+      * an API key — its own project, and only that, selected or not.
+
+    A user who belongs to no project gets an empty list, which means no rows. That is the
+    intended answer, not a bug: their work isn't attributed to anything, so there is
+    nothing for them to be shown.
+    """
+    if reader.get("type") == "api_key":
+        project_id = (reader.get("_record") or {}).get("project_id")
+        return [project_id] if project_id else []
+
+    user = reader.get("_user") or {}
+    selected = (request.headers.get("x-project-id") or "").strip()
+
+    if is_super_admin(user):
+        return [selected] if selected else None
+
+    allowed = database.list_member_project_ids(user.get("sub") or "")
+    if selected:
+        # Not a member of it: show nothing rather than falling back to everything they
+        # can see, which would quietly ignore a selection they can see on screen.
+        return [selected] if selected in allowed else []
+    return allowed
+
+
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 @app.get("/api/dashboard")
-async def get_dashboard():
-    stats = database.get_dashboard_stats()
-    return stats
+async def get_dashboard(request: Request, reader: dict = Depends(require_reader)):
+    return database.get_dashboard_stats(project_ids=_visible_project_ids(reader, request))
 
 
 @app.get("/api/reviews")
-async def list_reviews(limit: int = 20, offset: int = 0):
-    reviews = database.list_reviews(limit=limit, offset=offset)
+async def list_reviews(request: Request, limit: int = 20, offset: int = 0,
+                       reader: dict = Depends(require_reader)):
+    reviews = database.list_reviews(limit=limit, offset=offset,
+                                    project_ids=_visible_project_ids(reader, request))
     return {"reviews": reviews, "count": len(reviews)}
 
 
 @app.get("/api/reviews/{review_id}")
-async def get_review(review_id: str):
+async def get_review(review_id: str, request: Request, reader: dict = Depends(require_reader)):
     review = database.get_review(review_id)
     if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    visible = _visible_project_ids(reader, request)
+    # 404 rather than 403: whether a review exists in someone else's project is itself
+    # something this caller has no business learning.
+    if visible is not None and review.get("project_id") not in visible:
         raise HTTPException(status_code=404, detail="Review not found")
     return review
 
 
 @app.get("/api/reports/{report_id}")
-async def get_report(report_id: str):
+async def get_report(report_id: str, request: Request, reader: dict = Depends(require_reader)):
     report = database.get_report(report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
+    # A report has no project of its own; it inherits the scope of the review it came from.
+    # One with no review can only be read by a super admin, since nothing establishes whose
+    # it is — the same rule the unattributed reviews follow.
+    visible = _visible_project_ids(reader, request)
+    if visible is not None:
+        source = database.get_review(report["review_id"]) if report.get("review_id") else None
+        if not source or source.get("project_id") not in visible:
+            raise HTTPException(status_code=404, detail="Report not found")
     return report
 
 
@@ -350,7 +483,7 @@ async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
 # poll GET /api/v1/agents/jobs/{job_id} for step progress and the final result.
 
 @app.post("/api/review/full", status_code=202)
-async def full_review(req: FullReviewRequest):
+async def full_review(req: FullReviewRequest, request: Request):
     if not any([req.requirement, req.compliance_artifact, req.architecture, req.code, req.prompt]):
         raise HTTPException(status_code=400, detail="At least one artifact is required")
     if not config.ANTHROPIC_API_KEY:
@@ -360,32 +493,54 @@ async def full_review(req: FullReviewRequest):
     if req.prompt:
         prompt_config = {"system_prompt": req.prompt}
 
-    total_steps = sum([
-        bool(req.requirement), bool(req.compliance_artifact), bool(req.architecture),
-        bool(req.code), bool(prompt_config),
-    ]) + 2  # release gate + report generation always run
+    # Step plan comes from the workflow itself, so this can't drift from what it runs.
+    total_steps = count_steps(full_review_workflow.plan_steps(
+        requirement=req.requirement, compliance_artifact=req.compliance_artifact,
+        architecture=req.architecture, code=req.code, prompt_config=prompt_config,
+    ))
+
+    # Guarded here rather than by the legacy middleware: this returns 202 and does its
+    # LLM work in a background job, so there is nothing request-scoped left to meter.
+    # The preflight runs before the 202 so a denied caller gets 403/402/429, not an
+    # accepted job that later fails.
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    # Stash the subject now: `_run` executes on a background thread with no request
+    # headers, so without this the job would meter against no project.
+    caller["_subject"] = subject_service.resolve_subject(caller, request.headers)
+    # The rate limit has to be applied by hand here for the same reason the metering is:
+    # this route is deliberately absent from the legacy middleware's map. Without it the
+    # single most expensive product on the platform — up to seven chained LLM calls per
+    # click — was the one thing a per-minute limit did not cover.
+    check_project_rate_limit(caller["_subject"], request.url.path)
+    agent_guard.preflight(caller["_subject"], "full")
 
     def _run(on_progress):
-        return orchestrator.full_review(
-            requirement=req.requirement,
-            compliance_artifact=req.compliance_artifact,
-            architecture=req.architecture,
-            code=req.code,
-            prompt_config=prompt_config,
-            test_evidence=req.test_evidence,
+        return agent_guard.guarded_call(
+            caller, "full", None, skip_preflight=True,
             project_name=req.project_name or "Unnamed Project",
-            context=req.context or "",
-            on_progress=on_progress,
+            fn=lambda: orchestrator.full_review(
+                requirement=req.requirement,
+                compliance_artifact=req.compliance_artifact,
+                architecture=req.architecture,
+                code=req.code,
+                prompt_config=prompt_config,
+                test_evidence=req.test_evidence,
+                project_name=req.project_name or "Unnamed Project",
+                context=req.context or "",
+                on_progress=on_progress,
+            ),
         )
 
-    logger.warning("DIAG: about to call job_service.start_job")
     job_id = job_service.start_job("full", total_steps, _run)
-    logger.warning("DIAG: start_job returned job_id=%s, about to return response", job_id)
     return {"job_id": job_id, "status": "queued", "poll_url": f"/api/v1/agents/jobs/{job_id}"}
 
 
 @app.get("/api/review/full/jobs/{job_id}")
-async def full_review_job_status(job_id: str):
+async def full_review_job_status(job_id: str, reader: dict = Depends(require_reader)):
+    # A completed job carries the full review result, so this is a read of the work
+    # product and needs the same credential the rest of them do.
     job = job_service.get_job_status(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"No job found with id '{job_id}'")
@@ -676,9 +831,18 @@ async def codegen_scaffold(req: CodeGenScaffoldRequest):
 
 
 @app.get("/api/codegen/scaffold/{review_id}/download")
-async def codegen_scaffold_download(review_id: str):
+async def codegen_scaffold_download(review_id: str, request: Request,
+                                    reader: dict = Depends(require_reader)):
+    # The UI used to link here with a plain <a href>, which cannot carry a token — it now
+    # fetches the zip through apiFetch and saves the blob instead (see downloadScaffold in
+    # app.js). The v1 twin of this route has always required a credential.
     review = database.get_review(review_id)
     if not review or review.get("review_type") != "codegen_scaffold":
+        raise HTTPException(status_code=404, detail="Scaffold not found")
+    # Generated source code, so it is scoped like any other review — a credential alone
+    # must not be enough to pull another project's scaffold by id.
+    visible = _visible_project_ids(reader, request)
+    if visible is not None and review.get("project_id") not in visible:
         raise HTTPException(status_code=404, detail="Scaffold not found")
     files = review["result"].get("files", [])
     if not files:

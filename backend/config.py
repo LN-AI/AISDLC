@@ -21,6 +21,25 @@ JIRA_PROJECT = os.getenv("JIRA_PROJECT", "")
 # runtime via PUT /api/v1/cost-optimization/settings, persisted in the DB.
 COST_OPTIMIZATION_ENABLED_DEFAULT = os.getenv("COST_OPTIMIZATION_ENABLED", "true").lower() == "true"
 
+# The legacy /api/review/* endpoints (which frontend/app.js uses) once accepted callers
+# with no credentials at all, resolving them to "unrestricted". That is a bypass around
+# every limit — a governed UI is pointless if the same endpoints answer to no credential —
+# so the default is now true and they return 401 instead.
+#
+# Every one of these routes is called through app.js's apiFetch(), which attaches the
+# bearer token whenever the user is logged in, so a signed-in session cannot 401 here.
+# What does stop working is *anonymous* browser use: the login modal is dismissible, and
+# a user who dismissed it could previously still run agents. They now get the modal back
+# with "Sign in to use this feature." Set this to false only to restore that.
+LEGACY_ROUTES_REQUIRE_AUTH = os.getenv("LEGACY_ROUTES_REQUIRE_AUTH", "true").lower() == "true"
+
+# Governance binds to a project: an API key carries its project, a browser session sends
+# the one the user picked (X-Project-Id). A UI caller with no project resolves to no plan
+# and no budget — i.e. unrestricted — which is the right default for an internal console
+# but a hole once customers get logins. Set this to true to reject UI agent calls that
+# aren't bound to a project, so nothing can be run outside a governed allowance.
+UI_REQUIRE_PROJECT = os.getenv("UI_REQUIRE_PROJECT", "false").lower() == "true"
+
 # Guardrails — applied uniformly to every agent call inside llm_gateway.call_tool().
 MAX_AGENT_INPUT_CHARS = int(os.getenv("MAX_AGENT_INPUT_CHARS", "400000"))
 # Several agents now request up to 16000 tokens (architecture, codegen-scaffold) or

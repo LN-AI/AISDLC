@@ -12,8 +12,10 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 
 import backend.database as database
+from backend.products import registry
 from backend.routes.auth import is_super_admin
 from backend.services.auth_service import decode_token
+from backend.services.entitlement_service import resolve_entitlements
 from backend.services.api_key_service import (
     DEFAULT_RATE_LIMIT_PER_DAY,
     DEFAULT_RATE_LIMIT_PER_MINUTE,
@@ -62,7 +64,9 @@ def _authorize_key(key_id: str, user: dict) -> dict:
     if is_super_admin(user):
         return key
     project_id = key.get("project_id")
-    if project_id and project_id in database.list_project_ids_for_user(user["sub"]):
+    # Administration, not membership: a key is a credential that spends the project's
+    # budget, so managing one is an admin right. Plain members are deliberately excluded.
+    if project_id and project_id in database.list_admin_project_ids(user["sub"]):
         return key
     raise HTTPException(status_code=403, detail="You are not an admin of this key's project")
 
@@ -99,6 +103,12 @@ class UpdateBudgetRequest(BaseModel):
     )
 
 
+class UpdatePlanAssignmentRequest(BaseModel):
+    plan_id: Optional[str] = Field(
+        None, description="Plan to put this key on. Null unassigns it (falls back to `scopes`)."
+    )
+
+
 class SetLLMConfigRequest(BaseModel):
     provider: str = Field(..., description="'anthropic' or 'openai'", examples=["anthropic", "openai"])
     api_key: str = Field(..., description="The team's own provider API key. Stored encrypted; never returned.")
@@ -114,7 +124,7 @@ class SetLLMConfigRequest(BaseModel):
                 "The raw key is never returned after creation.",
 )
 def get_keys(user: dict = Depends(_require_auth)):
-    project_ids = None if is_super_admin(user) else database.list_project_ids_for_user(user["sub"])
+    project_ids = None if is_super_admin(user) else database.list_admin_project_ids(user["sub"])
     keys = list_api_keys(project_ids=project_ids)
     for k in keys:
         usage = get_usage_summary(k["id"])
@@ -223,6 +233,62 @@ def get_key_budget(key_id: str, user: dict = Depends(_require_auth)):
     return {
         **get_api_key_budget_status(key_id),
         "cost_by_agent_last_30d": get_api_key_cost_breakdown(key_id, days=30),
+    }
+
+
+@router.patch(
+    "/{key_id}/plan",
+    summary="Assign an API key to a plan",
+    description="Points the key at a plan, which determines which products (agents and workflows) "
+                "it may call and their monthly quotas. Pass null to unassign — the key then falls "
+                "back to its `scopes` column, which is 'all' for every key created so far.",
+)
+def set_key_plan(key_id: str, req: UpdatePlanAssignmentRequest, user: dict = Depends(_require_super_admin)):
+    _authorize_key(key_id, user)
+    if req.plan_id is not None and not database.get_plan(req.plan_id):
+        raise HTTPException(status_code=404, detail="Plan not found")
+    database.set_api_key_plan(key_id, req.plan_id, actor=user.get("username", "admin"))
+    return {
+        "message": "Plan assigned" if req.plan_id else "Plan unassigned (falls back to scopes)",
+        "key_id": key_id,
+        "plan": database.get_plan_for_key(key_id),
+    }
+
+
+@router.get(
+    "/{key_id}/entitlements",
+    summary="What this key may call",
+    description="Resolved entitlement for the key — its plan (or `scopes` fallback), the product "
+                "ids it may call, and per-product quota usage this calendar month.",
+)
+def get_key_entitlements(key_id: str, user: dict = Depends(_require_auth)):
+    key = _authorize_key(key_id, user)
+    caller = {"type": "api_key", "key_id": key_id, "_record": key}
+    ent = resolve_entitlements(caller)
+    period = database._current_budget_period()
+    products = []
+    for product in registry.PRODUCTS:
+        if not ent.allows(product.id):
+            continue
+        quota = ent.quota_for(product.id)
+        totals = database.get_usage_totals(key_id, product.id, period)
+        products.append({
+            "product_id": product.id,
+            "kind": product.kind,
+            "title": product.title,
+            "quota_calls_per_month": quota.get("quota_calls_per_month"),
+            "quota_usd_per_month": quota.get("quota_usd_per_month"),
+            "used_calls_this_period": totals["events"],
+            "used_usd_this_period": round(totals["cost_usd"], 6),
+        })
+    return {
+        "key_id": key_id,
+        "unlimited": ent.unlimited,
+        "source": ent.source,
+        "plan_id": ent.plan_id,
+        "plan_name": ent.plan_name,
+        "period_start": period,
+        "products": products,
     }
 
 
