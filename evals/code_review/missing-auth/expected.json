@@ -1,0 +1,24 @@
+{
+  "must_find": [
+    {
+      "control_id": "SEC-001",
+      "line_range": [
+        4,
+        7
+      ],
+      "note": "destructive endpoint with no auth dependency"
+    }
+  ],
+  "must_not_find": [
+    {
+      "control_id": "SEC-001",
+      "match": "injection",
+      "note": "the DELETE is correctly parameterized"
+    }
+  ],
+  "expected_gate": [
+    "Red",
+    "Amber"
+  ],
+  "case": "missing-auth"
+}

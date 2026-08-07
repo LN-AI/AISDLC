@@ -30,6 +30,7 @@ One nuance worth knowing up front: **not every endpoint returns `_budget_stats` 
 | [AI Code Provenance & Risk](ai-provenance.md) | `POST /api/v1/agents/ai-provenance` | Assesses the AI-origin likelihood of a code artifact as probabilistic evidence, never a verdict. |
 | [Migration Assessment](migration-assessment.md) | `POST /api/v1/agents/migration-assessment` | Assesses migration complexity, breaking changes, risk, and a phased plan between two stacks. |
 | [Migration Execution](migration-execute.md) | `POST /api/v1/agents/migration-execute` | Transforms a specific file/artifact from its current stack to a target stack, preserving behavior. |
+| [Legacy Modernization](modernization.md) | `POST /api/v1/modernization/runs` | Converts a **whole codebase** as a durable, resumable run — dependency-ordered, charter-bound, secrets redacted before any model call. Metered per converted file. |
 | [Auto-Fix & Open PR](auto-fix.md) | `POST /api/v1/agents/auto-fix` | Reviews a PR, commits fixes to a new branch, and opens a follow-up PR — writes real commits to GitHub. |
 
 ## Security Intelligence

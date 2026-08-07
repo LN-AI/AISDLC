@@ -22,6 +22,14 @@ def run(orch, pr_url: str, jira_ticket: str = "") -> Dict[str, Any]:
         code=guardrail_service.wrap_untrusted_content(pr_data["diff"], "GITHUB_PR_DIFF"),
         language="",
         context=context,
+        # An oversized diff is cut before it gets here (github_service.MAX_DIFF_CHARS).
+        # Telling the reviewer keeps it from posting a Green comment on a PR whose tail
+        # it never saw.
+        coverage_incomplete=pr_data.get("diff_truncated", False),
+        coverage_reason=(
+            f"The PR diff was truncated to {len(pr_data['diff']):,} of "
+            f"{pr_data.get('diff_full_chars', 0):,} characters; the remainder was not reviewed."
+        ),
     )
 
     review_id = database.save_review(

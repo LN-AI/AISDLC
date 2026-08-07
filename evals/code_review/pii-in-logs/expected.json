@@ -1,0 +1,18 @@
+{
+  "must_find": [
+    {
+      "control_id": "SEC-004",
+      "line_range": [
+        1,
+        4
+      ],
+      "note": "SSN and card number written to logs"
+    }
+  ],
+  "must_not_find": [],
+  "expected_gate": [
+    "Red",
+    "Amber"
+  ],
+  "case": "pii-in-logs"
+}

@@ -42,10 +42,17 @@ Gate logic: **Red** on any Critical finding (hardcoded secret, SQL injection, au
 
 ## Guardrails applied
 
-- **Input size limit** — rejects (HTTP 413) artifacts over `MAX_AGENT_INPUT_CHARS` (400,000 characters by default)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient provider errors
+- **Chunking** — an artifact too large for one call is split automatically, at diff-hunk and declaration boundaries (never mid-hunk), with overlap so nothing falls between the cuts. Chunks are reviewed in parallel and their findings merged and de-duplicated. Each chunk is told which files exist elsewhere in the same change and instructed not to assert anything about code it wasn't shown — a control that lives in another file is not a missing control. `MAX_AGENT_INPUT_CHARS` still applies per chunk, so it is no longer a ceiling on artifact size
+- **Per-chunk failure isolation** — one chunk failing does not fail the review; `coverage` reports how many ran and the gate clamps accordingly. Every chunk failing is an error, not a clean report over nothing
+- **Evidence verification** — each finding must quote the offending code verbatim. That quote is checked against the source in Python: a quote that isn't there means the finding is discarded as unfounded, and a quote that is there but at a different line has its line number corrected. Discarded findings are returned as `discarded_findings` rather than hidden
+- **Baseline & waivers** — findings are fingerprinted (excluding line number, so they survive code moving) and compared against what the project has already seen. Results carry `new_findings_count` / `pre_existing_count` / `waived_count`. Waive one with `PATCH /api/v1/findings/{id}`; waived findings drop out of future reviews for that project and stop blocking. Pre-existing but un-waived findings still count toward the gate — otherwise a codebase with a hundred existing Criticals would report Green
+- **Path suppression** — findings in test, fixture, vendored, generated, minified or build-output paths are separated out and cannot block
+- **Timeout & retry** — `LLM_TIMEOUT_SECONDS` (360s by default), up to `LLM_MAX_RETRIES` (2) retries on transient provider errors
 - **Prompt-injection scan** — non-blocking; matches surfaced as `guardrail_flags`
-- **Untrusted content wrapping** — a fetched PR diff is delimited with `<<<UNTRUSTED_GITHUB_PR_DIFF_START/END>>>` markers before being sent to the model, so injected instructions inside the diff (e.g. in a comment or commit message) are treated as data, never followed
+- **Untrusted content wrapping** — any content fetched from GitHub or Jira is delimited with `<<<UNTRUSTED_..._START/END>>>` markers before being sent to the model, so injected instructions inside it (e.g. in a PR comment or commit message) are treated as data, never followed. Applied centrally in the v1 source resolver, so it covers this agent whether the diff arrives via `github_pr_url` or via the PR workflows
+- **Deterministic gate** — `gate_status` is never taken from the model alone. It is reconciled against the arithmetic over the returned findings and the result is the stricter of the two, so a response that reports a Critical finding cannot also report Green. The model's own answer is preserved as `model_gate_status`. `risk_score` is floored to match the gate (Red ≥ 70, Amber ≥ 40)
+- **Coverage clamp** — if part of the artifact was never reviewed (e.g. an oversized PR diff cut at 50,000 characters), the result cannot be Green: it degrades to at least Amber, sets `coverage_complete: false`, and adds an explicit `GOV-COVERAGE` finding saying what was skipped
+- **Empty-result guard** — a response with no findings *and* no summary on a non-trivial artifact is rejected rather than stored, because that shape indicates a truncated or malformed model response, not clean code
 - This agent is deliberately never blocked from analyzing "suspicious" code — a Code Review agent that refused to look at malicious-looking input would be useless for its actual job
 
 ## Cost control

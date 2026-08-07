@@ -1,0 +1,18 @@
+{
+  "must_find": [
+    {
+      "control_id": "SEC-006",
+      "line_range": [
+        1,
+        4
+      ],
+      "note": "MD5 used for password hashing"
+    }
+  ],
+  "must_not_find": [],
+  "expected_gate": [
+    "Red",
+    "Amber"
+  ],
+  "case": "weak-crypto"
+}

@@ -59,7 +59,9 @@ from backend.models.api_models import (
     TestScenarioRequest,
     VAPTRequest,
 )
-from backend.services import agent_guard, llm_gateway, job_service, subject_service
+from backend.services import (
+    agent_guard, code_chunker, guardrail_service, llm_gateway, job_service, subject_service,
+)
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
     check_and_record_rate_limit,
@@ -184,9 +186,29 @@ def get_caller(
 
 # ── Source resolver ───────────────────────────────────────────────────────
 
-def _resolve(req) -> tuple:
+# Content fetched from GitHub or Jira is written by whoever opened the PR or filed the
+# ticket, so it is data, not instruction. `workflows/review_pr.py` and `autofix_pr.py`
+# have always wrapped it; the v1 endpoints did not, which meant POST /api/v1/agents/code
+# with a github_pr_url handed a raw attacker-controllable diff straight to the model.
+# Wrapping here covers every agent that takes an external source, in one place.
+_UNTRUSTED_LABELS = {
+    "github_pr": "GITHUB_PR_DIFF",
+    "github_file": "GITHUB_FILE",
+    "github_repo": "GITHUB_REPO",
+    "jira": "JIRA_ISSUE",
+    "github_issue": "GITHUB_ISSUE",
+}
+
+
+def _resolve(req, untrusted_mode: str = "analyze") -> tuple:
     """Return (artifact_text, source_type, display_ref, postback_ref).
     Priority: github_pr > github_file > github_repo > jira > github_issue > text fields.
+
+    `untrusted_mode` is "analyze" by default so a new endpoint is protected by default.
+    The handful of agents that *transform* their input into output code or documents pass
+    "transform", which wraps with wording suited to that (see `wrap_untrusted_content`);
+    they are listed at their call sites. Text supplied directly in the request body is
+    never wrapped — it came from the caller, not from a third party.
     """
     def _gh(url, hint):
         try:
@@ -210,21 +232,28 @@ def _resolve(req) -> tuple:
     jt  = getattr(req, "jira_ticket",      None)
     gi  = getattr(req, "github_issue_url", None)
 
+    def _external(text, source_type, display_ref, postback_ref):
+        if untrusted_mode != "none" and text:
+            text = guardrail_service.wrap_untrusted_content(
+                text, _UNTRUSTED_LABELS[source_type], mode=untrusted_mode
+            )
+        return text, source_type, display_ref, postback_ref
+
     if pr:
         d = _gh(pr, "code")
-        return d.get("diff") or d.get("content", ""), "github_pr", d.get("title", pr), pr
+        return _external(d.get("diff") or d.get("content", ""), "github_pr", d.get("title", pr), pr)
     if gf:
         d = _gh(gf, "code")
-        return d.get("content", ""), "github_file", d.get("name", gf), ""
+        return _external(d.get("content", ""), "github_file", d.get("name", gf), "")
     if gr:
         d = _gh(gr, "architecture")
-        return d.get("content", ""), "github_repo", d.get("repo", gr), ""
+        return _external(d.get("content", ""), "github_repo", d.get("repo", gr), "")
     if jt:
         issue = _jr(jt)
-        return issue.get("content", ""), "jira", issue.get("title", jt), jt
+        return _external(issue.get("content", ""), "jira", issue.get("title", jt), jt)
     if gi:
         d = _gh(gi, "requirement")
-        return d.get("content", ""), "github_issue", d.get("title", gi), gi
+        return _external(d.get("content", ""), "github_issue", d.get("title", gi), gi)
 
     for attr in ("text", "code", "artifact", "content", "system_prompt"):
         val = getattr(req, attr, None)
@@ -392,10 +421,14 @@ def run_code(req: CodeReviewRequest, caller: dict = Depends(get_caller)):
     artifact, src_type, src_ref, pb_ref = _resolve(req)
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
     override = _effective_llm_override(req, caller, "code")
-    result = agent_guard.guarded_call(
-        caller, "code", override,
-        lambda: _orch.review_code(artifact, req.language or "", ctx, req.project_name or src_ref[:60]),
-    )
+    # A large artifact is reviewed as N parallel calls, not one, so the reservation has to
+    # be sized from N. Without this a 40-chunk review reserved for a single call and could
+    # spend far past a budget cap that had already been checked.
+    with agent_guard.expect_calls(code_chunker.estimate_chunks(artifact)):
+        result = agent_guard.guarded_call(
+            caller, "code", override,
+            lambda: _orch.review_code(artifact, req.language or "", ctx, req.project_name or src_ref[:60]),
+        )
     pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
     return _wrap("code", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
 
@@ -1013,7 +1046,7 @@ returning it.
 """,
 )
 def run_migration_execute(req: MigrationExecutionRequest, caller: dict = Depends(get_caller)):
-    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    artifact, src_type, src_ref, pb_ref = _resolve(req, untrusted_mode="transform")
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
     override = _effective_llm_override(req, caller, "migration-execute")
     result = agent_guard.guarded_call(
@@ -1212,7 +1245,7 @@ def run_gxp_generate_plan(req: GxPValidationPlanRequest, caller: dict = Depends(
         src_type, src_ref = "files", f"{len(req.files)} files"
         files_payload = [{"path": f.path, "content": f.content} for f in req.files]
     else:
-        artifact, src_type, src_ref, _ = _resolve(req)
+        artifact, src_type, src_ref, _ = _resolve(req, untrusted_mode="transform")
         files_payload = []
 
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
@@ -1267,7 +1300,7 @@ def run_gxp_generate_document(req: GxPDocumentGenerateRequest, caller: dict = De
         src_type, src_ref = "files", f"{len(req.files)} files"
         files_payload = [{"path": f.path, "content": f.content} for f in req.files]
     else:
-        artifact, src_type, src_ref, _ = _resolve(req)
+        artifact, src_type, src_ref, _ = _resolve(req, untrusted_mode="transform")
         files_payload = []
 
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
@@ -1419,7 +1452,7 @@ Feed the result's scenario catalogue into `POST /api/v1/agents/test-case` (via `
 """,
 )
 def run_test_scenario(req: TestScenarioRequest, caller: dict = Depends(get_caller)):
-    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    artifact, src_type, src_ref, pb_ref = _resolve(req, untrusted_mode="transform")
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
     override = _effective_llm_override(req, caller, "test-scenario")
     result = agent_guard.guarded_call(
@@ -1465,7 +1498,7 @@ traceability — either directly from a requirement, or from a prior Test Scenar
 """,
 )
 def run_test_case(req: TestCaseRequest, caller: dict = Depends(get_caller)):
-    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    artifact, src_type, src_ref, pb_ref = _resolve(req, untrusted_mode="transform")
     ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
     override = _effective_llm_override(req, caller, "test-case")
     result = agent_guard.guarded_call(

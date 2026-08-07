@@ -75,6 +75,9 @@
             <li class="nav-item" data-page="migration" data-product="migration-assessment">
               <span class="nav-icon">🔀</span> Code Migration
             </li>
+            <li class="nav-item" data-page="modernization" data-product="modernization">
+              <span class="nav-icon">🏗️</span> Legacy Modernization
+            </li>
             <li class="nav-item" data-page="ai-provenance" data-product="ai-provenance">
               <span class="nav-icon">🧬</span> AI Provenance
             </li>
@@ -861,6 +864,61 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           </div>
         </div>
         <div id="migration-execution-result" class="result-area hidden"></div>
+      </div>
+
+      <!--
+        Legacy Modernization — a run dashboard, not two textareas.
+        A modernization is a process with state that outlives the page: the screen's job is
+        to show where a run is up to, what it is waiting on, and what it has produced. Every
+        panel below reads from the run row, so a reload (or a different person, on a
+        different day) sees the same thing.
+      -->
+      <div id="page-modernization" class="page">
+        <div class="page-header">
+          <h1>Legacy Modernization</h1>
+          <p class="subtitle">Converts a whole codebase to a target stack as a durable run — secrets redacted before any model call, files converted in dependency order against a charter your team approves once, and a symbol registry that keeps file 400 consistent with file 4. A run survives a restart: stopped at file 390, it resumes at 391.</p>
+        </div>
+
+        <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. Start a run</div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Run Name <span class="required">*</span></label>
+              <input type="text" id="mod-name" placeholder="e.g. Billing engine → .NET 8" />
+            </div>
+            <div class="form-group flex1">
+              <label>Target Stack <span class="required">*</span></label>
+              <input type="text" id="mod-target" placeholder="e.g. .NET 8 / ASP.NET Core Web API" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Source Zip <span class="required">*</span></label>
+              <input type="file" id="mod-zip" accept=".zip" />
+            </div>
+            <div class="form-group flex1">
+              <label>Budget Cap (USD, optional)</label>
+              <input type="number" id="mod-cap" step="0.01" min="0" placeholder="e.g. 50.00" />
+              <div class="field-hint">The run pauses here instead of overspending. Everything converted so far is kept. Strongly recommended on a first run.</div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Extensions to convert (optional)</label>
+            <input type="text" id="mod-ext" placeholder="e.g. .cbl,.cpy — leave blank for the default list, which already includes legacy extensions" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" data-product="modernization" onclick="createModernizationRun()">
+              <span class="btn-icon">📦</span> Ingest &amp; Analyse
+            </button>
+            <button class="btn btn-secondary" onclick="loadModernizationRuns()">Refresh runs</button>
+          </div>
+          <div class="field-hint">Ingest, redaction and dependency analysis cost nothing — no model is called until you set a charter and approve the plan.</div>
+        </div>
+
+        <div class="section-title">Runs</div>
+        <div id="mod-runs" class="result-area"></div>
+
+        <div id="mod-detail" class="hidden"></div>
       </div>
 
       <!-- Issue Triage Page -->
