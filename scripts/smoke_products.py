@@ -165,8 +165,17 @@ def main_():
     check("every declared review_type is one the code really writes",
           declared <= written, f"orphaned: {sorted(declared - written)}")
 
-    every_invocable = all(p.invoke is not None for p in registry.PRODUCTS if p.id != "swarm")
-    check("every product except swarm has an invoke adapter", every_invocable)
+    # `swarm` and `modernization` are the two products whose own service owns dispatch:
+    # neither is a single orchestrator call a flat params dict could drive. Everything else
+    # must have an adapter, or it is entitleable and meterable but not runnable.
+    SERVICE_DISPATCHED = {"swarm", "modernization"}
+    every_invocable = all(p.invoke is not None
+                          for p in registry.PRODUCTS if p.id not in SERVICE_DISPATCHED)
+    check("every product except the service-dispatched ones has an invoke adapter",
+          every_invocable,
+          f"missing: {sorted(p.id for p in registry.PRODUCTS if p.invoke is None) }")
+    check("only swarm and modernization are service-dispatched",
+          {p.id for p in registry.PRODUCTS if p.invoke is None} == SERVICE_DISPATCHED)
 
     # ── 2. back-compat: an existing key keeps working ──────────────────────
     section("2. Back-compat (key with no plan, scopes='all')")

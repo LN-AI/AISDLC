@@ -2,6 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Read `DECISIONS.md` first
+
+`DECISIONS.md` (repo root) is the durable memory across sessions: architectural decisions and
+what they rejected, known landmines, and corrections to earlier analysis. Read it before
+proposing architecture or diagnosing something that looks like a bug — several things that
+read as defects are documented, deliberate trade-offs.
+
+Add a row when you decide something non-obvious, hit a landmine, or find that earlier analysis
+was wrong. Keep entries to one line, cite `file.py:line` rather than restating code, and delete
+rows once they are resolved — the file is only useful while it stays scannable.
+
 ## Project overview
 
 LM AI-SDLC ReviewOps Agent — an AI-powered governance/review platform covering the full SDLC (requirement → architecture → dev → QA → security → ops → governance) via ~25 specialized agents (Code Review, Code Generation, Security/Threat Model, Auto-Fix & Open PR, Issue Triaging, Compliance Mapper, Governance Report, etc.), organized into 9 "Intelligence" modules under `backend/agents/<module>/`. Backend is FastAPI + Python, orchestrating calls to Anthropic Claude. Frontend is a plain HTML/CSS/JS SPA with no build step, served as static files by FastAPI.
@@ -25,9 +36,13 @@ There is currently no test framework, linter/formatter config, or CI pipeline in
 ## Architecture
 
 - `backend/main.py` — FastAPI app entrypoint, mounts `/static` → `frontend/`.
-- `backend/agents/` — per-module agent implementations (`architecture_intelligence/`, `developer_intelligence/`, `devops_intelligence/` [stub], `governance_intelligence/`, `operations_intelligence/`, `qa_intelligence/`, `requirement_intelligence/`, `security_intelligence/`), all extending `base_agent.py`.
+- `backend/agents/` — per-module agent implementations (`architecture_intelligence/`, `developer_intelligence/`, `devops_intelligence/` [stub], `governance_intelligence/`, `modernization_intelligence/`, `operations_intelligence/`, `qa_intelligence/`, `requirement_intelligence/`, `security_intelligence/`), all extending `base_agent.py`.
 - `backend/routes/` — FastAPI routers (one per concern: `agents.py`, `auth.py`, `swarm.py`, `v1_agents.py` [external API surface], etc.).
 - `backend/services/` — business logic; `orchestrator.py` (`SDLCOrchestrator`) is the central coordinator. Also: `llm_gateway.py`, `github_service.py`, `jira_service.py`, `guardrail_service.py`, `agent_guard.py` (cost/budget control), `knowledge_base.py`, `crypto_service.py`.
+- `backend/services/modernization/` — the one subsystem with its own schema and its own durable
+  execution model: whole-codebase conversion runs (ingest → dependency graph → charter → claim-and-lease
+  worker loop → Tier-0 validation). Its DDL lives in `store.py` and is called from `database.init_db()`.
+  Read its package docstring before changing anything in it.
 - `backend/database.py` — raw SQLite data layer, no ORM, no migration tooling. DB file defaults to `sdlc_agent.db` at repo root.
 - `backend/config.py` — env var loading (see below).
 - `docs/` — per-agent reference docs and integration guides (`n8n-workflows/`, `vscode-integration/`).

@@ -419,6 +419,14 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id, created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id)")
 
+    # Modernization owns six tables of its own. Their DDL lives with the code that queries
+    # them rather than here — this module is already read by everything, and those tables
+    # are read by one subsystem — but they are still created in exactly one place, at
+    # startup, like every other table. Imported lazily because that module needs
+    # `get_connection` from this one.
+    from backend.services.modernization.store import init_schema as _init_modernization
+    _init_modernization(cursor)
+
     conn.commit()
     conn.close()
     logger.info("Database ready")

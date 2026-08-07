@@ -538,6 +538,27 @@ PRODUCTS: List[Product] = [
         }),
     ),
     Product(
+        id="modernization",
+        kind=WORKFLOW,
+        title="Legacy Modernization",
+        module="modernization_intelligence",
+        description=(
+            "Converts a whole legacy codebase to a target stack as a durable, resumable run: "
+            "ingests a repo (redacting secrets before any model call), derives a dependency "
+            "graph with real parsers, converts file by file in topological order against a "
+            "charter the team approves once, and keeps a symbol registry so later files stay "
+            "consistent with earlier ones. Survives a restart — a run killed at file 390 "
+            "resumes at 391. Metered per converted file."
+        ),
+        endpoint="POST /api/v1/modernization/runs",
+        sources=("zip", "files", "github_repo_url"),
+        frameworks=("NIST-AI-RMF",),
+        review_type="",  # writes modernization_* rows, not a `reviews` row
+        # Dispatch is owned by services/modernization/runner.py, which is a long-running
+        # loop over a job rather than one call — the same reason `swarm` has no adapter.
+        invoke=None,
+    ),
+    Product(
         id="swarm",
         kind=WORKFLOW,
         title="Agent Swarm",
