@@ -49,9 +49,15 @@ def run(
         )
 
     if auto_review:
-        result["governance_review"] = governance_review(
-            orch, files, language, project_name, "Generated scaffold"
-        )
+        gov = governance_review(orch, files, language, project_name, "Generated scaffold")
+        result["governance_review"] = gov
+        # Lifted to the top level, not just nested: `load_findings_from_reviews` and
+        # `database.save_review` both read `result["findings"]`, so a scaffold whose
+        # auto-review found Criticals otherwise reached the release gate as zero findings
+        # and showed Green on the dashboard.
+        result["findings"] = gov["findings"]
+        result["gate_status"] = gov["gate_status"]
+        result["risk_score"] = gov["risk_score"]
 
     review_id = database.save_review(
         review_type="codegen_scaffold",

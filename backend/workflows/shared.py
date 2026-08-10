@@ -53,27 +53,74 @@ def derive_gate_from_findings(all_findings: List[Dict[str, Any]]) -> str:
     return "Green"
 
 
+_GATE_RANK = {"green": 0, "amber": 1, "red": 2}
+
+
+def strictest_gate(*gates: str) -> str:
+    """The worst of the gates given, ignoring blanks. Fails closed on an unknown value.
+
+    Used where several agents each issue a gate over the same artifact and one verdict has
+    to come out. Mirrors D-10's floor-not-replacement rule: combining gates may only ever
+    tighten the result, never loosen it.
+    """
+    worst = "Green"
+    for gate in gates:
+        if not gate:
+            continue
+        rank = _GATE_RANK.get(gate.strip().lower())
+        if rank is None:          # an unrecognised gate is not evidence of safety
+            return "Red"
+        if rank > _GATE_RANK[worst.lower()]:
+            worst = gate.strip().capitalize()
+    return worst
+
+
 def governance_review(orch, files: List[dict], language: str, project_name: str, label: str) -> Dict[str, Any]:
     """Pre-release governance check over generated or migrated code.
 
     Runs the Code Review and Sensitive Data agents over the combined output and returns
     the trimmed summary shape both the scaffold and migration workflows attach as
     `result["governance_review"]`.
+
+    The two agents' findings are also returned flattened under `findings`, with a combined
+    `gate_status`/`risk_score`. Callers must copy those onto the *top level* of the result
+    they persist: `load_findings_from_reviews` reads `result["findings"]` and
+    `database.save_review` derives its finding counts from the same key, so findings left
+    only under `governance_review` reach neither the release gate nor the dashboard.
     """
     combined = combine_files(files)
     code_review = orch.code_agent.review_code(combined, language, f"{label} — pre-release governance check")
     sensitive_scan = orch.sensitive_agent.scan(combined, label, project_name)
+
+    code_part = {
+        "gate_status": code_review.get("gate_status", "Green"),
+        "risk_score": code_review.get("risk_score", 0),
+        "findings": code_review.get("findings", []),
+        "summary": code_review.get("summary", ""),
+    }
+    sensitive_part = {
+        "gate_status": sensitive_scan.get("gate_status", "Green"),
+        "risk_score": sensitive_scan.get("risk_score", 0),
+        "findings": sensitive_scan.get("findings", []),
+        "summary": sensitive_scan.get("summary", ""),
+    }
+
+    findings = [
+        {**f, "source": "code"} for f in code_part["findings"]
+    ] + [
+        {**f, "source": "sensitive_data"} for f in sensitive_part["findings"]
+    ]
+
     return {
-        "code_review": {
-            "gate_status": code_review.get("gate_status", "Green"),
-            "risk_score": code_review.get("risk_score", 0),
-            "findings": code_review.get("findings", []),
-            "summary": code_review.get("summary", ""),
-        },
-        "sensitive_data_scan": {
-            "gate_status": sensitive_scan.get("gate_status", "Green"),
-            "risk_score": sensitive_scan.get("risk_score", 0),
-            "findings": sensitive_scan.get("findings", []),
-            "summary": sensitive_scan.get("summary", ""),
-        },
+        "code_review": code_part,
+        "sensitive_data_scan": sensitive_part,
+        "findings": findings,
+        # Both agents' own gates, plus the deterministic floor over the merged findings —
+        # so a Critical neither agent gated on still can't come out Green.
+        "gate_status": strictest_gate(
+            code_part["gate_status"],
+            sensitive_part["gate_status"],
+            derive_gate_from_findings(findings),
+        ),
+        "risk_score": calculate_overall_risk([code_part, sensitive_part]),
     }

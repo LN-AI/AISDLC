@@ -58,7 +58,7 @@ One nuance worth knowing up front: **not every endpoint returns `_budget_stats` 
 | Agent | Endpoint | Description |
 |---|---|---|
 | [Release Gate](release-gate.md) | `POST /api/v1/agents/release-gate` | Evaluates release readiness: aggregates prior findings, checks mandatory controls, issues a gate decision. |
-| [Full SDLC Review](full.md) | `POST /api/v1/agents/full` | Runs requirement, code, compliance, architecture, and release gate agents in one call. |
+| [Core SDLC Review](full.md) | `POST /api/v1/agents/full` | Runs requirement, compliance, architecture, code and prompt-safety agents in one call, then the release gate. STRIDE, VAPT and sensitive-data are opt-in; whatever is skipped is reported. |
 | [Governance Report Generator](report-generate.md) | `POST /api/v1/agents/report-generate` | Synthesizes prior review findings into an audit-ready governance report without re-running a review. |
 
 ## Operations Intelligence

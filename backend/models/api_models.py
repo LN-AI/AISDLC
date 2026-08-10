@@ -451,13 +451,18 @@ class CodeGenScaffoldRequest(LLMOverrideFields):
 
 
 class FullReviewRequest(_SourceBase):
-    """Run all relevant agents in one pass — requirement, compliance, architecture, code — and produce a release gate decision."""
+    """Run the core review agents in one pass — requirement, compliance, architecture, code,
+    prompt safety — then a release gate and a governance report.
+
+    STRIDE security review, VAPT and the sensitive-data scan are opt-in via `include_security` /
+    `include_vapt` / `include_sensitive_data`. Whatever does not run is listed in the response's
+    `steps_not_run`, because a gate is only as broad as the reviews behind it."""
     text: Optional[str] = Field(
         None, description="Requirement or code artifact (used as a fallback if `requirement`/`code` aren't passed via github_pr_url/jira_ticket)"
     )
     github_pr_url: Optional[str] = Field(
         None,
-        description="GitHub PR URL — runs code + VAPT + compliance",
+        description="GitHub PR URL — its diff is reviewed as `code`. Add `include_vapt` / `include_sensitive_data` to also assess it for vulnerabilities and exposed data.",
         examples=["https://github.com/owner/repo/pull/88"]
     )
     jira_ticket: Optional[str] = Field(
@@ -477,6 +482,15 @@ class FullReviewRequest(_SourceBase):
     )
     test_evidence: Optional[str] = Field(
         None, description="Test results or sign-off evidence for the release gate"
+    )
+    include_security: bool = Field(
+        False, description="Also run the STRIDE Security Review over `architecture`. Adds one LLM call."
+    )
+    include_vapt: bool = Field(
+        False, description="Also run the VAPT assessment (CVSS, OWASP) over the code. Adds one LLM call."
+    )
+    include_sensitive_data: bool = Field(
+        False, description="Also scan the code for PII/PHI/PCI and credentials. Adds one LLM call."
     )
 
 

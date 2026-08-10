@@ -148,10 +148,13 @@
           </div>
           <ul class="nav-section-items">
             <li class="nav-item" data-page="full" data-product="full">
-              <span class="nav-icon">🔍</span> Full SDLC Review
+              <span class="nav-icon">🔍</span> Core SDLC Review
             </li>
             <li class="nav-item" data-page="gate" data-product="release-gate">
               <span class="nav-icon">🚦</span> Release Gate
+            </li>
+            <li class="nav-item" data-page="governance-report" data-product="report-generate">
+              <span class="nav-icon">📄</span> Governance Report
             </li>
             <li class="nav-item" data-page="inventory">
               <span class="nav-icon">📦</span> AI Inventory
@@ -443,8 +446,10 @@ Answer questions about patients based on the provided context."></textarea>
       <!-- Full SDLC Review Page -->
       <div id="page-full" class="page">
         <div class="page-header">
-          <h1>Full SDLC Review</h1>
-          <p class="subtitle">Run all agents in one pass — requirement, code, prompt safety, compliance, and release gate</p>
+          <h1>Core SDLC Review</h1>
+          <p class="subtitle">Requirement, compliance, architecture, code and prompt safety in one pass, then a
+            release gate and a governance report. Security testing is opt-in below — the result names anything
+            that did not run.</p>
         </div>
         <div class="form-card">
           <div class="form-group">
@@ -475,9 +480,31 @@ Answer questions about patients based on the provided context."></textarea>
             <label>Test Evidence Summary</label>
             <textarea id="full-test" rows="4" placeholder="Describe test coverage, test results, red-team tests, validation evidence..."></textarea>
           </div>
+
+          <div class="form-group opt-in-block">
+            <label>Additional security stages</label>
+            <p class="field-hint">Each runs over an artifact you already supplied above and adds one LLM call
+              to this run. Off by default because this is billed as a single call.</p>
+            <label class="checkbox-label">
+              <input type="checkbox" id="full-include-security" />
+              <span><strong>Security Review (STRIDE)</strong> — threat model over the architecture description.
+                Needs <em>Architecture Description</em>.</span>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" id="full-include-vapt" />
+              <span><strong>VAPT</strong> — vulnerability assessment with CVSS scoring over the code.
+                Needs <em>Code Sample</em>.</span>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" id="full-include-sensitive" />
+              <span><strong>Sensitive Data Scan</strong> — PII/PHI/PCI and credentials in the code.
+                Needs <em>Code Sample</em>.</span>
+            </label>
+          </div>
+
           <div class="form-actions">
             <button class="btn btn-primary btn-large" onclick="runFullReview()">
-              <span class="btn-icon">🚀</span> Run Full SDLC Review
+              <span class="btn-icon">🚀</span> Run Core SDLC Review
             </button>
           </div>
         </div>
@@ -545,13 +572,31 @@ Answer questions about patients based on the provided context."></textarea>
             </div>
           </div>
           <div class="form-group">
-            <label>Paste Review IDs (one per line, optional)</label>
-            <textarea id="gate-review-ids" rows="4" placeholder="If you have prior review IDs, paste them here to load their findings..."></textarea>
+            <div class="picker-header">
+              <label>Reviews to gate on</label>
+              <div class="picker-actions">
+                <button type="button" class="btn-link" onclick="selectAllReviews(true)">Select all</button>
+                <button type="button" class="btn-link" onclick="selectAllReviews(false)">Clear</button>
+                <button type="button" class="btn-link" onclick="loadReviewPicker()">↻ Refresh</button>
+              </div>
+            </div>
+            <p class="field-hint">The gate aggregates the findings from every review you tick. It is only
+              as broad as what you select.</p>
+            <div id="gate-review-picker" class="review-picker">
+              <div class="empty-state">Loading reviews…</div>
+            </div>
           </div>
-          <div class="form-group">
-            <label>Or paste findings JSON directly (optional)</label>
-            <textarea id="gate-findings" rows="6" placeholder='[{"control_id": "SEC-003", "severity": 5, "title": "Hardcoded API key", ...}]'></textarea>
-          </div>
+          <details class="form-group advanced-block">
+            <summary>Advanced — paste IDs or findings directly</summary>
+            <div class="form-group">
+              <label>Review IDs (one per line)</label>
+              <textarea id="gate-review-ids" rows="3" placeholder="For review IDs from another project or an API run…"></textarea>
+            </div>
+            <div class="form-group">
+              <label>Findings JSON</label>
+              <textarea id="gate-findings" rows="6" placeholder='[{"control_id": "SEC-003", "severity": 5, "title": "Hardcoded API key", ...}]'></textarea>
+            </div>
+          </details>
           <div class="form-actions">
             <button class="btn btn-primary" onclick="runReleaseGate()">
               <span class="btn-icon">🚦</span> Check Release Gate
@@ -559,6 +604,49 @@ Answer questions about patients based on the provided context."></textarea>
           </div>
         </div>
         <div id="gate-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Governance Report Page -->
+      <div id="page-governance-report" class="page">
+        <div class="page-header">
+          <h1>Governance Report</h1>
+          <p class="subtitle">Synthesise prior reviews into one audit-ready report — executive summary,
+            findings by category, controls assessment, and the release decision. Does not re-run any review.</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name</label>
+              <input type="text" id="report-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+            </div>
+          </div>
+          <div class="form-group">
+            <div class="picker-header">
+              <label>Reviews to report on</label>
+              <div class="picker-actions">
+                <button type="button" class="btn-link" onclick="selectAllReportReviews(true)">Select all</button>
+                <button type="button" class="btn-link" onclick="selectAllReportReviews(false)">Clear</button>
+                <button type="button" class="btn-link" onclick="loadReportReviewPicker()">↻ Refresh</button>
+              </div>
+            </div>
+            <div id="report-review-picker" class="review-picker">
+              <div class="empty-state">Loading reviews…</div>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="generateGovernanceReport()">
+              <span class="btn-icon">📄</span> Generate Report
+            </button>
+          </div>
+        </div>
+
+        <div class="section-heading" style="margin-top:24px">
+          <h2>Previous reports</h2>
+          <p class="subtitle">Every report generated for this project.</p>
+        </div>
+        <div id="report-list" class="review-picker"><div class="empty-state">Loading…</div></div>
+
+        <div id="report-result" class="result-area hidden"></div>
       </div>
 
       <!-- Knowledge Base Page -->
@@ -1417,9 +1505,63 @@ Examples:
       <div id="page-agent-hub" class="page">
         <div class="page-header">
           <h1>Agent Hub</h1>
-          <p class="subtitle">Run any agent directly from a GitHub PR/issue/repo or Jira ticket — results post back automatically</p>
+          <p class="subtitle">Run one agent against a GitHub PR/issue/repo or Jira ticket — or fan one artifact out to a whole policy at once</p>
         </div>
         <div id="agent-hub-status" class="info-box" style="margin-bottom:16px"></div>
+
+        <!-- Agent Swarm -->
+        <div class="form-card swarm-card">
+          <div class="section-heading">
+            <h2>⚡ Agent Swarm</h2>
+            <p class="subtitle">Runs several review agents over the same artifact in parallel under a named
+              policy, then collapses them into one gate decision. One agent failing never blocks the gate.</p>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Policy</label>
+              <select id="swarm-policy"><option value="">Loading…</option></select>
+              <p class="field-hint" id="swarm-policy-hint">&nbsp;</p>
+            </div>
+            <div class="form-group flex1">
+              <label>Project Name</label>
+              <input type="text" id="swarm-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Source</label>
+            <select id="swarm-source-type" onchange="onSwarmSourceChange()">
+              <option value="text">Paste text / code</option>
+              <option value="github_pr_url">GitHub PR URL</option>
+              <option value="github_file_url">GitHub file URL</option>
+              <option value="github_repo_url">GitHub repo URL</option>
+              <option value="jira_ticket">Jira ticket</option>
+            </select>
+          </div>
+          <div class="form-group" id="swarm-ref-group" style="display:none">
+            <label id="swarm-ref-label">Reference</label>
+            <input type="text" id="swarm-ref" placeholder="https://github.com/owner/repo/pull/42" />
+          </div>
+          <div class="form-group" id="swarm-text-group">
+            <label>Artifact</label>
+            <textarea id="swarm-text" rows="8" placeholder="Paste the code, architecture description, or document to fan out to the policy's agents…"></textarea>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="swarm-postback" /> Post the result back to GitHub / Jira
+            </label>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runSwarm()">
+              <span class="btn-icon">⚡</span> Run Swarm
+            </button>
+          </div>
+        </div>
+        <div id="swarm-result" class="result-area hidden"></div>
+
+        <div class="section-heading" style="margin-top:28px">
+          <h2>Single agent</h2>
+          <p class="subtitle">Run one agent on its own.</p>
+        </div>
         <div id="agent-cards" class="agent-grid"></div>
         <div id="hub-result" class="result-area hidden"></div>
       </div>

@@ -20,6 +20,10 @@
   --blue: #3b82f6;
   --radius: 8px;
   --shadow: 0 4px 24px rgba(0,0,0,0.4);
+  /* Tells the browser to paint native widgets (dropdown popups, scrollbars, arrows)
+     for a dark UI. Without it, a <select>'s popup list is drawn light while the
+     options inherit our light --text, making the names unreadable. */
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -887,6 +891,13 @@ select {
   cursor: pointer;
 }
 select:focus { border-color: var(--accent); }
+/* The popup list is a native widget: it needs opaque colours of its own, because a
+   translucent background on the <select> is not carried into the dropdown. */
+select option, select optgroup {
+  background: var(--surface2);
+  color: var(--text);
+}
+select option:disabled { color: var(--text-muted); }
 
 /* ── Architecture button ───────────────────────────────────────────── */
 .btn-arch { background: #1a2e1a; color: #4ade80; border-color: #166534; }
@@ -1067,13 +1078,30 @@ select:focus { border-color: var(--accent); }
 }
 .sidebar-project select {
   width: 100%;
-  background: var(--bg-input, rgba(255,255,255,.04));
+  /* Opaque, so the native popup inherits a readable background. */
+  background-color: var(--surface2);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text);
-  padding: 7px 10px;
+  /* Own chevron: the native one sits too close to long names in a 220px sidebar. */
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='none' stroke='%238892a4' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round' d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  padding: 7px 26px 7px 10px;
   font-size: 13px;
+  line-height: 1.4;
   cursor: pointer;
+  /* Project names are often longer than the sidebar; cut them with an ellipsis. */
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.sidebar-project select:hover { border-color: var(--accent); }
+.sidebar-project select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(99,102,241,.2);
 }
 .sidebar-project-meta {
   margin-top: 6px;
@@ -1544,3 +1572,76 @@ button.not-entitled::after {
 .mod-unit-path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .mod-charter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 900px) { .mod-charter-grid { grid-template-columns: 1fr; } }
+
+/* ── Review picker (Release Gate, Governance Report) ───────────────────────
+   The gate takes review IDs; before this they had to be pasted as raw UUIDs. */
+
+.picker-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.picker-actions { display: flex; gap: 12px; }
+
+.review-picker {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); max-height: 320px; overflow-y: auto; margin-top: 8px;
+}
+.review-pick {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-bottom: 1px solid var(--border);
+  cursor: pointer; font-size: 13px;
+}
+.review-pick:last-child { border-bottom: none; }
+.review-pick:hover { background: var(--surface2); }
+.review-pick input[type="checkbox"] { flex: none; cursor: pointer; }
+.review-pick-clickable { cursor: pointer; }
+.review-pick-gate { flex: none; }
+.review-pick-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.review-pick-type { text-transform: capitalize; font-weight: 600; }
+.review-pick-meta { color: var(--text-muted); font-size: 12px; }
+.review-pick-when { flex: none; color: var(--text-muted); font-size: 11px; white-space: nowrap; }
+
+/* ── Opt-in stages / advanced blocks ──────────────────────────────────────── */
+
+.checkbox-label {
+  display: flex; align-items: flex-start; gap: 8px;
+  font-size: 13px; font-weight: 400; margin-top: 8px; cursor: pointer; line-height: 1.5;
+}
+.checkbox-label input[type="checkbox"] { flex: none; margin-top: 3px; cursor: pointer; }
+.checkbox-label em { color: var(--text-muted); font-style: normal; }
+
+.opt-in-block {
+  border: 1px dashed var(--border); border-radius: var(--radius);
+  padding: 12px 14px; background: rgba(99,102,241,.04);
+}
+.advanced-block > summary {
+  cursor: pointer; color: var(--text-muted); font-size: 13px; padding: 6px 0; user-select: none;
+}
+.advanced-block > summary:hover { color: var(--text); }
+
+/* A stage that did not run. Deliberately muted and struck through — it is the absence of
+   evidence, not a passing result, and must not read like one. */
+.not-run-row { margin-top: 8px; }
+.pill-not-run { opacity: .62; border-style: dashed; }
+.pill-not-run strong { text-decoration: line-through; text-decoration-thickness: 1px; }
+
+/* ── Agent Swarm ──────────────────────────────────────────────────────────── */
+
+.swarm-card { border-left: 3px solid var(--accent); }
+.section-heading { margin-bottom: 12px; }
+.section-heading h2 { font-size: 17px; margin: 0 0 4px; }
+.section-heading .subtitle { margin: 0; }
+
+.swarm-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px; margin-top: 10px;
+}
+.swarm-agent {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--surface); padding: 12px;
+}
+.swarm-agent-error { border-color: var(--red); background: rgba(239,68,68,.05); }
+.swarm-agent-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px;
+}
+.swarm-agent-meta { font-size: 12px; color: var(--text-muted); }
+.swarm-agent-summary { font-size: 12px; margin-top: 6px; line-height: 1.5; }
+
+.chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }

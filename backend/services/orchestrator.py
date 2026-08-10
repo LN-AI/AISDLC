@@ -199,10 +199,16 @@ class SDLCOrchestrator:
         project_name: str = "Unnamed Project",
         context: str = "",
         on_progress: Optional[Any] = None,
+        include_security: bool = False,
+        include_vapt: bool = False,
+        include_sensitive_data: bool = False,
     ) -> Dict[str, Any]:
         """`on_progress`, if given, is called as `on_progress(step_index, total_steps,
         step_label)` immediately before each sequential sub-agent call — used by the
-        job-status endpoint (see job_service.py). See backend/workflows/full_review.py."""
+        job-status endpoint (see job_service.py). See backend/workflows/full_review.py.
+
+        The three `include_*` flags add opt-in stages over artifacts already supplied and
+        default off, so an existing caller's run is unchanged."""
         return full_review_workflow.run(
             self,
             requirement=requirement,
@@ -214,6 +220,9 @@ class SDLCOrchestrator:
             project_name=project_name,
             context=context,
             on_progress=on_progress,
+            include_security=include_security,
+            include_vapt=include_vapt,
+            include_sensitive_data=include_sensitive_data,
         )
     @_log_call
     def review_vapt(

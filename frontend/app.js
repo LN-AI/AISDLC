@@ -188,6 +188,8 @@ function renderProjectSelector() {
       `<option value="${esc(p.id)}"${p.id === getActiveProjectId() ? ' selected' : ''}>${esc(p.name)}</option>`))
     .join('');
   select.value = getActiveProjectId();
+  // The sidebar is narrow enough that long names ellipsize, so keep the full one on hover.
+  select.title = _activeProject ? _activeProject.name : 'No project';
   renderProjectMeta();
   _syncProjectInputs();
 }
@@ -330,7 +332,9 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'approvals') loadApprovals(_approvalFilter);
     if (page === 'audit') loadAuditTrail();
     if (page === 'users') loadUsers();
-    if (page === 'agent-hub') loadAgentHub();
+    if (page === 'agent-hub') { loadAgentHub(); loadSwarmPolicies(); }
+    if (page === 'gate') loadReviewPicker();
+    if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
     if (page === 'inventory') loadInventory();
     if (page === 'sensitive') { /* page ready, no auto-load */ }
     if (page === 'ai-provenance') { /* page ready, no auto-load */ }
@@ -1439,18 +1443,37 @@ async function runFullReview() {
   const code = document.getElementById('full-code').value.trim();
   const prompt = document.getElementById('full-prompt').value.trim();
   const test_evidence = document.getElementById('full-test').value.trim();
+  const include_security = document.getElementById('full-include-security').checked;
+  const include_vapt = document.getElementById('full-include-vapt').checked;
+  const include_sensitive_data = document.getElementById('full-include-sensitive').checked;
 
   if (!requirement && !compliance_artifact && !architecture && !code && !prompt) {
     alert('Please provide at least one artifact to review.');
     return;
   }
 
-  showLoading('Submitting Full SDLC Review…');
+  // Each opt-in stage reads an artifact from the form above. Asking for one without that
+  // artifact is a silent no-op server-side, so say so here rather than let someone believe
+  // they ran a scan they didn't.
+  const orphaned = [
+    include_security && !architecture ? 'Security Review (STRIDE) needs an Architecture Description' : '',
+    include_vapt && !code ? 'VAPT needs a Code Sample' : '',
+    include_sensitive_data && !code ? 'Sensitive Data Scan needs a Code Sample' : '',
+  ].filter(Boolean);
+  if (orphaned.length) {
+    alert('These stages cannot run and will be skipped:\n\n• ' + orphaned.join('\n• '));
+    return;
+  }
+
+  showLoading('Submitting Core SDLC Review…');
   try {
     const submitResp = await apiFetch('/api/review/full', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence }),
+      body: JSON.stringify({
+        project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence,
+        include_security, include_vapt, include_sensitive_data,
+      }),
     });
     const result = await pollFullReviewJob(submitResp.job_id);
     renderFullResult('full-result', result);
@@ -1570,6 +1593,58 @@ async function autoFixGithubPR() {
 }
 
 // ── Release Gate ──────────────────────────────────────────────────────────
+//
+// The gate takes review IDs. Those are UUIDs, and the only place one was ever shown is the
+// subtitle of the review-detail modal — so gating on prior work meant copying UUIDs by
+// hand. This picker lists the reviews the caller can already see (GET /api/reviews is
+// project-scoped server-side) and ticking them feeds the same `review_ids` field.
+
+const GATE_ICONS = { Green: '✅', Amber: '⚠️', Red: '🔴' };
+
+async function loadReviewPicker() {
+  const wrap = document.getElementById('gate-review-picker');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="empty-state">Loading reviews…</div>';
+  try {
+    const data = await apiFetch('/api/reviews?limit=50');
+    const reviews = data.reviews || [];
+    if (!reviews.length) {
+      wrap.innerHTML = `<div class="empty-state">No reviews yet in this project. Run an agent first,
+        or paste review IDs under Advanced.</div>`;
+      return;
+    }
+    wrap.innerHTML = reviews.map(r => {
+      const type = (r.review_type || '').replace(/_/g, ' ');
+      const gate = r.gate_status || '';
+      const when = (r.created_at || '').slice(0, 16).replace('T', ' ');
+      const counts = [
+        r.findings_count ? `${r.findings_count} findings` : 'no findings',
+        r.critical_count ? `${r.critical_count} critical` : '',
+        r.high_count ? `${r.high_count} high` : '',
+      ].filter(Boolean).join(' · ');
+      return `
+        <label class="review-pick" title="${esc(r.id)}">
+          <input type="checkbox" class="gate-review-cb" value="${esc(r.id)}" />
+          <span class="review-pick-gate gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'}</span>
+          <span class="review-pick-main">
+            <span class="review-pick-type">${esc(type)}</span>
+            <span class="review-pick-meta">${esc(r.project_name || '')} · ${esc(counts)}</span>
+          </span>
+          <span class="review-pick-when">${esc(when)}</span>
+        </label>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load reviews: ${esc(e.message)}</div>`;
+  }
+}
+
+function selectAllReviews(checked) {
+  document.querySelectorAll('.gate-review-cb').forEach(cb => { cb.checked = checked; });
+}
+
+function pickedReviewIds() {
+  return Array.from(document.querySelectorAll('.gate-review-cb:checked')).map(cb => cb.value);
+}
 
 async function runReleaseGate() {
   const project_name = document.getElementById('gate-project').value.trim();
@@ -1579,8 +1654,14 @@ async function runReleaseGate() {
 
   const body = { project_name, release_version };
 
+  // Ticked reviews and pasted IDs are additive — pasting is how you reach a review from
+  // another project or an API run that isn't in this list.
+  const ids = pickedReviewIds();
   if (idsText) {
-    body.review_ids = idsText.split('\n').map(s => s.trim()).filter(Boolean);
+    ids.push(...idsText.split('\n').map(s => s.trim()).filter(Boolean));
+  }
+  if (ids.length) {
+    body.review_ids = Array.from(new Set(ids));
   }
 
   if (findingsText) {
@@ -1592,6 +1673,17 @@ async function runReleaseGate() {
     }
   }
 
+  // A gate over nothing returns Green, which is indistinguishable from a gate over work
+  // that genuinely passed. Make the caller say they meant it.
+  if (!body.review_ids && !body.findings) {
+    const go = confirm(
+      'No reviews selected and no findings pasted.\n\n' +
+      'The gate would be evaluated over zero findings and will almost certainly come back ' +
+      'Green — which means "nothing was checked", not "nothing is wrong".\n\nRun it anyway?'
+    );
+    if (!go) return;
+  }
+
   showLoading('Evaluating Release Gate...');
   try {
     const result = await apiFetch('/api/release-gate', {
@@ -1600,12 +1692,204 @@ async function runReleaseGate() {
       body: JSON.stringify(body),
     });
     renderResult('gate-result', result);
+    if (body.review_ids) {
+      document.getElementById('gate-result').insertAdjacentHTML('afterbegin',
+        `<div class="info-box">Gated on ${body.review_ids.length} prior review${body.review_ids.length === 1 ? '' : 's'}.</div>`);
+    }
     loadDashboard();
   } catch (e) {
     showError('gate-result', e.message);
   } finally {
     hideLoading();
   }
+}
+
+// ── Governance Report ─────────────────────────────────────────────────────
+//
+// `report-generate` is a registered workflow that nothing in the browser called, and a
+// report produced by a full review was only ever surfaced as a bare UUID. Reports also had
+// no listing endpoint at all until `GET /api/reports` was added, so the only way to reach
+// one was to already know its id.
+
+async function loadReportReviewPicker() {
+  const wrap = document.getElementById('report-review-picker');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="empty-state">Loading reviews…</div>';
+  try {
+    const data = await apiFetch('/api/reviews?limit=50');
+    const reviews = data.reviews || [];
+    if (!reviews.length) {
+      wrap.innerHTML = '<div class="empty-state">No reviews yet in this project. Run an agent first.</div>';
+      return;
+    }
+    wrap.innerHTML = reviews.map(r => {
+      const gate = r.gate_status || '';
+      return `
+        <label class="review-pick" title="${esc(r.id)}">
+          <input type="checkbox" class="report-review-cb" value="${esc(r.id)}" />
+          <span class="review-pick-gate gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'}</span>
+          <span class="review-pick-main">
+            <span class="review-pick-type">${esc((r.review_type || '').replace(/_/g, ' '))}</span>
+            <span class="review-pick-meta">${esc(r.project_name || '')} · ${r.findings_count || 0} findings</span>
+          </span>
+          <span class="review-pick-when">${esc((r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
+        </label>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load reviews: ${esc(e.message)}</div>`;
+  }
+}
+
+function selectAllReportReviews(checked) {
+  document.querySelectorAll('.report-review-cb').forEach(cb => { cb.checked = checked; });
+}
+
+async function loadReportList() {
+  const wrap = document.getElementById('report-list');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/api/reports?limit=25');
+    const reports = data.reports || [];
+    if (!reports.length) {
+      wrap.innerHTML = '<div class="empty-state">No reports generated yet.</div>';
+      return;
+    }
+    wrap.innerHTML = reports.map(r => {
+      const gate = r.gate_status || '';
+      return `
+        <div class="review-pick review-pick-clickable" onclick="viewGovernanceReport('${esc(r.id)}')">
+          <span class="review-pick-gate gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'}</span>
+          <span class="review-pick-main">
+            <span class="review-pick-type">${esc(r.project_name || 'Report')}</span>
+            <span class="review-pick-meta">
+              Risk ${Math.round(r.overall_risk_score || 0)}/100 · ${r.total_findings || 0} findings
+              ${r.approval_required ? ' · approval required' : ''}
+            </span>
+          </span>
+          <span class="review-pick-when">${esc((r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load reports: ${esc(e.message)}</div>`;
+  }
+}
+
+async function generateGovernanceReport() {
+  const project_name = document.getElementById('report-project').value.trim();
+  const review_ids = Array.from(document.querySelectorAll('.report-review-cb:checked')).map(cb => cb.value);
+  if (!review_ids.length) {
+    alert('Select at least one review — the report is a synthesis of prior findings, not a new review.');
+    return;
+  }
+
+  showLoading('Generating governance report…');
+  try {
+    const result = await apiFetch('/api/v1/agents/report-generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_name, review_ids }),
+    });
+    renderGovernanceReport('report-result', result);
+    loadReportList();
+  } catch (e) {
+    showError('report-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function viewGovernanceReport(reportId) {
+  showLoading('Loading report…');
+  try {
+    const data = await apiFetch(`/api/reports/${reportId}`);
+    renderGovernanceReport('report-result', data.report || data);
+    document.getElementById('report-result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    showError('report-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+function renderGovernanceReport(targetId, report) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+
+  const gate = report.gate_status || 'Unknown';
+  const score = report.overall_risk_score ?? 0;
+  const byCategory = report.findings_by_category || {};
+  const totalFindings = Object.values(byCategory).reduce((n, v) => n + (v || []).length, 0);
+
+  let html = `
+    <div class="result-header">
+      <span class="gate-badge gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'} Gate: ${esc(gate)}</span>
+      <span class="risk-score-badge">Overall Risk: ${Math.round(score)}/100</span>
+      <span style="color:var(--text-muted);font-size:13px">
+        ${esc(report.project_name || '')} · ${esc(report.review_date || '')} · ${totalFindings} findings
+      </span>
+    </div>`;
+
+  if (report.executive_summary) {
+    html += `<div class="findings-section"><h3>Executive Summary</h3>
+      <div class="summary-box">${esc(report.executive_summary)}</div></div>`;
+  }
+
+  if (report.approval_required) {
+    const approvers = report.approvers_needed || [];
+    html += `<div class="info-box" style="margin-top:12px">
+      <strong>Approval required before release.</strong>
+      ${approvers.length ? `<ul class="recs-list">${approvers.map(a => `<li>${esc(a)}</li>`).join('')}</ul>` : ''}
+    </div>`;
+  }
+  if (report.human_oversight_required) {
+    html += `<div class="info-box" style="margin-top:12px">
+      🧑‍⚖️ <strong>Human oversight required</strong> — a high-risk AI decision-making control was flagged.
+    </div>`;
+  }
+
+  // Controls assessment. `controls_checked` is the whole library, so show the count rather
+  // than listing a few hundred ids.
+  const checked = (report.controls_checked || []).length;
+  const failed = report.controls_failed || [];
+  const passed = (report.controls_passed || []).length;
+  html += `<div class="findings-section"><h3>Controls</h3>
+    <div class="sub-reviews">
+      <div class="sub-review-pill">📋 <strong>${checked}</strong> <span style="color:var(--text-muted)">checked</span></div>
+      <div class="sub-review-pill">✅ <strong>${passed}</strong> <span style="color:var(--text-muted)">passed</span></div>
+      <div class="sub-review-pill">🔴 <strong>${failed.length}</strong> <span style="color:var(--text-muted)">failed</span></div>
+    </div>`;
+  if (failed.length) {
+    html += `<div class="chip-row">${failed.filter(Boolean).map(c => `<span class="compliance-chip">${esc(c)}</span>`).join('')}</div>`;
+  }
+  html += `</div>`;
+
+  // The stored document carries `compliance_flags`; the report-generate response returns
+  // the same set as the keys of `compliance_mapping`. Accept either.
+  const flags = report.compliance_flags || Object.keys(report.compliance_mapping || {});
+  if (flags.length) {
+    html += `<div class="findings-section"><h3>Compliance Coverage</h3>
+      <div class="chip-row">${flags.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join('')}</div></div>`;
+  }
+
+  Object.entries(byCategory).forEach(([category, findings]) => {
+    if (!findings || !findings.length) return;
+    html += `<div class="findings-section"><h3>${esc(category)} (${findings.length})</h3>`;
+    [...findings].sort((a, b) => (b.severity || 0) - (a.severity || 0))
+      .forEach(f => { html += renderFinding(f); });
+    html += `</div>`;
+  });
+
+  const recs = report.recommendations || [];
+  if (recs.length) {
+    html += `<div class="findings-section"><h3>Recommendations</h3>
+      <ol class="recs-list">${recs.map(r => `<li>${esc(r)}</li>`).join('')}</ol></div>`;
+  }
+
+  if (report.report_id) {
+    html += `<div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Report ID: ${esc(report.report_id)}</div>`;
+  }
+
+  wrap.innerHTML = html;
 }
 
 // ── Render Results ────────────────────────────────────────────────────────
@@ -1697,6 +1981,23 @@ function renderFullResult(targetId, result) {
     html += `</div>`;
   }
 
+  // What this gate did NOT look at. Without it a Green over five checks is indistinguishable
+  // from a Green over eight, which is the whole reason a reader over-trusts this screen.
+  const notRun = result.steps_not_run || [];
+  if (notRun.length) {
+    html += `<div class="sub-reviews not-run-row">`;
+    notRun.forEach(label => {
+      html += `<div class="sub-review-pill pill-not-run" title="This stage did not run, so the gate above says nothing about it">
+          ⊘ <strong>${esc(label)}</strong> <span style="color:var(--text-muted)">not run</span>
+        </div>`;
+    });
+    html += `</div>
+      <div class="info-box" style="margin-top:10px">
+        This gate covers only the stages that ran. ${notRun.length} stage${notRun.length === 1 ? ' was' : 's were'}
+        not part of this review — supply its artifact, or tick the matching option, to include it.
+      </div>`;
+  }
+
   const findings = result.top_findings || [];
   if (findings.length) {
     html += `<div class="findings-section"><h3>Top Findings</h3>`;
@@ -1714,13 +2015,26 @@ function renderFullResult(targetId, result) {
   if (result.report_id) {
     html += `
       <div class="info-box" style="margin-top:16px">
-        📄 <strong>Governance Report generated</strong> — ID: <code>${result.report_id}</code>
-        <br/>Accessible at <code>/api/reports/${result.report_id}</code>
+        📄 <strong>Governance Report generated.</strong>
+        <button class="btn-link" onclick="openGovernanceReport('${esc(result.report_id)}')">Open the report →</button>
       </div>
     `;
   }
+  // The review id is what the Release Gate and the Governance Report take as input. It used
+  // to be produced here and never shown, so the one thing you needed to carry this result
+  // forward was the one thing the screen withheld.
+  if (result.review_id) {
+    html += `<div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(result.review_id)}</div>`;
+  }
 
   wrap.innerHTML = html;
+}
+
+/** Jump to the Governance Report page and render one report. */
+function openGovernanceReport(reportId) {
+  const navItem = document.querySelector('.nav-item[data-page="governance-report"]');
+  if (navItem) navItem.click();
+  viewGovernanceReport(reportId);
 }
 
 function renderFinding(f) {
@@ -3124,6 +3438,164 @@ function renderGxPGeneratedDocuments() {
       </details>`;
     }).join('')}
   `;
+}
+
+// ── Agent Swarm ───────────────────────────────────────────────────────────
+//
+// POST /api/v1/swarm has existed, entitled and metered, since the swarm product was added —
+// but nothing in the browser ever called it, so the platform's one parallel multi-agent
+// capability was reachable only by API. The nav item already carries data-product="swarm",
+// so plan entitlement gating for this panel works without any extra wiring.
+
+const SWARM_SOURCE_LABELS = {
+  github_pr_url:   ['GitHub PR URL',   'https://github.com/owner/repo/pull/42'],
+  github_file_url: ['GitHub file URL', 'https://github.com/owner/repo/blob/main/src/api.py'],
+  github_repo_url: ['GitHub repo URL', 'https://github.com/owner/repo'],
+  jira_ticket:     ['Jira ticket',     'PROJ-123'],
+};
+
+let _swarmPolicies = {};
+
+async function loadSwarmPolicies() {
+  const sel = document.getElementById('swarm-policy');
+  if (!sel) return;
+  try {
+    const data = await apiFetch('/api/v1/swarm/policies');
+    _swarmPolicies = data.policies || {};
+    const names = data.policy_names || Object.keys(_swarmPolicies);
+    sel.innerHTML = names.map(n =>
+      `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    sel.onchange = describeSwarmPolicy;
+    describeSwarmPolicy();
+  } catch (e) {
+    sel.innerHTML = '<option value="">Could not load policies</option>';
+    document.getElementById('swarm-policy-hint').textContent = e.message;
+  }
+}
+
+function describeSwarmPolicy() {
+  const hint = document.getElementById('swarm-policy-hint');
+  const policy = _swarmPolicies[document.getElementById('swarm-policy').value];
+  if (!policy) { hint.innerHTML = '&nbsp;'; return; }
+  const req = (policy.required_agents || []).join(' · ');
+  const opt = (policy.optional_agents || []).join(' · ');
+  hint.innerHTML = `Required: <strong>${esc(req || 'none')}</strong>`
+    + (opt ? ` · Optional: ${esc(opt)}` : '')
+    + ` · Passes below ${policy.min_passing_score}`;
+}
+
+function onSwarmSourceChange() {
+  const type = document.getElementById('swarm-source-type').value;
+  const isText = type === 'text';
+  document.getElementById('swarm-text-group').style.display = isText ? '' : 'none';
+  document.getElementById('swarm-ref-group').style.display = isText ? 'none' : '';
+  if (!isText) {
+    const [label, placeholder] = SWARM_SOURCE_LABELS[type];
+    document.getElementById('swarm-ref-label').textContent = label;
+    document.getElementById('swarm-ref').placeholder = placeholder;
+  }
+}
+
+async function runSwarm() {
+  const project_name = document.getElementById('swarm-project').value.trim();
+  if (!project_name) { alert('Project name is required — the swarm result is filed against it.'); return; }
+
+  const type = document.getElementById('swarm-source-type').value;
+  const body = { project_name, policy_name: document.getElementById('swarm-policy').value };
+
+  if (type === 'text') {
+    const text = document.getElementById('swarm-text').value.trim();
+    if (!text) { alert('Paste an artifact to fan out.'); return; }
+    body.text = text;
+  } else {
+    const ref = document.getElementById('swarm-ref').value.trim();
+    if (!ref) { alert('Enter the source reference.'); return; }
+    body[type] = ref;
+  }
+  if (document.getElementById('swarm-postback').checked) body.post_back = true;
+
+  showLoading('Running the swarm — agents run in parallel…');
+  try {
+    const result = await apiFetch('/api/v1/swarm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    renderSwarmResult('swarm-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('swarm-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+function renderSwarmResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+
+  const gate = (r.swarm_gate || '').toUpperCase();
+  const icon = { GREEN: '✅', AMBER: '⚠️', RED: '🔴', BLOCKED: '⛔' }[gate] || '❓';
+  // The swarm's own gate vocabulary (GREEN/AMBER/RED/BLOCKED) is upper case and has a
+  // fourth value the per-agent gate badges don't; map onto the existing badge classes.
+  const gateClass = { GREEN: 'Green', AMBER: 'Amber', RED: 'Red', BLOCKED: 'Red' }[gate] || '';
+
+  let html = `
+    <div class="result-header">
+      <span class="gate-badge gate-${gateClass}">${icon} Swarm Gate: ${esc(gate)}</span>
+      <span class="risk-score-badge">Risk: ${Math.round(r.swarm_risk_score || 0)}/100</span>
+      <span style="color:var(--text-muted);font-size:13px">
+        ${(r.agents_run || []).length} agents · ${r.total_critical || 0} critical · ${r.total_high || 0} high
+      </span>
+    </div>
+    <div class="summary-box">
+      Policy <strong>${esc(document.getElementById('swarm-policy').value)}</strong>
+      (required: ${esc((r.policy_applied?.required_agents || []).join(' · ') || 'none')})
+      over ${esc(r.source_type || 'text')}${r.source_ref ? ` — ${esc(r.source_ref)}` : ''}.
+    </div>`;
+
+  const results = r.results || [];
+  if (results.length) {
+    html += `<div class="findings-section"><h3>Agents</h3><div class="swarm-grid">`;
+    results.forEach(a => {
+      const errored = !!a.error;
+      const ag = a.gate_status || '';
+      const agIcon = errored ? '💥' : (GATE_ICONS[ag] || '❓');
+      html += `
+        <div class="swarm-agent ${errored ? 'swarm-agent-error' : ''}">
+          <div class="swarm-agent-head">
+            <span>${agIcon} <strong>${esc(a.agent)}</strong></span>
+            <span class="gate-badge gate-${esc(ag)}">${esc(errored ? 'error' : ag)}</span>
+          </div>
+          ${errored
+            ? `<div class="swarm-agent-meta" style="color:var(--red)">${esc(a.error)}</div>
+               <div class="swarm-agent-meta">The gate was still issued — a failed agent never blocks it.</div>`
+            : `<div class="swarm-agent-meta">Risk ${Math.round(a.risk_score || 0)}/100 ·
+                 ${(a.findings || []).length} findings ·
+                 ${a.critical_count || 0} critical</div>
+               <div class="swarm-agent-summary">${esc((a.summary || '').slice(0, 180))}</div>`}
+        </div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  const blocking = r.blocking_findings || [];
+  if (blocking.length) {
+    html += `<div class="findings-section"><h3>Blocking findings (${blocking.length})</h3>`;
+    blocking.forEach(f => { html += renderFinding(f); });
+    html += `</div>`;
+  }
+
+  if ((r.agents_errored || []).length) {
+    html += `<div class="info-box" style="margin-top:12px">
+      ⚠️ Errored, and excluded from the score: <strong>${esc(r.agents_errored.join(', '))}</strong>.
+    </div>`;
+  }
+  if (r.swarm_review_id) {
+    html += `<div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.swarm_review_id)}</div>`;
+  }
+
+  wrap.innerHTML = html;
 }
 
 // ── Agent Hub ─────────────────────────────────────────────────────────────

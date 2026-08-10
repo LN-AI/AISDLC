@@ -38,9 +38,12 @@ def run(
         )
 
     if auto_review:
-        result["governance_review"] = governance_review(
-            orch, files, "", project_name, "Migrated code"
-        )
+        gov = governance_review(orch, files, "", project_name, "Migrated code")
+        result["governance_review"] = gov
+        # Top level, not just nested — see the same block in `codegen_scaffold.run`.
+        result["findings"] = gov["findings"]
+        result["gate_status"] = gov["gate_status"]
+        result["risk_score"] = gov["risk_score"]
 
     review_id = database.save_review(
         review_type="migration_execution",

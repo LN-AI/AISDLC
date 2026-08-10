@@ -419,6 +419,16 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id, created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id)")
 
+    # Same reasoning as `reviews.project_id` above, for the same reason: a governance report
+    # is the artifact a customer actually shows an auditor, and until now the only way to
+    # reach one was to already know its UUID — `reports` carried a free-text `project_name`
+    # and nothing else, so no screen could list a project's reports. NULL on pre-existing rows.
+    try:
+        cursor.execute("ALTER TABLE reports ADD COLUMN project_id TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reports_project ON reports(project_id, created_at)")
+
     # Modernization owns six tables of its own. Their DDL lives with the code that queries
     # them rather than here — this module is already read by everything, and those tables
     # are read by one subsystem — but they are still created in exactly one place, at
@@ -690,11 +700,16 @@ def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, An
 
 def save_report(review_id: Optional[str], project_name: str, report: Dict[str, Any]) -> str:
     report_id = str(uuid.uuid4())
+    # Same as `save_review`: `project_name` is free text a user typed, the real project is
+    # the one the call was authorised against, published by the API boundary.
+    project_id = context.current_project_id()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO reports (id, review_id, project_name, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
-        (report_id, review_id, project_name, json.dumps(report), datetime.utcnow().isoformat()),
+        "INSERT INTO reports (id, review_id, project_name, report_json, created_at, project_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (report_id, review_id, project_name, json.dumps(report),
+         datetime.utcnow().isoformat(), project_id),
     )
     conn.commit()
     conn.close()
@@ -712,6 +727,41 @@ def get_report(report_id: str) -> Optional[Dict[str, Any]]:
     data = dict(row)
     data["report"] = json.loads(data["report_json"]) if data["report_json"] else {}
     return data
+
+
+def list_reports(limit: int = 25, offset: int = 0,
+                 project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Reports newest first, scoped exactly like `list_reviews`.
+
+    Returns a summary row per report — gate, risk and title lifted out of `report_json` —
+    rather than the whole document, so a listing screen doesn't transfer every report in
+    full. Use `get_report` for the document itself.
+    """
+    scope, params = _review_scope_sql(project_ids)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT id, review_id, project_name, project_id, created_at, report_json "
+        f"FROM reports WHERE 1 = 1{scope} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        params + (limit, offset),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    reports = []
+    for row in rows:
+        data = dict(row)
+        document = json.loads(data.pop("report_json") or "{}")
+        # The report document has no finding total of its own — it groups them by category
+        # (report_generator._build_report_document), so count across the groups.
+        by_category = document.get("findings_by_category") or {}
+        data["gate_status"] = document.get("gate_status", "")
+        data["overall_risk_score"] = document.get("overall_risk_score", 0)
+        data["total_findings"] = sum(len(v or []) for v in by_category.values())
+        data["review_date"] = document.get("review_date", "")
+        data["approval_required"] = document.get("approval_required", False)
+        reports.append(data)
+    return reports
 
 
 def log_audit(cursor, event_type: str, entity_type: str, entity_id: str, actor: str = "system", details: str = ""):

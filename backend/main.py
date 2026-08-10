@@ -383,18 +383,37 @@ async def get_review(review_id: str, request: Request, reader: dict = Depends(re
     return review
 
 
+@app.get("/api/reports")
+async def list_reports(request: Request, limit: int = 25, offset: int = 0,
+                       reader: dict = Depends(require_reader)):
+    """A project's governance reports, newest first.
+
+    Reports were previously reachable only by UUID — there was no way to list them, which
+    is why nothing in the UI could show one.
+    """
+    reports = database.list_reports(limit=limit, offset=offset,
+                                    project_ids=_visible_project_ids(reader, request))
+    return {"reports": reports, "count": len(reports)}
+
+
 @app.get("/api/reports/{report_id}")
 async def get_report(report_id: str, request: Request, reader: dict = Depends(require_reader)):
     report = database.get_report(report_id)
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
-    # A report has no project of its own; it inherits the scope of the review it came from.
-    # One with no review can only be read by a super admin, since nothing establishes whose
-    # it is — the same rule the unattributed reviews follow.
+    # A report is attributed to a project directly (`reports.project_id`, stamped from the
+    # request context by `save_report`). It used to be scoped only through the review it
+    # came from — but both workflows that write reports pass `review_id=None`
+    # (`full_review.py`, `standalone_report.py`), so that path made every report 404 for
+    # everyone except a super admin. Falling back to the review keeps rows written before
+    # the column existed reachable.
     visible = _visible_project_ids(reader, request)
     if visible is not None:
-        source = database.get_review(report["review_id"]) if report.get("review_id") else None
-        if not source or source.get("project_id") not in visible:
+        project_id = report.get("project_id")
+        if project_id is None and report.get("review_id"):
+            source = database.get_review(report["review_id"])
+            project_id = source.get("project_id") if source else None
+        if project_id not in visible:
             raise HTTPException(status_code=404, detail="Report not found")
     return report
 
@@ -511,6 +530,8 @@ async def full_review(req: FullReviewRequest, request: Request):
     total_steps = count_steps(full_review_workflow.plan_steps(
         requirement=req.requirement, compliance_artifact=req.compliance_artifact,
         architecture=req.architecture, code=req.code, prompt_config=prompt_config,
+        include_security=req.include_security, include_vapt=req.include_vapt,
+        include_sensitive_data=req.include_sensitive_data,
     ))
 
     # Guarded here rather than by the legacy middleware: this returns 202 and does its
@@ -528,24 +549,32 @@ async def full_review(req: FullReviewRequest, request: Request):
     # single most expensive product on the platform — up to seven chained LLM calls per
     # click — was the one thing a per-minute limit did not cover.
     check_project_rate_limit(caller["_subject"], request.url.path)
-    agent_guard.preflight(caller["_subject"], "full")
+    # Reservation sized from the step plan above rather than the fixed
+    # `_EXPECTED_CALLS_BY_PRODUCT["full"]`, since the opt-in stages make the real call
+    # count vary from 5 to 10 per request (D-25's contextvar, same as the chunked reviewer).
+    with agent_guard.expect_calls(total_steps):
+        agent_guard.preflight(caller["_subject"], "full")
 
     def _run(on_progress):
-        return agent_guard.guarded_call(
-            caller, "full", None, skip_preflight=True,
-            project_name=req.project_name or "Unnamed Project",
-            fn=lambda: orchestrator.full_review(
-                requirement=req.requirement,
-                compliance_artifact=req.compliance_artifact,
-                architecture=req.architecture,
-                code=req.code,
-                prompt_config=prompt_config,
-                test_evidence=req.test_evidence,
+        with agent_guard.expect_calls(total_steps):
+            return agent_guard.guarded_call(
+                caller, "full", None, skip_preflight=True,
                 project_name=req.project_name or "Unnamed Project",
-                context=req.context or "",
-                on_progress=on_progress,
-            ),
-        )
+                fn=lambda: orchestrator.full_review(
+                    requirement=req.requirement,
+                    compliance_artifact=req.compliance_artifact,
+                    architecture=req.architecture,
+                    code=req.code,
+                    prompt_config=prompt_config,
+                    test_evidence=req.test_evidence,
+                    project_name=req.project_name or "Unnamed Project",
+                    context=req.context or "",
+                    on_progress=on_progress,
+                    include_security=req.include_security,
+                    include_vapt=req.include_vapt,
+                    include_sensitive_data=req.include_sensitive_data,
+                ),
+            )
 
     job_id = job_service.start_job("full", total_steps, _run)
     return {"job_id": job_id, "status": "queued", "poll_url": f"/api/v1/agents/jobs/{job_id}"}
