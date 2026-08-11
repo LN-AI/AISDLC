@@ -50,7 +50,7 @@ Custom envelope, fields returned at the top level (not nested):
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries (this call uses a raised `max_tokens=8000` output budget to fit a complete migrated file)
+- **Timeout & retry** — 900s timeout, up to 2 retries (this call uses a raised `max_tokens=16000` output budget to fit a complete migrated file)
 - **Prompt-injection scan** — non-blocking; would surface as `guardrail_flags` if triggered, though this field is not echoed in the explicit response shape above — check the underlying orchestrator result if you need it
 - **Untrusted content wrapping** — a fetched PR/file is wrapped before analysis
 - If `auto_review: true`, the migrated output is passed through the same Code Review and Sensitive Data Detector pipeline described in [`code.md`](code.md) and [`sensitive-data.md`](sensitive-data.md)

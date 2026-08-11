@@ -246,6 +246,29 @@ def init_db():
             UNIQUE(key_id, agent_name)
         );
 
+        -- Named LLM endpoints an admin can define in the UI and switch between. One of
+        -- these is the platform default (its id lives in platform_settings under
+        -- 'active_llm_connection_id'); per-key and per-request BYOL still override it.
+        -- `provider` is the wire format the gateway speaks ('anthropic' | 'openai');
+        -- `preset` is only a UI label (omniroute, ollama, azure, ...) driving field prefills.
+        CREATE TABLE IF NOT EXISTS llm_connections (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            preset TEXT DEFAULT 'custom',
+            provider TEXT NOT NULL,
+            api_key_encrypted TEXT DEFAULT '',
+            base_url TEXT,
+            model TEXT,
+            max_tokens INTEGER,
+            timeout_seconds REAL,
+            last_test_status TEXT,
+            last_test_at TEXT,
+            last_test_detail TEXT,
+            created_by TEXT DEFAULT 'admin',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS platform_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -621,6 +644,21 @@ def list_reviews(limit: int = 20, offset: int = 0,
     return [dict(r) for r in rows]
 
 
+def count_reviews(project_ids: Optional[List[str]] = None) -> int:
+    """How many reviews the caller may see — the denominator a pager needs.
+
+    Scoped through the same `_review_scope_sql` as `list_reviews`, so the count and the
+    page it describes can never disagree about which projects are in view.
+    """
+    scope, params = _review_scope_sql(project_ids)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) as total FROM reviews WHERE 1 = 1{scope}", params)
+    total = cursor.fetchone()["total"]
+    conn.close()
+    return total
+
+
 def get_platform_setting(key: str) -> Optional[str]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -643,6 +681,126 @@ def set_platform_setting(key: str, value: str, updated_by: str = "system") -> No
     )
     conn.commit()
     conn.close()
+
+
+# ── LLM connections (admin-managed provider endpoints) ─────────────────────
+#
+# Rows are returned raw, encrypted secret included — decrypting and masking is the
+# service layer's job (backend/services/llm_settings_service.py), because only it
+# knows which callers may see what. Nothing here ever returns a plaintext key.
+
+ACTIVE_LLM_CONNECTION_KEY = "active_llm_connection_id"
+
+
+def list_llm_connections() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM llm_connections ORDER BY name COLLATE NOCASE")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_llm_connection(connection_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM llm_connections WHERE id = ?", (connection_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_llm_connection_by_name(name: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM llm_connections WHERE name = ? COLLATE NOCASE", (name,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_llm_connection(
+    name: str, provider: str, api_key_encrypted: str = "", *,
+    preset: str = "custom", base_url: Optional[str] = None, model: Optional[str] = None,
+    max_tokens: Optional[int] = None, timeout_seconds: Optional[float] = None,
+    created_by: str = "admin",
+) -> Dict[str, Any]:
+    now = datetime.utcnow().isoformat()
+    connection_id = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO llm_connections
+            (id, name, preset, provider, api_key_encrypted, base_url, model,
+             max_tokens, timeout_seconds, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (connection_id, name, preset, provider, api_key_encrypted, base_url or None,
+         model or None, max_tokens, timeout_seconds, created_by, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return get_llm_connection(connection_id)
+
+
+def update_llm_connection(connection_id: str, **fields) -> Optional[Dict[str, Any]]:
+    """Patch-update. Only the columns present in `fields` are written, so an edit that
+    doesn't re-enter the API key keeps the stored one instead of blanking it."""
+    allowed = {
+        "name", "preset", "provider", "api_key_encrypted", "base_url", "model",
+        "max_tokens", "timeout_seconds",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return get_llm_connection(connection_id)
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    assignments = ", ".join(f"{k} = ?" for k in updates)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE llm_connections SET {assignments} WHERE id = ?",
+        (*updates.values(), connection_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_llm_connection(connection_id)
+
+
+def delete_llm_connection(connection_id: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM llm_connections WHERE id = ?", (connection_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    # A deleted connection must not stay selected — the gateway would then resolve an
+    # id that no longer exists and silently fall back with no trace of why.
+    if deleted and get_platform_setting(ACTIVE_LLM_CONNECTION_KEY) == connection_id:
+        set_platform_setting(ACTIVE_LLM_CONNECTION_KEY, "", "system")
+    return deleted
+
+
+def record_llm_connection_test(connection_id: str, status: str, detail: str = "") -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE llm_connections SET last_test_status = ?, last_test_at = ?, last_test_detail = ? WHERE id = ?",
+        (status, datetime.utcnow().isoformat(), detail[:2000], connection_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_active_llm_connection() -> Optional[Dict[str, Any]]:
+    connection_id = get_platform_setting(ACTIVE_LLM_CONNECTION_KEY)
+    if not connection_id:
+        return None
+    return get_llm_connection(connection_id)
+
+
+def set_active_llm_connection(connection_id: Optional[str], updated_by: str = "admin") -> None:
+    set_platform_setting(ACTIVE_LLM_CONNECTION_KEY, connection_id or "", updated_by)
 
 
 def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:

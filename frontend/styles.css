@@ -508,6 +508,42 @@ textarea { font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; }
 
 .reviews-table tr:hover td { background: var(--surface2); cursor: pointer; }
 
+/* A full page of reviews is taller than the dashboard: scroll the rows and pin the
+   header, so the columns stay readable on the way down. */
+.reviews-table-scroll {
+  max-height: 58vh;
+  overflow-y: auto;
+}
+
+.reviews-table-scroll .reviews-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.table-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.pager-range { font-size: 12px; color: var(--text-muted); }
+
+.pager-buttons { display: flex; gap: 8px; }
+
+.pager-buttons .btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pager-buttons .btn:disabled:hover {
+  border-color: var(--border);
+  color: var(--text);
+}
+
 .gate-dot {
   display: inline-flex;
   align-items: center;
@@ -1645,3 +1681,48 @@ button.not-entitled::after {
 .swarm-agent-summary { font-size: 12px; margin-top: 6px; line-height: 1.5; }
 
 .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+
+/* Which LLM is serving agent calls — sits under the project picker so it is visible on
+   every page. Shown to every signed-in user, not just admins: a reader of a set of
+   findings needs to know whether Claude or a local router produced them. */
+.sidebar-llm {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.sidebar-llm-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-muted);
+}
+/* Green is reserved for a connection that has actually passed a tool-call test.
+   Configured-but-untested is amber — "set up" and "works" are different claims. */
+.sidebar-llm-dot.ok { background: var(--green); }
+.sidebar-llm-dot.untested { background: var(--amber); }
+.sidebar-llm-dot.failed { background: var(--red); }
+.sidebar-llm-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Compact status pills for the connections table. The existing .gate-badge is sized for
+   a headline verdict (15px, generous padding) and looks wrong inside a table row. */
+.llm-pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.llm-pill.ok { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+.llm-pill.untested { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber); }
+.llm-pill.failed { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }

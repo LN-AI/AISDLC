@@ -28,6 +28,14 @@
         <div class="sidebar-project-meta" id="active-project-meta"></div>
       </div>
 
+      <!-- Which LLM is actually serving reviews. Visible to every signed-in user, not
+           just admins: if a review was produced by a local router rather than Claude,
+           that is something the person reading the findings needs to know. -->
+      <div class="sidebar-llm" id="sidebar-llm" style="display:none" title="The model serving agent calls">
+        <span class="sidebar-llm-dot" id="sidebar-llm-dot"></span>
+        <span class="sidebar-llm-text" id="sidebar-llm-text">—</span>
+      </div>
+
       <ul class="nav-list">
         <li class="nav-item active" data-page="dashboard">
           <span class="nav-icon">📊</span> Dashboard
@@ -175,6 +183,9 @@
             <li class="nav-item" data-page="api-keys" id="nav-api-keys" style="display:none">
               <span class="nav-icon">🔑</span> API Keys
             </li>
+            <li class="nav-item" data-page="llm-providers" id="nav-llm-providers" style="display:none">
+              <span class="nav-icon">🧠</span> LLM Providers
+            </li>
             <li class="nav-item" data-page="plans" id="nav-plans" style="display:none">
               <span class="nav-icon">📦</span> Plans
             </li>
@@ -248,8 +259,15 @@
           </div>
         </div>
         <div class="section-title">Recent Reviews</div>
-        <div id="recent-reviews" class="reviews-table-wrap">
+        <div id="recent-reviews" class="reviews-table-wrap reviews-table-scroll">
           <div class="empty-state">Loading...</div>
+        </div>
+        <div id="recent-reviews-pager" class="table-pager hidden">
+          <span id="recent-reviews-range" class="pager-range"></span>
+          <div class="pager-buttons">
+            <button class="btn btn-secondary btn-sm" id="recent-reviews-prev" onclick="pageRecentReviews(-1)">← Newer</button>
+            <button class="btn btn-secondary btn-sm" id="recent-reviews-next" onclick="pageRecentReviews(1)">Older →</button>
+          </div>
         </div>
       </div>
 
@@ -1860,6 +1878,49 @@ Examples:
         </div>
       </div>
 
+      <!-- LLM Providers Page -->
+      <div id="page-llm-providers" class="page">
+        <div class="page-header">
+          <h1>LLM Providers</h1>
+          <p class="subtitle">Define the model endpoints this platform can run on and choose which one serves agent calls. The active connection is used everywhere — the review forms on this site, Agent Hub, Swarm, workflows and the v1 API — so switching here switches the whole platform. Teams that bring their own LLM on an API key still override it.</p>
+        </div>
+
+        <div class="form-card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+          <div>
+            <div class="section-title" style="margin-top:0">Currently serving agent calls</div>
+            <div id="llmp-active-label" style="font-size:13px;color:var(--text-muted)">Loading…</div>
+          </div>
+          <button class="btn btn-primary" onclick="openLlmConnectionModal()">
+            <span class="btn-icon">＋</span> Add Connection
+          </button>
+        </div>
+
+        <div id="llmp-list" class="result-area" style="margin-top:16px"></div>
+
+        <div class="api-usage-card" style="margin-top:16px">
+          <div class="api-usage-title">Things worth knowing before you switch</div>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Tool calling is mandatory.</strong> Every agent gets its structured output by forcing the
+            model to call a JSON tool, so a provider that can't do that can't run a single review.
+            <strong>Test</strong> sends exactly that kind of call and tells you whether one came back.
+          </p>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Costs become estimates.</strong> Spend is priced from a per-model table; a model that isn't in
+            it is priced with a default rate and flagged as estimated on the Usage screen. A free local
+            endpoint will still show a non-zero figure.
+          </p>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Prompt caching is Anthropic-only.</strong> Switching away loses it and multi-agent runs get
+            more expensive per token; switching back restores it automatically.
+          </p>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Latency compounds.</strong> Reviews send far larger prompts than the test does. If the test
+            takes tens of seconds, a full review will take minutes — set a per-connection timeout to fail fast
+            rather than waiting out the platform-wide one.
+          </p>
+        </div>
+      </div>
+
       <!-- API Keys Page -->
       <div id="page-api-keys" class="page">
         <div class="page-header">
@@ -2252,6 +2313,71 @@ Examples:
       <div class="form-actions" style="margin-top:18px">
         <button class="btn btn-primary" onclick="saveProjectEdits()">Save Changes</button>
         <button class="btn btn-secondary" onclick="closeProjectEditor()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="llm-connection-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeLlmConnectionModal()">
+    <div class="modal-box" style="width:600px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeLlmConnectionModal()" title="Dismiss (Esc)">✕</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 style="margin-bottom:2px" id="llmc-title">Add LLM Connection</h2>
+        <p>Anthropic, a local router, or anything that speaks one of the two wire formats.</p>
+      </div>
+
+      <div class="form-group">
+        <label>Provider type</label>
+        <select id="llmc-preset" onchange="applyLlmPreset()"></select>
+        <div id="llmc-preset-hint" style="font-size:12px;color:var(--text-muted);margin-top:6px"></div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Name</label>
+          <input type="text" id="llmc-name" placeholder="e.g. OmniRoute local" />
+        </div>
+        <div class="form-group flex1">
+          <label>Wire format</label>
+          <select id="llmc-provider">
+            <option value="anthropic">Anthropic Messages API</option>
+            <option value="openai">OpenAI chat-completions</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Base URL</label>
+          <input type="text" id="llmc-baseurl" placeholder="Blank for the vendor default" />
+        </div>
+        <div class="form-group flex1">
+          <label>Model</label>
+          <input type="text" id="llmc-model" placeholder="e.g. auto/best-fast" />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>API Key</label>
+        <input type="password" id="llmc-apikey" placeholder="Encrypted at rest, never shown again" />
+        <div id="llmc-key-hint" style="font-size:12px;color:var(--text-muted);margin-top:6px"></div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Max output tokens — ceiling (optional)</label>
+          <input type="number" id="llmc-maxtokens" placeholder="Blank uses the platform default" />
+          <div class="field-hint">Your model's real output cap, e.g. 16384 for gpt-4o. Agents ask for up to 32000; larger requests are clamped to this rather than rejected by the endpoint.</div>
+        </div>
+        <div class="form-group flex1">
+          <label>Timeout, seconds (optional)</label>
+          <input type="number" id="llmc-timeout" placeholder="Blank uses the platform default" />
+        </div>
+      </div>
+
+      <div id="llmc-error" class="hidden" style="font-size:13px;color:var(--red);margin-bottom:10px"></div>
+      <div class="form-actions">
+        <button class="btn btn-primary" id="llmc-save" onclick="saveLlmConnection()">Save</button>
+        <button class="btn btn-secondary" onclick="closeLlmConnectionModal()">Cancel</button>
       </div>
     </div>
   </div>

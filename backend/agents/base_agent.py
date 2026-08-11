@@ -167,9 +167,11 @@ class BaseAgent:
         # default, any review with a realistic number of findings (~10+) could truncate — this
         # was previously invisible because a truncated response silently rendered as an empty
         # "clean" result; now that truncation raises instead of swallowing, it surfaced as a
-        # real 502 on a requirement review with 12 findings. 8000 matches the floor already
-        # established for VAPT/security's comparably-sized schemas.
-        return llm_gateway.call_tool(self.system_prompt, user_content, REVIEW_TOOL_SCHEMA, llm_override, max_tokens=8000)
+        # real 502 on a requirement review with 12 findings. 16000 is deliberate headroom over
+        # the largest review anyone has produced, not a fit to the typical one: the failure
+        # mode of too little is a discarded review, and of too much is nothing at all — the
+        # provider bills generated tokens, not the budget.
+        return llm_gateway.call_tool(self.system_prompt, user_content, REVIEW_TOOL_SCHEMA, llm_override, max_tokens=16000)
 
     def review(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content
@@ -185,12 +187,13 @@ class BaseAgent:
         in Python (release-gate, report-generate) — asks the model only for prose (summary,
         recommendations, compliance_flags) via GOVERNANCE_SUMMARY_TOOL_SCHEMA, instead of
         REVIEW_TOOL_SCHEMA which forces a full findings re-echo the caller would discard
-        anyway. 4096 gives real margin over the schema's actual size (3 small fields) rather
-        than being tuned to exactly fit today's typical response."""
+        anyway. 8000 gives real margin over the schema's actual size (3 small fields) rather
+        than being tuned to exactly fit today's typical response — the smallest budget in the
+        codebase, because this is the only call that asks for prose alone."""
         user_content = content
         if context:
             user_content = f"Context:\n{context}\n\n---\n\nContent to Review:\n{content}"
-        result = llm_gateway.call_tool(self.system_prompt, user_content, GOVERNANCE_SUMMARY_TOOL_SCHEMA, llm_override, max_tokens=4096)
+        result = llm_gateway.call_tool(self.system_prompt, user_content, GOVERNANCE_SUMMARY_TOOL_SCHEMA, llm_override, max_tokens=8000)
         result["agent_name"] = self.agent_name
         return result
 
@@ -319,8 +322,10 @@ class VAPTBaseAgent(BaseAgent):
         # empty findings/summary response (false "Green, 0 findings"), so this
         # call needs more headroom than the generic REVIEW_TOOL_SCHEMA agents.
         # 8000 was still observed truncating (confirmed via the new truncation-raising
-        # error path rather than a silent empty result) — bumped further to 14000.
-        return llm_gateway.call_tool(self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override, max_tokens=14000)
+        # error path rather than a silent empty result), then 14000; now 28000, so a
+        # thorough pentest report on a large surface has room to be thorough rather than
+        # being cut off and discarded.
+        return llm_gateway.call_tool(self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override, max_tokens=28000)
 
     def review_vapt(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content
@@ -447,7 +452,9 @@ class ArchitectureBaseAgent(BaseAgent):
         # end — the platform default max_tokens (4096) was observed truncating the
         # response after the specialized arrays but before those tail fields, giving a
         # false "Green, 0 findings" gate despite real anti-patterns/SPOFs being found.
-        return llm_gateway.call_tool(self.system_prompt, user_content, ARCHITECTURE_TOOL_SCHEMA, llm_override, max_tokens=16000)
+        # 32000 is the top tier in the codebase, and `agent_guard.RESERVATION_MAX_TOKENS`
+        # is sized from this value — raising it further has to move that constant too.
+        return llm_gateway.call_tool(self.system_prompt, user_content, ARCHITECTURE_TOOL_SCHEMA, llm_override, max_tokens=32000)
 
     def review_architecture(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content
@@ -463,8 +470,8 @@ class SecurityReviewBaseAgent(BaseAgent):
         # SECURITY_REVIEW_TOOL_SCHEMA adds stride_threats[]/trust_boundaries[] on top of
         # the generic findings[], comparable per-finding verbosity to VAPT_TOOL_SCHEMA —
         # 8000 still truncated in practice (confirmed via the truncation-raising error,
-        # not silently), so this matches VAPT's proven 14000 level.
-        return llm_gateway.call_tool(self.system_prompt, user_content, SECURITY_REVIEW_TOOL_SCHEMA, llm_override, max_tokens=14000)
+        # not silently), so this tracks VAPT's budget — now 28000.
+        return llm_gateway.call_tool(self.system_prompt, user_content, SECURITY_REVIEW_TOOL_SCHEMA, llm_override, max_tokens=28000)
 
     def review_security(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content

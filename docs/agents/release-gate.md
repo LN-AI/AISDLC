@@ -48,7 +48,7 @@ Gate Decision Framework:
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars) applies to the aggregated evidence/findings text sent to the model
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; flags surfaced as `guardrail_flags`
 - No GitHub/Jira fetch happens for this endpoint, so there is no untrusted-content wrapping step — all input is either your own `evidence_summary` text or findings already stored from prior agent calls
 

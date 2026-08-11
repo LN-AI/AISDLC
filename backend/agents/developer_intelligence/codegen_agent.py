@@ -209,7 +209,7 @@ and 3-8 concrete design patterns for this system. Provide 2-3 ranked, meaningful
 and list 1-3 prose alternatives with switch conditions. Flag any compliance-driven build requirements implied by
 the requirement.
 """
-        result = llm_gateway.call_tool(ADVISORY_SYSTEM_PROMPT, prompt, CODEGEN_ADVISORY_TOOL_SCHEMA, max_tokens=6000)
+        result = llm_gateway.call_tool(ADVISORY_SYSTEM_PROMPT, prompt, CODEGEN_ADVISORY_TOOL_SCHEMA, max_tokens=12000)
         result["agent_name"] = self.agent_name
         return result
 
@@ -266,7 +266,7 @@ Generate the starter project files now.
         # empty `files: []` response — a real scaffold (8-16 files with actual
         # content) needs substantially more headroom than a findings list.
         result = llm_gateway.call_tool(
-            SCAFFOLD_SYSTEM_PROMPT, prompt, CODEGEN_SCAFFOLD_TOOL_SCHEMA, max_tokens=16000,
+            SCAFFOLD_SYSTEM_PROMPT, prompt, CODEGEN_SCAFFOLD_TOOL_SCHEMA, max_tokens=32000,
         )
         result["agent_name"] = self.agent_name
         return result

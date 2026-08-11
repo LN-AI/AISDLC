@@ -24,9 +24,11 @@ from backend.services.modernization import charter as charter_module
 logger = logging.getLogger(__name__)
 
 # A converted unit can legitimately be long — this is a whole file, not a list of findings.
-# Above the 16000 `agent_guard.RESERVATION_MAX_TOKENS` would under-reserve budget, so any
-# increase here has to move that constant too.
-CONVERSION_MAX_TOKENS = 16000
+# Above the 32000 `agent_guard.RESERVATION_MAX_TOKENS` would under-reserve budget, so any
+# increase here has to move that constant too. At 32000 the largest unit that converts in
+# one call is roughly 3,000 LOC (was ~1,500 at 16000 — see C-23); beyond that the unit
+# still fails validation rather than emitting a partial file.
+CONVERSION_MAX_TOKENS = 32000
 
 UNIT_CONVERSION_TOOL_SCHEMA = {
     "name": "submit_unit_conversion",

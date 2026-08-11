@@ -210,7 +210,7 @@ Verify this codebase against FDA 21 CFR Part 11. Cover audit trail, electronic s
 access control, and data integrity (ALCOA+) as four distinct assessments, plus a full findings list with
 specific evidence. Note validation-readiness (process-level) gaps separately from code findings. Be exhaustive.
 """
-        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, CFR21_TOOL_SCHEMA, max_tokens=8000)
+        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, CFR21_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
         if "files_scanned" not in result or not result["files_scanned"]:
             result["files_scanned"] = [f.get("path", "unknown") for f in files]

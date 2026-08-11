@@ -66,7 +66,7 @@ Custom envelope — note the entire agent result is nested under `recommendation
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; flags surface inside `recommendation.guardrail_flags`
 - No external content is fetched for this agent, so no untrusted-content wrapping applies
 

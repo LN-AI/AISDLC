@@ -49,7 +49,7 @@ The underlying Auto-Fix Agent also fixes only what findings describe — it will
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars), applied to the PR diff during the Code Review step
-- **Timeout & retry** — 120s timeout per LLM call (there are at least two: the Code Review call and the Auto-Fix generation call, raised to `max_tokens=8000`), up to 2 retries each
+- **Timeout & retry** — 900s timeout per LLM call (there are at least two: the Code Review call and the Auto-Fix generation call, raised to `max_tokens=16000`), up to 2 retries each
 - **Prompt-injection scan** — non-blocking, applied during the Code Review sub-call
 - **Untrusted content wrapping** — the PR diff is wrapped with `<<<UNTRUSTED_GITHUB_PR_DIFF_START/END>>>` markers before either the Code Review or Auto-Fix step analyzes it
 - **Secret-scan commit guardrail (blocking, unique to this agent)** — every generated patch's `fixed_content` is scanned with `scan_for_hardcoded_secrets()` (AWS keys, private key blocks, generic `api_key=`/`secret=`/`token=`/`password=` assignments, GitHub PATs, OpenAI/Anthropic-style secret keys) before being committed. A match blocks that one file from being committed — it's listed in `blocked_patches` instead — while any other clean patches in the same batch are still committed normally

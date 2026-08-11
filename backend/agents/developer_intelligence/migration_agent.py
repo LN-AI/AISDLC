@@ -206,7 +206,7 @@ and recommend an approach (with justification) and a rollback strategy.
         # No max_tokens override here previously (4096 default) was observed truncating
         # this call on a realistic multi-section assessment (breaking changes + phased
         # plan + risk areas) — bump to match migration-execution's already-proven 8000.
-        result = llm_gateway.call_tool(MIGRATION_ASSESSMENT_SYSTEM_PROMPT, prompt, MIGRATION_ASSESSMENT_TOOL_SCHEMA, max_tokens=8000)
+        result = llm_gateway.call_tool(MIGRATION_ASSESSMENT_SYSTEM_PROMPT, prompt, MIGRATION_ASSESSMENT_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
         return result
 
@@ -236,6 +236,6 @@ and recommend an approach (with justification) and a rollback strategy.
 Migrate this file to the target stack now. Preserve behavior. List every change and everything that needs
 manual follow-up.
 """
-        result = llm_gateway.call_tool(MIGRATION_EXECUTION_SYSTEM_PROMPT, prompt, MIGRATION_EXECUTION_TOOL_SCHEMA, max_tokens=8000)
+        result = llm_gateway.call_tool(MIGRATION_EXECUTION_SYSTEM_PROMPT, prompt, MIGRATION_EXECUTION_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
         return result

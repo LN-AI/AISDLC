@@ -54,7 +54,7 @@ Standard envelope (`_wrap`):
 ## Guardrails applied
 
 - **Input size limit** — rejects (HTTP 413) artifacts over `MAX_AGENT_INPUT_CHARS` (400,000 characters by default)
-- **Timeout & retry** — 120s timeout per LLM call, up to 2 retries on transient provider errors (connection/timeout/rate-limit/5xx)
+- **Timeout & retry** — 900s timeout per LLM call, up to 2 retries on transient provider errors (connection/timeout/rate-limit/5xx)
 - **Prompt-injection scan** — non-blocking heuristic scan of the submitted content; matches are attached to the response as `guardrail_flags`, never used to block the call
 - **Untrusted content wrapping** — content fetched from Jira/GitHub is delimited with `<<<UNTRUSTED_..._START/END>>>` markers so the model treats it as data, never as instructions
 

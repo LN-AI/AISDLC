@@ -8,7 +8,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Security, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, UploadFile, File, Form
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
@@ -37,6 +37,7 @@ from backend.routes.products import router as products_router
 from backend.routes.usage import router as usage_router
 from backend.routes.swarm import router as swarm_router
 from backend.routes.llm_config import router as llm_config_router
+from backend.routes.llm_providers import router as llm_providers_router
 from backend.routes.projects import router as projects_router
 from backend.routes.verticals import router as verticals_router
 from backend.routes.issue_triage_dashboard import router as issue_triage_dashboard_router
@@ -72,7 +73,7 @@ from backend.models.api_models import (
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services import job_service
 from backend.services.knowledge_base import knowledge_base
-from backend.services import agent_guard, legacy_guard, subject_service
+from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
 from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
     RateLimitExceeded,
@@ -246,6 +247,7 @@ app.include_router(products_router)
 app.include_router(usage_router)
 app.include_router(swarm_router)
 app.include_router(llm_config_router)
+app.include_router(llm_providers_router)
 app.include_router(projects_router)
 app.include_router(verticals_router)
 app.include_router(issue_triage_dashboard_router)
@@ -253,6 +255,23 @@ app.include_router(cost_optimization_router)
 app.include_router(client_log_router)
 
 orchestrator = SDLCOrchestrator()
+
+
+def _require_llm() -> None:
+    """Refuse an agent call only when *nothing* can serve it.
+
+    This used to be a bare `if not config.ANTHROPIC_API_KEY` repeated on every route,
+    which 503'd even with a perfectly good local connection selected — the app claimed
+    to need a key it wasn't going to call. An admin-selected LLM connection (see
+    /api/v1/llm-providers) now satisfies it too, so ANTHROPIC_API_KEY can be left empty.
+    """
+    if not llm_settings_service.is_llm_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="No LLM configured. Set ANTHROPIC_API_KEY, or add and activate a "
+                   "connection under Settings → LLM Providers.",
+        )
+
 
 # Security schemes for the read endpoints below. `auto_error=False` on both so a missing
 # credential falls through to require_reader's own 401 rather than FastAPI's terser one.
@@ -363,11 +382,23 @@ async def get_dashboard(request: Request, reader: dict = Depends(require_reader)
 
 
 @app.get("/api/reviews")
-async def list_reviews(request: Request, limit: int = 20, offset: int = 0,
+async def list_reviews(request: Request, limit: int = Query(20, ge=1, le=200),
+                       offset: int = Query(0, ge=0),
                        reader: dict = Depends(require_reader)):
-    reviews = database.list_reviews(limit=limit, offset=offset,
-                                    project_ids=_visible_project_ids(reader, request))
-    return {"reviews": reviews, "count": len(reviews)}
+    """One page of reviews, newest first.
+
+    `count` is how many rows this page holds; `total` is how many the caller may see in
+    all, which is what a pager needs to know whether there is a next page.
+    """
+    visible = _visible_project_ids(reader, request)
+    reviews = database.list_reviews(limit=limit, offset=offset, project_ids=visible)
+    return {
+        "reviews": reviews,
+        "count": len(reviews),
+        "total": database.count_reviews(project_ids=visible),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @app.get("/api/reviews/{review_id}")
@@ -424,8 +455,7 @@ async def get_report(report_id: str, request: Request, reader: dict = Depends(re
 async def review_requirement(req: ReviewRequest, project_name: str = ""):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_requirement(
             content=req.content,
@@ -468,8 +498,7 @@ async def review_requirement_file(
 async def review_code(req: CodeReviewRequest, project_name: str = ""):
     if not req.code.strip():
         raise HTTPException(status_code=400, detail="Code is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_code(
             code=req.code,
@@ -491,8 +520,7 @@ async def review_code(req: CodeReviewRequest, project_name: str = ""):
 async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
     if not any([req.system_prompt, req.user_prompt, req.tool_definitions, req.rag_config]):
         raise HTTPException(status_code=400, detail="At least one prompt field is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_prompt(
             system_prompt=req.system_prompt or "",
@@ -519,8 +547,7 @@ async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
 async def full_review(req: FullReviewRequest, request: Request):
     if not any([req.requirement, req.compliance_artifact, req.architecture, req.code, req.prompt]):
         raise HTTPException(status_code=400, detail="At least one artifact is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
 
     prompt_config = None
     if req.prompt:
@@ -596,8 +623,7 @@ async def full_review_job_status(job_id: str, reader: dict = Depends(require_rea
 async def review_github_pr(req: GithubPRRequest):
     if not req.pr_url:
         raise HTTPException(status_code=400, detail="PR URL is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_github_pr(
             pr_url=req.pr_url,
@@ -619,8 +645,7 @@ async def auto_fix_github_pr(req: GithubAutoFixRequest):
         raise HTTPException(status_code=400, detail="PR URL is required")
     if not config.GITHUB_TOKEN:
         raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.auto_fix_github_pr(
             pr_url=req.pr_url,
@@ -640,8 +665,7 @@ async def auto_fix_github_pr(req: GithubAutoFixRequest):
 
 @app.post("/api/release-gate")
 async def release_gate(req: ReleaseGateRequest):
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
 
     findings = []
     if req.findings:
@@ -671,8 +695,7 @@ async def release_gate(req: ReleaseGateRequest):
 async def review_architecture(req: ArchitectureReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Architecture description is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     if req.review_mode not in ("review", "recommend", "compare"):
         raise HTTPException(status_code=400, detail="review_mode must be: review | recommend | compare")
     try:
@@ -702,8 +725,7 @@ async def review_architecture_file(
     text = _extract_text(content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_architecture(
             artifact=text,
@@ -725,8 +747,7 @@ async def review_architecture_file(
 async def review_vapt(req: VAPTReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Artifact content is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_vapt(
             artifact=req.artifact,
@@ -752,8 +773,7 @@ async def review_vapt_file(
     text = _extract_text(content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_vapt(
             artifact=text,
@@ -774,8 +794,7 @@ async def review_vapt_file(
 async def review_security(req: SecurityReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Artifact content is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_security(
             artifact=req.artifact,
@@ -801,8 +820,7 @@ async def review_security_file(
     text = _extract_text(content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.review_security(
             artifact=text,
@@ -823,8 +841,7 @@ async def review_security_file(
 async def codegen_advisory(req: CodeGenAdvisoryRequest):
     if not req.requirement.strip():
         raise HTTPException(status_code=400, detail="Requirement is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         pins = {
             "language": req.pin_language,
@@ -849,8 +866,7 @@ async def codegen_advisory(req: CodeGenAdvisoryRequest):
 
 @app.post("/api/codegen/scaffold")
 async def codegen_scaffold(req: CodeGenScaffoldRequest):
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.generate_codegen_scaffold(
             project_name=req.project_name,
@@ -909,8 +925,7 @@ async def codegen_scaffold_download(review_id: str, request: Request,
 async def review_ai_provenance(req: AIProvenanceRequest):
     if not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Code is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     disclosure = {
         "ai_used": req.ai_used,
         "ai_tool": req.ai_tool,
@@ -942,8 +957,7 @@ async def review_migration_assessment(req: MigrationAssessmentRequest):
         raise HTTPException(status_code=400, detail="Code is required")
     if not req.migration_target.strip():
         raise HTTPException(status_code=400, detail="migration_target is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.assess_migration(
             source=req.code,
@@ -965,8 +979,7 @@ async def review_migration_execute(req: MigrationExecutionRequest):
         raise HTTPException(status_code=400, detail="Code is required")
     if not req.migration_target.strip():
         raise HTTPException(status_code=400, detail="migration_target is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.execute_migration(
             source=req.code,
@@ -1031,8 +1044,7 @@ async def review_cfr21_verification(req: CFR21VerificationRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.verify_cfr21(
             files=files,
@@ -1057,8 +1069,7 @@ async def review_cfr21_verification_upload_zip(
 ):
     if not (file.filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     content = await file.read()
     try:
         files = _extract_zip_files(content)
@@ -1088,8 +1099,7 @@ async def review_gxp_document_check(req: GxPDocumentCheckRequest):
     documents = [{"name": d.name, "content": d.content} for d in (req.documents or [])]
     if not documents and not (req.content or "").strip():
         raise HTTPException(status_code=400, detail="Provide `documents` or `content`")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.check_gxp_documents(
             documents=documents,
@@ -1112,8 +1122,7 @@ async def review_gxp_document_check_upload(
     project_name: str = Form(""),
     context: str = Form(""),
 ):
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     documents = []
     for f in files:
         content_bytes = await f.read()
@@ -1144,8 +1153,7 @@ async def review_gxp_generate_plan(req: GxPValidationPlanRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.plan_gxp_validation_package(
             files=files,
@@ -1170,8 +1178,7 @@ async def review_gxp_generate_plan_upload_zip(
 ):
     if not (file.filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     content = await file.read()
     try:
         files = _extract_zip_files(content)
@@ -1203,8 +1210,7 @@ async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
     if not req.document_type.strip():
         raise HTTPException(status_code=400, detail="document_type is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.generate_gxp_document(
             document_type=req.document_type,
@@ -1238,8 +1244,7 @@ async def review_issue_triage(req: IssueTriageRequest):
         title, description = gh.get("title", ""), gh.get("body", "")
     if not (title.strip() or description.strip()):
         raise HTTPException(status_code=400, detail="Supply `title`/`description`, or `github_issue_url`")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.triage_issue(
             title=title, description=description, logs=req.logs or "", stack_trace=req.stack_trace or "",
@@ -1260,8 +1265,7 @@ async def review_issue_triage(req: IssueTriageRequest):
 async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
     if not req.github_repo_url.strip():
         raise HTTPException(status_code=400, detail="github_repo_url is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.triage_github_repo_issues(
             github_repo_url=req.github_repo_url, limit=req.limit, team_roster=req.team_roster or "",
@@ -1280,8 +1284,7 @@ async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
 async def review_test_scenario(req: ReviewRequest, project_name: str = ""):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.generate_test_scenarios(
             requirement=req.content, context=req.context or "", project_name=project_name or "Unnamed Project",
@@ -1304,8 +1307,7 @@ class TestCaseInternalRequest(BaseModel):
 async def review_test_case(req: TestCaseInternalRequest):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.generate_test_cases(
             requirement=req.content, scenarios_context=req.scenarios_context or "",
@@ -1330,8 +1332,7 @@ class SensitiveDataRequest(BaseModel):
 async def review_sensitive_data(req: SensitiveDataRequest):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.scan_sensitive_data(
             content=req.content, context=req.context or "", project_name=req.project_name or "Unnamed Project",
@@ -1353,8 +1354,7 @@ async def review_sensitive_data_file(
     text = _extract_text(content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
-    if not config.ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured")
+    _require_llm()
     try:
         result = orchestrator.scan_sensitive_data(
             content=text, context=context, project_name=project_name or file.filename or "Unnamed Project",

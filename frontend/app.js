@@ -56,6 +56,10 @@ function updateAuthUI() {
     if (navVertical) navVertical.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navPlans) navPlans.style.display = isSuperAdmin() ? '' : 'none';
     if (navUsage) navUsage.style.display = isSuperAdmin() ? '' : 'none';
+    // Credentials, so super admin only — but the badge below it is for everyone.
+    const navLlm = document.getElementById('nav-llm-providers');
+    if (navLlm) navLlm.style.display = isSuperAdmin() ? '' : 'none';
+    refreshActiveLlmBadge();
   } else {
     el.innerHTML = `<button class="btn-login" onclick="openLogin()">🔑 Sign In</button>`;
     navUsers.style.display = 'none';
@@ -64,6 +68,10 @@ function updateAuthUI() {
     if (navVertical) navVertical.style.display = 'none';
     if (navPlans) navPlans.style.display = 'none';
     if (navUsage) navUsage.style.display = 'none';
+    const navLlm = document.getElementById('nav-llm-providers');
+    if (navLlm) navLlm.style.display = 'none';
+    const llmBadge = document.getElementById('sidebar-llm');
+    if (llmBadge) llmBadge.style.display = 'none';
   }
   refreshApprovalBadge();
 }
@@ -88,6 +96,8 @@ document.addEventListener('keydown', e => {
     if (gate && !gate.classList.contains('hidden')) closeLogin();
     const llmModal = document.getElementById('llm-config-modal');
     if (llmModal && !llmModal.classList.contains('hidden')) closeLlmConfigModal();
+    const llmConnModal = document.getElementById('llm-connection-modal');
+    if (llmConnModal && !llmConnModal.classList.contains('hidden')) closeLlmConnectionModal();
     const reviewModal = document.getElementById('review-detail-modal');
     if (reviewModal && !reviewModal.classList.contains('hidden')) closeReviewDetail();
     const keyModal = document.getElementById('key-edit-modal');
@@ -347,6 +357,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'gxp-docs') { /* page ready, no auto-load */ }
     if (page === 'gxp-generate') { /* page ready, no auto-load */ }
     if (page === 'api-keys') loadApiKeys();
+    if (page === 'llm-providers') loadLlmProviders();
     if (page === 'plans') loadPlans();
     if (page === 'usage') loadUsage();
     if (page === 'projects') loadProjects();
@@ -1065,6 +1076,11 @@ function renderIssueTriageDashboard(targetId, d) {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────
 
+// The dashboard table is paged off /api/reviews rather than the five rows /api/dashboard
+// embeds, so "Recent Reviews" can reach the whole history instead of the last handful.
+const RECENT_REVIEWS_PAGE_SIZE = 30;
+let recentReviewsOffset = 0;
+
 async function loadDashboard() {
   try {
     const data = await apiFetch('/api/dashboard');
@@ -1074,16 +1090,58 @@ async function loadDashboard() {
     document.getElementById('stat-green').textContent = data.green_gates;
     document.getElementById('stat-amber').textContent = data.amber_gates;
     document.getElementById('stat-red').textContent = data.red_gates;
-
-    const wrap = document.getElementById('recent-reviews');
-    if (!data.recent_reviews || data.recent_reviews.length === 0) {
-      wrap.innerHTML = '<div class="empty-state">No reviews yet. Start by running a review above.</div>';
-      return;
-    }
-    wrap.innerHTML = renderReviewsTable(data.recent_reviews);
   } catch (e) {
     feLog.error(e.message, { source: 'loadDashboard' });
   }
+  // Reset to the newest page: switching project or re-entering the dashboard should not
+  // land the reader deep in a history that may no longer be that long.
+  recentReviewsOffset = 0;
+  await loadRecentReviews();
+}
+
+async function loadRecentReviews() {
+  const wrap = document.getElementById('recent-reviews');
+  const pager = document.getElementById('recent-reviews-pager');
+  try {
+    const data = await apiFetch(
+      `/api/reviews?limit=${RECENT_REVIEWS_PAGE_SIZE}&offset=${recentReviewsOffset}`);
+    const reviews = data.reviews || [];
+    const total = typeof data.total === 'number' ? data.total : reviews.length;
+
+    if (reviews.length === 0) {
+      // An empty page past the first means rows were deleted (or the project switched)
+      // under us — fall back to the newest page instead of showing a blank table.
+      if (recentReviewsOffset > 0) {
+        recentReviewsOffset = 0;
+        return loadRecentReviews();
+      }
+      wrap.innerHTML = '<div class="empty-state">No reviews yet. Start by running a review above.</div>';
+      pager.classList.add('hidden');
+      return;
+    }
+
+    wrap.innerHTML = renderReviewsTable(reviews);
+    wrap.scrollTop = 0;
+
+    const first = recentReviewsOffset + 1;
+    const last = recentReviewsOffset + reviews.length;
+    document.getElementById('recent-reviews-range').textContent =
+      `Showing ${first}–${last} of ${total}`;
+    document.getElementById('recent-reviews-prev').disabled = recentReviewsOffset === 0;
+    document.getElementById('recent-reviews-next').disabled = last >= total;
+    pager.classList.toggle('hidden', total <= RECENT_REVIEWS_PAGE_SIZE);
+  } catch (e) {
+    wrap.innerHTML = '<div class="empty-state">Error loading reviews.</div>';
+    pager.classList.add('hidden');
+    feLog.error(e.message, { source: 'loadRecentReviews' });
+  }
+}
+
+function pageRecentReviews(direction) {
+  const next = recentReviewsOffset + direction * RECENT_REVIEWS_PAGE_SIZE;
+  if (next < 0) return;
+  recentReviewsOffset = next;
+  loadRecentReviews();
 }
 
 // ── History ───────────────────────────────────────────────────────────────
@@ -5758,5 +5816,279 @@ async function exportModernizationRun() {
     URL.revokeObjectURL(url);
   } catch (e) {
     alert('Could not download the converted code: ' + e.message);
+  }
+}
+
+// ── LLM Providers ───────────────────────────────────────────────────────────
+//
+// Named model endpoints the platform can run on, and which one is active. The active
+// connection is the default for every surface — the review forms on this site, Agent
+// Hub, Swarm, workflows, background jobs and the v1 API — because it's resolved inside
+// llm_gateway.call_tool() rather than at any one route. A team that brought its own LLM
+// on an API key still overrides it; see backend/services/llm_settings_service.py for the
+// full precedence chain.
+//
+// Super-admin only, except the sidebar badge: anyone reading a set of findings is
+// entitled to know which model produced them.
+
+let _llmPresets = null;
+let _editingLlmConnectionId = null;
+
+async function refreshActiveLlmBadge() {
+  const wrap = document.getElementById('sidebar-llm');
+  if (!wrap || !_authUser) return;
+  try {
+    const active = await apiFetch('/api/v1/llm-providers/active', { _silent: true });
+    const dot = document.getElementById('sidebar-llm-dot');
+    const text = document.getElementById('sidebar-llm-text');
+    wrap.style.display = '';
+    // Green only for a tested-good connection. A connection that's never been tested is
+    // amber rather than green — "configured" and "works" are different claims, and this
+    // badge shouldn't make the stronger one on no evidence.
+    let state = 'default';
+    if (active.active) state = active.last_test_status === 'ok' ? 'ok' : 'untested';
+    if (active.active && active.last_test_status === 'failed') state = 'failed';
+    dot.className = 'sidebar-llm-dot ' + state;
+    const label = active.active ? active.name : 'Platform default';
+    text.textContent = `${label}${active.model ? ' · ' + active.model : ''}`;
+    wrap.title = active.active
+      ? `Agent calls are served by "${active.name}" (${active.provider}${active.model ? ', ' + active.model : ''}).`
+      : `Agent calls use the platform's own Anthropic key${active.env_key_present ? '' : ' — which is not set'}.`;
+  } catch {
+    wrap.style.display = 'none';   // not signed in, or the endpoint is unreachable
+  }
+}
+
+async function _ensureLlmPresets() {
+  if (_llmPresets) return _llmPresets;
+  const data = await apiFetch('/api/v1/llm-providers/presets');
+  _llmPresets = data.presets || [];
+  return _llmPresets;
+}
+
+async function loadLlmProviders() {
+  const label = document.getElementById('llmp-active-label');
+  const list = document.getElementById('llmp-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const [active, data] = await Promise.all([
+      apiFetch('/api/v1/llm-providers/active'),
+      apiFetch('/api/v1/llm-providers/connections'),
+    ]);
+    if (label) {
+      label.innerHTML = active.active
+        ? `<strong>${esc(active.name)}</strong> — ${esc(active.provider)}${active.model ? ' · ' + esc(active.model) : ''}`
+        : `<strong>Platform default</strong> — the ANTHROPIC_API_KEY in <code>.env</code>${active.env_key_present ? '' : ' <span style="color:var(--red)">(not set — agent calls will be refused)</span>'}`;
+    }
+    renderLlmConnections(data.connections || [], active);
+  } catch (e) {
+    list.innerHTML = `<div class="empty-state">Could not load LLM providers: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderLlmConnections(connections, active) {
+  const list = document.getElementById('llmp-list');
+  if (!connections.length) {
+    list.innerHTML = `
+      <div class="empty-state">
+        No connections yet — agent calls use the <code>ANTHROPIC_API_KEY</code> from <code>.env</code>.<br />
+        Add one to run the platform on a local router, a different vendor, or a second Anthropic account.
+      </div>`;
+    return;
+  }
+  const rows = connections.map(c => {
+    const testBadge = c.last_test_status === 'ok'
+      ? `<span class="llm-pill ok">Tested OK</span>`
+      : c.last_test_status === 'failed'
+        ? `<span class="llm-pill failed">Test failed</span>`
+        : `<span class="llm-pill untested">Never tested</span>`;
+    const activeBadge = c.is_active
+      ? `<span class="llm-pill ok">Active</span>`
+      : `<button class="btn btn-secondary" style="font-size:12px" onclick="activateLlmConnection('${c.id}')">Make active</button>`;
+    return `
+      <tr>
+        <td>
+          <strong>${esc(c.name)}</strong>
+          <div style="font-size:12px;color:var(--text-muted)">${esc(c.preset)} · ${esc(c.provider)} wire format</div>
+        </td>
+        <td style="font-size:12px">
+          ${c.base_url ? `<code>${esc(c.base_url)}</code>` : '<span style="color:var(--text-muted)">vendor default</span>'}
+          <div style="color:var(--text-muted);margin-top:4px">${c.model ? esc(c.model) : 'no model set'}</div>
+        </td>
+        <td style="font-size:12px">
+          ${c.has_api_key ? `<code>${esc(c.api_key_masked)}</code>` : '<span style="color:var(--text-muted)">none</span>'}
+        </td>
+        <td>
+          ${testBadge}
+          ${c.last_test_detail ? `<div style="font-size:11px;color:var(--text-muted);margin-top:4px;max-width:280px">${esc(c.last_test_detail)}</div>` : ''}
+        </td>
+        <td>${activeBadge}</td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-secondary" style="font-size:12px" onclick="testLlmConnection('${c.id}', this)">Test</button>
+          <button class="btn btn-secondary" style="font-size:12px" onclick="openLlmConnectionModal('${c.id}')">Edit</button>
+          <button class="btn btn-secondary btn-danger-outline" style="font-size:12px" onclick="deleteLlmConnection('${c.id}', '${esc(c.name).replace(/'/g, "\\'")}')">Delete</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  list.innerHTML = `
+    <table class="users-table">
+      <thead><tr>
+        <th>Connection</th><th>Endpoint</th><th>Credential</th><th>Last test</th><th>Status</th><th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${active && active.active ? `
+      <div style="margin-top:12px">
+        <button class="btn btn-secondary" onclick="activateLlmConnection(null)">
+          Revert to the platform default (.env)
+        </button>
+      </div>` : ''}`;
+}
+
+async function openLlmConnectionModal(connectionId) {
+  const presets = await _ensureLlmPresets();
+  _editingLlmConnectionId = connectionId || null;
+
+  const presetSel = document.getElementById('llmc-preset');
+  presetSel.innerHTML = presets.map(p => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('');
+
+  document.getElementById('llmc-title').textContent = connectionId ? 'Edit LLM Connection' : 'Add LLM Connection';
+  document.getElementById('llmc-error').classList.add('hidden');
+
+  if (connectionId) {
+    const data = await apiFetch('/api/v1/llm-providers/connections');
+    const c = (data.connections || []).find(x => x.id === connectionId);
+    if (!c) return;
+    presetSel.value = c.preset || 'custom';
+    document.getElementById('llmc-name').value = c.name || '';
+    document.getElementById('llmc-provider').value = c.provider || 'openai';
+    document.getElementById('llmc-baseurl').value = c.base_url || '';
+    document.getElementById('llmc-model').value = c.model || '';
+    document.getElementById('llmc-maxtokens').value = c.max_tokens || '';
+    document.getElementById('llmc-timeout').value = c.timeout_seconds || '';
+    document.getElementById('llmc-apikey').value = '';
+    // The stored key is never sent to the browser, so an empty box on an edit means
+    // "keep it" rather than "clear it" — say so, or a rename looks like it wiped the key.
+    document.getElementById('llmc-key-hint').textContent = c.has_api_key
+      ? `A key is stored (${c.api_key_masked}). Leave this blank to keep it.`
+      : 'No key stored for this connection.';
+    _describePreset(presetSel.value);
+  } else {
+    presetSel.value = 'omniroute';
+    applyLlmPreset();
+    document.getElementById('llmc-name').value = '';
+    document.getElementById('llmc-apikey').value = '';
+    document.getElementById('llmc-maxtokens').value = '';
+    document.getElementById('llmc-timeout').value = '';
+    document.getElementById('llmc-key-hint').textContent = '';
+  }
+  document.getElementById('llm-connection-modal').classList.remove('hidden');
+}
+
+function closeLlmConnectionModal() {
+  document.getElementById('llm-connection-modal').classList.add('hidden');
+  _editingLlmConnectionId = null;
+}
+
+function _describePreset(presetId) {
+  const preset = (_llmPresets || []).find(p => p.id === presetId);
+  document.getElementById('llmc-preset-hint').textContent = preset ? preset.hint : '';
+}
+
+function applyLlmPreset() {
+  const presetId = document.getElementById('llmc-preset').value;
+  const preset = (_llmPresets || []).find(p => p.id === presetId);
+  if (!preset) return;
+  document.getElementById('llmc-provider').value = preset.provider;
+  document.getElementById('llmc-baseurl').value = preset.base_url || '';
+  document.getElementById('llmc-model').value = preset.model || '';
+  const name = document.getElementById('llmc-name');
+  if (!name.value.trim()) name.value = preset.label;
+  _describePreset(presetId);
+}
+
+async function saveLlmConnection() {
+  const err = document.getElementById('llmc-error');
+  const btn = document.getElementById('llmc-save');
+  const maxTokens = document.getElementById('llmc-maxtokens').value.trim();
+  const timeout = document.getElementById('llmc-timeout').value.trim();
+  const body = {
+    name: document.getElementById('llmc-name').value.trim(),
+    preset: document.getElementById('llmc-preset').value,
+    provider: document.getElementById('llmc-provider').value,
+    api_key: document.getElementById('llmc-apikey').value,
+    base_url: document.getElementById('llmc-baseurl').value.trim(),
+    model: document.getElementById('llmc-model').value.trim(),
+    max_tokens: maxTokens ? parseInt(maxTokens, 10) : null,
+    timeout_seconds: timeout ? parseFloat(timeout) : null,
+  };
+  if (!body.name) {
+    err.textContent = 'Give the connection a name.';
+    err.classList.remove('hidden');
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const path = _editingLlmConnectionId
+      ? `/api/v1/llm-providers/connections/${_editingLlmConnectionId}`
+      : '/api/v1/llm-providers/connections';
+    await apiFetch(path, {
+      method: _editingLlmConnectionId ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    closeLlmConnectionModal();
+    loadLlmProviders();
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function activateLlmConnection(connectionId) {
+  try {
+    await apiFetch('/api/v1/llm-providers/active', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ connection_id: connectionId }),
+    });
+    loadLlmProviders();
+    refreshActiveLlmBadge();
+  } catch (e) {
+    alert('Could not switch the active LLM: ' + e.message);
+  }
+}
+
+async function testLlmConnection(connectionId, btn) {
+  const original = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+  try {
+    // Not a ping: this sends the same kind of forced tool call every agent makes, because
+    // an endpoint that answers but can't produce a tool call cannot run a single review.
+    const result = await apiFetch(`/api/v1/llm-providers/connections/${connectionId}/test`, { method: 'POST' });
+    alert(result.status === 'ok'
+      ? `Connection works.\n\n${result.detail}`
+      : `Connection failed.\n\n${result.detail}`);
+    loadLlmProviders();
+    refreshActiveLlmBadge();
+  } catch (e) {
+    alert('Could not run the test: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = original; }
+  }
+}
+
+async function deleteLlmConnection(connectionId, name) {
+  if (!confirm(`Delete the connection "${name}"?\n\nIf it is the active one, agent calls revert to the platform's own Anthropic key.`)) return;
+  try {
+    await apiFetch(`/api/v1/llm-providers/connections/${connectionId}`, { method: 'DELETE' });
+    loadLlmProviders();
+    refreshActiveLlmBadge();
+  } catch (e) {
+    alert('Could not delete the connection: ' + e.message);
   }
 }

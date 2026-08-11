@@ -22,6 +22,10 @@ venv/
 # Logs
 *.log
 
+# Demo capture output (PNGs, contact sheet, artifact page) — all regenerable via
+# scripts/demo_capture.py, demo_contact_sheet.py, demo_artifact.py
+demo/screenshots/
+
 # OS / editor
 .DS_Store
 Thumbs.db

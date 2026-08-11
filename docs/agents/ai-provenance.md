@@ -70,7 +70,7 @@ The scoring model is fixed and documented in the agent's own instructions (not i
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; flags surface inside `report.guardrail_flags`
 - **Untrusted content wrapping** — a fetched PR/file is wrapped before analysis
 - **Product policy guardrail (prompt-level, not code-enforced):** the agent is instructed to never recommend blocking or rejecting code solely on AI-origin likelihood — "AI-generated code is allowed, but must be declared, reviewed, tested, and traceable," never a block

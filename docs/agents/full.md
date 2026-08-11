@@ -78,7 +78,7 @@ Custom envelope (does not use `_wrap`) — this is a synthesized cross-agent res
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars), enforced independently on each sub-agent's own artifact
-- **Timeout & retry** — 120s timeout per underlying LLM call (there may be several — one per sub-agent triggered), up to 2 retries each
+- **Timeout & retry** — 900s timeout per underlying LLM call (there may be several — one per sub-agent triggered), up to 2 retries each
 - **Prompt-injection scan** — non-blocking per sub-agent call; any `guardrail_flags` surface on that sub-review's own result within the composite response
 - **Untrusted content wrapping** — a fetched PR diff or Jira issue body is wrapped before analysis
 - Because this endpoint can invoke up to five separate LLM calls per request, it typically has the highest latency and cost of any single endpoint — factor that into budget caps and timeouts for automation that calls it

@@ -44,7 +44,7 @@ Custom envelope, fields returned at the top level:
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries (raised `max_tokens=6000` output budget)
+- **Timeout & retry** — 900s timeout, up to 2 retries (raised `max_tokens=16000` output budget)
 - **Prompt-injection scan** — non-blocking heuristic (not echoed in this endpoint's explicit response fields)
 - **Untrusted content wrapping** — a fetched Jira/GitHub issue is wrapped before analysis
 

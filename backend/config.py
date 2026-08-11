@@ -8,7 +8,12 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "sdlc_agent.db")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-in-production-32chars!!")
 MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "8000"))
+# The response budget for an agent that names none of its own. A floor, not a ceiling:
+# most agents pass an explicit `max_tokens` (see base_agent.py and the per-agent modules),
+# and the model's real ceiling is far higher — claude-sonnet-4-6 allows 128000 output
+# tokens. Kept well below that because a budget only has to be larger than the longest
+# legitimate response; every token of headroom above that is latency risk, not quality.
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "16000"))
 APP_ENV = os.getenv("APP_ENV", "development")
 JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
 DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@1234")
@@ -42,13 +47,20 @@ UI_REQUIRE_PROJECT = os.getenv("UI_REQUIRE_PROJECT", "false").lower() == "true"
 
 # Guardrails — applied uniformly to every agent call inside llm_gateway.call_tool().
 MAX_AGENT_INPUT_CHARS = int(os.getenv("MAX_AGENT_INPUT_CHARS", "400000"))
-# Several agents now request up to 16000 tokens (architecture, codegen-scaffold) or
-# 14000 (vapt, security) which can legitimately take longer to finish generating —
-# too short a timeout here causes a spurious APITimeoutError mid-generation rather
-# than letting a genuinely slow-but-successful call complete. Long-running calls no
-# longer block an HTTP connection for their full duration (see the job-status
-# endpoint used by the `full` review), so a generous value here is safe.
-LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "360"))
+# This has to be large enough for the largest output budget to actually finish
+# generating. The top tier is now 32000 tokens (architecture, codegen-scaffold,
+# test-case, unit conversion); at the 50-80 tokens/sec a Sonnet-class model sustains,
+# that is 400-640 seconds of generation. Too short a timeout here turns a
+# slow-but-successful call into an APITimeoutError *and* retries it, so the tokens are
+# paid for twice more and no result is ever returned. Long-running calls no longer
+# block an HTTP connection for their full duration (see the job-status endpoint used
+# by the `full` review), so a generous value is safe on Anthropic.
+#
+# It is NOT safe on a slow local router: with LLM_MAX_RETRIES=2 a wedged endpoint can
+# burn 3x this before erroring (C-30). Set `llm_connections.timeout_seconds` per
+# connection rather than lowering this globally — lowering it globally reintroduces
+# spurious timeouts on the large-budget agents.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "900"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 
 # Anthropic prompt caching — marks the system prompt + tool schema (a byte-identical

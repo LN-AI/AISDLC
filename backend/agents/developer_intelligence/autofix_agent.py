@@ -84,6 +84,6 @@ class AutoFixAgent(BaseAgent):
 Produce corrected file contents for every finding you can safely fix. List any findings you deliberately did
 not address and why.
 """
-        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, AUTOFIX_TOOL_SCHEMA, max_tokens=8000)
+        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, AUTOFIX_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
         return result

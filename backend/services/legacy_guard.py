@@ -192,10 +192,15 @@ async def legacy_product_guard(request, call_next):
     if not usage["calls"]:
         return response  # nothing reached an LLM (validation error, cache hit, 4xx)
 
-    # The legacy handlers never call resolve_effective_override, so a BYOL config cannot
-    # apply on these routes — the platform always pays, and `billable` is always true here.
-    # If BYOL is ever wired into /api/review/*, this has to derive it the way guarded_call does.
-    model = config.MODEL
+    # These routes still resolve no *caller* BYOL config — a browser session has no API-key
+    # record to hang one on — so the platform always pays and `billable` stays true. But a
+    # UI call does follow the admin-selected platform connection, which is resolved inside
+    # call_tool. Deriving the model the same way guarded_call does (D-36) is what keeps the
+    # ledger honest: without this, a review served by a local router was recorded as
+    # claude-sonnet-4-6/anthropic and priced at Claude rates.
+    effective_llm = llm_gateway.resolve_override(None) or {}
+    model = effective_llm.get("model") or config.MODEL
+    provider = effective_llm.get("provider") or "anthropic"
     cost_usd = agent_guard._price_usage(usage, model)
     if subject.project_id:
         database.record_project_cost(subject.project_id, cost_usd)
@@ -215,7 +220,7 @@ async def legacy_product_guard(request, call_next):
             output_tokens=usage["output_tokens"],
             cost_usd=cost_usd,
             model=model,
-            provider="anthropic",
+            provider=provider,
             billable=True,
             cost_estimated=agent_guard._is_estimated(model),
             project_id=subject.project_id,

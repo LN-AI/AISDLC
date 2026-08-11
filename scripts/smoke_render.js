@@ -23,7 +23,7 @@ const ROOT = path.resolve(__dirname, '..');
 const source = fs.readFileSync(process.argv[2] || path.join(ROOT, 'frontend', 'app.js'), 'utf8');
 
 function makeEl(id) {
-  return {
+  const el = {
     id,
     innerHTML: '',
     value: '',
@@ -32,7 +32,17 @@ function makeEl(id) {
     placeholder: '',
     textContent: '',
     readOnly: false,
-    classList: { add() {}, remove() {}, contains() { return false; } },
+    disabled: false,
+    scrollTop: 0,
+    // `hidden` tracks what the class list was last told, so a test can assert that a
+    // pager was shown or hidden rather than only that the call didn't throw.
+    hidden: false,
+    classList: {
+      add(c) { if (c === 'hidden') this._el.hidden = true; },
+      remove(c) { if (c === 'hidden') this._el.hidden = false; },
+      toggle(c, on) { const v = on === undefined ? !this._el.hidden : !!on; if (c === 'hidden') this._el.hidden = v; return v; },
+      contains(c) { return c === 'hidden' ? this._el.hidden : false; },
+    },
     dataset: {},
     addEventListener() {},
     insertAdjacentHTML(_pos, html) { this.innerHTML += html; },
@@ -42,6 +52,8 @@ function makeEl(id) {
     appendChild() {},
     querySelectorAll() { return []; },
   };
+  el.classList._el = el;  // classList needs a way back for the `hidden` bookkeeping above
+  return el;
 }
 
 const elements = new Map();
@@ -58,12 +70,23 @@ const document = {
   body: makeEl('body'),
 };
 
+// Requests app.js makes, and the canned reply for the next one. `fetchLog` lets a test
+// assert the URL (and therefore the paging query) the code actually asked for.
+const fetchLog = [];
+let nextFetchBody = {};
+
 const sandbox = {
   document,
   window: { location: { href: '' } },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   console,
-  fetch: async () => ({ ok: true, status: 200, json: async () => ({}), text: async () => '' }),
+  // logger.js is a separate script tag in index.html, so it isn't in `source`; the
+  // renderers don't touch it but the loaders' error paths do.
+  feLog: { error() {}, warn() {}, info() {}, debug() {} },
+  fetch: async (url) => {
+    fetchLog.push(url);
+    return { ok: true, status: 200, json: async () => nextFetchBody, text: async () => '' };
+  },
   setTimeout, clearTimeout, setInterval, clearInterval,
   alert() {}, confirm: () => true, prompt: () => null,
   navigator: { userAgent: 'node' },
@@ -81,6 +104,16 @@ let failures = 0;
 function check(label, fn) {
   try {
     fn();
+    console.log(`  PASS  ${label}`);
+  } catch (e) {
+    console.log(`  FAIL  ${label}\n          ${e.message}`);
+    failures++;
+  }
+}
+// The paging loaders await a fetch, so they need an awaiting variant of `check`.
+async function checkAsync(label, fn) {
+  try {
+    await fn();
     console.log(`  PASS  ${label}`);
   } catch (e) {
     console.log(`  FAIL  ${label}\n          ${e.message}`);
@@ -211,10 +244,128 @@ check('omits the not-run block when everything ran', () => {
   assert(!html.includes('not-run-row'), 'not-run block should be absent');
 });
 
-console.log('\n' + '-'.repeat(60));
-if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
-console.log('OK: all render checks passed');
-// app.js schedules a couple of timers at load (the login modal focuses its field). Nothing
-// here depends on them, and letting them fire against the stub only produces noise after the
-// results, so leave on the spot rather than waiting the event loop out.
-process.exit(0);
+// ── Dashboard "Recent Reviews" paging ──────────────────────────────────────
+// The dashboard table pages off /api/reviews (30 a page) instead of the five rows
+// /api/dashboard embeds. What can break silently is the arithmetic: an off-by-one in the
+// range label, or a Next button left live on the last page.
+
+function fakePage(offset, pageLen, total) {
+  return {
+    total,
+    count: pageLen,
+    reviews: Array.from({ length: pageLen }, (_, i) => ({
+      id: `rev-${offset + i}-0000000`,
+      review_type: 'code',
+      project_name: `proj-${offset + i}`,
+      findings_count: 1, critical_count: 0, high_count: 1,
+      risk_score: 20, gate_status: 'Amber',
+      created_at: '2026-08-10T09:00:00',
+    })),
+  };
+}
+
+const pagerEl = () => document.getElementById('recent-reviews-pager');
+const rangeEl = () => document.getElementById('recent-reviews-range');
+const prevEl = () => document.getElementById('recent-reviews-prev');
+const nextEl = () => document.getElementById('recent-reviews-next');
+
+async function runPagingChecks() {
+  console.log('\nDashboard recent-reviews paging');
+
+  await checkAsync('the first page asks for 30 rows at offset 0 and labels the range', async () => {
+    nextFetchBody = fakePage(0, 30, 72);
+    fetchLog.length = 0;
+    await sandbox.loadRecentReviews();
+    assert(fetchLog[0] === '/api/reviews?limit=30&offset=0', `asked for ${fetchLog[0]}`);
+    assert(rangeEl().textContent === 'Showing 1–30 of 72', `label was "${rangeEl().textContent}"`);
+    assert(prevEl().disabled === true, 'Newer should be disabled on the first page');
+    assert(nextEl().disabled === false, 'Older should be live when more rows remain');
+    assert(pagerEl().hidden === false, 'the pager should be visible past one page');
+    assert(document.getElementById('recent-reviews').innerHTML.includes('proj-0'), 'rows missing');
+  });
+
+  await checkAsync('Older advances one page and offsets the range', async () => {
+    nextFetchBody = fakePage(30, 30, 72);
+    fetchLog.length = 0;
+    sandbox.pageRecentReviews(1);
+    await new Promise(r => setTimeout(r, 0));
+    assert(fetchLog[0] === '/api/reviews?limit=30&offset=30', `asked for ${fetchLog[0]}`);
+    assert(rangeEl().textContent === 'Showing 31–60 of 72', `label was "${rangeEl().textContent}"`);
+    assert(prevEl().disabled === false, 'Newer should be live off the first page');
+    assert(nextEl().disabled === false, 'Older should still be live');
+  });
+
+  await checkAsync('a short last page disables Older and counts only its own rows', async () => {
+    nextFetchBody = fakePage(60, 12, 72);
+    fetchLog.length = 0;
+    sandbox.pageRecentReviews(1);
+    await new Promise(r => setTimeout(r, 0));
+    assert(fetchLog[0] === '/api/reviews?limit=30&offset=60', `asked for ${fetchLog[0]}`);
+    assert(rangeEl().textContent === 'Showing 61–72 of 72', `label was "${rangeEl().textContent}"`);
+    assert(nextEl().disabled === true, 'Older must be dead on the last page');
+  });
+
+  await checkAsync('Newer walks back, and never past the first page', async () => {
+    nextFetchBody = fakePage(30, 30, 72);
+    sandbox.pageRecentReviews(-1);
+    await new Promise(r => setTimeout(r, 0));
+    assert(rangeEl().textContent === 'Showing 31–60 of 72', `label was "${rangeEl().textContent}"`);
+
+    nextFetchBody = fakePage(0, 30, 72);
+    sandbox.pageRecentReviews(-1);
+    await new Promise(r => setTimeout(r, 0));
+    assert(rangeEl().textContent === 'Showing 1–30 of 72', `label was "${rangeEl().textContent}"`);
+
+    fetchLog.length = 0;
+    sandbox.pageRecentReviews(-1);   // already at the top — must not ask for a negative offset
+    await new Promise(r => setTimeout(r, 0));
+    assert(fetchLog.length === 0, `fetched ${fetchLog[0]} from the first page`);
+  });
+
+  await checkAsync('a single page of results hides the pager entirely', async () => {
+    nextFetchBody = fakePage(0, 7, 7);
+    await sandbox.loadRecentReviews();
+    assert(rangeEl().textContent === 'Showing 1–7 of 7', `label was "${rangeEl().textContent}"`);
+    assert(pagerEl().hidden === true, 'the pager should stay hidden under one page');
+  });
+
+  await checkAsync('no reviews at all shows the empty state, not an empty table', async () => {
+    nextFetchBody = { reviews: [], count: 0, total: 0 };
+    await sandbox.loadRecentReviews();
+    const html = document.getElementById('recent-reviews').innerHTML;
+    assert(html.includes('No reviews yet'), 'empty state missing');
+    assert(!html.includes('<table'), 'should not render a headers-only table');
+    assert(pagerEl().hidden === true, 'the pager should be hidden with no rows');
+  });
+
+  await checkAsync('an emptied page past the first falls back to the newest page', async () => {
+    // Rows deleted (or the project switched) under a reader sitting on page 3: the retry
+    // must land them back on page 1 rather than on a blank table.
+    nextFetchBody = fakePage(0, 30, 72);
+    await sandbox.loadRecentReviews();
+    sandbox.pageRecentReviews(1);
+    await new Promise(r => setTimeout(r, 0));
+
+    let call = 0;
+    fetchLog.length = 0;
+    sandbox.fetch = async (url) => {
+      fetchLog.push(url);
+      const body = call++ === 0 ? { reviews: [], count: 0, total: 0 } : fakePage(0, 4, 4);
+      return { ok: true, status: 200, json: async () => body, text: async () => '' };
+    };
+    await sandbox.loadRecentReviews();
+    assert(fetchLog.length === 2, `expected a retry, saw ${fetchLog.length} call(s)`);
+    assert(fetchLog[1].includes('offset=0'), `retry asked for ${fetchLog[1]}`);
+    assert(rangeEl().textContent === 'Showing 1–4 of 4', `label was "${rangeEl().textContent}"`);
+  });
+}
+
+runPagingChecks().then(() => {
+  console.log('\n' + '-'.repeat(60));
+  if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
+  console.log('OK: all render checks passed');
+  // app.js schedules a couple of timers at load (the login modal focuses its field). Nothing
+  // here depends on them, and letting them fire against the stub only produces noise after the
+  // results, so leave on the spot rather than waiting the event loop out.
+  process.exit(0);
+});
