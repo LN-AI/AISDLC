@@ -1,10 +1,14 @@
-# Full SDLC Review
+# Core SDLC Review
 
-A composite endpoint: runs Requirement Review, Code Review, Compliance Mapping, Architecture Review, and Prompt Safety Review as applicable in one call, aggregates every finding, runs the Release Gate agent over the combined set, and generates a full governance report — one call instead of orchestrating five.
+A composite endpoint: runs Requirement Review, Compliance Mapping, Architecture Review, Code Review and Prompt Safety Review as applicable in one call, aggregates every finding, runs the Release Gate agent over the combined set, and generates a governance report — one call instead of orchestrating five.
+
+Three further stages — **Security Review (STRIDE)**, **VAPT** and the **Sensitive Data Scan** — run over artifacts you already supply, but only when you ask for them (`include_security` / `include_vapt` / `include_sensitive_data`). They are off by default because each adds an LLM call to what is billed as a single call.
+
+> **The gate is only as broad as the stages that ran.** Whatever did not run is listed in the response as `steps_not_run`. A Green over five stages is not a Green over eight, and this endpoint will not let that difference stay invisible.
 
 **Module:** Governance Intelligence
 **Endpoint:** `POST /api/v1/agents/full`
-**Agent name (for scopes/BYOL config):** `full`
+**Agent name (for scopes/BYOL config):** `full` — unchanged; only the display title changed, so existing key scopes, per-agent BYOL config and cost history keep resolving.
 
 ## Authentication
 
@@ -17,12 +21,27 @@ Supply either:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `text` | string | at least one source field | Requirement or code artifact — used as a fallback when neither `github_pr_url` nor `jira_ticket` is given. When supplied, it is analyzed as **both** requirement and code |
-| `github_pr_url` | string | " | GitHub PR URL — runs Code Review against the diff |
+| `github_pr_url` | string | " | GitHub PR URL — its diff is reviewed as `code`. It does **not** by itself run VAPT; set `include_vapt` for that |
 | `jira_ticket` | string | " | Jira ticket — runs Requirement Review against the issue content |
 | `compliance_artifact` | string | no | Artifact to map to compliance frameworks — runs the Compliance Mapper *in addition to* whichever of the above triggered |
 | `architecture` | string | no | Architecture/system description — runs a real Architecture Review (quality scoring, anti-patterns, SPOFs) alongside the others |
 | `prompt_config` | object | no | Keys: `system_prompt`, `user_prompt`, `tool_definitions`, `rag_config` — runs Prompt Safety Review |
 | `test_evidence` | string | no | Test results or sign-off evidence, fed into the Release Gate step |
+| `include_security` | bool | no | Also run the STRIDE Security Review. Reads `architecture`; a no-op without it. Adds one LLM call |
+| `include_vapt` | bool | no | Also run the VAPT assessment (CVSS, OWASP API Top 10). Reads the code; a no-op without it. Adds one LLM call |
+| `include_sensitive_data` | bool | no | Also scan the code for PII/PHI/PCI and credentials. Reads the code; a no-op without it. Adds one LLM call |
+
+### Stage order
+
+`Requirement → Compliance → Architecture → Security (STRIDE) → Code → VAPT → Sensitive Data → Prompt Safety → Release Gate → Report`
+
+Each opt-in stage sits directly after the stage whose artifact it reads. Requesting one without its artifact is silently skipped rather than rejected, and named in `steps_not_run`.
+
+### Cost and quota
+
+A default run is up to 7 LLM calls; with all three stages on it is up to 10. All of it is metered as **one** call of the `full` product, so per-call quota (`plan_products.quota_calls_per_month`) is unaffected by how many stages you enable — but the underlying token cost, and any USD budget, is not. Budget is reserved from the actual step count for the request.
+
+The workflow is all-or-nothing: if any stage raises, the whole run aborts and nothing is persisted. A longer plan is a wider window for that to happen.
 | `project_name`, `context`, `post_back` | — | no | Standard fields |
 | `llm_provider`, `llm_api_key`, `llm_base_url`, `llm_model` | — | no | Per-call BYOL override |
 
@@ -59,7 +78,7 @@ Custom envelope (does not use `_wrap`) — this is a synthesized cross-agent res
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars), enforced independently on each sub-agent's own artifact
-- **Timeout & retry** — 120s timeout per underlying LLM call (there may be several — one per sub-agent triggered), up to 2 retries each
+- **Timeout & retry** — 900s timeout per underlying LLM call (there may be several — one per sub-agent triggered), up to 2 retries each
 - **Prompt-injection scan** — non-blocking per sub-agent call; any `guardrail_flags` surface on that sub-review's own result within the composite response
 - **Untrusted content wrapping** — a fetched PR diff or Jira issue body is wrapped before analysis
 - Because this endpoint can invoke up to five separate LLM calls per request, it typically has the highest latency and cost of any single endpoint — factor that into budget caps and timeouts for automation that calls it

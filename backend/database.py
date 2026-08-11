@@ -246,6 +246,29 @@ def init_db():
             UNIQUE(key_id, agent_name)
         );
 
+        -- Named LLM endpoints an admin can define in the UI and switch between. One of
+        -- these is the platform default (its id lives in platform_settings under
+        -- 'active_llm_connection_id'); per-key and per-request BYOL still override it.
+        -- `provider` is the wire format the gateway speaks ('anthropic' | 'openai');
+        -- `preset` is only a UI label (omniroute, ollama, azure, ...) driving field prefills.
+        CREATE TABLE IF NOT EXISTS llm_connections (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            preset TEXT DEFAULT 'custom',
+            provider TEXT NOT NULL,
+            api_key_encrypted TEXT DEFAULT '',
+            base_url TEXT,
+            model TEXT,
+            max_tokens INTEGER,
+            timeout_seconds REAL,
+            last_test_status TEXT,
+            last_test_at TEXT,
+            last_test_detail TEXT,
+            created_by TEXT DEFAULT 'admin',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS platform_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -418,6 +441,16 @@ def init_db():
         pass  # column already exists
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_project ON reviews(project_id, created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_project_members_user ON project_members(user_id)")
+
+    # Same reasoning as `reviews.project_id` above, for the same reason: a governance report
+    # is the artifact a customer actually shows an auditor, and until now the only way to
+    # reach one was to already know its UUID — `reports` carried a free-text `project_name`
+    # and nothing else, so no screen could list a project's reports. NULL on pre-existing rows.
+    try:
+        cursor.execute("ALTER TABLE reports ADD COLUMN project_id TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reports_project ON reports(project_id, created_at)")
 
     # Modernization owns six tables of its own. Their DDL lives with the code that queries
     # them rather than here — this module is already read by everything, and those tables
@@ -611,6 +644,21 @@ def list_reviews(limit: int = 20, offset: int = 0,
     return [dict(r) for r in rows]
 
 
+def count_reviews(project_ids: Optional[List[str]] = None) -> int:
+    """How many reviews the caller may see — the denominator a pager needs.
+
+    Scoped through the same `_review_scope_sql` as `list_reviews`, so the count and the
+    page it describes can never disagree about which projects are in view.
+    """
+    scope, params = _review_scope_sql(project_ids)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT COUNT(*) as total FROM reviews WHERE 1 = 1{scope}", params)
+    total = cursor.fetchone()["total"]
+    conn.close()
+    return total
+
+
 def get_platform_setting(key: str) -> Optional[str]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -633,6 +681,126 @@ def set_platform_setting(key: str, value: str, updated_by: str = "system") -> No
     )
     conn.commit()
     conn.close()
+
+
+# ── LLM connections (admin-managed provider endpoints) ─────────────────────
+#
+# Rows are returned raw, encrypted secret included — decrypting and masking is the
+# service layer's job (backend/services/llm_settings_service.py), because only it
+# knows which callers may see what. Nothing here ever returns a plaintext key.
+
+ACTIVE_LLM_CONNECTION_KEY = "active_llm_connection_id"
+
+
+def list_llm_connections() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM llm_connections ORDER BY name COLLATE NOCASE")
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_llm_connection(connection_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM llm_connections WHERE id = ?", (connection_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_llm_connection_by_name(name: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM llm_connections WHERE name = ? COLLATE NOCASE", (name,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_llm_connection(
+    name: str, provider: str, api_key_encrypted: str = "", *,
+    preset: str = "custom", base_url: Optional[str] = None, model: Optional[str] = None,
+    max_tokens: Optional[int] = None, timeout_seconds: Optional[float] = None,
+    created_by: str = "admin",
+) -> Dict[str, Any]:
+    now = datetime.utcnow().isoformat()
+    connection_id = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO llm_connections
+            (id, name, preset, provider, api_key_encrypted, base_url, model,
+             max_tokens, timeout_seconds, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (connection_id, name, preset, provider, api_key_encrypted, base_url or None,
+         model or None, max_tokens, timeout_seconds, created_by, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return get_llm_connection(connection_id)
+
+
+def update_llm_connection(connection_id: str, **fields) -> Optional[Dict[str, Any]]:
+    """Patch-update. Only the columns present in `fields` are written, so an edit that
+    doesn't re-enter the API key keeps the stored one instead of blanking it."""
+    allowed = {
+        "name", "preset", "provider", "api_key_encrypted", "base_url", "model",
+        "max_tokens", "timeout_seconds",
+    }
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return get_llm_connection(connection_id)
+    updates["updated_at"] = datetime.utcnow().isoformat()
+    assignments = ", ".join(f"{k} = ?" for k in updates)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE llm_connections SET {assignments} WHERE id = ?",
+        (*updates.values(), connection_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_llm_connection(connection_id)
+
+
+def delete_llm_connection(connection_id: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM llm_connections WHERE id = ?", (connection_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    # A deleted connection must not stay selected — the gateway would then resolve an
+    # id that no longer exists and silently fall back with no trace of why.
+    if deleted and get_platform_setting(ACTIVE_LLM_CONNECTION_KEY) == connection_id:
+        set_platform_setting(ACTIVE_LLM_CONNECTION_KEY, "", "system")
+    return deleted
+
+
+def record_llm_connection_test(connection_id: str, status: str, detail: str = "") -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE llm_connections SET last_test_status = ?, last_test_at = ?, last_test_detail = ? WHERE id = ?",
+        (status, datetime.utcnow().isoformat(), detail[:2000], connection_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_active_llm_connection() -> Optional[Dict[str, Any]]:
+    connection_id = get_platform_setting(ACTIVE_LLM_CONNECTION_KEY)
+    if not connection_id:
+        return None
+    return get_llm_connection(connection_id)
+
+
+def set_active_llm_connection(connection_id: Optional[str], updated_by: str = "admin") -> None:
+    set_platform_setting(ACTIVE_LLM_CONNECTION_KEY, connection_id or "", updated_by)
 
 
 def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -690,11 +858,16 @@ def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, An
 
 def save_report(review_id: Optional[str], project_name: str, report: Dict[str, Any]) -> str:
     report_id = str(uuid.uuid4())
+    # Same as `save_review`: `project_name` is free text a user typed, the real project is
+    # the one the call was authorised against, published by the API boundary.
+    project_id = context.current_project_id()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO reports (id, review_id, project_name, report_json, created_at) VALUES (?, ?, ?, ?, ?)",
-        (report_id, review_id, project_name, json.dumps(report), datetime.utcnow().isoformat()),
+        "INSERT INTO reports (id, review_id, project_name, report_json, created_at, project_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (report_id, review_id, project_name, json.dumps(report),
+         datetime.utcnow().isoformat(), project_id),
     )
     conn.commit()
     conn.close()
@@ -712,6 +885,41 @@ def get_report(report_id: str) -> Optional[Dict[str, Any]]:
     data = dict(row)
     data["report"] = json.loads(data["report_json"]) if data["report_json"] else {}
     return data
+
+
+def list_reports(limit: int = 25, offset: int = 0,
+                 project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Reports newest first, scoped exactly like `list_reviews`.
+
+    Returns a summary row per report — gate, risk and title lifted out of `report_json` —
+    rather than the whole document, so a listing screen doesn't transfer every report in
+    full. Use `get_report` for the document itself.
+    """
+    scope, params = _review_scope_sql(project_ids)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT id, review_id, project_name, project_id, created_at, report_json "
+        f"FROM reports WHERE 1 = 1{scope} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        params + (limit, offset),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    reports = []
+    for row in rows:
+        data = dict(row)
+        document = json.loads(data.pop("report_json") or "{}")
+        # The report document has no finding total of its own — it groups them by category
+        # (report_generator._build_report_document), so count across the groups.
+        by_category = document.get("findings_by_category") or {}
+        data["gate_status"] = document.get("gate_status", "")
+        data["overall_risk_score"] = document.get("overall_risk_score", 0)
+        data["total_findings"] = sum(len(v or []) for v in by_category.values())
+        data["review_date"] = document.get("review_date", "")
+        data["approval_required"] = document.get("approval_required", False)
+        reports.append(data)
+    return reports
 
 
 def log_audit(cursor, event_type: str, entity_type: str, entity_id: str, actor: str = "system", details: str = ""):

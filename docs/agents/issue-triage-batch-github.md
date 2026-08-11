@@ -48,7 +48,7 @@ Custom envelope — unlike the single-issue endpoint, the underlying result dict
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars), enforced independently per issue's content
-- **Timeout & retry** — 120s timeout per issue's LLM call, up to 2 retries each — a batch of `limit=25` issues can therefore take substantially longer than a single triage call; size your client-side timeout accordingly
+- **Timeout & retry** — 900s timeout per issue's LLM call, up to 2 retries each — a batch of `limit=25` issues can therefore take substantially longer than a single triage call; size your client-side timeout accordingly
 - **Prompt-injection scan** — non-blocking per issue; any `guardrail_flags` appear on that issue's own triage report within the batch response
 - **Untrusted content wrapping** — each fetched issue body is wrapped before analysis, same as any other GitHub-sourced content
 - GitHub API errors during the fetch (not LLM/guardrail errors) surface as HTTP 502 with the underlying error message

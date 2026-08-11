@@ -29,9 +29,19 @@ python run.py
 - There is no separate frontend dev server or build step — `frontend/` (`index.html`, `app.js`, `styles.css`, `logger.js`) is mounted directly at `/static` by `backend/main.py`.
 - Interactive API docs available at `/docs` once running.
 
-## No test suite, lint, or CI
+## Tests: smoke scripts, no framework
 
-There is currently no test framework, linter/formatter config, or CI pipeline in this repo. Don't assume `pytest`, `ruff`, `eslint`, etc. are available — check before suggesting a command that relies on them.
+There is no test framework, linter/formatter config, or CI pipeline. Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework.
+
+```
+python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
+python scripts/smoke_code_review.py     # chunking, gate floor, evidence verification, waivers
+python scripts/smoke_modernization.py   # run lifecycle, dependency order, crash/resume
+python scripts/smoke_governance.py      # Core SDLC Review stages, reports, gate fan-in, swarm
+node   scripts/smoke_render.js          # frontend result rendering (DOM-stubbed, no deps)
+```
+
+The Python ones drive the real app through FastAPI's `TestClient` against a throwaway SQLite file with `llm_gateway.call_tool` stubbed, so they need no server, no API key and no network — they exercise routing, auth, entitlement, quota and persistence, but never the model itself.
 
 ## Architecture
 

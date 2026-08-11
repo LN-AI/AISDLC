@@ -28,6 +28,14 @@
         <div class="sidebar-project-meta" id="active-project-meta"></div>
       </div>
 
+      <!-- Which LLM is actually serving reviews. Visible to every signed-in user, not
+           just admins: if a review was produced by a local router rather than Claude,
+           that is something the person reading the findings needs to know. -->
+      <div class="sidebar-llm" id="sidebar-llm" style="display:none" title="The model serving agent calls">
+        <span class="sidebar-llm-dot" id="sidebar-llm-dot"></span>
+        <span class="sidebar-llm-text" id="sidebar-llm-text">—</span>
+      </div>
+
       <ul class="nav-list">
         <li class="nav-item active" data-page="dashboard">
           <span class="nav-icon">📊</span> Dashboard
@@ -148,10 +156,13 @@
           </div>
           <ul class="nav-section-items">
             <li class="nav-item" data-page="full" data-product="full">
-              <span class="nav-icon">🔍</span> Full SDLC Review
+              <span class="nav-icon">🔍</span> Core SDLC Review
             </li>
             <li class="nav-item" data-page="gate" data-product="release-gate">
               <span class="nav-icon">🚦</span> Release Gate
+            </li>
+            <li class="nav-item" data-page="governance-report" data-product="report-generate">
+              <span class="nav-icon">📄</span> Governance Report
             </li>
             <li class="nav-item" data-page="inventory">
               <span class="nav-icon">📦</span> AI Inventory
@@ -171,6 +182,9 @@
             </li>
             <li class="nav-item" data-page="api-keys" id="nav-api-keys" style="display:none">
               <span class="nav-icon">🔑</span> API Keys
+            </li>
+            <li class="nav-item" data-page="llm-providers" id="nav-llm-providers" style="display:none">
+              <span class="nav-icon">🧠</span> LLM Providers
             </li>
             <li class="nav-item" data-page="plans" id="nav-plans" style="display:none">
               <span class="nav-icon">📦</span> Plans
@@ -245,8 +259,15 @@
           </div>
         </div>
         <div class="section-title">Recent Reviews</div>
-        <div id="recent-reviews" class="reviews-table-wrap">
+        <div id="recent-reviews" class="reviews-table-wrap reviews-table-scroll">
           <div class="empty-state">Loading...</div>
+        </div>
+        <div id="recent-reviews-pager" class="table-pager hidden">
+          <span id="recent-reviews-range" class="pager-range"></span>
+          <div class="pager-buttons">
+            <button class="btn btn-secondary btn-sm" id="recent-reviews-prev" onclick="pageRecentReviews(-1)">← Newer</button>
+            <button class="btn btn-secondary btn-sm" id="recent-reviews-next" onclick="pageRecentReviews(1)">Older →</button>
+          </div>
         </div>
       </div>
 
@@ -443,8 +464,10 @@ Answer questions about patients based on the provided context."></textarea>
       <!-- Full SDLC Review Page -->
       <div id="page-full" class="page">
         <div class="page-header">
-          <h1>Full SDLC Review</h1>
-          <p class="subtitle">Run all agents in one pass — requirement, code, prompt safety, compliance, and release gate</p>
+          <h1>Core SDLC Review</h1>
+          <p class="subtitle">Requirement, compliance, architecture, code and prompt safety in one pass, then a
+            release gate and a governance report. Security testing is opt-in below — the result names anything
+            that did not run.</p>
         </div>
         <div class="form-card">
           <div class="form-group">
@@ -475,9 +498,31 @@ Answer questions about patients based on the provided context."></textarea>
             <label>Test Evidence Summary</label>
             <textarea id="full-test" rows="4" placeholder="Describe test coverage, test results, red-team tests, validation evidence..."></textarea>
           </div>
+
+          <div class="form-group opt-in-block">
+            <label>Additional security stages</label>
+            <p class="field-hint">Each runs over an artifact you already supplied above and adds one LLM call
+              to this run. Off by default because this is billed as a single call.</p>
+            <label class="checkbox-label">
+              <input type="checkbox" id="full-include-security" />
+              <span><strong>Security Review (STRIDE)</strong> — threat model over the architecture description.
+                Needs <em>Architecture Description</em>.</span>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" id="full-include-vapt" />
+              <span><strong>VAPT</strong> — vulnerability assessment with CVSS scoring over the code.
+                Needs <em>Code Sample</em>.</span>
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" id="full-include-sensitive" />
+              <span><strong>Sensitive Data Scan</strong> — PII/PHI/PCI and credentials in the code.
+                Needs <em>Code Sample</em>.</span>
+            </label>
+          </div>
+
           <div class="form-actions">
             <button class="btn btn-primary btn-large" onclick="runFullReview()">
-              <span class="btn-icon">🚀</span> Run Full SDLC Review
+              <span class="btn-icon">🚀</span> Run Core SDLC Review
             </button>
           </div>
         </div>
@@ -545,13 +590,31 @@ Answer questions about patients based on the provided context."></textarea>
             </div>
           </div>
           <div class="form-group">
-            <label>Paste Review IDs (one per line, optional)</label>
-            <textarea id="gate-review-ids" rows="4" placeholder="If you have prior review IDs, paste them here to load their findings..."></textarea>
+            <div class="picker-header">
+              <label>Reviews to gate on</label>
+              <div class="picker-actions">
+                <button type="button" class="btn-link" onclick="selectAllReviews(true)">Select all</button>
+                <button type="button" class="btn-link" onclick="selectAllReviews(false)">Clear</button>
+                <button type="button" class="btn-link" onclick="loadReviewPicker()">↻ Refresh</button>
+              </div>
+            </div>
+            <p class="field-hint">The gate aggregates the findings from every review you tick. It is only
+              as broad as what you select.</p>
+            <div id="gate-review-picker" class="review-picker">
+              <div class="empty-state">Loading reviews…</div>
+            </div>
           </div>
-          <div class="form-group">
-            <label>Or paste findings JSON directly (optional)</label>
-            <textarea id="gate-findings" rows="6" placeholder='[{"control_id": "SEC-003", "severity": 5, "title": "Hardcoded API key", ...}]'></textarea>
-          </div>
+          <details class="form-group advanced-block">
+            <summary>Advanced — paste IDs or findings directly</summary>
+            <div class="form-group">
+              <label>Review IDs (one per line)</label>
+              <textarea id="gate-review-ids" rows="3" placeholder="For review IDs from another project or an API run…"></textarea>
+            </div>
+            <div class="form-group">
+              <label>Findings JSON</label>
+              <textarea id="gate-findings" rows="6" placeholder='[{"control_id": "SEC-003", "severity": 5, "title": "Hardcoded API key", ...}]'></textarea>
+            </div>
+          </details>
           <div class="form-actions">
             <button class="btn btn-primary" onclick="runReleaseGate()">
               <span class="btn-icon">🚦</span> Check Release Gate
@@ -559,6 +622,49 @@ Answer questions about patients based on the provided context."></textarea>
           </div>
         </div>
         <div id="gate-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Governance Report Page -->
+      <div id="page-governance-report" class="page">
+        <div class="page-header">
+          <h1>Governance Report</h1>
+          <p class="subtitle">Synthesise prior reviews into one audit-ready report — executive summary,
+            findings by category, controls assessment, and the release decision. Does not re-run any review.</p>
+        </div>
+        <div class="form-card">
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project Name</label>
+              <input type="text" id="report-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+            </div>
+          </div>
+          <div class="form-group">
+            <div class="picker-header">
+              <label>Reviews to report on</label>
+              <div class="picker-actions">
+                <button type="button" class="btn-link" onclick="selectAllReportReviews(true)">Select all</button>
+                <button type="button" class="btn-link" onclick="selectAllReportReviews(false)">Clear</button>
+                <button type="button" class="btn-link" onclick="loadReportReviewPicker()">↻ Refresh</button>
+              </div>
+            </div>
+            <div id="report-review-picker" class="review-picker">
+              <div class="empty-state">Loading reviews…</div>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="generateGovernanceReport()">
+              <span class="btn-icon">📄</span> Generate Report
+            </button>
+          </div>
+        </div>
+
+        <div class="section-heading" style="margin-top:24px">
+          <h2>Previous reports</h2>
+          <p class="subtitle">Every report generated for this project.</p>
+        </div>
+        <div id="report-list" class="review-picker"><div class="empty-state">Loading…</div></div>
+
+        <div id="report-result" class="result-area hidden"></div>
       </div>
 
       <!-- Knowledge Base Page -->
@@ -1417,9 +1523,63 @@ Examples:
       <div id="page-agent-hub" class="page">
         <div class="page-header">
           <h1>Agent Hub</h1>
-          <p class="subtitle">Run any agent directly from a GitHub PR/issue/repo or Jira ticket — results post back automatically</p>
+          <p class="subtitle">Run one agent against a GitHub PR/issue/repo or Jira ticket — or fan one artifact out to a whole policy at once</p>
         </div>
         <div id="agent-hub-status" class="info-box" style="margin-bottom:16px"></div>
+
+        <!-- Agent Swarm -->
+        <div class="form-card swarm-card">
+          <div class="section-heading">
+            <h2>⚡ Agent Swarm</h2>
+            <p class="subtitle">Runs several review agents over the same artifact in parallel under a named
+              policy, then collapses them into one gate decision. One agent failing never blocks the gate.</p>
+          </div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Policy</label>
+              <select id="swarm-policy"><option value="">Loading…</option></select>
+              <p class="field-hint" id="swarm-policy-hint">&nbsp;</p>
+            </div>
+            <div class="form-group flex1">
+              <label>Project Name</label>
+              <input type="text" id="swarm-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Source</label>
+            <select id="swarm-source-type" onchange="onSwarmSourceChange()">
+              <option value="text">Paste text / code</option>
+              <option value="github_pr_url">GitHub PR URL</option>
+              <option value="github_file_url">GitHub file URL</option>
+              <option value="github_repo_url">GitHub repo URL</option>
+              <option value="jira_ticket">Jira ticket</option>
+            </select>
+          </div>
+          <div class="form-group" id="swarm-ref-group" style="display:none">
+            <label id="swarm-ref-label">Reference</label>
+            <input type="text" id="swarm-ref" placeholder="https://github.com/owner/repo/pull/42" />
+          </div>
+          <div class="form-group" id="swarm-text-group">
+            <label>Artifact</label>
+            <textarea id="swarm-text" rows="8" placeholder="Paste the code, architecture description, or document to fan out to the policy's agents…"></textarea>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="swarm-postback" /> Post the result back to GitHub / Jira
+            </label>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runSwarm()">
+              <span class="btn-icon">⚡</span> Run Swarm
+            </button>
+          </div>
+        </div>
+        <div id="swarm-result" class="result-area hidden"></div>
+
+        <div class="section-heading" style="margin-top:28px">
+          <h2>Single agent</h2>
+          <p class="subtitle">Run one agent on its own.</p>
+        </div>
         <div id="agent-cards" class="agent-grid"></div>
         <div id="hub-result" class="result-area hidden"></div>
       </div>
@@ -1715,6 +1875,49 @@ Examples:
             <button class="btn btn-primary" onclick="createUser()">Create User</button>
             <button class="btn btn-secondary" onclick="closeCreateUser()">Cancel</button>
           </div>
+        </div>
+      </div>
+
+      <!-- LLM Providers Page -->
+      <div id="page-llm-providers" class="page">
+        <div class="page-header">
+          <h1>LLM Providers</h1>
+          <p class="subtitle">Define the model endpoints this platform can run on and choose which one serves agent calls. The active connection is used everywhere — the review forms on this site, Agent Hub, Swarm, workflows and the v1 API — so switching here switches the whole platform. Teams that bring their own LLM on an API key still override it.</p>
+        </div>
+
+        <div class="form-card" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+          <div>
+            <div class="section-title" style="margin-top:0">Currently serving agent calls</div>
+            <div id="llmp-active-label" style="font-size:13px;color:var(--text-muted)">Loading…</div>
+          </div>
+          <button class="btn btn-primary" onclick="openLlmConnectionModal()">
+            <span class="btn-icon">＋</span> Add Connection
+          </button>
+        </div>
+
+        <div id="llmp-list" class="result-area" style="margin-top:16px"></div>
+
+        <div class="api-usage-card" style="margin-top:16px">
+          <div class="api-usage-title">Things worth knowing before you switch</div>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Tool calling is mandatory.</strong> Every agent gets its structured output by forcing the
+            model to call a JSON tool, so a provider that can't do that can't run a single review.
+            <strong>Test</strong> sends exactly that kind of call and tells you whether one came back.
+          </p>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Costs become estimates.</strong> Spend is priced from a per-model table; a model that isn't in
+            it is priced with a default rate and flagged as estimated on the Usage screen. A free local
+            endpoint will still show a non-zero figure.
+          </p>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Prompt caching is Anthropic-only.</strong> Switching away loses it and multi-agent runs get
+            more expensive per token; switching back restores it automatically.
+          </p>
+          <p style="font-size:12px;color:var(--text-muted);margin-top:8px">
+            <strong>Latency compounds.</strong> Reviews send far larger prompts than the test does. If the test
+            takes tens of seconds, a full review will take minutes — set a per-connection timeout to fail fast
+            rather than waiting out the platform-wide one.
+          </p>
         </div>
       </div>
 
@@ -2110,6 +2313,71 @@ Examples:
       <div class="form-actions" style="margin-top:18px">
         <button class="btn btn-primary" onclick="saveProjectEdits()">Save Changes</button>
         <button class="btn btn-secondary" onclick="closeProjectEditor()">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="llm-connection-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeLlmConnectionModal()">
+    <div class="modal-box" style="width:600px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeLlmConnectionModal()" title="Dismiss (Esc)">✕</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 style="margin-bottom:2px" id="llmc-title">Add LLM Connection</h2>
+        <p>Anthropic, a local router, or anything that speaks one of the two wire formats.</p>
+      </div>
+
+      <div class="form-group">
+        <label>Provider type</label>
+        <select id="llmc-preset" onchange="applyLlmPreset()"></select>
+        <div id="llmc-preset-hint" style="font-size:12px;color:var(--text-muted);margin-top:6px"></div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Name</label>
+          <input type="text" id="llmc-name" placeholder="e.g. OmniRoute local" />
+        </div>
+        <div class="form-group flex1">
+          <label>Wire format</label>
+          <select id="llmc-provider">
+            <option value="anthropic">Anthropic Messages API</option>
+            <option value="openai">OpenAI chat-completions</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Base URL</label>
+          <input type="text" id="llmc-baseurl" placeholder="Blank for the vendor default" />
+        </div>
+        <div class="form-group flex1">
+          <label>Model</label>
+          <input type="text" id="llmc-model" placeholder="e.g. auto/best-fast" />
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label>API Key</label>
+        <input type="password" id="llmc-apikey" placeholder="Encrypted at rest, never shown again" />
+        <div id="llmc-key-hint" style="font-size:12px;color:var(--text-muted);margin-top:6px"></div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex1">
+          <label>Max output tokens — ceiling (optional)</label>
+          <input type="number" id="llmc-maxtokens" placeholder="Blank uses the platform default" />
+          <div class="field-hint">Your model's real output cap, e.g. 16384 for gpt-4o. Agents ask for up to 32000; larger requests are clamped to this rather than rejected by the endpoint.</div>
+        </div>
+        <div class="form-group flex1">
+          <label>Timeout, seconds (optional)</label>
+          <input type="number" id="llmc-timeout" placeholder="Blank uses the platform default" />
+        </div>
+      </div>
+
+      <div id="llmc-error" class="hidden" style="font-size:13px;color:var(--red);margin-bottom:10px"></div>
+      <div class="form-actions">
+        <button class="btn btn-primary" id="llmc-save" onclick="saveLlmConnection()">Save</button>
+        <button class="btn btn-secondary" onclick="closeLlmConnectionModal()">Cancel</button>
       </div>
     </div>
   </div>

@@ -45,7 +45,7 @@ Gate logic: **Red** — critical architectural flaws (missing auth, broken encry
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; flags surfaced as `guardrail_flags`
 - **Untrusted content wrapping** — fetched repo/file/Jira content is wrapped before analysis
 

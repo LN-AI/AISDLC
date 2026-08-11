@@ -172,8 +172,8 @@ def _estimated_call_cost(model: str, expected_calls: int = 1) -> float:
     generate, priced as output. Deliberately pessimistic — reserving too little lets the
     race back in, while reserving too much only refuses a call that was already at the edge.
 
-    `RESERVATION_MAX_TOKENS`, not `config.MAX_TOKENS`: the latter is 8000, but architecture
-    requests 16000 and VAPT/security 14000, so reserving against it under-estimated the
+    `RESERVATION_MAX_TOKENS`, not `config.MAX_TOKENS`: the latter is 16000, but architecture
+    requests 32000 and VAPT/security 28000, so reserving against it under-estimated the
     expensive calls by roughly 2x — precisely the ones worth protecting against.
 
     `expected_calls` covers the composite products. `full` is one guarded_call wrapping
@@ -184,10 +184,11 @@ def _estimated_call_cost(model: str, expected_calls: int = 1) -> float:
     return (RESERVATION_MAX_TOKENS * max(expected_calls, 1) / 1_000_000) * pricing["output"]
 
 
-# The largest max_tokens any agent actually asks for (architecture; VAPT and security use
-# 14000). Kept here rather than imported from base_agent to avoid the agent layer becoming
-# a dependency of the billing layer — but it must be raised if any agent goes higher.
-RESERVATION_MAX_TOKENS = 16000
+# The largest max_tokens any agent actually asks for (architecture, codegen-scaffold,
+# test-case and unit conversion; VAPT and security use 28000). Kept here rather than
+# imported from base_agent to avoid the agent layer becoming a dependency of the billing
+# layer — but it must be raised if any agent goes higher.
+RESERVATION_MAX_TOKENS = 32000
 
 # How many LLM calls one guarded_call can make. A plain agent is one; a workflow chains
 # several behind a single guard, and `full` chains the most. Only used for sizing the
@@ -353,7 +354,12 @@ def guarded_call(
 
     logger.info("Agent call started: caller=%s product=%s", caller_id, agent_name)
     status = "ok"
-    model_for_reservation = (override or {}).get("model") or config.MODEL
+    # What actually serves the call: the caller's own override if they sent one, else the
+    # admin-selected platform connection, else .env Anthropic. Resolved here so the
+    # reservation and the ledger name the real model — a UI call has override=None but may
+    # still be running on a local router, and pricing it as Claude would be a fiction.
+    effective_llm = llm_gateway.resolve_override(override) or {}
+    model_for_reservation = effective_llm.get("model") or config.MODEL
     failed_usage = None
     try:
         # Held for the duration of the call so a concurrent request sees this one's
@@ -394,14 +400,20 @@ def guarded_call(
                 logger.exception("Could not record usage for the failed call (continuing)")
         raise
 
-    model = (override or {}).get("model") or config.MODEL
-    provider = (override or {}).get("provider") or "anthropic"
+    model = effective_llm.get("model") or config.MODEL
+    provider = effective_llm.get("provider") or "anthropic"
     cost_usd = _price_usage(usage, model) if usage["calls"] else 0.0
 
     # A caller-supplied api_key means the caller's own LLM account paid for this call, not
     # the platform's. The spend is still recorded for visibility, but it must not consume
     # a budget cap that exists to protect *our* bill. Call quotas still apply — see
     # entitlement_service.check_quota.
+    #
+    # Deliberately reads `override`, not `effective_llm`: an admin-selected platform
+    # connection is still *our* endpoint and our bill, so it must keep drawing down
+    # budgets exactly as the .env key does. Using the resolved value here would silently
+    # switch every UI call to non-billable the moment a connection was selected, and
+    # budgets would stop moving with nothing in the logs to explain it.
     billable = not (override or {}).get("api_key")
 
     if usage["calls"]:
@@ -459,8 +471,9 @@ def _record_failed_usage(usage, subject, key_id, caller_id, agent_name, product_
     visibility: before this, a run that failed after generating 14,000 output tokens left
     no trace of the spend anywhere, so a customer whose calls kept truncating looked free.
     """
-    model = (override or {}).get("model") or config.MODEL
-    provider = (override or {}).get("provider") or "anthropic"
+    effective_llm = llm_gateway.resolve_override(override) or {}
+    model = effective_llm.get("model") or config.MODEL
+    provider = effective_llm.get("provider") or "anthropic"
     cost_usd = _price_usage(usage, model)
     logger.warning(
         "Failed call still consumed tokens: caller=%s product=%s tokens_in=%d tokens_out=%d "

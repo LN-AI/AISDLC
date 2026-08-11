@@ -51,7 +51,7 @@ Custom envelope, fields returned at the top level:
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars), applied to the aggregated findings/summary text sent to the model
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; would surface as `guardrail_flags` on the internal result, though this field is not included in the explicit top-level response shape above
 - No GitHub/Jira fetch happens for this endpoint — all input is either findings you supply directly or findings already stored from prior agent calls, so there is no untrusted-content wrapping step
 

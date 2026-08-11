@@ -152,6 +152,36 @@ def get_override() -> Optional[Dict[str, Any]]:
     return _current_override.get()
 
 
+def platform_default() -> Optional[Dict[str, Any]]:
+    """The admin-selected platform LLM connection, or None to mean config.ANTHROPIC_API_KEY.
+
+    This is the rung that makes the browser UI work against a non-Anthropic provider.
+    It is resolved *here*, at call time, rather than pushed through `with_override()`:
+    `agent_guard.guarded_call` sets the contextvar to None for every UI call, so an
+    outer contextvar value would be shadowed and never seen.
+
+    Never raises. A settings lookup failing must degrade to the platform default, not
+    take down every agent in the product.
+    """
+    try:
+        from backend.services import llm_settings_service  # local: it imports this module
+        return llm_settings_service.active_override()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Could not resolve the platform LLM connection (using default): %s", e)
+        return None
+
+
+def resolve_override(llm_override: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """The single definition of which LLM config wins, shared with agent_guard so the
+    ledger records the model that actually served a call rather than assuming Anthropic.
+
+    Explicit argument > request contextvar > active platform connection > None (.env).
+    """
+    if llm_override is not None:
+        return llm_override
+    return get_override() or platform_default()
+
+
 def _cacheable_system(system_prompt: str):
     """Return the `system` parameter, marked cacheable when prompt caching is on.
 
@@ -173,11 +203,12 @@ def _cacheable_system(system_prompt: str):
 def _call_anthropic(
     api_key: Optional[str], base_url: Optional[str], model: Optional[str],
     system_prompt: str, user_content: str, tool_schema: Dict[str, Any],
-    max_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None, timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     client = _default_anthropic_client if not api_key else anthropic.Anthropic(
         api_key=api_key, base_url=base_url or None
     )
+    timeout = timeout or config.LLM_TIMEOUT_SECONDS
     resolved_model = model or config.MODEL
     last_err = None
     response = None
@@ -192,7 +223,7 @@ def _call_anthropic(
                 tools=[tool_schema],
                 tool_choice={"type": "tool", "name": tool_schema["name"]},
                 messages=[{"role": "user", "content": user_content}],
-                timeout=config.LLM_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             break
         except _RETRYABLE_ANTHROPIC as e:
@@ -250,17 +281,23 @@ def _call_anthropic(
 def _call_openai(
     api_key: str, base_url: Optional[str], model: Optional[str],
     system_prompt: str, user_content: str, tool_schema: Dict[str, Any],
-    max_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None, timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     client = openai.OpenAI(api_key=api_key, base_url=base_url or None)
     resolved_model = model or "gpt-4o"
+    # Was hardcoded to 4096 while the Anthropic path used config.MAX_TOKENS (8000). Any
+    # agent that doesn't name its own budget got half as much room here, and a response
+    # cut off at the limit raises LLMTruncatedResponseError rather than degrading — so
+    # the same agent would work on Anthropic and fail on an OpenAI-compatible endpoint.
+    resolved_max_tokens = max_tokens or config.MAX_TOKENS
+    timeout = timeout or config.LLM_TIMEOUT_SECONDS
     response = None
     start = time.perf_counter()
     for attempt in range(config.LLM_MAX_RETRIES + 1):
         try:
             response = client.chat.completions.create(
                 model=resolved_model,
-                max_tokens=max_tokens or 4096,
+                max_tokens=resolved_max_tokens,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
@@ -274,7 +311,7 @@ def _call_openai(
                     },
                 }],
                 tool_choice={"type": "function", "function": {"name": tool_schema["name"]}},
-                timeout=config.LLM_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             break
         except _RETRYABLE_OPENAI as e:
@@ -306,10 +343,10 @@ def _call_openai(
     if finish_reason == "length":
         logger.warning(
             "OpenAI call for tool '%s' hit the token limit (%d) — response is likely truncated/incomplete",
-            tool_schema["name"], max_tokens or 4096,
+            tool_schema["name"], resolved_max_tokens,
         )
         raise LLMTruncatedResponseError(
-            tool_schema["name"], max_tokens or 4096,
+            tool_schema["name"], resolved_max_tokens,
             elapsed_ms=duration_ms, input_tokens=input_tokens, output_tokens=output_tokens,
             model=resolved_model, provider="openai",
         )
@@ -331,11 +368,15 @@ def call_tool(
     """Run one tool-call turn against the platform default LLM or a BYOL override.
 
     llm_override shape: {"provider": "anthropic"|"openai", "api_key": str,
-                          "base_url": Optional[str], "model": Optional[str]}
+                          "base_url": Optional[str], "model": Optional[str],
+                          "max_tokens": Optional[int], "timeout_seconds": Optional[float]}
     Falls back to `get_override()` (contextvar) when llm_override is not passed
-    explicitly, then to the platform default when neither is set.
+    explicitly, then to the admin-selected platform connection (`platform_default()`),
+    then to config.ANTHROPIC_API_KEY when none is set.
     `max_tokens` lets callers with larger output needs (e.g. code generation)
-    override the platform default response-length budget for this call only.
+    override the platform default response-length budget for this call only. A connection's
+    configured `max_tokens` is a hard ceiling and clamps that request down — see the
+    comment at the resolution site for why an endpoint's real limit has to win.
 
     Cost-optimization (Headroom) compression is NOT done here — it happens at the
     orchestrator level, on the raw artifact field, before it's wrapped into this
@@ -352,18 +393,45 @@ def call_tool(
     """
     enforce_input_limit(user_content)
 
-    override = llm_override if llm_override is not None else get_override()
+    override = resolve_override(llm_override)
     provider = (override or {}).get("provider") or "anthropic"
     api_key = (override or {}).get("api_key")
     base_url = (override or {}).get("base_url")
     model = (override or {}).get("model")
+    # Resolved once, here, rather than separately inside each provider function — the two
+    # used to disagree (Anthropic config.MAX_TOKENS, OpenAI a hardcoded 4096), so the same
+    # agent got half the room on an OpenAI-compatible endpoint and raised
+    # LLMTruncatedResponseError instead of finishing.
+    #
+    # The connection's `max_tokens` is a **ceiling**, not just a default: agents now ask for
+    # up to 32000, which is above what several OpenAI-compatible models will accept as an
+    # output cap at all (gpt-4o tops out at 16384, gpt-4-turbo at 4096). Letting the agent's
+    # request through unchanged makes those endpoints reject the whole call with a
+    # non-retryable 400 — strictly worse than clamping, which at most truncates and raises
+    # LLMTruncatedResponseError with a message saying so. An admin who knows their endpoint's
+    # limit can now express it, and the clamp is logged so a short answer is never mysterious.
+    requested = max_tokens or config.MAX_TOKENS
+    ceiling = (override or {}).get("max_tokens")
+    if ceiling and requested > ceiling:
+        logger.warning(
+            "Clamping max_tokens for tool '%s' from %d to the connection's ceiling of %d — "
+            "a response longer than that will be reported as truncated",
+            tool_schema["name"], requested, ceiling,
+        )
+        requested = ceiling
+    max_tokens = requested
+    timeout = (override or {}).get("timeout_seconds")
 
     if provider == "openai":
         if not api_key:
-            raise ValueError("An OpenAI-compatible BYOL config requires an api_key.")
-        result = _call_openai(api_key, base_url, model, system_prompt, user_content, tool_schema, max_tokens)
+            # Local routers (Ollama, OmniRoute, LM Studio) don't check the key, but the
+            # OpenAI SDK refuses to construct a client without one. Send a placeholder
+            # rather than making the admin invent one — a real endpoint that does check
+            # will reject it and the connection test will say so.
+            api_key = "not-required"
+        result = _call_openai(api_key, base_url, model, system_prompt, user_content, tool_schema, max_tokens, timeout)
     else:
-        result = _call_anthropic(api_key, base_url, model, system_prompt, user_content, tool_schema, max_tokens)
+        result = _call_anthropic(api_key, base_url, model, system_prompt, user_content, tool_schema, max_tokens, timeout)
 
     flags = scan_for_injection_markers(user_content)
     if flags:
@@ -394,7 +462,7 @@ def count_tokens(
     Never raises — a token count is an optimisation input, not a correctness one, so any
     failure degrades to the character estimate rather than breaking the caller.
     """
-    override = llm_override if llm_override is not None else get_override()
+    override = resolve_override(llm_override)
     provider = (override or {}).get("provider") or "anthropic"
     combined = f"{system_prompt}\n{user_content}"
     estimate = int(len(combined) / 3.5) + 1
@@ -421,13 +489,21 @@ def count_tokens(
 
 
 def describe(llm_override: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    """Small metadata blob describing which LLM actually served a call — for audit trails."""
-    if not llm_override:
+    """Small metadata blob describing which LLM actually served a call — for audit trails.
+
+    Resolves the same chain call_tool does, so a UI call running on an admin-selected
+    connection is recorded as that connection rather than as Anthropic.
+    """
+    resolved = llm_override or platform_default()
+    if not resolved:
         return {"provider": "anthropic", "model": config.MODEL, "source": "platform"}
-    provider = llm_override.get("provider") or "anthropic"
+    provider = resolved.get("provider") or "anthropic"
     default_model = config.MODEL if provider == "anthropic" else "gpt-4o"
-    return {
+    described = {
         "provider": provider,
-        "model": llm_override.get("model") or default_model,
-        "source": llm_override.get("source", "byol"),
+        "model": resolved.get("model") or default_model,
+        "source": resolved.get("source", "byol"),
     }
+    if resolved.get("connection_name"):
+        described["connection"] = resolved["connection_name"]
+    return described

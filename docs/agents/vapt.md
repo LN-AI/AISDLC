@@ -42,7 +42,7 @@ Gate logic: **Red** — any Critical or multiple High findings. **Amber** — Hi
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; flags surfaced as `guardrail_flags`. This agent is deliberately never blocked from analyzing malicious-looking code — that's the point of a VAPT scan
 - **Untrusted content wrapping** — fetched PR/file/repo content is wrapped before analysis
 

@@ -42,7 +42,7 @@ Gate logic: **Red** — direct prompt injection vector, PHI passed to an externa
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient provider errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient provider errors
 - **Prompt-injection scan** — non-blocking; flags surfaced as `guardrail_flags`. Note this agent's entire *job* is finding injection vectors in the submitted prompt — the heuristic scan is a secondary, generic signal on top of the LLM's own analysis, not a substitute for it
 - **Untrusted content wrapping** — a fetched `github_file_url` is wrapped before analysis
 

@@ -53,7 +53,7 @@ Custom envelope, fields returned at the top level:
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars) applies to the `requirement`/`context` text passed in
-- **Timeout & retry** — 120s timeout, up to 2 retries (this call also uses a raised `max_tokens=8000` output budget to fit a full multi-file scaffold in one response)
+- **Timeout & retry** — 900s timeout, up to 2 retries (this call also uses a raised `max_tokens=32000` output budget to fit a full multi-file scaffold in one response)
 - **Prompt-injection scan** — non-blocking; would surface as `guardrail_flags` if present, though a synthetic `requirement` rarely triggers it
 - If `auto_review: true`, the generated scaffold is passed through the same Code Review and Sensitive Data Detector guardrail pipeline described in [`code.md`](code.md) and [`sensitive-data.md`](sensitive-data.md) before being returned
 

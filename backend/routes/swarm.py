@@ -18,7 +18,7 @@ from backend.models.swarm_models import (
     SwarmRequest,
     SwarmResponse,
 )
-from backend.services import agent_guard, llm_gateway
+from backend.services import agent_guard, llm_gateway, llm_settings_service
 from backend.services.agent_guard import (
     BudgetExceededError,
     QuotaExceededError,
@@ -80,11 +80,12 @@ See `GET /api/v1/swarm/policies` for the full policy catalogue.
 """,
 )
 def run_swarm(req: SwarmRequest, caller: dict = Depends(get_caller)) -> SwarmResponse:
-    if not config.ANTHROPIC_API_KEY and not has_any_byol(req, caller):
+    if not llm_settings_service.is_llm_configured() and not has_any_byol(req, caller):
         raise HTTPException(
             status_code=503,
-            detail="ANTHROPIC_API_KEY not configured in .env. Supply llm_provider/llm_api_key, "
-                   "or configure BYOL via PUT /api/v1/llm-config, to bring your own LLM instead.",
+            detail="No LLM configured. Activate a connection under Settings → LLM Providers, "
+                   "set ANTHROPIC_API_KEY in .env, or supply llm_provider/llm_api_key on this "
+                   "call (or via PUT /api/v1/llm-config) to bring your own.",
         )
 
     # Validate that at least one source is provided

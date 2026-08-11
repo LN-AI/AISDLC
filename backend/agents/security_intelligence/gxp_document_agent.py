@@ -210,6 +210,6 @@ class GxPDocumentAgent(BaseAgent):
 Identify the document type, run the full element checklist for that type, and check signatures/approvals,
 version control, and traceability. If multiple documents were given, check consistency across them. Be exhaustive.
 """
-        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, GXP_DOCUMENT_TOOL_SCHEMA, max_tokens=8000)
+        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, GXP_DOCUMENT_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
         return result

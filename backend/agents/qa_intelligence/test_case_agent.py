@@ -106,6 +106,6 @@ traceability back to the requirement or scenario each one validates.
         # error, not silently) on a realistic multi-scenario test suite — steps[] is itself
         # a nested array of objects per test case, comparable verbosity to architecture's
         # deeply-nested schema (which needed 16000); matched to that proven level.
-        result = llm_gateway.call_tool(TEST_CASE_SYSTEM_PROMPT, prompt, TEST_CASE_TOOL_SCHEMA, max_tokens=16000)
+        result = llm_gateway.call_tool(TEST_CASE_SYSTEM_PROMPT, prompt, TEST_CASE_TOOL_SCHEMA, max_tokens=32000)
         result["agent_name"] = self.agent_name
         return result

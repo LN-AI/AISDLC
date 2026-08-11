@@ -67,7 +67,7 @@ Custom envelope — the assessment is nested under `assessment`:
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; flags surface inside `assessment.guardrail_flags`
 - **Untrusted content wrapping** — a fetched PR/file is wrapped before analysis
 

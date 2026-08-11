@@ -56,6 +56,10 @@ function updateAuthUI() {
     if (navVertical) navVertical.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navPlans) navPlans.style.display = isSuperAdmin() ? '' : 'none';
     if (navUsage) navUsage.style.display = isSuperAdmin() ? '' : 'none';
+    // Credentials, so super admin only — but the badge below it is for everyone.
+    const navLlm = document.getElementById('nav-llm-providers');
+    if (navLlm) navLlm.style.display = isSuperAdmin() ? '' : 'none';
+    refreshActiveLlmBadge();
   } else {
     el.innerHTML = `<button class="btn-login" onclick="openLogin()">🔑 Sign In</button>`;
     navUsers.style.display = 'none';
@@ -64,6 +68,10 @@ function updateAuthUI() {
     if (navVertical) navVertical.style.display = 'none';
     if (navPlans) navPlans.style.display = 'none';
     if (navUsage) navUsage.style.display = 'none';
+    const navLlm = document.getElementById('nav-llm-providers');
+    if (navLlm) navLlm.style.display = 'none';
+    const llmBadge = document.getElementById('sidebar-llm');
+    if (llmBadge) llmBadge.style.display = 'none';
   }
   refreshApprovalBadge();
 }
@@ -88,6 +96,8 @@ document.addEventListener('keydown', e => {
     if (gate && !gate.classList.contains('hidden')) closeLogin();
     const llmModal = document.getElementById('llm-config-modal');
     if (llmModal && !llmModal.classList.contains('hidden')) closeLlmConfigModal();
+    const llmConnModal = document.getElementById('llm-connection-modal');
+    if (llmConnModal && !llmConnModal.classList.contains('hidden')) closeLlmConnectionModal();
     const reviewModal = document.getElementById('review-detail-modal');
     if (reviewModal && !reviewModal.classList.contains('hidden')) closeReviewDetail();
     const keyModal = document.getElementById('key-edit-modal');
@@ -188,6 +198,8 @@ function renderProjectSelector() {
       `<option value="${esc(p.id)}"${p.id === getActiveProjectId() ? ' selected' : ''}>${esc(p.name)}</option>`))
     .join('');
   select.value = getActiveProjectId();
+  // The sidebar is narrow enough that long names ellipsize, so keep the full one on hover.
+  select.title = _activeProject ? _activeProject.name : 'No project';
   renderProjectMeta();
   _syncProjectInputs();
 }
@@ -330,7 +342,9 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'approvals') loadApprovals(_approvalFilter);
     if (page === 'audit') loadAuditTrail();
     if (page === 'users') loadUsers();
-    if (page === 'agent-hub') loadAgentHub();
+    if (page === 'agent-hub') { loadAgentHub(); loadSwarmPolicies(); }
+    if (page === 'gate') loadReviewPicker();
+    if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
     if (page === 'inventory') loadInventory();
     if (page === 'sensitive') { /* page ready, no auto-load */ }
     if (page === 'ai-provenance') { /* page ready, no auto-load */ }
@@ -343,6 +357,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'gxp-docs') { /* page ready, no auto-load */ }
     if (page === 'gxp-generate') { /* page ready, no auto-load */ }
     if (page === 'api-keys') loadApiKeys();
+    if (page === 'llm-providers') loadLlmProviders();
     if (page === 'plans') loadPlans();
     if (page === 'usage') loadUsage();
     if (page === 'projects') loadProjects();
@@ -1061,6 +1076,11 @@ function renderIssueTriageDashboard(targetId, d) {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────
 
+// The dashboard table is paged off /api/reviews rather than the five rows /api/dashboard
+// embeds, so "Recent Reviews" can reach the whole history instead of the last handful.
+const RECENT_REVIEWS_PAGE_SIZE = 30;
+let recentReviewsOffset = 0;
+
 async function loadDashboard() {
   try {
     const data = await apiFetch('/api/dashboard');
@@ -1070,16 +1090,58 @@ async function loadDashboard() {
     document.getElementById('stat-green').textContent = data.green_gates;
     document.getElementById('stat-amber').textContent = data.amber_gates;
     document.getElementById('stat-red').textContent = data.red_gates;
-
-    const wrap = document.getElementById('recent-reviews');
-    if (!data.recent_reviews || data.recent_reviews.length === 0) {
-      wrap.innerHTML = '<div class="empty-state">No reviews yet. Start by running a review above.</div>';
-      return;
-    }
-    wrap.innerHTML = renderReviewsTable(data.recent_reviews);
   } catch (e) {
     feLog.error(e.message, { source: 'loadDashboard' });
   }
+  // Reset to the newest page: switching project or re-entering the dashboard should not
+  // land the reader deep in a history that may no longer be that long.
+  recentReviewsOffset = 0;
+  await loadRecentReviews();
+}
+
+async function loadRecentReviews() {
+  const wrap = document.getElementById('recent-reviews');
+  const pager = document.getElementById('recent-reviews-pager');
+  try {
+    const data = await apiFetch(
+      `/api/reviews?limit=${RECENT_REVIEWS_PAGE_SIZE}&offset=${recentReviewsOffset}`);
+    const reviews = data.reviews || [];
+    const total = typeof data.total === 'number' ? data.total : reviews.length;
+
+    if (reviews.length === 0) {
+      // An empty page past the first means rows were deleted (or the project switched)
+      // under us — fall back to the newest page instead of showing a blank table.
+      if (recentReviewsOffset > 0) {
+        recentReviewsOffset = 0;
+        return loadRecentReviews();
+      }
+      wrap.innerHTML = '<div class="empty-state">No reviews yet. Start by running a review above.</div>';
+      pager.classList.add('hidden');
+      return;
+    }
+
+    wrap.innerHTML = renderReviewsTable(reviews);
+    wrap.scrollTop = 0;
+
+    const first = recentReviewsOffset + 1;
+    const last = recentReviewsOffset + reviews.length;
+    document.getElementById('recent-reviews-range').textContent =
+      `Showing ${first}–${last} of ${total}`;
+    document.getElementById('recent-reviews-prev').disabled = recentReviewsOffset === 0;
+    document.getElementById('recent-reviews-next').disabled = last >= total;
+    pager.classList.toggle('hidden', total <= RECENT_REVIEWS_PAGE_SIZE);
+  } catch (e) {
+    wrap.innerHTML = '<div class="empty-state">Error loading reviews.</div>';
+    pager.classList.add('hidden');
+    feLog.error(e.message, { source: 'loadRecentReviews' });
+  }
+}
+
+function pageRecentReviews(direction) {
+  const next = recentReviewsOffset + direction * RECENT_REVIEWS_PAGE_SIZE;
+  if (next < 0) return;
+  recentReviewsOffset = next;
+  loadRecentReviews();
 }
 
 // ── History ───────────────────────────────────────────────────────────────
@@ -1439,18 +1501,37 @@ async function runFullReview() {
   const code = document.getElementById('full-code').value.trim();
   const prompt = document.getElementById('full-prompt').value.trim();
   const test_evidence = document.getElementById('full-test').value.trim();
+  const include_security = document.getElementById('full-include-security').checked;
+  const include_vapt = document.getElementById('full-include-vapt').checked;
+  const include_sensitive_data = document.getElementById('full-include-sensitive').checked;
 
   if (!requirement && !compliance_artifact && !architecture && !code && !prompt) {
     alert('Please provide at least one artifact to review.');
     return;
   }
 
-  showLoading('Submitting Full SDLC Review…');
+  // Each opt-in stage reads an artifact from the form above. Asking for one without that
+  // artifact is a silent no-op server-side, so say so here rather than let someone believe
+  // they ran a scan they didn't.
+  const orphaned = [
+    include_security && !architecture ? 'Security Review (STRIDE) needs an Architecture Description' : '',
+    include_vapt && !code ? 'VAPT needs a Code Sample' : '',
+    include_sensitive_data && !code ? 'Sensitive Data Scan needs a Code Sample' : '',
+  ].filter(Boolean);
+  if (orphaned.length) {
+    alert('These stages cannot run and will be skipped:\n\n• ' + orphaned.join('\n• '));
+    return;
+  }
+
+  showLoading('Submitting Core SDLC Review…');
   try {
     const submitResp = await apiFetch('/api/review/full', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence }),
+      body: JSON.stringify({
+        project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence,
+        include_security, include_vapt, include_sensitive_data,
+      }),
     });
     const result = await pollFullReviewJob(submitResp.job_id);
     renderFullResult('full-result', result);
@@ -1570,6 +1651,58 @@ async function autoFixGithubPR() {
 }
 
 // ── Release Gate ──────────────────────────────────────────────────────────
+//
+// The gate takes review IDs. Those are UUIDs, and the only place one was ever shown is the
+// subtitle of the review-detail modal — so gating on prior work meant copying UUIDs by
+// hand. This picker lists the reviews the caller can already see (GET /api/reviews is
+// project-scoped server-side) and ticking them feeds the same `review_ids` field.
+
+const GATE_ICONS = { Green: '✅', Amber: '⚠️', Red: '🔴' };
+
+async function loadReviewPicker() {
+  const wrap = document.getElementById('gate-review-picker');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="empty-state">Loading reviews…</div>';
+  try {
+    const data = await apiFetch('/api/reviews?limit=50');
+    const reviews = data.reviews || [];
+    if (!reviews.length) {
+      wrap.innerHTML = `<div class="empty-state">No reviews yet in this project. Run an agent first,
+        or paste review IDs under Advanced.</div>`;
+      return;
+    }
+    wrap.innerHTML = reviews.map(r => {
+      const type = (r.review_type || '').replace(/_/g, ' ');
+      const gate = r.gate_status || '';
+      const when = (r.created_at || '').slice(0, 16).replace('T', ' ');
+      const counts = [
+        r.findings_count ? `${r.findings_count} findings` : 'no findings',
+        r.critical_count ? `${r.critical_count} critical` : '',
+        r.high_count ? `${r.high_count} high` : '',
+      ].filter(Boolean).join(' · ');
+      return `
+        <label class="review-pick" title="${esc(r.id)}">
+          <input type="checkbox" class="gate-review-cb" value="${esc(r.id)}" />
+          <span class="review-pick-gate gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'}</span>
+          <span class="review-pick-main">
+            <span class="review-pick-type">${esc(type)}</span>
+            <span class="review-pick-meta">${esc(r.project_name || '')} · ${esc(counts)}</span>
+          </span>
+          <span class="review-pick-when">${esc(when)}</span>
+        </label>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load reviews: ${esc(e.message)}</div>`;
+  }
+}
+
+function selectAllReviews(checked) {
+  document.querySelectorAll('.gate-review-cb').forEach(cb => { cb.checked = checked; });
+}
+
+function pickedReviewIds() {
+  return Array.from(document.querySelectorAll('.gate-review-cb:checked')).map(cb => cb.value);
+}
 
 async function runReleaseGate() {
   const project_name = document.getElementById('gate-project').value.trim();
@@ -1579,8 +1712,14 @@ async function runReleaseGate() {
 
   const body = { project_name, release_version };
 
+  // Ticked reviews and pasted IDs are additive — pasting is how you reach a review from
+  // another project or an API run that isn't in this list.
+  const ids = pickedReviewIds();
   if (idsText) {
-    body.review_ids = idsText.split('\n').map(s => s.trim()).filter(Boolean);
+    ids.push(...idsText.split('\n').map(s => s.trim()).filter(Boolean));
+  }
+  if (ids.length) {
+    body.review_ids = Array.from(new Set(ids));
   }
 
   if (findingsText) {
@@ -1592,6 +1731,17 @@ async function runReleaseGate() {
     }
   }
 
+  // A gate over nothing returns Green, which is indistinguishable from a gate over work
+  // that genuinely passed. Make the caller say they meant it.
+  if (!body.review_ids && !body.findings) {
+    const go = confirm(
+      'No reviews selected and no findings pasted.\n\n' +
+      'The gate would be evaluated over zero findings and will almost certainly come back ' +
+      'Green — which means "nothing was checked", not "nothing is wrong".\n\nRun it anyway?'
+    );
+    if (!go) return;
+  }
+
   showLoading('Evaluating Release Gate...');
   try {
     const result = await apiFetch('/api/release-gate', {
@@ -1600,12 +1750,204 @@ async function runReleaseGate() {
       body: JSON.stringify(body),
     });
     renderResult('gate-result', result);
+    if (body.review_ids) {
+      document.getElementById('gate-result').insertAdjacentHTML('afterbegin',
+        `<div class="info-box">Gated on ${body.review_ids.length} prior review${body.review_ids.length === 1 ? '' : 's'}.</div>`);
+    }
     loadDashboard();
   } catch (e) {
     showError('gate-result', e.message);
   } finally {
     hideLoading();
   }
+}
+
+// ── Governance Report ─────────────────────────────────────────────────────
+//
+// `report-generate` is a registered workflow that nothing in the browser called, and a
+// report produced by a full review was only ever surfaced as a bare UUID. Reports also had
+// no listing endpoint at all until `GET /api/reports` was added, so the only way to reach
+// one was to already know its id.
+
+async function loadReportReviewPicker() {
+  const wrap = document.getElementById('report-review-picker');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="empty-state">Loading reviews…</div>';
+  try {
+    const data = await apiFetch('/api/reviews?limit=50');
+    const reviews = data.reviews || [];
+    if (!reviews.length) {
+      wrap.innerHTML = '<div class="empty-state">No reviews yet in this project. Run an agent first.</div>';
+      return;
+    }
+    wrap.innerHTML = reviews.map(r => {
+      const gate = r.gate_status || '';
+      return `
+        <label class="review-pick" title="${esc(r.id)}">
+          <input type="checkbox" class="report-review-cb" value="${esc(r.id)}" />
+          <span class="review-pick-gate gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'}</span>
+          <span class="review-pick-main">
+            <span class="review-pick-type">${esc((r.review_type || '').replace(/_/g, ' '))}</span>
+            <span class="review-pick-meta">${esc(r.project_name || '')} · ${r.findings_count || 0} findings</span>
+          </span>
+          <span class="review-pick-when">${esc((r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
+        </label>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load reviews: ${esc(e.message)}</div>`;
+  }
+}
+
+function selectAllReportReviews(checked) {
+  document.querySelectorAll('.report-review-cb').forEach(cb => { cb.checked = checked; });
+}
+
+async function loadReportList() {
+  const wrap = document.getElementById('report-list');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/api/reports?limit=25');
+    const reports = data.reports || [];
+    if (!reports.length) {
+      wrap.innerHTML = '<div class="empty-state">No reports generated yet.</div>';
+      return;
+    }
+    wrap.innerHTML = reports.map(r => {
+      const gate = r.gate_status || '';
+      return `
+        <div class="review-pick review-pick-clickable" onclick="viewGovernanceReport('${esc(r.id)}')">
+          <span class="review-pick-gate gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'}</span>
+          <span class="review-pick-main">
+            <span class="review-pick-type">${esc(r.project_name || 'Report')}</span>
+            <span class="review-pick-meta">
+              Risk ${Math.round(r.overall_risk_score || 0)}/100 · ${r.total_findings || 0} findings
+              ${r.approval_required ? ' · approval required' : ''}
+            </span>
+          </span>
+          <span class="review-pick-when">${esc((r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load reports: ${esc(e.message)}</div>`;
+  }
+}
+
+async function generateGovernanceReport() {
+  const project_name = document.getElementById('report-project').value.trim();
+  const review_ids = Array.from(document.querySelectorAll('.report-review-cb:checked')).map(cb => cb.value);
+  if (!review_ids.length) {
+    alert('Select at least one review — the report is a synthesis of prior findings, not a new review.');
+    return;
+  }
+
+  showLoading('Generating governance report…');
+  try {
+    const result = await apiFetch('/api/v1/agents/report-generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_name, review_ids }),
+    });
+    renderGovernanceReport('report-result', result);
+    loadReportList();
+  } catch (e) {
+    showError('report-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function viewGovernanceReport(reportId) {
+  showLoading('Loading report…');
+  try {
+    const data = await apiFetch(`/api/reports/${reportId}`);
+    renderGovernanceReport('report-result', data.report || data);
+    document.getElementById('report-result').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    showError('report-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+function renderGovernanceReport(targetId, report) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+
+  const gate = report.gate_status || 'Unknown';
+  const score = report.overall_risk_score ?? 0;
+  const byCategory = report.findings_by_category || {};
+  const totalFindings = Object.values(byCategory).reduce((n, v) => n + (v || []).length, 0);
+
+  let html = `
+    <div class="result-header">
+      <span class="gate-badge gate-${esc(gate)}">${GATE_ICONS[gate] || '❓'} Gate: ${esc(gate)}</span>
+      <span class="risk-score-badge">Overall Risk: ${Math.round(score)}/100</span>
+      <span style="color:var(--text-muted);font-size:13px">
+        ${esc(report.project_name || '')} · ${esc(report.review_date || '')} · ${totalFindings} findings
+      </span>
+    </div>`;
+
+  if (report.executive_summary) {
+    html += `<div class="findings-section"><h3>Executive Summary</h3>
+      <div class="summary-box">${esc(report.executive_summary)}</div></div>`;
+  }
+
+  if (report.approval_required) {
+    const approvers = report.approvers_needed || [];
+    html += `<div class="info-box" style="margin-top:12px">
+      <strong>Approval required before release.</strong>
+      ${approvers.length ? `<ul class="recs-list">${approvers.map(a => `<li>${esc(a)}</li>`).join('')}</ul>` : ''}
+    </div>`;
+  }
+  if (report.human_oversight_required) {
+    html += `<div class="info-box" style="margin-top:12px">
+      🧑‍⚖️ <strong>Human oversight required</strong> — a high-risk AI decision-making control was flagged.
+    </div>`;
+  }
+
+  // Controls assessment. `controls_checked` is the whole library, so show the count rather
+  // than listing a few hundred ids.
+  const checked = (report.controls_checked || []).length;
+  const failed = report.controls_failed || [];
+  const passed = (report.controls_passed || []).length;
+  html += `<div class="findings-section"><h3>Controls</h3>
+    <div class="sub-reviews">
+      <div class="sub-review-pill">📋 <strong>${checked}</strong> <span style="color:var(--text-muted)">checked</span></div>
+      <div class="sub-review-pill">✅ <strong>${passed}</strong> <span style="color:var(--text-muted)">passed</span></div>
+      <div class="sub-review-pill">🔴 <strong>${failed.length}</strong> <span style="color:var(--text-muted)">failed</span></div>
+    </div>`;
+  if (failed.length) {
+    html += `<div class="chip-row">${failed.filter(Boolean).map(c => `<span class="compliance-chip">${esc(c)}</span>`).join('')}</div>`;
+  }
+  html += `</div>`;
+
+  // The stored document carries `compliance_flags`; the report-generate response returns
+  // the same set as the keys of `compliance_mapping`. Accept either.
+  const flags = report.compliance_flags || Object.keys(report.compliance_mapping || {});
+  if (flags.length) {
+    html += `<div class="findings-section"><h3>Compliance Coverage</h3>
+      <div class="chip-row">${flags.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join('')}</div></div>`;
+  }
+
+  Object.entries(byCategory).forEach(([category, findings]) => {
+    if (!findings || !findings.length) return;
+    html += `<div class="findings-section"><h3>${esc(category)} (${findings.length})</h3>`;
+    [...findings].sort((a, b) => (b.severity || 0) - (a.severity || 0))
+      .forEach(f => { html += renderFinding(f); });
+    html += `</div>`;
+  });
+
+  const recs = report.recommendations || [];
+  if (recs.length) {
+    html += `<div class="findings-section"><h3>Recommendations</h3>
+      <ol class="recs-list">${recs.map(r => `<li>${esc(r)}</li>`).join('')}</ol></div>`;
+  }
+
+  if (report.report_id) {
+    html += `<div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Report ID: ${esc(report.report_id)}</div>`;
+  }
+
+  wrap.innerHTML = html;
 }
 
 // ── Render Results ────────────────────────────────────────────────────────
@@ -1697,6 +2039,23 @@ function renderFullResult(targetId, result) {
     html += `</div>`;
   }
 
+  // What this gate did NOT look at. Without it a Green over five checks is indistinguishable
+  // from a Green over eight, which is the whole reason a reader over-trusts this screen.
+  const notRun = result.steps_not_run || [];
+  if (notRun.length) {
+    html += `<div class="sub-reviews not-run-row">`;
+    notRun.forEach(label => {
+      html += `<div class="sub-review-pill pill-not-run" title="This stage did not run, so the gate above says nothing about it">
+          ⊘ <strong>${esc(label)}</strong> <span style="color:var(--text-muted)">not run</span>
+        </div>`;
+    });
+    html += `</div>
+      <div class="info-box" style="margin-top:10px">
+        This gate covers only the stages that ran. ${notRun.length} stage${notRun.length === 1 ? ' was' : 's were'}
+        not part of this review — supply its artifact, or tick the matching option, to include it.
+      </div>`;
+  }
+
   const findings = result.top_findings || [];
   if (findings.length) {
     html += `<div class="findings-section"><h3>Top Findings</h3>`;
@@ -1714,13 +2073,26 @@ function renderFullResult(targetId, result) {
   if (result.report_id) {
     html += `
       <div class="info-box" style="margin-top:16px">
-        📄 <strong>Governance Report generated</strong> — ID: <code>${result.report_id}</code>
-        <br/>Accessible at <code>/api/reports/${result.report_id}</code>
+        📄 <strong>Governance Report generated.</strong>
+        <button class="btn-link" onclick="openGovernanceReport('${esc(result.report_id)}')">Open the report →</button>
       </div>
     `;
   }
+  // The review id is what the Release Gate and the Governance Report take as input. It used
+  // to be produced here and never shown, so the one thing you needed to carry this result
+  // forward was the one thing the screen withheld.
+  if (result.review_id) {
+    html += `<div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(result.review_id)}</div>`;
+  }
 
   wrap.innerHTML = html;
+}
+
+/** Jump to the Governance Report page and render one report. */
+function openGovernanceReport(reportId) {
+  const navItem = document.querySelector('.nav-item[data-page="governance-report"]');
+  if (navItem) navItem.click();
+  viewGovernanceReport(reportId);
 }
 
 function renderFinding(f) {
@@ -3124,6 +3496,164 @@ function renderGxPGeneratedDocuments() {
       </details>`;
     }).join('')}
   `;
+}
+
+// ── Agent Swarm ───────────────────────────────────────────────────────────
+//
+// POST /api/v1/swarm has existed, entitled and metered, since the swarm product was added —
+// but nothing in the browser ever called it, so the platform's one parallel multi-agent
+// capability was reachable only by API. The nav item already carries data-product="swarm",
+// so plan entitlement gating for this panel works without any extra wiring.
+
+const SWARM_SOURCE_LABELS = {
+  github_pr_url:   ['GitHub PR URL',   'https://github.com/owner/repo/pull/42'],
+  github_file_url: ['GitHub file URL', 'https://github.com/owner/repo/blob/main/src/api.py'],
+  github_repo_url: ['GitHub repo URL', 'https://github.com/owner/repo'],
+  jira_ticket:     ['Jira ticket',     'PROJ-123'],
+};
+
+let _swarmPolicies = {};
+
+async function loadSwarmPolicies() {
+  const sel = document.getElementById('swarm-policy');
+  if (!sel) return;
+  try {
+    const data = await apiFetch('/api/v1/swarm/policies');
+    _swarmPolicies = data.policies || {};
+    const names = data.policy_names || Object.keys(_swarmPolicies);
+    sel.innerHTML = names.map(n =>
+      `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    sel.onchange = describeSwarmPolicy;
+    describeSwarmPolicy();
+  } catch (e) {
+    sel.innerHTML = '<option value="">Could not load policies</option>';
+    document.getElementById('swarm-policy-hint').textContent = e.message;
+  }
+}
+
+function describeSwarmPolicy() {
+  const hint = document.getElementById('swarm-policy-hint');
+  const policy = _swarmPolicies[document.getElementById('swarm-policy').value];
+  if (!policy) { hint.innerHTML = '&nbsp;'; return; }
+  const req = (policy.required_agents || []).join(' · ');
+  const opt = (policy.optional_agents || []).join(' · ');
+  hint.innerHTML = `Required: <strong>${esc(req || 'none')}</strong>`
+    + (opt ? ` · Optional: ${esc(opt)}` : '')
+    + ` · Passes below ${policy.min_passing_score}`;
+}
+
+function onSwarmSourceChange() {
+  const type = document.getElementById('swarm-source-type').value;
+  const isText = type === 'text';
+  document.getElementById('swarm-text-group').style.display = isText ? '' : 'none';
+  document.getElementById('swarm-ref-group').style.display = isText ? 'none' : '';
+  if (!isText) {
+    const [label, placeholder] = SWARM_SOURCE_LABELS[type];
+    document.getElementById('swarm-ref-label').textContent = label;
+    document.getElementById('swarm-ref').placeholder = placeholder;
+  }
+}
+
+async function runSwarm() {
+  const project_name = document.getElementById('swarm-project').value.trim();
+  if (!project_name) { alert('Project name is required — the swarm result is filed against it.'); return; }
+
+  const type = document.getElementById('swarm-source-type').value;
+  const body = { project_name, policy_name: document.getElementById('swarm-policy').value };
+
+  if (type === 'text') {
+    const text = document.getElementById('swarm-text').value.trim();
+    if (!text) { alert('Paste an artifact to fan out.'); return; }
+    body.text = text;
+  } else {
+    const ref = document.getElementById('swarm-ref').value.trim();
+    if (!ref) { alert('Enter the source reference.'); return; }
+    body[type] = ref;
+  }
+  if (document.getElementById('swarm-postback').checked) body.post_back = true;
+
+  showLoading('Running the swarm — agents run in parallel…');
+  try {
+    const result = await apiFetch('/api/v1/swarm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    renderSwarmResult('swarm-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('swarm-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+function renderSwarmResult(targetId, r) {
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+
+  const gate = (r.swarm_gate || '').toUpperCase();
+  const icon = { GREEN: '✅', AMBER: '⚠️', RED: '🔴', BLOCKED: '⛔' }[gate] || '❓';
+  // The swarm's own gate vocabulary (GREEN/AMBER/RED/BLOCKED) is upper case and has a
+  // fourth value the per-agent gate badges don't; map onto the existing badge classes.
+  const gateClass = { GREEN: 'Green', AMBER: 'Amber', RED: 'Red', BLOCKED: 'Red' }[gate] || '';
+
+  let html = `
+    <div class="result-header">
+      <span class="gate-badge gate-${gateClass}">${icon} Swarm Gate: ${esc(gate)}</span>
+      <span class="risk-score-badge">Risk: ${Math.round(r.swarm_risk_score || 0)}/100</span>
+      <span style="color:var(--text-muted);font-size:13px">
+        ${(r.agents_run || []).length} agents · ${r.total_critical || 0} critical · ${r.total_high || 0} high
+      </span>
+    </div>
+    <div class="summary-box">
+      Policy <strong>${esc(document.getElementById('swarm-policy').value)}</strong>
+      (required: ${esc((r.policy_applied?.required_agents || []).join(' · ') || 'none')})
+      over ${esc(r.source_type || 'text')}${r.source_ref ? ` — ${esc(r.source_ref)}` : ''}.
+    </div>`;
+
+  const results = r.results || [];
+  if (results.length) {
+    html += `<div class="findings-section"><h3>Agents</h3><div class="swarm-grid">`;
+    results.forEach(a => {
+      const errored = !!a.error;
+      const ag = a.gate_status || '';
+      const agIcon = errored ? '💥' : (GATE_ICONS[ag] || '❓');
+      html += `
+        <div class="swarm-agent ${errored ? 'swarm-agent-error' : ''}">
+          <div class="swarm-agent-head">
+            <span>${agIcon} <strong>${esc(a.agent)}</strong></span>
+            <span class="gate-badge gate-${esc(ag)}">${esc(errored ? 'error' : ag)}</span>
+          </div>
+          ${errored
+            ? `<div class="swarm-agent-meta" style="color:var(--red)">${esc(a.error)}</div>
+               <div class="swarm-agent-meta">The gate was still issued — a failed agent never blocks it.</div>`
+            : `<div class="swarm-agent-meta">Risk ${Math.round(a.risk_score || 0)}/100 ·
+                 ${(a.findings || []).length} findings ·
+                 ${a.critical_count || 0} critical</div>
+               <div class="swarm-agent-summary">${esc((a.summary || '').slice(0, 180))}</div>`}
+        </div>`;
+    });
+    html += `</div></div>`;
+  }
+
+  const blocking = r.blocking_findings || [];
+  if (blocking.length) {
+    html += `<div class="findings-section"><h3>Blocking findings (${blocking.length})</h3>`;
+    blocking.forEach(f => { html += renderFinding(f); });
+    html += `</div>`;
+  }
+
+  if ((r.agents_errored || []).length) {
+    html += `<div class="info-box" style="margin-top:12px">
+      ⚠️ Errored, and excluded from the score: <strong>${esc(r.agents_errored.join(', '))}</strong>.
+    </div>`;
+  }
+  if (r.swarm_review_id) {
+    html += `<div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.swarm_review_id)}</div>`;
+  }
+
+  wrap.innerHTML = html;
 }
 
 // ── Agent Hub ─────────────────────────────────────────────────────────────
@@ -5286,5 +5816,279 @@ async function exportModernizationRun() {
     URL.revokeObjectURL(url);
   } catch (e) {
     alert('Could not download the converted code: ' + e.message);
+  }
+}
+
+// ── LLM Providers ───────────────────────────────────────────────────────────
+//
+// Named model endpoints the platform can run on, and which one is active. The active
+// connection is the default for every surface — the review forms on this site, Agent
+// Hub, Swarm, workflows, background jobs and the v1 API — because it's resolved inside
+// llm_gateway.call_tool() rather than at any one route. A team that brought its own LLM
+// on an API key still overrides it; see backend/services/llm_settings_service.py for the
+// full precedence chain.
+//
+// Super-admin only, except the sidebar badge: anyone reading a set of findings is
+// entitled to know which model produced them.
+
+let _llmPresets = null;
+let _editingLlmConnectionId = null;
+
+async function refreshActiveLlmBadge() {
+  const wrap = document.getElementById('sidebar-llm');
+  if (!wrap || !_authUser) return;
+  try {
+    const active = await apiFetch('/api/v1/llm-providers/active', { _silent: true });
+    const dot = document.getElementById('sidebar-llm-dot');
+    const text = document.getElementById('sidebar-llm-text');
+    wrap.style.display = '';
+    // Green only for a tested-good connection. A connection that's never been tested is
+    // amber rather than green — "configured" and "works" are different claims, and this
+    // badge shouldn't make the stronger one on no evidence.
+    let state = 'default';
+    if (active.active) state = active.last_test_status === 'ok' ? 'ok' : 'untested';
+    if (active.active && active.last_test_status === 'failed') state = 'failed';
+    dot.className = 'sidebar-llm-dot ' + state;
+    const label = active.active ? active.name : 'Platform default';
+    text.textContent = `${label}${active.model ? ' · ' + active.model : ''}`;
+    wrap.title = active.active
+      ? `Agent calls are served by "${active.name}" (${active.provider}${active.model ? ', ' + active.model : ''}).`
+      : `Agent calls use the platform's own Anthropic key${active.env_key_present ? '' : ' — which is not set'}.`;
+  } catch {
+    wrap.style.display = 'none';   // not signed in, or the endpoint is unreachable
+  }
+}
+
+async function _ensureLlmPresets() {
+  if (_llmPresets) return _llmPresets;
+  const data = await apiFetch('/api/v1/llm-providers/presets');
+  _llmPresets = data.presets || [];
+  return _llmPresets;
+}
+
+async function loadLlmProviders() {
+  const label = document.getElementById('llmp-active-label');
+  const list = document.getElementById('llmp-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state">Loading…</div>';
+  try {
+    const [active, data] = await Promise.all([
+      apiFetch('/api/v1/llm-providers/active'),
+      apiFetch('/api/v1/llm-providers/connections'),
+    ]);
+    if (label) {
+      label.innerHTML = active.active
+        ? `<strong>${esc(active.name)}</strong> — ${esc(active.provider)}${active.model ? ' · ' + esc(active.model) : ''}`
+        : `<strong>Platform default</strong> — the ANTHROPIC_API_KEY in <code>.env</code>${active.env_key_present ? '' : ' <span style="color:var(--red)">(not set — agent calls will be refused)</span>'}`;
+    }
+    renderLlmConnections(data.connections || [], active);
+  } catch (e) {
+    list.innerHTML = `<div class="empty-state">Could not load LLM providers: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderLlmConnections(connections, active) {
+  const list = document.getElementById('llmp-list');
+  if (!connections.length) {
+    list.innerHTML = `
+      <div class="empty-state">
+        No connections yet — agent calls use the <code>ANTHROPIC_API_KEY</code> from <code>.env</code>.<br />
+        Add one to run the platform on a local router, a different vendor, or a second Anthropic account.
+      </div>`;
+    return;
+  }
+  const rows = connections.map(c => {
+    const testBadge = c.last_test_status === 'ok'
+      ? `<span class="llm-pill ok">Tested OK</span>`
+      : c.last_test_status === 'failed'
+        ? `<span class="llm-pill failed">Test failed</span>`
+        : `<span class="llm-pill untested">Never tested</span>`;
+    const activeBadge = c.is_active
+      ? `<span class="llm-pill ok">Active</span>`
+      : `<button class="btn btn-secondary" style="font-size:12px" onclick="activateLlmConnection('${c.id}')">Make active</button>`;
+    return `
+      <tr>
+        <td>
+          <strong>${esc(c.name)}</strong>
+          <div style="font-size:12px;color:var(--text-muted)">${esc(c.preset)} · ${esc(c.provider)} wire format</div>
+        </td>
+        <td style="font-size:12px">
+          ${c.base_url ? `<code>${esc(c.base_url)}</code>` : '<span style="color:var(--text-muted)">vendor default</span>'}
+          <div style="color:var(--text-muted);margin-top:4px">${c.model ? esc(c.model) : 'no model set'}</div>
+        </td>
+        <td style="font-size:12px">
+          ${c.has_api_key ? `<code>${esc(c.api_key_masked)}</code>` : '<span style="color:var(--text-muted)">none</span>'}
+        </td>
+        <td>
+          ${testBadge}
+          ${c.last_test_detail ? `<div style="font-size:11px;color:var(--text-muted);margin-top:4px;max-width:280px">${esc(c.last_test_detail)}</div>` : ''}
+        </td>
+        <td>${activeBadge}</td>
+        <td style="white-space:nowrap">
+          <button class="btn btn-secondary" style="font-size:12px" onclick="testLlmConnection('${c.id}', this)">Test</button>
+          <button class="btn btn-secondary" style="font-size:12px" onclick="openLlmConnectionModal('${c.id}')">Edit</button>
+          <button class="btn btn-secondary btn-danger-outline" style="font-size:12px" onclick="deleteLlmConnection('${c.id}', '${esc(c.name).replace(/'/g, "\\'")}')">Delete</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  list.innerHTML = `
+    <table class="users-table">
+      <thead><tr>
+        <th>Connection</th><th>Endpoint</th><th>Credential</th><th>Last test</th><th>Status</th><th></th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    ${active && active.active ? `
+      <div style="margin-top:12px">
+        <button class="btn btn-secondary" onclick="activateLlmConnection(null)">
+          Revert to the platform default (.env)
+        </button>
+      </div>` : ''}`;
+}
+
+async function openLlmConnectionModal(connectionId) {
+  const presets = await _ensureLlmPresets();
+  _editingLlmConnectionId = connectionId || null;
+
+  const presetSel = document.getElementById('llmc-preset');
+  presetSel.innerHTML = presets.map(p => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join('');
+
+  document.getElementById('llmc-title').textContent = connectionId ? 'Edit LLM Connection' : 'Add LLM Connection';
+  document.getElementById('llmc-error').classList.add('hidden');
+
+  if (connectionId) {
+    const data = await apiFetch('/api/v1/llm-providers/connections');
+    const c = (data.connections || []).find(x => x.id === connectionId);
+    if (!c) return;
+    presetSel.value = c.preset || 'custom';
+    document.getElementById('llmc-name').value = c.name || '';
+    document.getElementById('llmc-provider').value = c.provider || 'openai';
+    document.getElementById('llmc-baseurl').value = c.base_url || '';
+    document.getElementById('llmc-model').value = c.model || '';
+    document.getElementById('llmc-maxtokens').value = c.max_tokens || '';
+    document.getElementById('llmc-timeout').value = c.timeout_seconds || '';
+    document.getElementById('llmc-apikey').value = '';
+    // The stored key is never sent to the browser, so an empty box on an edit means
+    // "keep it" rather than "clear it" — say so, or a rename looks like it wiped the key.
+    document.getElementById('llmc-key-hint').textContent = c.has_api_key
+      ? `A key is stored (${c.api_key_masked}). Leave this blank to keep it.`
+      : 'No key stored for this connection.';
+    _describePreset(presetSel.value);
+  } else {
+    presetSel.value = 'omniroute';
+    applyLlmPreset();
+    document.getElementById('llmc-name').value = '';
+    document.getElementById('llmc-apikey').value = '';
+    document.getElementById('llmc-maxtokens').value = '';
+    document.getElementById('llmc-timeout').value = '';
+    document.getElementById('llmc-key-hint').textContent = '';
+  }
+  document.getElementById('llm-connection-modal').classList.remove('hidden');
+}
+
+function closeLlmConnectionModal() {
+  document.getElementById('llm-connection-modal').classList.add('hidden');
+  _editingLlmConnectionId = null;
+}
+
+function _describePreset(presetId) {
+  const preset = (_llmPresets || []).find(p => p.id === presetId);
+  document.getElementById('llmc-preset-hint').textContent = preset ? preset.hint : '';
+}
+
+function applyLlmPreset() {
+  const presetId = document.getElementById('llmc-preset').value;
+  const preset = (_llmPresets || []).find(p => p.id === presetId);
+  if (!preset) return;
+  document.getElementById('llmc-provider').value = preset.provider;
+  document.getElementById('llmc-baseurl').value = preset.base_url || '';
+  document.getElementById('llmc-model').value = preset.model || '';
+  const name = document.getElementById('llmc-name');
+  if (!name.value.trim()) name.value = preset.label;
+  _describePreset(presetId);
+}
+
+async function saveLlmConnection() {
+  const err = document.getElementById('llmc-error');
+  const btn = document.getElementById('llmc-save');
+  const maxTokens = document.getElementById('llmc-maxtokens').value.trim();
+  const timeout = document.getElementById('llmc-timeout').value.trim();
+  const body = {
+    name: document.getElementById('llmc-name').value.trim(),
+    preset: document.getElementById('llmc-preset').value,
+    provider: document.getElementById('llmc-provider').value,
+    api_key: document.getElementById('llmc-apikey').value,
+    base_url: document.getElementById('llmc-baseurl').value.trim(),
+    model: document.getElementById('llmc-model').value.trim(),
+    max_tokens: maxTokens ? parseInt(maxTokens, 10) : null,
+    timeout_seconds: timeout ? parseFloat(timeout) : null,
+  };
+  if (!body.name) {
+    err.textContent = 'Give the connection a name.';
+    err.classList.remove('hidden');
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const path = _editingLlmConnectionId
+      ? `/api/v1/llm-providers/connections/${_editingLlmConnectionId}`
+      : '/api/v1/llm-providers/connections';
+    await apiFetch(path, {
+      method: _editingLlmConnectionId ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    closeLlmConnectionModal();
+    loadLlmProviders();
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function activateLlmConnection(connectionId) {
+  try {
+    await apiFetch('/api/v1/llm-providers/active', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ connection_id: connectionId }),
+    });
+    loadLlmProviders();
+    refreshActiveLlmBadge();
+  } catch (e) {
+    alert('Could not switch the active LLM: ' + e.message);
+  }
+}
+
+async function testLlmConnection(connectionId, btn) {
+  const original = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Testing…'; }
+  try {
+    // Not a ping: this sends the same kind of forced tool call every agent makes, because
+    // an endpoint that answers but can't produce a tool call cannot run a single review.
+    const result = await apiFetch(`/api/v1/llm-providers/connections/${connectionId}/test`, { method: 'POST' });
+    alert(result.status === 'ok'
+      ? `Connection works.\n\n${result.detail}`
+      : `Connection failed.\n\n${result.detail}`);
+    loadLlmProviders();
+    refreshActiveLlmBadge();
+  } catch (e) {
+    alert('Could not run the test: ' + e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = original; }
+  }
+}
+
+async function deleteLlmConnection(connectionId, name) {
+  if (!confirm(`Delete the connection "${name}"?\n\nIf it is the active one, agent calls revert to the platform's own Anthropic key.`)) return;
+  try {
+    await apiFetch(`/api/v1/llm-providers/connections/${connectionId}`, { method: 'DELETE' });
+    loadLlmProviders();
+    refreshActiveLlmBadge();
+  } catch (e) {
+    alert('Could not delete the connection: ' + e.message);
   }
 }

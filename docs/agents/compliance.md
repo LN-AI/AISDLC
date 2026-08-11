@@ -40,7 +40,7 @@ Gate logic: **Red** — fundamental gap in a mandatory framework (e.g. a PHI sys
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries on transient errors
+- **Timeout & retry** — 900s timeout, up to 2 retries on transient errors
 - **Prompt-injection scan** — non-blocking; flags surfaced as `guardrail_flags`
 - **Untrusted content wrapping** — a fetched Jira ticket body is wrapped before analysis
 

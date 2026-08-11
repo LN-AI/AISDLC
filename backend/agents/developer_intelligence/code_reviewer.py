@@ -277,7 +277,9 @@ class CodeReviewAgent(BaseAgent):
 
         A truncated tool response means the findings did not fit the output budget, not
         that the call was transiently unlucky — so the useful retry is a smaller input,
-        not the same one again. Raising max_tokens instead would only move the ceiling.
+        not the same one again. Raising max_tokens only moves the ceiling; a chunk sized
+        for ~10-15 findings should fit 16000 with room to spare, and the halve-and-retry
+        below is what handles the chunk that doesn't.
         """
         lang_hint = f"Language: {language}\n\n" if language else ""
         prompt = f"""Please perform a security and quality review of the following code.
@@ -296,7 +298,7 @@ Quote the offending code verbatim in `evidence` for every finding, and give its 
         try:
             return llm_gateway.call_tool(
                 self.system_prompt, user_content, CODE_REVIEW_TOOL_SCHEMA,
-                llm_override, max_tokens=8000,
+                llm_override, max_tokens=16000,
             )
         except LLMTruncatedResponseError:
             if depth >= MAX_TRUNCATION_SPLITS:

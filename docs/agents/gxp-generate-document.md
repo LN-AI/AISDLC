@@ -49,7 +49,7 @@ Custom envelope, fields returned at the top level:
 ## Guardrails applied
 
 - **Input size limit** — HTTP 413 over `MAX_AGENT_INPUT_CHARS` (400,000 chars)
-- **Timeout & retry** — 120s timeout, up to 2 retries; output budget raised to `max_tokens=14000` for OQ/PQ Protocol generation (which can include full test scripts), `max_tokens=8000` for every other document type
+- **Timeout & retry** — 900s timeout, up to 2 retries; output budget raised to `max_tokens=28000` for OQ/PQ Protocol generation (which can include full test scripts), `max_tokens=24000` for every other document type
 - **Prompt-injection scan** — non-blocking heuristic (not echoed in this endpoint's explicit response fields)
 - **Untrusted content wrapping** — a fetched PR/file is wrapped before analysis
 - A generated test script is only marked `automatable: true` when it genuinely exercises real application code — the agent is instructed never to pad `test_cases` with a hollow script just to fill the field, and execution results (pass/fail) still require a human to run the script and sign off per §11.100/11.200

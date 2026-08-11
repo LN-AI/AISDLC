@@ -753,26 +753,36 @@ async def run_full(req: FullReviewRequest, caller: dict = Depends(get_caller)):
     total_steps = count_steps(full_review_workflow.plan_steps(
         requirement=requirement, compliance_artifact=req.compliance_artifact,
         architecture=req.architecture, code=code, prompt_config=req.prompt_config,
+        include_security=req.include_security, include_vapt=req.include_vapt,
+        include_sensitive_data=req.include_sensitive_data,
     ))
 
     # Entitlement/budget/quota BEFORE the 202 — otherwise a rejected caller gets an
     # accepted job that later fails, instead of a 403/402/429 on this request.
-    agent_guard.preflight(caller, "full")
+    # `expect_calls` (D-25) replaces the fixed `_EXPECTED_CALLS_BY_PRODUCT["full"]` estimate:
+    # with opt-in stages the real call count is 5-10 depending on the request, and the plan
+    # above is the only thing that knows which.
+    with agent_guard.expect_calls(total_steps):
+        agent_guard.preflight(caller, "full")
 
     def _run(on_progress):
-        result = agent_guard.guarded_call(
-            caller, "full", override, skip_preflight=True, fn=lambda: _orch.full_review(
-                requirement=requirement,
-                compliance_artifact=req.compliance_artifact,
-                architecture=req.architecture,
-                code=code,
-                prompt_config=req.prompt_config,
-                test_evidence=req.test_evidence or "",
-                project_name=req.project_name or src_ref[:60] or "Full Review",
-                context=ctx,
-                on_progress=on_progress,
-            ),
-        )
+        with agent_guard.expect_calls(total_steps):
+            result = agent_guard.guarded_call(
+                caller, "full", override, skip_preflight=True, fn=lambda: _orch.full_review(
+                    requirement=requirement,
+                    compliance_artifact=req.compliance_artifact,
+                    architecture=req.architecture,
+                    code=code,
+                    prompt_config=req.prompt_config,
+                    test_evidence=req.test_evidence or "",
+                    project_name=req.project_name or src_ref[:60] or "Full Review",
+                    context=ctx,
+                    on_progress=on_progress,
+                    include_security=req.include_security,
+                    include_vapt=req.include_vapt,
+                    include_sensitive_data=req.include_sensitive_data,
+                ),
+            )
         pb = _do_postback(src_type, pb_ref, result) if req.post_back and pb_ref else "not_requested"
         return _wrap("full", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
 

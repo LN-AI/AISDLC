@@ -246,7 +246,7 @@ class GxPGeneratorAgent(BaseAgent):
 Classify this application's GxP relevance and plan its validation document package: which documents apply,
 why, and a specific outline for each, in the correct generation order.
 """
-        result = llm_gateway.call_tool(PLAN_SYSTEM_PROMPT, prompt, GXP_PLAN_TOOL_SCHEMA, max_tokens=8000)
+        result = llm_gateway.call_tool(PLAN_SYSTEM_PROMPT, prompt, GXP_PLAN_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
         return result
 
@@ -282,10 +282,10 @@ why, and a specific outline for each, in the correct generation order.
 Write the complete {document_type} for this application now.
 """
         # 8000 was still observed truncating full-length GxP documents for non-Protocol
-        # types (confirmed via the truncation-raising error) — bumped to match the
+        # types (confirmed via the truncation-raising error) — bumped to near the
         # Protocol-type ceiling, since a full document (not just a protocol) can be just
-        # as long.
-        max_tokens = 14000 if document_type in ("OQ Protocol", "PQ Protocol") else 12000
+        # as long. Protocols keep the larger budget because they carry full test scripts.
+        max_tokens = 28000 if document_type in ("OQ Protocol", "PQ Protocol") else 24000
         result = llm_gateway.call_tool(GENERATE_SYSTEM_PROMPT, prompt, GXP_GENERATE_TOOL_SCHEMA, max_tokens=max_tokens)
         result["agent_name"] = self.agent_name
         return result

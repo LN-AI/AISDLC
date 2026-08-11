@@ -86,6 +86,12 @@ class FullReviewRequest(BaseModel):
     project_name: Optional[str] = "Unnamed Project"
     pr_url: Optional[str] = None
     jira_ticket: Optional[str] = None
+    # Opt-in stages over artifacts already supplied above — STRIDE reads `architecture`,
+    # VAPT and the sensitive-data scan read `code`. Default off so an existing caller's
+    # run, and its cost, are unchanged. See backend/workflows/full_review.py.
+    include_security: bool = False
+    include_vapt: bool = False
+    include_sensitive_data: bool = False
 
 
 class ReleaseGateRequest(BaseModel):

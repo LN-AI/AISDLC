@@ -396,11 +396,23 @@ PRODUCTS: List[Product] = [
 
     # ── Workflows (multi-agent / multi-stage composites) ───────────────────
     Product(
+        # The ID stays `full` even though the title no longer says "Full": IDs are
+        # persisted in `api_keys.scopes`, `api_key_cost_log.agent_name` and
+        # `api_key_agent_llm_config.agent_name` (UNIQUE) — see the module docstring — so
+        # renaming one costs an entitlement migration while retitling costs a string.
         id="full",
         kind=WORKFLOW,
-        title="Full SDLC Review",
+        title="Core SDLC Review",
         module="",
-        description="Runs requirement, code, compliance (via `compliance_artifact`), architecture (via `architecture`), and release gate agents in one call. Returns a consolidated gate decision.",
+        description=(
+            "Runs requirement, compliance (via `compliance_artifact`), architecture (via `architecture`), "
+            "code and prompt-safety reviews in one call, then a release gate and a governance report. "
+            "STRIDE security review, VAPT and the sensitive-data scan are available as opt-in stages "
+            "(`include_security` / `include_vapt` / `include_sensitive_data`) over the same artifacts; "
+            "they are off by default because each adds an LLM call to a single metered call. "
+            "The response lists any stage that did not run under `steps_not_run` — the gate is only as "
+            "broad as the reviews behind it."
+        ),
         endpoint="POST /api/v1/agents/full",
         sources=("text", "github_pr_url", "jira_ticket", "compliance_artifact", "architecture"),
         frameworks=("NIST-AI-RMF", "OWASP-LLM", "HIPAA", "GDPR", "ISO27001"),
@@ -409,7 +421,8 @@ PRODUCTS: List[Product] = [
             "requirement": "requirement", "compliance_artifact": "compliance_artifact",
             "architecture": "architecture", "code": "code", "prompt_config": "prompt_config",
             "test_evidence": "test_evidence", "project_name": _PROJECT, "context": _CTX,
-            "on_progress": "on_progress",
+            "on_progress": "on_progress", "include_security": "include_security",
+            "include_vapt": "include_vapt", "include_sensitive_data": "include_sensitive_data",
         }),
     ),
     Product(

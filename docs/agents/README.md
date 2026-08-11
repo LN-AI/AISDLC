@@ -7,7 +7,7 @@ All 25 endpoints share the same cross-cutting behavior, described identically in
 - **RBAC** — an API key's `scopes` field (comma-separated agent names, or `all`) gates which agents it may call; an out-of-scope call returns HTTP 403.
 - **Monthly budget cap** — if a key has a `monthly_budget_usd` set (`PATCH /api/v1/keys/{key_id}/budget`), calls are rejected with HTTP 402 once that month's usage reaches the cap.
 - **Input size limit** — artifacts over `MAX_AGENT_INPUT_CHARS` (400,000 characters by default) are rejected with HTTP 413.
-- **Timeout & retry** — 120s timeout per LLM call, up to 2 retries on transient provider errors.
+- **Timeout & retry** — 900s timeout per LLM call, up to 2 retries on transient provider errors.
 - **Prompt-injection scan** — a non-blocking heuristic scan whose hits (if any) are attached to the response as `guardrail_flags` — informational only, never blocks.
 - **Untrusted content wrapping** — content fetched from GitHub/Jira is delimited so the model treats it as data, never as instructions.
 - **Bring your own LLM** — every request accepts `llm_provider` / `llm_api_key` / `llm_base_url` / `llm_model` to route a single call through your own Anthropic or OpenAI-compatible credentials.
@@ -58,7 +58,7 @@ One nuance worth knowing up front: **not every endpoint returns `_budget_stats` 
 | Agent | Endpoint | Description |
 |---|---|---|
 | [Release Gate](release-gate.md) | `POST /api/v1/agents/release-gate` | Evaluates release readiness: aggregates prior findings, checks mandatory controls, issues a gate decision. |
-| [Full SDLC Review](full.md) | `POST /api/v1/agents/full` | Runs requirement, code, compliance, architecture, and release gate agents in one call. |
+| [Core SDLC Review](full.md) | `POST /api/v1/agents/full` | Runs requirement, compliance, architecture, code and prompt-safety agents in one call, then the release gate. STRIDE, VAPT and sensitive-data are opt-in; whatever is skipped is reported. |
 | [Governance Report Generator](report-generate.md) | `POST /api/v1/agents/report-generate` | Synthesizes prior review findings into an audit-ready governance report without re-running a review. |
 
 ## Operations Intelligence
