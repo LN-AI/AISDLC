@@ -164,6 +164,9 @@
             <li class="nav-item" data-page="governance-report" data-product="report-generate">
               <span class="nav-icon">📄</span> Governance Report
             </li>
+            <li class="nav-item" data-page="findings">
+              <span class="nav-icon">🐞</span> Findings
+            </li>
             <li class="nav-item" data-page="inventory">
               <span class="nav-icon">📦</span> AI Inventory
             </li>
@@ -1585,6 +1588,43 @@ Examples:
       </div>
 
       <!-- AI Inventory Page -->
+      <!-- Findings Page -->
+      <div id="page-findings" class="page">
+        <div class="page-header">
+          <h1>Findings</h1>
+          <p class="subtitle">Every finding this project's reviews have produced, in one place. Waive what you
+            have accepted and it drops out of future reviews of this project.</p>
+        </div>
+        <div class="findings-toolbar">
+          <select id="findings-status">
+            <option value="open">Open</option>
+            <option value="">Any status</option>
+            <option value="waived">Waived</option>
+            <option value="accepted_risk">Accepted risk</option>
+            <option value="false_positive">False positive</option>
+            <option value="resolved">Resolved</option>
+          </select>
+          <select id="findings-severity">
+            <option value="0">All severities</option>
+            <option value="4">High and Critical</option>
+            <option value="5">Critical only</option>
+          </select>
+          <button class="btn btn-primary" onclick="loadFindings(0)">Apply</button>
+          <button class="btn btn-secondary" onclick="loadFindings(_findingsOffset)">↺ Refresh</button>
+          <span id="findings-counts" class="findings-counts"></span>
+        </div>
+        <div id="findings-list">
+          <div class="empty-state">Loading…</div>
+        </div>
+        <div class="table-pager hidden" id="findings-pager">
+          <span id="findings-range" class="pager-range"></span>
+          <div class="pager-buttons">
+            <button class="btn btn-secondary" id="findings-prev" onclick="pageFindings(-1)">← Newer</button>
+            <button class="btn btn-secondary" id="findings-next" onclick="pageFindings(1)">Older →</button>
+          </div>
+        </div>
+      </div>
+
       <div id="page-inventory" class="page">
         <div class="page-header">
           <h1>AI Use-Case Inventory</h1>

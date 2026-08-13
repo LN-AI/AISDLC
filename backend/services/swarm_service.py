@@ -14,8 +14,9 @@ Agent selection is automatic based on the source type supplied:
     + system_prompt field → always adds prompt agent
 
 Policy enforcement:
-    required agent RED  → swarm_gate = BLOCKED
-    optional agent RED  → swarm_gate = AMBER (unless already BLOCKED)
+    required agent RED     → swarm_gate = BLOCKED
+    required agent ERRORED → swarm_gate = AMBER (it never ran; it cannot have passed)
+    optional agent RED     → swarm_gate = AMBER (unless already BLOCKED)
     all pass, avg score > policy.min_passing_score → swarm_gate = AMBER
     all pass, avg score <= policy.min_passing_score → swarm_gate = GREEN
 """
@@ -453,10 +454,20 @@ class SwarmService:
         # ── Gate decision ──────────────────────────────────────────────────
         required_failed = [a for a in agents_failed if a in policy.required_agents]
         optional_failed = [a for a in agents_failed if a in policy.optional_agents]
+        # An agent that crashed did not clear the artifact — it was never asked. Excluded
+        # from `scores` and from `agents_failed` above, a crashed *required* agent used to
+        # leave `required_failed` empty and the swarm could return GREEN having never run a
+        # mandatory check. That is the same failure D-29 fixed for `full` with
+        # `steps_not_run`: a gate is only as broad as the reviews behind it.
+        #
+        # Deliberately AMBER rather than BLOCKED, so the documented promise that "one agent
+        # crashing never blocks the gate" still holds — what it may no longer do is come
+        # back clean.
+        required_errored = [a for a in agents_errored if a in policy.required_agents]
 
         if required_failed:
             swarm_gate = "BLOCKED"
-        elif optional_failed or swarm_risk_score > policy.min_passing_score:
+        elif required_errored or optional_failed or swarm_risk_score > policy.min_passing_score:
             swarm_gate = "AMBER"
         else:
             swarm_gate = "GREEN"

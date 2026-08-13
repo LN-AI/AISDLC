@@ -698,15 +698,19 @@ class SDLCOrchestrator:
         release_version: str = "",
         evidence_summary: str = "",
         context: str = "",
+        findings: list = None,
     ) -> Dict[str, Any]:
         # `context` is accepted for backwards compatibility with existing callers but is
         # not used — the gate agent takes its input from findings and evidence only.
+        # `findings` is the pasted-findings path the legacy `/api/release-gate` route
+        # needs; it used to evaluate those inline and persist nothing.
         return release_gate_workflow.run(
             self,
             project_name=project_name,
             review_ids=review_ids,
             release_version=release_version,
             evidence_summary=evidence_summary,
+            findings=findings,
         )
     @_log_call
     def review_github_pr(self, pr_url: str, jira_ticket: str = "", include_prompt_review: bool = False) -> Dict[str, Any]:

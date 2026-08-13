@@ -3,10 +3,13 @@
 Each function here replaced a near-verbatim duplicate pair in `orchestrator.py`.
 """
 import json
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend import database
 from backend.workflows.base import combine_files
+
+logger = logging.getLogger(__name__)
 
 
 def calculate_overall_risk(results: List[Dict[str, Any]]) -> float:
@@ -73,6 +76,25 @@ def strictest_gate(*gates: str) -> str:
         if rank > _GATE_RANK[worst.lower()]:
             worst = gate.strip().capitalize()
     return worst
+
+
+def attach_approval(result: Dict[str, Any], review_id: Optional[str]) -> Dict[str, Any]:
+    """Tell the caller whether their gate decision is now waiting on a human.
+
+    Enqueueing itself is `save_review`'s job and has been all along (`database.py`, "Auto-
+    create approval request for Red gate or critical findings") — a fact worth stating
+    because it is invisible from the workflow: nothing here calls `create_approval`, so
+    reading the workflow alone suggests the sign-off step is never triggered.
+
+    What was genuinely missing is the other half. The queue filled, but the response that
+    caused the row said nothing about it, so neither the UI nor an API client could link a
+    blocked release to the request now sitting in someone's queue. Reports it rather than
+    re-deriving the trigger condition, so this can never disagree with what was written.
+    """
+    approval = database.get_pending_approval_for_review(review_id) if review_id else None
+    result["approval_required"] = approval is not None
+    result["approval_id"] = approval["id"] if approval else None
+    return result
 
 
 def governance_review(orch, files: List[dict], language: str, project_name: str, label: str) -> Dict[str, Any]:

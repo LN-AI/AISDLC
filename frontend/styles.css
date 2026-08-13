@@ -1319,6 +1319,26 @@ button.not-entitled::after {
   cursor: pointer; font-size: 13px; padding: 0; text-decoration: underline;
 }
 
+/* ── Findings page ────────────────────────────────────────────────────── */
+.findings-toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+/* Opaque, never a translucent background — a <select>'s popup is a native widget and
+   does not inherit one, so the options would paint light-on-white (see D-32). */
+.findings-toolbar select {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 13px; padding: 6px 12px; min-width: 160px;
+}
+.findings-toolbar select:focus { outline: none; border-color: var(--accent); }
+.findings-counts { color: var(--text-muted); font-size: 13px; margin-left: auto; }
+
+/* Which review a finding came from. On every other screen that is implied by the page
+   you are on; here findings from different reviews and different agents sit together,
+   so each one has to name its own origin. */
+.finding-origin {
+  align-items: center; color: var(--text-muted); display: flex; flex-wrap: wrap;
+  font-size: 12px; gap: 10px; margin: 18px 0 -6px;
+}
+.finding-origin .btn-link { font-size: 12px; padding: 0; }
+
 /* ── Approvals page ───────────────────────────────────────────────────── */
 .approval-filters { display: flex; gap: 8px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
 .filter-btn {

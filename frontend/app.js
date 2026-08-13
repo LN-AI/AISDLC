@@ -345,6 +345,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'agent-hub') { loadAgentHub(); loadSwarmPolicies(); }
     if (page === 'gate') loadReviewPicker();
     if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
+    if (page === 'findings') loadFindings(0);
     if (page === 'inventory') loadInventory();
     if (page === 'sensitive') { /* page ready, no auto-load */ }
     if (page === 'ai-provenance') { /* page ready, no auto-load */ }
@@ -2128,6 +2129,73 @@ function renderFinding(f) {
   `;
 }
 
+// ── Findings ──────────────────────────────────────────────────────────────
+//
+// A finding could be waived from the day the API existed, but only from inside the
+// review-detail modal of the review that produced it — so "what is still open in this
+// project" had no answer on any screen. This page is the read side of that lifecycle:
+// `GET /api/v1/findings`, project-scoped server-side like every other governance surface.
+
+const FINDINGS_PAGE_SIZE = 25;
+let _findingsOffset = 0;
+
+async function loadFindings(offset) {
+  _findingsOffset = Math.max(0, offset || 0);
+  const wrap = document.getElementById('findings-list');
+  const pager = document.getElementById('findings-pager');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+
+  const status = document.getElementById('findings-status').value;
+  const minSeverity = document.getElementById('findings-severity').value;
+  const params = new URLSearchParams({
+    limit: FINDINGS_PAGE_SIZE, offset: _findingsOffset, min_severity: minSeverity,
+  });
+  if (status) params.set('status', status);
+
+  try {
+    const data = await apiFetch(`/api/v1/findings?${params}`);
+    const findings = data.findings || [];
+    const counts = data.counts || {};
+    document.getElementById('findings-counts').innerHTML =
+      `<strong>${data.total || 0}</strong> matching · ${counts.critical || 0} critical · ${counts.high || 0} high`;
+
+    if (!findings.length) {
+      wrap.innerHTML = `<div class="empty-state">No findings match this filter.
+        ${status === 'open' ? 'Nothing is open — either nothing was found, or everything found has been waived or resolved.' : ''}</div>`;
+      pager.classList.add('hidden');
+      return;
+    }
+
+    // A finding is meaningless without the review it came from, so each card is prefixed
+    // with its origin — this is the one screen where findings from different reviews and
+    // different agents sit next to each other.
+    wrap.innerHTML = findings.map(f => `
+      <div class="finding-origin">
+        <span class="tag tag-${esc(f.review_type || '')}">${esc((f.review_type || 'review').replace(/_/g, ' '))}</span>
+        <span>${esc(f.project_name || '')}</span>
+        <span>${esc((f.review_created_at || '').slice(0, 16).replace('T', ' '))}</span>
+        <button class="btn btn-link" onclick="viewReview('${esc(f.review_id)}')">Open review</button>
+      </div>
+      ${renderFinding(f)}
+    `).join('');
+
+    const first = _findingsOffset + 1;
+    const last = _findingsOffset + findings.length;
+    document.getElementById('findings-range').textContent = `Showing ${first}–${last} of ${data.total}`;
+    document.getElementById('findings-prev').disabled = _findingsOffset === 0;
+    document.getElementById('findings-next').disabled = last >= data.total;
+    pager.classList.toggle('hidden', (data.total || 0) <= FINDINGS_PAGE_SIZE);
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load findings: ${esc(e.message)}</div>`;
+    pager.classList.add('hidden');
+  }
+}
+
+function pageFindings(direction) {
+  loadFindings(_findingsOffset + direction * FINDINGS_PAGE_SIZE);
+}
+
 // ── Waiving a finding ─────────────────────────────────────────────────────
 //
 // The `findings` table has always had status/resolved_by/resolved_at and the API to write
@@ -2174,6 +2242,20 @@ async function waiveFinding(findingId, forcedStatus) {
     if (card) {
       const holder = card.querySelector('.finding-actions, .finding-waived');
       if (holder) holder.outerHTML = renderWaiveControl({ ...updated, id: findingId });
+    }
+    // The Findings page counts "how many are still open", which this just changed. The
+    // card is updated in place rather than removed — pulling a row out from under the
+    // cursor mid-review is worse than a list that is one row stale.
+    const active = document.querySelector('.page.active');
+    if (active && active.id === 'page-findings') {
+      apiFetch('/api/v1/findings?limit=1&status=open', { _silent: true })
+        .then(d => {
+          const el = document.getElementById('findings-counts');
+          const c = (d && d.counts) || {};
+          if (el) el.innerHTML =
+            `<strong>${d.total || 0}</strong> open · ${c.critical || 0} critical · ${c.high || 0} high`;
+        })
+        .catch(() => {});
     }
   } catch (e) {
     alert('Could not update the finding: ' + (e.message || e));

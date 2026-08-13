@@ -46,11 +46,15 @@ from backend.services import llm_gateway  # noqa: E402
 # several checks below: a finding that never arrives leaves a *Green* gate, which is exactly
 # how the governance_review hole stayed invisible.
 _llm_calls = []
+# The prompts themselves, so section 10 can assert that a later stage of `full` actually
+# received what earlier stages found rather than the caller's context alone.
+_llm_inputs = []
 
 
 def _stub_call_tool(system_prompt, user_content, tool_schema, llm_override=None, max_tokens=None):
     name = tool_schema.get("name", "?")
     _llm_calls.append(name)
+    _llm_inputs.append(user_content if isinstance(user_content, str) else str(user_content))
     llm_gateway._record_usage("anthropic", config.MODEL, 1000, 100)
     result = {
         "findings": [{
@@ -330,6 +334,170 @@ def main_():
         check("...with a per-agent row for everything that ran",
               len(sw["results"]) == len(sw["agents_run"]) and len(sw["results"]) > 1,
               f"{len(sw['results'])} results / {len(sw['agents_run'])} run")
+
+    # ── 6. The approval loop ───────────────────────────────────────────────
+    section("6. Approvals — a blocked gate reaches a human")
+
+    # `save_review` has always enqueued an approval for a Red gate or a Critical finding.
+    # What it did not do was stamp `project_id`, so the queue could not be scoped and
+    # showed every customer's blocked releases to anyone holding a token.
+    queue = client.get("/api/approvals?status=pending", headers=scoped)
+    check("GET /api/approvals responds", queue.status_code == 200, queue.text[:200])
+    pending = queue.json().get("approvals", []) if queue.status_code == 200 else []
+    check("a blocked review is waiting for sign-off", len(pending) > 0, f"{len(pending)} pending")
+    check("...attributed to the project that ran it, so the queue can be scoped at all",
+          pending and all(a.get("project_id") == project_id for a in pending),
+          str({a.get("project_id") for a in pending}))
+    check("...at urgent priority for a Red gate",
+          any(a.get("priority") == "urgent" for a in pending),
+          str([a.get("priority") for a in pending]))
+    check("...naming the review it is gating",
+          all(a.get("review_id") for a in pending))
+
+    stats = client.get("/api/approvals/stats", headers=scoped).json()
+    check("the sidebar badge counts them", stats.get("pending", 0) == len(pending), str(stats))
+
+    check("the queue is scoped — another project sees none of them",
+          client.get("/api/approvals?status=pending",
+                     headers={**admin, "X-Project-Id": other_id}).json().get("approvals") == [])
+    check("...and it refuses an unauthenticated caller outright",
+          client.get("/api/approvals").status_code == 401)
+
+    # The Release Gate page's own endpoint. It used to evaluate inline and persist nothing.
+    before_reviews = client.get("/api/reviews?limit=100", headers=scoped).json()["total"]
+    legacy = client.post("/api/release-gate", headers=scoped, json={
+        "project_name": "Governance Smoke", "review_ids": [scaffold_review_id],
+    })
+    check("the legacy /api/release-gate route still answers", legacy.status_code == 200,
+          legacy.text[:300])
+    lg = legacy.json() if legacy.status_code == 200 else {}
+    check("...and now persists its decision instead of discarding it",
+          bool(lg.get("review_id")), str(list(lg))[:200])
+    check("...so the release decision reaches History like every other result",
+          client.get("/api/reviews?limit=100", headers=scoped).json()["total"] > before_reviews)
+    check("...and the response names the approval it raised",
+          lg.get("approval_required") is True and bool(lg.get("approval_id")),
+          str({k: lg.get(k) for k in ("gate_status", "approval_required", "approval_id")}))
+    check("...with the gate decision itself now pickable for a governance report",
+          any(r["id"] == lg.get("review_id") for r in
+              client.get("/api/reviews?limit=100", headers=scoped).json()["reviews"]))
+
+    pasted = client.post("/api/release-gate", headers=scoped, json={
+        "project_name": "Governance Smoke",
+        "findings": [{"control_id": "X-1", "severity": 5, "risk_level": "Critical",
+                      "title": "pasted", "description": "d", "recommendation": "r",
+                      "is_blocking": True}],
+    })
+    check("pasting findings straight into the gate still works", pasted.status_code == 200,
+          pasted.text[:300])
+
+    target = pending[0]["id"]
+    decided = client.post(f"/api/approvals/{target}/approve", headers=scoped,
+                          json={"comment": "accepted for the smoke run"})
+    check("an approval can be decided", decided.status_code == 200, decided.text[:200])
+    check("...and a second decision on it is refused",
+          client.post(f"/api/approvals/{target}/approve", headers=scoped,
+                      json={"comment": "again"}).status_code == 400)
+    check("...and it is invisible to a caller scoped elsewhere",
+          client.get(f"/api/approvals/{target}",
+                     headers={**admin, "X-Project-Id": other_id}).status_code == 404)
+
+    # ── 7. The findings read side ──────────────────────────────────────────
+    section("7. Findings — the list the lifecycle never had")
+
+    listing = client.get("/api/v1/findings?status=open", headers=scoped)
+    check("GET /api/v1/findings responds", listing.status_code == 200, listing.text[:200])
+    payload = listing.json() if listing.status_code == 200 else {}
+    rows = payload.get("findings", [])
+    check("it returns this project's open findings", len(rows) > 0, str(payload)[:200])
+    check("...with the review context a row is meaningless without",
+          all({"review_id", "review_type", "review_created_at"} <= set(r) for r in rows))
+    check("...and a severity breakdown for the filter chips",
+          {"critical", "high", "total"} <= set(payload.get("counts", {})),
+          str(payload.get("counts")))
+    check("the Critical from the stub is in it",
+          any(r.get("severity") == 5 for r in rows))
+    check("filtering by severity narrows it",
+          all(r.get("severity", 0) >= 4 for r in
+              client.get("/api/v1/findings?min_severity=4", headers=scoped).json()["findings"]))
+    check("findings are scoped — another project sees none of them",
+          client.get("/api/v1/findings",
+                     headers={**admin, "X-Project-Id": other_id}).json()["findings"] == [])
+
+    # Waiving through the list, then proving it leaves the open set.
+    waive_id = rows[0]["id"]
+    open_before = client.get("/api/v1/findings?status=open", headers=scoped).json()["total"]
+    waived = client.patch(f"/api/v1/findings/{waive_id}", headers=scoped,
+                          json={"status": "accepted_risk", "comment": "smoke"})
+    check("a finding reached from the list can be waived", waived.status_code == 200, waived.text[:200])
+    open_after = client.get("/api/v1/findings?status=open", headers=scoped).json()["total"]
+    check("...and it drops out of the open set", open_after == open_before - 1,
+          f"{open_before} -> {open_after}")
+    check("...and is still reachable under its new status",
+          any(r["id"] == waive_id for r in
+              client.get("/api/v1/findings?status=accepted_risk", headers=scoped).json()["findings"]))
+    check("a finding in another project cannot be waived by id",
+          client.patch(f"/api/v1/findings/{waive_id}",
+                       headers={**admin, "X-Project-Id": other_id},
+                       json={"status": "open", "comment": "x"}).status_code == 404)
+
+    # ── 8. Audit events that were only ever filter options ─────────────────
+    section("8. Audit trail — the event types nothing emitted")
+
+    events = client.get("/api/audit?limit=200", headers=admin).json()
+    kinds = {e.get("event_type") for e in events.get("events", events.get("audit", []))}
+    check("`user_login` is now written", "user_login" in kinds, str(sorted(kinds)))
+    check("`approval_created` is now written", "approval_created" in kinds, str(sorted(kinds)))
+    check("...alongside the two that always were",
+          {"review_created", "approval_decided"} <= kinds, str(sorted(kinds)))
+
+    # ── 9. The swarm's error gate ──────────────────────────────────────────
+    section("9. Swarm — a crashed required agent cannot pass")
+
+    from backend.models.swarm_models import AgentSwarmResult, SwarmRequest
+    from backend.services.swarm_service import SwarmService, BUILTIN_POLICIES
+
+    policy = BUILTIN_POLICIES["standard"]
+    required = policy.required_agents[0]
+    req = SwarmRequest(project_name="Governance Smoke", text="x")
+
+    crashed = SwarmService()._aggregate(
+        req=req, policy=policy,
+        results={required: AgentSwarmResult(
+            agent=required, gate_status="Green", risk_score=0.0, summary="",
+            error="boom — the agent never ran")},
+        agents_run=[required], source_type="text", source_ref="",
+    )
+    check("a required agent that errored is reported as errored",
+          crashed.agents_errored == [required], str(crashed.agents_errored))
+    check("...and the swarm does NOT come back GREEN over a check that never ran",
+          crashed.swarm_gate != "GREEN", crashed.swarm_gate)
+    check("...it comes back AMBER — incomplete, but still not blocking (the documented promise)",
+          crashed.swarm_gate == "AMBER", crashed.swarm_gate)
+
+    clean = SwarmService()._aggregate(
+        req=req, policy=policy,
+        results={required: AgentSwarmResult(
+            agent=required, gate_status="Green", risk_score=1.0, summary="clean")},
+        agents_run=[required], source_type="text", source_ref="",
+    )
+    check("a required agent that actually ran clean still gates GREEN",
+          clean.swarm_gate == "GREEN", clean.swarm_gate)
+
+    # ── 10. `full` as a pipeline, not a batch ──────────────────────────────
+    section("10. Core SDLC Review — later stages see earlier findings")
+
+    _llm_inputs.clear()
+    run_full({"project_name": "Governance Smoke", "requirement": "story", "code": "KEY='sk-live'"})
+    carried = [text for text in _llm_inputs if "EARLIER STAGES OF THIS SAME REVIEW" in text]
+    check("a later stage's prompt carries what earlier stages found",
+          len(carried) > 0, f"{len(_llm_inputs)} prompts, {len(carried)} carrying a digest")
+    check("...naming the actual finding rather than just a count",
+          any("Hardcoded credential" in text for text in carried))
+    check("...attributed to the stage that raised it",
+          any("[requirement]" in text for text in carried))
+    check("the first stage is unaffected — there is nothing to carry yet",
+          "EARLIER STAGES OF THIS SAME REVIEW" not in (_llm_inputs[0] if _llm_inputs else ""))
 
     # ── done ───────────────────────────────────────────────────────────────
     stack.close()
