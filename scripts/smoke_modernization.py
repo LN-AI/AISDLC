@@ -1436,6 +1436,108 @@ check("another project's caller cannot read this run's suggestions",
                  headers=other_hdr).status_code == 404)
 
 
+# ── 18. Resume, through the real entry point ───────────────────────────────
+section("18. Resume — the path the Resume button actually takes")
+
+# Found by a real run, invisible to every check above it. `runner.start` (which `resume`
+# delegates to) cleared `paused_reason` but left `status='paused'`, and the driver's very first
+# act is `_stop_reason`, which treats `paused` as "stop now". So every Resume click started a
+# job that immediately observed a paused run and exited having done nothing — leaving
+# `status=paused, paused_reason=None`, which renders as a button that does nothing and says
+# nothing. A run stopped at a gate could never be continued.
+#
+# Nothing here caught it because `drive()` calls `convert_run` directly and sets the status
+# itself, so the one line that was wrong was never executed. This section goes through
+# `runner.resume` with the background job made synchronous, which is the only way the bug is
+# reachable offline.
+from backend.services import job_service                                  # noqa: E402
+
+_real_start_job = job_service.start_job
+
+
+def sync_start_job(agent_name, total_steps, run_fn):
+    """Run the job inline. `start_job` schedules on an event loop that a plain script has
+    none of; the point of the stub is to reach `start()`'s own logic, not to test threading."""
+    run_fn(lambda step, total, label: None)
+    return "job-sync"
+
+
+job_service.start_job = sync_start_job
+llm_gateway.call_tool = fake_call_tool
+try:
+    r18 = store.create_run("resume-path", ".NET 8 / ASP.NET Core MVC", "files",
+                           created_by="smoke")
+    runner.ingest_and_analyze(r18, PHP_FIXTURE)
+    runner.set_charter(r18, VALID_CHARTER, "smoke")
+
+    # Answer each blocking gate and continue exactly as a person clicking the buttons would —
+    # never touching `status` by hand, which is the whole point of this section.
+    for _ in range(8):
+        gates = [c for c in store.list_checkpoints(r18, "open") if c["blocking"]]
+        for gate in gates:
+            store.answer_checkpoint(gate["id"], {"decision": "approved"}, "smoke")
+        before = store.get_run(r18)
+        if before["status"] in store.TERMINAL_RUN_STATES:
+            break
+        runner.resume(r18, CALLER)
+        after = store.get_run(r18)
+        # The exact failure: paused, with nothing to say about why, and no work done.
+        check(f"resume from phase '{before['phase']}' actually advanced the run",
+              after["phase"] != before["phase"]
+              or after["status"] != "paused"
+              or bool(after["paused_reason"]),
+              f"stuck at {before['phase']}: status={after['status']} "
+              f"reason={after['paused_reason']!r}")
+        if after["status"] == "paused" and not after["paused_reason"] \
+                and after["phase"] == before["phase"]:
+            break
+
+    final = store.get_run(r18)
+    check("a run driven only by start/resume reaches the end",
+          final["status"] == "completed", f"{final['status']} at phase {final['phase']}")
+    check("a paused run is never left without a reason for it",
+          not (final["status"] == "paused" and not final["paused_reason"]),
+          f"status={final['status']} reason={final['paused_reason']!r}")
+    check("the scaffold stage produced its unit — the stage the real run died on",
+          store.stage_units_exist(r18, "scaffold"))
+    check("components were promoted rather than left blocked at level 0",
+          store.unit_status_counts(r18, kind="component")["blocked"] == 0,
+          str(store.unit_status_counts(r18, kind="component")))
+    check("every component converted",
+          store.unit_status_counts(r18, kind="component")["converted"] > 0,
+          str(store.unit_status_counts(r18, kind="component")))
+    # A source file with no output must never be silently absent. The fixture guarantees one:
+    # `admin/run.php` carries an `eval` and a dynamic include, so its component's output is
+    # refused by the hazard check (D-55) and its members stay `rolled_up` — deliberately not
+    # `converted`, so no per-file tally can claim work that did not happen.
+    _comp_counts = store.unit_status_counts(r18, kind="component")
+    _stranded = [u["path"] for u in store.list_units(r18, kind="source_file")
+                 if u["status"] == "rolled_up"]
+    check("a file whose component failed is left rolled_up, never counted as converted",
+          not _stranded or _comp_counts["failed"] > 0,
+          f"stranded={_stranded} components={_comp_counts}")
+    check("every file is either converted or accounted for as not converted",
+          store.unit_status_counts(r18)["converted"] + len(_stranded)
+          + store.unit_status_counts(r18)["failed"] == store.unit_status_counts(r18)["total"],
+          str(store.unit_status_counts(r18)))
+    _recon = reconcile.run(r18)
+    check("and reconciliation names it rather than letting the run look clean",
+          any(_stranded[0] in str(i) for i in _recon.get("issues") or []) if _stranded else True,
+          str(_recon.get("issues"))[:300])
+
+    # `start` must not resurrect a run somebody finished or cancelled.
+    for terminal in ("completed", "cancelled"):
+        store.update_run(r18, status=terminal)
+        try:
+            runner.resume(r18, CALLER)
+            check(f"a {terminal} run refuses to resume", False)
+        except ValueError as exc:
+            check(f"a {terminal} run refuses to resume", terminal in str(exc))
+finally:
+    job_service.start_job = _real_start_job
+    llm_gateway.call_tool = _real_call_tool
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

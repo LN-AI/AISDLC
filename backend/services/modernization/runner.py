@@ -280,7 +280,22 @@ def start(run_id: str, caller: dict, llm_override: Optional[dict] = None) -> str
 
     counts = store.unit_status_counts(run_id)
     store.recover_expired_leases(run_id)
-    store.update_run(run_id, paused_reason=None)
+
+    # Clear the pause itself, not only its reason.
+    #
+    # `_stop_reason` treats `paused` as "stop now" — which is how cooperative pause works —
+    # and the driver checks it at the top of its loop, *before* it sets the current stage's
+    # own `run_status`. So a run still marked `paused` here starts a job that immediately
+    # observes a paused run and exits having done nothing.
+    #
+    # This made `resume()` a no-op for every paused run in production: each click cleared the
+    # reason, started a job, and stopped again — leaving `status=paused` with
+    # `paused_reason=None`, which renders as a Resume button that does nothing and says
+    # nothing. Nothing offline caught it because the smoke driver calls `convert_run`
+    # directly and sets the status itself; section 18 now goes through `resume()` instead.
+    stage = stages.current(run.get("phase") or "")
+    store.update_run(run_id, status=(stage.run_status if stage else "converting"),
+                     paused_reason=None)
 
     from backend.services import job_service
 
