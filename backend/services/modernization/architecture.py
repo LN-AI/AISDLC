@@ -45,6 +45,11 @@ def _slugify(text: str, fallback: str = "component") -> str:
     return (slug or fallback)[:48]
 
 
+def _pascal(text: str) -> str:
+    """A slug as an identifier segment — `order-admin` -> `OrderAdmin`."""
+    return "".join(part.capitalize() for part in _SLUG.split(text or "") if part) or "Component"
+
+
 def component_path(index: int, name: str) -> str:
     """The synthetic `path` a component row occupies.
 
@@ -93,13 +98,19 @@ def _fallback_component_name(path: str) -> str:
     return _slugify(directory.replace("/", "-") or "root", "root")
 
 
-def _unique(value: str, taken: Set[str], suffix_with: int) -> str:
+def _unique(value: str, taken: Set[str], suffix_with: int, separator: str = "-") -> str:
+    """Make a name unique by suffixing it.
+
+    `separator` matters: a namespace is an identifier in the target language, and
+    `Shop.Web.Controllers-2` is not a legal C# namespace. A directory may contain a hyphen;
+    a namespace may not.
+    """
     if value not in taken:
         return value
-    candidate = f"{value}-{suffix_with}"
+    candidate = f"{value}{separator}{suffix_with}"
     while candidate in taken:
         suffix_with += 1
-        candidate = f"{value}-{suffix_with}"
+        candidate = f"{value}{separator}{suffix_with}"
     return candidate
 
 
@@ -153,8 +164,10 @@ def normalize_proposal(
 
         namespace = _NS_OK.sub("", raw.get("namespace") or "").strip(".")
         if not namespace:
-            namespace = ".".join(part for part in (project, name.replace("-", "")) if part)
-        namespace = _unique(namespace, taken_ns, 2)
+            namespace = ".".join(part for part in (project, _pascal(name)) if part)
+        # Suffixed with a dot, not a hyphen: the result has to be a legal identifier path in
+        # the target language, and every artifact in the component declares it verbatim.
+        namespace = _unique(namespace, taken_ns, 2, separator=".")
         taken_ns.add(namespace)
 
         for member in keep:

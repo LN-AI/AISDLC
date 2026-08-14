@@ -38,7 +38,7 @@ from backend.products import registry  # noqa: E402
 from backend.services import agent_guard, code_chunker, llm_gateway  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
-    analyzers, charter, evidence, graph, repo_ingest, runner, store, validation,
+    analyzers, charter, evidence, graph, reconcile, repo_ingest, runner, store, validation,
 )
 
 database.init_db()
@@ -838,9 +838,20 @@ try:
           counts["converted"] == 2, str(counts))
     check("the run does not report 'completed' with a hole in it",
           fail_outcome["status"] in ("completed", "paused"), str(fail_outcome))
+    # A failed component leaves its source files `rolled_up` — not `failed` — so a per-file
+    # tally reports zero problems while a third of the codebase has no output. This is the
+    # check that stops a run looking complete because the files look fine.
+    fail_report = reconcile.run(fail_run)
     check("reconciliation reports the component that produced nothing",
-          any(c["kind"] == "reconciliation" for c in store.list_checkpoints(fail_run))
-          or fail_outcome["status"] == "paused", str(fail_outcome["status"]))
+          any(i["kind"] == "component_failed" for i in fail_report["issues"]),
+          str([i["kind"] for i in fail_report["issues"]]))
+    check("and names the source files it stranded",
+          any("b.py" in i["detail"] for i in fail_report["issues"]
+              if i["kind"] == "component_failed"))
+    check("a run with a failed component raises a non-blocking reconciliation checkpoint",
+          any(c["kind"] == "reconciliation" and not c["blocking"]
+              for c in store.list_checkpoints(fail_run)),
+          str([c["kind"] for c in store.list_checkpoints(fail_run)]))
 
     cap_run = store.create_run("cap", ".NET 8", "files", budget_cap_usd=0.01, created_by="smoke")
     runner.ingest_and_analyze(cap_run, [{"path": f"f{i}.py", "content": f"X{i} = 1\n"} for i in range(5)])

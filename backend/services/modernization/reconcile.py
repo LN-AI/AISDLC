@@ -59,16 +59,17 @@ def run(run_id: str) -> Dict[str, Any]:
         issues.append(_issue("duplicate_symbol", "fail", event.get("detail") or "",
                              unit_id=event.get("unit_id")))
 
-    # 2. Output-path conformance. Every artifact should live under some component's
-    #    directory or be part of the scaffold.
+    # 2. Output-path conformance. Every *converted* artifact should live under its
+    #    component's directory. Scaffold files legitimately do not — a `.sln` belongs at the
+    #    root and a `.csproj` at the project root — so they are excluded by the unit that
+    #    produced them rather than by guessing from the path shape.
     dirs = {(c.get("output_dir") or "").strip("/") for c in components if c.get("output_dir")}
-    scaffold_paths = {a["path"] for a in artifacts
-                      if "/" not in a["path"] or a["path"].split("/", 1)[0].endswith(".sln")}
+    scaffold_ids = {u["id"] for u in store.list_units(run_id, kind="scaffold")}
     strays = []
     for artifact in artifacts:
-        path = artifact["path"]
-        if path in scaffold_paths:
+        if artifact.get("unit_id") in scaffold_ids:
             continue
+        path = artifact["path"]
         if any(path.startswith(d + "/") for d in dirs):
             continue
         strays.append(path)
@@ -139,12 +140,34 @@ def run(run_id: str) -> Dict[str, Any]:
                              f"is marked converted but emitted no files.",
                              unit_id=component["id"]))
 
-    # 7. Files that never converted. Reported here as one number rather than as a checkpoint
-    #    per file — the per-unit checkpoints already exist and this is the summary.
+    # 7. Components that failed outright, and the source files they took down with them.
+    #    Those members are still `rolled_up` — not `converted`, not `failed` — so a per-file
+    #    tally reports zero failures while a seventh of the codebase has no output at all.
+    #    This is the check that stops a run looking complete because the *files* look fine.
+    stranded = 0
+    for component in components:
+        if component.get("status") not in ("failed", "needs_human"):
+            continue
+        members = (component.get("meta") or {}).get("members") or []
+        stranded += len(members)
+        issues.append(_issue(
+            "component_failed", "fail",
+            f"Component `{component.get('component_name') or component['path']}` did not "
+            f"convert, so {len(members)} source file(s) produced no output: "
+            + ", ".join(f"`{m}`" for m in members[:8])
+            + (" …" if len(members) > 8 else ""),
+            unit_id=component["id"]))
+
     counts = store.unit_status_counts(run_id)
     if counts["failed"]:
         issues.append(_issue("unconverted_files", "warn",
                              f"{counts['failed']} source file(s) did not convert."))
+    if counts["rolled_up"] and not stranded:
+        # Members left rolled_up with no failed component above them means a component was
+        # never claimed at all — the run stopped between stages.
+        issues.append(_issue("unfinished_run", "warn",
+                             f"{counts['rolled_up']} source file(s) were assigned to a "
+                             f"component that has not been converted yet."))
 
     report = {
         "issues": issues,

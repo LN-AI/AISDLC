@@ -380,7 +380,18 @@ def _php_facts(path: str, content: str, caps: Optional[Dict[str, List[Any]]] = N
             if len(db_sites) >= MAX_FACT_ROWS:
                 break
     if db_sites:
-        facts["db_sites"] = db_sites[:MAX_FACT_ROWS]
+        # Two calls on one line — `mysqli_fetch_assoc(mysqli_query(...))` is the classic —
+        # resolve to the same SQL, and reporting the same statement twice reads as two
+        # queries in the prompt.
+        seen_sql = set()
+        deduped = []
+        for site in sorted(db_sites, key=lambda s: (s["line"], s["fn"])):
+            key = (site["line"], site.get("sql", ""))
+            if site.get("sql") and key in seen_sql:
+                continue
+            seen_sql.add(key)
+            deduped.append(site)
+        facts["db_sites"] = deduped[:MAX_FACT_ROWS]
         facts["db_apis"] = sorted({s["api"] for s in db_sites})
     if tables:
         facts["tables"] = sorted(tables)[:MAX_FACT_ROWS]
