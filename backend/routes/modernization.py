@@ -27,9 +27,9 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from backend import scope
 from backend.routes.v1_agents import get_caller
 from backend.services import agent_guard
-from backend.services.auth_service import is_super_admin
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import repo_ingest, runner, store
 
@@ -81,26 +81,11 @@ class StopRequest(BaseModel):
 
 # ── Access ─────────────────────────────────────────────────────────────────
 
-def _visible_project_ids(caller: dict) -> Optional[List[str]]:
-    """Which projects' runs this caller may see. `None` means unrestricted.
-
-    Matches how `database.list_reviews` scopes: a super admin sees everything, a caller
-    bound to a project sees that project, and an unbound session (an internal console with
-    no project selected) is unrestricted — the same default the rest of the platform has.
-    Tighten it with `UI_REQUIRE_PROJECT=true`, which stops unbound sessions existing.
-    """
-    if is_super_admin(caller.get("_user")):
-        return None
-    subject = caller.get("_subject")
-    project_id = getattr(subject, "project_id", None)
-    return [project_id] if project_id else None
-
-
 def _require_run(run_id: str, caller: dict) -> Dict[str, Any]:
     run = store.get_run(run_id)
     if not run:
         raise HTTPException(404, f"No modernization run with id '{run_id}'.")
-    visible = _visible_project_ids(caller)
+    visible = scope.visible_from_caller(caller)
     if visible is not None and run.get("project_id") not in visible:
         # 404 rather than 403: whether a run exists in someone else's project is itself
         # information this caller has no claim to.
@@ -241,7 +226,7 @@ def _fetch_github_repo(repo_url: str) -> List[Dict[str, str]]:
 
 @router.get("/runs", summary="List modernization runs")
 def list_runs(limit: int = 50, caller: dict = Depends(get_caller)):
-    return {"runs": store.list_runs(_visible_project_ids(caller), limit=limit)}
+    return {"runs": store.list_runs(scope.visible_from_caller(caller), limit=limit)}
 
 
 @router.get("/runs/{run_id}", summary="Run manifest — status, progress, open checkpoints")

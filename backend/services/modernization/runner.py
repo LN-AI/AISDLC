@@ -30,7 +30,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.agents.modernization_intelligence.unit_converter import UnitConverterAgent
-from backend.services import agent_guard
+from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import analyzers, graph, repo_ingest, store, validation
 
@@ -153,9 +153,30 @@ def set_charter(run_id: str, charter: Dict[str, Any], actor: str = "system") -> 
             "than earlier ones."
         )
     cleaned = charter_module.validate(charter)
+    previous = run.get("charter") or {}
     store.update_run(run_id, charter=cleaned, target_stack=cleaned["target_stack"],
                      status="awaiting_approval", phase="plan_approval")
     store.append_event(run_id, "charter_set", f"target={cleaned['target_stack']} by {actor}")
+
+    # The charter's own docstring promises this and nothing implemented it: a file converted
+    # before the change was converted against different rules than one converted after, and
+    # that inconsistency is the entire thing the charter exists to prevent. Non-blocking —
+    # the run can continue — but it must not be silent.
+    if previous and previous != cleaned:
+        changed = sorted(k for k in set(previous) | set(cleaned)
+                         if (previous.get(k) or "") != (cleaned.get(k) or ""))
+        flagged = store.flag_converted_for_review(
+            run_id, "the charter changed after they were converted (" + ", ".join(changed) + ")")
+        if flagged:
+            store.create_checkpoint(
+                run_id, "charter_changed",
+                f"{flagged} already-converted file(s) predate this charter",
+                detail=(f"These decisions changed: {', '.join(changed)}. The files converted "
+                        f"before the change followed the old rules and are flagged for review. "
+                        f"Re-converting them is a deliberate act, not something this run will "
+                        f"do on its own."),
+                blocking=False,
+            )
 
     open_approval = [c for c in store.list_checkpoints(run_id, "open") if c["kind"] == "plan_approval"]
     if not open_approval:
@@ -275,7 +296,16 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     """One unit: build context, call the model under the guard, validate, commit."""
     path = unit["path"]
     meta = unit.get("meta") or {}
-    dependency_symbols = store.symbols_for_paths(run_id, unit.get("depends_on") or [])
+    # `graph.build` strips intra-cycle edges from `depends_on` so the cycle can convert at
+    # all (D-21) — but dependency context was read from `depends_on` alone, so a unit whose
+    # only dependencies were cycle siblings got *nothing*: it rendered both "you are at the
+    # root of the dependency order" and "you are in a cycle", with no signatures either way.
+    # Siblings already converted have real signatures to offer, and in a legacy codebase
+    # (Delphi, PHP) the cycle is the common case, not the edge case.
+    context_paths = list(dict.fromkeys(
+        (unit.get("depends_on") or []) + (meta.get("in_cycle_with") or [])
+    ))
+    dependency_symbols = store.symbols_for_paths(run_id, context_paths)
 
     try:
         result = agent_guard.guarded_call(
@@ -303,6 +333,21 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
             store.update_run(run_id, status="paused", paused_reason=str(exc))
             store.append_event(run_id, "run_paused", str(exc)[:400], unit_id=unit["id"],
                                level="warning")
+            return "failed"
+        # An input-size violation is a property of the file, not of the attempt: the same
+        # source produces the same length every time, so all three attempts fail identically
+        # while the model is never even called. Fail it once and say so.
+        if isinstance(exc, guardrail_service.GuardrailViolation):
+            logger.warning("Unit %s is too large to convert: %s", path, exc)
+            store.fail_unit(unit["id"], run_id, f"Too large to convert in one call: {exc}",
+                            terminal=True)
+            store.create_checkpoint(
+                run_id, "oversize", f"{path} is too large to convert in one call",
+                detail=(f"{exc} This file has to be split before it can be converted. "
+                        f"Nothing was spent on it — the limit is checked before the model "
+                        f"is called."),
+                unit_id=unit["id"], blocking=False,
+            )
             return "failed"
         logger.exception("Conversion failed for %s in run %s", path, run_id)
         status = store.fail_unit(unit["id"], run_id, f"{type(exc).__name__}: {exc}",
@@ -338,9 +383,9 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         return "failed"
 
     symbols = result.get("symbols_exported") or []
-    known = {s["name"] for s in store.list_symbols(run_id)} | {
-        s.get("name", "") for s in symbols
-    }
+    # `symbol_names`, not `list_symbols`: the latter is a paged display query whose 2000-row
+    # default silently turned this set into an alphabetical prefix on any real codebase.
+    known = store.symbol_names(run_id) | {s.get("name", "") for s in symbols}
     report = validation.validate_unit_output(safe_artifacts, result.get("references") or [], known)
 
     if report["status"] == "fail":
@@ -372,7 +417,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     store.complete_unit(
         unit_id=unit["id"], run_id=run_id,
         artifacts=safe_artifacts, symbols=symbols, validation=report,
-        needs_human_review=needs_review,
+        needs_human_review=needs_review, cost_usd=cost,
         event_detail=(
             f"{path} -> {len(safe_artifacts)} file(s), {len(symbols)} symbol(s), "
             f"validation={report['status']}, confidence={result.get('confidence', '?')}"
