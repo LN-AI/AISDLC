@@ -53,6 +53,12 @@ class UnitFacts:
     exports: List[Symbol] = field(default_factory=list)
     confidence: float = 1.0
     source: str = "parser"       # parser | heuristic | default — recorded on the unit row
+    # Language-specific findings that are not edges and not declarations: which superglobals
+    # a PHP file reads and under which keys, where its SQL is built by concatenation, which
+    # regions are inline HTML. `graph.build` merges this into the unit's `meta_json`, and it
+    # reaches the converter in the *message* for the unit that owns it — never the system
+    # block, since it differs per unit and would cost the prompt cache on every call.
+    meta: Dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -65,6 +71,7 @@ class UnitFacts:
                         for s in self.exports],
             "classification_confidence": self.confidence,
             "classification_source": self.source,
+            "meta": dict(self.meta),
         }
 
 
@@ -109,6 +116,9 @@ def languages_seen(facts: List[UnitFacts]) -> Dict[str, int]:
 
 
 # Importing the analyzers registers them. Kept at the bottom so `register` exists first.
+# Import order is alphabetical and `register` is last-write-wins, so an analyzer claiming an
+# extension another already owns silently takes it. `php` deliberately does not register
+# `.inc`, which `pascal` owns — see the note at the top of php.py.
 from backend.services.modernization.analyzers import (  # noqa: E402,F401
-    dotnet, generic, java, pascal, python,
+    dotnet, generic, java, pascal, php, python,
 )

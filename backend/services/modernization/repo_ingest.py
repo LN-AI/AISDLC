@@ -116,6 +116,19 @@ _REDACTION_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
         r"\s*(?::=|=|:)\s*['\"](?P<value>[^'\"\r\n]{8,})['\"]")),
     ("connection_string", re.compile(
         r"(?i)\b(?:pwd|password)\s*=\s*(?P<value>[^;'\"\r\n]{4,}?)(?=\s*(?:;|$))")),
+    # Positional credentials in a connect call. Nothing above catches these, because the
+    # secret is identified by its *argument position* rather than by a key next to it —
+    # and `mysqli_connect('localhost', 'root', 'hunter2', 'shop')` is the single most common
+    # place a credential lives in a legacy PHP codebase. Third argument only; host, user and
+    # database name are not secrets and removing them would break the conversion.
+    ("db_connect_password", re.compile(
+        r"""(?ix) \b (?: mysqli?_connect | mysqli_real_connect | pg_connect | oci_connect
+                       | new \s+ mysqli )
+            \s* \( \s*
+            (['"])[^'"\r\n]{0,120}\1 \s*, \s*      # host
+            (['"])[^'"\r\n]{0,120}\2 \s*, \s*      # user
+            (['"])(?P<value>[^'"\r\n]{4,})\3       # password
+        """)),
 ]
 
 REDACTION_PLACEHOLDER = "__REDACTED_{category}__"

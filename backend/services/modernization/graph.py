@@ -182,7 +182,12 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
             # Everything the graph knows but the scheduler doesn't need travels in `meta`,
             # so `depends_on` stays exactly "what must be converted before this" and can be
             # read literally by the readiness check.
+            #
+            # The analyzer's own findings go in first and the graph's four keys overwrite
+            # them, so an analyzer cannot shadow `in_cycle_with` or `depends_on`'s companions
+            # by returning a key of the same name.
             unit["meta"] = {
+                **(unit.pop("meta", None) or {}),
                 "provides": unit.pop("provides", []),
                 "requires": unit.pop("requires", []),
                 "in_cycle_with": sorted(member_set - {path}),

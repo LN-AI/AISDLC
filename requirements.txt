@@ -18,3 +18,20 @@ headroom-ai>=0.1.0
 # a Rust+MSVC toolchain fails. 1.91.x is pure-Python and satisfies headroom-ai's
 # own requirement (litellm<2.0,>=1.86.2).
 litellm<1.92.0
+
+# Real PHP parsing for the modernization analyzers. Both ship prebuilt win_amd64 wheels, so
+# unlike the litellm case above there is no MSVC/Rust toolchain requirement — but they are
+# still binary wheels, and a Python version with no published wheel would fall back to an
+# sdist and try to compile C. Two mitigations, both deliberate:
+#
+#   * upper bounds, because `tree_sitter.Language()` changed signature at 0.22 (path+name ->
+#     PyCapsule) and `tree_sitter_php` renamed its getter (`language` -> `language_php`).
+#     `analyzers/php.py` probes for both rather than assuming either, but a major version is
+#     still where that probe would run out of options.
+#   * `analyzers/php.py` fails open: if the import or the grammar load fails for any reason
+#     it logs once and uses a regex analyzer that finds fewer edges but still finds them.
+#     A missing wheel degrades precision, never availability — and the smoke suite runs the
+#     PHP assertions twice, once with the parser forced off, so that path is exercised
+#     rather than merely intended.
+tree-sitter>=0.23,<0.26
+tree-sitter-php>=0.23,<0.25

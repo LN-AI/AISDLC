@@ -232,12 +232,14 @@ class UnitConverterAgent(BaseAgent):
         addendum: str = "",
         placement: Optional[Dict[str, Any]] = None,
         members: Optional[List[Dict[str, Any]]] = None,
+        source_facts: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         user_content = _build_user_message(
             source=source, path=path, dependency_symbols=dependency_symbols or [],
             module_type=module_type, language=language,
             in_cycle_with=in_cycle_with or [], redactions=redactions or [],
             placement=placement or {}, members=members or [],
+            source_facts=source_facts or [],
         )
         result = llm_gateway.call_tool(
             self.system_for(charter, addendum), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
@@ -245,6 +247,95 @@ class UnitConverterAgent(BaseAgent):
         )
         result["agent_name"] = self.agent_name
         return result
+
+
+def _render_language_facts(source_facts: List[Dict[str, Any]]) -> str:
+    """What the parser observed in *these* source files.
+
+    In the message, never the system block: it differs per unit, and anything that differs
+    per unit sitting in the cached prefix costs full price on every call in the run (D-06).
+
+    This is the difference between a converter that knows `$_GET['id']` is an integer route
+    parameter and one that sees a dictionary lookup and writes a dictionary lookup.
+    """
+    lines: List[str] = []
+    hazards_seen: List[str] = []
+    for entry in source_facts:
+        facts = entry.get("facts") or {}
+        if not facts:
+            continue
+        path = entry.get("path") or ""
+        detail: List[str] = []
+
+        superglobals = facts.get("superglobals") or {}
+        if superglobals:
+            rendered = "; ".join(
+                f"`{name}`" + (f" keys: {', '.join('`' + k + '`' for k in info['keys'][:12])}"
+                               if info.get("keys") else f" ({info['count']}x)")
+                for name, info in sorted(superglobals.items()))
+            detail.append(f"- Request/session state read: {rendered}")
+
+        sites = facts.get("db_sites") or []
+        if sites:
+            apis = ", ".join(facts.get("db_apis") or [])
+            interpolated = [s for s in sites if s.get("interpolated")]
+            detail.append(f"- Data access via {apis} at {len(sites)} site(s)"
+                          + (f", {len(interpolated)} of which build SQL by concatenation "
+                             f"(these are injections as well as mappings)" if interpolated else ""))
+            for site in sites[:6]:
+                if site.get("sql"):
+                    detail.append(f"    - line {site['line']}: `{site['sql'][:160]}`")
+        if facts.get("tables"):
+            detail.append("- Tables named in SQL: "
+                          + ", ".join(f"`{t}`" for t in facts["tables"][:20]))
+
+        shape = []
+        if facts.get("has_html_document"):
+            shape.append("emits a complete HTML document (this is a page, not a fragment)")
+        elif float(facts.get("html_ratio") or 0) > 0.3:
+            shape.append(f"{int(float(facts['html_ratio']) * 100)}% inline HTML "
+                         f"(a presentation fragment)")
+        if facts.get("redirects"):
+            shape.append("issues a redirect — that path returns a redirect result, not a view")
+        if facts.get("emits_json"):
+            shape.append("returns JSON — an API endpoint, with no view")
+        if facts.get("starts_session"):
+            shape.append("calls session_start(); session is configured once in the host, "
+                         "never per file")
+        if facts.get("handles_uploads"):
+            shape.append("handles file uploads")
+        if shape:
+            detail.append("- Shape: " + "; ".join(shape))
+
+        for hazard in facts.get("hazards") or []:
+            hazards_seen.append(f"`{hazard['kind']}` at {path}:{hazard['line']}")
+
+        if detail:
+            lines.append(f"**`{path}`**")
+            lines.extend(detail)
+            lines.append("")
+
+    if not lines and not hazards_seen:
+        return ""
+
+    parts = ["\n## What the parser found in this source", "",
+             "Observed before conversion, with line numbers. Use it — it is the difference "
+             "between binding a typed parameter and copying a dictionary lookup.", ""]
+    parts.extend(lines)
+
+    if hazards_seen:
+        parts.extend([
+            "### Constructs you must NOT translate", "",
+            "\n".join(f"- {h}" for h in hazards_seen[:25]),
+            "",
+            "For each one: emit a comment at that exact location beginning "
+            "`// MIGRATION-BLOCKED:` naming the construct, leave the behaviour "
+            "**unimplemented**, add it to `manual_followup`, and set `needs_human_review`. "
+            "The run rejects output that resolved one of these silently. A reported `eval` is "
+            "a useful result; an `eval` turned into a `switch` covering the cases you could "
+            "see is a behaviour change nobody will find.",
+        ])
+    return "\n".join(parts)
 
 
 def _build_user_message(
@@ -257,6 +348,7 @@ def _build_user_message(
     redactions: List[Dict[str, Any]],
     placement: Optional[Dict[str, Any]] = None,
     members: Optional[List[Dict[str, Any]]] = None,
+    source_facts: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Everything that varies per unit. Kept out of the system prompt so it cannot
     invalidate the cached prefix."""
@@ -337,6 +429,10 @@ def _build_user_message(
               "have, list them in `references`, and note it in `manual_followup`. Do not invent "
               "their contents."
         )
+
+    language_facts = _render_language_facts(source_facts or [])
+    if language_facts:
+        parts.append(language_facts)
 
     if redactions:
         categories = sorted({r.get("category", "secret") for r in redactions})

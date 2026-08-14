@@ -26,7 +26,7 @@ import ast
 import logging
 import os
 import re
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from backend.services import guardrail_service
 
@@ -212,6 +212,56 @@ def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
     return {"path": path, "status": status, "issues": issues}
 
 
+BLOCKED_MARKER = "MIGRATION-BLOCKED"
+
+# Which observed hazards actually block. Not every hazard is one: `removed_mysql_ext` and
+# `weak_password_hash` are real findings but they *do* have correct target equivalents, so
+# demanding a marker for them would fail honest conversions. These six have no safe
+# mechanical translation at all — the correct output is a gap and a note.
+BLOCKING_HAZARDS = frozenset({
+    "eval", "variable_variable", "variable_include", "extract",
+    "unserialize_request", "shell_exec",
+})
+
+
+def check_blocked_hazards(artifacts: List[Dict[str, Any]], hazard_kinds: List[str],
+                          manual_followup: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """The third and only enforced layer of the hazard rule.
+
+    The source of this unit contained something with no safe mechanical equivalent — an
+    `eval`, a variable variable, a dynamic include. The converter was told to leave a
+    `// MIGRATION-BLOCKED:` marker and not implement it. If the output contains neither the
+    marker nor a `manual_followup` entry, the model resolved it silently, which is the
+    outcome the whole rule exists to prevent: an `eval` helpfully turned into a `switch` over
+    the three cases visible in the file looks converted, passes review, and quietly drops
+    every case that was not visible.
+
+    A `fail` rather than a `warn`, and deliberately: a warning here is indistinguishable from
+    the noise every large run produces, and this is the one class of silent behaviour change
+    that no later stage can detect.
+    """
+    # Filtered here rather than by the caller, so a second call site cannot forget to and
+    # start failing honest conversions of a `mysql_*` call that has a perfectly good target.
+    hazard_kinds = sorted(set(hazard_kinds or []) & BLOCKING_HAZARDS)
+    if not hazard_kinds:
+        return []
+    blob = "\n".join(a.get("content") or "" for a in artifacts)
+    followup = " ".join(str(x) for x in (manual_followup or []))
+    if BLOCKED_MARKER in blob:
+        return []
+    if BLOCKED_MARKER.lower() in followup.lower() or any(
+            kind.replace("_", " ") in followup.lower() or kind in followup.lower()
+            for kind in hazard_kinds):
+        return []
+    return [{
+        "severity": "fail", "check": "blocked_hazard",
+        "detail": (f"The source contained {', '.join(sorted(set(hazard_kinds)))}, which has no "
+                   f"safe equivalent in the target — but the output contains no "
+                   f"`// {BLOCKED_MARKER}:` marker and nothing in `manual_followup` mentions "
+                   f"it. Either it was translated silently, or it was dropped silently."),
+    }]
+
+
 def check_symbols(references: Iterable[Dict[str, Any]], known: Set[str],
                   allow_external: bool = True) -> List[Dict[str, str]]:
     """Cross-file coherence: did this unit reference something no unit has emitted?
@@ -248,6 +298,8 @@ def validate_unit_output(
     artifacts: List[Dict[str, Any]],
     references: Iterable[Dict[str, Any]],
     known_symbols: Set[str],
+    hazard_kinds: Optional[List[str]] = None,
+    manual_followup: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Everything Tier 0 has to say about one converted unit.
 
@@ -262,6 +314,7 @@ def validate_unit_output(
         for issue in report["issues"]:
             issues.append({**issue, "path": report["path"]})
     issues.extend(check_symbols(references, known_symbols))
+    issues.extend(check_blocked_hazards(artifacts, hazard_kinds or [], manual_followup))
 
     failed = [i for i in issues if i["severity"] == "fail"]
     status = "fail" if failed else ("warn" if issues else "pass")

@@ -35,7 +35,7 @@ from backend.agents.modernization_intelligence.unit_converter import UnitConvert
 from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
-    analyzers, architecture, comprehension, estimate, evidence, graph, reconcile,
+    analyzers, architecture, comprehension, estimate, evidence, graph, playbooks, reconcile,
     repo_ingest, scaffold, stages, store, validation,
 )
 
@@ -642,29 +642,33 @@ def _component_members(run_id: str, component_path: str) -> List[str]:
 
 def _unit_source(run_id: str, unit: Dict[str, Any],
                  meta: Dict[str, Any]) -> tuple:
-    """-> (members, single_source, redactions) for whatever kind of unit this is.
+    """-> (members, single_source, redactions, language_facts) for this kind of unit.
 
     A component row holds no source of its own — its members do, and they were rolled up
     when the plan was approved. Their text is fetched here rather than duplicated onto the
     component row, so there is exactly one copy of any source file in the database.
     """
     if unit.get("kind") != "component":
-        return [], unit.get("source_text") or "", meta.get("redactions") or []
+        facts = [{"path": unit["path"], "facts": meta.get("php") or {}}]
+        return [], unit.get("source_text") or "", meta.get("redactions") or [], facts
 
     wanted = meta.get("members") or []
     if not wanted:
-        return [], "", []
+        return [], "", [], []
     by_path = {u["path"]: u for u in store.list_units(run_id, kind="source_file",
                                                       include_source=True)}
-    members, redactions = [], []
+    members, redactions, facts = [], [], []
     for path in wanted:
         member = by_path.get(path)
         if not member:
             continue
         members.append({"path": path, "source_text": member.get("source_text") or ""})
-        redactions.extend((member.get("meta") or {}).get("redactions") or [])
+        member_meta = member.get("meta") or {}
+        redactions.extend(member_meta.get("redactions") or [])
+        if member_meta.get("php"):
+            facts.append({"path": path, "facts": member_meta["php"]})
     single = members[0]["source_text"] if len(members) == 1 else ""
-    return members, single, redactions
+    return members, single, redactions, facts
 
 
 def _place_artifacts(run_id: str, unit: Dict[str, Any],
@@ -760,7 +764,8 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     # which is what makes them one prompt-cache write instead of one per file (D-06).
     digest = comprehension.render_digest(run_id, run.get("stats") or {})
     conventions = (design_meta.get("shared_conventions") or "").strip()
-    addendum_parts = [p for p in (digest, _render_conventions(conventions, plan)) if p]
+    addendum_parts = [p for p in (digest, _render_conventions(conventions, plan),
+                                  _render_playbook(run_id, run)) if p]
     store.update_run(run_id, system_addendum="\n\n".join(addendum_parts))
 
     files = store.unit_status_counts(run_id)["total"]
@@ -781,6 +786,28 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
                        f"{len(components)} component(s), est ${totals['expected_usd']:.2f}, "
                        f"ceiling ${totals['ceiling_usd']:.2f}")
     return plan
+
+
+def _render_playbook(run_id: str, run: Dict[str, Any]) -> str:
+    """The language-pair mapping corpus, scoped to what this codebase actually contains.
+
+    Selected once and frozen here, not recomputed per unit: it is part of the cached prefix,
+    so a section list that changed as the run learned things would invalidate it. A codebase
+    with no `mysql_*` call never ships the data-access section — which is why scoping is
+    worth doing at all rather than sending the whole corpus every time.
+    """
+    units = store.list_units(run_id, kind="source_file")
+    facts = playbooks.aggregate_facts(units)
+    languages = (run.get("stats") or {}).get("languages") or {}
+    source_language = run.get("source_language") or (
+        max(languages, key=languages.get) if languages else "")
+    playbook = playbooks.find(source_language, run.get("target_stack") or "")
+    if playbook is None:
+        return ""
+    keys = playbooks.select(playbook, facts)
+    store.append_event(run_id, "playbook_selected",
+                       f"{playbook.source} -> {playbook.target}: {', '.join(keys)}")
+    return playbooks.render(playbook, keys)
 
 
 def _render_conventions(conventions: str, plan: Dict[str, Any]) -> str:
@@ -847,7 +874,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         (unit.get("depends_on") or []) + (meta.get("in_cycle_with") or [])
     ))
 
-    members, source, redactions = _unit_source(run_id, unit, meta)
+    members, source, redactions, source_facts = _unit_source(run_id, unit, meta)
     # A component depends on other *components*, so its context is the symbols exported by
     # those — and additionally by the source files those components absorbed, since the
     # registry is keyed on whichever unit declared them.
@@ -885,6 +912,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                 addendum=addendum,
                 placement=placement,
                 members=members,
+                source_facts=source_facts,
             ),
         )
     except Exception as exc:
@@ -951,7 +979,14 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     # `symbol_names`, not `list_symbols`: the latter is a paged display query whose 2000-row
     # default silently turned this set into an alphabetical prefix on any real codebase.
     known = store.symbol_names(run_id) | {s.get("name", "") for s in symbols}
-    report = validation.validate_unit_output(safe_artifacts, result.get("references") or [], known)
+    hazard_kinds = sorted({kind
+                           for entry in source_facts
+                           for kind in ((entry.get("facts") or {}).get("hazard_kinds") or [])
+                           if kind in validation.BLOCKING_HAZARDS})
+    report = validation.validate_unit_output(
+        safe_artifacts, result.get("references") or [], known,
+        hazard_kinds=hazard_kinds, manual_followup=result.get("manual_followup") or [],
+    )
 
     if report["status"] == "fail":
         detail = "; ".join(i["detail"] for i in report["issues"] if i["severity"] == "fail")[:400]

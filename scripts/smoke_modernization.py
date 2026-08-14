@@ -38,7 +38,7 @@ from backend.products import registry  # noqa: E402
 from backend.services import agent_guard, code_chunker, llm_gateway  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
-    analyzers, charter, graph, repo_ingest, runner, store, validation,
+    analyzers, charter, evidence, graph, repo_ingest, runner, store, validation,
 )
 
 database.init_db()
@@ -1023,6 +1023,206 @@ try:
                       headers=HDR).status_code == 409)
 finally:
     llm_gateway.call_tool = _real_call_tool
+
+
+# ── 16. PHP: the language pack ─────────────────────────────────────────────
+section("16. PHP — edges, facts, hazards, and the fail-open path")
+
+from backend.services.modernization import playbooks                      # noqa: E402
+from backend.services.modernization.analyzers import php                  # noqa: E402
+
+# A legacy PHP shop, small enough to read and shaped like the real thing: include-based
+# layout, mysqli with concatenated SQL, $_SESSION auth, a circular include between two
+# domain classes, an .htaccess routing table, and one file full of things that must not be
+# converted at all.
+PHP_FIXTURE = [
+    {"path": "public/.htaccess", "content":
+        "RewriteEngine On\n"
+        "RewriteRule ^products/([0-9]+)$ product.php?id=$1 [L]\n"
+        "DirectoryIndex index.php\n"},
+    {"path": "public/index.php", "content":
+        "<?php require_once __DIR__ . '/../lib/db.php';\n"
+        "include 'header.php';\n"
+        "$rows = mysqli_query($conn, \"SELECT id, name FROM products ORDER BY name\");\n"
+        "?>\n<html><body><h1>Products</h1>\n"
+        "<?php while ($r = mysqli_fetch_assoc($rows)) { echo '<li>' . $r['name'] . '</li>'; } ?>\n"
+        "</body></html>\n<?php include 'footer.php'; ?>\n"},
+    {"path": "public/product.php", "content":
+        "<?php require_once __DIR__ . '/../lib/db.php';\n"
+        "require_once __DIR__ . '/../lib/Cart.php';\n"
+        "include 'header.php';\n"
+        "$sql = \"SELECT * FROM products WHERE id = \" . $_GET['id'];\n"
+        "$row = mysqli_fetch_assoc(mysqli_query($conn, $sql));\n"
+        "if (!$row) { header('Location: /index.php'); die(); }\n"
+        "$cart = new Cart($_SESSION['user_id']);\n"
+        "?>\n<div><?= $row['name'] ?></div>\n<?php include 'footer.php'; ?>\n"},
+    {"path": "public/header.php", "content":
+        "<?php session_start(); ?>\n<!DOCTYPE html><html><head><title>Shop</title></head><body>\n"},
+    {"path": "public/footer.php", "content": "<footer>&copy; 2004</footer></body></html>\n"},
+    {"path": "lib/db.php", "content":
+        "<?php\n$conn = mysqli_connect('localhost', 'root', 'hunter2hunter2', 'shop');\n"
+        "function q($sql) { global $conn; return mysqli_query($conn, $sql); }\n"
+        "define('DB_NAME', 'shop');\n"},
+    {"path": "lib/Cart.php", "content":
+        "<?php\nnamespace Shop\\Domain;\nrequire_once __DIR__ . '/Item.php';\n"
+        "class Cart extends Base implements \\Countable {\n"
+        "  public function add(Item $i) { $_SESSION['cart'][] = $i; }\n}\n"},
+    {"path": "lib/Item.php", "content":
+        "<?php\nnamespace Shop\\Domain;\nrequire_once __DIR__ . '/Cart.php';\n"
+        "class Item { public static function sum($xs) { return count($xs); } }\n"},
+    {"path": "admin/run.php", "content":
+        "<?php\n$page = $_GET['page'];\ninclude $page . '.php';\n"
+        "eval($_POST['code']);\nexec('ls ' . $_GET['dir']);\n"},
+]
+
+php_ingest = repo_ingest.normalize_files(PHP_FIXTURE)
+php_paths = [f["path"] for f in php_ingest["files"]]
+check("PHP files are ingested", "public/index.php" in php_paths)
+# The file with no extension at all, carrying the app's entire routing table.
+check(".htaccess is ingested despite having no extension", "public/.htaccess" in php_paths,
+      str(php_paths))
+check("a positional connect-call password is redacted",
+      any(r["category"] == "db_connect_password" for r in php_ingest["redactions"]),
+      str([r["category"] for r in php_ingest["redactions"]]))
+check("the password value itself is gone from the stored source",
+      all("hunter2hunter2" not in f["content"] for f in php_ingest["files"]))
+check("but the connect call survives, so the conversion still has a config site",
+      any("mysqli_connect" in f["content"] for f in php_ingest["files"]))
+
+check("the .inc extension still belongs to Delphi, not PHP",
+      analyzers.analyze_file("u.inc", "unit U; interface uses SysUtils;").language
+      == "Delphi/Pascal")
+
+
+def php_facts_for(engine_available):
+    """Analyze the fixture with tree-sitter, then again with the parser forced off.
+
+    The second pass is the whole point of a fail-open design: a fallback nobody exercises is
+    a fallback that does not work. Two binary wheels are exactly the dependency most likely
+    to be missing on somebody's machine.
+    """
+    saved = php._PARSER
+    if not engine_available:
+        php._PARSER = None
+    try:
+        return {f.path: f for f in analyzers.discover(php_ingest["files"])}
+    finally:
+        php._PARSER = saved
+
+
+for engine, label in ((True, "tree-sitter"), (False, "regex fallback")):
+    if engine and not php.parser_available():
+        continue
+    facts = php_facts_for(engine)
+    index = facts["public/index.php"]
+    cart = facts["lib/Cart.php"]
+    admin = facts["admin/run.php"]
+
+    check(f"[{label}] include edges are found — this is what was completely missing",
+          "lib/db.php" in index.requires and "public/header.php" in index.requires,
+          str(index.requires))
+    check(f"[{label}] a file provides its own path, so an include can resolve to it",
+          "lib/db.php" in facts["lib/db.php"].provides)
+    check(f"[{label}] namespaced classes are declared under every spelling",
+          {"Cart", "Shop\\Domain\\Cart"} <= set(cart.provides), str(cart.provides))
+    check(f"[{label}] extends and implements become requirements",
+          "Base" in cart.requires and "Countable" in cart.requires, str(cart.requires))
+    check(f"[{label}] functions and defines are exported",
+          {("function", "q"), ("constant", "DB_NAME")}
+          <= {(s.kind, s.name) for s in facts["lib/db.php"].exports})
+    check(f"[{label}] a dynamic include produces NO edge — a guessed edge corrupts the order",
+          not any(r.endswith(".php") for r in admin.requires), str(admin.requires))
+    check(f"[{label}] but it is recorded as a hazard instead",
+          "variable_include" in (admin.meta["php"].get("hazard_kinds") or []))
+    check(f"[{label}] __DIR__ . '/x.php' is NOT a dynamic include",
+          "variable_include" not in (index.meta["php"].get("hazard_kinds") or []),
+          str(index.meta["php"].get("hazard_kinds")))
+    check(f"[{label}] superglobal keys are captured, not just their presence",
+          facts["public/product.php"].meta["php"]["superglobals"]["$_GET"]["keys"] == ["id"],
+          str(facts["public/product.php"].meta["php"].get("superglobals")))
+    check(f"[{label}] concatenated SQL is flagged as both a mapping and an injection",
+          any(s.get("interpolated") for s in
+              facts["public/product.php"].meta["php"].get("db_sites") or []),
+          str(facts["public/product.php"].meta["php"].get("db_sites")))
+    check(f"[{label}] tables are lifted out of the SQL",
+          "products" in (index.meta["php"].get("tables") or []))
+    check(f"[{label}] a page that emits a document is UI, even though it queries",
+          index.module_type == "ui", index.module_type)
+    check(f"[{label}] a class file is business, not unknown",
+          facts["lib/Item.php"].module_type == "business")
+    check(f"[{label}] a redirect is recorded — that path returns no view",
+          facts["public/product.php"].meta["php"].get("redirects") == 1)
+    check(f"[{label}] session_start is recorded on the file that calls it",
+          facts["public/header.php"].meta["php"].get("starts_session") is True)
+    check(f"[{label}] eval and shell-out are hazards",
+          {"eval", "shell_exec"} <= set(admin.meta["php"].get("hazard_kinds") or []))
+    check(f"[{label}] the engine that ran is recorded",
+          index.source == ("parser" if engine else "heuristic"), index.source)
+
+    php_graph = graph.build(list(facts.values()))
+    check(f"[{label}] the graph is no longer flat — PHP used to produce zero edges",
+          php_graph["stats"]["edges"] >= 6, str(php_graph["stats"]))
+    check(f"[{label}] the circular include between two domain classes is detected",
+          php_graph["stats"]["cycles"] == 1, str(php_graph["stats"]["cycles"]))
+    check(f"[{label}] db.php converts before the page that includes it",
+          [u["path"] for u in php_graph["units"]].index("lib/db.php")
+          < [u["path"] for u in php_graph["units"]].index("public/index.php"))
+    check(f"[{label}] analyzer output is deterministic",
+          [u["path"] for u in graph.build(list(php_facts_for(engine).values()))["units"]]
+          == [u["path"] for u in php_graph["units"]])
+
+# Evidence, and the promise that it never carries a secret.
+php_units = graph.build(list(php_facts_for(php.parser_available()).values()))["units"]
+rows = evidence.collect(php_ingest["files"], php_units)
+kinds = {r["kind"] for r in rows}
+check("evidence records the routing table from .htaccess", "route" in kinds, str(sorted(kinds)))
+check("evidence records the persistence API in use",
+      any(r["kind"] == "datastore" and "mysqli" in r["value"] for r in rows))
+check("evidence records the config keys redaction created", "config_key" in kinds)
+check("every evidence row cites a line",
+      all(r["line"] >= 1 for r in rows if r["kind"] not in ("entrypoint",)))
+check("no evidence row or snippet carries a redacted value",
+      not any("hunter2hunter2" in (r["value"] + (r["snippet"] or "")) for r in rows))
+check("evidence extraction is deterministic",
+      [(r["kind"], r["path"], r["value"], r["line"]) for r in rows]
+      == [(r["kind"], r["path"], r["value"], r["line"])
+          for r in evidence.collect(php_ingest["files"], php_units)])
+
+# The playbook: in the system prompt, scoped to what the run contains, byte-stable.
+book = playbooks.find("PHP", ".NET 8 / ASP.NET Core")
+check("a PHP -> .NET playbook is registered", book is not None)
+aggregate = playbooks.aggregate_facts([{"language": "PHP", "meta": u["meta"]} for u in php_units])
+keys = playbooks.select(book, aggregate)
+check("the playbook includes the sections this codebase needs",
+      {"core", "superglobals", "sessions", "data", "presentation", "hazards"} <= set(keys),
+      str(keys))
+empty_keys = playbooks.select(book, playbooks.aggregate_facts([]))
+check("a codebase with no data access does not ship the EF section",
+      "data" not in empty_keys and "core" in empty_keys, str(empty_keys))
+check("rendering is byte-identical regardless of the order keys arrive in",
+      playbooks.render(book, keys) == playbooks.render(book, list(reversed(keys))))
+check("the playbook warns about the false-y sentinel, which is the trap that compiles",
+      "strpos" in playbooks.render(book, keys))
+
+# The hazard rule is enforced, not decorative.
+blocked = validation.validate_unit_output(
+    [{"path": "X.cs", "content": "public class X { void Run() { Eval(); } }"}],
+    [], set(), hazard_kinds=["eval"], manual_followup=[])
+check("output that silently resolved a blocked hazard FAILS validation",
+      blocked["status"] == "fail" and "blocked_hazard" in blocked["failed_checks"],
+      str(blocked["failed_checks"]))
+allowed = validation.validate_unit_output(
+    [{"path": "X.cs", "content": "public class X { /* MIGRATION-BLOCKED: eval() */ }"}],
+    [], set(), hazard_kinds=["eval"], manual_followup=[])
+check("output that marked it is accepted", allowed["status"] != "fail", str(allowed["issues"]))
+noted = validation.validate_unit_output(
+    [{"path": "X.cs", "content": "public class X { }"}],
+    [], set(), hazard_kinds=["eval"], manual_followup=["the eval at line 4 needs a human"])
+check("naming it in manual_followup is also accepted", noted["status"] != "fail")
+check("a hazard with a real target equivalent does not demand a marker",
+      validation.validate_unit_output(
+          [{"path": "X.cs", "content": "public class X { }"}], [], set(),
+          hazard_kinds=["removed_mysql_ext"])["status"] != "fail")
 
 
 # ── Summary ────────────────────────────────────────────────────────────────
