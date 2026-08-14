@@ -1601,11 +1601,32 @@ button.not-entitled::after {
   font-size: 11px; padding: 3px 8px; border-radius: 4px; text-transform: uppercase;
   letter-spacing: .04em; border: 1px solid var(--border); background: var(--surface2);
 }
-.mod-status.converting { border-color: var(--accent); color: var(--accent); }
+.mod-status.converting,
+.mod-status.comprehending,
+.mod-status.analyzing,
+.mod-status.reconciling { border-color: var(--accent); color: var(--accent); }
 .mod-status.completed  { border-color: #16a34a; color: #16a34a; }
+.mod-status.rolled_up  { border-color: var(--border); color: var(--text-muted); }
 .mod-status.paused     { border-color: #d97706; color: #d97706; }
 .mod-status.failed,
 .mod-status.cancelled  { border-color: #dc2626; color: #dc2626; }
+
+/* The stage strip. A run spends minutes in `analyzing` and the status alone cannot tell a
+   thinking run from a stuck one. */
+.mod-stages {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 12px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+}
+.mod-stage {
+  padding: 3px 9px; border-radius: 4px; border: 1px solid var(--border);
+  color: var(--text-muted); background: var(--surface2);
+}
+.mod-stage.done   { border-color: #16a34a; color: #16a34a; }
+.mod-stage.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.mod-stage-label {
+  text-transform: none; letter-spacing: normal; color: var(--text-muted);
+  font-size: 12px; margin-left: 4px;
+}
 .mod-bar {
   height: 6px; border-radius: 3px; background: var(--surface2);
   overflow: hidden; margin-top: 10px;

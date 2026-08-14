@@ -905,6 +905,10 @@ for expected in (
     "/api/v1/modernization/runs/{run_id}/units",
     "/api/v1/modernization/runs/{run_id}/export",
     "/api/v1/modernization/runs/{run_id}/redactions",
+    "/api/v1/modernization/runs/{run_id}/components",
+    "/api/v1/modernization/runs/{run_id}/evidence",
+    "/api/v1/modernization/runs/{run_id}/plan",
+    "/api/v1/modernization/runs/{run_id}/reconciliation",
     "/api/v1/modernization/checkpoints/{checkpoint_id}/answer",
     "/api/v1/modernization/charter-fields",
 ):
@@ -977,6 +981,16 @@ check("units come back in dependency order",
       str([u["path"] for u in units_resp["units"]]))
 check("source text never rides along on the unit list",
       all("source_text" not in u for u in units_resp["units"]))
+
+ev = client.get(f"/api/v1/modernization/runs/{api_run_id}/evidence", headers=HDR).json()
+check("evidence is readable before anything has been spent", "counts_by_kind" in ev, str(ev)[:160])
+check("a plan does not exist before the architecture is designed",
+      client.get(f"/api/v1/modernization/runs/{api_run_id}/plan", headers=HDR).status_code == 404)
+comps = client.get(f"/api/v1/modernization/runs/{api_run_id}/components", headers=HDR).json()
+check("the components endpoint answers with nothing yet", comps["count"] == 0, str(comps)[:160])
+check("reconciliation over an empty run reports no issues",
+      client.get(f"/api/v1/modernization/runs/{api_run_id}/reconciliation",
+                 headers=HDR).json()["counts"]["fail"] == 0)
 
 check("exporting a run with no output yet is a 404",
       client.get(f"/api/v1/modernization/runs/{api_run_id}/export", headers=HDR).status_code == 404)

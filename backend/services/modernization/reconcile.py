@@ -43,6 +43,14 @@ def run(run_id: str) -> Dict[str, Any]:
     symbols = store.list_symbols(run_id, limit=100000)
     issues: List[Dict[str, Any]] = []
 
+    if not components:
+        # Nothing has been converted, so every check below would be vacuously alarming —
+        # every entry point "uncovered", every interface "unimplemented". A report over a run
+        # that has not run is not a finding, it is a category error.
+        return {"issues": [], "applicable": False,
+                "counts": {"artifacts": len(artifacts), "components": 0,
+                           "symbols": len(symbols), "fail": 0, "warn": 0}}
+
     # 1. Duplicate declarations. `complete_unit` records the collision as it happens; this
     #    is the run-level view, because by the end the registry only remembers the winner.
     conflicts = [e for e in store.list_events(run_id, limit=100000)
@@ -140,6 +148,7 @@ def run(run_id: str) -> Dict[str, Any]:
 
     report = {
         "issues": issues,
+        "applicable": True,
         "counts": {
             "artifacts": len(artifacts),
             "components": len(components),

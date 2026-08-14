@@ -5696,7 +5696,11 @@ async function openModernizationRun(runId) {
   clearInterval(_modPollTimer);
   _modPollTimer = setInterval(async () => {
     const run = await refreshModernizationRun();
-    if (!run || run.status !== 'converting') clearInterval(_modPollTimer);
+    // A run is "working" in several states now, not only `converting` — stopping the poll at
+    // the first non-converting tick would freeze the screen the moment it started thinking.
+    if (!run || !['converting', 'comprehending', 'analyzing', 'reconciling', 'scanning'].includes(run.status)) {
+      clearInterval(_modPollTimer);
+    }
   }, 4000);
 }
 
@@ -5704,11 +5708,19 @@ async function refreshModernizationRun() {
   if (!_modRunId) return null;
   const box = document.getElementById('mod-detail');
   try {
-    const run = await apiFetch(`/api/v1/modernization/runs/${_modRunId}`, { _silent: true });
-    const checkpoints = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/checkpoints?status=open`, { _silent: true });
-    const units = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/units`, { _silent: true });
+    const base = `/api/v1/modernization/runs/${_modRunId}`;
+    const run = await apiFetch(base, { _silent: true });
+    const checkpoints = await apiFetch(`${base}/checkpoints?status=open`, { _silent: true });
+    const units = await apiFetch(`${base}/units`, { _silent: true });
+    // Components only exist once the architecture has been designed; a 404 or an empty list
+    // is the normal state for most of a run's life, not an error worth showing.
+    let components = [];
+    try {
+      components = (await apiFetch(`${base}/components`, { _silent: true })).components || [];
+    } catch (e) { /* not designed yet */ }
     box.classList.remove('hidden');
-    box.innerHTML = renderModernizationRun(run, checkpoints.checkpoints || [], units.units || []);
+    box.innerHTML = renderModernizationRun(run, checkpoints.checkpoints || [],
+                                           units.units || [], components);
     return run;
   } catch (e) {
     box.classList.remove('hidden');
@@ -5717,14 +5729,16 @@ async function refreshModernizationRun() {
   }
 }
 
-function renderModernizationRun(run, checkpoints, units) {
+function renderModernizationRun(run, checkpoints, units, components) {
   const u = run.units || {};
-  const blocking = checkpoints.filter(c => c.blocking);
+  const c = run.components || {};
+  const blocking = checkpoints.filter(x => x.blocking);
   const needsCharter = run.status === 'awaiting_charter';
   const canStart = run.status === 'awaiting_approval' && blocking.length === 0;
   const canResume = run.status === 'paused';
-  const running = run.status === 'converting';
+  const working = ['converting', 'comprehending', 'analyzing', 'reconciling'].includes(run.status);
   const terminal = ['completed', 'cancelled', 'failed'].includes(run.status);
+  const est = run.estimate || {};
 
   return `
     <div class="mod-panel">
@@ -5733,28 +5747,46 @@ function renderModernizationRun(run, checkpoints, units) {
         <span class="mod-status ${esc(run.status)}">${esc(run.status)}</span>
         <span class="compliance-chip">${esc(run.target_stack || '')}</span>
       </div>
+      ${renderModernizationStages(run)}
       <div class="mod-bar"><span style="width:${run.progress_pct || 0}%"></span></div>
       <div class="mod-meta">
-        ${u.converted || 0} of ${u.total || 0} converted
+        ${u.converted || 0} of ${u.total || 0} files converted
+        ${c.total ? ` · ${c.converted || 0} of ${c.total} components` : ''}
         ${u.failed ? ` · ${u.failed} failed` : ''}
-        ${u.blocked ? ` · ${u.blocked} waiting on dependencies` : ''}
+        ${c.blocked ? ` · ${c.blocked} waiting on dependencies` : ''}
         · $${Number(run.spent_usd || 0).toFixed(2)} spent${run.budget_cap_usd ? ' of $' + Number(run.budget_cap_usd).toFixed(2) + ' cap' : ''}
+        ${est.expected_usd !== undefined ? ` · est. $${Number(est.expected_usd).toFixed(2)}, ceiling $${Number(est.ceiling_usd || 0).toFixed(2)}` : ''}
         ${run.redaction_count ? ` · ${run.redaction_count} secret(s) redacted at ingest` : ''}
       </div>
       ${run.paused_reason ? `<div class="mod-alert">${esc(run.paused_reason)}</div>` : ''}
       <div class="form-actions" style="margin-top:12px">
-        ${canStart ? '<button class="btn btn-primary" onclick="startModernizationRun()">Start conversion</button>' : ''}
+        ${canStart ? '<button class="btn btn-primary" onclick="startModernizationRun()">Start</button>' : ''}
         ${canResume ? '<button class="btn btn-primary" onclick="resumeModernizationRun()">Resume</button>' : ''}
-        ${running ? '<button class="btn btn-secondary" onclick="pauseModernizationRun()">Pause</button>' : ''}
+        ${working ? '<button class="btn btn-secondary" onclick="pauseModernizationRun()">Pause</button>' : ''}
         ${u.converted ? '<button class="btn btn-secondary" onclick="exportModernizationRun()">Download converted code</button>' : ''}
+        ${(c.converted || terminal) ? '<button class="btn btn-secondary" onclick="showModernizationReconciliation()">Consistency report</button>' : ''}
         ${terminal ? '' : '<button class="btn btn-link" onclick="cancelModernizationRun()">Cancel run</button>'}
       </div>
     </div>
 
     ${needsCharter ? renderCharterForm(run) : ''}
     ${checkpoints.length ? renderModernizationCheckpoints(checkpoints) : ''}
+    <div id="mod-reconciliation"></div>
+    ${renderModernizationComponents(components)}
     ${renderModernizationUnits(units)}
   `;
+}
+
+function renderModernizationStages(run) {
+  // The stage strip is the answer to "what is it doing" — a status of `analyzing` for ten
+  // minutes is otherwise indistinguishable from a stuck run.
+  const s = run.stage;
+  if (!s) return '';
+  const names = ['Understand', 'Portrait', 'Design', 'Cost', 'Scaffold', 'Convert', 'Reconcile'];
+  return `<div class="mod-stages">
+    ${names.map((n, i) => `<span class="mod-stage ${i < s.index ? 'done' : (i === s.index ? 'active' : '')}">${esc(n)}</span>`).join('')}
+    <span class="mod-stage-label">${esc(s.label)}</span>
+  </div>`;
 }
 
 function renderModernizationCheckpoints(checkpoints) {
@@ -5762,12 +5794,96 @@ function renderModernizationCheckpoints(checkpoints) {
     <div class="section-title" style="margin-top:0">Waiting on you (${checkpoints.length})</div>
     ${checkpoints.map(c => `
       <div class="mod-alert">
-        <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks conversion' : ' — informational'}
-        <div style="margin-top:6px">${esc(c.detail || '')}</div>
-        <button class="btn btn-secondary btn-sm" style="margin-top:8px"
-                onclick="answerModernizationCheckpoint('${esc(c.id)}')">Acknowledge</button>
+        <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks the run' : ' — informational'}
+        <div style="margin-top:6px;white-space:pre-wrap">${esc(c.detail || '')}</div>
+        ${renderCheckpointPayload(c)}
+        <button class="btn ${c.blocking ? 'btn-primary' : 'btn-secondary'} btn-sm" style="margin-top:8px"
+                onclick="answerModernizationCheckpoint('${esc(c.id)}')">${c.blocking ? 'Approve' : 'Acknowledge'}</button>
       </div>`).join('')}
   </div>`;
+}
+
+function renderCheckpointPayload(c) {
+  // A gate whose entire body is prose can only be approved or not. One carrying a table can
+  // be read first, which is the difference between a gate and a speed bump.
+  const p = c.payload;
+  if (!p) return '';
+  if (p.estimate && !p.components) {
+    const e = p.estimate;
+    return `<div class="mod-meta" style="margin-top:8px">
+      ${e.calls} model call(s) · estimated $${Number(e.expected_usd || 0).toFixed(2)} ·
+      ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}${e.price_is_estimated ? ' (indicative rates)' : ''}
+    </div>`;
+  }
+  if (!p.components || !p.components.length) return '';
+  const t = p.totals || {};
+  return `<div style="margin-top:10px">
+    <div class="mod-meta">${p.components.length} component(s) ·
+      estimated $${Number(t.expected_usd || 0).toFixed(2)} ·
+      ceiling $${Number(t.ceiling_usd || 0).toFixed(2)}</div>
+    ${(p.corrections || []).length ? `<div class="mod-meta">${p.corrections.length} correction(s) were applied to the proposed layout.</div>` : ''}
+    <div style="max-height:320px;overflow:auto;margin-top:8px">
+      <table class="mod-unit-table">
+        <thead><tr><th>Component</th><th>Project</th><th>Namespace</th><th>Files</th><th>Risk</th><th>Est.</th></tr></thead>
+        <tbody>${p.components.map(r => `<tr>
+          <td class="mod-unit-path">${esc(r.component)}</td>
+          <td>${esc(r.project || '')}</td>
+          <td class="mod-unit-path">${esc(r.namespace || '')}</td>
+          <td>${r.files}</td>
+          <td><span class="compliance-chip">${esc(r.risk || '')}</span></td>
+          <td>$${Number(r.est_cost_usd || 0).toFixed(3)}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function renderModernizationComponents(components) {
+  if (!components || !components.length) return '';
+  // The view a per-file inventory cannot give: which source files were converted together,
+  // and where the result landed.
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Target architecture (${components.length} components)</div>
+    <p class="subtitle" style="margin-top:-6px">Decided once, before any file was converted. Every converted file lands under its component's directory and declares its namespace — the drift that used to be possible across a long run is now not expressible.</p>
+    <div style="max-height:420px;overflow:auto">
+      <table class="mod-unit-table">
+        <thead><tr><th>Level</th><th>Component</th><th>Project</th><th>Directory</th><th>Files</th><th>Risk</th><th>Status</th></tr></thead>
+        <tbody>${components.map(c => `<tr>
+          <td>${c.topo_level}</td>
+          <td class="mod-unit-path">${esc(c.name)}</td>
+          <td>${esc(c.project || '')}</td>
+          <td class="mod-unit-path">${esc(c.output_dir || '')}</td>
+          <td title="${esc((c.members || []).join(', '))}">${(c.members || []).length}</td>
+          <td><span class="compliance-chip">${esc(c.risk || '')}</span></td>
+          <td><span class="mod-status ${esc(c.status)}">${esc(c.status)}</span>${c.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+async function showModernizationReconciliation() {
+  const box = document.getElementById('mod-reconciliation');
+  if (!box) return;
+  box.innerHTML = '<div class="mod-panel">Checking the converted codebase…</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/reconciliation`, { _silent: true });
+    const counts = r.counts || {};
+    box.innerHTML = `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Cross-file consistency</div>
+      <p class="subtitle" style="margin-top:-6px">Nothing here was compiled. These are the inconsistencies visible across the whole output — the ones no single-file check can see.</p>
+      <div class="mod-meta">${counts.fail || 0} failure(s) · ${counts.warn || 0} warning(s) · ${counts.artifacts || 0} file(s) checked</div>
+      ${(r.issues || []).length
+        ? `<div style="max-height:360px;overflow:auto;margin-top:10px">${r.issues.map(i => `
+            <div class="mod-alert" style="margin-bottom:6px">
+              <span class="compliance-chip">${esc(i.kind.replace(/_/g, ' '))}</span>
+              ${esc(i.detail)}
+            </div>`).join('')}</div>`
+        : '<div class="mod-meta" style="margin-top:10px">No cross-file inconsistencies were found.</div>'}
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="mod-panel">Could not run the consistency check: ${esc(e.message)}</div>`;
+  }
 }
 
 function renderModernizationUnits(units) {

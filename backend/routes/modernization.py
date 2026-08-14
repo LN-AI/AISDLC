@@ -31,7 +31,7 @@ from backend import scope
 from backend.routes.v1_agents import get_caller
 from backend.services import agent_guard
 from backend.services.modernization import charter as charter_module
-from backend.services.modernization import repo_ingest, runner, store
+from backend.services.modernization import reconcile, repo_ingest, runner, stages, store
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +100,21 @@ def _actor(caller: dict) -> str:
 def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
     """The manifest view — the answer to "how far along are we", which the old migration
     product could not answer at all because there was no row to ask."""
-    counts = store.unit_status_counts(run["id"])
+    counts = store.unit_status_counts(run["id"])            # source files: what a human counts
+    components = store.unit_status_counts(run["id"], kind="component")
     checkpoints = store.list_checkpoints(run["id"], "open")
     total = counts["total"] or 1
     settled = counts["converted"] + counts["failed"] + counts["skipped"]
+    stage = stages.get(run.get("phase") or "")
     return {
         **{k: v for k, v in run.items() if k not in ("redactions",)},
         "units": counts,
+        "components": components,
+        # Progress is over *files*, not over rows. A run also contains components, probes and
+        # a scaffold, and "417 of 523" has to keep meaning what a customer thinks it means.
         "progress_pct": round(100.0 * settled / total, 1),
+        "stage": ({"id": stage.id, "label": stage.label, "index": stages.ORDER.index(stage.id),
+                   "total": len(stages.ORDER)} if stage else None),
         "open_checkpoints": len(checkpoints),
         "blocking_checkpoints": sum(1 for c in checkpoints if c.get("blocking")),
         # Count only. The map itself carries paths and line numbers and is available on its
@@ -235,10 +242,79 @@ def get_run(run_id: str, caller: dict = Depends(get_caller)):
 
 
 @router.get("/runs/{run_id}/units", summary="The conversion inventory, in dependency order")
-def list_units(run_id: str, status: str = "", caller: dict = Depends(get_caller)):
+def list_units(run_id: str, status: str = "", kind: str = "source_file",
+               caller: dict = Depends(get_caller)):
+    """Defaults to source files, because that is what "the inventory" means to a customer.
+    A run now also contains components, a scaffold and (later) comprehension probes; pass
+    `kind=` for those, or `kind=all` for every row."""
     _require_run(run_id, caller)
-    units = store.list_units(run_id, status=status)[:MAX_UNITS_IN_RESPONSE]
+    units = store.list_units(run_id, status=status,
+                             kind="" if kind == "all" else kind)[:MAX_UNITS_IN_RESPONSE]
+    for unit in units:
+        # Per-file language facts can be large and are only meaningful one unit at a time.
+        # `GET /units/{id}` still carries them.
+        (unit.get("meta") or {}).pop("php", None)
     return {"count": len(units), "units": units}
+
+
+@router.get("/runs/{run_id}/components", summary="The target architecture, as approved")
+def list_components(run_id: str, caller: dict = Depends(get_caller)):
+    """What each group of source files becomes, and where it lands. This is the artifact the
+    plan gate is really about — a per-file inventory cannot show that six page-scripts became
+    one layout."""
+    _require_run(run_id, caller)
+    components = store.list_units(run_id, kind="component")
+    return {
+        "count": len(components),
+        "components": [{
+            "id": c["id"],
+            "name": c.get("component_name") or c["path"],
+            "project": c.get("target_project"),
+            "namespace": c.get("target_namespace"),
+            "output_dir": c.get("output_dir"),
+            "role": c.get("module_type"),
+            "status": c["status"],
+            "risk": c.get("risk"),
+            "topo_level": c.get("topo_level"),
+            "loc": c.get("loc"),
+            "est_cost_usd": c.get("est_cost_usd"),
+            "actual_cost_usd": c.get("actual_cost_usd"),
+            "needs_human_review": bool(c.get("needs_human_review")),
+            "members": (c.get("meta") or {}).get("members") or [],
+            "expected_files": (c.get("meta") or {}).get("expected_files") or [],
+            "rationale": (c.get("meta") or {}).get("rationale") or "",
+            "depends_on": c.get("depends_on") or [],
+        } for c in components],
+    }
+
+
+@router.get("/runs/{run_id}/evidence", summary="What the parsers observed, with citations")
+def list_evidence(run_id: str, kind: str = "", limit: int = 2000,
+                  caller: dict = Depends(get_caller)):
+    """Deterministic findings, each with a path and a line. This is the assessment's
+    substance — and it is free, so it exists before any spend is approved."""
+    _require_run(run_id, caller)
+    rows = store.list_evidence(run_id, kind=kind, limit=min(limit, 5000))
+    return {"count": len(rows), "counts_by_kind": store.evidence_counts(run_id),
+            "evidence": rows}
+
+
+@router.get("/runs/{run_id}/plan", summary="The costed conversion plan")
+def get_plan(run_id: str, caller: dict = Depends(get_caller)):
+    run = _require_run(run_id, caller)
+    if not run.get("plan"):
+        raise HTTPException(404, "This run has no plan yet — it is raised once the target "
+                                 "architecture has been designed.")
+    return {"plan": run["plan"], "estimate": run.get("estimate")}
+
+
+@router.get("/runs/{run_id}/reconciliation", summary="Cross-file consistency of the output")
+def get_reconciliation(run_id: str, caller: dict = Depends(get_caller)):
+    """Recomputed on request rather than stored: it is deterministic over the current
+    artifacts, so a stored copy could only ever be staler than this one."""
+    _require_run(run_id, caller)
+    report = reconcile.run(run_id)
+    return {**report, "summary": reconcile.describe(report)}
 
 
 @router.get("/runs/{run_id}/units/{unit_id}", summary="One unit, with its converted output")
@@ -414,9 +490,40 @@ def _export_report(run: Dict[str, Any], counts: Dict[str, int],
         "",
         "This conversion was validated structurally — placeholders, unbalanced syntax, "
         "unresolved cross-file symbols and reintroduced credentials. **It was not compiled "
-        "and no tests were run.** Build it in your own CI before treating any of it as done.",
+        "and no tests were run.** Build it in your own CI before treating any of it as done. "
+        "The solution and project files in this archive were generated deterministically, so "
+        "`dotnet restore && dotnet build` is the first thing to try.",
         "",
     ]
+
+    components = store.list_units(run["id"], kind="component")
+    if components:
+        by_project: Dict[str, List[Dict[str, Any]]] = {}
+        for component in components:
+            by_project.setdefault(component.get("target_project") or "—", []).append(component)
+        lines += [f"## The target architecture ({len(components)} components, "
+                  f"{len(by_project)} projects)", ""]
+        for project in sorted(by_project):
+            lines.append(f"### {project}")
+            lines.append("")
+            lines.append("| component | namespace | directory | files | risk | status |")
+            lines.append("|---|---|---|---|---|---|")
+            for component in sorted(by_project[project],
+                                    key=lambda c: c.get("component_name") or ""):
+                members = (component.get("meta") or {}).get("members") or []
+                lines.append(
+                    f"| {component.get('component_name')} | `{component.get('target_namespace')}` "
+                    f"| `{component.get('output_dir')}` | {len(members)} | "
+                    f"{component.get('risk') or '—'} | {component['status']} |")
+            lines.append("")
+
+    try:
+        report = reconcile.run(run["id"])
+    except Exception:                                   # never let a report fail an export
+        logger.exception("Reconciliation failed while writing the export report")
+        report = None
+    if report and report["issues"]:
+        lines += ["## Cross-file consistency", "", reconcile.describe(report), ""]
     if redactions:
         lines += [
             f"## Configuration you must supply ({len(redactions)})",
