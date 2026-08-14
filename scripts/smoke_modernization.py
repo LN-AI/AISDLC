@@ -463,29 +463,97 @@ check("re-declaring the same symbol does not abort the checkpoint",
 section("10. A whole run — order, artifacts, coherence, export")
 
 _real_call_tool = llm_gateway.call_tool
-conversion_order = []
+conversion_order = []          # component names, in the order they were converted
+call_log = []                  # every stubbed schema name, so "no model call" is testable
 
 
-def fake_call_tool(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
-    if schema.get("name") != "submit_unit_conversion":
-        return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+def _stem(path):
+    return "".join(p.capitalize() for p in
+                   os.path.splitext(os.path.basename(path))[0].replace("_", "-").split("-"))
+
+
+def _fake_architecture(user_content):
+    """One component per source file.
+
+    Deliberately the trivial decomposition: it keeps section 10's dependency-order
+    assertions meaningful (a component maps 1:1 to a file, so the order is the file order)
+    while still exercising the whole component path. Grouping is exercised separately in
+    section 16, where the assertion is about grouping rather than about order.
+    """
     import re as _re
-    path = _re.search(r"# Unit to convert: `([^`]+)`", user_content).group(1)
-    conversion_order.append(path)
-    stem = os.path.splitext(os.path.basename(path))[0].capitalize()
+    paths = _re.findall(r"^\| `([^`]+)` \|", user_content, _re.M)
+    components = []
+    for path in paths:
+        name = path.replace("/", "-").replace(".", "-")
+        components.append({
+            "name": name,
+            "project": "Acme.App",
+            "namespace": f"Acme.App.{_stem(path)}",
+            "output_dir": f"Acme.App/{_stem(path)}",
+            "members": [path],
+            "role": "service",
+            "rationale": "one file, one component",
+            "expected_files": [f"{_stem(path)}.cs"],
+        })
     return {
-        "files": [{"path": f"src/{stem}.cs", "content": f"// from {path}\npublic class {stem} {{ }}\n",
+        "projects": [{"name": "Acme.App", "purpose": "converted code"}],
+        "components": components,
+        "shared_conventions": "Types are PascalCase; async for all I/O.",
+        "risks": ["stubbed architecture"],
+        "summary": "One component per source file.",
+    }
+
+
+def _fake_conversion(system_prompt, user_content):
+    import re as _re
+    name = _re.search(r"# Unit to convert: `([^`]+)`", user_content).group(1)
+    conversion_order.append(name)
+    stem = _stem(name)
+    return {
+        # `filename`, not `path`: the directory is the run's, joined on in Python. A stub
+        # that still supplied a path would be testing a shape the schema no longer asks for.
+        "files": [{"filename": f"{stem}.cs",
+                   "content": f"// from {name}\npublic class {stem} {{ }}\n",
                    "purpose": "converted"}],
         "symbols_exported": [{"name": stem, "kind": "class", "signature": f"public class {stem}",
-                              "target_path": f"src/{stem}.cs"}],
+                              "target_path": f"{stem}.cs"}],
         "references": [],
         "changes": [{"change": "ported", "reason": "target stack"}],
         "manual_followup": [],
         "confidence": "High",
-        "summary": f"{path} became {stem}.cs",
+        "summary": f"{name} became {stem}.cs",
         "_system_prompt_seen": system_prompt,
         "_user_content_seen": user_content,
     }
+
+
+def fake_call_tool(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
+    name = schema.get("name")
+    call_log.append(name)
+    if name == "submit_unit_conversion":
+        return _fake_conversion(system_prompt, user_content)
+    if name == "submit_target_architecture":
+        return _fake_architecture(user_content)
+    return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+def drive(run_id, caller=CALLER, rounds=8):
+    """Run the driver until it stops making progress.
+
+    The driver stops at every blocking gate, which is the point of it — so a test that wants
+    to see the far end of the pipeline answers each gate and re-enters. `rounds` is a
+    backstop against a gate that re-raises itself forever.
+    """
+    outcome = None
+    for _ in range(rounds):
+        outcome = runner.convert_run(run_id, caller)
+        blocking = [c for c in store.list_checkpoints(run_id, "open") if c["blocking"]]
+        if not blocking:
+            break
+        for checkpoint in blocking:
+            store.answer_checkpoint(checkpoint["id"], {"decision": "approved"}, "smoke")
+        store.update_run(run_id, status="converting", paused_reason=None)
+    return outcome
 
 
 llm_gateway.call_tool = fake_call_tool
@@ -512,8 +580,15 @@ try:
         check("a run without a charter refuses to start", "charter" in str(exc).lower())
 
     runner.set_charter(e2e, VALID_CHARTER, "smoke")
-    check("setting the charter raises the plan-approval gate",
-          store.open_blocking_checkpoints(e2e) == 1)
+    open_now = [c for c in store.list_checkpoints(e2e, "open") if c["blocking"]]
+    check("setting the charter raises the assessment gate, not the conversion gate",
+          [c["kind"] for c in open_now] == ["discovery_approval"], str([c["kind"] for c in open_now]))
+    check("the assessment gate quotes a bounded cost before any spend",
+          (open_now[0]["payload"] or {}).get("estimate", {}).get("ceiling_usd", -1)
+          >= (open_now[0]["payload"] or {}).get("estimate", {}).get("expected_usd", 0),
+          str(open_now[0]["payload"]))
+    check("nothing has been spent when the assessment gate is raised",
+          (store.get_run(e2e)["spent_usd"] or 0) == 0)
 
     try:
         runner.start(e2e, CALLER)
@@ -521,39 +596,90 @@ try:
     except ValueError as exc:
         check("an unapproved plan refuses to start", "checkpoint" in str(exc).lower())
 
-    approval = [c for c in store.list_checkpoints(e2e, "open") if c["kind"] == "plan_approval"][0]
-    store.answer_checkpoint(approval["id"], {"decision": "approved"}, "smoke")
+    store.answer_checkpoint(open_now[0]["id"], {"decision": "approved"}, "smoke")
     check("approving clears the blocking gate", store.open_blocking_checkpoints(e2e) == 0)
 
-    store.mark_roots_ready(e2e)
+    # First pass: design + costing, then stop at the conversion gate.
     store.update_run(e2e, status="converting")
-    outcome = runner.convert_run(e2e, CALLER)
+    runner.convert_run(e2e, CALLER)
+
+    plan_gate = [c for c in store.list_checkpoints(e2e, "open")
+                 if c["kind"] == "plan_approval" and c["blocking"]]
+    check("designing the architecture raises the conversion gate", len(plan_gate) == 1,
+          str([c["kind"] for c in store.list_checkpoints(e2e, "open")]))
+    payload = plan_gate[0]["payload"] or {}
+    check("the conversion gate carries one row per component",
+          len(payload.get("components") or []) == 6, str(len(payload.get("components") or [])))
+    check("the conversion gate carries a real cost, not a promise",
+          (payload.get("totals") or {}).get("expected_usd", -1) >= 0
+          and (payload.get("totals") or {}).get("ceiling_usd", 0)
+          >= (payload.get("totals") or {}).get("expected_usd", 0),
+          str(payload.get("totals")))
+    check("every component names a project, a namespace and a directory",
+          all(r["project"] and r["namespace"] and r["output_dir"]
+              for r in payload.get("components") or []))
+    check("no two components share an output directory",
+          len({r["output_dir"] for r in payload["components"]}) == len(payload["components"]))
+    check("no source file is left unassigned",
+          sum(r["files"] for r in payload["components"]) == 6,
+          str(sum(r["files"] for r in payload["components"])))
+
+    outcome = drive(e2e)
 
     check("the run completes", outcome["status"] == "completed", str(outcome))
-    check("every unit converted", outcome["units"]["converted"] == 6, str(outcome["units"]))
+    check("every source file converted", outcome["units"]["converted"] == 6,
+          str(outcome["units"]))
     check("nothing was left behind",
           outcome["units"]["blocked"] == 0 and outcome["units"]["ready"] == 0)
 
-    pos = {p: i for i, p in enumerate(conversion_order)}
+    components = store.list_units(e2e, kind="component")
+    member_of = {m: c["component_name"]
+                 for c in components for m in (c["meta"].get("members") or [])}
+    pos = {name: i for i, name in enumerate(conversion_order)}
+    file_pos = {path: pos[name] for path, name in member_of.items() if name in pos}
     order_violations = []
-    for unit in store.list_units(e2e):
+    for unit in store.list_units(e2e, kind="source_file"):
         for dep in unit["depends_on"]:
-            if pos.get(dep, -1) > pos.get(unit["path"], 0):
+            if file_pos.get(dep, -1) > file_pos.get(unit["path"], 0):
                 order_violations.append(f"{unit['path']} converted before its dependency {dep}")
     check("EVERY unit converted after everything it depends on", not order_violations,
           "; ".join(order_violations))
     check("models converted before service",
-          pos["app/models.py"] < pos["app/service.py"], str(conversion_order))
-    check("service converted before api", pos["app/service.py"] < pos["app/api.py"])
+          file_pos["app/models.py"] < file_pos["app/service.py"], str(conversion_order))
+    check("service converted before api", file_pos["app/service.py"] < file_pos["app/api.py"])
 
     artifacts = store.list_artifacts(e2e)
-    check("one artifact per unit", len(artifacts) == 6, str(len(artifacts)))
+    component_ids = {c["id"] for c in components}
+    converted_files = [a for a in artifacts if a["unit_id"] in component_ids]
+    check("one artifact per component", len(converted_files) == 6, str(len(converted_files)))
     check("the symbol registry filled up", len(store.list_symbols(e2e)) == 6)
 
-    api_unit = next(u for u in store.list_units(e2e) if u["path"] == "app/api.py")
-    deps_symbols = store.symbols_for_paths(e2e, api_unit["depends_on"])
-    check("a unit's dependency signatures are retrievable — this is what keeps files coherent",
-          [s["name"] for s in deps_symbols] == ["Service"], str(deps_symbols))
+    # The defect this replaced: each call chose its own path, so file 1 wrote
+    # `Api/Controllers/X.cs` and file 200 wrote `src/Api/Controllers/X.cs`.
+    dirs = {c["output_dir"] for c in components}
+    strays = [a["path"] for a in converted_files
+              if not any(a["path"].startswith(d + "/") for d in dirs)]
+    check("every converted file landed under its component's directory", not strays, str(strays))
+
+    scaffold_files = {a["path"] for a in artifacts} - {a["path"] for a in converted_files}
+    check("the run emitted a solution file",
+          any(p.endswith(".sln") for p in scaffold_files), str(sorted(scaffold_files)))
+    check("the run emitted a project file",
+          any(p.endswith(".csproj") for p in scaffold_files), str(sorted(scaffold_files)))
+    check("the run emitted a host entry point",
+          any(p.endswith("Program.cs") for p in scaffold_files), str(sorted(scaffold_files)))
+    check("the run emitted configuration",
+          any(p.endswith("appsettings.json") for p in scaffold_files), str(sorted(scaffold_files)))
+    check("the scaffold cost no model call",
+          call_log.count("submit_unit_conversion") == 6
+          and call_log.count("submit_target_architecture") == 1
+          and len(call_log) == 7, str(call_log))
+
+    api_component = next(c for c in components
+                         if "app/api.py" in (c["meta"].get("members") or []))
+    deps_symbols = store.symbols_for_paths(e2e, api_component["depends_on"])
+    check("a component's dependency signatures are retrievable — this is what keeps files coherent",
+          [s["name"] for s in deps_symbols] == ["AppServicePy"], str(deps_symbols))
 
     check("spend accrued to the run", (store.get_run(e2e)["spent_usd"] or 0) >= 0)
     check("events were recorded", len(store.list_events(e2e)) >= 6)
@@ -561,11 +687,26 @@ try:
     # The prompt shape the whole cost model depends on: a system block that never varies
     # between units, so it is one cache write and N-1 reads instead of N full prices.
     agent = runner._agent
-    sys_a = agent.system_for(charter.validate(VALID_CHARTER))
-    sys_b = agent.system_for(charter.validate(dict(reversed(list(VALID_CHARTER.items())))))
+    addendum = store.get_run(e2e)["system_addendum"] or ""
+    sys_a = agent.system_for(charter.validate(VALID_CHARTER), addendum)
+    sys_b = agent.system_for(charter.validate(dict(reversed(list(VALID_CHARTER.items())))),
+                             addendum)
     check("the system prompt is identical across units — the prompt cache depends on it",
           sys_a == sys_b)
     check("the charter is in the system prompt, not the message", "Conversion Charter" in sys_a)
+    check("the frozen architecture is in the system prompt too",
+          "target architecture" in sys_a.lower(), sys_a[-400:])
+    check("the addendum was rendered once and stored, not re-derived per unit",
+          addendum and addendum == store.get_run(e2e)["system_addendum"])
+    # The property that actually protects the cache: two *different* units see the same
+    # system block. Run-scoped facts (entry points, the component map) legitimately appear
+    # in it — what must never appear is anything that differs between two calls.
+    prompts = {msg for msg in []} or set()
+    for unit in components[:3]:
+        prompts.add(agent.system_for(charter.validate(VALID_CHARTER), addendum))
+    check("two different units are given a byte-identical system block", len(prompts) == 1)
+    check("nothing unit-specific reaches the cached prefix — no synthetic unit paths",
+          "#component/" not in sys_a)
 
     export_md = __import__("backend.routes.modernization", fromlist=["_export_report"])._export_report(
         store.get_run(e2e), store.unit_status_counts(e2e), store.list_artifacts(e2e))
@@ -593,23 +734,37 @@ try:
         {"path": "d.py", "content": "from c import C\nD = 4\n"},
     ])
     runner.set_charter(crash_run, VALID_CHARTER, "smoke")
-    for cp in store.list_checkpoints(crash_run, "open"):
-        store.answer_checkpoint(cp["id"], {"decision": "ok"}, "smoke")
-    store.mark_roots_ready(crash_run)
+    # Through both gates and the design stage, so the crash happens where it matters —
+    # during conversion, with real component rows to lose.
     store.update_run(crash_run, status="converting")
+    for _ in range(3):
+        blocking = [c for c in store.list_checkpoints(crash_run, "open") if c["blocking"]]
+        for cp in blocking:
+            store.answer_checkpoint(cp["id"], {"decision": "ok"}, "smoke")
+        store.update_run(crash_run, status="converting", paused_reason=None)
+        if store.stage_units_exist(crash_run, "component"):
+            break
+        runner.convert_run(crash_run, CALLER)
+    for cp in store.list_checkpoints(crash_run, "open"):
+        if cp["blocking"]:
+            store.answer_checkpoint(cp["id"], {"decision": "ok"}, "smoke")
 
-    # Convert exactly the first two units, then "die".
+    # Convert exactly the first two components, then "die".
     conversion_order.clear()
     owner = "worker-crash"
+    store.update_run(crash_run, status="converting", phase="convert", paused_reason=None)
+    store.mark_roots_ready(crash_run, kind="component")
     for _ in range(2):
-        unit = store.claim_next_unit(crash_run, owner)
+        unit = store.claim_next_unit(crash_run, owner, kind="component")
         runner._convert_one(crash_run, unit, charter.validate(VALID_CHARTER), CALLER, None)
-    mid = store.claim_next_unit(crash_run, owner)          # claimed, never completed
-    check("two units converted before the crash",
+    mid = store.claim_next_unit(crash_run, owner, kind="component")   # claimed, never completed
+    components = store.unit_status_counts(crash_run, kind="component")
+    check("two components converted before the crash", components["converted"] == 2,
+          str(components))
+    check("a third is in flight", mid is not None and components["in_progress"] == 1)
+    check("their source files moved with them",
           store.unit_status_counts(crash_run)["converted"] == 2,
           str(store.unit_status_counts(crash_run)))
-    check("a third is in flight", mid is not None and
-          store.unit_status_counts(crash_run)["in_progress"] == 1)
 
     conn = database.get_connection()
     conn.execute("UPDATE modernization_units SET lease_expires_at='2000-01-01T00:00:00' WHERE id=?",
@@ -621,17 +776,18 @@ try:
     check("startup recovery releases the in-flight unit", swept["units_released"] >= 1, str(swept))
     check("the run is paused, not failed", store.get_run(crash_run)["status"] == "paused")
     check("converted work survived the crash",
-          store.unit_status_counts(crash_run)["converted"] == 2)
+          store.unit_status_counts(crash_run, kind="component")["converted"] == 2)
 
-    converted_before = {u["path"] for u in store.list_units(crash_run, "converted")}
+    converted_before = {u["component_name"] for u in
+                        store.list_units(crash_run, "converted", kind="component")}
     conversion_order.clear()
     store.recover_expired_leases(crash_run)
-    store.mark_roots_ready(crash_run)
-    store.update_run(crash_run, status="converting")
-    resumed = runner.convert_run(crash_run, CALLER)
+    store.update_run(crash_run, status="converting", phase="convert", paused_reason=None)
+    resumed = drive(crash_run)
 
     check("the resume finishes the run", resumed["status"] == "completed", str(resumed))
-    check("all four units are converted", resumed["units"]["converted"] == 4)
+    check("all four units are converted", resumed["units"]["converted"] == 4,
+          str(resumed["units"]))
     check("the resume re-converted NOTHING that was already done",
           not (set(conversion_order) & converted_before),
           f"re-converted {sorted(set(conversion_order) & converted_before)}")
@@ -646,15 +802,16 @@ section("12. A bad file does not strand the codebase; a cap stops the spend")
 
 
 def failing_call_tool(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
-    if schema.get("name") != "submit_unit_conversion":
-        return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
-    import re as _re
-    path = _re.search(r"# Unit to convert: `([^`]+)`", user_content).group(1)
-    if path == "b.py":
-        # A file the converter keeps eliding — exactly what Tier-0 validation exists for.
-        return {"files": [{"path": "src/B.cs", "content": "class B {\n // ... rest of the code unchanged\n}"}],
-                "symbols_exported": [], "references": [], "changes": [],
-                "manual_followup": [], "confidence": "High", "summary": ""}
+    if schema.get("name") == "submit_unit_conversion":
+        import re as _re
+        name = _re.search(r"# Unit to convert: `([^`]+)`", user_content).group(1)
+        if name == "b-py":
+            # A component the converter keeps eliding — what Tier-0 validation exists for.
+            call_log.append("submit_unit_conversion")
+            return {"files": [{"filename": "B.cs",
+                               "content": "class B {\n // ... rest of the code unchanged\n}"}],
+                    "symbols_exported": [], "references": [], "changes": [],
+                    "manual_followup": [], "confidence": "High", "summary": ""}
     return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
 
 
@@ -667,30 +824,29 @@ try:
         {"path": "c.py", "content": "from b import B\nC = 3\n"},
     ])
     runner.set_charter(fail_run, VALID_CHARTER, "smoke")
-    for cp in store.list_checkpoints(fail_run, "open"):
-        store.answer_checkpoint(cp["id"], {"decision": "ok"}, "smoke")
-    store.mark_roots_ready(fail_run)
-    store.update_run(fail_run, status="converting")
     conversion_order.clear()
-    fail_outcome = runner.convert_run(fail_run, CALLER)
+    store.update_run(fail_run, status="converting")
+    fail_outcome = drive(fail_run)
 
-    counts = store.unit_status_counts(fail_run)
+    counts = store.unit_status_counts(fail_run, kind="component")
     check("the bad file is retried, then retired", counts["failed"] == 1, str(counts))
     check("its validation failure is recorded",
-          any(e["event"] == "validation_failed" for e in store.list_events(fail_run)))
+          any(e["event"] == "validation_failed" for e in store.list_events(fail_run, limit=500)))
     check("a failed unit raises a non-blocking checkpoint",
           any(c["kind"] == "validation" for c in store.list_checkpoints(fail_run)))
     check("the file behind it still converted — one bad file does not strand the rest",
           counts["converted"] == 2, str(counts))
     check("the run does not report 'completed' with a hole in it",
           fail_outcome["status"] in ("completed", "paused"), str(fail_outcome))
+    check("reconciliation reports the component that produced nothing",
+          any(c["kind"] == "reconciliation" for c in store.list_checkpoints(fail_run))
+          or fail_outcome["status"] == "paused", str(fail_outcome["status"]))
 
     cap_run = store.create_run("cap", ".NET 8", "files", budget_cap_usd=0.01, created_by="smoke")
     runner.ingest_and_analyze(cap_run, [{"path": f"f{i}.py", "content": f"X{i} = 1\n"} for i in range(5)])
     runner.set_charter(cap_run, VALID_CHARTER, "smoke")
     for cp in store.list_checkpoints(cap_run, "open"):
         store.answer_checkpoint(cp["id"], {"decision": "ok"}, "smoke")
-    store.mark_roots_ready(cap_run)
     store.update_run(cap_run, status="converting")
     store.add_run_spend(cap_run, 0.02)                  # already over
     cap_outcome = runner.convert_run(cap_run, CALLER)
@@ -700,6 +856,8 @@ try:
     check("the pause explains itself", "cap" in (store.get_run(cap_run)["paused_reason"] or "").lower())
     check("everything already converted is kept",
           store.unit_status_counts(cap_run)["converted"] == 0)
+    check("the cap is checked before the architect runs, not only before conversion",
+          not store.stage_units_exist(cap_run, "component"))
 finally:
     llm_gateway.call_tool = _real_call_tool
 
@@ -797,9 +955,9 @@ check("the 400 names the missing decisions", "data_access" in bad.text, bad.text
 ok = client.post(f"/api/v1/modernization/runs/{api_run_id}/charter", headers=HDR,
                  json={"charter": VALID_CHARTER})
 check("a complete charter is accepted", ok.status_code == 200, f"{ok.status_code} {ok.text[:200]}")
-check("it moves the run to plan approval",
+check("it moves the run to the assessment gate",
       ok.json()["run"]["status"] == "awaiting_approval", str(ok.json()["run"]["status"]))
-check("the plan approval gate is blocking", ok.json()["run"]["blocking_checkpoints"] == 1)
+check("the assessment gate is blocking", ok.json()["run"]["blocking_checkpoints"] == 1)
 
 started = client.post(f"/api/v1/modernization/runs/{api_run_id}/start", headers=HDR)
 check("starting before approval is a 409", started.status_code == 409,
@@ -843,7 +1001,8 @@ check("and it does not appear in their list",
 # specifically here to catch that handler being written as `def` instead of `async def`.
 llm_gateway.call_tool = fake_call_tool
 try:
-    cp = [c for c in store.list_checkpoints(api_run_id, "open") if c["kind"] == "plan_approval"][0]
+    cp = [c for c in store.list_checkpoints(api_run_id, "open")
+          if c["kind"] == "discovery_approval"][0]
     approved = client.post(f"/api/v1/modernization/checkpoints/{cp['id']}/answer",
                            headers=HDR, json={"decision": "approved"})
     check("answering a checkpoint over HTTP works", approved.status_code == 200,

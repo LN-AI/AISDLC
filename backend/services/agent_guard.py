@@ -132,6 +132,31 @@ def _price_usage(usage: Dict[str, int], model: str) -> float:
     )
 
 
+def estimate_cost(input_tokens: int, output_tokens: int, model: str = "") -> Dict[str, Any]:
+    """What a call of this shape would cost, before making it.
+
+    Public because a quote and an invoice must come from the same price table. The
+    modernization plan gate has to put a number in front of a customer before any spend, and
+    the alternatives were for it to reach into `_price_usage` or to keep its own copy of
+    `MODEL_PRICING_PER_MILLION_TOKENS` — a duplicated price table being precisely how a
+    quote and an invoice start disagreeing.
+
+    `estimated` is true when the model is not in the table and `DEFAULT_PRICING` was used,
+    which a BYOL or self-hosted caller will hit routinely. A guess must never be presented
+    as a measurement.
+    """
+    resolved = model or (llm_gateway.resolve_override(None) or {}).get("model") or config.MODEL
+    return {
+        "cost_usd": _price_usage(
+            {"input_tokens": max(0, int(input_tokens)),
+             "output_tokens": max(0, int(output_tokens))},
+            resolved,
+        ),
+        "model": resolved,
+        "estimated": _is_estimated(resolved),
+    }
+
+
 def _is_estimated(model: str) -> bool:
     """True when we priced with DEFAULT_PRICING because the model isn't in the table —
     a BYOL caller can name any model, and a guess must not be shown as a measurement."""

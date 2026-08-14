@@ -44,17 +44,35 @@ UNIT_CONVERSION_TOOL_SCHEMA = {
             "files": {
                 "type": "array",
                 "description": (
-                    "The converted output. Usually one file; more when the target stack "
-                    "splits what the source combined (e.g. a Delphi form becomes a view and "
-                    "a view-model). Every file must be complete and syntactically valid — "
+                    "The converted output. Usually several files, because the target stack "
+                    "splits what the source combined — a page script becomes a controller, a "
+                    "view and a model. Every file must be complete and syntactically valid — "
                     "never a diff, never a fragment, and never a comment standing in for "
                     "code you did not write out."
                 ),
                 "items": {
                     "type": "object",
-                    "required": ["path", "content"],
+                    "required": ["filename", "content"],
                     "properties": {
-                        "path": {"type": "string", "description": "Output path, following the charter's project layout."},
+                        # `filename`, not `path`. The directory is not the model's to choose:
+                        # it was decided once, for the whole run, and is joined on in Python.
+                        # When each call picked its own path, file 1 wrote
+                        # `Api/Controllers/X.cs` and file 200 wrote `src/Api/Controllers/X.cs`
+                        # and nothing compared them. A bare name cannot express that
+                        # disagreement, so the whole class of drift stops being possible
+                        # rather than being something we check for afterwards.
+                        "filename": {
+                            "type": "string",
+                            "description": "File name only — no directories, no slashes. "
+                                           "e.g. 'OrderController.cs'.",
+                        },
+                        "subdir": {
+                            "type": "string",
+                            "description": "Optional sub-directory *inside* this component's "
+                                           "output directory, e.g. 'Views'. No leading slash "
+                                           "and no '..'. Leave empty unless the target stack "
+                                           "requires the nesting.",
+                        },
                         "content": {"type": "string", "description": "Complete file content."},
                         "purpose": {"type": "string", "description": "One line: what this file is."},
                     },
@@ -185,9 +203,20 @@ class UnitConverterAgent(BaseAgent):
             system_prompt=BASE_SYSTEM_PROMPT,
         )
 
-    def system_for(self, charter: Dict[str, Any]) -> str:
-        """The run's system prompt. Identical for every unit — that is the point."""
-        return f"{BASE_SYSTEM_PROMPT}\n\n{charter_module.render(charter)}\n"
+    def system_for(self, charter: Dict[str, Any], addendum: str = "") -> str:
+        """The run's system prompt. Identical for every unit — that is the point.
+
+        `addendum` is the comprehension digest and the architecture's shared conventions,
+        rendered **once** at plan approval and stored verbatim on the run. It is passed in as
+        an already-rendered string rather than as data to format here, because anything
+        re-rendered per call from a dict that `json.loads` rebuilt could come out in a
+        different order and silently cost full price on every file (D-06, and the same
+        argument `charter.render` makes).
+        """
+        parts = [BASE_SYSTEM_PROMPT, charter_module.render(charter)]
+        if addendum:
+            parts.append(addendum)
+        return "\n\n".join(parts) + "\n"
 
     def convert(
         self,
@@ -200,14 +229,18 @@ class UnitConverterAgent(BaseAgent):
         in_cycle_with: Optional[List[str]] = None,
         redactions: Optional[List[Dict[str, Any]]] = None,
         llm_override: Optional[Dict[str, Any]] = None,
+        addendum: str = "",
+        placement: Optional[Dict[str, Any]] = None,
+        members: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         user_content = _build_user_message(
             source=source, path=path, dependency_symbols=dependency_symbols or [],
             module_type=module_type, language=language,
             in_cycle_with=in_cycle_with or [], redactions=redactions or [],
+            placement=placement or {}, members=members or [],
         )
         result = llm_gateway.call_tool(
-            self.system_for(charter), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
+            self.system_for(charter, addendum), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
             llm_override, max_tokens=CONVERSION_MAX_TOKENS,
         )
         result["agent_name"] = self.agent_name
@@ -222,13 +255,46 @@ def _build_user_message(
     language: str,
     in_cycle_with: List[str],
     redactions: List[Dict[str, Any]],
+    placement: Optional[Dict[str, Any]] = None,
+    members: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Everything that varies per unit. Kept out of the system prompt so it cannot
     invalidate the cached prefix."""
-    parts = [f"# Unit to convert: `{path}`"]
+    placement = placement or {}
+    members = members or []
+    label = placement.get("component_name") or path
+    parts = [f"# Unit to convert: `{label}`"]
     if language or module_type:
         descriptor = " · ".join(p for p in (language, f"role: {module_type}" if module_type else "") if p)
         parts.append(f"({descriptor})")
+
+    if placement.get("output_dir") or placement.get("target_namespace"):
+        lines = ["", "## Where your output goes", ""]
+        if placement.get("target_project"):
+            lines.append(f"- **Project**: `{placement['target_project']}`")
+        if placement.get("target_namespace"):
+            lines.append(f"- **Namespace**: `{placement['target_namespace']}` — "
+                         f"everything you emit declares this namespace.")
+        if placement.get("output_dir"):
+            lines.append(f"- **Directory**: `{placement['output_dir']}` — chosen for the whole "
+                         f"run. You give **file names only**; the directory is joined on for "
+                         f"you, so do not repeat it and do not invent a different one.")
+        if placement.get("expected_files"):
+            lines.append("- **Expected output** (a plan, not a contract — emit what the code "
+                         "actually needs): "
+                         + ", ".join(f"`{f}`" for f in placement["expected_files"][:12]))
+        if placement.get("rationale"):
+            lines.append(f"- **Why these files convert together**: {placement['rationale']}")
+        parts.append("\n".join(lines))
+
+    if len(members) > 1:
+        parts.append(
+            "\n## This unit is several source files\n\n"
+            "They were grouped because they belong together in the target — converting them "
+            "separately would force each one to guess about the others. Emit the files the "
+            "target stack actually needs, which is usually neither one per source file nor "
+            "one in total."
+        )
 
     if dependency_symbols:
         lines = ["", "## Already converted — use these exactly as written",
@@ -248,7 +314,10 @@ def _build_user_message(
             lines.append(f"- **{unit_path}**")
             lines.extend(sorted(by_unit[unit_path]))
         parts.append("\n".join(lines))
-    else:
+    elif not in_cycle_with:
+        # Only claim this when it is true. A unit inside a cycle has dependencies — they are
+        # just not converted yet — and telling it that it sits at the root while also telling
+        # it that it sits in a cycle was contradictory and left it with nothing either way.
         parts.append(
             "\n## Dependencies\n\nThis unit has no already-converted dependencies — it is at the "
             "root of the dependency order. Everything it needs is either in the source below or "
@@ -280,9 +349,20 @@ def _build_user_message(
             "knows what to supply."
         )
 
-    parts.append(f"\n## Source\n\n```\n{source}\n```")
+    if len(members) > 1:
+        # One fenced block per member, labelled. Concatenating them into one blob loses which
+        # code came from which file, and `manual_followup` has to be able to name the file.
+        blocks = []
+        for member in members:
+            blocks.append(f"### `{member['path']}`\n\n```\n{member.get('source_text') or ''}\n```")
+        parts.append("\n## Source\n\n" + "\n\n".join(blocks))
+    else:
+        parts.append(f"\n## Source\n\n```\n{source}\n```")
+
     parts.append(
-        "\nConvert this unit now, following the charter. Declare every public symbol you emit, "
-        "every symbol from other units you reference, and everything that needs a human."
+        "\nConvert this unit now, following the charter. Give **file names only** in "
+        "`files[].filename` — the directory above is applied for you. Declare every public "
+        "symbol you emit, every symbol from other units you reference, and everything that "
+        "needs a human."
     )
     return "\n".join(parts)

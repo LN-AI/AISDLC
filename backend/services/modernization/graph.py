@@ -109,6 +109,37 @@ def strongly_connected(deps: Dict[str, Set[str]]) -> List[List[str]]:
     return components
 
 
+def condense(deps: Dict[str, Set[str]]) -> Dict[str, Any]:
+    """Cycles collapsed, levels assigned. The half of `build` that is not about `UnitFacts`.
+
+    Extracted so the *component* graph can reuse it. A target architecture partitions the
+    file graph into components, and that quotient graph needs exactly the same treatment —
+    Tarjan for the cycles a partition can create between components that did not exist
+    between files, Kahn for the order. Running a second, subtly different implementation
+    over it is how the two would drift, and a drifted order is the failure D-04 describes.
+
+    Returns the components (each a sorted member list), the member -> component index, and
+    each component's longest-path level.
+    """
+    components = strongly_connected(deps)
+    comp_of: Dict[str, int] = {}
+    for i, component in enumerate(components):
+        for member in component:
+            comp_of[member] = i
+
+    comp_deps: Dict[int, Set[int]] = {i: set() for i in range(len(components))}
+    for node, targets in deps.items():
+        source_comp = comp_of[node]
+        for target in targets:
+            target_comp = comp_of.get(target)
+            if target_comp is not None and target_comp != source_comp:
+                comp_deps[source_comp].add(target_comp)
+
+    levels = _kahn_levels(comp_deps, components)
+    return {"components": components, "comp_of": comp_of, "comp_deps": comp_deps,
+            "levels": levels}
+
+
 def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
     """Full pipeline. Returns units ready for `store.insert_units`, plus the cycles found.
 
@@ -118,23 +149,9 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
     later without re-deriving anything.
     """
     deps, external = resolve_edges(facts)
-    components = strongly_connected(deps)
-
-    comp_of: Dict[str, int] = {}
-    for i, component in enumerate(components):
-        for path in component:
-            comp_of[path] = i
-
-    # Condensation: edges between components only.
-    comp_deps: Dict[int, Set[int]] = {i: set() for i in range(len(components))}
-    for path, targets in deps.items():
-        source_comp = comp_of[path]
-        for target in targets:
-            target_comp = comp_of[target]
-            if target_comp != source_comp:
-                comp_deps[source_comp].add(target_comp)
-
-    levels = _kahn_levels(comp_deps, components)
+    condensed = condense(deps)
+    components = condensed["components"]
+    levels = condensed["levels"]
 
     # Order: by level, then by the component's lowest path, then by path inside it. Fully
     # determined by the inventory, so a re-ingest of the same repo converts in the same

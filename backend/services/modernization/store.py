@@ -901,6 +901,29 @@ def fail_unit(unit_id: str, run_id: str, error: str, terminal: bool = False,
     return status
 
 
+def set_unit_meta(unit_id: str, updates: Dict[str, Any]) -> None:
+    """Merge keys into a unit's `meta_json`. Read-modify-write in one connection.
+
+    Merge rather than replace: `meta` already carries what the graph knows (`in_cycle_with`,
+    `external_requires`) and what ingest found (`redactions`), and a stage writing its own
+    findings must not silently drop either.
+    """
+    conn = get_connection()
+    row = conn.execute("SELECT meta_json FROM modernization_units WHERE id = ?",
+                       (unit_id,)).fetchone()
+    try:
+        meta = json.loads((row["meta_json"] if row else None) or "{}")
+    except (TypeError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.update(updates)
+    conn.execute("UPDATE modernization_units SET meta_json = ? WHERE id = ?",
+                 (json.dumps(meta), unit_id))
+    conn.commit()
+    conn.close()
+
+
 def set_unit_status(unit_id: str, status: str, detail: str = "") -> None:
     conn = get_connection()
     conn.execute(
@@ -1140,15 +1163,25 @@ def list_artifacts(run_id: str, current_only: bool = True,
 
 def create_checkpoint(run_id: str, kind: str, title: str, detail: str = "",
                       unit_id: Optional[str] = None, options: Optional[List[str]] = None,
-                      blocking: bool = True) -> str:
+                      blocking: bool = True,
+                      payload: Optional[Dict[str, Any]] = None) -> str:
+    """Raise a decision for a human.
+
+    `payload` carries structure the UI renders — a per-component cost table, a list of
+    conflicts — as opposed to `options`, which is a list of answers. A gate whose entire body
+    is prose can only ever be approved or not; one carrying a table can be *read* first,
+    which is the difference between a gate and a speed bump.
+    """
     checkpoint_id = str(uuid.uuid4())
     conn = get_connection()
     conn.execute(
         "INSERT INTO modernization_checkpoints "
-        "(id, run_id, unit_id, kind, title, detail, options_json, status, blocking, created_at) "
-        "VALUES (?,?,?,?,?,?,?,'open',?,?)",
+        "(id, run_id, unit_id, kind, title, detail, options_json, status, blocking, "
+        " created_at, payload_json) "
+        "VALUES (?,?,?,?,?,?,?,'open',?,?,?)",
         (checkpoint_id, run_id, unit_id, kind, title, detail,
-         json.dumps(options or []), 1 if blocking else 0, _now()),
+         json.dumps(options or []), 1 if blocking else 0, _now(),
+         json.dumps(payload) if payload else None),
     )
     conn.commit()
     conn.close()
@@ -1172,7 +1205,8 @@ def list_checkpoints(run_id: str, status: str = "") -> List[Dict[str, Any]]:
     out = []
     for row in rows:
         cp = dict(row)
-        for field, target in (("options_json", "options"), ("answer_json", "answer")):
+        for field, target in (("options_json", "options"), ("answer_json", "answer"),
+                              ("payload_json", "payload")):
             raw = cp.pop(field, None)
             try:
                 cp[target] = json.loads(raw) if raw else None
