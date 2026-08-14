@@ -8,7 +8,8 @@ ones a compiler catches.
 Content, not process: `playbooks/__init__.py` explains why this is Python constants and how
 sections are selected and rendered.
 """
-from backend.services.modernization.playbooks import Playbook, Section, register
+from backend.services.modernization.playbooks import (DOTNET_ALIASES, Playbook, Section,
+                                                      register)
 
 CORE = Section(
     key="core",
@@ -192,12 +193,8 @@ change nobody will find.
 """.strip(),
 )
 
-register(Playbook(
-    source="PHP",
-    target="dotnet",
-    sections=(CORE, SUPERGLOBALS, SESSIONS, DATA, PRESENTATION, DATES, HAZARDS),
-))
-# The same corpus applies to any .NET-shaped target string.
-for alias in ("aspnetcore", "aspnet", "net8", "net9", "csharp", "netcore"):
+# The same corpus applies to every .NET-shaped target string. The alias list lives in the
+# package so `advice` keys off the identical set.
+for alias in DOTNET_ALIASES:
     register(Playbook(source="PHP", target=alias,
                       sections=(CORE, SUPERGLOBALS, SESSIONS, DATA, PRESENTATION, DATES, HAZARDS)))

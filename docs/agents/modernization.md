@@ -41,7 +41,11 @@ reconcile   duplicate types, namespace drift, unimplemented interfaces,
 
 Ingest, redaction, dependency analysis and evidence extraction are synchronous and **cost nothing**. Three gates exist before the codebase is converted, all deliberate:
 
-- **The charter** is refused if incomplete. Leaving those decisions to the model is what produces a codebase that disagrees with itself.
+- **The charter** is refused if incomplete. Leaving those decisions to the model is what produces a codebase that disagrees with itself. It arrives **pre-filled**: `GET /runs/{id}/charter-suggestions` derives an answer for each field from the evidence already extracted, with the observation behind it attached — `mysqli` in use and three tables found means EF Core with a MySQL provider; six of seven files emitting markup means one controller action plus one view per page and a single shared layout; `session_start` means cookie auth, with a warning that legacy PHP password hashes cannot be rehashed without the plaintext. Every suggestion is editable free text and none of them is enforced.
+
+  Those suggestions are **deterministic and free** — no model call is made anywhere on that path, which the smoke suite asserts by checking the call log is untouched. That is not an optimisation: the charter is set *before* Gate 1, so a suggestion that cost money would be the run's first spend with nothing yet approved.
+
+  Fields the codebase makes urgent are promoted from *optional* to *recommended* in the form. Evidence is never allowed to make a field **required**, because a caller POSTing a charter that validates today must not start getting a 400 because the parsers learned something. It can only relax the requirement — a batch program with no database is not asked how it reaches one.
 - **Gate 1** approves a small, bounded assessment. It has to exist because pricing a conversion means understanding the codebase first, and understanding it costs money — the alternative was a gate that asked for approval of a number it could not compute.
 - **Gate 2** is the one that matters. It carries one row per component — where it lands, how many source files it absorbs, its risk band and its estimated cost — plus a total with a **provable ceiling**: the provider cannot generate more than `max_tokens`, so that figure is an upper bound rather than a forecast.
 
@@ -57,7 +61,8 @@ The unit of conversion is a *component*, not a file. A legacy page-script is mar
 | `POST` | `/runs/upload` | Create + ingest from a zip (multipart) |
 | `GET` | `/runs` | List runs visible to the caller |
 | `GET` | `/runs/{id}` | Manifest — status, progress, counts, open checkpoints |
-| `GET` | `/charter-fields` | The charter's schema, so a UI form can't drift from what is enforced |
+| `GET` | `/charter-fields` | The charter's schema, so a UI form can't drift from what is enforced. Run-independent; carries stack-neutral `generic_options` |
+| `GET` | `/runs/{id}/charter-suggestions` | A suggested answer per charter field, derived from this codebase, with the evidence behind each |
 | `POST` | `/runs/{id}/charter` | Set the binding charter (400 if incomplete) |
 | `POST` | `/runs/{id}/start` | 202 + `job_id`; begins converting |
 | `POST` | `/runs/{id}/pause` | Stops after the file currently in flight |
@@ -143,4 +148,6 @@ curl -OJ https://your-host/api/v1/modernization/runs/$RUN/export -H "X-API-Key: 
 
 ## Verification
 
-`python scripts/smoke_modernization.py` — offline, free, deterministic. 300 checks covering path safety, redaction, the analyzers, graph ordering and cycle detection, charter validation, Tier-0 validation, claim-and-lease, a full run end to end (asserting every unit converted after everything it depends on, that both gates carry real numbers, that every artifact landed under its component's directory, and that the scaffold cost zero model calls), a simulated crash and resume (asserting nothing already converted is re-converted), failure isolation, the budget cap, the HTTP surface, and the PHP language pack — whose assertions run **twice**, once with tree-sitter forced off, so the fail-open path is exercised rather than merely intended.
+`python scripts/smoke_modernization.py` — offline, free, deterministic. 356 checks covering path safety, redaction, the analyzers, graph ordering and cycle detection, charter validation, Tier-0 validation, claim-and-lease, a full run end to end (asserting every unit converted after everything it depends on, that both gates carry real numbers, that every artifact landed under its component's directory, and that the scaffold cost zero model calls), a simulated crash and resume (asserting nothing already converted is re-converted), failure isolation, the budget cap, the HTTP surface, the PHP language pack — whose assertions run **twice**, once with tree-sitter forced off, so the fail-open path is exercised rather than merely intended — and the charter suggestions (zero model calls, byte-identical on a second pass, no redacted value in any option or citation, and an unrecognised language pair still answering every required field with nothing .NET-specific in it).
+
+`node scripts/smoke_render.js` — the browser rendering, against a DOM stub with no dependencies. Includes the charter form: that it arrives pre-filled from the recommended option, that its evidence is on screen rather than only in a tooltip, and that a failed suggestions fetch still leaves a form the user can fill in by hand.

@@ -1650,6 +1650,41 @@ button.not-entitled::after {
 .mod-charter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 900px) { .mod-charter-grid { grid-template-columns: 1fr; } }
 
+/* Charter suggestions. Seventeen decisions is too many to present as one flat wall of boxes,
+   so they are grouped by how loudly the evidence says to answer them — and the two groups
+   that matter are open by default while `optional` starts collapsed. */
+.mod-charter-group { margin: 14px 0; }
+.mod-charter-group > summary {
+  cursor: pointer; padding: 8px 0; list-style: none;
+  border-bottom: 1px solid var(--border); margin-bottom: 12px;
+}
+.mod-charter-group > summary::-webkit-details-marker { display: none; }
+.mod-charter-group > summary::before {
+  content: '▸ '; color: var(--text-dim); font-size: 11px;
+}
+.mod-charter-group[open] > summary::before { content: '▾ '; }
+
+/* One suggested answer. The star marks the recommended one; the title attribute carries the
+   evidence, which is also shown in full under the textarea for whichever is selected. */
+.mod-choice {
+  font-size: 11px; padding: 4px 9px; border-radius: 12px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--surface2); color: var(--text);
+  transition: border-color .15s, background .15s;
+}
+.mod-choice:hover { border-color: var(--accent); }
+.mod-choice.selected {
+  border-color: var(--accent); background: color-mix(in srgb, var(--accent) 16%, transparent);
+  font-weight: 600;
+}
+.mod-choice-why { margin-top: 5px; font-style: italic; }
+
+/* The selected run. Without this the detail panel below the list is the only clue as to which
+   run is open, and swapping between two runs at the same status looks like nothing happened. */
+.mod-run-card.selected {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 /* ── Review picker (Release Gate, Governance Report) ───────────────────────
    The gate takes review IDs; before this they had to be pasted as raw UUIDs. */
 

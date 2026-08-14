@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field
 from backend import scope
 from backend.routes.v1_agents import get_caller
 from backend.services import agent_guard
+from backend.services.modernization import advice
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import reconcile, repo_ingest, runner, stages, store
 
@@ -129,9 +130,16 @@ def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
 def charter_fields(caller: dict = Depends(get_caller)):
     """Served rather than hardcoded in the UI so the form cannot drift from what the server
     actually enforces — a charter screen missing a required field would produce runs that
-    are refused at submit for no visible reason."""
+    are refused at submit for no visible reason.
+
+    Run-independent, and cached by the browser across runs. `generic_options` are the
+    stack-neutral suggestions for a codebase nothing is known about, so a caller holding no run
+    still gets more than a list of field names; the per-run suggestions, with citations back to
+    specific files and lines, come from `GET /runs/{run_id}/charter-suggestions`.
+    """
     return {"fields": charter_module.describe_fields(),
-            "required": charter_module.REQUIRED_KEYS}
+            "required": charter_module.REQUIRED_KEYS,
+            "generic_options": {f["key"]: f["options"] for f in advice.describe("", {})}}
 
 
 def _ingest(run_id: str, files: List[Dict[str, str]], extensions: Optional[set]) -> Dict[str, Any]:
@@ -297,6 +305,35 @@ def list_evidence(run_id: str, kind: str = "", limit: int = 2000,
     rows = store.list_evidence(run_id, kind=kind, limit=min(limit, 5000))
     return {"count": len(rows), "counts_by_kind": store.evidence_counts(run_id),
             "evidence": rows}
+
+
+@router.get("/runs/{run_id}/charter-suggestions",
+            summary="Suggested charter answers, derived from this codebase")
+def charter_suggestions(run_id: str, caller: dict = Depends(get_caller)):
+    """Per-field options with the evidence behind each one, so the charter screen arrives
+    answered instead of blank.
+
+    Free and deterministic — no model call, here or anywhere behind this. The charter is set
+    *before* the discovery gate, so a suggestion that cost money would be the run's first spend
+    with nothing approved. Ask twice and get the same answer twice.
+
+    Every option is a starting point, not a constraint: the UI keeps the field editable and
+    `charter.validate()` cannot tell whether a value came from here or was typed.
+
+    Separate from `/charter-fields` on purpose. That endpoint is the run-independent public
+    schema and the browser caches it across runs; folding per-run answers into it would serve
+    one codebase's suggestions on another codebase's form.
+    """
+    run = _require_run(run_id, caller)
+    units = store.list_units(run_id, kind="source_file")
+    observed = advice.observe(units, store.list_evidence(run_id), run.get("redactions") or [])
+    return {
+        "fields": advice.describe(run.get("target_stack") or "", observed),
+        # What the suggestions were derived from, so a user can judge them rather than trust
+        # them. Redaction *categories* only — the values were never stored.
+        "observed": observed,
+        "source": "deterministic",
+    }
 
 
 @router.get("/runs/{run_id}/plan", summary="The costed conversion plan")

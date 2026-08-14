@@ -360,7 +360,153 @@ async function runPagingChecks() {
   });
 }
 
-runPagingChecks().then(() => {
+// ── Charter form ───────────────────────────────────────────────────────────
+// The screen a user cannot get past. It used to render five empty required boxes; these checks
+// hold it to arriving pre-filled with the recommended answer and its evidence.
+
+const CHARTER_SUGGESTIONS = [
+  { key: 'target_stack', label: 'Target stack', help: 'The stack, concretely.',
+    required: true, emphasis: 'required',
+    options: [{ value: '.NET 8 / ASP.NET Core MVC', label: 'MVC + Razor',
+                why: 'The source renders server-side HTML.', recommended: true },
+              { value: '.NET 8 / Web API', label: 'Web API', why: 'No markup.', recommended: false }] },
+  { key: 'data_access', label: 'Data access', help: 'One way to the database.',
+    required: true, emphasis: 'required',
+    options: [{ value: 'EF Core 8 + Pomelo', label: 'EF Core 8 + MySQL',
+                why: 'mysqli in use; 3 tables.', recommended: true }] },
+  { key: 'ui_strategy', label: 'UI / presentation', help: 'How the UI carries across.',
+    required: false, emphasis: 'recommended',
+    options: [{ value: 'Action + view model + view', label: 'Action + view',
+                why: '6 of 7 files emit markup.', recommended: true }] },
+  { key: 'naming_conventions', label: 'Naming conventions', help: 'Casing rules.',
+    required: false, emphasis: 'optional', options: [] },
+];
+
+// The suggestions state is a module-level `let`, so it cannot be poked from out here — which
+// is fine, because driving it through the fetch it really makes also exercises the per-run
+// caching. The first call returns a placeholder and starts the request; the second renders.
+async function runCharterChecks() {
+  console.log('\nConversion charter form');
+
+  let _charterRunSeq = 0;
+async function renderCharter(fields) {
+  const run = { id: `run-${++_charterRunSeq}`, target_stack: '.NET 8' };
+  nextFetchBody = { fields, observed: {}, source: 'deterministic' };
+  const first = sandbox.renderCharterForm(run);
+  await new Promise(r => setTimeout(r, 0));
+  return { first, html: sandbox.renderCharterForm(run) };
+}
+
+await checkAsync('the first render asks the server and says what it is doing', async () => {
+  const { first } = await renderCharter(CHARTER_SUGGESTIONS);
+  assert(first.includes('Reading the codebase'), `placeholder was: ${first.slice(0, 80)}`);
+  assert(fetchLog.some(u => u.includes('charter-suggestions')), 'never fetched suggestions');
+});
+
+await checkAsync('the form renders grouped by how loudly the evidence asks', async () => {
+  const { html } = await renderCharter(CHARTER_SUGGESTIONS);
+  assert(html.includes('Required'), 'missing the required group');
+  assert(html.includes('Recommended for this codebase'), 'missing the recommended group');
+  assert(html.includes('Optional'), 'missing the optional group');
+});
+
+await checkAsync('required and recommended groups are open; optional starts collapsed', async () => {
+  const { html } = await renderCharter(CHARTER_SUGGESTIONS);
+  // Three <details>; exactly the two non-optional ones carry `open`.
+  assert((html.match(/<details/g) || []).length === 3, 'expected three groups');
+  assert((html.match(/<details class="mod-charter-group" open>/g) || []).length === 2,
+         'expected exactly two open groups');
+});
+
+await checkAsync('every field arrives pre-filled with its recommended answer', async () => {
+  const { html } = await renderCharter(CHARTER_SUGGESTIONS);
+  assert(html.includes('>.NET 8 / ASP.NET Core MVC</textarea>'), 'target_stack not pre-filled');
+  assert(html.includes('>EF Core 8 + Pomelo</textarea>'), 'data_access not pre-filled');
+  assert(html.includes('>Action + view model + view</textarea>'), 'ui_strategy not pre-filled');
+});
+
+await checkAsync('a field with no options renders an empty box, not a broken one', async () => {
+  const { html } = await renderCharter(CHARTER_SUGGESTIONS);
+  assert(html.includes('id="charter-naming_conventions" rows="3"></textarea>'),
+         'the optionless field should render an empty textarea');
+});
+
+await checkAsync('the evidence for each recommendation is on screen, not only a tooltip', async () => {
+  const { html } = await renderCharter(CHARTER_SUGGESTIONS);
+  assert(html.includes('mysqli in use; 3 tables.'), 'the citation is missing');
+  assert(html.includes('6 of 7 files emit markup.'), 'the UI citation is missing');
+});
+
+await checkAsync('the recommended chip is the selected one', async () => {
+  const { html } = await renderCharter(CHARTER_SUGGESTIONS);
+  // Three fields carry a recommendation; target_stack's second option must not be selected.
+  assert((html.match(/mod-choice selected/g) || []).length === 3,
+         'one chip per field with a recommendation should be selected');
+});
+
+await checkAsync('a field whose first option is NOT recommended is left blank', async () => {
+  // The server sorts recommended-first, so this is the shape when nothing is recommended at all.
+  const { html } = await renderCharter([{ key: 'logging', label: 'Logging', help: 'h',
+    required: false, emphasis: 'optional',
+    options: [{ value: 'x', label: 'X', why: 'w', recommended: false }] }]);
+  assert(html.includes('id="charter-logging" rows="3"></textarea>'),
+         'should not pre-fill from a non-recommended option');
+});
+
+await checkAsync('picking a different option rewrites the box and its citation', async () => {
+  await renderCharter(CHARTER_SUGGESTIONS);
+  sandbox.pickCharterOption('target_stack', 1);
+  assert(document.getElementById('charter-target_stack').value === '.NET 8 / Web API',
+         'the textarea was not updated');
+  assert(document.getElementById('why-target_stack').textContent === 'No markup.',
+         'the citation was not updated');
+});
+
+await checkAsync('picking an option that does not exist is a no-op, not a crash', async () => {
+  await renderCharter(CHARTER_SUGGESTIONS);
+  document.getElementById('charter-data_access').value = 'hand-written';
+  sandbox.pickCharterOption('data_access', 99);
+  assert(document.getElementById('charter-data_access').value === 'hand-written',
+         'a bad index must not clear what the user typed');
+});
+
+await checkAsync('a failed suggestions fetch still yields a usable form', async () => {
+  // The fallback that matters: an empty form the user can fill in beats a screen that only
+  // reports an error on the one step they cannot skip.
+  const run = { id: 'run-fallback', target_stack: '.NET 8' };
+  const saved = sandbox.fetch;
+  let call = 0;
+  sandbox.fetch = async (url) => {
+    fetchLog.push(url);
+    // First call (suggestions) fails; the retry against /charter-fields succeeds.
+    if (call++ === 0) return { ok: false, status: 500, json: async () => ({}), text: async () => 'boom' };
+    return { ok: true, status: 200, text: async () => '',
+             json: async () => ({ fields: [{ key: 'data_access', label: 'Data access',
+                                             help: 'h', required: true }], required: ['data_access'] }) };
+  };
+  sandbox.renderCharterForm(run);
+  await new Promise(r => setTimeout(r, 0));
+  await new Promise(r => setTimeout(r, 0));
+  const html = sandbox.renderCharterForm(run);
+  sandbox.fetch = saved;
+  assert(html.includes('charter-data_access'), `no usable field: ${html.slice(0, 120)}`);
+  assert(html.includes('Save charter'), 'the submit button must still be there');
+});
+
+check('BLOCKED is not shown to a user — it is the ordinary pre-start state', () => {
+  const html = sandbox.renderModernizationUnits([
+    { order_index: 0, topo_level: 0, path: 'lib/db.php', module_type: 'data',
+      depends_on: [], status: 'blocked' },
+    { order_index: 1, topo_level: 1, path: 'index.php', module_type: 'ui',
+      depends_on: ['lib/db.php'], status: 'rolled_up' },
+  ]);
+  assert(!html.includes('>blocked<'), 'the internal state name leaked to the screen');
+  assert(html.includes('>waiting<'), 'expected "waiting"');
+  assert(html.includes('>in a component<'), 'expected rolled_up to read as absorbed');
+});
+}
+
+runCharterChecks().then(runPagingChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

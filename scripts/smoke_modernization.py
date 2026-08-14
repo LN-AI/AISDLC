@@ -922,6 +922,7 @@ for expected in (
     "/api/v1/modernization/runs/{run_id}/reconciliation",
     "/api/v1/modernization/checkpoints/{checkpoint_id}/answer",
     "/api/v1/modernization/charter-fields",
+    "/api/v1/modernization/runs/{run_id}/charter-suggestions",
 ):
     check(f"{expected} is mounted", expected in paths)
 
@@ -1248,6 +1249,191 @@ check("a hazard with a real target equivalent does not demand a marker",
       validation.validate_unit_output(
           [{"path": "X.cs", "content": "public class X { }"}], [], set(),
           hazard_kinds=["removed_mysql_ext"])["status"] != "fail")
+
+
+# ── 17. Charter advice ─────────────────────────────────────────────────────
+section("17. Charter advice — the form arrives answered, for free")
+
+from backend.services.modernization import advice                        # noqa: E402
+
+# The observations every suggestion is derived from. Same inputs the real endpoint uses.
+php_evidence = evidence.collect(php_ingest["files"], php_units)
+observed = advice.observe(php_units, php_evidence, php_ingest["redactions"])
+
+check("the dominant language is identified, which is what picks the advisor",
+      observed["dominant_language"] == "php", observed["dominant_language"])
+check("the data API is observed", "mysqli" in " ".join(observed["db_apis"]).lower(),
+      str(observed["db_apis"]))
+check("the UI is observed — six of seven files emit markup", observed["has_ui"] is True)
+check("session use is observed", observed["sessions"] is True)
+check("routes are observed, from a file with no extension", bool(observed["routes"]),
+      str(observed["routes"]))
+check("hazards are observed", bool(observed["hazard_kinds"]), str(observed["hazard_kinds"]))
+check("redaction categories are observed, and are categories not values",
+      "db_connect_password" in observed["redaction_categories"]
+      and not any("hunter2" in c for c in observed["redaction_categories"]),
+      str(observed["redaction_categories"]))
+
+# The suggestions themselves.
+calls_before = len(call_log)
+described = advice.describe(".NET 8 / ASP.NET Core MVC", observed)
+by_key = {f["key"]: f for f in described}
+
+# This is the check that enforces the decision. Everything in this section is derived from
+# parser output, and a suggestion that cost money would be the run's first spend — before the
+# discovery gate, which is raised by set_charter, i.e. after this screen.
+check("suggestions cost NOTHING — not one model call on this whole path",
+      len(call_log) == calls_before, f"{len(call_log) - calls_before} call(s) made")
+
+check("every charter field is described, in charter order",
+      [f["key"] for f in described] == charter.ALL_KEYS)
+check("every required field has at least one option — no blank required box",
+      all(by_key[k]["options"] for k in charter.required_for(observed)),
+      str([k for k in charter.required_for(observed) if not by_key[k]["options"]]))
+check("exactly one option per field is the recommended one",
+      all(sum(1 for o in f["options"] if o["recommended"]) <= 1 for f in described))
+check("the recommended option is listed first, so pre-filling takes options[0]",
+      all(f["options"][0]["recommended"]
+          for f in described if any(o["recommended"] for o in f["options"])))
+check("every option explains itself — a default nobody can audit is worse than a blank",
+      all(o["why"] for f in described for o in f["options"]))
+
+# Right answers for this codebase, not merely non-empty ones.
+data_access = by_key["data_access"]["options"][0]
+check("data access recommends EF Core with the provider the source's engine needs",
+      "EF Core" in data_access["value"] and "Pomelo" in data_access["value"],
+      data_access["value"][:120])
+check("and cites the mysqli call sites rather than asserting it",
+      "mysqli" in data_access["why"], data_access["why"])
+check("UI strategy names the decomposition — action + view model + view",
+      "view model" in by_key["ui_strategy"]["options"][0]["value"].lower())
+check("and says the shared includes collapse into ONE layout",
+      "_Layout.cshtml" in by_key["ui_strategy"]["options"][0]["value"])
+check("auth is suggested because a session was seen, and it warns about legacy hashes",
+      any("md5" in o["why"] for o in by_key["auth_model"]["options"]),
+      str([o["label"] for o in by_key["auth_model"]["options"]]))
+check("URL compatibility is suggested and cites the extracted route count",
+      by_key["url_compatibility"]["options"]
+      and "path(s)" in by_key["url_compatibility"]["options"][0]["why"])
+check("constraints name the blocked hazards and forbid an invented equivalent",
+      "MIGRATION-BLOCKED" in by_key["constraints"]["options"][0]["value"],
+      by_key["constraints"]["options"][0]["value"][:120])
+# Found by running a real 7-file app through the endpoint: `sql_string_building` is a hazard in
+# the *reporting* sense and was being pushed into the "leave this unimplemented" instruction.
+# Interpolated SQL has a correct answer — a parameterised query — so refusing it would block
+# nearly every data-access line in a legacy PHP codebase. Only validation's blocking set counts.
+check("only hazards with NO safe equivalent reach the constraints text",
+      set(advice.blocking_hazards(observed)) <= set(validation.BLOCKING_HAZARDS)
+      and "sql_string_building" not in by_key["constraints"]["options"][0]["value"],
+      str(advice.blocking_hazards(observed)))
+_sqli_only = {"dominant_language": "php", "db_apis": ["mysqli"], "tables": ["t"],
+              "hazards": ["sql_string_building"], "hazard_kinds": ["sql_string_building"]}
+check("a codebase whose only hazard is interpolated SQL gets NO refusal instruction",
+      not {f["key"]: f for f in advice.describe(".NET 8", _sqli_only)}["constraints"]["options"],
+      str({f["key"]: f for f in advice.describe(".NET 8", _sqli_only)}["constraints"]["options"]))
+check("and its constraints field is therefore not promoted either",
+      {f["key"]: f for f in advice.describe(".NET 8", _sqli_only)}["constraints"]["emphasis"]
+      == "optional")
+check("but a real eval still produces one",
+      bool({f["key"]: f for f in
+            advice.describe(".NET 8", {**_sqli_only, "hazard_kinds": ["eval"]})}
+           ["constraints"]["options"]))
+check("the stack itself is suggested as MVC, because the source renders HTML",
+      "MVC" in by_key["target_stack"]["options"][0]["value"],
+      by_key["target_stack"]["options"][0]["value"])
+
+# Emphasis, which is the only thing evidence is allowed to change about a field's prominence.
+check("ui_strategy is promoted to `recommended` on a codebase that is mostly UI",
+      by_key["ui_strategy"]["emphasis"] == "recommended", by_key["ui_strategy"]["emphasis"])
+check("auth_model is promoted because a session was observed",
+      by_key["auth_model"]["emphasis"] == "recommended")
+check("naming_conventions stays optional — no evidence makes it urgent",
+      by_key["naming_conventions"]["emphasis"] == "optional")
+check("a required field reports `required`", by_key["data_access"]["emphasis"] == "required")
+
+# Determinism. A suggestion that varies between runs of the same codebase is a coin flip.
+check("suggestions are byte-identical on a second pass, options and citations alike",
+      described == advice.describe(".NET 8 / ASP.NET Core MVC",
+                                  advice.observe(php_units, php_evidence,
+                                                 php_ingest["redactions"])))
+
+# The secret-handling promise, restated for this new surface. The fixture's db.php carries a
+# real-looking password and everything below can reach a screen, an export and a prompt.
+_advice_text = " ".join(o["value"] + o["why"] + o["label"]
+                        for f in described for o in f["options"])
+check("no option value, label or citation carries a redacted secret",
+      "hunter2hunter2" not in _advice_text and "hunter2" not in _advice_text)
+check("nor does the observations payload", "hunter2" not in str(observed))
+
+# Required-ness: loosening is allowed, tightening is not. This assertion *is* the compatibility
+# decision — a caller POSTing a charter that validates today must not start getting a 400.
+no_data = {"dominant_language": "cobol", "file_count": 8, "languages": ["cobol"]}
+check("a codebase with no database is not asked how it reaches one",
+      "data_access" not in charter.required_for(no_data),
+      str(charter.required_for(no_data)))
+check("nor how it configures one, when nothing was redacted and nothing is reached",
+      "config_strategy" not in charter.required_for(no_data))
+check("but error handling is never dropped — every codebase has failures",
+      "error_handling" in charter.required_for(no_data))
+for _facts in ({}, no_data, observed, {"db_apis": ["pdo"]}, {"has_ui": True},
+               {"integrations": ["api.example.com"]}):
+    check("required_for never ADDS a field — evidence may only loosen",
+          set(charter.required_for(_facts)) <= set(charter.REQUIRED_KEYS), str(_facts))
+
+# An unrecognised pair must still help, and must not talk about .NET.
+cobol = advice.describe("Python 3.12", no_data)
+cobol_by_key = {f["key"]: f for f in cobol}
+check("an unknown language pair still gets options for its required fields",
+      all(cobol_by_key[k]["options"] for k in charter.required_for(no_data)),
+      str([k for k in charter.required_for(no_data) if not cobol_by_key[k]["options"]]))
+_cobol_text = " ".join(o["value"] + o["why"] for f in cobol for o in f["options"])
+check("and not one word of it is about .NET",
+      not any(w in _cobol_text for w in
+              (".NET", "EF Core", "Razor", "IOptions", "ILogger", "xUnit", "C#", "cshtml")),
+      _cobol_text[:200])
+check("a codebase with no UI is told so, rather than offered a UI strategy",
+      "No UI" in cobol_by_key["ui_strategy"]["options"][0]["label"],
+      str([o["label"] for o in cobol_by_key["ui_strategy"]["options"]]))
+
+# The renamed field. A charter stored before the rename must not lose the value a human typed.
+legacy = charter.validate({**VALID_CHARTER, "dependency_injection": "constructor injection only"})
+check("a charter using the old `dependency_injection` key still validates",
+      legacy["composition"] == "constructor injection only")
+check("and its value still reaches the system prompt, under the new label",
+      "constructor injection only" in charter.render(legacy)
+      and "Composition & wiring" in charter.render(legacy))
+check("the old key is not also emitted, which would duplicate the line in every prompt",
+      charter.render(legacy).count("constructor injection only") == 1)
+
+# Prompt-cache safety for the widened field set: `render` still cannot vary with dict order,
+# and the five appended fields cannot change what an older charter renders to.
+_shuffled = dict(reversed(list(VALID_CHARTER.items())))
+check("render is still byte-stable against key order with 17 fields",
+      charter.render(charter.validate(VALID_CHARTER))
+      == charter.render(charter.validate(_shuffled)))
+check("appending fields did not change what a charter predating them renders to",
+      "Database & schema" not in charter.render(charter.validate(VALID_CHARTER)))
+check("but a charter that answers them does render them, in charter order",
+      charter.render(charter.validate({**VALID_CHARTER, "auth_model": "cookie auth",
+                                       "datastore_fate": "keep MySQL"}))
+      .index("Database & schema") < charter.render(
+          charter.validate({**VALID_CHARTER, "auth_model": "cookie auth",
+                            "datastore_fate": "keep MySQL"})).index("Authentication & sessions"))
+
+# And the endpoint, through the app, with project scoping applied.
+_sugg = client.get(f"/api/v1/modernization/runs/{api_run_id}/charter-suggestions", headers=HDR)
+check("GET /charter-suggestions serves them", _sugg.status_code == 200, _sugg.text[:200])
+check("and says plainly that they cost nothing to produce",
+      _sugg.json().get("source") == "deterministic")
+check("it reports what it derived them from, so they can be judged not just trusted",
+      "observed" in _sugg.json() and "languages" in _sugg.json()["observed"])
+check("the schema endpoint carries stack-neutral options for a caller with no run",
+      bool(client.get("/api/v1/modernization/charter-fields",
+                      headers=HDR).json().get("generic_options", {}).get("error_handling")))
+# Project scoping applies here exactly as to every other run-scoped endpoint (D-42).
+check("another project's caller cannot read this run's suggestions",
+      client.get(f"/api/v1/modernization/runs/{api_run_id}/charter-suggestions",
+                 headers=other_hdr).status_code == 404)
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

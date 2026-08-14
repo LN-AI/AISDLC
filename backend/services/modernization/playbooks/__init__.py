@@ -45,19 +45,56 @@ class Playbook:
 _REGISTRY: Dict[Tuple[str, str], Playbook] = {}
 
 
+# ── Stack-pair keying ──────────────────────────────────────────────────────
+#
+# Shared with `advice`, which keys its registry the same way. Extracted rather than copied:
+# two lookups that are meant to agree on what ".NET 8 / ASP.NET Core MVC" matches, but
+# normalise it in two places, eventually disagree — and the symptom is a run that gets the
+# PHP playbook but the generic charter advice, which nothing would flag.
+
+def normalize_target(target_stack: str) -> str:
+    """A target stack reduced to a comparison key: lowercase, alphanumerics only.
+
+    Stack strings are free text from a human ('.NET 8 / ASP.NET Core MVC', 'dotnet8',
+    '.Net 8'), so matching has to survive punctuation, spacing and case.
+    """
+    return "".join(c for c in (target_stack or "").lower() if c.isalnum())
+
+
+# Target-stack spellings that all mean .NET, registered as separate keys because `lookup`
+# matches a fragment and none of these contains the others: '.NET 8' normalises to `net8`,
+# which does **not** contain `dotnet`. Shared with `advice` so the playbook and the charter
+# advice cannot end up recognising different spellings of the same target — a run getting the
+# PHP playbook but generic charter advice would look like a content gap, not a keying bug.
+DOTNET_ALIASES = ("dotnet", "aspnetcore", "aspnet", "netcore", "csharp",
+                  "net6", "net7", "net8", "net9", "net10")
+
+
+def lookup(registry: Dict[Tuple[str, str], Any], source_language: str,
+           target_stack: str) -> Optional[Any]:
+    """Find the entry registered for this language pair, or None.
+
+    The registered target is a *fragment* matched against the normalised stack, so one
+    entry keyed `dotnet` serves '.NET 8', '.NET 9 / ASP.NET Core' and 'dotnet-8'. Keys
+    must therefore be long enough not to collide by accident — a key of `'c'` would match
+    `cobol`, which is a bug this codebase has already had once.
+    """
+    source = (source_language or "").strip().lower()
+    normalized = normalize_target(target_stack)
+    if not source or not normalized:
+        return None
+    for (entry_source, entry_target), entry in registry.items():
+        if entry_source == source and entry_target in normalized:
+            return entry
+    return None
+
+
 def register(playbook: Playbook) -> None:
     _REGISTRY[(playbook.source.lower(), playbook.target.lower())] = playbook
 
 
 def find(source_language: str, target_stack: str) -> Optional[Playbook]:
-    source = (source_language or "").strip().lower()
-    normalized = "".join(c for c in (target_stack or "").lower() if c.isalnum())
-    if not source or not normalized:
-        return None
-    for (playbook_source, playbook_target), playbook in _REGISTRY.items():
-        if playbook_source == source and playbook_target in normalized:
-            return playbook
-    return None
+    return lookup(_REGISTRY, source_language, target_stack)
 
 
 def select(playbook: Playbook, facts: Dict[str, Any]) -> List[str]:

@@ -5634,6 +5634,9 @@ loadDashboard();
 let _modRunId = null;
 let _modPollTimer = null;
 let _modCharterFields = null;
+// Per-run, deliberately not cached across runs: these answers are derived from one specific
+// codebase's evidence. `runId` is the cache key; a mismatch triggers a fetch.
+let _modCharterSuggestions = { runId: null, fields: [], loading: false, prefilled: false };
 
 async function loadModernizationRuns() {
   const box = document.getElementById('mod-runs');
@@ -5644,8 +5647,11 @@ async function loadModernizationRuns() {
       box.innerHTML = '<div class="empty-state">No runs yet. Upload a zip above to build an inventory — nothing is billed until you approve a plan.</div>';
       return;
     }
+    // `selected` matters more than it looks: the detail panel is a single element below this
+    // list, so clicking a second run swaps its contents in place. With two runs at the same
+    // status the swap is invisible, and clicking reads as a dead control.
     box.innerHTML = data.runs.map(r => `
-      <div class="mod-run-card" onclick="openModernizationRun('${esc(r.id)}')">
+      <div class="mod-run-card ${r.id === _modRunId ? 'selected' : ''}" onclick="openModernizationRun('${esc(r.id)}')">
         <div class="mod-run-head">
           <span class="mod-run-name">${esc(r.name || 'Untitled run')}</span>
           <span class="mod-status ${esc(r.status)}">${esc(r.status)}</span>
@@ -5689,8 +5695,17 @@ async function createModernizationRun() {
 }
 
 async function openModernizationRun(runId) {
+  const switching = _modRunId !== runId;
   _modRunId = runId;
   await refreshModernizationRun();
+  if (switching) {
+    // Re-render the list so the newly selected card is highlighted, and bring the panel into
+    // view — it sits below the run list, so on a page with several runs the update happens
+    // off-screen and the click appears to have done nothing.
+    loadModernizationRuns();
+    const panel = document.getElementById('mod-detail');
+    if (panel && panel.scrollIntoView) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
   // Poll only while there is something to watch. A completed or cancelled run never
   // changes again, and a paused one only changes when someone acts on this page.
   clearInterval(_modPollTimer);
@@ -5886,6 +5901,23 @@ async function showModernizationReconciliation() {
   }
 }
 
+// `blocked` is the *default* state of every unit — a unit becomes `ready` only once everything
+// it depends on is converted, which is what makes the topological order real rather than
+// advisory. Rendering the internal name meant a run that had not started yet showed every file
+// as BLOCKED, which reads as an error and sent at least one person looking for the fault.
+// `rolled_up` has the same problem in reverse: it sounds like nothing happened, when it means
+// the file was absorbed into a component that is doing the work.
+const MOD_UNIT_STATUS_LABELS = {
+  blocked: 'waiting',
+  in_progress: 'converting',
+  needs_human: 'needs review',
+  rolled_up: 'in a component',
+};
+
+function modUnitStatusLabel(status) {
+  return MOD_UNIT_STATUS_LABELS[status] || status || '';
+}
+
 function renderModernizationUnits(units) {
   if (!units.length) return '';
   // Ordered by the topological sort, so reading top to bottom is reading the conversion
@@ -5903,7 +5935,7 @@ function renderModernizationUnits(units) {
           <td class="mod-unit-path">${esc(x.path)}${(x.scc_group !== null && x.scc_group !== undefined) ? ' <span class="compliance-chip">cycle</span>' : ''}</td>
           <td>${esc(x.module_type || '')}</td>
           <td>${(x.depends_on || []).length}</td>
-          <td><span class="mod-status ${esc(x.status)}">${esc(x.status)}</span>${x.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
+          <td><span class="mod-status ${esc(x.status)}">${esc(modUnitStatusLabel(x.status))}</span>${x.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
         </tr>`).join('')}
         </tbody>
       </table>
@@ -5912,29 +5944,109 @@ function renderModernizationUnits(units) {
 }
 
 function renderCharterForm(run) {
-  // Field definitions come from the server so this form cannot drift from what
-  // `charter.validate()` actually enforces — a screen missing a required field would
-  // produce runs rejected at submit for no visible reason.
-  if (!_modCharterFields) {
-    apiFetch('/api/v1/modernization/charter-fields', { _silent: true })
-      .then(d => { _modCharterFields = d.fields; refreshModernizationRun(); })
-      .catch(() => {});
-    return '<div class="mod-panel">Loading the charter form…</div>';
+  // The per-run suggestions carry the field definitions too, and those come from the server so
+  // the form cannot drift from what `charter.validate()` enforces — a screen missing a required
+  // field would produce runs rejected at submit for no visible reason.
+  //
+  // Suggestions are per run and are NOT cached across runs: they are derived from one specific
+  // codebase's evidence, and serving one run's answers on another run's form would be worse
+  // than serving none.
+  if (_modCharterSuggestions.runId !== run.id) {
+    if (!_modCharterSuggestions.loading) {
+      _modCharterSuggestions.loading = true;
+      apiFetch(`/api/v1/modernization/runs/${run.id}/charter-suggestions`, { _silent: true })
+        .then(d => {
+          _modCharterSuggestions = { runId: run.id, fields: d.fields || [], loading: false,
+                                    prefilled: false };
+          refreshModernizationRun();
+        })
+        .catch(() => {
+          // Falling back to the plain schema is the right failure: an empty form the user can
+          // still fill in beats a screen that only says something went wrong.
+          apiFetch('/api/v1/modernization/charter-fields', { _silent: true })
+            .then(d => {
+              _modCharterSuggestions = {
+                runId: run.id, loading: false, prefilled: true,
+                fields: (d.fields || []).map(f => ({ ...f, emphasis: f.required ? 'required' : 'optional', options: [] })),
+              };
+              refreshModernizationRun();
+            })
+            .catch(() => { _modCharterSuggestions.loading = false; });
+        });
+    }
+    return '<div class="mod-panel">Reading the codebase to suggest answers…</div>';
   }
+
+  const fields = _modCharterSuggestions.fields;
+  _modCharterFields = fields;          // what saveModernizationCharter() iterates
+  const groups = [
+    ['required', 'Required', 'Every file is converted against these. A run cannot start without them.'],
+    ['recommended', 'Recommended for this codebase', 'Optional in general — but the parsers found the thing each one is about, so leaving it blank means the model decides per file.'],
+    ['optional', 'Optional', 'Sensible defaults apply if you leave these alone.'],
+  ];
+
   return `<div class="mod-panel">
     <div class="section-title" style="margin-top:0">Conversion charter</div>
-    <p class="subtitle" style="margin-top:-6px">Decided once, applied to every file. This is what stops file 1 using EF Core and file 90 using raw ADO.NET — the inconsistency nothing could detect before, because nothing compared them.</p>
-    <div class="mod-charter-grid">
-      ${_modCharterFields.map(f => `
-        <div class="form-group">
-          <label>${esc(f.label)}${f.required ? ' <span class="required">*</span>' : ''}</label>
-          <textarea id="charter-${esc(f.key)}" rows="2" placeholder="${esc(f.help)}">${esc(f.key === 'target_stack' ? (run.target_stack || '') : '')}</textarea>
-        </div>`).join('')}
-    </div>
+    <p class="subtitle" style="margin-top:-6px">Decided once, applied to every file. This is what stops file 1 using EF Core and file 90 using raw ADO.NET — the inconsistency nothing could detect before, because nothing compared them. The answers below were derived from your codebase, not from a template: each one shows what it was derived from. Change any of them.</p>
+    ${groups.map(([key, title, blurb]) => {
+      const inGroup = fields.filter(f => (f.emphasis || 'optional') === key);
+      if (!inGroup.length) return '';
+      return `
+        <details class="mod-charter-group" ${key === 'optional' ? '' : 'open'}>
+          <summary><strong>${esc(title)}</strong> <span class="mod-meta">${inGroup.length} — ${esc(blurb)}</span></summary>
+          <div class="mod-charter-grid">
+            ${inGroup.map(f => renderCharterField(f)).join('')}
+          </div>
+        </details>`;
+    }).join('')}
     <div class="form-actions">
       <button class="btn btn-primary" onclick="saveModernizationCharter()">Save charter and review the plan</button>
+      <button class="btn btn-secondary" onclick="resetCharterToSuggested()">Reset to suggested</button>
     </div>
+    <div class="field-hint">Nothing has been billed yet. Saving this raises an approval showing what the assessment will cost, before it runs.</div>
   </div>`;
+}
+
+function renderCharterField(f) {
+  const options = f.options || [];
+  // options[0] is the recommended one when there is one — the server sorts it first, which the
+  // smoke suite asserts, so pre-filling never has to search for it.
+  const initial = (options[0] && options[0].recommended) ? options[0].value : '';
+  return `
+    <div class="form-group">
+      <label>${esc(f.label)}${f.required ? ' <span class="required">*</span>' : ''}</label>
+      <div class="field-hint" style="margin-top:-4px">${esc(f.help || '')}</div>
+      ${options.length ? `<div class="chip-row">
+        ${options.map((o, i) => `<button type="button" class="mod-choice ${i === 0 && o.recommended ? 'selected' : ''}"
+            data-charter-key="${esc(f.key)}" data-charter-index="${i}"
+            onclick="pickCharterOption('${esc(f.key)}', ${i})"
+            title="${esc(o.why || '')}">${esc(o.label)}${o.recommended ? ' ★' : ''}</button>`).join('')}
+      </div>` : ''}
+      <textarea id="charter-${esc(f.key)}" rows="3">${esc(initial)}</textarea>
+      ${options.length ? `<div class="field-hint mod-choice-why" id="why-${esc(f.key)}">${esc(options[0].why || '')}</div>` : ''}
+    </div>`;
+}
+
+// Which option each field's chips came from, so a click can find its value and its `why`
+// without a second fetch or a lookup by text.
+function pickCharterOption(key, index) {
+  const field = (_modCharterSuggestions.fields || []).find(f => f.key === key);
+  const option = field && (field.options || [])[index];
+  if (!option) return;
+  const box = document.getElementById('charter-' + key);
+  if (box) box.value = option.value;
+  const why = document.getElementById('why-' + key);
+  if (why) why.textContent = option.why || '';
+  document.querySelectorAll(`[data-charter-key="${key}"]`).forEach(el => {
+    el.classList.toggle('selected', el.dataset.charterIndex === String(index));
+  });
+}
+
+function resetCharterToSuggested() {
+  (_modCharterSuggestions.fields || []).forEach(f => {
+    const options = f.options || [];
+    if (options[0] && options[0].recommended) pickCharterOption(f.key, 0);
+  });
 }
 
 async function saveModernizationCharter() {
