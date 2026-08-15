@@ -15,12 +15,32 @@ CORE = Section(
     key="core",
     title="Semantics that differ silently",
     body="""
+**A `PhpCompat` static class ships with this conversion.** It is written deterministically
+into the project — it is not something you generate, and it is not something to re-derive
+inside the file you are converting. Call it whenever PHP semantics differ from C#'s, and
+list the call in `changes`. What it provides:
+
+| Instead of | Call |
+|---|---|
+| `==` across different types | `PhpCompat.LooseEquals(a, b)` / `LooseNotEquals` |
+| `===` | `PhpCompat.StrictEquals(a, b)` (plain `==` is fine for two known-same types) |
+| `if ($x)`, `empty($x)` | `PhpCompat.Truthy(x)` / `PhpCompat.Empty(x)` |
+| `strpos` | `PhpCompat.StrPos(...)` — returns `int?`, `null` for "not found" |
+| `array_search`, `in_array`, `count` | `PhpCompat.ArraySearch` / `InArray` / `Count` |
+| `isset` vs `array_key_exists` | `PhpCompat.Isset` / `PhpCompat.ArrayKeyExists` |
+| `strlen` vs `mb_strlen` | `PhpCompat.StrLen` (bytes) / `PhpCompat.MbStrLen` (characters) |
+| `substr` with a negative offset or length | `PhpCompat.SubstrPhp(...)` |
+| `(string)`, `(int)`, `.` concatenation | `PhpCompat.ToPhpString` / `IntVal` / `Concat` |
+| `date()`, `time()`, `strtotime()` | `PhpCompat.FormatDate` / `Time` / `StrToTime` |
+| `usort` comparators, `<` on mixed types | `PhpCompat.LooseCompare(a, b)` |
+
 **`==` is not `==`.** PHP's `==` coerces; C#'s does not. `"1" == "01"` is `true` in PHP and
-`false` in C#; `"abc" == 0` is `true` before PHP 8 and `false` from PHP 8. Map `===` to `==`
-and, where the source used `==` across different types, call the shared `PhpCompat.LooseEquals`
-helper rather than re-deriving the rule per file. `switch` in PHP compares loosely; `in_array`
-without a third argument compares loosely; `if ($x)` is false for `0`, `"0"`, `""`, `[]` and
-`null` — `"0"` in particular is *not* falsy in C#.
+`false` in C#; `"abc" == 0` is `true` before PHP 8 and `false` from PHP 8. `PhpCompat`
+implements the **PHP 8** rules — if this codebase is PHP 5 or 7 and relies on the old
+string-to-number comparison, say so in `manual_followup` rather than working around it.
+`switch` in PHP compares loosely; `in_array` without a third argument compares loosely;
+`if ($x)` is false for `0`, `"0"`, `""`, `[]` and `null` — `"0"` in particular is *not*
+falsy in C#.
 
 **`null` is not the failure value.** PHP functions signal failure with `false`, not `null`:
 `strpos`, `array_search`, `fopen`, `mysqli_query`, `DateTime::createFromFormat`. Never map a

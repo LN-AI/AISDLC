@@ -45,6 +45,16 @@ LEGACY_ROUTES_REQUIRE_AUTH = os.getenv("LEGACY_ROUTES_REQUIRE_AUTH", "true").low
 # aren't bound to a project, so nothing can be run outside a governed allowance.
 UI_REQUIRE_PROJECT = os.getenv("UI_REQUIRE_PROJECT", "false").lower() == "true"
 
+# Where *other systems* reach this deployment — specifically a GitHub Actions runner posting
+# build diagnostics back to POST /api/v1/modernization/runs/{id}/build-results.
+#
+# It cannot be derived from the incoming request. `request.base_url` is whatever the proxy
+# forwarded to (often `http://127.0.0.1:8000`), and a callback URL pointing at localhost
+# produces a PR whose CI runs, fails to call back, and reports nothing — a silent failure
+# that looks exactly like a build nobody triggered. Left empty, the route asks for the URL
+# explicitly rather than guessing one.
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
 # Guardrails — applied uniformly to every agent call inside llm_gateway.call_tool().
 MAX_AGENT_INPUT_CHARS = int(os.getenv("MAX_AGENT_INPUT_CHARS", "400000"))
 # This has to be large enough for the largest output budget to actually finish

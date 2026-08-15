@@ -233,13 +233,23 @@ class UnitConverterAgent(BaseAgent):
         placement: Optional[Dict[str, Any]] = None,
         members: Optional[List[Dict[str, Any]]] = None,
         source_facts: Optional[List[Dict[str, Any]]] = None,
+        build_diagnostics: str = "",
     ) -> Dict[str, Any]:
+        """`build_diagnostics` is what a real compiler said about this unit's *previous*
+        output, and it is the only reason a re-conversion produces anything different.
+
+        It goes in the user message, never the system block: the system block is the cached
+        prefix (D-06), so per-unit compiler output there would invalidate the cache for every
+        other unit in the run — paying full price on all of them to tell one of them
+        something. It is also why the rework loop cannot be a no-op: without this the second
+        attempt sends a byte-identical prompt and the stuck-loop guard fires on round two.
+        """
         user_content = _build_user_message(
             source=source, path=path, dependency_symbols=dependency_symbols or [],
             module_type=module_type, language=language,
             in_cycle_with=in_cycle_with or [], redactions=redactions or [],
             placement=placement or {}, members=members or [],
-            source_facts=source_facts or [],
+            source_facts=source_facts or [], build_diagnostics=build_diagnostics,
         )
         result = llm_gateway.call_tool(
             self.system_for(charter, addendum), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
@@ -349,6 +359,7 @@ def _build_user_message(
     placement: Optional[Dict[str, Any]] = None,
     members: Optional[List[Dict[str, Any]]] = None,
     source_facts: Optional[List[Dict[str, Any]]] = None,
+    build_diagnostics: str = "",
 ) -> str:
     """Everything that varies per unit. Kept out of the system prompt so it cannot
     invalidate the cached prefix."""
@@ -433,6 +444,13 @@ def _build_user_message(
     language_facts = _render_language_facts(source_facts or [])
     if language_facts:
         parts.append(language_facts)
+
+    if build_diagnostics:
+        # Placed after the dependency context and before the source, so the model reads what
+        # is available to it and *then* what went wrong last time. These are facts from a
+        # compiler, not a review opinion — which is why the instruction is to fix them rather
+        # than to consider them.
+        parts.append(build_diagnostics)
 
     if redactions:
         categories = sorted({r.get("category", "secret") for r in redactions})

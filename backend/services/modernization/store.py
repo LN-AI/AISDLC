@@ -247,6 +247,82 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             ON modernization_evidence(run_id, kind, value);
         CREATE INDEX IF NOT EXISTS idx_mod_evidence_path
             ON modernization_evidence(run_id, path);
+
+        -- One attempt to build the converted codebase. The row exists whether the compiler
+        -- ran here, in the customer's CI, or in a sandbox worker: the diagnostics contract
+        -- is the interface, so nothing downstream has to know which one produced it.
+        --
+        -- `fingerprint` is what stops the obvious failure mode. A model that cannot fix an
+        -- error will happily regenerate the same file forever; two consecutive builds with
+        -- the same fingerprint mean the loop is not converging, and the run stops for a
+        -- human instead of spending the budget discovering that slowly.
+        CREATE TABLE IF NOT EXISTS modernization_builds (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            round INTEGER DEFAULT 1,
+            source TEXT DEFAULT 'external',
+            status TEXT NOT NULL DEFAULT 'reported',
+            branch TEXT,
+            commit_sha TEXT,
+            command TEXT,
+            error_count INTEGER DEFAULT 0,
+            warning_count INTEGER DEFAULT 0,
+            unmapped_count INTEGER DEFAULT 0,
+            reopened_count INTEGER DEFAULT 0,
+            fingerprint TEXT,
+            summary TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_builds_run
+            ON modernization_builds(run_id, round);
+
+        -- One compiler message. `unit_id` is resolved at ingest by mapping `file` back
+        -- through the artifact table, and stays NULL when nothing owns that path — which is
+        -- itself a finding worth surfacing (an error in a file no unit produced means the
+        -- scaffold is wrong, not the conversion).
+        CREATE TABLE IF NOT EXISTS modernization_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            build_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            unit_id TEXT,
+            artifact_path TEXT,
+            file TEXT NOT NULL,
+            line INTEGER DEFAULT 0,
+            col INTEGER DEFAULT 0,
+            severity TEXT DEFAULT 'error',
+            code TEXT,
+            message TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_diagnostics_build
+            ON modernization_diagnostics(build_id, severity);
+        CREATE INDEX IF NOT EXISTS idx_mod_diagnostics_unit
+            ON modernization_diagnostics(run_id, unit_id);
+
+        -- Business rules the comprehension pass proposed, each pinned to a line of source.
+        -- Separate from `modernization_evidence` because the lifecycle differs: evidence is
+        -- deterministic and regenerable, a rule is a model's claim that has to survive
+        -- verification against the file it cites before it is allowed to steer conversion.
+        -- `status` is that lifecycle — nothing reaches a prompt while still `proposed`.
+        CREATE TABLE IF NOT EXISTS modernization_rules (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            unit_id TEXT,
+            statement TEXT NOT NULL,
+            category TEXT,
+            path TEXT,
+            line INTEGER DEFAULT 0,
+            quote TEXT,
+            status TEXT NOT NULL DEFAULT 'proposed',
+            reject_reason TEXT,
+            confidence REAL DEFAULT 0.0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_rules_run
+            ON modernization_rules(run_id, status);
     """)
     _migrate(cursor)
     # Strictly after `_migrate`: this one indexes `kind`, which the CREATE TABLE above does
@@ -281,9 +357,14 @@ _ADDED_COLUMNS = (
     ("modernization_units", "est_cost_usd", "REAL DEFAULT 0"),
     ("modernization_units", "actual_cost_usd", "REAL DEFAULT 0"),
     ("modernization_units", "risk", "TEXT"),
+    ("modernization_units", "rework_attempts", "INTEGER DEFAULT 0"),
     ("modernization_runs", "system_addendum", "TEXT"),
     ("modernization_runs", "plan_json", "TEXT"),
     ("modernization_runs", "estimate_json", "TEXT"),
+    ("modernization_runs", "build_round", "INTEGER DEFAULT 0"),
+    ("modernization_runs", "build_fingerprint", "TEXT"),
+    ("modernization_runs", "github_branch", "TEXT"),
+    ("modernization_runs", "pr_url", "TEXT"),
     ("modernization_checkpoints", "payload_json", "TEXT"),
 )
 
@@ -1121,6 +1202,345 @@ def evidence_counts(run_id: str) -> Dict[str, int]:
     return {row["kind"]: row["n"] for row in rows}
 
 
+# ── Business rules (comprehension) ─────────────────────────────────────────
+
+def insert_rules(run_id: str, rules: List[Dict[str, Any]]) -> int:
+    """Bulk-insert proposed rules. Verification flips them to `confirmed` afterwards."""
+    if not rules:
+        return 0
+    now = _now()
+    conn = get_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO modernization_rules "
+            "(id, run_id, unit_id, statement, category, path, line, quote, status, "
+            " reject_reason, confidence, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(str(uuid.uuid4()), run_id, r.get("unit_id"), r.get("statement", ""),
+              r.get("category", ""), r.get("path", ""), int(r.get("line") or 0),
+              r.get("quote", ""), r.get("status", "proposed"), r.get("reject_reason", ""),
+              float(r.get("confidence") or 0.0), now) for r in rules],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rules)
+
+
+def list_rules(run_id: str, status: str = "", limit: int = 500) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_rules WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY category, path, line LIMIT ?"
+    params.append(limit)
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_rule_status(rule_id: str, status: str, reject_reason: str = "") -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE modernization_rules SET status = ?, reject_reason = ? WHERE id = ?",
+        (status, reject_reason, rule_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def rule_counts(run_id: str) -> Dict[str, int]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS n FROM modernization_rules WHERE run_id = ? GROUP BY status",
+        (run_id,),
+    ).fetchall()
+    conn.close()
+    return {row["status"]: row["n"] for row in rows}
+
+
+# ── Builds and diagnostics ─────────────────────────────────────────────────
+
+def units_for_artifact_paths(run_id: str, paths: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Map an emitted file path back to the unit that produced it.
+
+    Current versions only: a diagnostic is about the code that was built, and a superseded
+    artifact is not that code. Chunked because a failing build can name more paths than
+    SQLite will bind in one statement.
+    """
+    if not paths:
+        return {}
+    found: Dict[str, Dict[str, Any]] = {}
+    conn = get_connection()
+    try:
+        for chunk in _chunks(list(dict.fromkeys(paths))):
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT a.path, a.unit_id, u.status, u.kind, u.rework_attempts "
+                f"FROM modernization_artifacts a "
+                f"LEFT JOIN modernization_units u ON u.id = a.unit_id "
+                f"WHERE a.run_id = ? AND a.is_current = 1 AND a.path IN ({placeholders})",
+                [run_id] + list(chunk),
+            ).fetchall()
+            for row in rows:
+                found[row["path"]] = {"unit_id": row["unit_id"], "status": row["status"],
+                                      "kind": row["kind"],
+                                      "rework_attempts": row["rework_attempts"] or 0}
+    finally:
+        conn.close()
+    return found
+
+
+def record_build(run_id: str, diagnostics: List[Dict[str, Any]], *, source: str = "external",
+                 branch: str = "", commit_sha: str = "", command: str = "",
+                 status: str = "reported", fingerprint: str = "",
+                 summary: str = "") -> Dict[str, Any]:
+    """Persist one build attempt and its messages. Does **not** reopen anything.
+
+    Recording and reopening are separate transactions on purpose: a build that is merely
+    informational (a warning-only run, a build the operator wants to look at before acting)
+    must be recordable without moving a single unit. `reopen_units` is the deliberate act.
+    """
+    now = _now()
+    build_id = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        prev = cursor.execute(
+            "SELECT COALESCE(MAX(round), 0) AS r FROM modernization_builds WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        round_no = (prev["r"] or 0) + 1
+        errors = sum(1 for d in diagnostics if (d.get("severity") or "error") == "error")
+        warnings = sum(1 for d in diagnostics if (d.get("severity") or "") == "warning")
+        unmapped = sum(1 for d in diagnostics if not d.get("unit_id"))
+        cursor.execute(
+            "INSERT INTO modernization_builds "
+            "(id, run_id, round, source, status, branch, commit_sha, command, error_count, "
+            " warning_count, unmapped_count, reopened_count, fingerprint, summary, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
+            (build_id, run_id, round_no, source, status, branch, commit_sha, command,
+             errors, warnings, unmapped, fingerprint, summary, now),
+        )
+        cursor.executemany(
+            "INSERT INTO modernization_diagnostics "
+            "(build_id, run_id, unit_id, artifact_path, file, line, col, severity, code, "
+            " message, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [(build_id, run_id, d.get("unit_id"), d.get("artifact_path", ""),
+              d.get("file", ""), int(d.get("line") or 0), int(d.get("col") or 0),
+              d.get("severity") or "error", d.get("code", ""), d.get("message", ""), now)
+             for d in diagnostics],
+        )
+        cursor.execute(
+            "UPDATE modernization_runs SET build_round = ?, build_fingerprint = ?, updated_at = ? "
+            "WHERE id = ?", (round_no, fingerprint, now, run_id),
+        )
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, ?, 'build_reported', ?, ?)",
+            (run_id, "warning" if errors else "info",
+             f"build round {round_no} from {source}: {errors} error(s), {warnings} warning(s)"
+             + (f", {unmapped} in file(s) no unit owns" if unmapped else ""), now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"build_id": build_id, "round": round_no, "errors": errors,
+            "warnings": warnings, "unmapped": unmapped}
+
+
+def reopen_units(run_id: str, unit_ids: List[str], reason: str,
+                 max_rework: int = 3) -> Dict[str, Any]:
+    """Send failing units back through the conversion loop.
+
+    No new persistence is needed for a rework pass: a unit goes `converted` -> `ready`, the
+    existing claim loop picks it up, and `complete_unit` versions the new artifact over the
+    old one. What this adds is the guard — a unit that has already been reworked
+    `max_rework` times is left alone and named, because the alternative is a loop that
+    spends the budget rewriting the same file.
+    """
+    if not unit_ids:
+        return {"reopened": 0, "units": [], "exhausted": [], "deferred": [], "skipped": 0}
+    now = _now()
+    conn = get_connection()
+    cursor = conn.cursor()
+    reopened, exhausted, deferred, skipped = [], [], [], 0
+    try:
+        for unit_id in dict.fromkeys(unit_ids):
+            row = cursor.execute(
+                "SELECT id, path, status, rework_attempts FROM modernization_units "
+                "WHERE id = ? AND run_id = ?",
+                (unit_id, run_id),
+            ).fetchone()
+            if not row:
+                skipped += 1
+                continue
+            # A unit a worker holds right now must not be reopened. Clearing its lease here
+            # does not stop that worker: it finishes, and `complete_unit` writes the
+            # *pre-rework* output as the new current artifact and sets the unit back to
+            # `converted` — so the reopen is silently lost while `rework_attempts` has still
+            # been spent. Three of those retire a unit as exhausted without one rework
+            # having run, and the next build then reports a `build_stuck` that is really a
+            # race. Deferring costs nothing: the unit is being converted as we speak, and if
+            # that output is still wrong the next build report reopens it for real.
+            if row["status"] == "in_progress":
+                deferred.append({"unit_id": unit_id, "path": row["path"]})
+                continue
+            if (row["rework_attempts"] or 0) >= max_rework:
+                exhausted.append({"unit_id": unit_id, "path": row["path"],
+                                  "attempts": row["rework_attempts"] or 0})
+                continue
+            # `attempts` is the *conversion* retry counter that `fail_unit` compares against
+            # max_attempts; resetting it is what makes a reopened unit a fresh piece of work
+            # rather than one that is already two-thirds of the way to terminal failure.
+            cursor.execute(
+                "UPDATE modernization_units SET status='ready', attempts=0, "
+                "rework_attempts = COALESCE(rework_attempts, 0) + 1, lease_owner=NULL, "
+                "lease_expires_at=NULL, finished_at=NULL, error_json=NULL "
+                "WHERE id = ? AND run_id = ?",
+                (unit_id, run_id),
+            )
+            # Members were flipped to `converted` alongside the component; they go back to
+            # `rolled_up` so the file count stops claiming work that is being redone.
+            cursor.execute(
+                "UPDATE modernization_units SET status='rolled_up', finished_at=NULL "
+                "WHERE run_id = ? AND parent_unit_id = ? AND status = 'converted'",
+                (run_id, unit_id),
+            )
+            reopened.append({"unit_id": unit_id, "path": row["path"]})
+        if reopened:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+                "VALUES (?, 'info', 'units_reopened', ?, ?)",
+                (run_id, f"{len(reopened)} unit(s) reopened for rework: {reason}", now),
+            )
+        if exhausted:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+                "VALUES (?, 'warning', 'rework_exhausted', ?, ?)",
+                (run_id, f"{len(exhausted)} unit(s) hit the rework limit and were left as-is: "
+                         + ", ".join(e["path"] for e in exhausted[:10]), now),
+            )
+        if deferred:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+                "VALUES (?, 'info', 'rework_deferred', ?, ?)",
+                (run_id, f"{len(deferred)} unit(s) were being converted when this build was "
+                         f"reported, so they were left alone: "
+                         + ", ".join(d["path"] for d in deferred[:10]), now),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"reopened": len(reopened), "units": reopened, "exhausted": exhausted,
+            "deferred": deferred, "skipped": skipped}
+
+
+def units_by_path(run_id: str, paths: List[str], include_source: bool = True
+                  ) -> List[Dict[str, Any]]:
+    """Just these units, with their source. The alternative — loading the whole inventory
+    and indexing it — costs one full read of the codebase per caller, and the callers here
+    run once per probe."""
+    if not paths:
+        return []
+    columns = "*" if include_source else \
+        "id, run_id, parent_unit_id, path, language, module_type, status, kind, meta_json"
+    out: List[Dict[str, Any]] = []
+    conn = get_connection()
+    try:
+        for chunk in _chunks(list(dict.fromkeys(paths))):
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT {columns} FROM modernization_units "
+                f"WHERE run_id = ? AND path IN ({placeholders})",
+                [run_id] + list(chunk),
+            ).fetchall()
+            out.extend(_decode_unit(r) for r in rows)
+    finally:
+        conn.close()
+    return out
+
+
+def pending_unit_count(run_id: str) -> int:
+    """Units still waiting to be converted or in flight, across every kind.
+
+    Read by the stuck-loop guard: "two builds reported the same errors" only means the model
+    cannot fix them if a rework pass actually ran in between. After a failed build the run is
+    left *paused* with units sitting in `ready`, so two identical reports with nothing
+    between them is the ordinary state — and the workflow offers `workflow_dispatch`, so an
+    operator clicking re-run produces byte-identical output by construction.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_units "
+        "WHERE run_id = ? AND status IN ('ready', 'in_progress')", (run_id,),
+    ).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def set_build_outcome(build_id: str, status: str, reopened_count: int = 0) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE modernization_builds SET status = ?, reopened_count = ? WHERE id = ?",
+                 (status, reopened_count, build_id))
+    conn.commit()
+    conn.close()
+
+
+def list_builds(run_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM modernization_builds WHERE run_id = ? ORDER BY round DESC LIMIT ?",
+        (run_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def latest_build(run_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM modernization_builds WHERE run_id = ? ORDER BY round DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_diagnostics(run_id: str, build_id: str = "", severity: str = "",
+                     unit_id: str = "", limit: int = 1000) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_diagnostics WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if build_id:
+        sql += " AND build_id = ?"
+        params.append(build_id)
+    if severity:
+        sql += " AND severity = ?"
+        params.append(severity)
+    if unit_id:
+        sql += " AND unit_id = ?"
+        params.append(unit_id)
+    sql += " ORDER BY severity, file, line LIMIT ?"
+    params.append(limit)
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def diagnostics_for_unit(run_id: str, unit_id: str, build_id: str = "",
+                         limit: int = 60) -> List[Dict[str, Any]]:
+    """What the compiler said about this unit's output, for the rework prompt."""
+    return list_diagnostics(run_id, build_id=build_id, unit_id=unit_id, limit=limit)
+
+
 def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, Any]]:
     """The public signatures a unit's dependencies exported.
 
@@ -1145,7 +1565,14 @@ def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, An
 def list_artifacts(run_id: str, current_only: bool = True,
                    include_content: bool = False) -> List[Dict[str, Any]]:
     conn = get_connection()
-    sql = "SELECT * FROM modernization_artifacts WHERE run_id = ?"
+    # `SELECT *` only when the caller wants the content. Selecting it and popping it
+    # afterwards materialises the whole converted codebase in memory to answer questions
+    # like "which paths exist" — which is what mapping a build's diagnostics does, on a
+    # request that may name hundreds of files.
+    columns = "*" if include_content else \
+        "id, run_id, unit_id, path, version, purpose, validation_json, is_current, " \
+        "created_at, LENGTH(content) AS size_chars"
+    sql = f"SELECT {columns} FROM modernization_artifacts WHERE run_id = ?"
     if current_only:
         sql += " AND is_current = 1"
     sql += " ORDER BY path, version"
@@ -1155,7 +1582,7 @@ def list_artifacts(run_id: str, current_only: bool = True,
     for row in rows:
         artifact = dict(row)
         if not include_content:
-            artifact["size_chars"] = len(artifact.get("content") or "")
+            artifact["size_chars"] = int(artifact.get("size_chars") or 0)
             artifact.pop("content", None)
         out.append(artifact)
     return out

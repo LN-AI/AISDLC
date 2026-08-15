@@ -30,14 +30,16 @@ import threading
 from typing import Any, Callable, Dict, List, Optional
 
 from backend.agents.modernization_intelligence import architect_agent, unit_converter
+from backend.agents.modernization_intelligence import comprehension_agent as _comprehension
 from backend.agents.modernization_intelligence.architect_agent import TargetArchitectAgent
 from backend.agents.modernization_intelligence.unit_converter import UnitConverterAgent
 from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
-    analyzers, architecture, comprehension, estimate, evidence, graph, playbooks, reconcile,
-    repo_ingest, scaffold, stages, store, validation,
+    analyzers, architecture, build_results, comprehension, estimate, evidence, graph,
+    playbooks, reconcile, repo_ingest, rules, scaffold, stages, store, validation,
 )
+from backend.services.modernization.scaffold import php_compat
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,14 @@ MAX_UNIT_ATTEMPTS = 3
 # Imported rather than hardcoded so the gate's ceiling and the call's actual budget cannot
 # drift apart — a quoted ceiling the provider is allowed to exceed is not a ceiling.
 _ARCHITECT_MAX_TOKENS = architect_agent.ARCHITECTURE_MAX_TOKENS
+
+# How much source one comprehension probe reads. Both caps are cost controls, and the file
+# cap is the one that matters: comprehension is priced per bundle at the assessment gate, so
+# these two numbers are what the operator is really approving. Deliberately well under the
+# gateway's input limit — a probe that has to be truncated would propose rules about code it
+# was not shown, and verification cannot catch that because the quote would still be genuine.
+_PROBE_MAX_CHARS = 60_000
+_PROBE_MAX_FILES = 12
 
 # v1 converts serially, on purpose. `topo_level` already proves which units are independent
 # of each other, so widening this later needs no new analysis — but correctness comes before
@@ -205,7 +215,14 @@ def set_charter(run_id: str, charter: Dict[str, Any], actor: str = "system") -> 
 # bundle plus one synthesis. Sized here rather than guessed at the gate so the number a
 # customer approves and the work that follows come from the same place.
 def _discovery_estimate(run_id: str) -> Dict[str, Any]:
-    units = store.list_units(run_id, kind="source_file")
+    """Everything Gate A is actually approving: the probes, the merge, and the architect.
+
+    Quoting only the architect would have been the same dishonesty the two-gate split exists
+    to remove — comprehension runs between this gate and the next one, so its cost belongs
+    here. `rules.bundle` is a pure function of the inventory, which is what makes the call
+    count a fact rather than a forecast: the run will make exactly this many probe calls.
+    """
+    units = store.list_units(run_id, kind="source_file", include_source=True)
     # The architect is shown the inventory, not the source: one row per file, and the row is
     # short. That is why understanding a codebase is affordable at all.
     inventory_chars = sum(len(u["path"]) + 60 for u in units)
@@ -213,9 +230,38 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
     expected_output = min(400 + 60 * max(len(units), 1),
                           _ARCHITECT_MAX_TOKENS)
     numbers = estimate.band(input_tokens, expected_output, _ARCHITECT_MAX_TOKENS)
-    return {"calls": 1, "expected_usd": numbers["expected_usd"],
-            "ceiling_usd": numbers["ceiling_usd"], "model": numbers["model"],
-            "price_is_estimated": numbers["estimated"]}
+    calls = 1
+    expected = numbers["expected_usd"]
+    ceiling = numbers["ceiling_usd"]
+    estimated = numbers["estimated"]
+
+    # Probes read the source itself, so unlike the architect they are priced from measured
+    # characters rather than from a row count.
+    bundles = rules.bundle(units, max_chars=_PROBE_MAX_CHARS, max_files=_PROBE_MAX_FILES) \
+        if units else []
+    for group in bundles:
+        chars = sum(len((u.get("source_text") or "")) for u in group)
+        probe = estimate.band(
+            estimate.tokens("x" * chars) + estimate.PROMPT_FRAME_TOKENS,
+            _comprehension.PROBE_MAX_TOKENS // 2, _comprehension.PROBE_MAX_TOKENS)
+        calls += 1
+        expected += probe["expected_usd"]
+        ceiling += probe["ceiling_usd"]
+        estimated = estimated or probe["estimated"]
+    if len(bundles) > 1:
+        # Synthesis reads probe output, not source — bounded by what the probes could emit.
+        merge = estimate.band(
+            len(bundles) * _comprehension.PROBE_MAX_TOKENS // 2 + estimate.PROMPT_FRAME_TOKENS,
+            _comprehension.SYNTHESIS_MAX_TOKENS // 2, _comprehension.SYNTHESIS_MAX_TOKENS)
+        calls += 1
+        expected += merge["expected_usd"]
+        ceiling += merge["ceiling_usd"]
+        estimated = estimated or merge["estimated"]
+
+    return {"calls": calls, "expected_usd": round(expected, 4),
+            "ceiling_usd": round(ceiling, 4), "model": numbers["model"],
+            "price_is_estimated": bool(estimated),
+            "comprehension_calls": len(bundles) + (1 if len(bundles) > 1 else 0)}
 
 
 def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
@@ -242,9 +288,11 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
             f"{stats.get('edges', 0)} dependency edge(s), {len(stats.get('cycles') or [])} "
             f"circular group(s), {stats.get('secrets_redacted', 0)} secret(s) redacted, and "
             f"observed {observed}.\n\n"
-            f"The next step designs the target architecture for "
-            f"{charter['target_stack']} and produces a costed, per-component conversion plan. "
-            f"{estimate.describe(numbers, run.get('budget_cap_usd'))}\n\n"
+            f"The next step reads the source for what the application *does* "
+            f"({numbers.get('comprehension_calls', 0)} pass(es) over the code, each business "
+            f"rule checked against the file it cites), designs the target architecture for "
+            f"{charter['target_stack']}, and produces a costed, per-component conversion "
+            f"plan. {estimate.describe(numbers, run.get('budget_cap_usd'))}\n\n"
             f"Nothing has been spent yet. You will be asked again, with a real number, before "
             f"any file is converted."
         ),
@@ -510,14 +558,49 @@ def _plan_stage(run_id: str, stage, run: Dict[str, Any]) -> int:
             "topo_level": 0,
             "order_index": 0,
         }])
-    # comprehension / synthesis are Phase 1b: the digest they will fill is rendered
-    # deterministically from evidence until then, so producing no rows here skips the stage
-    # rather than leaving a hole.
+    if stage.id == "comprehension":
+        # One row per bundle, one call per row. The bundler is deterministic (a probe
+        # boundary decides which files are read together, which decides which rules are
+        # found — a bundler that shuffled would make two runs over one codebase disagree
+        # about what the application does), so re-planning after a crash regroups
+        # identically. It never runs, though: `stage_units_exist` is the resume cursor.
+        source_units = store.list_units(run_id, kind="source_file", include_source=True)
+        if not source_units:
+            return 0
+        bundles = rules.bundle(source_units, max_chars=_PROBE_MAX_CHARS,
+                               max_files=_PROBE_MAX_FILES)
+        return store.insert_units(run_id, [{
+            "path": f"#comprehension/{i:04d}",
+            "kind": "comprehension",
+            "module_type": "comprehension",
+            "status": "ready",
+            "topo_level": 0,
+            "order_index": i,
+            "meta": {"members": [u["path"] for u in group]},
+        } for i, group in enumerate(bundles)])
+    if stage.id == "synthesis":
+        # Only worth a call when there is more than one reading to merge. A single probe
+        # already saw the whole codebase, so synthesising it would pay for a paraphrase.
+        if store.stage_outstanding(run_id, "comprehension") or \
+                len(store.list_units(run_id, kind="comprehension")) < 2:
+            return 0
+        return store.insert_units(run_id, [{
+            "path": "#synthesis/0001",
+            "kind": "synthesis",
+            "module_type": "synthesis",
+            "status": "ready",
+            "topo_level": 0,
+            "order_index": 0,
+        }])
     return 0
 
 
 def _produce(run_id: str, stage, unit: Dict[str, Any], charter: Dict[str, Any],
              caller: dict, llm_override: Optional[dict], project_name: str) -> str:
+    if stage.id == "comprehension":
+        return _probe_one(run_id, unit, charter, caller, llm_override, project_name)
+    if stage.id == "synthesis":
+        return _synthesize_one(run_id, unit, charter, caller, llm_override, project_name)
     if stage.id == "design":
         return _design_one(run_id, unit, charter, caller, llm_override, project_name)
     if stage.id == "scaffold":
@@ -537,6 +620,126 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
                 detail=reconcile.describe(report)[:4000],
                 blocking=False,
             )
+
+
+def _probe_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
+               caller: dict, llm_override: Optional[dict], project_name: str) -> str:
+    """One bundle of source files read for what the application *does*.
+
+    The rules it proposes are claims, not evidence — so they are checked against the files
+    they cite before anything stores them as confirmed (D-04 applies to a business rule
+    exactly as it applies to a dependency edge). A rule whose quote is not in the file it
+    names is kept as `rejected` rather than dropped: the reject list is how anyone judges
+    whether the pass is worth its money.
+    """
+    members = (unit.get("meta") or {}).get("members") or []
+    # Only this probe's own files. Loading the whole inventory with `include_source=True`
+    # here would read the entire codebase out of SQLite once per probe — 40 probes over a
+    # 500-file codebase is 40 full loads to assemble twelve files each time.
+    by_path = {u["path"]: u for u in store.units_by_path(run_id, members)}
+    files = [{"path": p, "source_text": (by_path.get(p) or {}).get("source_text") or ""}
+             for p in members if p in by_path]
+    if not files:
+        store.set_unit_status(unit["id"], "skipped", "no source files in this bundle")
+        return "converted"
+
+    try:
+        result = agent_guard.guarded_call(
+            caller, "modernization", llm_override, project_name=project_name,
+            fn=lambda: _comprehension.probe(
+                files=files,
+                evidence=store.list_evidence(run_id),
+                charter=charter,
+                run_id=run_id,
+                llm_override=llm_override,
+            ),
+        )
+    except Exception as exc:
+        return _handle_stage_exception(run_id, unit, exc, "this part of the codebase")
+
+    cost = ((result or {}).get("_budget_stats") or {}).get("cost_usd") or 0.0
+    if cost:
+        store.add_run_spend(run_id, float(cost))
+
+    checked = rules.verify(run_id, (result or {}).get("rules") or [],
+                           {f["path"]: f["source_text"] for f in files})
+    for rule in checked["confirmed"] + checked["rejected"]:
+        rule["unit_id"] = unit["id"]
+    store.insert_rules(run_id, checked["confirmed"] + checked["rejected"])
+
+    store.set_unit_meta(unit["id"], {
+        "purpose": (result or {}).get("purpose") or "",
+        "capabilities": (result or {}).get("capabilities") or [],
+        "integrations": (result or {}).get("integrations") or [],
+        "risks": (result or {}).get("risks") or [],
+        "open_questions": (result or {}).get("open_questions") or [],
+        "rule_counts": checked["counts"],
+    })
+    store.complete_unit(
+        unit_id=unit["id"], run_id=run_id, artifacts=[], symbols=[], cost_usd=float(cost),
+        event_detail=(f"{len(files)} file(s) read; {checked['counts']['confirmed']} rule(s) "
+                      f"confirmed, {checked['counts']['rejected']} rejected as unverifiable"),
+    )
+    return "converted"
+
+
+def _synthesize_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
+                    caller: dict, llm_override: Optional[dict], project_name: str) -> str:
+    """Merge every probe's reading into one portrait. One call, over probe output only.
+
+    Deliberately not given the source again: this stage resolves disagreements between
+    readings, and re-reading the codebase to do it would pay twice for the same files.
+    """
+    probes = [u for u in store.list_units(run_id, kind="comprehension")
+              if u["status"] == "converted"]
+    results = [{**(u.get("meta") or {}), "scope": (u.get("meta") or {}).get("members") or []}
+               for u in probes]
+    if not results:
+        store.set_unit_status(unit["id"], "skipped", "no probe survived to be merged")
+        return "converted"
+
+    try:
+        portrait = agent_guard.guarded_call(
+            caller, "modernization", llm_override, project_name=project_name,
+            fn=lambda: _comprehension.synthesize(
+                probe_results=results, charter=charter, run_id=run_id,
+                llm_override=llm_override,
+            ),
+        )
+    except Exception as exc:
+        return _handle_stage_exception(run_id, unit, exc, "the system portrait")
+
+    cost = ((portrait or {}).get("_budget_stats") or {}).get("cost_usd") or 0.0
+    if cost:
+        store.add_run_spend(run_id, float(cost))
+
+    store.set_unit_meta(unit["id"], {k: (portrait or {}).get(k)
+                                     for k in ("system_purpose", "primary_capabilities",
+                                               "actors", "data_lifecycle",
+                                               "cross_cutting_concerns", "conventions",
+                                               "contradictions")})
+    contradictions = (portrait or {}).get("contradictions") or []
+    if contradictions:
+        # Two probes reading the same system differently is worth a human's attention before
+        # the architect designs against one of them. Non-blocking: it is a caveat on the
+        # portrait, not a reason to stop a run that can still proceed.
+        store.create_checkpoint(
+            run_id, "comprehension_contradiction",
+            f"{len(contradictions)} part(s) of the codebase were read two different ways",
+            # Through the same renderer as the digest: the schema makes a contradiction an
+            # object (`subject`, `readings`, `why_it_matters`), and a str-only join would put
+            # the *count* in front of a human with an empty body underneath it — which is
+            # the one outcome this checkpoint exists to prevent.
+            detail="\n".join(comprehension._bullets(contradictions))[:3000],
+            unit_id=unit["id"], blocking=False,
+        )
+    store.complete_unit(
+        unit_id=unit["id"], run_id=run_id, artifacts=[], symbols=[], cost_usd=float(cost),
+        needs_human_review=bool(contradictions),
+        event_detail=(f"{len(results)} probe(s) merged, "
+                      f"{len(contradictions)} contradiction(s)"),
+    )
+    return "converted"
 
 
 def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
@@ -635,6 +838,22 @@ def _scaffold_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) ->
         )
         return "converted"
 
+    # The source-language semantics shim, when there is one. This is a scaffold file for the
+    # same reason the `.csproj` is: the playbook *instructs* every converted file to call
+    # `PhpCompat.LooseEquals` rather than re-deriving PHP's `==`, and a promised helper that
+    # nothing emits is a guaranteed compile error in every file that obeyed. Asking the model
+    # for it per file would instead produce 200 subtly different implementations of PHP
+    # truthiness, each of which reviews as correct on its own.
+    shim_symbols: List[Dict[str, Any]] = []
+    if php_compat.is_applicable(run.get("source_language") or "", charter):
+        root = proposed[0].get("name") or "Converted"
+        # Under the project directory, not at the export root: an SDK-style `.csproj` globs
+        # `**/*.cs` beneath itself, so a file above it is never compiled — which is the same
+        # end state as never emitting it, arrived at less visibly.
+        shim_dir = f"{root}/{php_compat.PHP_COMPAT_NAMESPACE_SUFFIX}"
+        files = list(files) + [php_compat.emit(root, output_dir=shim_dir)]
+        shim_symbols = php_compat.symbols(root, output_dir=shim_dir)
+
     artifacts = []
     for entry in files:
         safe = repo_ingest.safe_relpath(entry["path"])
@@ -642,8 +861,10 @@ def _scaffold_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) ->
             artifacts.append({"path": safe, "content": entry["content"],
                               "purpose": entry.get("purpose", "")})
     store.complete_unit(
-        unit_id=unit["id"], run_id=run_id, artifacts=artifacts, symbols=[],
-        event_detail=f"{len(artifacts)} scaffold file(s), no model call",
+        unit_id=unit["id"], run_id=run_id, artifacts=artifacts, symbols=shim_symbols,
+        event_detail=(f"{len(artifacts)} scaffold file(s), no model call"
+                      + (f"; {len(shim_symbols)} compatibility symbol(s) registered"
+                         if shim_symbols else "")),
     )
     return "converted"
 
@@ -910,6 +1131,13 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         "rationale": meta.get("rationale") or "",
     }
 
+    # A reopened unit is the only one with anything to say here, and the check is a column
+    # already on the row — so the common case (first conversion of every unit in the run)
+    # costs no query at all. Without this the rework loop is a no-op: the second attempt
+    # sends a byte-identical prompt, produces the same output, and trips the stuck guard.
+    build_diagnostics = (build_results.summarize_for_prompt(run_id, unit["id"])
+                         if (unit.get("rework_attempts") or 0) > 0 else "")
+
     try:
         result = agent_guard.guarded_call(
             caller, "modernization", llm_override,
@@ -928,6 +1156,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                 placement=placement,
                 members=members,
                 source_facts=source_facts,
+                build_diagnostics=build_diagnostics,
             ),
         )
     except Exception as exc:

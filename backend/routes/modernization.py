@@ -20,23 +20,30 @@ by polling. Only conversion goes to a background job.
 """
 import io
 import logging
+import re
 import zipfile
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend import scope
+from backend import config, scope
 from backend.routes.v1_agents import get_caller
 from backend.services import agent_guard
+from backend.services.orchestrator import SDLCOrchestrator
 from backend.services.modernization import advice
 from backend.services.modernization import charter as charter_module
-from backend.services.modernization import reconcile, repo_ingest, runner, stages, store
+from backend.services.modernization import (
+    build_results, reconcile, repo_ingest, runner, stages, store,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/modernization", tags=["Modernization"])
+
+_orch = SDLCOrchestrator()
 
 # A run's inventory is the whole codebase; these endpoints never return source or artifact
 # content unless one specific unit was asked for.
@@ -80,6 +87,38 @@ class StopRequest(BaseModel):
     reason: str = ""
 
 
+class BuildDiagnostic(BaseModel):
+    file: str = ""
+    line: int = 0
+    col: int = 0
+    severity: str = "error"
+    code: str = ""
+    message: str = ""
+
+
+class GithubPrRequest(BaseModel):
+    owner: str = Field(..., description="GitHub account or organisation that owns the target repo.")
+    repo: str = Field(..., description="Target repository. Usually a *new* one, not the legacy repo.")
+    callback_url: str = Field(
+        "", description="Where the build workflow POSTs its diagnostics. Defaults to this "
+                        "run's build-results endpoint under PUBLIC_BASE_URL.")
+    base_branch: str = Field("", description="Branch to build on. Defaults to the repo's default.")
+    dotnet_version: str = "8.0.x"
+
+
+class BuildResultsRequest(BaseModel):
+    """Either shape is accepted, because both producers are real: a CI job with a problem
+    matcher sends `diagnostics`, and a developer who just ran `dotnet build` sends `log`."""
+    diagnostics: Optional[List[BuildDiagnostic]] = Field(
+        None, description="Structured compiler messages.")
+    log: Optional[str] = Field(
+        None, description="Raw MSBuild/dotnet build output, parsed server-side.")
+    source: str = Field("external", description="Who compiled it — e.g. 'github_actions'.")
+    branch: str = ""
+    commit_sha: str = ""
+    command: str = Field("", description="What was run, recorded for the audit trail.")
+
+
 # ── Access ─────────────────────────────────────────────────────────────────
 
 def _require_run(run_id: str, caller: dict) -> Dict[str, Any]:
@@ -107,6 +146,11 @@ def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
     total = counts["total"] or 1
     settled = counts["converted"] + counts["failed"] + counts["skipped"]
     stage = stages.get(run.get("phase") or "")
+    # Both are one small query and both change what the screen offers, so they ride on the
+    # poll rather than costing a second round trip: a run that has compiled is in a different
+    # conversation with its operator than one that never has.
+    last_build = store.latest_build(run["id"]) if run.get("build_round") else None
+    rule_counts = store.rule_counts(run["id"])
     return {
         **{k: v for k, v in run.items() if k not in ("redactions",)},
         "units": counts,
@@ -118,6 +162,8 @@ def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
                    "total": len(stages.ORDER)} if stage else None),
         "open_checkpoints": len(checkpoints),
         "blocking_checkpoints": sum(1 for c in checkpoints if c.get("blocking")),
+        "last_build": last_build,
+        "rules_confirmed": rule_counts.get("confirmed", 0),
         # Count only. The map itself carries paths and line numbers and is available on its
         # own endpoint; putting it on every poll would be noise.
         "redaction_count": len(run.get("redactions") or []),
@@ -305,6 +351,101 @@ def list_evidence(run_id: str, kind: str = "", limit: int = 2000,
     rows = store.list_evidence(run_id, kind=kind, limit=min(limit, 5000))
     return {"count": len(rows), "counts_by_kind": store.evidence_counts(run_id),
             "evidence": rows}
+
+
+@router.get("/runs/{run_id}/rules", summary="Business rules found in the source, with citations")
+def list_rules(run_id: str, status: str = "confirmed", caller: dict = Depends(get_caller)):
+    """What the comprehension pass claims the application does, each pinned to a line.
+
+    Defaults to `confirmed` because a *proposed* rule has not yet been checked against the
+    file it cites, and an unverified claim rendered as a finding is exactly the failure mode
+    D-04 exists to prevent. Pass `status=proposed` or `status=rejected` to audit the pass
+    itself — the rejects are the more interesting read.
+    """
+    _require_run(run_id, caller)
+    return {"counts": store.rule_counts(run_id),
+            "rules": store.list_rules(run_id, status=status)}
+
+
+@router.post("/runs/{run_id}/build-results", summary="Report compiler diagnostics for a run")
+def report_build_results(run_id: str, req: BuildResultsRequest,
+                         caller: dict = Depends(get_caller)):
+    """Close the loop: whatever compiled the converted code reports what broke.
+
+    This endpoint — not the sandbox worker — is the interface. A GitHub Actions job, a
+    developer pasting the output of `dotnet build`, and a future sandbox worker are three
+    producers of the same contract, so the platform never has to know which one ran. That is
+    also what keeps D-05 true: nothing is compiled on this host, results merely arrive here.
+
+    Failing units go back to `ready` and the existing claim loop re-converts them, which is
+    why the fix loop needed no new execution model. Resume the run afterwards.
+    """
+    _require_run(run_id, caller)
+    try:
+        return build_results.ingest(run_id, req.model_dump(exclude_none=True), _actor(caller))
+    except build_results.BuildReportError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.post("/runs/{run_id}/github-pr", summary="Push the converted code and open a PR")
+def open_github_pr(run_id: str, req: GithubPrRequest, caller: dict = Depends(get_caller)):
+    """Commit this run's converted codebase to a branch and open a pull request carrying a
+    build workflow that reports its compiler output back here.
+
+    This is the door to the fix loop. Without it `build-results` only ever receives what
+    somebody pastes by hand — which works, and is not a product.
+
+    The target repository is named explicitly rather than inferred from the run's source: a
+    PHP → .NET conversion usually belongs in a *new* repository, so guessing would be wrong
+    more often than right.
+    """
+    _require_run(run_id, caller)
+    callback = (req.callback_url or "").strip() or (
+        f"{config.PUBLIC_BASE_URL}/api/v1/modernization/runs/{run_id}/build-results"
+        if config.PUBLIC_BASE_URL else "")
+    if not callback:
+        raise HTTPException(400, (
+            "No callback URL. GitHub Actions has to reach this deployment to report the "
+            "build, and that address cannot be derived from this request — behind a proxy "
+            "it would resolve to localhost, and the PR would silently never report. Set "
+            "PUBLIC_BASE_URL, or pass callback_url."))
+    if _unreachable_from_ci(callback):
+        raise HTTPException(400, (
+            f"'{callback}' is not reachable from a GitHub Actions runner, so the build would "
+            f"run and report nothing — which looks exactly like a build nobody triggered."))
+    try:
+        return _orch.modernization_pr(
+            run_id=run_id, owner=req.owner, repo=req.repo, callback_url=callback,
+            base_branch=req.base_branch, dotnet_version=req.dotnet_version)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+def _unreachable_from_ci(url: str) -> bool:
+    """A loopback or private-network callback fails in a way nobody sees: the workflow runs,
+    the `curl` fails, and the platform simply never hears back."""
+    host = (urlparse(url).hostname or "").lower()
+    return (host in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "")
+            or host.endswith(".local")
+            or host.startswith(("10.", "192.168.", "169.254."))
+            or bool(re.match(r"^172\.(1[6-9]|2\d|3[01])\.", host)))
+
+
+@router.get("/runs/{run_id}/builds", summary="Build attempts and their diagnostics")
+def list_builds(run_id: str, build_id: str = "", severity: str = "",
+                limit: int = 500, caller: dict = Depends(get_caller)):
+    """Rounds newest first, plus the messages for one of them. `fingerprint` is what the
+    stuck-loop guard compares: two consecutive rounds with the same value mean the model is
+    regenerating the same broken file and the run stops for a human."""
+    _require_run(run_id, caller)
+    builds = store.list_builds(run_id)
+    target = build_id or (builds[0]["id"] if builds else "")
+    return {
+        "builds": builds,
+        "selected_build_id": target,
+        "diagnostics": (store.list_diagnostics(run_id, build_id=target, severity=severity,
+                                               limit=min(limit, 2000)) if target else []),
+    }
 
 
 @router.get("/runs/{run_id}/charter-suggestions",

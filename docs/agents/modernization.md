@@ -29,14 +29,22 @@ Modernization is a different shape, not a bigger version:
 ```
 ingest → parse → dependency graph → evidence          $0, synchronous, no model call
   └──▶ GATE 1  discovery_approval — "assess this for ~$4.20?"
+comprehend  what the application *does* — one call per bundle of related
+            files, each proposed business rule checked against the source
+            it cites before it is allowed to influence anything
+synthesize  one call merging every probe into a system portrait
 design      N source files → M components, with an explicit
             output-directory and namespace map for the whole run
 plan        per-component effort, risk and cost — computed, not guessed
   └──▶ GATE 2  plan_approval — the real number, per component
-scaffold    .sln / .csproj / Program.cs / appsettings   (no model call at all)
+scaffold    .sln / .csproj / Program.cs / appsettings / PhpCompat.cs
+            (no model call at all)
 convert     per component, in dependency order
 reconcile   duplicate types, namespace drift, unimplemented interfaces,
             stray files, entry-point coverage
+  └──▶ build results POST back → failing units reopen → re-convert
+            (bounded: 3 rework attempts per unit, 5 rounds per run, and a
+             blocking stop when two builds report identical errors)
 ```
 
 Ingest, redaction, dependency analysis and evidence extraction are synchronous and **cost nothing**. Three gates exist before the codebase is converted, all deliberate:
@@ -74,6 +82,10 @@ The unit of conversion is a *component*, not a file. A legacy page-script is mar
 | `GET` | `/runs/{id}/evidence` | What the parsers observed, each row with a path and a line |
 | `GET` | `/runs/{id}/plan` | The costed conversion plan |
 | `GET` | `/runs/{id}/reconciliation` | Cross-file consistency of the output |
+| `GET` | `/runs/{id}/rules` | Business rules found in the source, each cited to a line (`?status=` — defaults to `confirmed`) |
+| `POST` | `/runs/{id}/build-results` | Report compiler diagnostics — structured rows or a raw `dotnet build` log |
+| `GET` | `/runs/{id}/builds` | Build rounds and their messages |
+| `POST` | `/runs/{id}/github-pr` | Push the converted code to a branch and open a PR carrying the build workflow |
 | `GET` | `/runs/{id}/symbols` | The run's symbol registry |
 | `GET` | `/runs/{id}/redactions` | Where secrets were removed — path, line, category |
 | `GET` | `/runs/{id}/checkpoints` | Decisions the run is waiting on |
@@ -91,7 +103,9 @@ The unit of conversion is a *component*, not a file. A legacy page-script is mar
 - **Constructs with no safe equivalent are reported, never translated.** `eval`, variable variables, dynamic includes, `extract`, `unserialize` on request data and shell-outs must come back marked `// MIGRATION-BLOCKED:` — output that quietly resolved one instead **fails validation**. An `eval` turned into a `switch` over the three visible cases looks converted, passes review, and drops every case that was not visible.
 - **Cycles are broken deterministically and never silently.** Strongly-connected components are detected; members share an `scc_group`, the intra-cycle edges are removed so the group can convert at all, each member is told which of its siblings does not exist yet, and a checkpoint records it. Cycle checkpoints are non-blocking — legacy code is full of them, and blocking on each would stall every real codebase at file zero — but they appear on the plan you approve.
 - **One transaction per converted file is the checkpoint.** Artifacts, symbols, the unit's status and its dependents' readiness all commit together. A crash costs at most one file's tokens, and that boundary coincides exactly with the LLM call boundary. Restart recovery returns in-flight units to the queue and pauses the run; resume continues from the next unconverted file and re-converts nothing.
-- **Validation is Tier 0 — thorough, and it executes nothing.** Placeholder detection (`// ... rest unchanged` is a failure, not a warning), bracket/string structural checks, exact `ast.parse` for Python output, unresolved-symbol checks against the run's registry, and a secret re-scan on every emitted file. **The output is never compiled and no tests are run.** Build it in your own CI before treating it as done — the export zip says so too.
+- **Validation is Tier 0 — thorough, and it executes nothing.** Placeholder detection (`// ... rest unchanged` is a failure, not a warning), bracket/string structural checks, exact `ast.parse` for Python output, unresolved-symbol checks against the run's registry, and a secret re-scan on every emitted file. **Nothing is ever compiled on this host.**
+- **The compiler's verdict comes back into the loop.** Whatever built the code — a GitHub Actions job the PR workflow installs, or a developer pasting `dotnet build` output — reports diagnostics to `POST /runs/{id}/build-results`. Each message is mapped back to the unit that emitted the file, failing units return to `ready`, and the ordinary conversion loop re-converts them with the compiler's own errors in the prompt. Bounded on three axes so it cannot oscillate: three rework attempts per unit, five rounds per run, and an immediate blocking stop if two consecutive builds report an identical set of errors — because a model that cannot fix an error will regenerate the same file indefinitely.
+- **Business rules are verified, not asserted.** The comprehension pass proposes rules, each quoting the source it claims to be reading. Every quote is checked against the real file; the model's line number is discarded and replaced with where the quote actually is; anything unverifiable is stored as `rejected` with a reason and **never reaches a prompt**. The rejects are kept and readable on `/runs/{id}/rules?status=rejected` — a verifier whose failures are invisible is indistinguishable from one that passes everything.
 - **Metered per converted file**, so cost is real per file, budget accrues as it goes, and `budget_cap_usd` pauses the run rather than discovering an overspend at the end.
 
 ## Cost control
@@ -102,9 +116,9 @@ The unit of conversion is a *component*, not a file. A legacy page-script is mar
 
 ## Deliberately not here yet
 
-- **Compiling.** Running a build on generated code derived from customer source is arbitrary code execution on the API host, and a real build needs the real SDK anyway. The correct home for it is your CI, reached by pushing a branch — the export now contains a solution and project files precisely so `dotnet restore && dotnet build` is the first thing you can try.
-- **Business-rule reconstruction.** The run records what the codebase *contains* — frameworks, entry points, routes, tables, data-access sites — and not what it *does*. The slot in the system prompt that a comprehension pass would fill already exists and is already frozen at the right moment.
-- **Writing to your git.** Export is a zip.
+- **Compiling *here*.** Running a build on generated code derived from customer source is arbitrary code execution on the API host. The build happens in your CI or on your machine and reports back — see the build loop above. What does not exist yet is an opt-in sandbox worker that would do it for you.
+- **Running the legacy application.** No screenshots, no crawl of the old UI, no parity test that replays a recorded legacy response against the converted one. This is the strongest accept criterion in the field and it needs a container runtime, so it belongs with the sandbox worker.
+- **Tracing a rule forward.** A confirmed business rule is cited back to its source line, but nothing links it to the converted file that implements it — so "was this rule preserved?" is still a manual read.
 - **Parallel conversion.** `topo_level` already proves which components are independent, so widening it later needs no new analysis — but correctness comes before throughput here, and SQLite write contention is the most likely thing to bite first.
 - **Language auto-detection beyond the file extension.**
 
@@ -148,6 +162,8 @@ curl -OJ https://your-host/api/v1/modernization/runs/$RUN/export -H "X-API-Key: 
 
 ## Verification
 
-`python scripts/smoke_modernization.py` — offline, free, deterministic. 368 checks covering path safety, redaction, the analyzers, graph ordering and cycle detection, charter validation, Tier-0 validation, claim-and-lease, a full run end to end (asserting every unit converted after everything it depends on, that both gates carry real numbers, that every artifact landed under its component's directory, and that the scaffold cost zero model calls), a simulated crash and resume (asserting nothing already converted is re-converted), failure isolation, the budget cap, the HTTP surface, the PHP language pack — whose assertions run **twice**, once with tree-sitter forced off, so the fail-open path is exercised rather than merely intended — and the charter suggestions (zero model calls, byte-identical on a second pass, no redacted value in any option or citation, and an unrecognised language pair still answering every required field with nothing .NET-specific in it).
+`python scripts/smoke_modernization.py` — offline, free, deterministic. 456 checks covering path safety, redaction, the analyzers, graph ordering and cycle detection, charter validation, Tier-0 validation, claim-and-lease, a full run end to end (asserting every unit converted after everything it depends on, that both gates carry real numbers, that every artifact landed under its component's directory, and that the scaffold cost zero model calls), a simulated crash and resume (asserting nothing already converted is re-converted), failure isolation, the budget cap, the HTTP surface, the PHP language pack — whose assertions run **twice**, once with tree-sitter forced off, so the fail-open path is exercised rather than merely intended — the charter suggestions (zero model calls, byte-identical on a second pass, no redacted value in any option or citation, and an unrecognised language pair still answering every required field with nothing .NET-specific in it), the build loop (real MSBuild output parsed in both slash directions and de-duplicated across referencing projects; a fingerprint that survives line-number churn but not a changed error; all five ingest outcomes over HTTP; a reopened component's members ceasing to count as converted files; and a unit at the rework limit being named rather than looped on), and comprehension (a rule with a genuine quote confirmed *and its line corrected*, an invented one rejected with a reason and kept out of the prompt, and — the check worth the most — that a re-conversion prompt actually differs from the first one, without which the entire fix loop is a no-op that trips its own stuck guard on round two).
+
+What none of it does is compile anything or call a real model. The build loop is verified in every part and has never been run end to end against a real compiler; see C-42 in `DECISIONS.md`.
 
 `node scripts/smoke_render.js` — the browser rendering, against a DOM stub with no dependencies. Includes the charter form: that it arrives pre-filled from the recommended option, that its evidence is on screen rather than only in a tooltip, and that a failed suggestions fetch still leaves a form the user can fill in by hand.

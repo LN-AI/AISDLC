@@ -5780,16 +5780,35 @@ function renderModernizationRun(run, checkpoints, units, components) {
         ${working ? '<button class="btn btn-secondary" onclick="pauseModernizationRun()">Pause</button>' : ''}
         ${u.converted ? '<button class="btn btn-secondary" onclick="exportModernizationRun()">Download converted code</button>' : ''}
         ${(c.converted || terminal) ? '<button class="btn btn-secondary" onclick="showModernizationReconciliation()">Consistency report</button>' : ''}
+        ${run.build_round ? '<button class="btn btn-secondary" onclick="showModernizationBuilds()">Build results</button>' : ''}
+        ${run.rules_confirmed ? '<button class="btn btn-secondary" onclick="showModernizationRules()">Business rules</button>' : ''}
         ${terminal ? '' : '<button class="btn btn-link" onclick="cancelModernizationRun()">Cancel run</button>'}
       </div>
+      ${run.build_round ? renderModernizationBuildBadge(run) : ''}
     </div>
 
     ${needsCharter ? renderCharterForm(run) : ''}
     ${checkpoints.length ? renderModernizationCheckpoints(checkpoints) : ''}
     <div id="mod-reconciliation"></div>
+    <div id="mod-builds"></div>
+    <div id="mod-rules"></div>
     ${renderModernizationComponents(components)}
     ${renderModernizationUnits(units)}
   `;
+}
+
+function renderModernizationBuildBadge(run) {
+  // A run that has been through a build round is in a different conversation with the user
+  // than one that never compiled: the question is no longer "did it convert" but "does it
+  // build". Surfacing the round on the header is what makes the loop visible at all.
+  const b = run.last_build || {};
+  const clean = b.error_count === 0;
+  return `<div class="mod-meta" style="margin-top:8px">
+    Build round ${run.build_round}${b.source ? ' from ' + esc(b.source) : ''} ·
+    ${clean ? 'compiled with no errors' : `${b.error_count || 0} error(s)`}
+    ${b.warning_count ? ` · ${b.warning_count} warning(s)` : ''}
+    ${b.reopened_count ? ` · ${b.reopened_count} unit(s) sent back for rework` : ''}
+  </div>`;
 }
 
 function renderModernizationStages(run) {
@@ -5898,6 +5917,82 @@ async function showModernizationReconciliation() {
     </div>`;
   } catch (e) {
     box.innerHTML = `<div class="mod-panel">Could not run the consistency check: ${esc(e.message)}</div>`;
+  }
+}
+
+async function showModernizationBuilds() {
+  const box = document.getElementById('mod-builds');
+  if (!box) return;
+  box.innerHTML = '<div class="mod-panel">Loading build results…</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/builds`, { _silent: true });
+    const builds = r.builds || [];
+    const diags = r.diagnostics || [];
+    box.innerHTML = `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Build results</div>
+      <p class="subtitle" style="margin-top:-6px">What a real compiler said about the converted code. Units whose output failed to compile go back through conversion automatically, carrying these messages — which is the only check here that can prove the output is buildable rather than merely plausible.</p>
+      <div style="overflow:auto">
+        <table class="mod-unit-table">
+          <thead><tr><th>Round</th><th>Source</th><th>Errors</th><th>Warnings</th><th>Reopened</th><th>Outcome</th><th>When</th></tr></thead>
+          <tbody>${builds.map(b => `<tr>
+            <td>${b.round}</td>
+            <td>${esc(b.source || '')}</td>
+            <td>${b.error_count || 0}</td>
+            <td>${b.warning_count || 0}</td>
+            <td>${b.reopened_count || 0}</td>
+            <td><span class="mod-status ${esc(b.status)}">${esc((b.status || '').replace(/_/g, ' '))}</span></td>
+            <td class="mod-meta">${esc((b.created_at || '').replace('T', ' ').slice(0, 16))}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>
+      ${diags.length ? `<div class="section-title">Messages (${diags.length})</div>
+        <div style="max-height:360px;overflow:auto">
+          <table class="mod-unit-table">
+            <thead><tr><th>Severity</th><th>Code</th><th>File</th><th>Line</th><th>Message</th></tr></thead>
+            <tbody>${diags.map(d => `<tr>
+              <td><span class="compliance-chip">${esc(d.severity)}</span></td>
+              <td>${esc(d.code || '')}</td>
+              <td class="mod-unit-path" title="${esc(d.file)}">${esc(d.artifact_path || d.file)}${d.unit_id ? '' : ' <span class="compliance-chip">unowned</span>'}</td>
+              <td>${d.line || ''}</td>
+              <td>${esc(d.message || '')}</td>
+            </tr>`).join('')}</tbody>
+          </table>
+        </div>` : '<div class="mod-meta" style="margin-top:10px">The last build reported no messages.</div>'}
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="mod-panel">Could not load build results: ${esc(e.message)}</div>`;
+  }
+}
+
+async function showModernizationRules() {
+  // Its own container, not the builds panel: these answer different questions and an
+  // operator comparing a compiler error against the rule it broke needs both on screen.
+  const box = document.getElementById('mod-rules');
+  if (!box) return;
+  box.innerHTML = '<div class="mod-panel">Loading business rules…</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/rules`, { _silent: true });
+    const rules = r.rules || [];
+    const counts = r.counts || {};
+    const byCategory = {};
+    rules.forEach(x => { (byCategory[x.category || 'other'] = byCategory[x.category || 'other'] || []).push(x); });
+    box.innerHTML = `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Business rules found in the source</div>
+      <p class="subtitle" style="margin-top:-6px">What the application does, not how it is built. Every rule below was checked against the file it cites — a claim whose quote could not be found in the source was rejected rather than shown, which is why the count of rejects is worth reading too.</p>
+      <div class="mod-meta">${counts.confirmed || 0} confirmed · ${counts.rejected || 0} rejected as unverifiable · ${counts.proposed || 0} awaiting verification</div>
+      ${rules.length ? Object.keys(byCategory).sort().map(cat => `
+        <div class="section-title">${esc(cat.replace(/_/g, ' '))} (${byCategory[cat].length})</div>
+        <div style="max-height:300px;overflow:auto">
+          ${byCategory[cat].map(x => `<div class="mod-alert" style="margin-bottom:6px">
+            ${esc(x.statement)}
+            <div class="mod-meta" style="margin-top:4px">${esc(x.path)}:${x.line}${x.reject_reason ? ' — rejected: ' + esc(x.reject_reason.replace(/_/g, ' ')) : ''}</div>
+            ${x.quote ? `<pre class="mod-unit-path" style="margin:6px 0 0;white-space:pre-wrap">${esc(x.quote)}</pre>` : ''}
+          </div>`).join('')}
+        </div>`).join('')
+        : '<div class="mod-meta" style="margin-top:10px">No rules at this status.</div>'}
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="mod-panel">Could not load business rules: ${esc(e.message)}</div>`;
   }
 }
 

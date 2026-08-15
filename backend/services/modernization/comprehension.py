@@ -24,6 +24,7 @@ import logging
 from typing import Any, Dict, List
 
 from backend.services.modernization import evidence as evidence_module
+from backend.services.modernization import rules as rules_module
 from backend.services.modernization import store
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,12 @@ logger = logging.getLogger(__name__)
 # ceiling at which "one cache write, N-1 reads" stops being the best economics in the
 # product and starts being a tax on every call.
 MAX_ADDENDUM_CHARS = 60_000
+
+# The rules' share of that budget. Capped separately rather than left to the overall
+# truncation, because the tail of this block is where the rules live and a codebase with a
+# lot of them would otherwise push the deterministic evidence out of the prompt entirely —
+# losing the part that was free and provable to keep the part that was neither.
+MAX_RULES_CHARS = 16_000
 
 # How many distinct values of each kind reach the prompt. Ordered by frequency, so the cut
 # is always the long tail.
@@ -105,6 +112,9 @@ def render_digest(run_id: str, stats: Dict[str, Any] = None) -> str:
                      + (f" … and {len(values) - limit} more" if len(values) > limit else ""))
         lines.append("")
 
+    lines.extend(_portrait_section(run_id))
+    lines.extend(_rules_section(run_id))
+
     lines.append(
         "If something above contradicts the file you are given, the file wins — this is a "
         "portrait of the whole, and one file may legitimately be the exception. Say so in "
@@ -116,6 +126,97 @@ def render_digest(run_id: str, stats: Dict[str, Any] = None) -> str:
         text = text[:MAX_ADDENDUM_CHARS].rsplit("\n", 1)[0] + (
             "\n\n_(truncated — the full evidence set is on the run's evidence endpoint)_")
     return text
+
+
+def _bullets(value: Any) -> List[str]:
+    """Render a portrait field, whichever shape the schema gives it.
+
+    Half of `SYNTHESIS_TOOL_SCHEMA`'s arrays are arrays of *objects* (`actors` is
+    `{name, description}`, `cross_cutting_concerns` is `{concern, how_it_works}`) and half
+    are arrays of strings. A renderer that handled only strings dropped exactly the fields
+    the synthesis call exists to produce — `cross_cutting_concerns` is the pattern no single
+    file shows, which is the whole reason for paying for a pass that reads every probe.
+
+    Object keys are joined in the schema's declared order rather than sorted, so this stays
+    byte-stable regardless of how the dict was rebuilt (D-06).
+    """
+    if value is None or isinstance(value, (str, int, float)):
+        text = str(value or "").strip()
+        return [text] if text else []
+    if not isinstance(value, list):
+        return []
+    out: List[str] = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            # One pass in the dict's own order, so `subject — readings — why_it_matters`
+            # reads the way the schema declares it rather than scalars-then-lists.
+            parts = []
+            for value_part in item.values():
+                if isinstance(value_part, (str, int, float)):
+                    text_part = str(value_part).strip()
+                elif isinstance(value_part, list):
+                    text_part = ", ".join(
+                        str(x).strip() for x in value_part
+                        if isinstance(x, (str, int, float)) and str(x).strip())
+                else:
+                    continue
+                if text_part:
+                    parts.append(text_part)
+            text = " — ".join(parts)
+        else:
+            continue
+        if text:
+            out.append(f"- {text}")
+    return out
+
+
+def _portrait_section(run_id: str) -> List[str]:
+    """What the synthesis pass concluded the system is for.
+
+    Read from the unit's stored meta rather than re-derived, and rendered in a fixed field
+    order — this lands in the cached system block, so a section whose order followed a dict's
+    iteration order would change the prefix between two runs of the same codebase and cost
+    full price on every call.
+    """
+    units = [u for u in store.list_units(run_id, kind="synthesis") if u["status"] == "converted"]
+    meta = (units[0].get("meta") if units else None) or {}
+    if not meta:
+        return []
+    out: List[str] = []
+    for key, title in (
+        ("system_purpose", "What the system is for"),
+        ("primary_capabilities", "What it does"),
+        ("actors", "Who uses it"),
+        ("data_lifecycle", "How data moves through it"),
+        ("cross_cutting_concerns", "Patterns that appear throughout"),
+        ("conventions", "Conventions every converted file must honour"),
+    ):
+        rendered = _bullets(meta.get(key))
+        if not rendered:
+            # Emitted only when there is something under it. A heading with nothing beneath
+            # it is worse than an absent one here: it is frozen into the cached system block
+            # and re-read on every conversion call for the life of the run.
+            continue
+        out.append(f"### {title}")
+        out.append("")
+        out.extend(rendered)
+        out.append("")
+    # `contradictions` is deliberately absent: it is a caveat for the human reading the run,
+    # and telling every conversion call that two readings disagreed invites the model to pick
+    # one and act on it — silently, in whichever file happens to be in front of it.
+    return out
+
+
+def _rules_section(run_id: str) -> List[str]:
+    """Confirmed business rules only. A proposed rule is a claim nobody has checked, and the
+    whole point of verification is that it never reaches a prompt (D-04)."""
+    confirmed = store.list_rules(run_id, status="confirmed")
+    if not confirmed:
+        return []
+    block = rules_module.render_rules_block(confirmed, max_chars=MAX_RULES_CHARS)
+    return [block, ""] if block else []
 
 
 def build_and_freeze(run_id: str) -> str:

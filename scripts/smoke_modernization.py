@@ -23,6 +23,7 @@ Costs nothing and is safe to run on every change.
 """
 import io
 import os
+import re
 import sys
 import tempfile
 import traceback
@@ -36,10 +37,14 @@ os.environ["DATABASE_PATH"] = os.path.join(tempfile.mkdtemp(prefix="lmsdlc-mod-"
 from backend import database  # noqa: E402
 from backend.products import registry  # noqa: E402
 from backend.services import agent_guard, code_chunker, llm_gateway  # noqa: E402
+from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
-    analyzers, charter, evidence, graph, reconcile, repo_ingest, runner, store, validation,
+    analyzers, build_results, charter, comprehension, evidence, graph, reconcile,
+    repo_ingest, runner, rules as rules_module, store, validation,
 )
+from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
+from backend.services.modernization.scaffold import php_compat  # noqa: E402
 
 database.init_db()
 
@@ -59,6 +64,18 @@ def check(label, condition, detail=""):
     else:
         _failures += 1
         print(f"  FAIL  {label}" + (f"\n        {detail}" if detail else ""))
+
+
+def _raises(exc_type, fn):
+    """True when `fn` raises exactly what it should. A check that merely asserts something
+    failed would also pass on a TypeError from a signature change."""
+    try:
+        fn()
+    except exc_type:
+        return True
+    except Exception:
+        return False
+    return False
 
 
 # A real project and a resolved Subject, rather than a bare caller dict: the deployment's
@@ -527,6 +544,65 @@ def _fake_conversion(system_prompt, user_content):
     }
 
 
+def _fake_probe(user_content):
+    """A comprehension probe's answer, with one rule that verifies and one that does not.
+
+    Both matter. The quotes are lifted from the PHP fixture verbatim so verification has a
+    real match to find and a real line to correct to; the invented one proves an unverifiable
+    claim is rejected rather than stored, which is the only reason this stage is allowed to
+    steer conversion at all.
+    """
+    cited = "public/product.php" if "public/product.php" in user_content else ""
+    rules_out = [{
+        "statement": "A product page requires a logged-in session before building the cart",
+        "category": "authorization",
+        "path": cited or "public/index.php",
+        "line": 999,                       # deliberately wrong: verification must correct it
+        "quote": "$cart = new Cart($_SESSION['user_id']);" if cited else "include 'header.php';",
+    }, {
+        "statement": "Orders over five hundred dollars require manager approval",
+        "category": "workflow",
+        "path": cited or "public/index.php",
+        "line": 3,
+        "quote": "if ($order->total > 500) { require_manager_approval(); }",   # not in any file
+    }]
+    return {
+        "purpose": "Storefront pages that list and display products.",
+        "capabilities": ["browse products", "view one product"],
+        "rules": rules_out,
+        "integrations": [],
+        "risks": [],
+        "open_questions": [],
+    }
+
+
+def _fake_portrait():
+    """Shaped exactly as SYNTHESIS_TOOL_SCHEMA declares — `actors`, `cross_cutting_concerns`
+    and `contradictions` are arrays of *objects*, not of strings.
+
+    This matters more than it looks. A stub returning strings for those fields made a
+    renderer that silently dropped every dict appear to work, so the most expensive part of
+    the comprehension pass was discarded and nobody could tell. A stub that cannot produce a
+    response the real schema forbids is the only kind worth having."""
+    return {
+        "system_purpose": "A small PHP storefront.",
+        "primary_capabilities": ["browse products", "maintain a cart"],
+        "actors": [{"name": "shopper", "description": "browses the catalogue and buys"}],
+        "data_lifecycle": "Products are read from MySQL per request; the cart lives in session.",
+        "cross_cutting_concerns": [
+            {"concern": "authentication",
+             "how_it_works": "session_start() in header.php; $_SESSION['user_id'] gates pages"},
+            {"concern": "logging", "how_it_works": "none — no logging anywhere in the source"},
+        ],
+        "conventions": ["every page includes header.php and footer.php"],
+        "contradictions": [
+            {"subject": "cart storage",
+             "readings": ["session array", "products table"],
+             "why_it_matters": "the target needs one of them to be the source of truth"},
+        ],
+    }
+
+
 def fake_call_tool(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
     name = schema.get("name")
     call_log.append(name)
@@ -534,6 +610,10 @@ def fake_call_tool(system_prompt, user_content, schema, llm_override=None, max_t
         return _fake_conversion(system_prompt, user_content)
     if name == "submit_target_architecture":
         return _fake_architecture(user_content)
+    if name == "submit_comprehension":
+        return _fake_probe(user_content)
+    if name == "submit_system_portrait":
+        return _fake_portrait()
     return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
 
 
@@ -670,10 +750,17 @@ try:
           any(p.endswith("Program.cs") for p in scaffold_files), str(sorted(scaffold_files)))
     check("the run emitted configuration",
           any(p.endswith("appsettings.json") for p in scaffold_files), str(sorted(scaffold_files)))
+    # Every call in the log is accounted for by a stage that is supposed to make one. The
+    # scaffold has no tool schema of its own, so an unexplained call *is* the scaffold
+    # calling a model — which is the thing being ruled out here. Counted by composition
+    # rather than against a fixed total, so that adding an LLM stage cannot silently
+    # convert this into an assertion about something else.
+    _comprehension_calls = (call_log.count("submit_comprehension")
+                            + call_log.count("submit_system_portrait"))
     check("the scaffold cost no model call",
           call_log.count("submit_unit_conversion") == 6
           and call_log.count("submit_target_architecture") == 1
-          and len(call_log) == 7, str(call_log))
+          and len(call_log) == 7 + _comprehension_calls, str(call_log))
 
     api_component = next(c for c in components
                          if "app/api.py" in (c["meta"].get("members") or []))
@@ -1464,6 +1551,13 @@ def sync_start_job(agent_name, total_steps, run_fn):
 
 job_service.start_job = sync_start_job
 llm_gateway.call_tool = fake_call_tool
+# Three files per probe rather than twelve, so the 9-file fixture produces *several* probes
+# and the synthesis stage actually runs. At the production cap this fixture fits in one
+# bundle — which would leave `_synthesize_one`, the portrait renderer and the contradictions
+# checkpoint completely unexercised, and would make "no probe re-reads a file another probe
+# covered" true by construction rather than by behaviour.
+_real_probe_max_files = runner._PROBE_MAX_FILES
+runner._PROBE_MAX_FILES = 3
 try:
     r18 = store.create_run("resume-path", ".NET 8 / ASP.NET Core MVC", "files",
                            created_by="smoke")
@@ -1536,6 +1630,505 @@ try:
 finally:
     job_service.start_job = _real_start_job
     llm_gateway.call_tool = _real_call_tool
+    runner._PROBE_MAX_FILES = _real_probe_max_files
+
+
+section("19. Build diagnostics — the durable half of the fix loop")
+#
+# The loop that closes the compile gap needs no new execution model: a unit goes back to
+# `ready` and the existing claim loop re-converts it. These checks are on that transaction,
+# because it is the one that can silently corrupt a run's accounting — a reopened component
+# whose members stayed `converted` would report work that is being redone as work that is
+# done.
+
+_r18_artifacts = [a["path"] for a in store.list_artifacts(r18)]
+check("the finished run has artifacts to attribute diagnostics to", len(_r18_artifacts) > 3,
+      f"{len(_r18_artifacts)} artifact(s)")
+
+_cs = [p for p in _r18_artifacts if p.endswith(".cs")]
+_target = _cs[0] if _cs else _r18_artifacts[0]
+_mapped = store.units_for_artifact_paths(r18, [_target, "nothing/at/all.cs"])
+check("an emitted path maps back to the unit that produced it",
+      _mapped.get(_target, {}).get("unit_id"), str(list(_mapped)[:3]))
+check("a path no unit produced maps to nothing rather than to something wrong",
+      "nothing/at/all.cs" not in _mapped)
+
+_b1 = store.record_build(r18, [
+    {"file": _target, "line": 42, "col": 17, "severity": "error", "code": "CS0246",
+     "message": "The type or namespace name 'Cart' could not be found",
+     "unit_id": _mapped[_target]["unit_id"], "artifact_path": _target},
+    {"file": "ghost/Unowned.cs", "line": 3, "severity": "error", "code": "CS1002",
+     "message": "; expected"},
+    {"file": _target, "line": 9, "severity": "warning", "code": "CS0649",
+     "message": "Field is never assigned", "unit_id": _mapped[_target]["unit_id"],
+     "artifact_path": _target},
+], source="smoke", fingerprint="fp-round-one", command="dotnet build")
+check("a build records its round, counting errors and warnings apart",
+      _b1["round"] == 1 and _b1["errors"] == 2 and _b1["warnings"] == 1, str(_b1))
+check("a diagnostic in a file no unit owns is counted as unmapped, not dropped",
+      _b1["unmapped"] == 1, str(_b1))
+check("the run remembers the fingerprint, which is what detects a stuck loop",
+      (store.get_run(r18) or {}).get("build_fingerprint") == "fp-round-one")
+check("diagnostics are filterable by severity",
+      len(store.list_diagnostics(r18, build_id=_b1["build_id"], severity="error")) == 2)
+check("and by unit, which is what a rework prompt is built from",
+      len(store.diagnostics_for_unit(r18, _mapped[_target]["unit_id"])) == 2)
+
+_b2 = store.record_build(r18, [], source="smoke", fingerprint="fp-round-two")
+check("rounds increment rather than overwriting each other", _b2["round"] == 2)
+check("the newest round is the one reported first",
+      (store.latest_build(r18) or {})["round"] == 2)
+
+# The reopen transaction. `_target`'s unit is a component whose members were flipped to
+# `converted` when it completed; reopening must put both halves back.
+_unit_id = _mapped[_target]["unit_id"]
+_members_before = [u["path"] for u in store.list_units(r18, kind="source_file")
+                   if u.get("parent_unit_id") == _unit_id and u["status"] == "converted"]
+_re = store.reopen_units(r18, [_unit_id], "smoke: CS0246")
+check("a failing unit goes back to ready for the existing claim loop to pick up",
+      (store.get_unit(_unit_id) or {})["status"] == "ready",
+      str((store.get_unit(_unit_id) or {}).get("status")))
+check("its finished stamp is cleared, so nothing reports it as done",
+      not (store.get_unit(_unit_id) or {}).get("finished_at"))
+check("the rework counter advances — this is what bounds the loop",
+      (store.get_unit(_unit_id) or {}).get("rework_attempts") == 1)
+_members_after = [u["path"] for u in store.list_units(r18, kind="source_file")
+                  if u.get("parent_unit_id") == _unit_id and u["status"] == "rolled_up"]
+check("a reopened component's members stop counting as converted files",
+      sorted(_members_after) == sorted(_members_before) if _members_before else True,
+      f"before={_members_before} after={_members_after}")
+check("reopening reports what it moved", _re["reopened"] == 1, str(_re))
+
+# The guard. A unit that has been rewritten to the limit is named, not silently retried
+# forever — an oscillating loop is the obvious failure mode of a build/fix cycle.
+store.reopen_units(r18, [_unit_id], "smoke: again")
+store.reopen_units(r18, [_unit_id], "smoke: and again")
+_exhausted = store.reopen_units(r18, [_unit_id], "smoke: once too often", max_rework=3)
+check("a unit at the rework limit is refused rather than looped on",
+      _exhausted["reopened"] == 0 and len(_exhausted["exhausted"]) == 1, str(_exhausted))
+check("and the refusal names the file a human has to look at",
+      _exhausted["exhausted"][0].get("path"), str(_exhausted["exhausted"]))
+check("reopening something that does not exist is counted, not crashed",
+      store.reopen_units(r18, ["no-such-unit"], "smoke")["skipped"] == 1)
+
+# A unit a worker is holding right now must be left alone. Clearing its lease does not stop
+# that worker: it finishes, `complete_unit` writes the *pre-rework* output as the new current
+# artifact and sets the unit back to `converted` — so the reopen is silently lost while a
+# rework attempt has still been spent. Three of those retire a unit as exhausted without one
+# rework having run, and the next build then reports a stuck loop that is really a race.
+_leased = store.claim_next_unit(r18, "smoke-worker", kind="component") \
+    or store.claim_next_unit(r18, "smoke-worker", kind="")
+if _leased:
+    _before_attempts = (store.get_unit(_leased["id"]) or {}).get("rework_attempts") or 0
+    _defer = store.reopen_units(r18, [_leased["id"]], "smoke: build failed mid-conversion")
+    check("a unit being converted right now is deferred, not reopened underneath its worker",
+          _defer["reopened"] == 0 and len(_defer.get("deferred") or []) == 1, str(_defer)[:200])
+    check("and no rework attempt is charged for a pass that was never run",
+          ((store.get_unit(_leased["id"]) or {}).get("rework_attempts") or 0) == _before_attempts)
+    check("its lease survives, so the worker that holds it still owns it",
+          (store.get_unit(_leased["id"]) or {}).get("lease_owner") == "smoke-worker",
+          str((store.get_unit(_leased["id"]) or {}).get("lease_owner")))
+    store.set_unit_status(_leased["id"], "converted", "smoke: released")
+
+# Cross-run safety: `reopen_units` is the only write in the store that takes unit ids from
+# outside, and a build report names files, not runs.
+_other_run = store.create_run("reopen-scope", ".NET 8", "files", created_by="smoke")
+store.insert_units(_other_run, [{"path": "x.php", "kind": "source_file", "status": "converted"}])
+_foreign = store.list_units(_other_run, kind="source_file")[0]["id"]
+check("a unit belonging to another run cannot be reopened by this one",
+      store.reopen_units(r18, [_foreign], "smoke")["skipped"] == 1
+      and (store.get_unit(_foreign) or {})["status"] == "converted")
+
+# Leaving a terminal state has to clear `finished_at`, or a reopened run stays marked
+# finished and the export report says it is over while units are still being redone.
+store.update_run(r18, status="paused", paused_reason="smoke: build round 1 failed")
+check("a run reopened after completing is no longer stamped finished",
+      not (store.get_run(r18) or {}).get("finished_at"),
+      str((store.get_run(r18) or {}).get("finished_at")))
+
+# Relative, not absolute: the comprehension stage has already written this run's real rules,
+# and asserting a total here would be asserting how many rules the fixture happens to yield.
+_smoke_rule_ok = {"statement": "An order over $500 needs manager approval",
+                  "category": "authorization", "path": "public/product.php", "line": 7,
+                  "quote": "$_SESSION['user_id']", "status": "confirmed", "confidence": 0.9}
+_smoke_rule_bad = {"statement": "Invented rule with no source", "category": "workflow",
+                   "path": "public/product.php", "line": 0, "quote": "",
+                   "status": "rejected", "reject_reason": "quote_not_found"}
+_before = store.rule_counts(r18)
+store.insert_rules(r18, [_smoke_rule_ok, _smoke_rule_bad])
+_after = store.rule_counts(r18)
+check("confirmed and rejected rules are stored apart",
+      _after.get("confirmed", 0) == _before.get("confirmed", 0) + 1
+      and _after.get("rejected", 0) == _before.get("rejected", 0) + 1,
+      f"{_before} -> {_after}")
+check("listing defaults to confirmed only — an unverified claim never reaches a prompt",
+      _smoke_rule_ok["statement"] in [r["statement"] for r in store.list_rules(r18, "confirmed")]
+      and _smoke_rule_bad["statement"] not in
+          [r["statement"] for r in store.list_rules(r18, "confirmed")])
+check("every confirmed rule cites a file and a line",
+      all(r["path"] and r["line"] for r in store.list_rules(r18, status="confirmed")))
+
+
+section("20. Reading a compiler's output — parsing, mapping and the stuck-loop guard")
+#
+# The diagnostics contract is the interface, not the sandbox worker. A CI job, a developer
+# pasting `dotnet build` output and a future worker are three producers of one schema, which
+# is what lets the fix loop exist with no new infrastructure and D-05 still hold.
+
+_LOG = r"""
+Determining projects to restore...
+  Restored D:\out\Shop.Domain\Shop.Domain.csproj (in 412 ms).
+D:\out\Shop.Web\Controllers\ProductController.cs(42,17): error CS0246: The type or namespace name 'Cart' could not be found (are you missing a using directive?) [D:\out\Shop.Web\Shop.Web.csproj]
+/home/runner/work/shop/shop/Shop.Domain/Cart.cs(8,5): warning CS0649: Field 'Cart._id' is never assigned to [/home/runner/work/shop/shop/Shop.Domain/Shop.Domain.csproj]
+D:\out\Shop.Web\Controllers\ProductController.cs(42,17): error CS0246: The type or namespace name 'Cart' could not be found (are you missing a using directive?) [D:\out\Shop.Web\Shop.Web.csproj]
+    2 Error(s)
+Build FAILED.
+Time Elapsed 00:00:03.91
+"""
+_parsed = build_results.parse_msbuild_log(_LOG)
+check("MSBuild output is parsed into diagnostics", len(_parsed) == 2, str(_parsed))
+check("both slash directions are understood",
+      any("Cart.cs" in d["file"] for d in _parsed), str([d["file"] for d in _parsed]))
+check("the repeated diagnostic is collapsed — MSBuild emits one per referencing project",
+      sum(1 for d in _parsed if d.get("code") == "CS0246") == 1)
+check("line and column survive the parse",
+      any(d["line"] == 42 and d["col"] == 17 for d in _parsed), str(_parsed))
+check("severity is read, not assumed",
+      sorted(d["severity"] for d in _parsed) == ["error", "warning"])
+check("summary lines are not mistaken for diagnostics",
+      not any("Error(s)" in (d.get("message") or "") for d in _parsed))
+check("the trailing [project] suffix is stripped from the message",
+      not any(".csproj]" in (d.get("message") or "") for d in _parsed))
+
+check("a payload with neither diagnostics nor a log is refused",
+      _raises(build_results.BuildReportError,
+              lambda: build_results.normalize({"source": "ci"})))
+# An empty log is not a clean build. The generated CI workflow reaches its reporting step
+# even when checkout or setup-dotnet failed, so this is the difference between "the compiler
+# ran and found nothing" and "the compiler never ran" — and calling the second one a pass
+# records a green round, wipes the error fingerprint the stuck guard needs, and lets an
+# operator resume into a rework pass whose prompts are identical to the ones that failed.
+check("an empty log is refused rather than read as a clean build",
+      _raises(build_results.BuildReportError,
+              lambda: build_results.normalize({"log": ""}))
+      and _raises(build_results.BuildReportError,
+                  lambda: build_results.normalize({"log": "  \n\t\n "})))
+check("but an explicit empty diagnostics list still means a clean build",
+      build_results.normalize({"diagnostics": []}) == [])
+# Against the API-created run: `r18` is not bound to a project until later in this section,
+# and a 404 for the wrong reason would pass a check about a 400.
+check("a blank log is a 400 over HTTP, not a silent pass",
+      client.post(f"/api/v1/modernization/runs/{api_run_id}/build-results",
+                  json={"log": ""}, headers=HDR).status_code == 400)
+check("a diagnostic naming an absolute path outside the run cannot escape",
+      all(".." not in d["file"] and not d["file"].startswith("/")
+          for d in build_results.normalize({"diagnostics": [
+              {"file": "../../../etc/passwd", "message": "x"},
+              {"file": "C:\\Windows\\System32\\evil.cs", "message": "x"}]})))
+check("an unknown severity becomes an error rather than being quietly ignored",
+      build_results.normalize({"diagnostics": [
+          {"file": "a.cs", "severity": "banana", "message": "x"}]})[0]["severity"] == "error")
+
+# The fingerprint must ignore line numbers: a file regenerated with one extra blank line
+# shifts every line while being exactly as broken, and a fingerprint that moved with it
+# would never detect a loop that is not converging.
+_fp_a = build_results.fingerprint([{"file": "a.cs", "line": 10, "code": "CS0246",
+                                    "message": "missing", "severity": "error"}])
+_fp_b = build_results.fingerprint([{"file": "a.cs", "line": 87, "code": "CS0246",
+                                    "message": "missing", "severity": "error"}])
+_fp_c = build_results.fingerprint([{"file": "a.cs", "line": 10, "code": "CS1002",
+                                    "message": "; expected", "severity": "error"}])
+check("the fingerprint survives line-number churn", _fp_a == _fp_b)
+check("but a different error is a different fingerprint", _fp_a != _fp_c)
+check("warnings do not enter the fingerprint",
+      build_results.fingerprint([{"file": "a.cs", "code": "CS0649", "message": "w",
+                                  "severity": "warning"}]) ==
+      build_results.fingerprint([]))
+
+# End to end against the real run, through the endpoint the way CI would. Two bits of
+# fixture surgery first, both about the section above rather than about this one:
+#
+#   * the fixture run was created without a project (the sections above drive the runner
+#     directly) and the HTTP surface is scoped, so bind it to the smoke project or every
+#     call below 404s for the right reason and the wrong one;
+#   * section 19 deliberately drove one unit to the rework limit to prove the guard fires.
+#     That guard is real and would correctly refuse to reopen it here, so the counter is
+#     cleared — otherwise this section would be testing section 19's leftovers.
+_ing_run = r18
+_reset = database.get_connection()
+_reset.execute("UPDATE modernization_units SET rework_attempts = 0 WHERE run_id = ?", (_ing_run,))
+_reset.commit()
+_reset.close()
+store.update_run(_ing_run, project_id=PROJECT_ID, status="completed")
+_cs_target = _target
+_pasted = (f"{_cs_target}(11,4): error CS0103: The name 'PhpCompat' does not exist "
+           f"in the current context [Shop.Web.csproj]\n")
+_res = client.post(f"/api/v1/modernization/runs/{_ing_run}/build-results",
+                    json={"log": _pasted, "source": "smoke_paste",
+                          "command": "dotnet build"}, headers=HDR)
+check("a pasted build log is accepted over HTTP", _res.status_code == 200, _res.text[:300])
+_body = _res.json() if _res.status_code == 200 else {}
+check("its errors are attributed to the unit that emitted the file",
+      _body.get("errors") == 1 and _body.get("reopened", 0) >= 1, str(_body)[:300])
+check("and the run leaves its terminal state so the work can actually be resumed",
+      (store.get_run(_ing_run) or {}).get("status") == "paused",
+      str((store.get_run(_ing_run) or {}).get("status")))
+check("a completed run reopened for rework is no longer stamped finished",
+      not (store.get_run(_ing_run) or {}).get("finished_at"))
+
+# The same errors again, but the rework this reopened has not been run yet — which is the
+# ordinary state of a paused run, and the state an operator produces by clicking "Re-run
+# jobs" in Actions. Reporting that as non-convergence would halt a loop that never ran, and
+# charge a rework attempt against units that have not been converted once since reopening.
+_res_repeat = client.post(f"/api/v1/modernization/runs/{_ing_run}/build-results",
+                          json={"log": _pasted, "source": "smoke_paste"}, headers=HDR)
+_body_repeat = _res_repeat.json() if _res_repeat.status_code == 200 else {}
+check("the same errors with the rework still queued is not called non-convergence",
+      _body_repeat.get("status") == "awaiting_rework", str(_body_repeat)[:300])
+check("and it charges no rework attempt for a pass that has not run",
+      _body_repeat.get("reopened", 0) == 0
+      and not any(c["kind"] == "build_stuck" for c in store.list_checkpoints(_ing_run, "open")),
+      str([c["kind"] for c in store.list_checkpoints(_ing_run, "open")]))
+
+# Now actually run the rework, so the next identical report means what the guard says it
+# means. This is the guard that matters: a model that cannot fix an error will regenerate
+# the same file forever, and spending a budget to discover that slowly is the obvious
+# failure mode of any build/fix loop.
+llm_gateway.call_tool = fake_call_tool
+try:
+    store.update_run(_ing_run, status="converting", paused_reason=None)
+    runner.convert_run(_ing_run, CALLER)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+check("resuming actually re-converts the reopened unit",
+      store.pending_unit_count(_ing_run) == 0,
+      f"{store.pending_unit_count(_ing_run)} unit(s) still pending")
+
+_res2 = client.post(f"/api/v1/modernization/runs/{_ing_run}/build-results",
+                     json={"log": _pasted, "source": "smoke_paste"}, headers=HDR)
+_body2 = _res2.json() if _res2.status_code == 200 else {}
+check("an identical build *after* a completed rework pass is non-convergence",
+      _body2.get("status") == "stuck", str(_body2)[:300])
+check("and it reopens nothing rather than spending another round",
+      _body2.get("reopened", 0) == 0, str(_body2)[:200])
+check("a stuck loop raises a blocking checkpoint a human has to clear",
+      any(c["kind"] == "build_stuck" and c["blocking"]
+          for c in store.list_checkpoints(_ing_run, "open")),
+      str([c["kind"] for c in store.list_checkpoints(_ing_run, "open")]))
+
+_res3 = client.post(f"/api/v1/modernization/runs/{_ing_run}/build-results",
+                     json={"diagnostics": []}, headers=HDR)
+check("a clean build passes and reopens nothing",
+      (_res3.json() or {}).get("status") == "passed", _res3.text[:200])
+
+_res4 = client.post(f"/api/v1/modernization/runs/{_ing_run}/build-results",
+                     json={"source": "smoke"}, headers=HDR)
+check("a malformed report is a 400, not a 500", _res4.status_code == 400, _res4.text[:200])
+
+_res5 = client.post(f"/api/v1/modernization/runs/{_ing_run}/build-results",
+                     json={"log": "ghost/NoSuchFile.cs(1,1): error CS1002: ; expected\n"},
+                     headers=HDR)
+_body5 = _res5.json() if _res5.status_code == 200 else {}
+check("errors in files no unit produced are reported as such, not silently dropped",
+      _body5.get("status") == "unmapped" and _body5.get("unmapped") == 1, str(_body5)[:300])
+
+check("another project's run cannot have build results posted to it",
+      client.post(f"/api/v1/modernization/runs/{_ing_run}/build-results",
+                   json={"diagnostics": []}, headers=other_hdr).status_code == 404)
+
+
+section("21. Comprehension — a claim is not evidence until it is checked")
+#
+# The pass that reads the source for what the application *does*. Its output is the one
+# thing in this pipeline a model asserts rather than a parser observes, so the interesting
+# checks are all about what happens to an assertion that turns out to be false.
+
+_probes = store.list_units(r18, kind="comprehension")
+# More than one, deliberately: with a single probe the coverage check below is true by
+# construction, and synthesis — the call that produces everything a per-file conversion
+# cannot see — never runs at all.
+check("the codebase was read for meaning, not only for structure", len(_probes) > 1,
+      f"{len(_probes)} probe(s)")
+check("every probe is one bundle of files, recorded so the run can be audited",
+      all((u.get("meta") or {}).get("members") for u in _probes),
+      str([(u.get("meta") or {}).get("members") for u in _probes]))
+check("no probe re-reads a file another probe already covered",
+      len([p for u in _probes for p in (u.get("meta") or {}).get("members") or []])
+      == len({p for u in _probes for p in (u.get("meta") or {}).get("members") or []}))
+
+_all_rules = store.list_rules(r18, status="")
+_confirmed = [r for r in _all_rules if r["status"] == "confirmed"]
+_rejected = [r for r in _all_rules if r["status"] == "rejected"]
+check("a rule whose quote is really in the file it cites is confirmed",
+      any("logged-in session" in r["statement"] for r in _confirmed),
+      str([r["statement"] for r in _confirmed])[:300])
+check("a rule quoting code that exists nowhere is rejected, not stored as fact",
+      any("Invented" in r["statement"] or "manager approval" in r["statement"]
+          for r in _rejected),
+      str([(r["statement"], r["reject_reason"]) for r in _rejected])[:300])
+check("the rejection says why, so the pass can be judged rather than trusted",
+      all(r["reject_reason"] for r in _rejected),
+      str([r["reject_reason"] for r in _rejected]))
+
+# The model claimed line 999. Nothing in the fixture has 999 lines. Trusting the model's
+# number would put a citation in front of a reviewer that points at nothing.
+_cited = [r for r in _confirmed if "logged-in session" in r["statement"]]
+if _cited:
+    _rule = _cited[0]
+    _src = next((u.get("source_text") or "" for u in
+                 store.list_units(r18, kind="source_file", include_source=True)
+                 if u["path"] == _rule["path"]), "")
+    _lines = _src.splitlines()
+    _in_range = 1 <= _rule["line"] <= len(_lines)
+    check("the line number is corrected to where the quote actually is",
+          _in_range, f"line {_rule['line']} of {len(_lines)}")
+    # Guarded: an out-of-range line is exactly the regression the check above exists to
+    # catch, and indexing on it would abort the whole script with an IndexError instead of
+    # printing one FAIL and carrying on. Compares the *whole* normalized quote, not a single
+    # token — a one-token match passes on a line that merely mentions `$cart`.
+    _actual = _lines[_rule["line"] - 1] if _in_range else ""
+    check("and the corrected line really does contain the whole quoted code",
+          _in_range and finding_pipeline.normalize(_rule["quote"])
+          in finding_pipeline.normalize(_actual),
+          f"line {_rule['line']}: {_actual!r} does not contain {_rule['quote']!r}")
+
+# Directly, on a file with the blank lines real source has. The fixture's files have none,
+# and that is the one shape where the naive offset arithmetic is accidentally correct: a
+# blank line contributes nothing to the normalized text but used to advance the accumulator,
+# so every blank line above a match dragged the reported citation one line earlier. D-67
+# states the corrected line as a guarantee, and the header of the rules block asserts it to
+# the model in every conversion prompt, so being approximately right is not good enough.
+_spaced = ("<?php\n"
+           "require_once 'db.php';\n"
+           "\n"
+           "function total($items) {\n"
+           "\n"
+           "    $sum = 0;\n"
+           "\n"
+           "    foreach ($items as $i) {\n"
+           "        $sum += $i['price'];\n"
+           "    }\n"
+           "\n"
+           "    if ($sum > 500) {\n"
+           "        $sum = $sum * 0.9;\n"
+           "    }\n"
+           "    return $sum;\n"
+           "}\n")
+_spaced_lines = _spaced.splitlines()
+_checked = rules_module.verify("smoke", [
+    {"statement": "Orders over 500 get a ten percent discount", "category": "calculation",
+     "path": "billing.php", "line": 1, "quote": "$sum = $sum * 0.9;"},
+    {"statement": "Every line item contributes its price to the total",
+     "category": "calculation",
+     "path": "billing.php", "line": 99, "quote": "foreach ($items as $i) {"},
+], {"billing.php": _spaced})
+check("a citation in a blank-line-heavy file lands on the right line",
+      all(_spaced_lines[r["line"] - 1].strip() == r["quote"]
+          for r in _checked["confirmed"]),
+      str([(r["line"], _spaced_lines[r["line"] - 1].strip(), r["quote"])
+           for r in _checked["confirmed"]]))
+check("both rules survived verification, so the check above is not vacuous",
+      len(_checked["confirmed"]) == 2, str(_checked["counts"]))
+
+_addendum = (store.get_run(r18) or {}).get("system_addendum") or ""
+check("confirmed rules reach the frozen system prompt", bool(_addendum))
+# By *citation*, not by statement text. Two probes can legitimately propose the same
+# sentence — one from the file that proves it (confirmed) and one from a bundle that does
+# not contain that file (rejected `unknown_path`), and `_dedupe` rejects a duplicate of an
+# already-confirmed statement by design. Asserting on the text alone would false-alarm on
+# the first real multi-probe run while proving nothing about what actually reached the
+# prompt. A rejected rule has no verified line, so its citation is what must be absent.
+_rejected_citations = {f"{r['path']}:{r['line']}" for r in _rejected
+                       if f"{r['path']}:{r['line']}" not in
+                       {f"{c['path']}:{c['line']}" for c in _confirmed}}
+check("and no rejected rule's citation does",
+      not any(cite in _addendum for cite in _rejected_citations),
+      f"leaked={[c for c in _rejected_citations if c in _addendum]}")
+check("the block a conversion actually reads contains only confirmed rules",
+      all(r["statement"] in rules_module.render_rules_block(_confirmed) for r in _confirmed[:5])
+      and not any(r["statement"] in rules_module.render_rules_block(_confirmed)
+                  for r in _rejected
+                  if r["statement"] not in {c["statement"] for c in _confirmed}))
+check("the addendum stays inside its cache budget",
+      len(_addendum) <= comprehension.MAX_ADDENDUM_CHARS,
+      f"{len(_addendum)} chars")
+
+# The synthesis half. Half of `SYNTHESIS_TOOL_SCHEMA`'s arrays are arrays of *objects*, and
+# a renderer handling only strings dropped precisely the fields the call exists to produce —
+# `cross_cutting_concerns` is the pattern no single file shows, which is the entire reason
+# for paying to read every probe at once.
+_synth = [u for u in store.list_units(r18, kind="synthesis") if u["status"] == "converted"]
+check("the probes were merged into one portrait", len(_synth) == 1, f"{len(_synth)} unit(s)")
+check("the portrait reaches the prompt, not just the database",
+      "shopper" in _addendum and "browses the catalogue" in _addendum,
+      _addendum[-600:])
+check("object-shaped fields survive rendering — this is what the schema actually returns",
+      "$_SESSION['user_id'] gates pages" in _addendum
+      and "no logging anywhere in the source" in _addendum,
+      "cross_cutting_concerns missing from the addendum")
+check("no heading is emitted with nothing underneath it",
+      not re.search(r"^### .+\n\n\n*(?=###|$)", _addendum, re.M),
+      str(re.findall(r"^### .+$", _addendum, re.M)))
+
+# A contradiction is the one comprehension output that must reach a human rather than a
+# prompt: two readings of the same thing, merged silently, is worse than no portrait at all.
+_contra = [c for c in store.list_checkpoints(r18) if c["kind"] == "comprehension_contradiction"]
+check("a contradiction between two readings raises a checkpoint", len(_contra) == 1,
+      str([c["kind"] for c in store.list_checkpoints(r18)]))
+if _contra:
+    check("and the checkpoint carries the contradiction, not just a count of them",
+          "cart storage" in (_contra[0].get("detail") or "")
+          and "source of truth" in (_contra[0].get("detail") or ""),
+          f"detail={(_contra[0].get('detail') or '')[:200]!r}")
+check("contradictions stay out of the conversion prompt",
+      "source of truth" not in _addendum,
+      "a contradiction leaked into the cached system block")
+# Re-rendered from the same stored state must be byte-identical, or the cached prefix moves
+# and a 500-file run pays full price on every call with nothing in the logs but cache_read=0.
+check("re-rendering the digest is byte-identical — the prompt cache depends on it",
+      comprehension.render_digest(r18, (store.get_run(r18) or {}).get("stats") or {})
+      == comprehension.render_digest(r18, (store.get_run(r18) or {}).get("stats") or {}))
+
+# The defect that would have made the whole fix loop a no-op: a reopened unit re-converted
+# with a byte-identical prompt produces byte-identical output, and round two then trips the
+# stuck guard rather than fixing anything.
+_msg_first = unit_converter._build_user_message(
+    source="<?php echo 1;", path="a.php", dependency_symbols=[], module_type="ui",
+    language="php", in_cycle_with=[], redactions=[])
+_msg_rework = unit_converter._build_user_message(
+    source="<?php echo 1;", path="a.php", dependency_symbols=[], module_type="ui",
+    language="php", in_cycle_with=[], redactions=[],
+    build_diagnostics="## Compiler errors\n\nCS0246: 'Cart' not found")
+check("a re-conversion prompt differs from the first one — otherwise rework is a no-op",
+      _msg_rework != _msg_first and "CS0246" in _msg_rework)
+check("the compiler output goes in the user message, never the cached system block",
+      "CS0246" not in unit_converter.UnitConverterAgent().system_for(VALID_CHARTER, _addendum))
+
+# Gate A is what the operator approves, and comprehension now runs behind it.
+_gate_a = [c for c in store.list_checkpoints(r18) if c["kind"] == "discovery_approval"]
+if _gate_a:
+    _payload = _gate_a[0].get("payload") or {}
+    _est = _payload.get("estimate") or {}
+    check("the assessment gate prices the comprehension calls it is authorising",
+          _est.get("comprehension_calls", 0) >= 1 and _est.get("calls", 0) > 1, str(_est))
+    check("and still quotes a ceiling at or above the expectation",
+          _est.get("ceiling_usd", 0) >= _est.get("expected_usd", 0), str(_est))
+
+# The shim the playbook has always told the model to call.
+_php_artifacts = [a["path"] for a in store.list_artifacts(r18)]
+check("a PHP run ships the compatibility shim the playbook instructs every file to use",
+      any(p.endswith(php_compat.PHP_COMPAT_FILENAME) for p in _php_artifacts),
+      str(_php_artifacts)[:300])
+check("it lands under a project directory, where an SDK-style .csproj will actually compile it",
+      all("/" in p for p in _php_artifacts if p.endswith(php_compat.PHP_COMPAT_FILENAME)))
+check("its symbols are registered, so validation stops calling them unresolved",
+      any("PhpCompat" in s["name"] for s in store.list_symbols(r18)),
+      str([s["name"] for s in store.list_symbols(r18)])[:200])
+check("emitting it twice produces byte-identical content",
+      php_compat.emit("Shop.Web", "Shop.Web/Compat") == php_compat.emit("Shop.Web", "Shop.Web/Compat"))
+check("a COBOL run gets no PHP semantics shim",
+      not php_compat.is_applicable("cobol", VALID_CHARTER))
+check("and neither does a Delphi one", not php_compat.is_applicable("delphi/pascal", VALID_CHARTER))
 
 
 # ── Summary ────────────────────────────────────────────────────────────────
