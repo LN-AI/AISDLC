@@ -37,7 +37,8 @@ from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence, graph,
-    playbooks, reconcile, repo_ingest, rules, scaffold, stages, store, validation,
+    playbooks, reconcile, repo_ingest, rules, scaffold, stages, store, usings, validation,
+    wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -558,6 +559,21 @@ def _plan_stage(run_id: str, stage, run: Dict[str, Any]) -> int:
             "topo_level": 0,
             "order_index": 0,
         }])
+    if stage.id == "wireup":
+        # Only worth a row when there is converted output to read. A run whose conversion
+        # produced nothing has no project files to correct, and planning the stage anyway
+        # would leave an unclaimable row behind that `stage_outstanding` reads as work
+        # waiting on a failure.
+        if not store.list_units(run_id, kind="component"):
+            return 0
+        return store.insert_units(run_id, [{
+            "path": "#wireup/0001",
+            "kind": "wireup",
+            "module_type": "wireup",
+            "status": "ready",
+            "topo_level": 0,
+            "order_index": 0,
+        }])
     if stage.id == "comprehension":
         # One row per bundle, one call per row. The bundler is deterministic (a probe
         # boundary decides which files are read together, which decides which rules are
@@ -605,6 +621,8 @@ def _produce(run_id: str, stage, unit: Dict[str, Any], charter: Dict[str, Any],
         return _design_one(run_id, unit, charter, caller, llm_override, project_name)
     if stage.id == "scaffold":
         return _scaffold_one(run_id, unit, charter)
+    if stage.id == "wireup":
+        return _wireup_one(run_id, unit, charter)
     return _convert_one(run_id, unit, charter, caller, llm_override, project_name)
 
 
@@ -865,6 +883,62 @@ def _scaffold_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) ->
         event_detail=(f"{len(artifacts)} scaffold file(s), no model call"
                       + (f"; {len(shim_symbols)} compatibility symbol(s) registered"
                          if shim_symbols else "")),
+    )
+    return "converted"
+
+
+def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> str:
+    """Correct the project files against what the converted code actually does.
+
+    Deterministic, no model call. The scaffold had to guess packages from charter free text
+    and project edges from the architect's proposal, both before any C# existed; here both
+    are observable. A missing `PackageReference` and a missing `ProjectReference` are the
+    same compile error as a missing `using` and are just as computable.
+    """
+    components = store.list_units(run_id, kind="component")
+    if not components:
+        store.set_unit_status(unit["id"], "skipped", "nothing was converted")
+        return "converted"
+
+    namespace_to_project = {c.get("target_namespace") or "": c.get("target_project") or ""
+                            for c in components if c.get("target_namespace")}
+    artifacts = store.list_artifacts(run_id, include_content=True)
+    needed = wireup.plan(artifacts, store.symbol_namespaces(run_id), namespace_to_project)
+
+    entry_project = next((c.get("target_project") for c in components
+                          if c.get("target_project")), "")
+    by_path = {a["path"]: a for a in artifacts}
+    rewritten: List[Dict[str, Any]] = []
+    notes: List[str] = []
+
+    for project in sorted(set(needed["packages"]) | set(needed["projects"])):
+        path = f"{project}/{project}.csproj"
+        packages = needed["packages"].get(project) or []
+        references = needed["projects"].get(project) or []
+        existing = by_path.get(path)
+        if existing is None:
+            # The architect named a project the scaffold never wrote a file for. Better to
+            # emit one than to leave source in a directory MSBuild will never look at.
+            content = wireup.csproj_for(project, charter, project == entry_project, references)
+            updated = wireup.apply_to_csproj(content, packages, references)
+            notes.append(f"{project}: project file created")
+        else:
+            updated = wireup.apply_to_csproj(existing.get("content") or "", packages, references)
+            if updated == (existing.get("content") or ""):
+                continue
+            added = [p for p, _ in packages] + [f"->{r}" for r in references]
+            notes.append(f"{project}: {', '.join(added)}")
+        rewritten.append({"path": path, "content": updated,
+                          "purpose": "project file, corrected from the converted code"})
+
+    if not rewritten:
+        store.complete_unit(unit_id=unit["id"], run_id=run_id, artifacts=[], symbols=[],
+                            event_detail="project files already matched the converted code")
+        return "converted"
+
+    store.complete_unit(
+        unit_id=unit["id"], run_id=run_id, artifacts=rewritten, symbols=[],
+        event_detail=f"{len(rewritten)} project file(s) corrected: {'; '.join(notes)}"[:400],
     )
     return "converted"
 
@@ -1220,6 +1294,27 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         return "failed"
 
     symbols = result.get("symbols_exported") or []
+
+    # Missing imports, added deterministically before anything looks at this output. The
+    # namespace of every generated type is already known, so asking the model to get it right
+    # and then failing it when it doesn't would be spending tokens to re-derive a fact — and
+    # a missing `using` is CS0246, the largest single class of error in generated C#. This
+    # unit's own exports are included so that two files it emits together can see each other.
+    own_namespace = unit.get("target_namespace") or ""
+    namespaces = dict(store.symbol_namespaces(run_id))
+    if own_namespace:
+        namespaces.update({s.get("name", ""): own_namespace for s in symbols if s.get("name")})
+    fixed = usings.repair(safe_artifacts, namespaces,
+                          declared_references=result.get("references") or [],
+                          is_web=bool(charter.get("ui_strategy") or charter.get("target_stack")))
+    if fixed["repaired"]:
+        store.append_event(
+            run_id, "usings_repaired",
+            "; ".join(f"{path}: {', '.join(added)}"
+                      for path, added in sorted(fixed["added"].items()))[:400],
+            unit_id=unit["id"],
+        )
+
     # `symbol_names`, not `list_symbols`: the latter is a paged display query whose 2000-row
     # default silently turned this set into an alphabetical prefix on any real codebase.
     known = store.symbol_names(run_id) | {s.get("name", "") for s in symbols}

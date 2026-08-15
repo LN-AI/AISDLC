@@ -406,16 +406,26 @@ def _build_user_message(
                  "in the target stack. Their bodies are not shown and you do not need them. Anything "
                  "not in this list either has not been converted yet or does not exist — do not call it.",
                  ""]
-        by_unit: Dict[str, List[str]] = {}
+        # Grouped by (path, namespace) rather than by path alone. A signature tells the model
+        # what to call; the namespace tells it what to import, and without that it could not
+        # write a correct `using` even in principle — which is the single largest class of
+        # compile error in generated C#. The run repairs missing imports deterministically
+        # afterwards, but a model that was told where a type lives mostly gets it right the
+        # first time, and a repaired import is one the reviewer has to read as a diff.
+        by_unit: Dict[tuple, List[str]] = {}
         for symbol in dependency_symbols:
-            key = symbol.get("target_path") or symbol.get("source_symbol") or "converted"
+            key = (symbol.get("target_path") or symbol.get("source_symbol") or "converted",
+                   symbol.get("namespace") or "")
             entry = f"  - `{symbol.get('signature') or symbol.get('name')}`"
             if symbol.get("source_symbol") and symbol["source_symbol"] != symbol.get("name"):
                 entry += f"   (was `{symbol['source_symbol']}`)"
             by_unit.setdefault(key, []).append(entry)
-        for unit_path in sorted(by_unit):
-            lines.append(f"- **{unit_path}**")
-            lines.extend(sorted(by_unit[unit_path]))
+        for unit_path, namespace in sorted(by_unit):
+            heading = f"- **{unit_path}**"
+            if namespace:
+                heading += f" — namespace `{namespace}`, so importing it needs `using {namespace};`"
+            lines.append(heading)
+            lines.extend(sorted(by_unit[(unit_path, namespace)]))
         parts.append("\n".join(lines))
     elif not in_cycle_with:
         # Only claim this when it is true. A unit inside a cycle has dependencies — they are

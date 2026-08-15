@@ -91,6 +91,13 @@ STAGES: Tuple[Stage, ...] = (
         llm=True,
     ),
     Stage(
+        id="wireup",
+        label="Correcting the project files",
+        kind="wireup",
+        run_status="converting",
+        llm=False,              # deterministic, like the scaffold — no model call at all
+    ),
+    Stage(
         id="reconcile",
         label="Reconciling the converted codebase",
         kind="",                # deterministic; owns no rows

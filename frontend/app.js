@@ -5816,7 +5816,9 @@ function renderModernizationStages(run) {
   // minutes is otherwise indistinguishable from a stuck run.
   const s = run.stage;
   if (!s) return '';
-  const names = ['Understand', 'Portrait', 'Design', 'Cost', 'Scaffold', 'Convert', 'Reconcile'];
+  // One entry per stage in backend/services/modernization/stages.py, in the same order —
+  // the server sends an index into that list, so a missing name shifts every later stage.
+  const names = ['Understand', 'Portrait', 'Design', 'Cost', 'Scaffold', 'Convert', 'Wire up', 'Reconcile'];
   return `<div class="mod-stages">
     ${names.map((n, i) => `<span class="mod-stage ${i < s.index ? 'done' : (i === s.index ? 'active' : '')}">${esc(n)}</span>`).join('')}
     <span class="mod-stage-label">${esc(s.label)}</span>

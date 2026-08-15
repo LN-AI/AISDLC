@@ -41,7 +41,8 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, build_results, charter, comprehension, evidence, graph, reconcile,
-    repo_ingest, runner, rules as rules_module, store, validation,
+    repo_ingest, runner, rules as rules_module, scaffold, stages, store, usings,
+    validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
@@ -2129,6 +2130,146 @@ check("emitting it twice produces byte-identical content",
 check("a COBOL run gets no PHP semantics shim",
       not php_compat.is_applicable("cobol", VALID_CHARTER))
 check("and neither does a Delphi one", not php_compat.is_applicable("delphi/pascal", VALID_CHARTER))
+
+
+section("22. Making it compile — SDK pin, usings, and project wiring")
+#
+# Everything here is about the difference between "the model wrote plausible C#" and "a
+# compiler accepts it". All of it is deterministic: the namespace of every generated type is
+# already known, so a missing import or project reference is a fact to compute, not a
+# judgement to spend a model call on.
+
+_sdk_files = {f["path"]: f["content"] for f in scaffold.build(
+    ".NET 8 / ASP.NET Core MVC", VALID_CHARTER,
+    [{"name": "A.Web", "purpose": "entry"}, {"name": "A.Domain", "purpose": "domain"}],
+    ["db_password"])}
+# `latestFeature` rolls forward only inside 8.0.x, so a machine with a newer SDK and no 8.0
+# band fails at SDK *resolution* — before any generated C# is read — with "A compatible .NET
+# SDK was not found". Every export was unbuildable for that reason alone.
+check("global.json does not pin an SDK band a newer machine cannot satisfy",
+      '"rollForward": "latestMajor"' in _sdk_files.get("global.json", ""),
+      _sdk_files.get("global.json", ""))
+check("and it still sets a floor rather than accepting anything",
+      '"version"' in _sdk_files.get("global.json", ""))
+
+# Namespaces must reach the registry, or nothing downstream can compute an import.
+_ns = store.symbol_namespaces(r18)
+check("every generated symbol knows which namespace it lives in",
+      _ns and all(v for v in _ns.values()), f"{len(_ns)} symbol(s)")
+# Directly on the column, not through `symbol_namespaces`. That query COALESCEs to the unit's
+# `target_namespace` so rows written before the column existed still resolve — which is
+# deliberate, and which also means it would keep answering correctly if nothing ever wrote
+# the column at all. The stored value is what a later query joining on symbols alone needs.
+_ns_conn = database.get_connection()
+_stored_ns = _ns_conn.execute(
+    "SELECT COUNT(*) AS n FROM modernization_symbols "
+    "WHERE run_id = ? AND COALESCE(namespace, '') <> ''", (r18,)).fetchone()["n"]
+_total_syms = _ns_conn.execute(
+    "SELECT COUNT(*) AS n FROM modernization_symbols WHERE run_id = ?", (r18,)).fetchone()["n"]
+_ns_conn.close()
+check("the namespace is persisted on the symbol row, not just derivable at read time",
+      _total_syms > 0 and _stored_ns == _total_syms, f"{_stored_ns} of {_total_syms} rows")
+check("the conversion prompt tells the model where a dependency lives",
+      "using " in unit_converter._build_user_message(
+          source="x", path="a.php", module_type="ui", language="php",
+          in_cycle_with=[], redactions=[],
+          dependency_symbols=[{"name": "Cart", "signature": "public class Cart",
+                               "target_path": "Domain/Cart.cs", "namespace": "Shop.Domain"}]))
+
+_known = {"Cart": "Shop.Domain", "Item": "Shop.Domain", "Ctl": "Shop.Web.Controllers"}
+check("a type from another namespace gains exactly the using it needs",
+      usings.required_usings("namespace Shop.Web;\npublic class X { Cart c; }\n", _known)
+      == {"Shop.Domain"})
+check("a type in the file's own namespace adds nothing",
+      usings.required_usings("namespace Shop.Domain;\npublic class Y { Item i; }\n", _known)
+      == set())
+check("an already-imported namespace is not added twice",
+      usings.required_usings("using Shop.Domain;\nnamespace Shop.Web;\npublic class X { Cart c; }\n",
+                             _known) == set())
+check("an ImplicitUsings namespace is never added",
+      usings.required_usings("namespace A;\npublic class Q { List<int> l; }\n",
+                             {"List": "System.Collections.Generic"}) == set())
+# A name inside a string or a comment is not a reference. Adding an import for one would put
+# a dependency in the file that the code does not have, which reads as a real edge later.
+check("a type named only in a comment or a string is not treated as a reference",
+      usings.required_usings(
+          'namespace Shop.Web;\n// Cart goes here\npublic class Z { string s = "Cart"; }\n',
+          _known) == set())
+check("an alias-only using does not count as importing the namespace",
+      usings.required_usings("using C = Shop.Domain.Cart;\nnamespace Shop.Web;\n"
+                             "public class X { Cart c; }\n", _known) == {"Shop.Domain"})
+
+_before = "// generated\nnamespace Shop.Web;\npublic class W { Cart c; }\n"
+_after = usings.apply(_before, usings.required_usings(_before, _known))
+check("the using lands after a leading comment and before the namespace",
+      _after.index("using Shop.Domain;") > _after.index("// generated")
+      and _after.index("using Shop.Domain;") < _after.index("namespace Shop.Web;"), _after)
+_block = "namespace Shop.Web\n{\n    public class V { Item i; }\n}\n"
+check("a block-scoped namespace is handled too",
+      "using Shop.Domain;" in usings.apply(_block, usings.required_usings(_block, _known)))
+check("repairing an already-repaired file changes nothing",
+      usings.apply(_after, usings.required_usings(_after, _known)) == _after)
+# An unused using is a compiler warning; a missing one is an error. We cannot prove a using
+# is unused without a real C# parser, so the asymmetry decides it: add freely, remove never.
+_extra = "using System.Text.Json;\nusing Shop.Domain;\nnamespace Shop.Web;\npublic class S { Cart c; }\n"
+check("no existing using is ever removed, even an apparently unused one",
+      "System.Text.Json" in usings.apply(_extra, usings.required_usings(_extra, _known)))
+
+# Project files, corrected from what the code does rather than from what was predicted.
+check("a type that can only come from a package pulls that package in",
+      ("Microsoft.EntityFrameworkCore", "8.0.10")
+      in wireup.packages_for_code("public class Db : DbContext { }"))
+check("the same name in a comment does not",
+      wireup.packages_for_code("// we could use a DbContext here") == set())
+_plan = wireup.plan(
+    [{"path": "Shop.Web/Ctl.cs", "content": "namespace Shop.Web;\npublic class Ctl { Cart c; }"},
+     # The Domain project is the one the scaffold gave no packages at all, which is exactly
+     # the shape that failed to build: an entity class needing EF Core in a project whose
+     # .csproj had zero PackageReference elements.
+     {"path": "Shop.Domain/Cart.cs",
+      "content": "namespace Shop.Domain;\npublic class Db : DbContext { }\npublic class Cart { }"}],
+    {"Cart": "Shop.Domain", "Ctl": "Shop.Web"},
+    {"Shop.Domain": "Shop.Domain", "Shop.Web": "Shop.Web"})
+check("a project using another project's type gets a ProjectReference",
+      _plan["projects"].get("Shop.Web") == ["Shop.Domain"], str(_plan))
+check("and a project depends on nothing it does not actually use",
+      "Shop.Web" not in (_plan["projects"].get("Shop.Domain") or []), str(_plan))
+check("a non-entry project gets the package its own code needs",
+      ("Microsoft.EntityFrameworkCore", "8.0.10")
+      in (_plan["packages"].get("Shop.Domain") or []), str(_plan["packages"]))
+check("and a project that does not use it does not get it",
+      not (_plan["packages"].get("Shop.Web") or []), str(_plan["packages"]))
+_csproj = '<Project Sdk="Microsoft.NET.Sdk">\n  <PropertyGroup>\n  </PropertyGroup>\n</Project>\n'
+_fixed = wireup.apply_to_csproj(_csproj, [("Dapper", "2.1.35")], ["Shop.Domain"])
+# Parsed, not pattern-matched. A `.csproj` MSBuild cannot read fails the build outright, and
+# substring counting is what let this check pass on my own broken version of it first —
+# `"<Project"` is also a prefix of `"<ProjectReference"`.
+def _parses_as_xml(text):
+    import xml.etree.ElementTree as ET
+    try:
+        return ET.fromstring(text).tag == "Project"
+    except ET.ParseError:
+        return False
+
+check("the corrected project file is still well-formed XML MSBuild can read",
+      _parses_as_xml(_fixed), _fixed)
+check("it carries both the package and the project reference",
+      'Include="Dapper"' in _fixed and "Shop.Domain.csproj" in _fixed, _fixed)
+check("applying it twice adds nothing the second time",
+      wireup.apply_to_csproj(_fixed, [("Dapper", "2.1.35")], ["Shop.Domain"]) == _fixed)
+check("a file with no </Project> is left untouched rather than corrupted",
+      wireup.apply_to_csproj("not xml", [("Dapper", "2.1.35")], []) == "not xml")
+
+# The stage itself: deterministic, and it must not spend a model call.
+_wireup_calls = call_log.count("submit_unit_conversion")
+check("the wireup stage exists in the pipeline", "wireup" in stages.ORDER, str(stages.ORDER))
+check("and it is declared as making no model call", not stages.BY_ID["wireup"].llm)
+check("it runs after conversion, so the code it reads is finished",
+      stages.ORDER.index("wireup") > stages.ORDER.index("convert"))
+check("the fixture run produced its wireup unit",
+      store.stage_units_exist(r18, "wireup"))
+check("wireup spent no model call",
+      call_log.count("submit_unit_conversion") == _wireup_calls)
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

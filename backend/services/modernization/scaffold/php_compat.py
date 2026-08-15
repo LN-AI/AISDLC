@@ -1545,12 +1545,17 @@ def symbols(root_namespace: str, output_dir: str = "") -> List[Dict[str, Any]]:
     the playbook tells the model to write the call.
     """
     path = _target_path(output_dir)
+    # Declared explicitly rather than left to be inherited from the unit. These rows are
+    # written by the *scaffold* unit, which has no `target_namespace` of its own — so without
+    # this the run would hold thirty symbols it cannot compute an import for.
+    namespace = namespace_for(root_namespace)
     rows: List[Dict[str, Any]] = [{
         "name": CLASS_NAME,
         "kind": "class",
-        "signature": f"namespace {namespace_for(root_namespace)}; public static class {CLASS_NAME}",
+        "signature": f"namespace {namespace}; public static class {CLASS_NAME}",
         "target_path": path,
         "source_symbol": "PHP runtime semantics",
+        "namespace": namespace,
     }]
     for member, kind, source_symbol in _MEMBERS:
         declaration = _declaration(member)
@@ -1565,6 +1570,7 @@ def symbols(root_namespace: str, output_dir: str = "") -> List[Dict[str, Any]]:
             "signature": declaration,
             "target_path": path,
             "source_symbol": source_symbol,
+            "namespace": namespace,
         })
     return rows
 

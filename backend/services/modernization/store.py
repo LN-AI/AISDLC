@@ -358,6 +358,10 @@ _ADDED_COLUMNS = (
     ("modernization_units", "actual_cost_usd", "REAL DEFAULT 0"),
     ("modernization_units", "risk", "TEXT"),
     ("modernization_units", "rework_attempts", "INTEGER DEFAULT 0"),
+    # Where a generated type lives, not just what it is called. Without it the converter is
+    # told a dependency's name and signature but never its namespace, so it cannot write a
+    # correct `using` even in principle — and nothing downstream can compute one for it.
+    ("modernization_symbols", "namespace", "TEXT"),
     ("modernization_runs", "system_addendum", "TEXT"),
     ("modernization_runs", "plan_json", "TEXT"),
     ("modernization_runs", "estimate_json", "TEXT"),
@@ -870,6 +874,15 @@ def complete_unit(
                  now),
             )
 
+        # The namespace every symbol in this batch lands in. Taken from the unit rather than
+        # from the symbol dict: the unit's `target_namespace` was assigned deterministically at
+        # design time and is what the file actually declares, whereas anything the model said
+        # about its own namespace is a claim. One read, reused for the whole batch.
+        unit_row = cursor.execute(
+            "SELECT target_namespace FROM modernization_units WHERE id = ?", (unit_id,),
+        ).fetchone()
+        unit_namespace = (unit_row["target_namespace"] if unit_row else "") or ""
+
         conflicts = []
         for symbol in symbols:
             name, kind = symbol.get("name", ""), symbol.get("kind", "")
@@ -887,11 +900,16 @@ def complete_unit(
                 conflicts.append((name, kind, prior["target_path"] or ""))
             cursor.execute(
                 "INSERT OR REPLACE INTO modernization_symbols "
-                "(id, run_id, unit_id, name, kind, signature, target_path, source_symbol, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "(id, run_id, unit_id, name, kind, signature, target_path, source_symbol, "
+                " namespace, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (str(uuid.uuid4()), run_id, unit_id, name, kind,
                  symbol.get("signature", ""),
-                 symbol.get("target_path", ""), symbol.get("source_symbol", ""), now),
+                 symbol.get("target_path", ""), symbol.get("source_symbol", ""),
+                 # A symbol may name its own namespace, and some do: the deterministic
+                 # scaffold knows exactly where it put `PhpCompat`, while the unit that
+                 # emitted it is a scaffold row with no `target_namespace` to inherit. The
+                 # unit is the fallback, not the authority.
+                 symbol.get("namespace") or unit_namespace, now),
             )
         for name, kind, prior_path in conflicts[:20]:
             cursor.execute(
@@ -1552,14 +1570,38 @@ def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, An
         return []
     conn = get_connection()
     placeholders = ",".join("?" * len(source_paths))
+    # `u.target_namespace` as a fallback for `s.namespace`: rows written before the column
+    # existed have NULL, and a run resumed across the upgrade would otherwise render half its
+    # dependency signatures without the namespace the model needs to import them.
     rows = conn.execute(
-        f"SELECT s.* FROM modernization_symbols s "
+        f"SELECT s.*, COALESCE(NULLIF(s.namespace, ''), u.target_namespace) AS namespace "
+        f"FROM modernization_symbols s "
         f"JOIN modernization_units u ON u.id = s.unit_id "
         f"WHERE s.run_id = ? AND u.path IN ({placeholders}) ORDER BY s.name",
         [run_id] + list(source_paths),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def symbol_namespaces(run_id: str) -> Dict[str, str]:
+    """Every generated type in the run -> the namespace it lives in.
+
+    The whole map, unlimited and in one query, because the using-resolver has to scan an
+    artifact against *all* of them: a file may reference a type from any component, not only
+    from the ones its unit declared a dependency on. Same reasoning as `symbol_names`, which
+    is the equivalent for the unresolved-symbol check.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT s.name AS name, "
+        "       COALESCE(NULLIF(s.namespace, ''), u.target_namespace) AS namespace "
+        "FROM modernization_symbols s "
+        "LEFT JOIN modernization_units u ON u.id = s.unit_id "
+        "WHERE s.run_id = ?", (run_id,),
+    ).fetchall()
+    conn.close()
+    return {r["name"]: r["namespace"] for r in rows if r["name"] and r["namespace"]}
 
 
 def list_artifacts(run_id: str, current_only: bool = True,

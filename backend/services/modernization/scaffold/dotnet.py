@@ -271,9 +271,16 @@ def build_dotnet(charter: Dict[str, Any], projects: List[Dict[str, Any]],
         "purpose": "Settings shared by every project, so they cannot drift apart.",
     })
     files.append({"path": "global.json",
+                  # `latestMajor`, not `latestFeature`. The stricter-looking value is the worse
+                  # one: `latestFeature` rolls forward only *within* 8.0.x, so a machine with
+                  # any newer SDK and no 8.0 band installed fails at SDK resolution — before a
+                  # single line of generated C# is read — with "A compatible .NET SDK was not
+                  # found". That reads as "the conversion produced broken code" when nothing
+                  # has been compiled at all. `latestMajor` keeps 8.0.400 as a floor and lets
+                  # any later SDK satisfy it; a net8.0 target builds fine on SDK 9 and 10.
                   "content": '{\n  "sdk": {\n    "version": "8.0.400",\n'
-                             '    "rollForward": "latestFeature"\n  }\n}\n',
-                  "purpose": "Pins the SDK band so CI and a developer machine agree."})
+                             '    "rollForward": "latestMajor"\n  }\n}\n',
+                  "purpose": "Sets an SDK floor without excluding newer SDKs."})
     files.append({"path": ".gitignore",
                   "content": "bin/\nobj/\n.vs/\n*.user\n*.suo\nTestResults/\n",
                   "purpose": "Standard .NET ignores."})
