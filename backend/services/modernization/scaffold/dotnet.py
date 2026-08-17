@@ -153,9 +153,13 @@ def _program_cs(entry: Dict[str, Any], charter: Dict[str, Any]) -> str:
         "",
         "builder.Services.AddControllersWithViews();",
     ]
-    if re.search(r"(?i)\bsession\b", " ".join(str(charter.get(k) or "")
-                                              for k in ("config_strategy", "constraints",
-                                                        "ui_strategy"))):
+    # Every charter value, not a hand-picked three. The old list was `config_strategy`,
+    # `constraints`, `ui_strategy` — and a PHP run that answered "records live in $_SESSION"
+    # under `data_access`/`datastore_fate`/`auth_model` scaffolded no session at all, so the
+    # app threw on its first request. Which field someone writes it in is not a signal.
+    # `wireup` re-checks this against the converted code afterwards, so a miss here is now
+    # corrected rather than fatal; scanning everything makes the scaffold right more often.
+    if re.search(r"(?i)\bsessions?\b", " ".join(str(v or "") for v in charter.values())):
         # Session is registered exactly once, here. A per-file converter emits
         # `AddSession()` in every file that touched `$_SESSION`, which is the single most
         # common way a converted PHP app fails to start.

@@ -40,12 +40,13 @@ from backend.services import agent_guard, code_chunker, llm_gateway  # noqa: E40
 from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
-    analyzers, build_results, charter, comprehension, evidence, graph, reconcile,
-    repo_ingest, runner, rules as rules_module, scaffold, stages, store, usings,
-    validation, wireup,
+    analyzers, architecture as _architecture, build_results, charter, comprehension,
+    evidence, graph, reconcile, repo_ingest, runner, rules as rules_module, scaffold,
+    stages, store, usings, validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
+from backend.services.modernization.scaffold import dotnet as _dotnet_scaffold  # noqa: E402
 
 database.init_db()
 
@@ -2270,6 +2271,169 @@ check("the fixture run produced its wireup unit",
       store.stage_units_exist(r18, "wireup"))
 check("wireup spent no model call",
       call_log.count("submit_unit_conversion") == _wireup_calls)
+
+
+# ── 22. Host wiring — the defect a build gate cannot see ───────────────────
+# A converted project used to compile clean and then throw
+# `Unable to resolve service for type 'I…'` on every request, because nothing ever replaced
+# the scaffold's placeholder in Program.cs. These checks are written against that failure.
+section("22. Host wiring (Program.cs)")
+
+_host_artifacts = [
+    {"path": "Shop.Web/Data/IEmployeeRepository.cs",
+     "content": "namespace Shop.Web.Data;\npublic interface IEmployeeRepository { }\n"},
+    {"path": "Shop.Web/Data/SessionEmployeeRepository.cs",
+     "content": ("namespace Shop.Web.Data;\n"
+                 "public sealed class SessionEmployeeRepository : IEmployeeRepository {\n"
+                 "  private readonly IHttpContextAccessor _a;\n"
+                 "  private ISession S => _a.HttpContext.Session;\n}\n")},
+    {"path": "Shop.Web/Features/Employees/EmployeesController.cs",
+     "content": ("namespace Shop.Web.Features.Employees;\n"
+                 "public sealed class EmployeesController : Controller { }\n")},
+    {"path": "Shop.Web/Features/Employees/Views/Index.cshtml", "content": "@model X\n"},
+    {"path": "Shop.Web/Views/Shared/_Layout.cshtml", "content": "<html></html>\n"},
+]
+_hp = wireup.host_plan(_host_artifacts, "Shop.Web")
+
+check("the single implementation of an interface is registered",
+      _hp["services"] == ["builder.Services.AddScoped<Shop.Web.Data.IEmployeeRepository, "
+                          "Shop.Web.Data.SessionEmployeeRepository>();"], str(_hp["services"]))
+check("code that reaches for the session is detected", _hp["needs_session"])
+check("and so is IHttpContextAccessor", _hp["needs_http_context"])
+check("a feature-folder view produces the Razor search path Razor lacks",
+      _hp["view_formats"] == ["/Features/{1}/Views/{0}.cshtml"], str(_hp["view_formats"]))
+check("_Layout is not turned into a search format",
+      all("_Layout" not in f for f in _hp["view_formats"]))
+
+# Views already at the convention need no format — adding one would be noise.
+check("a conventional Views/<Controller> layout adds no search path",
+      wireup.host_plan(
+          [{"path": "Shop.Web/Views/Employees/Index.cshtml", "content": "@model X\n"},
+           {"path": "Shop.Web/Features/Employees/EmployeesController.cs",
+            "content": "namespace N;\npublic sealed class EmployeesController : Controller { }\n"}],
+          "Shop.Web")["view_formats"] == [])
+
+# Two implementations is a decision, not a default. Registering either would be a guess.
+_ambiguous = wireup.host_plan(_host_artifacts + [
+    {"path": "Shop.Web/Data/SqlEmployeeRepository.cs",
+     "content": "namespace Shop.Web.Data;\npublic sealed class SqlEmployeeRepository : "
+                "IEmployeeRepository { }\n"}], "Shop.Web")
+check("two implementations register neither and are reported instead",
+      not _ambiguous["services"] and _ambiguous["ambiguous"], str(_ambiguous))
+
+_program = ("var builder = WebApplication.CreateBuilder(args);\n\n"
+            "builder.Services.AddControllersWithViews();\n\n"
+            f"{wireup.MARKER}\n\n"
+            "var app = builder.Build();\n\n"
+            "app.UseStaticFiles();\napp.UseRouting();\n"
+            "app.MapControllerRoute(name: \"default\", pattern: \"{controller=Home}\");\n\n"
+            "app.Run();\n")
+_wired = wireup.apply_to_program_cs(_program, _hp)
+check("the placeholder is gone once the host is wired", wireup.MARKER not in _wired, _wired)
+check("the registration is in the file", "AddScoped<Shop.Web.Data.IEmployeeRepository" in _wired)
+check("session is registered and its middleware ordered after UseRouting",
+      "AddSession();" in _wired
+      and _wired.index("app.UseRouting();") < _wired.index("app.UseSession();")
+      and _wired.index("app.UseSession();") < _wired.index("app.MapControllerRoute"), _wired)
+check("the view search path is registered before the host is built",
+      "ViewLocationFormats" in _wired
+      and _wired.index("ViewLocationFormats") < _wired.index("var app = builder.Build();"))
+check("everything registered lands before Build(), never after",
+      _wired.index("AddScoped<") < _wired.index("var app = builder.Build();"))
+check("wiring an already-wired Program.cs changes nothing",
+      wireup.apply_to_program_cs(_wired, _hp) == _wired)
+check("a Program.cs with no placeholder still gets its registrations",
+      "AddScoped<" in wireup.apply_to_program_cs(_program.replace(wireup.MARKER, ""), _hp))
+check("a Program.cs with nowhere to put them is left untouched rather than corrupted",
+      wireup.apply_to_program_cs("// not a host", _hp) == "// not a host")
+check("nothing to wire leaves the file alone",
+      wireup.apply_to_program_cs(_program, wireup.host_plan([], "Shop.Web")) == _program)
+
+# A converter that wrote its own host is the normal case once the architect gives Program.cs
+# to a component. Re-registering on top of it produced a duplicated `AddSession` beside the
+# converter's configured one, because the guard tested for the literal `AddSession()`.
+_own_host = (
+    "builder.Services.AddDistributedMemoryCache();\n"
+    "builder.Services.AddSession(options => { options.IdleTimeout = x; });\n"
+    "builder.Services.AddScoped<IEmployeeRepository, SessionEmployeeRepository>();\n"
+    "var app = builder.Build();\n"
+)
+_own_plan = {"needs_session": True, "needs_http_context": False, "view_formats": [],
+             "services": ["builder.Services.AddScoped<Shop.IEmployeeRepository, "
+                          "Shop.Data.SessionEmployeeRepository>();"]}
+_re_wired = wireup.apply_to_program_cs(_own_host, _own_plan)
+check("a converter's configured AddSession(...) is not registered a second time",
+      _re_wired.count("AddSession") == 1)
+check("AddDistributedMemoryCache is not duplicated either",
+      _re_wired.count("AddDistributedMemoryCache") == 1)
+check("a pair already registered short-form is not re-registered fully-qualified",
+      _re_wired.count("AddScoped") == 1)
+
+# Two components proposing one namespace used to be separated with a dot and a number,
+# giving `Shop.Features.Employees.2` — a segment starting with a digit is not an identifier,
+# so every file in the component and every `using` of it failed to compile with CS1002.
+_taken = set()
+_ns = []
+for _ in range(3):
+    _n = _architecture._unique("Shop.Features.Employees", _taken, 2, separator="")
+    _taken.add(_n)
+    _ns.append(_n)
+check("a colliding namespace stays a legal identifier path",
+      _ns == ["Shop.Features.Employees", "Shop.Features.Employees2",
+              "Shop.Features.Employees3"], str(_ns))
+check("a namespace segment starting with a digit is made legal, keeping the word",
+      _architecture._legal_namespace("Shop.Web.2Factor") == "Shop.Web.N2Factor")
+
+# A controller that renders a view nobody emitted compiles clean and throws on the first
+# request. Found by running a converted app: `/add_employee.php` 500'd with "The view
+# 'Index' was not found" while `dotnet build` reported 0 errors.
+_views = [
+    {"path": "App/Features/AddEmployee/Views/AddEmployee.cshtml", "content": "x"},
+    {"path": "App/Features/Employees/Views/Index.cshtml", "content": "x"},
+    {"path": "App/Views/Shared/_Layout.cshtml", "content": "x"},
+    {"path": "App/Features/AddEmployee/AddEmployeeController.cs",
+     "content": "public IActionResult Index() { return View(new AddEmployeeViewModel()); }"},
+    {"path": "App/Features/Employees/EmployeesController.cs",
+     "content": "public IActionResult Index() { return View(model); }"},
+    {"path": "App/Features/Home/HomeController.cs",
+     "content": 'public IActionResult Whatever() { return View("_Layout"); }'},
+]
+_unres = reconcile._unresolved_views(_views)
+_flagged = [i for i in _unres if "AddEmployeeController" in i["detail"]]
+check("a controller rendering a view that was never emitted is a failure",
+      len(_flagged) == 1 and _flagged[0]["severity"] == "fail")
+check("a view resolved from the controller's own feature folder is not flagged",
+      not any("EmployeesController" in i["detail"] for i in _unres))
+check("Views/Shared is reachable from any controller",
+      not any("HomeController" in i["detail"] for i in _unres))
+check("only the genuinely unresolved view is reported",
+      len(_unres) == 1, str([i["detail"][:60] for i in _unres]))
+check("no views emitted at all is not treated as every view being broken",
+      reconcile._unresolved_views([_views[3]]) == [])
+
+# `htmlspecialchars($name)` became `@Html.Encode(name)`, which Razor encodes a second time —
+# the page showed `&amp;lt;script&amp;gt;` where PHP showed `&lt;script&gt;`. Found by
+# posting a name containing `<` to a running converted app.
+_enc = reconcile._double_encoded_views([
+    {"path": "App/Views/List.cshtml", "content": "<td>@Html.Encode(e.Name)</td>"
+                                                 "<td>@Html.Encode(e.Dept)</td>"},
+    {"path": "App/Views/Ok.cshtml", "content": "<td>@e.Name</td><td>@Html.Raw(e.Id)</td>"},
+    {"path": "App/Thing.cs", "content": "Html.Encode(x)"},
+])
+check("a Razor view that double-encodes its output is reported", len(_enc) == 1)
+check("the count of double-encoded expressions is reported", "2 time(s)" in _enc[0]["detail"])
+check("plain `@value` and `@Html.Raw` are left alone",
+      not any("Ok.cshtml" in i["detail"] for i in _enc))
+check("`Html.Encode` in C# (not Razor) is not a double-encode",
+      not any("Thing.cs" in i["detail"] for i in _enc))
+
+# The scaffold's own session detection, which read three charter keys and missed a charter
+# that answered "records live in $_SESSION" under `data_access`.
+check("the scaffold finds session wherever in the charter it was written",
+      "AddSession();" in _dotnet_scaffold._program_cs(
+          {"name": "Shop.Web"},
+          {"target_stack": ".NET 8 / ASP.NET Core MVC", "ui_strategy": "Razor views",
+           "data_access": "records live in PHP $_SESSION; keep session state"}))
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

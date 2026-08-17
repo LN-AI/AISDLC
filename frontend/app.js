@@ -5634,6 +5634,18 @@ loadDashboard();
 let _modRunId = null;
 let _modPollTimer = null;
 let _modCharterFields = null;
+// Last run object handed back by a successful refresh, so a skipped repaint (see
+// `_charterIsDirty`) can still answer the poll loop's "is it still working?" question.
+let _modLastRun = null;
+
+// True when the charter form is on screen holding text the server has not been given yet.
+// Compared against what the form was rendered with, not against emptiness — a user editing
+// a pre-filled suggestion is exactly the case the poll used to silently revert.
+function _charterIsDirty() {
+  const boxes = document.querySelectorAll('#mod-detail textarea[id^="charter-"]');
+  if (!boxes.length) return false;
+  return Array.from(boxes).some(el => el.value !== (el.dataset.rendered ?? ''));
+}
 // Per-run, deliberately not cached across runs: these answers are derived from one specific
 // codebase's evidence. `runId` is the cache key; a mismatch triggers a fetch.
 let _modCharterSuggestions = { runId: null, fields: [], loading: false, prefilled: false };
@@ -5721,6 +5733,13 @@ async function openModernizationRun(runId) {
 
 async function refreshModernizationRun() {
   if (!_modRunId) return null;
+  // Re-rendering #mod-detail rebuilds the charter form from the server's suggestions, which
+  // throws away anything typed but not yet saved. The damage is invisible for fields that
+  // have a suggestion — they are refilled with the same text — so it only ever destroyed the
+  // answers a human had to write themselves, and the run then rejected those as missing.
+  // Skipping the repaint while the form is dirty is safe: `awaiting_charter` only changes in
+  // response to this page, so there is nothing to miss.
+  if (_charterIsDirty()) return _modLastRun;
   const box = document.getElementById('mod-detail');
   try {
     const base = `/api/v1/modernization/runs/${_modRunId}`;
@@ -5736,6 +5755,7 @@ async function refreshModernizationRun() {
     box.classList.remove('hidden');
     box.innerHTML = renderModernizationRun(run, checkpoints.checkpoints || [],
                                            units.units || [], components);
+    _modLastRun = run;
     return run;
   } catch (e) {
     box.classList.remove('hidden');
@@ -6119,7 +6139,8 @@ function renderCharterField(f) {
             onclick="pickCharterOption('${esc(f.key)}', ${i})"
             title="${esc(o.why || '')}">${esc(o.label)}${o.recommended ? ' ★' : ''}</button>`).join('')}
       </div>` : ''}
-      <textarea id="charter-${esc(f.key)}" rows="3">${esc(initial)}</textarea>
+      <textarea id="charter-${esc(f.key)}" rows="3"
+                data-rendered="${esc(initial)}">${esc(initial)}</textarea>
       ${options.length ? `<div class="field-hint mod-choice-why" id="why-${esc(f.key)}">${esc(options[0].why || '')}</div>` : ''}
     </div>`;
 }
@@ -6157,6 +6178,14 @@ async function saveModernizationCharter() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ charter }),
+    });
+    // The server now holds exactly what these boxes contain, so the form is no longer
+    // "unsaved" — re-baseline `data-rendered` before refreshing. Without this the dirty
+    // guard that protects unsaved edits (C-54) never releases: the repaint after a
+    // successful save is skipped, the charter form stays on screen as though nothing
+    // happened, and the only way forward is a manual reload.
+    document.querySelectorAll('#mod-detail textarea[id^="charter-"]').forEach(el => {
+      el.dataset.rendered = el.value;
     });
     await refreshModernizationRun();
   } catch (e) {

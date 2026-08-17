@@ -931,14 +931,50 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
         rewritten.append({"path": path, "content": updated,
                           "purpose": "project file, corrected from the converted code"})
 
+    # Host wiring. Without this the export compiles clean and then throws
+    # `Unable to resolve service for type 'I…'` on every request — the one failure mode a
+    # build gate cannot see, so it is corrected here rather than left to the build loop.
+    host_plan = wireup.host_plan(artifacts, entry_project)
+    program_path = f"{entry_project}/Program.cs" if entry_project else ""
+    program = by_path.get(program_path)
+    if program is not None:
+        updated = wireup.apply_to_program_cs(program.get("content") or "", host_plan)
+        if updated != (program.get("content") or ""):
+            rewritten.append({"path": program_path, "content": updated,
+                              "purpose": "application host, wired from the converted code"})
+            bits = []
+            if host_plan["services"]:
+                bits.append(f"{len(host_plan['services'])} service registration(s)")
+            if host_plan["view_formats"]:
+                bits.append(f"{len(host_plan['view_formats'])} view location(s)")
+            if host_plan["needs_session"]:
+                bits.append("session")
+            notes.append(f"Program.cs: {', '.join(bits) or 'corrected'}")
+    elif program_path:
+        logger.warning("No Program.cs artifact at %s — host wiring skipped", program_path)
+
+    # An interface with two implementations cannot be registered without choosing, and that
+    # choice is not this stage's to make. Say so rather than registering neither in silence.
+    if host_plan["ambiguous"]:
+        store.create_checkpoint(
+            run_id, "wireup_ambiguous",
+            f"{len(host_plan['ambiguous'])} interface(s) need a registration decision",
+            detail=("More than one converted type implements each of these, so the container "
+                    "cannot be told which to use without a decision:\n  "
+                    + "\n  ".join(host_plan["ambiguous"])
+                    + "\n\nRegister the intended one in Program.cs before running."),
+            unit_id=unit["id"], blocking=False,
+        )
+
     if not rewritten:
         store.complete_unit(unit_id=unit["id"], run_id=run_id, artifacts=[], symbols=[],
-                            event_detail="project files already matched the converted code")
+                            event_detail="project files and host already matched the "
+                                         "converted code")
         return "converted"
 
     store.complete_unit(
         unit_id=unit["id"], run_id=run_id, artifacts=rewritten, symbols=[],
-        event_detail=f"{len(rewritten)} project file(s) corrected: {'; '.join(notes)}"[:400],
+        event_detail=f"{len(rewritten)} file(s) corrected: {'; '.join(notes)}"[:400],
     )
     return "converted"
 
@@ -1343,9 +1379,40 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
             )
         return "failed"
 
+    # What the plan promised, against what arrived. The architect wrote `expected_files` for
+    # this component and it is already rendered into the prompt — but nothing compared the
+    # two, so a component that promised ten files and returned one 52-byte stub was recorded
+    # `converted` and the run reported "0 failed". A shortfall is not automatically a failure
+    # (a converter may fold two predicted files into one, legitimately), so it is surfaced as
+    # a review flag and a checkpoint rather than a hard fail.
+    expected = [f for f in (meta.get("expected_files") or []) if f]
+    shortfall: List[str] = []
+    if expected:
+        produced = {os.path.basename((a.get("path") or "").replace("\\", "/")).lower()
+                    for a in safe_artifacts}
+        shortfall = [f for f in expected
+                     if os.path.basename(f.replace("\\", "/")).lower() not in produced]
+        if shortfall:
+            store.append_event(
+                run_id, "expected_files_missing",
+                f"{path}: {len(shortfall)} of {len(expected)} planned file(s) not returned: "
+                + ", ".join(shortfall[:12]), unit_id=unit["id"], level="warning")
+            store.create_checkpoint(
+                run_id, "incomplete_component",
+                f"{unit.get('component_name') or path} returned "
+                f"{len(expected) - len(shortfall)} of {len(expected)} planned files",
+                detail=("The conversion plan for this component listed these files, and the "
+                        "converter did not return them:\n  " + "\n  ".join(shortfall)
+                        + "\n\nThis is not always wrong — two planned files may have been "
+                          "folded into one. Check the output before treating the component "
+                          "as done."),
+                unit_id=unit["id"], blocking=False,
+            )
+
     needs_review = bool(result.get("needs_human_review")) \
         or (result.get("confidence") or "").lower() == "low" \
         or report["status"] == "warn" \
+        or bool(shortfall) \
         or bool(result.get("manual_followup"))
 
     for artifact in safe_artifacts:
@@ -1382,7 +1449,21 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
 
     if run.get("status") in store.ACTIVE_RUN_STATES:
         stages_left = run.get("phase") not in ("completed", "") and stages.get(run.get("phase") or "")
-        if outstanding == 0 and not stages_left:
+        # No components at all means the architect never produced a plan — every conversion
+        # call it would have driven does not exist, so `outstanding` is 0 and the run used to
+        # sail through to `completed`. A run that ingested files, converted none of them and
+        # reported success is the least trustworthy thing this system can do: the export is
+        # then a bare scaffold wearing a finished run's status. `total > 0` keeps a run with
+        # genuinely nothing to convert out of this branch.
+        if components["total"] == 0 and counts["total"] > 0 and counts["converted"] == 0:
+            store.update_run(run_id, status="failed", phase=run.get("phase") or "design")
+            store.append_event(
+                run_id, "run_failed",
+                f"No target architecture was produced, so none of {counts['total']} file(s) "
+                f"could be converted. The export contains scaffolding only.",
+                level="error",
+            )
+        elif outstanding == 0 and not stages_left:
             store.update_run(run_id, status="completed", phase="completed")
             store.append_event(
                 run_id, "run_completed",

@@ -259,7 +259,14 @@ def describe(target_stack: str, observed: Dict[str, Any]) -> List[Dict[str, Any]
     """
     observed = observed or {}
     options = suggest(target_stack, observed)
-    required = charter_module.required_for(observed)
+    # What `charter.validate()` will actually enforce — the static list, deliberately, for the
+    # reason given in its docstring. This used to be `required_for(observed)`, which is
+    # *subtractive*: on a codebase with no database it dropped `data_access` from the form's
+    # required set, so the field rendered inside the collapsed "optional" fold with no
+    # suggested value — and then the save was refused with "…before any file is converted:
+    # Data access". The form hid a question the server went on to demand. A form may ask for
+    # more than is enforced; it must never ask for less.
+    required = list(charter_module.REQUIRED_KEYS)
     out = []
     for f in charter_module.CHARTER_FIELDS:
         out.append({

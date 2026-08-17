@@ -418,6 +418,14 @@ await checkAsync('required and recommended groups are open; optional starts coll
          'expected exactly two open groups');
 });
 
+// The textarea carries a `data-rendered` copy of what it was filled with, so the poll can
+// tell an edited form from an untouched one. Assert on the *content* of the box rather than
+// on an exact attribute string, or every future attribute breaks these checks.
+function textareaBody(html, key) {
+  const m = html.match(new RegExp(`id="charter-${key}"[^>]*>([\s\S]*?)</textarea>`));
+  return m ? m[1] : null;
+}
+
 await checkAsync('every field arrives pre-filled with its recommended answer', async () => {
   const { html } = await renderCharter(CHARTER_SUGGESTIONS);
   assert(html.includes('>.NET 8 / ASP.NET Core MVC</textarea>'), 'target_stack not pre-filled');
@@ -425,9 +433,21 @@ await checkAsync('every field arrives pre-filled with its recommended answer', a
   assert(html.includes('>Action + view model + view</textarea>'), 'ui_strategy not pre-filled');
 });
 
+await checkAsync('each box records what it was rendered with, so an edit is detectable', async () => {
+  // This is what lets refreshModernizationRun() skip the repaint on a dirty form. Without it
+  // the 4s poll rebuilds the charter and silently discards whatever was typed — which only
+  // ever hurt the fields a human had to write themselves, because the ones with a suggestion
+  // were refilled with identical text and looked untouched.
+  const { html } = await renderCharter(CHARTER_SUGGESTIONS);
+  const m = html.match(/id="charter-target_stack"[^>]*data-rendered="([^"]*)"[^>]*>([\s\S]*?)<\/textarea>/);
+  assert(m, 'target_stack textarea should carry data-rendered');
+  assert(m[1] === m[2], `data-rendered ${JSON.stringify(m[1])} != body ${JSON.stringify(m[2])}`);
+  assert(m[2] === '.NET 8 / ASP.NET Core MVC', 'should record the pre-filled suggestion');
+});
+
 await checkAsync('a field with no options renders an empty box, not a broken one', async () => {
   const { html } = await renderCharter(CHARTER_SUGGESTIONS);
-  assert(html.includes('id="charter-naming_conventions" rows="3"></textarea>'),
+  assert(textareaBody(html, 'naming_conventions') === '',
          'the optionless field should render an empty textarea');
 });
 
@@ -449,7 +469,7 @@ await checkAsync('a field whose first option is NOT recommended is left blank', 
   const { html } = await renderCharter([{ key: 'logging', label: 'Logging', help: 'h',
     required: false, emphasis: 'optional',
     options: [{ value: 'x', label: 'X', why: 'w', recommended: false }] }]);
-  assert(html.includes('id="charter-logging" rows="3"></textarea>'),
+  assert(textareaBody(html, 'logging') === '',
          'should not pre-fill from a non-recommended option');
 });
 

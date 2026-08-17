@@ -59,6 +59,196 @@ _PACKAGE_TYPES: Tuple[Tuple[str, str, str], ...] = (
 _PACKAGE_REF = re.compile(r'<PackageReference\s+Include="([^"]+)"', re.IGNORECASE)
 _PROJECT_REF = re.compile(r'<ProjectReference\s+Include="[^"]*?([^\\/"]+)\.csproj"', re.IGNORECASE)
 
+# ── Host wiring ────────────────────────────────────────────────────────────────────────
+#
+# The scaffold writes `Program.cs` before any C# exists, so it can only leave a placeholder
+# where the registrations go. Nothing used to replace it, and the result is the worst kind
+# of output this pipeline can produce: a project that **compiles clean and 500s on every
+# route** (`Unable to resolve service for type 'IEmployeeRepository'`). A build gate cannot
+# catch that, which is why this is computed here and not left to the build loop.
+#
+# Same rule as the rest of this module — read the converted code, make no model call. Which
+# concrete type implements an interface is a fact about the code, and a model asked to guess
+# it will sometimes register a type that does not exist.
+MARKER = "// Registrations for converted services are added here as components are converted."
+
+_NAMESPACE = re.compile(r"^\s*namespace\s+([\w.]+)\s*[;{]", re.MULTILINE)
+_INTERFACE = re.compile(r"\b(?:public|internal)\s+(?:partial\s+)?interface\s+(I\w+)")
+# `abstract` is excluded deliberately: registering an abstract type as an implementation is a
+# runtime failure, and it is never the thing the container should construct.
+_CLASS = re.compile(
+    r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+|static\s+)*class\s+(\w+)\s*:\s*([^\{\r\n]+)")
+_CONTROLLER = re.compile(r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+)*class\s+(\w+)Controller\b")
+
+
+def _namespace_of(content: str) -> str:
+    m = _NAMESPACE.search(content or "")
+    return m.group(1) if m else ""
+
+
+def host_plan(artifacts: List[Dict[str, Any]], entry_project: str) -> Dict[str, Any]:
+    """What `Program.cs` is missing, read off the converted code. Pure — no I/O.
+
+    Returns `services` (registration lines), `view_formats` (Razor search paths for a layout
+    the default view engine will not find), and the two feature flags the host needs.
+    """
+    interfaces: Dict[str, str] = {}          # IFoo -> namespace that declares it
+    impls: Dict[str, List[Tuple[str, str]]] = {}   # IFoo -> [(class, namespace)]
+    controllers: Set[str] = set()
+    view_paths: List[str] = []
+    needs_session = False
+    needs_http_context = False
+
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        raw = artifact.get("content") or ""
+        if path.lower().endswith(".cshtml"):
+            view_paths.append(path)
+            continue
+        if not path.lower().endswith(".cs"):
+            continue
+        code = usings.strip_non_code(raw)
+        namespace = _namespace_of(raw)
+        for name in _INTERFACE.findall(code):
+            interfaces[name] = namespace
+        for cls, bases in _CLASS.findall(code):
+            for base in (b.strip() for b in bases.split(",")):
+                base = base.split("<")[0].strip()
+                if base.startswith("I") and len(base) > 1 and base[1:2].isupper():
+                    impls.setdefault(base, []).append((cls, namespace))
+        controllers.update(_CONTROLLER.findall(code))
+        if re.search(r"\bISession\b|\.Session\b", code):
+            needs_session = True
+        if "IHttpContextAccessor" in code:
+            needs_http_context = True
+
+    services: List[str] = []
+    ambiguous: List[str] = []
+    for interface in sorted(interfaces):
+        found = impls.get(interface) or []
+        if len(found) != 1:
+            # Zero means the interface is implemented outside the conversion (or not at all —
+            # reconciliation already reports that). More than one means the container cannot
+            # be told which to use without a decision this stage is not entitled to make.
+            if len(found) > 1:
+                ambiguous.append(f"{interface} ({', '.join(c for c, _ in found)})")
+            continue
+        cls, impl_ns = found[0]
+        iface_ns = interfaces[interface]
+        lhs = f"{iface_ns}.{interface}" if iface_ns else interface
+        rhs = f"{impl_ns}.{cls}" if impl_ns else cls
+        services.append(f"builder.Services.AddScoped<{lhs}, {rhs}>();")
+
+    return {
+        "services": services,
+        "ambiguous": ambiguous,
+        "view_formats": _view_formats(view_paths, controllers, entry_project),
+        "needs_session": needs_session,
+        "needs_http_context": needs_http_context,
+    }
+
+
+def _view_formats(view_paths: List[str], controllers: Set[str], entry_project: str) -> List[str]:
+    """Razor search paths for views the default engine cannot find.
+
+    ASP.NET Core only looks in `Views/{Controller}` and `Views/Shared`. A folder-per-feature
+    layout — which the architect chooses often, because it is what the charter asks for — puts
+    them in `Features/{Controller}/Views`, and every action then throws
+    `InvalidOperationException: The view 'Index' was not found`. The format is derived from
+    where the views actually landed rather than assumed, so an architect that picks a
+    different shape is still wired correctly.
+    """
+    formats: Set[str] = set()
+    for path in view_paths:
+        rel = path[len(entry_project) + 1:] if entry_project and path.startswith(
+            entry_project + "/") else path
+        parts = rel.split("/")
+        if len(parts) < 2:
+            continue
+        name = parts[-1]
+        if name.startswith("_"):
+            continue                      # _Layout / _ViewStart live at their literal path
+        directory = parts[:-1]
+        if directory and directory[0] == "Views" and len(directory) == 2:
+            continue                      # already the convention Razor searches
+        rebuilt = ["{1}" if seg in controllers else seg for seg in directory]
+        if "{1}" not in rebuilt:
+            continue                      # nothing controller-shaped — cannot generalise
+        formats.add("/" + "/".join(rebuilt) + "/{0}.cshtml")
+    return sorted(formats)
+
+
+def _registers_pair(text: str, lhs: str, rhs: str) -> bool:
+    """True when `text` already registers this interface against this implementation,
+    whether it named them fully-qualified or relied on a `using`."""
+    left, right = lhs.rsplit(".", 1)[-1], rhs.rsplit(".", 1)[-1]
+    for match in re.finditer(r"Add(?:Scoped|Singleton|Transient)\s*<([^>]+)>", text):
+        parts = [p.strip().rsplit(".", 1)[-1] for p in match.group(1).split(",")]
+        if len(parts) == 2 and parts[0] == left and parts[1] == right:
+            return True
+    return False
+
+
+def apply_to_program_cs(content: str, plan: Dict[str, Any]) -> str:
+    """Insert the registrations. Idempotent, and never removes what is already there."""
+    text = content or ""
+    if not text.strip():
+        return text
+    additions: List[str] = []
+
+    # Match the *call*, not one spelling of it. A converter that writes the configured form,
+    # `AddSession(options => { … })`, does not contain the literal `AddSession()` — testing
+    # for that re-registered session on top of the converter's own configured call, and the
+    # duplicate `AddDistributedMemoryCache()` beside it, in a file that already worked.
+    if plan.get("needs_http_context") and "AddHttpContextAccessor" not in text:
+        additions.append("builder.Services.AddHttpContextAccessor();")
+    if plan.get("needs_session"):
+        if "AddDistributedMemoryCache" not in text:
+            additions.append("builder.Services.AddDistributedMemoryCache();")
+        if "AddSession" not in text:
+            additions.append("builder.Services.AddSession();")
+    # Compared on the type *pair*, not the rendered line. This stage emits fully-qualified
+    # names; a converter that emitted `AddScoped<IFoo, Foo>()` plus a `using` registers the
+    # same pair in text that shares no substring with it, and an exact match would register
+    # it a second time.
+    for line in plan.get("services") or []:
+        pair = re.search(r"<\s*([^,>]+?)\s*,\s*([^>]+?)\s*>", line)
+        if pair and _registers_pair(text, pair.group(1), pair.group(2)):
+            continue
+        if line not in text:
+            additions.append(line)
+
+    formats = [f for f in (plan.get("view_formats") or [])]
+    if formats and "ViewLocationFormats" not in text:
+        additions.append(
+            "builder.Services.Configure<Microsoft.AspNetCore.Mvc.Razor."
+            "RazorViewEngineOptions>(options =>")
+        additions.append("{")
+        for fmt in formats:
+            additions.append(f'    options.ViewLocationFormats.Add("{fmt}");')
+        additions.append('    options.ViewLocationFormats.Add("/Views/Shared/{0}.cshtml");')
+        additions.append("});")
+
+    if additions:
+        block = "\n".join(additions)
+        if MARKER in text:
+            text = text.replace(MARKER, block)
+        else:
+            # A Program.cs the scaffold did not write (or one already corrected once). Put the
+            # registrations immediately before the build call rather than giving up — after
+            # `Build()` they would throw, and dropping them silently is the bug this fixes.
+            anchor = "var app = builder.Build();"
+            if anchor not in text:
+                logger.warning("Program.cs has no registration point — host wiring skipped")
+                return content
+            text = text.replace(anchor, block + "\n\n" + anchor, 1)
+
+    # `UseSession` is ordering-sensitive: it has to sit after UseRouting and before the
+    # endpoints, so it is placed by anchor rather than appended with the registrations.
+    if plan.get("needs_session") and "UseSession()" not in text and "app.UseRouting();" in text:
+        text = text.replace("app.UseRouting();", "app.UseRouting();\napp.UseSession();", 1)
+    return text
+
 
 def packages_for_code(content: str) -> Set[Tuple[str, str]]:
     """Packages the code in `content` proves it needs. Comments and strings are stripped

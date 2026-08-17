@@ -16,7 +16,7 @@ A human turns findings into repair work.
 import logging
 import re
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from backend.services.modernization import store
 
@@ -34,6 +34,109 @@ def _implements_pattern(name: str) -> re.Pattern:
 
 def _issue(kind: str, severity: str, detail: str, **extra: Any) -> Dict[str, Any]:
     return {"kind": kind, "severity": severity, "detail": detail, **extra}
+
+
+_ACTION = re.compile(
+    r"public\s+(?:async\s+)?(?:Task<)?(?:IActionResult|ActionResult|ViewResult)>?\s+"
+    r"(\w+)\s*\(")
+# `View()`, `View(model)`, `View("Name")`, `View("Name", model)`. Group 1 is the literal
+# name when the first argument is a string; otherwise the action's own name is used.
+_VIEW_CALL = re.compile(r"\breturn\s+View\s*\(\s*(?:\"([^\"]+)\")?")
+
+
+def _unresolved_views(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Every `return View(...)` whose target `.cshtml` was never emitted.
+
+    Scoped to the controller's own folder, not to the whole output. Matching on name alone
+    is too weak in exactly the case that bites: `Index.cshtml` almost always exists under
+    *some* feature, so a controller in another feature rendering `Index` looks resolvable
+    while Razor — which substitutes the controller name into the location format — still
+    fails. A shared layout or partial (`_Layout`) is reachable from anywhere, so
+    `Views/Shared` counts for every controller.
+    """
+    all_views = {}                       # dir -> {view name}
+    shared: Set[str] = set()
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        if not path.lower().endswith(".cshtml"):
+            continue
+        directory, _, filename = path.rpartition("/")
+        name = filename[: -len(".cshtml")]
+        all_views.setdefault(directory, set()).add(name)
+        if "/Views/Shared" in f"/{path}" or directory.endswith("Shared"):
+            shared.add(name)
+    if not all_views:
+        return []
+
+    def _reachable(controller_dir: str) -> Set[str]:
+        """Views a controller in this directory can actually resolve: anything at or below
+        its own folder (`Features/X/`, `Features/X/Views/`), plus the shared folder."""
+        found = set(shared)
+        for directory, names in all_views.items():
+            if directory == controller_dir or directory.startswith(controller_dir + "/"):
+                found |= names
+        return found
+
+    issues: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        if not path.lower().endswith(".cs"):
+            continue
+        content = artifact.get("content") or ""
+        # Which action each `return View(...)` sits in, by position — an action's body runs
+        # from its signature to the next signature.
+        actions = [(m.start(), m.group(1)) for m in _ACTION.finditer(content)]
+        if not actions:
+            continue
+        controller_dir = path.rpartition("/")[0]
+        view_names = _reachable(controller_dir)
+        for call in _VIEW_CALL.finditer(content):
+            explicit = call.group(1)
+            if explicit:
+                wanted = explicit.rsplit("/", 1)[-1].replace(".cshtml", "")
+            else:
+                enclosing = [name for pos, name in actions if pos < call.start()]
+                if not enclosing:
+                    continue
+                wanted = enclosing[-1]
+            if wanted in view_names or wanted.startswith("_"):
+                continue
+            issues.append(_issue(
+                "unresolved_view", "fail",
+                f"`{path}` renders view `{wanted}`, but no `{wanted}.cshtml` was emitted. "
+                f"This compiles and then fails at runtime with "
+                f"\"The view '{wanted}' was not found\". "
+                f"Views that do exist: "
+                + ", ".join(f"`{v}`" for v in sorted(view_names)[:8])))
+    return issues
+
+
+_RAZOR_DOUBLE_ENCODE = re.compile(r"@Html\.Encode\s*\(")
+
+
+def _double_encoded_views(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """`@Html.Encode(x)` in a Razor view, which encodes the value twice.
+
+    A converter translating `htmlspecialchars($x)` reaches for the call with the matching
+    name, but Razor's `@` already HTML-encodes whatever the expression returns — so the
+    output is `&amp;lt;script&amp;gt;` where PHP rendered `&lt;script&gt;`, and every name
+    containing `<`, `&` or a quote is visibly corrupted on the page. `@x` is the correct
+    translation and is equally safe. Always a defect, so it needs no cross-file context.
+    """
+    issues: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        if not path.lower().endswith(".cshtml"):
+            continue
+        hits = len(_RAZOR_DOUBLE_ENCODE.findall(artifact.get("content") or ""))
+        if hits:
+            issues.append(_issue(
+                "double_encoded_output", "warn",
+                f"`{path}` calls `@Html.Encode(...)` {hits} time(s). Razor's `@` already "
+                f"HTML-encodes, so the value is encoded twice and renders as `&amp;lt;` "
+                f"where the source rendered `&lt;`. Use `@value` instead — it is just as "
+                f"safe as the source's `htmlspecialchars`."))
+    return issues
 
 
 def run(run_id: str) -> Dict[str, Any]:
@@ -63,8 +166,13 @@ def run(run_id: str) -> Dict[str, Any]:
     #    component's directory. Scaffold files legitimately do not — a `.sln` belongs at the
     #    root and a `.csproj` at the project root — so they are excluded by the unit that
     #    produced them rather than by guessing from the path shape.
+    #    `wireup` is excluded for the same reason: it rewrites the scaffold's own
+    #    `Program.cs` and `.csproj` files in place, so the current version of a root file
+    #    belongs to the wireup unit. Judging by the producing unit alone reported the host
+    #    the pipeline had just correctly wired as a stray.
     dirs = {(c.get("output_dir") or "").strip("/") for c in components if c.get("output_dir")}
     scaffold_ids = {u["id"] for u in store.list_units(run_id, kind="scaffold")}
+    scaffold_ids |= {u["id"] for u in store.list_units(run_id, kind="wireup")}
     strays = []
     for artifact in artifacts:
         if artifact.get("unit_id") in scaffold_ids:
@@ -157,6 +265,17 @@ def run(run_id: str) -> Dict[str, Any]:
             + ", ".join(f"`{m}`" for m in members[:8])
             + (" …" if len(members) > 8 else ""),
             unit_id=component["id"]))
+
+    # N. Unresolved views. An MVC action that renders a view names it either explicitly or
+    #    implicitly by the action's own name; if no `.cshtml` with that name was emitted, the
+    #    route throws `InvalidOperationException: The view '…' was not found` at runtime.
+    #    This is invisible to the compiler — the project builds clean and 500s on the first
+    #    request — and it is exactly the cross-file disagreement this stage exists to catch:
+    #    the controller and its view come out of one call and can still disagree.
+    for issue in _unresolved_views(artifacts):
+        issues.append(issue)
+    for issue in _double_encoded_views(artifacts):
+        issues.append(issue)
 
     counts = store.unit_status_counts(run_id)
     if counts["failed"]:

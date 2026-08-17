@@ -98,12 +98,34 @@ def _fallback_component_name(path: str) -> str:
     return _slugify(directory.replace("/", "-") or "root", "root")
 
 
+def _legal_namespace(value: str) -> str:
+    """Every dotted segment made into something the target will accept as an identifier.
+
+    `_NS_OK` removes illegal *characters*, which is not the whole rule: a segment may not
+    *start* with a digit. A model that answers `Shop.Web.2Factor`, or a de-duplication that
+    appends a number, both produce a namespace that parses as a numeric literal mid-path.
+    Prefixing keeps the author's word rather than discarding it.
+    """
+    segments = []
+    for segment in (value or "").split("."):
+        if not segment:
+            continue
+        segments.append(f"N{segment}" if segment[0].isdigit() else segment)
+    return ".".join(segments)
+
+
 def _unique(value: str, taken: Set[str], suffix_with: int, separator: str = "-") -> str:
     """Make a name unique by suffixing it.
 
     `separator` matters: a namespace is an identifier in the target language, and
     `Shop.Web.Controllers-2` is not a legal C# namespace. A directory may contain a hyphen;
     a namespace may not.
+
+    Pass `separator=""` for a namespace. A dot is no better than a hyphen here — it makes
+    `Shop.Web.Controllers.2`, whose last segment starts with a digit, and an identifier may
+    not. Every file in the component then declares that namespace verbatim and every file
+    referencing it emits `using …Controllers.2;`, so one collision fails the whole build
+    with CS1002 far from its cause. Suffixing the final segment gives `Controllers2`.
     """
     if value not in taken:
         return value
@@ -162,12 +184,13 @@ def normalize_proposal(
         output_dir = _unique(output_dir, taken_dirs, 2)
         taken_dirs.add(output_dir)
 
-        namespace = _NS_OK.sub("", raw.get("namespace") or "").strip(".")
+        namespace = _legal_namespace(_NS_OK.sub("", raw.get("namespace") or "").strip("."))
         if not namespace:
             namespace = ".".join(part for part in (project, _pascal(name)) if part)
-        # Suffixed with a dot, not a hyphen: the result has to be a legal identifier path in
-        # the target language, and every artifact in the component declares it verbatim.
-        namespace = _unique(namespace, taken_ns, 2, separator=".")
+        # Suffixed onto the final segment, with no separator: the result has to be a legal
+        # identifier path in the target language, and every artifact in the component
+        # declares it verbatim.
+        namespace = _unique(namespace, taken_ns, 2, separator="")
         taken_ns.add(namespace)
 
         for member in keep:
