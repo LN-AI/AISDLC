@@ -36,7 +36,7 @@ from backend.services.orchestrator import SDLCOrchestrator
 from backend.services.modernization import advice
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
-    build_results, reconcile, repo_ingest, runner, stages, store,
+    build_results, parity, reconcile, repo_ingest, runner, stages, store,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,31 @@ class BuildDiagnostic(BaseModel):
     severity: str = "error"
     code: str = ""
     message: str = ""
+
+
+class ParityCasesRequest(BaseModel):
+    """Golden cases recorded from the **legacy** application.
+
+    Typed loosely on purpose. `parity.normalize_case` is the one validator, it produces the
+    exact 400 the caller needs to fix the case, and a pydantic model that half-validated the
+    same shape would give two answers to "is this case usable" — the recorder's problem is
+    almost never a missing field, it is a regex that matches nothing.
+    """
+    cases: List[Dict[str, Any]] = Field(
+        ..., description="Recorded interactions: {name, request:{method,path,headers,body,"
+                         "cookies}, expected:{status,location,content_type,body}, extract:[]}.")
+    source: str = Field("", description="What recorded them — e.g. 'proxy', 'access_log'.")
+
+
+class ParityResultsRequest(BaseModel):
+    """What replaying the corpus against the *converted* application observed."""
+    results: List[Dict[str, Any]] = Field(
+        ..., description="One per case: {case_id, status, headers, body, location, "
+                         "duration_ms, error}. An empty list is recorded as a replay that "
+                         "ran nothing, never as a pass.")
+    source: str = Field("external", description="Who replayed it — e.g. 'github_actions'.")
+    base_url: str = Field("", description="Where the converted app was reachable, for the log.")
+    commit_sha: str = ""
 
 
 class GithubPrRequest(BaseModel):
@@ -163,6 +188,10 @@ def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
         "open_checkpoints": len(checkpoints),
         "blocking_checkpoints": sum(1 for c in checkpoints if c.get("blocking")),
         "last_build": last_build,
+        # `None` when no case was ever recorded, which the screen has to render differently
+        # from "checked and matching" — a run nobody checked behaviourally and a run that
+        # passed parity must never look the same.
+        "parity": parity.summary_for_run(run["id"]),
         "rules_confirmed": rule_counts.get("confirmed", 0),
         # Count only. The map itself carries paths and line numbers and is available on its
         # own endpoint; putting it on every poll would be noise.
@@ -445,6 +474,93 @@ def list_builds(run_id: str, build_id: str = "", severity: str = "",
         "selected_build_id": target,
         "diagnostics": (store.list_diagnostics(run_id, build_id=target, severity=severity,
                                                limit=min(limit, 2000)) if target else []),
+    }
+
+
+@router.post("/runs/{run_id}/parity-cases", status_code=201,
+             summary="Record golden cases captured from the legacy application")
+def record_parity_cases(run_id: str, req: ParityCasesRequest,
+                        caller: dict = Depends(get_caller)):
+    """What the legacy system actually did, as replayable cases.
+
+    Behaviour, not code. Every other check in this product reads the converted source; a
+    conversion that compiles, starts, answers every route and quietly stores `0` where the
+    original stored `61234` passes all of them (C-62). A golden case is the only artifact
+    that can fail on that.
+
+    Cases capture the legacy system's behaviour **including its bugs** — the PHP in that
+    codebase numbers rows `count+1`, which collides after a delete, and that has to be
+    preserved. This is not a test suite: a test would assert the correct answer, a case
+    asserts the *same* answer.
+
+    Recording happens outside this platform (D-05 — nothing here executes PHP), so this
+    endpoint is where a capture proxy, an access-log replayer or a hand-written corpus all
+    arrive. A case whose `extract` rule matches nothing in its own recording is refused: it
+    would compare nothing with nothing and pass against any output at all.
+    """
+    _require_run(run_id, caller)
+    try:
+        return parity.record_cases(run_id, req.model_dump(), _actor(caller))
+    except parity.ParityError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/runs/{run_id}/parity-cases", summary="The golden corpus, ready to replay")
+def list_parity_cases(run_id: str, status: str = "active", include_bodies: bool = False,
+                      caller: dict = Depends(get_caller)):
+    """What a replay runner reads before it starts, and what a UI lists.
+
+    `include_bodies` is off by default because a recorded page is the largest thing in this
+    schema; a runner does not need the expected response at all — adjudication happens here,
+    which is what stops two implementations of "the same" from existing.
+    """
+    _require_run(run_id, caller)
+    cases = store.list_parity_cases(run_id, status=status, include_bodies=include_bodies)
+    return {"count": len(cases), "total_active": store.parity_case_count(run_id),
+            "cases": cases}
+
+
+@router.post("/runs/{run_id}/parity-results", summary="Report a replay of the golden corpus")
+def report_parity_results(run_id: str, req: ParityResultsRequest,
+                          caller: dict = Depends(get_caller)):
+    """Close the behavioural loop: whatever replayed the cases reports what came back.
+
+    The same shape as `build-results`, for the same reason. This endpoint is the interface,
+    not the thing that runs the application: a CI job that deployed the converted app, a
+    developer with it running locally, and a future sandbox worker are three producers of one
+    contract, and D-05 stays true because nothing is executed here — results merely arrive.
+
+    Divergence raises a **blocking** checkpoint, so the run cannot be declared done while its
+    recorded behaviour differs. Nothing is reopened for rework automatically: unlike a
+    compiler error, a divergence may be a wrong case, a missing seed row or an environment
+    difference, and spending a conversion call before a human has read the diff is the loop
+    D-63's guards exist to bound.
+    """
+    _require_run(run_id, caller)
+    try:
+        return parity.ingest(run_id, req.model_dump(), _actor(caller))
+    except parity.ParityError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/runs/{run_id}/parity", summary="Behavioural parity — rounds and what diverged")
+def get_parity(run_id: str, report_id: str = "", verdict: str = "", limit: int = 500,
+               caller: dict = Depends(get_caller)):
+    """Rounds newest first, plus the per-case verdicts for one of them.
+
+    Failures sort first: a parity report is read for what broke. Each failing result carries
+    `unit_id` — the component that reimplemented the legacy file the case exercises — which
+    is the forward link from "this behaviour is wrong" to "this is the file to look at".
+    """
+    _require_run(run_id, caller)
+    reports = store.list_parity_reports(run_id)
+    target = report_id or (reports[0]["id"] if reports else "")
+    return {
+        "cases": store.parity_case_count(run_id),
+        "reports": reports,
+        "selected_report_id": target,
+        "results": (store.list_parity_results(run_id, report_id=target, verdict=verdict,
+                                              limit=min(limit, 2000)) if target else []),
     }
 
 

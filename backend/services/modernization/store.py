@@ -323,6 +323,103 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_mod_rules_run
             ON modernization_rules(run_id, status);
+
+        -- One recorded interaction with the *legacy* application: a request, and exactly
+        -- what came back. The golden corpus, and the only thing in this schema that
+        -- describes behaviour rather than code.
+        --
+        -- The recorded response is stored **raw**, not normalized. Normalization is what
+        -- makes two renderings comparable (see `parity.normalize_body`) and it will keep
+        -- improving; a stored normalized form would freeze whatever the comparator believed
+        -- on the day the case was recorded, and a later fix to the comparator could never
+        -- reach it. Cheap to re-derive, impossible to un-bake.
+        --
+        -- `source_path` is the forward link C-41 is about: the legacy file this case
+        -- exercises, which resolves through `modernization_units.parent_unit_id` to the
+        -- component that was supposed to reimplement it. Without it a divergence says
+        -- "something is wrong" and nothing more.
+        CREATE TABLE IF NOT EXISTS modernization_parity_cases (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            group_name TEXT,
+            seq INTEGER DEFAULT 0,
+            source_path TEXT,
+            rule_id TEXT,
+            method TEXT NOT NULL DEFAULT 'GET',
+            path TEXT NOT NULL,
+            query TEXT,
+            request_headers_json TEXT,
+            cookies_json TEXT,
+            request_body TEXT,
+            request_content_type TEXT,
+            expected_status INTEGER DEFAULT 200,
+            expected_location TEXT,
+            expected_content_type TEXT,
+            expected_headers_json TEXT,
+            expected_body TEXT,
+            expected_values_json TEXT,
+            extract_json TEXT,
+            ignore_json TEXT,
+            body_match TEXT DEFAULT 'normalized',
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT DEFAULT 'recorded',
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            UNIQUE(run_id, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_cases_run
+            ON modernization_parity_cases(run_id, status, group_name, seq);
+
+        -- One adjudicated replay of the corpus against a converted deployment. Same shape
+        -- and same reason as `modernization_builds`: the thing that ran the cases lives
+        -- somewhere else (D-05), so what is durable here is the verdict, not the execution.
+        CREATE TABLE IF NOT EXISTS modernization_parity_reports (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            round INTEGER DEFAULT 1,
+            source TEXT DEFAULT 'external',
+            status TEXT NOT NULL DEFAULT 'reported',
+            base_url TEXT,
+            commit_sha TEXT,
+            total INTEGER DEFAULT 0,
+            passed INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0,
+            errored INTEGER DEFAULT 0,
+            missing INTEGER DEFAULT 0,
+            fingerprint TEXT,
+            summary TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_reports_run
+            ON modernization_parity_reports(run_id, round);
+
+        -- One case's verdict in one report, with the differences that produced it. A table
+        -- rather than a blob on the report for the same reason `modernization_diagnostics`
+        -- is one: "which cases are still failing, and which unit owns them" is a query.
+        CREATE TABLE IF NOT EXISTS modernization_parity_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            case_id TEXT NOT NULL,
+            case_name TEXT,
+            verdict TEXT NOT NULL DEFAULT 'fail',
+            actual_status INTEGER DEFAULT 0,
+            actual_location TEXT,
+            differences_json TEXT,
+            unit_id TEXT,
+            error TEXT,
+            duration_ms INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_results_report
+            ON modernization_parity_results(report_id, verdict);
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_results_case
+            ON modernization_parity_results(run_id, case_id);
     """)
     _migrate(cursor)
     # Strictly after `_migrate`: this one indexes `kind`, which the CREATE TABLE above does
@@ -418,8 +515,14 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
     if not row:
         return None
     run = dict(row)
+    # `plan_json` and `estimate_json` are decoded here too. They were written by the
+    # architect and the coster but never read back, so `GET /runs/{id}/plan` answered 404 for
+    # every run that had a plan, and the run header's `est. $X, ceiling $Y` line — which
+    # reads `run.estimate` — was dead the day it was written. Both are the *only* record of
+    # what a spend gate was approved against.
     for field, target in (("charter_json", "charter"), ("stats_json", "stats"),
-                          ("redaction_json", "redactions"), ("error_json", "error")):
+                          ("redaction_json", "redactions"), ("error_json", "error"),
+                          ("plan_json", "plan"), ("estimate_json", "estimate")):
         raw = run.pop(field, None)
         try:
             run[target] = json.loads(raw) if raw else None
@@ -1557,6 +1660,248 @@ def diagnostics_for_unit(run_id: str, unit_id: str, build_id: str = "",
                          limit: int = 60) -> List[Dict[str, Any]]:
     """What the compiler said about this unit's output, for the rework prompt."""
     return list_diagnostics(run_id, build_id=build_id, unit_id=unit_id, limit=limit)
+
+
+# ── Behavioural parity ─────────────────────────────────────────────────────
+#
+# Golden cases and their verdicts. Deliberately shaped like the build tables above, because
+# the constraint is the same one: the platform stores and adjudicates, something else runs
+# (D-05). Nothing here executes an HTTP request, a PHP interpreter or a .NET host.
+
+# JSON-encoded columns, and the plain key each decodes to. One tuple so that reading and
+# writing cannot drift — the failure mode otherwise is a column written as JSON and read as
+# text, which yields a case whose `extract` rules are the *string* "[]" and silently match
+# nothing.
+_PARITY_CASE_JSON = (
+    ("request_headers_json", "request_headers"),
+    ("cookies_json", "cookies"),
+    ("expected_headers_json", "expected_headers"),
+    ("expected_values_json", "expected_values"),
+    ("extract_json", "extract"),
+    ("ignore_json", "ignore"),
+)
+
+_PARITY_CASE_COLUMNS = (
+    "name", "group_name", "seq", "source_path", "rule_id", "method", "path", "query",
+    "request_headers_json", "cookies_json", "request_body", "request_content_type",
+    "expected_status", "expected_location", "expected_content_type",
+    "expected_headers_json", "expected_body", "expected_values_json", "extract_json",
+    "ignore_json", "body_match", "status", "source", "notes",
+)
+
+
+def _decode_parity_case(row: sqlite3.Row) -> Dict[str, Any]:
+    case = dict(row)
+    for column, key in _PARITY_CASE_JSON:
+        raw = case.pop(column, None)
+        try:
+            case[key] = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            case[key] = None
+    return case
+
+
+def upsert_parity_cases(run_id: str, cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Store recorded golden cases, keyed by `name` within the run.
+
+    An existing case is **updated in place** rather than replaced, so its id survives — a
+    re-recording of "employee list after adding Ann" is the same case as before, and its
+    history in `modernization_parity_results` has to stay attached to it. `INSERT OR REPLACE`
+    would mint a new id and orphan every verdict ever reached about that behaviour, which is
+    exactly the record you want when arguing about whether a conversion regressed.
+    """
+    if not cases:
+        return {"inserted": 0, "updated": 0, "ids": {}}
+    now = _now()
+    inserted = updated = 0
+    ids: Dict[str, str] = {}
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        for case in cases:
+            values = [case.get(column) for column in _PARITY_CASE_COLUMNS]
+            existing = cursor.execute(
+                "SELECT id FROM modernization_parity_cases WHERE run_id = ? AND name = ?",
+                (run_id, case.get("name")),
+            ).fetchone()
+            if existing:
+                assignments = ", ".join(f"{c} = ?" for c in _PARITY_CASE_COLUMNS)
+                cursor.execute(
+                    f"UPDATE modernization_parity_cases SET {assignments}, updated_at = ? "
+                    f"WHERE id = ?", values + [now, existing["id"]])
+                ids[case["name"]] = existing["id"]
+                updated += 1
+            else:
+                case_id = str(uuid.uuid4())
+                placeholders = ",".join("?" * (len(_PARITY_CASE_COLUMNS) + 3))
+                cursor.execute(
+                    f"INSERT INTO modernization_parity_cases "
+                    f"(id, run_id, {', '.join(_PARITY_CASE_COLUMNS)}, created_at) "
+                    f"VALUES ({placeholders})",
+                    [case_id, run_id] + values + [now])
+                ids[case["name"]] = case_id
+                inserted += 1
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, 'info', 'parity_cases_recorded', ?, ?)",
+            (run_id, f"{inserted} new and {updated} updated golden case(s)", now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"inserted": inserted, "updated": updated, "ids": ids}
+
+
+def list_parity_cases(run_id: str, status: str = "active",
+                      include_bodies: bool = False) -> List[Dict[str, Any]]:
+    """The corpus, in replay order. `include_bodies` off by default — a recorded page is
+    the largest thing in this schema and a case list is rendered as a table."""
+    columns = "*" if include_bodies else (
+        "id, run_id, name, group_name, seq, source_path, rule_id, method, path, query, "
+        "cookies_json, request_content_type, expected_status, expected_location, "
+        "expected_content_type, expected_headers_json, expected_values_json, extract_json, "
+        "ignore_json, body_match, status, source, notes, created_at, updated_at, "
+        "request_headers_json, LENGTH(expected_body) AS expected_body_chars")
+    sql = f"SELECT {columns} FROM modernization_parity_cases WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY group_name, seq, name"
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [_decode_parity_case(row) for row in rows]
+
+
+def parity_case_count(run_id: str, status: str = "active") -> int:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_parity_cases "
+        "WHERE run_id = ? AND status = ?", (run_id, status),
+    ).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def record_parity_report(run_id: str, results: List[Dict[str, Any]], *,
+                         source: str = "external", base_url: str = "", commit_sha: str = "",
+                         status: str = "reported", fingerprint: str = "",
+                         summary: str = "") -> Dict[str, Any]:
+    """Persist one adjudicated replay. Changes no unit and no run state.
+
+    Split from acting on it for the same reason `record_build` is: a parity report that is
+    merely informational — a first replay against a half-deployed environment, say — has to
+    be recordable without moving anything.
+    """
+    now = _now()
+    report_id = str(uuid.uuid4())
+    tally = {v: sum(1 for r in results if r.get("verdict") == v)
+             for v in ("pass", "fail", "error", "missing")}
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        prev = cursor.execute(
+            "SELECT COALESCE(MAX(round), 0) AS r FROM modernization_parity_reports "
+            "WHERE run_id = ?", (run_id,),
+        ).fetchone()
+        round_no = (prev["r"] or 0) + 1
+        cursor.execute(
+            "INSERT INTO modernization_parity_reports "
+            "(id, run_id, round, source, status, base_url, commit_sha, total, passed, "
+            " failed, errored, missing, fingerprint, summary, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (report_id, run_id, round_no, source, status, base_url, commit_sha,
+             len(results), tally["pass"], tally["fail"], tally["error"], tally["missing"],
+             fingerprint, summary, now),
+        )
+        cursor.executemany(
+            "INSERT INTO modernization_parity_results "
+            "(report_id, run_id, case_id, case_name, verdict, actual_status, "
+            " actual_location, differences_json, unit_id, error, duration_ms, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(report_id, run_id, r.get("case_id") or "", r.get("case_name") or "",
+              r.get("verdict") or "fail", int(r.get("actual_status") or 0),
+              r.get("actual_location") or "",
+              json.dumps(r.get("differences") or []), r.get("unit_id") or None,
+              (r.get("error") or "")[:2000], int(r.get("duration_ms") or 0), now)
+             for r in results],
+        )
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, ?, 'parity_reported', ?, ?)",
+            (run_id, "warning" if tally["fail"] or tally["error"] or tally["missing"] else "info",
+             f"parity round {round_no} from {source}: {tally['pass']} passed, "
+             f"{tally['fail']} diverged, {tally['error']} errored, {tally['missing']} missing",
+             now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"report_id": report_id, "round": round_no, **tally}
+
+
+def set_parity_outcome(report_id: str, status: str, summary: str = "") -> None:
+    conn = get_connection()
+    conn.execute("UPDATE modernization_parity_reports SET status = ?, summary = ? WHERE id = ?",
+                 (status, summary, report_id))
+    conn.commit()
+    conn.close()
+
+
+def list_parity_reports(run_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM modernization_parity_reports WHERE run_id = ? "
+        "ORDER BY round DESC LIMIT ?", (run_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def latest_parity_report(run_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM modernization_parity_reports WHERE run_id = ? "
+        "ORDER BY round DESC LIMIT 1", (run_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_parity_results(run_id: str, report_id: str = "", verdict: str = "",
+                        limit: int = 1000) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_parity_results WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if report_id:
+        sql += " AND report_id = ?"
+        params.append(report_id)
+    if verdict:
+        sql += " AND verdict = ?"
+        params.append(verdict)
+    # Failures first, then errors, then the passes: a parity report is read for what broke.
+    sql += (" ORDER BY CASE verdict WHEN 'fail' THEN 0 WHEN 'error' THEN 1 "
+            "WHEN 'missing' THEN 2 ELSE 3 END, case_name LIMIT ?")
+    params.append(limit)
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    out = []
+    for row in rows:
+        result = dict(row)
+        raw = result.pop("differences_json", None)
+        try:
+            result["differences"] = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            result["differences"] = []
+        out.append(result)
+    return out
 
 
 def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, Any]]:

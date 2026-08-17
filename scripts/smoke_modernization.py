@@ -41,8 +41,8 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
-    evidence, graph, reconcile, repo_ingest, runner, rules as rules_module, scaffold,
-    stages, store, usings, validation, wireup,
+    evidence, graph, parity, reconcile, repo_ingest, runner, rules as rules_module,
+    scaffold, stages, store, usings, validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
@@ -408,6 +408,29 @@ check("a symbol that was emitted is accepted",
 
 
 # ── 9. Claim-and-lease ─────────────────────────────────────────────────────
+section("8b. Run JSON columns survive the round trip")
+
+# `update_run` encoded `plan`/`estimate` from the day they were added; `get_run` never
+# decoded them. So the write worked, the read silently returned nothing, and two things
+# built on top were dead without a single error: `GET /runs/{id}/plan` answered 404 for
+# every run that had one, and the run header's `est. $X, ceiling $Y` line never rendered.
+# Both are the only record of what a spend gate was approved against. Asserted for every
+# JSON column at once, because the failure was an omission from a list.
+_json_run = store.create_run("json round trip", ".NET 8", "files", created_by="smoke")
+_plan = {"summary": "one project", "projects": [{"name": "Web"}], "risks": ["r"]}
+_estimate = {"calls": 6, "expected_usd": 0.12, "ceiling_usd": 2.94}
+store.update_run(_json_run, charter={"target_stack": "x"}, stats={"files": 7},
+                 redactions=[{"category": "key"}], plan=_plan, estimate=_estimate)
+_read = store.get_run(_json_run)
+for _key, _want in (("charter", {"target_stack": "x"}), ("stats", {"files": 7}),
+                    ("redactions", [{"category": "key"}]), ("plan", _plan),
+                    ("estimate", _estimate)):
+    check(f"run.{_key} is decoded back into an object", _read.get(_key) == _want,
+          f"got {_read.get(_key)!r}")
+check("the raw *_json columns are not also handed out",
+      not any(k.endswith("_json") for k in _read))
+
+
 section("9. Claim-and-lease — the durability primitive")
 
 lease_run = store.create_run("lease test", ".NET 8", "files", created_by="smoke")
@@ -2434,6 +2457,498 @@ check("the scaffold finds session wherever in the charter it was written",
           {"name": "Shop.Web"},
           {"target_stack": ".NET 8 / ASP.NET Core MVC", "ui_strategy": "Razor views",
            "data_access": "records live in PHP $_SESSION; keep session state"}))
+
+
+# ── 23. Behavioural parity ─────────────────────────────────────────────────
+section("23. Behavioural parity — the accept criterion no compiler can check")
+#
+# Everything above this reads code. C-62 is the reason that is not enough: `(int)"61234.99"`
+# is 61234 in PHP, the conversion used `int.TryParse`, which fails and stores 0, and the
+# result is valid C# that compiles clean, runs, answers 200 and is wrong. A golden case is
+# the only artifact in this product that can fail on that — and the comprehension pass had
+# already *confirmed* the rule, in the same run, cited to the line.
+#
+# Two rendering of the same employee list. Everything that differs below is something two
+# correct implementations differ on anyway: indentation, attribute order, quote style,
+# comments, the doctype's case, `<br>` vs `<br/>`, ASP.NET Core's anti-forgery input, a
+# timestamp, and a session token. If any of these registered as a divergence, no case would
+# ever pass and the corpus would be ignored inside a week.
+
+_PHP_PAGE = """<!DOCTYPE html>
+<html>
+  <head><title>Employees</title></head>
+  <body>
+    <!-- rendered by list.php -->
+    <p>Generated 2026-08-17 09:12:44 &middot; session 4f8a2c9e1b7d6045a3c8e2f1b9d70a63</p>
+    <form method='post' action='/add_employee.php'>
+      <input type='text' name='name'>
+      <br>
+    </form>
+    <table class='grid' id='employees'>
+      <tr><td>3</td><td>Ann</td><td id='salary'>61234</td></tr>
+    </table>
+  </body>
+</html>"""
+
+_RAZOR_PAGE = """<!doctype html>
+<html><head><title>Employees</title></head><body>
+<p>Generated 2026-08-18 14:55:01 &middot; session c1d0e93f7a2b48561fe0a7c3d9b28e40</p>
+<form action="/add_employee.php" method="post">
+<input name="name" type="text" />
+<br />
+<input name="__RequestVerificationToken" type="hidden" value="CfDJ8Nr4x" />
+</form>
+<table id="employees" class="grid">
+    <tr>
+        <td>3</td>
+        <td>Ann</td>
+        <td id="salary">61234</td>
+    </tr>
+</table>
+</body></html>"""
+
+check("two renderings of the same page compare equal once normalized",
+      parity.normalize_body(_PHP_PAGE) == parity.normalize_body(_RAZOR_PAGE),
+      parity.normalize_body(_PHP_PAGE)[:200] + "\n vs \n"
+      + parity.normalize_body(_RAZOR_PAGE)[:200])
+check("the anti-forgery input the framework injects is dropped, element and all",
+      "__requestverificationtoken" not in parity.normalize_body(_RAZOR_PAGE).lower())
+check("a timestamp becomes a placeholder — no page carrying one could ever match",
+      parity.normalize_body(_PHP_PAGE).count("<TIMESTAMP>") == 1)
+check("and so does a session token, without eating the numbers around it",
+      "<TOKEN>" in parity.normalize_body(_PHP_PAGE))
+check("an HTML comment is not a behavioural difference",
+      "rendered by list.php" not in parity.normalize_body(_PHP_PAGE))
+
+# The other half, and the half that matters more. Each of these is a real difference the
+# normalizer must not swallow — a comparator that is quiet about them is worse than none,
+# because it certifies.
+_salary_zero = _RAZOR_PAGE.replace('id="salary">61234', 'id="salary">0')
+check("but a changed number is NOT normalized away — this is the C-62 defect",
+      parity.normalize_body(_PHP_PAGE) != parity.normalize_body(_salary_zero))
+check("nor is a truncation, which is the same defect the other way",
+      parity.normalize_body(_PHP_PAGE)
+      != parity.normalize_body(_RAZOR_PAGE.replace(">61234<", ">61234.99<")))
+check("nor is changed element text",
+      parity.normalize_body(_PHP_PAGE) != parity.normalize_body(
+          _RAZOR_PAGE.replace("<td>Ann</td>", "<td>Anne</td>")))
+check("nor is a row that stopped being rendered",
+      parity.normalize_body(_PHP_PAGE) != parity.normalize_body(
+          _RAZOR_PAGE.replace("<td>Ann</td>", "")))
+check("nor is a missing doctype — that decides quirks mode",
+      parity.normalize_body(_PHP_PAGE) != parity.normalize_body(
+          _RAZOR_PAGE.replace("<!doctype html>", "")))
+# A bare date is data — a hire date, an invoice date. Normalizing it would hide a conversion
+# that shifted or reformatted one, which is a classic migration defect.
+check("a date with no time is left alone, because a date is usually data",
+      parity.normalize_body("<p>Hired 2019-04-01</p>")
+      != parity.normalize_body("<p>Hired 2019-04-02</p>"))
+# The lookahead in the token pattern exists for exactly this: without it a long decimal id
+# would be replaced by <TOKEN> and any two of them would compare equal.
+check("a long *decimal* number is not mistaken for a session token",
+      parity.normalize_body("<i>" + "1" * 40 + "</i>")
+      != parity.normalize_body("<i>" + "2" * 40 + "</i>"))
+
+check("whitespace inside <pre> is content, so it is preserved",
+      parity.normalize_body("<pre>a\n  b</pre>") != parity.normalize_body("<pre>a b</pre>"))
+check("but whitespace outside it is not",
+      parity.normalize_body("<div>a\n\n  b</div>") == parity.normalize_body("<div>a b</div>"))
+
+check("JSON key order is not behaviour",
+      parity.normalize_body('{"b":1,"a":2}', "application/json")
+      == parity.normalize_body('{ "a": 2, "b": 1 }', "application/json"))
+check("but JSON array order is — that is the data",
+      parity.normalize_body('[1,2]', "application/json")
+      != parity.normalize_body('[2,1]', "application/json"))
+
+# Redirects. PHP writes `header("Location: employees.php")`; ASP.NET Core writes an absolute
+# path on a different host and port. Same destination.
+check("a relative and an absolute redirect to the same place are the same place",
+      parity.normalize_location("/add_employee.php", "employees.php")
+      == parity.normalize_location("/add_employee.php", "http://localhost:5000/employees.php"))
+check("query parameter order in a redirect target is not behaviour",
+      parity.normalize_location("/x", "/y?b=2&a=1") == parity.normalize_location("/x", "/y?a=1&b=2"))
+check("a redirect to a different path is a difference",
+      parity.normalize_location("/x", "/employees.php")
+      != parity.normalize_location("/x", "/index.php"))
+
+# ── The comparator, on its own ──
+_case_fixture = {
+    "path": "/employees.php", "expected_status": 200,
+    "expected_content_type": "text/html", "expected_body": _PHP_PAGE,
+    "body_match": "normalized",
+    "extract": [{"name": "salary", "regex": r'id="salary">([^<]*)<'}],
+    "expected_values": {"salary": "61234"},
+}
+_ok = parity.compare(_case_fixture, {
+    "status": 200,
+    "headers": {"Content-Type": "text/html; charset=utf-8", "Server": "Kestrel",
+                "Date": "Mon, 18 Aug 2026 14:55:01 GMT", "X-Powered-By": "ASP.NET"},
+    "body": _RAZOR_PAGE})
+check("a faithful conversion passes despite every header differing",
+      _ok["verdict"] == "pass", str(_ok["differences"])[:400])
+check("the charset spelling is not a difference — PHP writes UTF-8, Kestrel writes utf-8",
+      parity.compare({"path": "/x", "expected_status": 200,
+                      "expected_content_type": "text/html; charset=UTF-8"},
+                     {"status": 200,
+                      "headers": {"Content-Type": "text/html; charset=utf-8"}})["verdict"]
+      == "pass")
+check("but a response that became JSON is",
+      parity.compare({"path": "/x", "expected_status": 200,
+                      "expected_content_type": "text/html"},
+                     {"status": 200, "headers": {"Content-Type": "application/json"}}
+                     )["verdict"] == "fail")
+check("a header a case names explicitly is compared",
+      parity.compare({"path": "/x", "expected_status": 200,
+                      "expected_headers": {"X-Frame-Options": "DENY"}},
+                     {"status": 200, "headers": {"x-frame-options": "SAMEORIGIN"}}
+                     )["verdict"] == "fail")
+check("a different status is a difference on its own",
+      [d["kind"] for d in parity.compare({"path": "/x", "expected_status": 302,
+                                          "expected_location": "/employees.php"},
+                                         {"status": 500, "headers": {}})["differences"]][0]
+      == "status")
+
+# The C-62 case, at the comparator level. Both signals must fire: the extracted value is the
+# sharp one a human reads, the body difference is the one that catches a page with no
+# extract rule at all.
+_bad = parity.compare(_case_fixture, {
+    "status": 200, "headers": {"Content-Type": "text/html"}, "body": _salary_zero})
+check("a stored 0 where PHP stored 61234 FAILS", _bad["verdict"] == "fail")
+check("and the failure names the value, not just 'the page differs'",
+      any(d["kind"] == "extracted_value" and d["name"] == "salary"
+          and d["expected"] == "61234" and d["actual"] == "0" for d in _bad["differences"]),
+      str(_bad["differences"])[:400])
+check("the body check catches it too, so a case with no extract rule is not blind",
+      any(d["kind"] == "body" for d in _bad["differences"]))
+check("and the body difference points at where it starts rather than dumping the page",
+      all(len(d.get("actual") or "") <= 400 for d in _bad["differences"]))
+
+# The bug that must be preserved. This PHP assigns ids as count+1, so after a delete the new
+# row collides with an existing one. A unit test would "fix" that; a parity case locks it in,
+# because what the customer bought is the same behaviour on a new stack.
+_count_plus_one = parity.compare(
+    {"path": "/employees.php", "expected_status": 200,
+     "expected_body": "<table><tr><td>3</td><td>Ann</td></tr></table>"},
+    {"status": 200, "headers": {"Content-Type": "text/html"},
+     "body": "<table><tr><td>4</td><td>Ann</td></tr></table>"})
+check("a converted app that 'fixed' the legacy count+1 id numbering FAILS parity",
+      _count_plus_one["verdict"] == "fail", str(_count_plus_one)[:300])
+
+# ── Recording a corpus ──
+_pr = store.create_run("parity fixture", ".NET 8", "files", project_id=PROJECT_ID,
+                       project_name=_smoke_project["name"], created_by="smoke")
+store.insert_units(_pr, [
+    {"path": "employees.php", "kind": "source_file", "status": "converted"},
+    {"path": "add_employee.php", "kind": "source_file", "status": "converted"},
+])
+store.insert_units(_pr, [{"path": "#component/employees", "kind": "component",
+                          "status": "converted", "component_name": "employees"}])
+_component_id = store.list_units(_pr, kind="component")[0]["id"]
+# The forward link C-41 is about, built the only way it can be built deterministically: a
+# case names the legacy file it exercises, that file is a unit, and `parent_unit_id` is the
+# component that was supposed to reimplement it.
+store.set_parent(_pr, ["employees.php", "add_employee.php"], _component_id)
+
+_cases_payload = {"source": "smoke_recorder", "cases": [
+    {"name": "employee list shows the truncated salary",
+     "group": "add_employee", "seq": 2,
+     "source_path": "employees.php",
+     "request": {"method": "GET", "path": "http://legacy.local/employees.php?sort=name"},
+     # A deliberately wrong value alongside the recording. The recorder computed it with
+     # its own extractor; ours must win, or the comparison is between two implementations
+     # and the one that is wrong is invisible.
+     "expected": {"status": 200, "content_type": "text/html; charset=UTF-8",
+                  "body": _PHP_PAGE, "values": {"salary": "999999"}},
+     "extract": [{"name": "salary", "regex": r'id="salary">([^<]*)<'}]},
+    {"name": "adding an employee redirects to the list",
+     "group": "add_employee", "seq": 1,
+     "source_path": "add_employee.php",
+     "request": {"method": "POST", "path": "/add_employee.php",
+                 "body": "name=Ann&salary=61234.99",
+                 "content_type": "application/x-www-form-urlencoded"},
+     "expected": {"status": 302, "location": "employees.php"}},
+]}
+_recorded = parity.record_cases(_pr, _cases_payload, "smoke")
+check("recorded cases are stored", _recorded["inserted"] == 2, str(_recorded)[:200])
+check("the expected value is DERIVED from the recording, not taken from the submission",
+      _recorded["cases"][0]["values"] == {"salary": "61234"},
+      str(_recorded["cases"][0]["values"]))
+check("a full URL is reduced to a path — a replay must not be able to hit the legacy host",
+      all("legacy.local" not in c["path"] for c in store.list_parity_cases(_pr)))
+check("the query survives that reduction",
+      any(c["query"] == "sort=name" for c in store.list_parity_cases(_pr)))
+check("cases come back in replay order, not insertion order",
+      [c["name"] for c in store.list_parity_cases(_pr)][0].startswith("adding an employee"),
+      str([c["name"] for c in store.list_parity_cases(_pr)]))
+check("re-recording a case updates it in place, keeping its id and its history",
+      parity.record_cases(_pr, _cases_payload, "smoke")["updated"] == 2)
+
+# The check that stops a corpus from being decorative. A rule matching nothing in its own
+# recording would extract None from the legacy side and None from the converted side and
+# compare them equal — a case that passes against any output at all, forever.
+check("an extract rule that matches nothing in its own recording is refused",
+      _raises(parity.ParityError, lambda: parity.record_cases(_pr, {"cases": [
+          {"name": "bad rule", "request": {"path": "/x"},
+           "expected": {"status": 200, "body": "<p>hello</p>"},
+           "extract": [{"name": "total", "regex": r'id="total">([^<]*)<'}]}]}, "smoke")))
+check("a case with no recorded status is refused — it would pass on a 500",
+      _raises(parity.ParityError, lambda: parity.record_cases(_pr, {"cases": [
+          {"name": "no status", "request": {"path": "/x"},
+           "expected": {"body": "<p>hi</p>"}}]}, "smoke")))
+check("a case with no recorded response at all is refused",
+      _raises(parity.ParityError, lambda: parity.record_cases(_pr, {"cases": [
+          {"name": "no expectation", "request": {"path": "/x"}}]}, "smoke")))
+check("two cases with one name in a batch are refused, not silently merged",
+      _raises(parity.ParityError, lambda: parity.record_cases(_pr, {"cases": [
+          {"name": "dup", "request": {"path": "/x"}, "expected": {"status": 200}},
+          {"name": "dup", "request": {"path": "/y"}, "expected": {"status": 200}}]}, "smoke")))
+check("an unusable extract regex is refused at record time, not at compare time",
+      _raises(parity.ParityError, lambda: parity.record_cases(_pr, {"cases": [
+          {"name": "bad regex", "request": {"path": "/x"},
+           "expected": {"status": 200, "body": "x"},
+           "extract": [{"name": "n", "regex": "([unclosed"}]}]}, "smoke")))
+
+# ── Adjudication ──
+_ids = {c["name"]: c["id"] for c in store.list_parity_cases(_pr)}
+_list_id = _ids["employee list shows the truncated salary"]
+_redirect_id = _ids["adding an employee redirects to the list"]
+
+_diverged = parity.ingest(_pr, {"source": "smoke_replay", "base_url": "http://localhost:5000",
+    "results": [
+        {"case_id": _list_id, "status": 200,
+         "headers": {"Content-Type": "text/html; charset=utf-8", "Server": "Kestrel"},
+         "body": _salary_zero},
+        {"case_id": _redirect_id, "status": 302,
+         "headers": {"Location": "http://localhost:5000/employees.php"}},
+    ]}, "smoke")
+check("the salary case FAILS against a converted response of 0",
+      _diverged["status"] == "diverged" and _diverged["failed"] == 1, str(_diverged)[:300])
+check("the redirect case passes — host, scheme and relative spelling are all ignored",
+      _diverged["passed"] == 1, str(_diverged)[:300])
+check("divergence raises a BLOCKING checkpoint, the way plan_approval does",
+      any(c["kind"] == "parity_divergence" and c["blocking"]
+          for c in store.list_checkpoints(_pr, "open")),
+      str([(c["kind"], c["blocking"]) for c in store.list_checkpoints(_pr, "open")]))
+check("the divergent case is attributed to the component that reimplemented its source file",
+      (store.list_parity_results(_pr, verdict="fail") or [{}])[0].get("unit_id")
+      == _component_id,
+      str([(r["case_name"], r["unit_id"]) for r in store.list_parity_results(_pr)]))
+check("the failing result carries the difference, so a UI needs no second call",
+      any(d["kind"] == "extracted_value"
+          for d in (store.list_parity_results(_pr, verdict="fail") or [{}])[0]
+          .get("differences") or []))
+
+_passing = parity.ingest(_pr, {"results": [
+    {"case_id": _list_id, "status": 200, "headers": {"Content-Type": "text/html"},
+     "body": _RAZOR_PAGE},
+    {"case_id": _redirect_id, "status": 302, "headers": {"Location": "/employees.php"}},
+]}, "smoke")
+check("the same case PASSES against a converted response of 61234",
+      _passing["status"] == "passed" and _passing["passed"] == 2, str(_passing)[:300])
+check("rounds increment rather than overwriting each other", _passing["round"] == 2)
+
+# A runner that skips the case it cannot satisfy must not be able to report success by
+# omission. This is the same argument D-70 makes about an empty build log.
+_partial = parity.ingest(_pr, {"results": [
+    {"case_id": _redirect_id, "status": 302, "headers": {"Location": "/employees.php"}}]},
+    "smoke")
+check("a case with no submitted result is 'missing', never a pass",
+      _partial["missing"] == 1 and _partial["status"] == "incomplete", str(_partial)[:300])
+check("an incomplete replay blocks too — a check that never ran is not a check that passed",
+      any(c["kind"] == "parity_incomplete" and c["blocking"]
+          for c in store.list_checkpoints(_pr, "open")))
+_errored = parity.ingest(_pr, {"results": [
+    {"case_id": _list_id, "error": "Connection refused"},
+    {"case_id": _redirect_id, "status": 302, "headers": {"Location": "/employees.php"}}]},
+    "smoke")
+check("a case the replay could not run is 'error', not a pass",
+      _errored["errored"] == 1 and _errored["status"] == "incomplete", str(_errored)[:200])
+check("a result with neither a status nor an error is an error, not a status difference",
+      parity.ingest(_pr, {"results": [{"case_id": _list_id}, {"case_id": _redirect_id}]},
+                    "smoke")["errored"] == 2)
+check("an empty results list is recorded as a replay that ran nothing",
+      parity.ingest(_pr, {"results": []}, "smoke")["missing"] == 2)
+check("but a report with no 'results' key at all is refused",
+      _raises(parity.ParityError, lambda: parity.ingest(_pr, {"source": "x"}, "smoke")))
+check("a result naming a case this run does not have is counted, not crashed",
+      parity.ingest(_pr, {"results": [{"case_id": "no-such-case"}]},
+                    "smoke")["unknown"] == 1)
+check("a run with no golden cases refuses a parity report rather than recording a green one",
+      _raises(parity.ParityError, lambda: parity.ingest(
+          store.create_run("no cases", ".NET 8", "files", created_by="smoke"),
+          {"results": []}, "smoke")))
+
+# The fingerprint. Same argument as the build fingerprint excluding line numbers: a page
+# carrying something we failed to normalize would produce different diff *text* every round
+# while being exactly as divergent, and a fingerprint that moved with it would report
+# progress on a loop making none.
+_fp_one = parity.fingerprint([{"case_name": "a", "verdict": "fail", "differences": [
+    {"kind": "extracted_value", "name": "salary", "expected": "61234", "actual": "0"}]}])
+_fp_two = parity.fingerprint([{"case_name": "a", "verdict": "fail", "differences": [
+    {"kind": "extracted_value", "name": "salary", "expected": "61234", "actual": "1"}]}])
+_fp_three = parity.fingerprint([{"case_name": "b", "verdict": "fail", "differences": [
+    {"kind": "extracted_value", "name": "salary", "expected": "61234", "actual": "0"}]}])
+check("the parity fingerprint is over which behaviours are wrong, not over the diff text",
+      _fp_one == _fp_two)
+check("but a different case diverging is a different fingerprint", _fp_one != _fp_three)
+check("a clean round has no fingerprint rather than a real-looking one",
+      parity.fingerprint([{"case_name": "a", "verdict": "pass", "differences": []}]) == "")
+
+# ── The gate ──
+_no_cases = store.create_run("no parity", ".NET 8", "files", created_by="smoke")
+_gate_none = parity.gate(_no_cases)
+check("a run that recorded no behaviour is not blocked for it",
+      _gate_none["status"] == "no_cases"
+      and store.open_blocking_checkpoints(_no_cases) == 0)
+check("but the absence is written down — 'never checked' must not look like 'checked and fine'",
+      any(e["event"] == "parity_not_recorded" for e in store.list_events(_no_cases)))
+
+_never = store.create_run("parity never run", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_never, {"cases": [
+    {"name": "home page", "request": {"path": "/index.php"},
+     "expected": {"status": 200, "body": "<p>hi</p>"}}]}, "smoke")
+check("a run carrying cases that were never replayed is blocked",
+      parity.gate(_never)["status"] == "never_run"
+      and any(c["kind"] == "parity_required" and c["blocking"]
+              for c in store.list_checkpoints(_never, "open")))
+check("and asking again does not queue a second copy of the same question",
+      parity.gate(_never) and len([c for c in store.list_checkpoints(_never, "open")
+                                   if c["kind"] == "parity_required"]) == 1)
+# Not `ORDER.index(...)` directly: a regression that returned "completed" — the exact trap
+# X-06 and `build_results._rework_phase` are about — would raise ValueError and take the
+# whole script down with a traceback instead of failing this one check.
+check("the gate's phase choice can never land on or before a spend gate",
+      parity._post_gate_phase() in stages.ORDER
+      and stages.ORDER.index(parity._post_gate_phase())
+      > max(i for i, s in enumerate(stages.STAGES) if s.gate),
+      parity._post_gate_phase())
+
+# The finalizer. Without this the driver stops for a blocking checkpoint everywhere except
+# on the very last stage — so a parity gate raised by `reconcile` would be recorded, shown,
+# and then overwritten by a green "completed" one line later.
+def _finalizable_run(with_checkpoint):
+    run_id = store.create_run("finalize", ".NET 8", "files", created_by="smoke")
+    store.insert_units(run_id, [{"path": "a.php", "kind": "source_file", "status": "converted"}])
+    store.insert_units(run_id, [{"path": "#c/1", "kind": "component", "status": "converted"}])
+    store.update_run(run_id, status="reconciling", phase="completed")
+    if with_checkpoint:
+        store.create_checkpoint(run_id, "parity_divergence", "smoke", blocking=True)
+    return run_id
+
+
+_clean = _finalizable_run(False)
+runner._finalize(_clean, 1, 0)
+check("a run with nothing outstanding completes", (store.get_run(_clean) or {})["status"] == "completed")
+_blocked = _finalizable_run(True)
+runner._finalize(_blocked, 1, 0)
+check("a run whose behaviour diverged cannot be declared done",
+      (store.get_run(_blocked) or {})["status"] == "paused",
+      str((store.get_run(_blocked) or {}).get("status")))
+check("and it is parked on the last stage, not on 'completed' — a resume must not restart it",
+      (store.get_run(_blocked) or {})["phase"] == stages.ORDER[-1],
+      str((store.get_run(_blocked) or {}).get("phase")))
+
+# Through the driver, not through `parity.gate` — X-06's lesson is that a test reaching the
+# machinery by a different door than the product does is not testing the door. This is the
+# whole chain: the last stage runs, the gate sees unreplayed cases, the checkpoint blocks,
+# and the finalizer refuses to call the run finished.
+_wired = store.create_run("parity wiring", ".NET 8", "files", created_by="smoke")
+store.insert_units(_wired, [{"path": "index.php", "kind": "source_file", "status": "converted"}])
+store.insert_units(_wired, [{"path": "#c/1", "kind": "component", "status": "converted"}])
+parity.record_cases(_wired, {"cases": [
+    {"name": "home page", "source_path": "index.php", "request": {"path": "/index.php"},
+     "expected": {"status": 200, "body": "<p>hi</p>"}}]}, "smoke")
+store.update_run(_wired, status="reconciling", phase="reconcile")
+_wired_outcome = runner.convert_run(_wired, CALLER)
+check("the driver's last stage raises the parity gate — nothing else in the run would",
+      any(c["kind"] == "parity_required" and c["blocking"]
+          for c in store.list_checkpoints(_wired, "open")),
+      str([c["kind"] for c in store.list_checkpoints(_wired, "open")]))
+check("so a run with unreplayed behaviour does not come back completed",
+      _wired_outcome["status"] == "paused", str(_wired_outcome)[:200])
+
+# A parity report arriving after the run finished. Only `completed` is revived — D-64's
+# argument applies unchanged: a deployment outlives the decision to stop, and a cancelled run
+# that quietly un-cancels itself is the worst kind of control.
+store.update_run(_pr, status="completed", phase="completed")
+parity.ingest(_pr, {"results": [
+    {"case_id": _list_id, "status": 200, "headers": {"Content-Type": "text/html"},
+     "body": _salary_zero},
+    {"case_id": _redirect_id, "status": 302, "headers": {"Location": "/employees.php"}}]},
+    "smoke")
+check("a divergence reported after the run finished takes it out of its finished state",
+      (store.get_run(_pr) or {})["status"] == "paused",
+      str((store.get_run(_pr) or {}).get("status")))
+check("and never onto a phase that would re-raise a spend gate on resume",
+      (store.get_run(_pr) or {})["phase"] == stages.ORDER[-1])
+_cancelled = store.create_run("cancelled parity", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_cancelled, {"cases": [
+    {"name": "x", "request": {"path": "/x"}, "expected": {"status": 200, "body": "a"}}]},
+    "smoke")
+store.update_run(_cancelled, status="cancelled")
+parity.ingest(_cancelled, {"results": [{"case_id": store.list_parity_cases(_cancelled)[0]["id"],
+                                        "status": 500, "headers": {}, "body": "b"}]}, "smoke")
+check("a cancelled run is not restarted by a parity report",
+      (store.get_run(_cancelled) or {})["status"] == "cancelled")
+
+# ── Over the real HTTP surface ──
+check("recording cases needs authentication",
+      client.post(f"/api/v1/modernization/runs/{_pr}/parity-cases",
+                  json={"cases": []}).status_code == 401)
+_http_cases = client.post(f"/api/v1/modernization/runs/{_pr}/parity-cases", headers=HDR,
+                          json={"cases": [{"name": "http case",
+                                           "request": {"path": "/index.php"},
+                                           "expected": {"status": 200,
+                                                        "body": "<p>hello</p>"}}]})
+check("POST /parity-cases creates", _http_cases.status_code == 201,
+      f"{_http_cases.status_code} {_http_cases.text[:200]}")
+_http_id = _http_cases.json()["cases"][0]["id"]
+check("an unusable case is a 400, not a 500",
+      client.post(f"/api/v1/modernization/runs/{_pr}/parity-cases", headers=HDR,
+                  json={"cases": [{"name": "x", "request": {"path": "/x"},
+                                   "expected": {"status": 999}}]}).status_code == 400)
+_listed = client.get(f"/api/v1/modernization/runs/{_pr}/parity-cases", headers=HDR).json()
+check("the corpus is listable", _listed["total_active"] >= 3, str(_listed)[:200])
+check("recorded pages do not ride along on the case list",
+      all("expected_body" not in c for c in _listed["cases"]))
+check("but their size does, so a UI can say how much was captured",
+      all("expected_body_chars" in c for c in _listed["cases"]))
+
+_http_report = client.post(f"/api/v1/modernization/runs/{_pr}/parity-results", headers=HDR,
+                           json={"source": "smoke_ci", "results": [
+                               {"case_id": _list_id, "status": 200,
+                                "headers": {"Content-Type": "text/html"}, "body": _RAZOR_PAGE},
+                               {"case_id": _redirect_id, "status": 302,
+                                "headers": {"Location": "/employees.php"}},
+                               {"case_id": _http_id, "status": 200,
+                                "headers": {"Content-Type": "text/html"},
+                                "body": "<p>hello</p>"}]})
+check("POST /parity-results adjudicates over HTTP", _http_report.status_code == 200,
+      f"{_http_report.status_code} {_http_report.text[:300]}")
+check("and a faithful replay comes back passed",
+      (_http_report.json() or {}).get("status") == "passed", _http_report.text[:300])
+check("a report with no results key is refused, never read as a silent pass",
+      client.post(f"/api/v1/modernization/runs/{_pr}/parity-results", headers=HDR,
+                  json={"source": "x"}).status_code in (400, 422))
+_parity_view = client.get(f"/api/v1/modernization/runs/{_pr}/parity", headers=HDR).json()
+check("the parity report is readable, newest round first",
+      _parity_view["reports"][0]["round"] > _parity_view["reports"][-1]["round"],
+      str([r["round"] for r in _parity_view["reports"]]))
+check("it names which round is being shown, so a UI needs no second call",
+      _parity_view["selected_report_id"] == _parity_view["reports"][0]["id"])
+check("the run manifest carries the parity state a screen has to render",
+      (client.get(f"/api/v1/modernization/runs/{_pr}", headers=HDR).json().get("parity")
+       or {}).get("status") == "passed")
+check("a run that recorded nothing reports no parity state rather than an empty one",
+      client.get(f"/api/v1/modernization/runs/{api_run_id}",
+                 headers=HDR).json().get("parity") is None)
+check("another project cannot read this run's recorded behaviour",
+      client.get(f"/api/v1/modernization/runs/{_pr}/parity-cases",
+                 headers=other_hdr).status_code == 404)
+check("nor post a parity report to it",
+      client.post(f"/api/v1/modernization/runs/{_pr}/parity-results",
+                  headers=other_hdr, json={"results": []}).status_code == 404)
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

@@ -37,8 +37,8 @@ from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence, graph,
-    playbooks, reconcile, repo_ingest, rules, scaffold, stages, store, usings, validation,
-    wireup,
+    parity, playbooks, reconcile, repo_ingest, rules, scaffold, stages, store, usings,
+    validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -638,6 +638,13 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
                 detail=reconcile.describe(report)[:4000],
                 blocking=False,
             )
+        # Behavioural parity is the last thing asked and the only one that is about what the
+        # application *does*. It is not a stage of its own (D-45 is about stages that drain
+        # rows through the claim loop; a parity replay happens on someone else's machine and
+        # reports back hours later), so what belongs in the run is the gate: a run carrying
+        # recorded behaviour must not reach `completed` without that behaviour having been
+        # checked. Nothing is raised for a run that recorded no cases.
+        parity.gate(run_id)
 
 
 def _probe_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
@@ -1463,6 +1470,24 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
                 f"could be converted. The export contains scaffolding only.",
                 level="error",
             )
+        elif outstanding == 0 and not stages_left and store.open_blocking_checkpoints(run_id):
+            # There is no work left, and a human still has to answer something. Completing
+            # here would be the sharpest version of the failure this whole file guards
+            # against: the driver stops for a blocking checkpoint everywhere *except* on the
+            # last one, so a gate raised by the final stage — parity divergence, most of all —
+            # would be recorded, displayed, and then overwritten by a green "completed".
+            #
+            # The phase is the last stage rather than `completed`, because `stages.current`
+            # resolves an unknown phase to the *first* stage: pausing at `completed` means a
+            # resume restarts the run at stage one and re-raises `plan_approval`. Same trap
+            # `build_results._rework_phase` documents. Answering the checkpoint and resuming
+            # re-enters the last stage, which is deterministic, and finishes.
+            store.update_run(
+                run_id, status="paused", phase=stages.ORDER[-1],
+                paused_reason=(
+                    f"Everything converted, but {store.open_blocking_checkpoints(run_id)} "
+                    f"blocking checkpoint(s) are unanswered. The run is not finished until "
+                    f"they are."))
         elif outstanding == 0 and not stages_left:
             store.update_run(run_id, status="completed", phase="completed")
             store.append_event(

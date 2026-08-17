@@ -1685,6 +1685,112 @@ button.not-entitled::after {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
+/* ── Looking inside a run ──────────────────────────────────────────────────
+   Read-only panels, deliberately a row of chips rather than more buttons: none of these
+   changes the run or spends anything, and they sat beside "Cancel run" badly. */
+.mod-inspect {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+}
+.mod-inspect-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-muted); margin-right: 4px;
+}
+.mod-scroll { max-height: 360px; overflow: auto; margin-top: 8px; }
+.mod-list { margin: 8px 0 0 18px; font-size: 13px; }
+.mod-list li { margin-bottom: 4px; }
+
+/* A path or symbol that opens the unit behind it. Dotted rather than solid underline: these
+   sit inside dense tables where a solid rule reads as a border. */
+.mod-drill {
+  cursor: pointer; color: var(--accent);
+  text-decoration: underline; text-decoration-style: dotted;
+}
+.mod-drill:hover { color: var(--accent-hover); }
+
+/* Parser evidence. The snippet is a line of the customer's own source, so it must never wrap
+   into something that looks like our prose. */
+.mod-snippet {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; background: var(--surface2); border-radius: 3px;
+  padding: 1px 5px; display: inline-block; max-width: 420px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+}
+
+/* Source and converted output. `white-space: pre` with its own scroller, because wrapping
+   generated code silently changes what it looks like. */
+.mod-source {
+  max-height: 380px; overflow: auto; margin-top: 8px;
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 4px;
+  padding: 10px 12px; white-space: pre; font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.mod-artifact { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 8px; }
+.mod-artifact > summary { cursor: pointer; list-style: none; }
+.mod-artifact > summary::-webkit-details-marker { display: none; }
+.mod-artifact > summary::before { content: '▸ '; color: var(--text-muted); font-size: 11px; }
+.mod-artifact[open] > summary::before { content: '▾ '; }
+.mod-unit-panel { border-left: 3px solid var(--accent); }
+
+/* The run log. One line per event, monospaced timestamp so the column stays a column. */
+.mod-timeline { font-size: 12px; }
+.mod-event {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 4px 0; border-bottom: 1px solid var(--border);
+}
+.mod-event-when {
+  flex: none; color: var(--text-muted); font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.mod-event-name { flex: none; font-weight: 600; min-width: 160px; }
+.mod-event-detail { color: var(--text-muted); word-break: break-word; }
+.mod-event-warning .mod-event-name { color: var(--amber); }
+.mod-event-error .mod-event-name { color: var(--red); }
+
+/* ── Dependency graph ──────────────────────────────────────────────────────
+   Inline SVG laid out by topological level. No library: there is no build step and no CDN
+   here, and a level already is an x coordinate. */
+.mod-graph-wrap {
+  overflow: auto; max-height: 540px; margin-top: 10px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+}
+.mod-graph { display: block; }
+.mod-graph-level {
+  fill: var(--text-muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+}
+.mod-edge { fill: none; stroke: var(--border); stroke-width: 1.2; }
+.mod-edge-arrow { fill: var(--border); }
+.mod-node-g { cursor: pointer; }
+.mod-node { fill: var(--surface2); stroke: var(--border); stroke-width: 1; }
+.mod-node-g:hover .mod-node { stroke: var(--accent); stroke-width: 1.6; }
+.mod-node.converted { stroke: var(--green); }
+.mod-node.in_progress { stroke: var(--accent); }
+.mod-node.needs_human { stroke: var(--amber); }
+.mod-node.failed, .mod-node.exhausted { stroke: var(--red); }
+.mod-node.rolled_up { opacity: .55; }
+/* A cycle cannot be seen in the drawing: the edges inside it are dropped server-side so the
+   run can be ordered at all. Dashed is the only honest way to say "there is more here". */
+.mod-node.in-cycle { stroke-dasharray: 4 3; }
+.mod-node-label {
+  fill: var(--text); font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.mod-node-sub { fill: var(--text-muted); font-size: 9px; }
+.mod-graph-legend {
+  display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px;
+  font-size: 11px; color: var(--text-muted);
+}
+.mod-graph-swatch {
+  display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  background: var(--surface2); border: 1px solid var(--border);
+  margin-right: 5px; vertical-align: -1px;
+}
+.mod-graph-swatch.swatch-converted { border-color: var(--green); }
+.mod-graph-swatch.swatch-in_progress { border-color: var(--accent); }
+.mod-graph-swatch.swatch-needs_human { border-color: var(--amber); }
+.mod-graph-swatch.swatch-failed { border-color: var(--red); }
+.mod-graph-swatch.swatch-cycle { border-style: dashed; }
+
 /* ── Review picker (Release Gate, Governance Report) ───────────────────────
    The gate takes review IDs; before this they had to be pasted as raw UUIDs. */
 

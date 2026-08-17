@@ -526,7 +526,382 @@ check('BLOCKED is not shown to a user — it is the ordinary pre-start state', (
 });
 }
 
-runCharterChecks().then(runPagingChecks).then(() => {
+// ── Modernization: everything the run knew and never showed ────────────────
+// The API exposes 26 endpoints and the screen called 9. These checks hold the six that were
+// rendered nowhere — evidence, redactions, symbols, events, plan, one unit's output — plus
+// the dependency graph, which is computed on every run and had no view at all.
+
+const MOD_UNITS = [
+  { id: 'u-db',    path: 'lib/db.php',     order_index: 0, topo_level: 0, module_type: 'data', depends_on: [], status: 'converted' },
+  { id: 'u-auth',  path: 'lib/auth.php',   order_index: 1, topo_level: 0, module_type: 'auth', depends_on: [], status: 'converted' },
+  { id: 'u-head',  path: 'inc/header.php', order_index: 2, topo_level: 1, module_type: 'ui',   depends_on: ['lib/db.php'], status: 'converted' },
+  { id: 'u-index', path: 'index.php',      order_index: 3, topo_level: 2, module_type: 'ui',   depends_on: ['inc/header.php', 'lib/auth.php'], status: 'in_progress' },
+  { id: 'u-emp',   path: 'employees.php',  order_index: 4, topo_level: 2, module_type: 'ui',   depends_on: ['inc/header.php', 'lib/db.php'], status: 'blocked' },
+];
+
+// Note what the component rows' own `depends_on` says: `#component/0000-...`, a synthetic path
+// GET /components does not return. The graph must still find the edge, by projecting the file
+// edges through `members` — that is the whole reason it is derived rather than read.
+const MOD_COMPONENTS = [
+  { id: 'c-data', name: 'DataAccess', project: 'Shop.Data', namespace: 'Shop.Data',
+    output_dir: 'src/Shop.Data', status: 'converted', topo_level: 0, risk: 'low',
+    members: ['lib/db.php', 'lib/auth.php'], depends_on: [] },
+  { id: 'c-web', name: 'WebFeature', project: 'Shop.Web', namespace: 'Shop.Web',
+    output_dir: 'src/Shop.Web', status: 'blocked', topo_level: 1, risk: 'medium',
+    members: ['inc/header.php', 'index.php', 'employees.php'],
+    depends_on: ['#component/0000-dataaccess'] },
+];
+
+const MOD_EVIDENCE = {
+  count: 3,
+  counts_by_kind: { db: 1, entrypoint: 1, route: 1 },
+  evidence: [
+    { id: 1, unit_id: 'u-index', path: 'index.php', kind: 'entrypoint', value: 'index.php',
+      line: 1, snippet: '<?php require "inc/header.php";', confidence: 1.0, source: 'parser' },
+    { id: 2, unit_id: 'u-emp', path: 'employees.php', kind: 'route', value: '/employees.php',
+      line: 12, snippet: '<a href="employees.php?q=<script>">', confidence: 0.6, source: 'regex' },
+    { id: 3, unit_id: 'u-db', path: 'lib/db.php', kind: 'db', value: 'employees',
+      line: 22, snippet: 'SELECT * FROM employees', confidence: 1.0, source: 'parser' },
+  ],
+};
+
+const MOD_PLAN = {
+  summary: 'Three ASP.NET Core projects: a data layer, a web layer and shared contracts.',
+  projects: [{ name: 'Shop.Data', purpose: 'EF Core context and repositories.', depends_on: [] },
+             { name: 'Shop.Web', purpose: 'Controllers and Razor views.', depends_on: ['Shop.Data'] }],
+  risks: ['The employee salary column is read as an integer in three places.'],
+  corrections: ['Component "WebFeature" proposed a path outside its own directory.'],
+  components: [{ component: 'DataAccess', project: 'Shop.Data', namespace: 'Shop.Data',
+                 output_dir: 'src/Shop.Data', files: 2, loc: 190, risk: 'low', level: 0,
+                 est_cost_usd: 0.0412 },
+               { component: 'WebFeature', project: 'Shop.Web', namespace: 'Shop.Web',
+                 output_dir: 'src/Shop.Web', files: 3, loc: 410, risk: 'medium', level: 1,
+                 est_cost_usd: 0.1031 }],
+  totals: { expected_usd: 0.14, ceiling_usd: 0.62 },
+  by_risk: { high: 0, medium: 1, low: 1 },
+};
+
+const MOD_GATE_A = {
+  id: 'cp-a', kind: 'discovery_approval', title: 'Approve the assessment', blocking: 1,
+  status: 'open', detail: '7 file(s) were ingested and analysed for free.',
+  payload: { stage: 'assessment', files: 7,
+             estimate: { calls: 3, expected_usd: 0.21, ceiling_usd: 0.94 },
+             evidence: { db: 1, entrypoint: 1, route: 1 } },
+};
+
+const MOD_RUN = {
+  id: 'run-gate', name: 'php-crud-to-dotnet', status: 'awaiting_approval',
+  target_stack: '.NET 8', source_kind: 'zip', progress_pct: 0, spent_usd: 0,
+  units: { total: 5, converted: 0 }, components: {}, redaction_count: 2,
+  // The run view carries the *raw* column: `store.get_run` never decodes it, which is why
+  // GET /plan 404s and the UI has to read it from here.
+  plan_json: JSON.stringify(MOD_PLAN),
+  estimate_json: JSON.stringify({ expected_usd: 0.14, ceiling_usd: 0.62 }),
+};
+
+function modGraphChecks() {
+  console.log('\nModernization dependency graph');
+
+  check('one column per topological level, one arrow per dependency', () => {
+    const html = sandbox.renderModernizationGraph(MOD_UNITS, [], 'files');
+    assert(html.includes('<svg'), 'nothing was drawn');
+    assert((html.match(/class="mod-edge"/g) || []).length === 5,
+           `expected 5 edges, saw ${(html.match(/class="mod-edge"/g) || []).length}`);
+    assert(html.includes('Level 0 · 2'), 'level 0 should hold the two roots');
+    assert(html.includes('Level 1 · 1'), 'level 1 header missing');
+    assert(html.includes('Level 2 · 2'), 'level 2 header missing');
+    assert(html.includes('3 level(s)'), 'the level count is wrong');
+  });
+
+  check('every node drills through to the unit behind it', () => {
+    const html = sandbox.renderModernizationGraph(MOD_UNITS, [], 'files');
+    assert(html.includes("showModernizationUnit('u-db')"), 'nodes are not clickable');
+    assert(html.includes('<title>lib/db.php</title>'), 'the full path should be the hover title');
+  });
+
+  check('component mode projects the file edges through members, deduped', () => {
+    // Five file edges collapse to one component edge: two are internal to WebFeature and the
+    // remaining three are the same DataAccess → WebFeature pair.
+    const html = sandbox.renderModernizationGraph(MOD_UNITS, MOD_COMPONENTS, 'components');
+    assert((html.match(/class="mod-edge"/g) || []).length === 1,
+           `expected one projected edge, saw ${(html.match(/class="mod-edge"/g) || []).length}`);
+    assert(html.includes('DataAccess') && html.includes('WebFeature'), 'component nodes missing');
+    assert(html.includes("showModernizationUnit('c-data')"), 'components are not clickable');
+  });
+
+  check('a source path carrying markup cannot break out of the SVG', () => {
+    const html = sandbox.renderModernizationGraph(
+      [{ id: 'u-x', path: 'a<script>alert(1)</script>.php', topo_level: 0, depends_on: [], status: 'blocked' }],
+      [], 'files');
+    assert(!html.includes('<script>'), 'an unescaped tag reached the DOM');
+    assert(html.includes('&lt;script&gt;'), 'the path was dropped rather than escaped');
+  });
+
+  check('a circular group is marked, because its edges are not drawn', () => {
+    // graph.build drops the edges *inside* an SCC so the run can be ordered at all (D-21).
+    // Undrawn and unmarked, the picture would claim an acyclic codebase.
+    const html = sandbox.renderModernizationGraph([
+      { id: 'u-a', path: 'a.php', topo_level: 0, scc_group: 0, depends_on: [], status: 'blocked' },
+      { id: 'u-b', path: 'b.php', topo_level: 0, scc_group: 0, depends_on: [], status: 'blocked' },
+      { id: 'u-c', path: 'c.php', topo_level: 1, depends_on: ['a.php'], status: 'blocked' },
+    ], [], 'files');
+    assert((html.match(/in-cycle/g) || []).length === 2, 'both cycle members should be marked');
+    assert(html.includes('in circular group 0'), 'the hover should say what the marking means');
+    assert(!html.includes('c.php — in circular'), 'an acyclic node must not be marked');
+  });
+
+  check('past the node cap it summarises instead of drawing spaghetti', () => {
+    const many = Array.from({ length: 200 }, (_, i) => ({
+      id: `u${i}`, path: `src/f${i}.php`, topo_level: i % 4, depends_on: [], status: 'blocked' }));
+    const html = sandbox.renderModernizationGraph(many, [], 'files');
+    assert(!html.includes('<svg'), 'a 200-node graph must not be drawn');
+    assert(html.includes('Too large to draw'), 'no explanation of why it was not drawn');
+    assert(html.includes('200 node(s)'), 'the summary should still state the size');
+  });
+
+  check('the graph costs the 4s poll nothing until it is asked for', () => {
+    // It is rendered inline from data the poll already has, so an unopened graph is an empty
+    // div rather than a second request.
+    const html = sandbox.renderModernizationRun(MOD_RUN, [], MOD_UNITS, MOD_COMPONENTS);
+    assert(html.includes('<div id="mod-graph"></div>'), 'the graph should start empty');
+    assert(html.includes('Dependency graph'), 'no way to open it');
+  });
+}
+
+function modPanelChecks() {
+  console.log('\nModernization evidence, redactions, symbols, timeline');
+
+  check('evidence is grouped by kind and carries file, line and snippet', () => {
+    const html = sandbox.renderModernizationEvidence(MOD_EVIDENCE);
+    assert(html.includes('entrypoint (1)'), 'kind grouping missing');
+    assert(html.includes('lib/db.php'), 'the file is missing');
+    assert(html.includes('>22<'), 'the line number is missing');
+    assert(html.includes('SELECT * FROM employees'), 'the snippet is missing');
+    assert(html.includes('60% sure'), 'a sub-1.0 confidence should be stated');
+    assert(html.includes("showModernizationUnit('u-db')"), 'evidence should drill into its file');
+  });
+
+  check('a snippet containing markup is escaped, not rendered', () => {
+    const html = sandbox.renderModernizationEvidence(MOD_EVIDENCE);
+    assert(!html.includes('<script>'), 'a source snippet executed as HTML');
+    assert(html.includes('&lt;script&gt;'), 'the snippet was dropped rather than escaped');
+  });
+
+  check('no evidence says so, rather than rendering an empty table', () => {
+    const html = sandbox.renderModernizationEvidence({ count: 0, counts_by_kind: {}, evidence: [] });
+    assert(!html.includes('<table'), 'should not render a headers-only table');
+    assert(html.includes('recorded nothing'), 'the empty state should explain what that means');
+  });
+
+  check('redactions render by category and never a value', () => {
+    const html = sandbox.renderModernizationRedactions({
+      count: 2, by_category: { db_password: 1, api_key: 1 },
+      redactions: [{ path: 'lib/db.php', line: 4, category: 'db_password' },
+                   { path: 'config.php', line: 9, category: 'api_key' }] });
+    assert(html.includes('db password · 1'), 'category counts missing');
+    assert(html.includes('lib/db.php') && html.includes('>4<'), 'path and line missing');
+    assert(html.includes('never entered this system'), 'must say the value was not kept');
+  });
+
+  check('symbols are grouped by the namespace they landed in', () => {
+    const html = sandbox.renderModernizationSymbols({ symbols: [
+      { name: 'IEmployeeRepository', kind: 'interface', namespace: 'Shop.Data',
+        signature: 'IEnumerable<Employee> All()', target_path: 'src/Shop.Data/IEmployeeRepository.cs',
+        source_symbol: 'lib/db.php', unit_id: 'c-data' },
+      { name: 'HomeController', kind: 'class', namespace: 'Shop.Web',
+        signature: 'IActionResult Index()', target_path: 'src/Shop.Web/HomeController.cs' },
+    ] });
+    assert(html.includes('Shop.Data (1)') && html.includes('Shop.Web (1)'), 'namespace grouping missing');
+    assert(html.includes('IEnumerable&lt;Employee&gt; All()'), 'the signature should be escaped, not lost');
+    assert(html.includes("showModernizationUnit('c-data')"), 'a symbol should drill to its emitter');
+  });
+
+  check('the timeline renders newest first and colours the level', () => {
+    const html = sandbox.renderModernizationEvents({ events: [
+      { id: 9, level: 'warning', event: 'run_paused', detail: 'Budget cap reached',
+        created_at: '2026-08-17T10:04:00' },
+      { id: 8, level: 'info', event: 'unit_converted', detail: 'lib/db.php',
+        created_at: '2026-08-17T10:01:00' },
+    ] });
+    assert(html.indexOf('run paused') < html.indexOf('unit converted'), 'not newest-first');
+    assert(html.includes('mod-event-warning'), 'the level is not visible');
+    assert(html.includes('2026-08-17 10:04:00'), 'the timestamp is missing');
+  });
+
+  check('an empty timeline is a sentence, not a blank box', () => {
+    assert(sandbox.renderModernizationEvents({ events: [] }).includes('No events recorded yet'));
+  });
+}
+
+function modPlanChecks() {
+  console.log('\nModernization plan and the two spend gates');
+
+  check('the plan carries the architect\'s reasoning, not only a price', () => {
+    const html = sandbox.renderModernizationPlan({ plan: MOD_PLAN, estimate: MOD_PLAN.totals });
+    assert(html.includes('Three ASP.NET Core projects'), 'the summary is missing');
+    assert(html.includes('Shop.Data') && html.includes('EF Core context'), 'projects missing');
+    assert(html.includes('salary column is read as an integer'), 'the stated risks are missing');
+    assert(html.includes('proposed a path outside'), 'the corrections are missing');
+    assert(html.includes('src/Shop.Web'), 'the component table is missing');
+    assert(html.includes('$0.62'), 'the ceiling is missing');
+  });
+
+  check('a run with no plan says so rather than rendering a blank document', () => {
+    assert(sandbox.renderModernizationPlan({}).includes('no plan yet'));
+  });
+
+  check('the plan gate shows the plan it is asking approval for', () => {
+    // The payload of a `plan_approval` checkpoint *is* the plan. It used to render as a table
+    // of prices with the architect's summary and risks thrown away.
+    const html = sandbox.renderCheckpointPayload({ kind: 'plan_approval', payload: MOD_PLAN });
+    assert(html.includes('Three ASP.NET Core projects'), 'the gate still hides the summary');
+    assert(html.includes('salary column is read as an integer'), 'the gate still hides the risks');
+    assert(html.includes('WebFeature'), 'the component table went missing');
+  });
+
+  check('the assessment gate names what was found and makes room for it', () => {
+    const html = sandbox.renderCheckpointPayload(MOD_GATE_A);
+    assert(html.includes('3 model call(s)'), 'the quote is missing');
+    assert(html.includes('$0.94'), 'the ceiling is missing');
+    assert(html.includes('entrypoint · 1') && html.includes('route · 1'), 'the evidence tally is missing');
+    assert(html.includes('over 7 ingested file(s)'), 'the file count is missing');
+    assert(html.includes('id="mod-gate-evidence"'), 'no container for the evidence itself');
+  });
+
+  check('the plan is offered from the run row, because GET /plan answers 404', () => {
+    // `store.get_run` decodes charter/stats/redactions/error and not plan_json/estimate_json,
+    // so `run.plan` is never populated. Reading the raw column is what makes the chip appear
+    // and the header estimate line render at all.
+    const html = sandbox.renderModernizationRun(MOD_RUN, [], MOD_UNITS, MOD_COMPONENTS);
+    assert(html.includes('>The plan</button>'), 'the plan chip is missing');
+    assert(html.includes('est. $0.14'), 'the header estimate is still dead');
+  });
+}
+
+function modUnitChecks() {
+  console.log('\nModernization file drill-down');
+
+  const UNIT = {
+    unit: { id: 'c-data', path: '#component/0000-dataaccess', component_name: 'DataAccess',
+            kind: 'component', status: 'converted', topo_level: 0, loc: 190, language: 'php',
+            module_type: 'data', risk: 'low', attempts: 1, actual_cost_usd: 0.0398,
+            target_namespace: 'Shop.Data', depends_on: [], dependents: ['#component/0001-webfeature'],
+            meta: { members: ['lib/db.php', 'lib/auth.php'], rationale: 'All data access.',
+                    expected_files: ['Employee.cs', 'IEmployeeRepository.cs'] },
+            source_text: '<?php $pdo = new PDO($dsn); ?>' },
+    artifacts: [{ id: 'a1', unit_id: 'c-data', path: 'src/Shop.Data/Employee.cs', version: 1,
+                  is_current: 1, purpose: 'entity',
+                  content: 'namespace Shop.Data;\npublic class Employee { }' }],
+  };
+
+  check('a unit shows what it became, its members and what needed it', () => {
+    const html = sandbox.renderModernizationUnit(UNIT, false);
+    assert(html.includes('DataAccess'), 'the name is missing');
+    assert(html.includes('lib/db.php') && html.includes('lib/auth.php'), 'members missing');
+    assert(html.includes('#component/0001-webfeature'), 'dependents missing');
+    assert(html.includes('IEmployeeRepository.cs'), 'the promised output list is missing');
+    assert(html.includes('src/Shop.Data/Employee.cs'), 'the converted file is missing');
+    assert(html.includes('public class Employee { }'), 'the converted text is missing');
+    assert(html.includes('$0.0398 spent'), 'the real cost of this unit is missing');
+  });
+
+  check('the original source is shown only when asked for', () => {
+    assert(!sandbox.renderModernizationUnit(UNIT, false).includes('new PDO'),
+           'source rode along on the closed view');
+    const open = sandbox.renderModernizationUnit(UNIT, true);
+    assert(open.includes('new PDO($dsn)'), 'source not shown when asked for');
+    assert(open.includes('Hide original source'), 'the toggle should flip its label');
+  });
+
+  check('a huge converted file is clipped rather than pasted whole into the DOM', () => {
+    const big = { unit: UNIT.unit,
+                  artifacts: [{ path: 'src/Big.cs', version: 1, is_current: 1,
+                                content: 'x'.repeat(25000) }] };
+    const html = sandbox.renderModernizationUnit(big, false);
+    assert(html.includes('… clipped: 5000 more character(s)'), 'nothing was clipped');
+  });
+
+  check('both inventory tables are doors into the unit, not just listings', () => {
+    // The files and components tables are where a reader already is when they want to know
+    // what one row became. Making the path itself the link is the shortest route there.
+    const files = sandbox.renderModernizationUnits(MOD_UNITS);
+    assert(files.includes(`showModernizationUnit('u-db')`), 'the files table does not drill down');
+    assert(files.includes('>lib/db.php</span>'), 'the path stopped being the link text');
+    const comps = sandbox.renderModernizationComponents(MOD_COMPONENTS);
+    assert(comps.includes(`showModernizationUnit('c-data')`), 'the components table does not drill down');
+  });
+
+  check('a unit that produced nothing says so', () => {
+    const html = sandbox.renderModernizationUnit({ unit: { path: 'x.php', status: 'blocked' }, artifacts: [] }, false);
+    assert(html.includes('Nothing has been written'), 'the empty state is missing');
+    assert(html.includes('>waiting<'), 'the internal status name leaked again');
+  });
+}
+
+async function runModernizationChecks() {
+  modGraphChecks();
+  modPanelChecks();
+  modPlanChecks();
+  modUnitChecks();
+
+  console.log('\nModernization panel wiring (the 4s poll)');
+
+  const saved = sandbox.fetch;
+  function modRoute(url) {
+    if (url.endsWith('/runs')) return { runs: [] };
+    if (url.includes('/evidence')) return MOD_EVIDENCE;
+    if (url.includes('/checkpoints')) return { checkpoints: [MOD_GATE_A] };
+    if (url.includes('/components')) return { components: MOD_COMPONENTS };
+    if (url.includes('/units/')) return { unit: MOD_UNITS[0], artifacts: [] };
+    if (url.includes('/units')) return { units: MOD_UNITS };
+    return MOD_RUN;
+  }
+  sandbox.fetch = async (url) => {
+    fetchLog.push(url);
+    const body = modRoute(url);
+    return { ok: true, status: 200, json: async () => body, text: async () => '' };
+  };
+
+  await checkAsync('the assessment gate loads its evidence without being asked', async () => {
+    // The gate is where money is approved. Asking a user to approve a spend against one
+    // sentence, with the evidence a click away on a panel they have to know exists, is the
+    // thing this is meant to stop.
+    fetchLog.length = 0;
+    await sandbox.openModernizationRun('run-gate');
+    await new Promise(r => setTimeout(r, 5));
+    assert(fetchLog.some(u => u.includes('/evidence')), 'the gate never fetched its evidence');
+    const html = document.getElementById('mod-gate-evidence').innerHTML;
+    assert(html.includes('SELECT * FROM employees'), 'the gate is still a single sentence');
+    assert(html.includes('index.php'), 'the entry point is not on the gate');
+  });
+
+  await checkAsync('a repaint restores an open panel from cache instead of re-fetching', async () => {
+    // Six panels hanging off a 4s timer would turn a read-only screen into a load generator.
+    fetchLog.length = 0;
+    await sandbox.refreshModernizationRun();
+    await new Promise(r => setTimeout(r, 5));
+    const again = fetchLog.filter(u => u.includes('/evidence')).length;
+    assert(again === 0, `the poll re-fetched the evidence ${again} time(s)`);
+    assert(document.getElementById('mod-gate-evidence').innerHTML.includes('SELECT * FROM employees'),
+           'the repaint dropped the gate evidence');
+  });
+
+  await checkAsync('an unsaved charter still stops the poll repainting over it', async () => {
+    // C-54. The panels above are restored inside refreshModernizationRun(), so this guard has
+    // to survive them — a dirty form must still short-circuit before any fetch.
+    const savedQsa = document.querySelectorAll;
+    document.querySelectorAll = () => [{ value: 'hand-written', dataset: { rendered: '' } }];
+    fetchLog.length = 0;
+    const run = await sandbox.refreshModernizationRun();
+    document.querySelectorAll = savedQsa;
+    assert(fetchLog.length === 0, `the poll fetched ${fetchLog.length} time(s) over unsaved input`);
+    assert(run && run.id === 'run-gate', 'the poll loop lost track of the run it is watching');
+  });
+
+  sandbox.fetch = saved;
+}
+
+runCharterChecks().then(runPagingChecks).then(runModernizationChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');
