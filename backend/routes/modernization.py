@@ -36,7 +36,7 @@ from backend.services.orchestrator import SDLCOrchestrator
 from backend.services.modernization import advice
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
-    build_results, parity, reconcile, repo_ingest, runner, stages, store,
+    build_results, parity, parity_tools, reconcile, repo_ingest, runner, stages, store,
 )
 
 logger = logging.getLogger(__name__)
@@ -505,6 +505,35 @@ def record_parity_cases(run_id: str, req: ParityCasesRequest,
         raise HTTPException(400, str(exc))
 
 
+@router.get("/runs/{run_id}/parity-tools", summary="The recorder and replayer for this run")
+def get_parity_tools(run_id: str, api_base: str = "", port: int = 8901,
+                     caller: dict = Depends(get_caller)):
+    """The two programs that produce parity's inputs, rendered for this run.
+
+    Parity cannot bootstrap itself: `parity.py` adjudicates and executes nothing (D-05), so
+    until something watches the legacy application there are no cases and the gate is inert.
+    These are that something, and they are handed over the same way the build workflow is —
+    generated, bound to one run, and run by the customer.
+
+    `api_base` defaults to `PUBLIC_BASE_URL`, which is the only address the platform knows a
+    customer's machine can reach it on; behind a proxy it cannot be derived from the request.
+    """
+    _require_run(run_id, caller)
+    base = (api_base or (f"{config.PUBLIC_BASE_URL}/api/v1/modernization"
+                         if config.PUBLIC_BASE_URL else "")).rstrip("/")
+    if not base:
+        raise HTTPException(
+            400, ("No address to call back on. Set PUBLIC_BASE_URL, or pass api_base — the "
+                  "recorder runs on the customer's network and has to be told where to "
+                  "upload, which cannot be read off this request behind a proxy."))
+    try:
+        files = parity_tools.bundle(base, run_id, port=port)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"files": [{"path": path, "content": content} for path, content in files.items()],
+            "api_base": base}
+
+
 @router.get("/runs/{run_id}/parity-cases", summary="The golden corpus, ready to replay")
 def list_parity_cases(run_id: str, status: str = "active", include_bodies: bool = False,
                       caller: dict = Depends(get_caller)):
@@ -755,6 +784,19 @@ def export_run(run_id: str, caller: dict = Depends(get_caller)):
         # three months is not the person who watched the run, and an export that does not
         # say what was skipped reads as a complete conversion.
         zf.writestr("MODERNIZATION_REPORT.md", _export_report(run, counts, artifacts))
+        # The parity tools ride along with the code they are meant to check. Downloading the
+        # conversion and separately discovering there is a way to verify it is one step too
+        # many — and the step that gets skipped is always the verification. Omitted only when
+        # the platform has no address a customer's machine could upload to, since a recorder
+        # that cannot phone home is worse than none.
+        if config.PUBLIC_BASE_URL:
+            try:
+                for path, content in parity_tools.bundle(
+                        f"{config.PUBLIC_BASE_URL}/api/v1/modernization", run_id).items():
+                    zf.writestr(path, content)
+            except ValueError as exc:
+                logger.warning("Parity tools left out of the export for run %s: %s",
+                               run_id, exc)
     buf.seek(0)
     safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in (run.get("name") or "run"))
     return StreamingResponse(

@@ -1759,8 +1759,14 @@ def list_parity_cases(run_id: str, status: str = "active",
                       include_bodies: bool = False) -> List[Dict[str, Any]]:
     """The corpus, in replay order. `include_bodies` off by default — a recorded page is
     the largest thing in this schema and a case list is rendered as a table."""
+    # `request_body` is in the lean list and `expected_body` is not, and the asymmetry is the
+    # point: the request is *input a runner must send* — without it every recorded POST
+    # replays as an empty form and diverges for a reason that has nothing to do with the
+    # conversion — while the expected response is the thing a runner must never see, because
+    # a runner holding it would be one edit away from deciding pass/fail itself.
     columns = "*" if include_bodies else (
         "id, run_id, name, group_name, seq, source_path, rule_id, method, path, query, "
+        "request_body, "
         "cookies_json, request_content_type, expected_status, expected_location, "
         "expected_content_type, expected_headers_json, expected_values_json, extract_json, "
         "ignore_json, body_match, status, source, notes, created_at, updated_at, "

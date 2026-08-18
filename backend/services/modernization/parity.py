@@ -84,7 +84,7 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
-from backend.services.modernization import stages, store
+from backend.services.modernization import repo_ingest, stages, store
 
 logger = logging.getLogger(__name__)
 
@@ -644,6 +644,44 @@ def normalize_case(entry: Any, index: int) -> Dict[str, Any]:
     }
 
 
+def redact_recorded(text: Any) -> Tuple[str, List[Dict[str, Any]]]:
+    """Mask credentials in something captured from a running application.
+
+    Source ingest has always done this (`repo_ingest.redact`); parity had not, and parity is
+    the *more* exposed of the two. A recorded page is a live response — session tokens, an
+    API key echoed into a debug panel, a connection string on an error page — where source
+    code only holds what someone committed. Same function, so there is one answer to "what
+    counts as a secret" and one place to improve it.
+
+    Applied to **both** sides, which is the part that is easy to get wrong. Redacting only
+    the recording would compare a masked legacy body against a live converted one and report
+    a divergence on every page carrying a token — parity failing for the one reason that has
+    nothing to do with the conversion.
+    """
+    if not text:
+        return "", []
+    return repo_ingest.redact(str(text), "parity")
+
+
+def _redact_entry(entry: Any) -> List[Dict[str, Any]]:
+    """Redact a submitted case in place, before anything reads it.
+
+    Before `normalize_case`, deliberately: it derives the expected values from the recorded
+    body, so redacting afterwards would leave a secret sitting in `expected_values_json`
+    having already passed the door.
+    """
+    hits: List[Dict[str, Any]] = []
+    if not isinstance(entry, dict):
+        return hits
+    for holder, key in (("expected", "body"), ("request", "body")):
+        section = entry.get(holder)
+        if isinstance(section, dict) and section.get(key):
+            cleaned, found = redact_recorded(section[key])
+            section[key] = cleaned
+            hits.extend(found)
+    return hits
+
+
 def record_cases(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
     """Store a batch of recorded golden cases. The entry point for any recorder."""
     run = store.get_run(run_id)
@@ -659,6 +697,9 @@ def record_cases(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
                           f"{MAX_CASES_PER_REQUEST}. Send them in batches.")
 
     source = _text(payload.get("source"), 40)
+    redactions: List[Dict[str, Any]] = []
+    for entry in entries:
+        redactions.extend(_redact_entry(entry))
     cases = [normalize_case(entry, index) for index, entry in enumerate(entries)]
     if source:
         for case in cases:
@@ -679,10 +720,22 @@ def record_cases(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
                           f"limit is {MAX_CASES}.")
 
     outcome = store.upsert_parity_cases(run_id, cases)
-    logger.info("Modernization run %s: %s parity case(s) recorded by %s",
-                run_id, len(cases), actor or "unknown")
+    logger.info("Modernization run %s: %s parity case(s) recorded by %s (%s redaction(s))",
+                run_id, len(cases), actor or "unknown", len(redactions))
+    if redactions:
+        # Counted by category, never by value — same rule as the ingest redaction map. The
+        # operator needs to know their corpus held credentials; nobody needs to know which.
+        by_category: Dict[str, int] = {}
+        for hit in redactions:
+            by_category[hit["category"]] = by_category.get(hit["category"], 0) + 1
+        store.append_event(
+            run_id, "parity_redacted",
+            f"{len(redactions)} credential(s) masked in recorded cases: "
+            + ", ".join(f"{k} x{v}" for k, v in sorted(by_category.items())),
+            level="warning")
     return {
         "recorded": len(cases),
+        "redacted": len(redactions),
         "inserted": outcome["inserted"],
         "updated": outcome["updated"],
         "total_active": store.parity_case_count(run_id),
@@ -850,9 +903,14 @@ def ingest(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
                             "differences": [], "actual_status": status,
                             "duration_ms": _int(entry.get("duration_ms"))})
             continue
+        # Redacted with the same function as the recording, and for both reasons: a replayed
+        # body is as live a response as the recorded one, and masking only one side would
+        # compare `<REDACTED:api_key>` against a real token and call every page carrying one
+        # a divergence.
+        observed_body, _ = redact_recorded(entry.get("body"))
         outcome = compare(case, {
             "status": status, "headers": entry.get("headers"),
-            "body": entry.get("body"), "location": entry.get("location"),
+            "body": observed_body, "location": entry.get("location"),
         })
         results.append({
             **base, "verdict": outcome["verdict"], "differences": outcome["differences"],

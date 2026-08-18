@@ -22,6 +22,7 @@ The two checks worth reading first:
 Costs nothing and is safe to run on every change.
 """
 import io
+import ast
 import os
 import re
 import sys
@@ -41,8 +42,8 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
-    evidence, graph, parity, reconcile, repo_ingest, runner, rules as rules_module,
-    scaffold, stages, store, usings, validation, wireup,
+    evidence, graph, parity, parity_tools, reconcile, repo_ingest, runner,
+    rules as rules_module, scaffold, stages, store, usings, validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
@@ -2949,6 +2950,95 @@ check("another project cannot read this run's recorded behaviour",
 check("nor post a parity report to it",
       client.post(f"/api/v1/modernization/runs/{_pr}/parity-results",
                   headers=other_hdr, json={"results": []}).status_code == 404)
+
+
+section("24. The parity recorder and replayer — the half that is not adjudication")
+
+# Parity cannot bootstrap itself: nothing here may execute (D-05), so the corpus only exists
+# if something watches the legacy application. These are that something. They are generated
+# per run and handed over, exactly as the build workflow is, so what is asserted below is
+# that the generated *text* is a correct program bound to the right run.
+_TOOL_BASE = "http://platform.example/api/v1/modernization"
+_tools = parity_tools.bundle(_TOOL_BASE, _pr, port=8911)
+check("the bundle carries a recorder, a replayer and instructions", len(_tools) == 3)
+for _path, _content in _tools.items():
+    check(f"{_path.split('/')[-1]} has no unsubstituted placeholder", "__LM_" not in _content)
+for _name in (parity_tools.RECORDER_FILENAME, parity_tools.REPLAYER_FILENAME):
+    _src = _tools[f"{parity_tools.PARITY_TOOLS_DIR}/{_name}"]
+    try:
+        ast.parse(_src)
+        check(f"{_name} is valid Python", True)
+    except SyntaxError as exc:
+        check(f"{_name} is valid Python", False, str(exc))
+    # A generated program that needs `pip install` on a customer's old server is a program
+    # that does not get run — the same argument that keeps the build workflow to curl.
+    _imports = {n.split(".")[0]
+                for line in _src.splitlines() if line.startswith(("import ", "from "))
+                for n in [line.split()[1]]}
+    check(f"{_name} imports only the standard library",
+          _imports <= set(sys.stdlib_module_names), str(sorted(_imports)))
+    check(f"{_name} is bound to this run", _pr in _src)
+    check(f"{_name} posts to the configured platform", _TOOL_BASE in _src)
+
+check("a bad callback address is refused rather than baked into a customer's script",
+      _raises(ValueError, lambda: parity_tools.render_recorder("not-a-url", _pr)))
+check("so is a run id carrying a quote",
+      _raises(ValueError, lambda: parity_tools.render_recorder(_TOOL_BASE, "abc'; rm -rf /")))
+
+# The recorder runs as a proxy, so its judgement about *what to record* is the thing that
+# decides whether the corpus is useful or 200 stylesheets. Exercised against the real module.
+_rec_ns: dict = {}
+exec(compile(_tools[f"{parity_tools.PARITY_TOOLS_DIR}/{parity_tools.RECORDER_FILENAME}"],
+             "record_parity.py", "exec"), _rec_ns)   # noqa: S102 - the artifact under test
+_should = _rec_ns["_should_record"]
+check("a page is recorded", _should("/employees.php", "text/html; charset=UTF-8"))
+check("a redirect with no content-type is recorded (the Location is the behaviour)",
+      _should("/add_employee.php", ""))
+check("a JSON endpoint is recorded", _should("/api/list", "application/json"))
+check("a stylesheet is not — it is not behaviour, and it would swamp the corpus",
+      not _should("/assets/site.css", "text/css"))
+check("nor an image, whatever its content-type claims",
+      not _should("/img/logo.png", "text/html"))
+check("a session groups its own cases so a stateful flow replays in order",
+      _rec_ns["_session_of"]("PHPSESSID=abc") == _rec_ns["_session_of"]("PHPSESSID=abc")
+      and _rec_ns["_session_of"]("PHPSESSID=abc") != _rec_ns["_session_of"]("PHPSESSID=xyz"))
+check("requests with no cookie share the anonymous group",
+      _rec_ns["_session_of"]("") == "anonymous")
+
+# A replay runner must be able to send a recorded POST. `request_body` therefore has to
+# survive the lean case list, while `expected_body` must not: a runner holding the expected
+# response is one edit away from deciding pass/fail itself, and then "the same" means two
+# different things in two places.
+_lean = store.list_parity_cases(_pr, status="active", include_bodies=False)
+check("the corpus a runner fetches carries the request body it must send",
+      any("request_body" in c for c in _lean), str(sorted(_lean[0])) if _lean else "no cases")
+check("but never the expected response it must not judge",
+      all("expected_body" not in c for c in _lean))
+
+# Credentials on a recorded page. Source ingest has always redacted; parity had not, and a
+# live response is the more exposed of the two.
+_secret_case = {
+    "name": "page with a token", "request": {"method": "GET", "path": "/dash.php"},
+    "expected": {"status": 200, "content_type": "text/html",
+                 "body": "<p>key AKIA1234567890ABCDEF</p>"},
+}
+_rec = parity.record_cases(_pr, {"cases": [_secret_case], "source": "proxy"}, actor="smoke")
+check("a credential on a recorded page is masked before it is stored", _rec["redacted"] >= 1)
+_stored = [c for c in store.list_parity_cases(_pr, status="active", include_bodies=True)
+           if c["name"] == "page with a token"]
+check("and the value is not in the database",
+      bool(_stored) and "AKIA1234567890ABCDEF" not in (_stored[0].get("expected_body") or ""))
+check("the operator is told it happened, by category and count",
+      any(e.get("event") == "parity_redacted" for e in store.list_events(_pr, limit=200)))
+
+# The half that is easy to get wrong: masking only the recording would compare a masked
+# legacy body against a live converted one and fail every page carrying a token.
+_replayed = parity.ingest(_pr, {"results": [
+    {"case_id": _stored[0]["id"], "status": 200,
+     "headers": {"content-type": "text/html"},
+     "body": "<p>key AKIA9999999999ZZZZZZ</p>"}], "source": "smoke"}, actor="smoke")
+check("a different credential in the same place is not reported as a divergence",
+      _replayed.get("passed") == 1 and _replayed.get("failed") == 0, str(_replayed))
 
 
 # ── Summary ────────────────────────────────────────────────────────────────
