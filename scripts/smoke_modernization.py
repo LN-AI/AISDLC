@@ -43,7 +43,7 @@ from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
     evidence, graph, parity, parity_tools, reconcile, repo_ingest, runner,
-    rules as rules_module, scaffold, stages, store, usings, validation, wireup,
+    rules as rules_module, sanity, scaffold, stages, store, usings, validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
@@ -3769,6 +3769,12 @@ check("but the sharing is reported rather than silent",
 check("output directories are still made unique",
       len({c["output_dir"] for c in _ns_components}) == 4,
       str([c["output_dir"] for c in _ns_components]))
+# …and the other half of D-90's argument, which was missing. A shared namespace is reported
+# and kept; a shared directory has to be broken — but breaking it silently left the reader of a
+# plan unable to see that the architect had put two groups of files in one place, which is the
+# same class of invisible correction the namespace report exists for.
+check("and breaking that tie is reported, not done silently",
+      len([p for p in _ns_problems if "claimed the directory" in p]) == 3, str(_ns_problems))
 check("and a namespace that is not a legal identifier is still corrected",
       _architecture._legal_namespace("Shop.Web.2Factor") == "Shop.Web.N2Factor")
 
@@ -3872,6 +3878,250 @@ check("a reference to a project outside the export is not a cycle",
       not reconcile._project_reference_cycles([
           {"path": "A.Web/A.Web.csproj",
            "content": '<ProjectReference Include="..\\..\\Vendor\\Vendor.csproj" />'}]))
+
+
+
+# ── 31. Cross-signal checks ──────────────────────────────────────────
+section("31. Cross-signal checks — the analysis layer saying it does not understand")
+
+# Every defect sections 27–30 cover was the same defect: a recogniser assumed something true of
+# the fixture and false of the codebase, and *nothing compared any two of the numbers it
+# produced*. `sanity.py` is that comparison. These checks are mostly about precision, because a
+# contradiction list that cries wolf is switched off within a week and then the silent failure
+# mode is back with a decommissioned alarm in front of it.
+#
+# Read the two calibration checks first: the facts as the pipeline recorded them *before* the
+# fixes must produce a pile of warnings, and every fixture in this file must produce none.
+
+_STACK = ".NET 8 / ASP.NET Core MVC with Razor views"
+
+
+def _signals_for(fixture):
+    """The signals for a fixture, through the same three steps ingest uses."""
+    normalized = repo_ingest.normalize_files(fixture)
+    built = graph.build(analyzers.discover(normalized["files"]))
+    rows = evidence.collect(normalized["files"], built["units"])
+    return sanity.collect(normalized["files"], built["units"], rows, built["stats"],
+                          normalized["redactions"], normalized["skipped"])
+
+
+def _codes(signals, stack=_STACK):
+    return [w["code"] for w in sanity.evaluate(signals, stack)]
+
+
+# ── Calibration: the run that went wrong, and the fixtures that did not ────
+#
+# EMS as the pipeline actually recorded it before D-80…D-93. Every number below was stored in
+# the run row; the whole defect is that no two of them were ever compared. Hand-written rather
+# than produced by reverting the analyzers, which is what makes it a fixed target: this is the
+# state the checks exist to catch, and it cannot drift.
+EMS_BEFORE = {
+    "files_ingested": 45, "files_skipped": 4, "files_analysed": 45, "code_files": 43,
+    "languages": {"PHP": 41, "SQL": 1, "JSON": 1, "JavaScript": 1, "unrecognised": 1},
+    "read_by": {"parser": 41, "heuristic": 4}, "dominant_language": "php",
+    "edges": 104, "levels": 7, "external_dependencies": 30,
+    "evidence_counts": {"datastore": 1, "table": 13, "route": 1, "hazard": 8, "output": 13},
+    # D-80: a CRUD application over PDO, reported as touching no database.
+    "db_apis": [], "db_sites": 0, "datastores": ["PDO"],
+    "tables": ["attendance", "departments", "employees", "users"],
+    # D-83: fifteen routes in routes/web.php, reported as the one rewrite rule.
+    "routes": 1,
+    # D-86: every template counted as reachable from outside.
+    "entrypoints": 13,
+    "entrypoint_templates": ["views/employees/index.php", "views/employees/edit.php",
+                             "views/layouts/main.php", "views/auth/login.php"],
+    "config_keys": 0, "hazard_kinds": ["extract", "variable_include"],
+    "has_ui": True, "sessions": True, "superglobals": ["$_GET", "$_POST"],
+    # D-81: `->exec()` read as a shell escape, so the connection wrapper nine files depend on
+    # refused to convert.
+    "blocked": [
+        {"path": "src/Core/View.php", "hazards": ["extract", "variable_include"],
+         "dependents": 11},
+        {"path": "src/Core/Database.php", "hazards": ["shell_exec"], "dependents": 9},
+        {"path": "public/index.php", "hazards": ["variable_include"], "dependents": 0},
+        {"path": "database/seed.php", "hazards": ["shell_exec"], "dependents": 0},
+        {"path": "composer.json", "hazards": ["shell_exec"], "dependents": 0}],
+    # D-85: the codebase's own namespace, offered to the customer as third-party surface.
+    "own_unresolved": [{"path": "src/Controllers/EmployeeController.php",
+                        "name": f"App\\Repositories\\Ghost{i}"} for i in range(30)],
+    "ddl_files": ["database/schema.sql"],
+    "config_files": ["config/database.php", "config/config.php"],
+    "template_files": 11,
+    "aggregate": {"db_apis": [], "db_engines": [], "html": True, "sessions": True,
+                  "superglobals": ["$_GET", "$_POST"], "tables": [],
+                  "hazard_kinds": ["extract", "variable_include"],
+                  "uploads": False, "redirects": True, "json": False},
+}
+
+_before = _codes(EMS_BEFORE)
+check("the pre-fix facts produce a pile of contradictions", len(_before) >= 5,
+      f"{len(_before)}: {_before}")
+for _code, _why in (
+        ("datastore_without_api", "a database was seen and no data-access API was (D-80)"),
+        ("tables_without_queries", "tables were named and no query touches one (D-80)"),
+        ("playbook_section_omitted", "the data-access guidance was withheld (D-80)"),
+        ("ui_without_routes", "fifteen routes reported as one (D-83)"),
+        ("template_without_renderer", "templates counted as entry points (D-86)"),
+        ("blocking_hazard_ratio", "a hazard pattern over-firing (D-81)"),
+        ("unresolved_own_namespace", "its own namespace called third-party (D-85)"),
+        ("config_files_without_keys", "settings files read for nothing (C-70)")):
+    check(f"and it names it: {_why}", _code in _before, str(_before))
+
+# The other half of precision, and the harder half. A check that fires here is a check somebody
+# turns off, so the bar is zero — including on the procedural fixtures, where a high entry-point
+# count is the *correct* answer for one-page-per-URL code.
+_lay = _signals_for([{"path": p, "content": t} for p, t in LAYERED.items()])
+check("the layered PDO fixture contradicts nothing", _codes(_lay) == [], str(_codes(_lay)))
+_proc = _signals_for(PHP_FIXTURE)
+check("the procedural fixture contradicts nothing either", _codes(_proc) == [],
+      str(_codes(_proc)))
+check("including its entry points, which a one-page-per-URL app really does have",
+      _proc["entrypoints"] >= 4 and "template_without_renderer" not in _codes(_proc),
+      f"{_proc['entrypoints']} entry point(s)")
+_tiny = _signals_for([
+    {"path": "index.php", "content": "<?php include 'lib.php';\necho greet('x');\n"},
+    {"path": "lib.php", "content": "<?php function greet($s) { return $s; }\n"}])
+check("a two-file fixture contradicts nothing", _codes(_tiny) == [], str(_codes(_tiny)))
+
+# ── Each check fires on its own contradiction and is quiet without it ──────
+#
+# One assertion per check would pass on a function that returns a warning unconditionally.
+# Every pair below removes exactly one number and asserts the warning goes with it.
+
+def _minus(base, **overrides):
+    merged = dict(base)
+    merged.update(overrides)
+    return merged
+
+
+check("datastore_without_api needs both halves to disagree",
+      "datastore_without_api" not in _codes(_minus(EMS_BEFORE, db_apis=["PDO"])))
+check("tables_without_queries stops once a query site is found",
+      "tables_without_queries" not in _codes(_minus(EMS_BEFORE, db_sites=42)))
+check("and it stays quiet on a repository that is only DDL — there is no code to disagree with",
+      "tables_without_queries" not in _codes(_minus(EMS_BEFORE, code_files=1, db_sites=0)))
+check("ui_without_routes stops once a route table is read",
+      "ui_without_routes" not in _codes(_minus(EMS_BEFORE, routes=15)))
+check("and it never fires on a small application, which may answer on one URL",
+      "ui_without_routes" not in _codes(_minus(EMS_BEFORE, files_analysed=8, routes=1)))
+check("template_without_renderer stops once something renders them",
+      "template_without_renderer" not in _codes(_minus(EMS_BEFORE, entrypoint_templates=[])))
+check("blocking_hazard_ratio stops when the pattern stops over-firing",
+      "blocking_hazard_ratio" not in _codes(_minus(
+          EMS_BEFORE, blocked=EMS_BEFORE["blocked"][:2])))
+check("and a floor of two keeps it off a tiny codebase where one file is the whole ratio",
+      "blocking_hazard_ratio" not in _codes(_minus(
+          EMS_BEFORE, files_analysed=4, code_files=4,
+          blocked=EMS_BEFORE["blocked"][:1])))
+check("unresolved_own_namespace stops once resolution finds them",
+      "unresolved_own_namespace" not in _codes(_minus(EMS_BEFORE, own_unresolved=[])))
+check("and two stragglers are not a pattern",
+      "unresolved_own_namespace" not in _codes(_minus(
+          EMS_BEFORE, own_unresolved=EMS_BEFORE["own_unresolved"][:2])))
+check("config_files_without_keys stops once a key is extracted",
+      "config_files_without_keys" not in _codes(_minus(EMS_BEFORE, config_keys=4)))
+
+_ddl = _codes(_minus(EMS_BEFORE, tables=[], ddl_files=["db/schema.sql"]))
+check("ddl_without_tables fires on a CREATE TABLE that produced no table",
+      "ddl_without_tables" in _ddl, str(_ddl))
+check("and not when the tables were extracted",
+      "ddl_without_tables" not in _codes(EMS_BEFORE))
+
+_flat = _codes(_minus(EMS_BEFORE, edges=0))
+check("graph_has_no_edges fires on a codebase where nothing depends on anything",
+      "graph_has_no_edges" in _flat, str(_flat))
+check("and not on a codebase with a graph", "graph_has_no_edges" not in _codes(EMS_BEFORE))
+check("nor on a handful of genuinely independent scripts",
+      "graph_has_no_edges" not in _codes(_minus(EMS_BEFORE, edges=0, code_files=5)))
+
+_unread = _codes(_minus(EMS_BEFORE, read_by={"parser": 40, "default": 5}))
+check("files_not_understood fires when an analyzer raised",
+      "files_not_understood" in _unread, str(_unread))
+check("and a pattern fallback is not a failure — it is degraded precision that says so",
+      "files_not_understood" not in _codes(_minus(
+          EMS_BEFORE, read_by={"parser": 20, "heuristic": 25})))
+
+# ── The properties the list has to have to be worth reading ───────────────
+
+check("every code a check can emit is in the closed vocabulary",
+      set(_before) | set(_ddl) | set(_flat) | set(_unread) <= set(sanity.WARNING_CODES),
+      str((set(_before) | set(_ddl) | set(_flat) | set(_unread)) - set(sanity.WARNING_CODES)))
+check("and every code in the vocabulary is reachable — a code nothing emits is dead",
+      set(sanity.WARNING_CODES) <= set(_before) | set(_ddl) | set(_flat) | set(_unread),
+      str(set(sanity.WARNING_CODES) - (set(_before) | set(_ddl) | set(_flat) | set(_unread))))
+check("the same facts always produce the same warnings, in the same order",
+      sanity.evaluate(EMS_BEFORE, _STACK) == sanity.evaluate(EMS_BEFORE, _STACK))
+check("the guidance-withheld warning is first — it is the one that changes every prompt",
+      _before[0] == "playbook_section_omitted", str(_before[:2]))
+for _w in sanity.evaluate(EMS_BEFORE, _STACK):
+    check(f"{_w['code']} names both numbers that disagree",
+          bool(_w.get("left")) and bool(_w.get("right")) and bool(_w.get("detail")),
+          str(_w))
+# This runs on the path to the first gate of every run. A self-check that can fail a run is
+# worse than no self-check, so a check that raises is logged and skipped, never fatal.
+check("a malformed signal set produces no warnings rather than an exception",
+      sanity.evaluate({"blocked": "not a list", "tables": 7, "read_by": None}) is not None)
+check("and an empty one is quiet", sanity.evaluate({}) == [])
+check("a target stack with no playbook withholds nothing",
+      "playbook_section_omitted" not in _codes(EMS_BEFORE, "COBOL on a mainframe"))
+
+# ── Denominators: the count you can disbelieve ────────────────────────────
+#
+# "1 route" and "we could not read this codebase" were the same sentence on the gate. A count
+# with the population it came from is not.
+_counts = sanity.render_counts(_lay)
+check("the counts name how many files were read, and how well",
+      "read by a real parser" in _counts and "could not be read at all" in _counts, _counts)
+check("and they leave a slot for every absence, so zero is visible",
+      all(label.split("(s)")[0].strip() in _counts or label in _counts
+          for _key, label in sanity._COUNT_LINES), _counts)
+check("a table count renders as a number, not as the list of table names",
+      "['" not in _counts, _counts)
+check("a file that needs a human is named with how many files depend on it",
+      "depend on" in sanity.render_counts(EMS_BEFORE), sanity.render_counts(EMS_BEFORE))
+check("and its absence is stated rather than omitted",
+      "0 file(s) that need a human" in sanity.render_counts(_minus(EMS_BEFORE, blocked=[])))
+
+# ── End to end: the run stores it, logs it, and puts it on the gate ───────
+
+_san_run = store.create_run("sanity", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_san_run, [{"path": p, "content": t} for p, t in LAYERED.items()])
+_san = store.get_run(_san_run)
+_analysis = (_san.get("stats") or {}).get("analysis") or {}
+check("ingest stores the signals on the run", bool(_analysis.get("signals")),
+      str(list(_analysis)))
+check("and the contradictions beside them", "contradictions" in _analysis)
+check("the signals carry no source text — they are persisted on the row",
+      "content" not in str(_analysis.get("signals")))
+_events = [e for e in store.list_events(_san_run) if e["event"] == "analysis_checked"]
+check("the run log says the analysis was checked, even when it found nothing",
+      len(_events) == 1, str([e["event"] for e in store.list_events(_san_run)]))
+check("and says so in words, not as an empty list",
+      "contradict" in (_events[0]["detail"] or ""), str(_events[0]))
+
+runner.set_charter(_san_run, VALID_CHARTER, "smoke")
+_gate = [c for c in store.list_checkpoints(_san_run, "open")
+         if c["kind"] == "discovery_approval"][0]
+_payload = _gate["payload"] or {}
+check("the assessment gate carries the denominators", bool(_payload.get("signals")),
+      str(list(_payload)))
+check("and the contradictions, so approving is a decision and not a formality",
+      "contradictions" in _payload)
+check("the gate text states how many files a parser could read",
+      "read by a real parser" in (_gate["detail"] or ""), (_gate["detail"] or "")[:300])
+check("and no longer promises what it cannot know",
+      "URL(s) this application answers on" in (_gate["detail"] or ""))
+check("nothing has been spent when it is raised", (_san.get("spent_usd") or 0) == 0)
+
+# The charter may name a different target stack than the run was created with, and *which*
+# guidance is withheld depends on it — so the gate re-evaluates rather than reusing ingest's
+# answer. `evaluate` is pure over the stored signals, so this costs nothing.
+check("the gate's contradictions are the ones for the charter's stack, not the run's",
+      _payload.get("contradictions") ==
+      sanity.evaluate(_payload.get("signals") or {}, VALID_CHARTER["target_stack"]),
+      str(_payload.get("contradictions")))
+
+
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

@@ -185,7 +185,19 @@ def normalize_proposal(
                 problems.append(f"component '{name}' proposed an unusable output_dir "
                                 f"{raw.get('output_dir')!r}; substituted one")
             output_dir = f"{_slugify(project, 'src')}/{name}"
-        output_dir = _unique(output_dir, taken_dirs, 2)
+        # Two components claiming one directory has to be broken — artifacts are versioned by
+        # path, so the second writer's file stops being current and leaves the export with no
+        # row anywhere saying so (D-91 raises `artifact_overwritten` when that guarantee is
+        # defeated downstream). Breaking it silently was the gap: the loser was renamed to
+        # `src/Foo2` and nobody was told, so the reader of a plan could not see that the
+        # architect had put two groups of files in one place — the same class of silent
+        # correction the shared-namespace report below exists for.
+        deduped_dir = _unique(output_dir, taken_dirs, 2)
+        if deduped_dir != output_dir:
+            problems.append(f"component '{name}' claimed the directory '{output_dir}', which "
+                            f"another component already claimed; moved it to '{deduped_dir}' "
+                            f"so neither loses a file")
+        output_dir = deduped_dir
         taken_dirs.add(output_dir)
 
         namespace = _legal_namespace(_NS_OK.sub("", raw.get("namespace") or "").strip("."))

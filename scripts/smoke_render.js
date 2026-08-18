@@ -586,7 +586,39 @@ const MOD_GATE_A = {
   status: 'open', detail: '7 file(s) were ingested and analysed for free.',
   payload: { stage: 'assessment', files: 7,
              estimate: { calls: 3, expected_usd: 0.21, ceiling_usd: 0.94 },
-             evidence: { db: 1, entrypoint: 1, route: 1 } },
+             evidence: { db: 1, entrypoint: 1, route: 1 },
+             // The two halves this gate grew: the denominators every count was drawn from,
+             // and the pairs of numbers that disagree. Without the first, "1 route" and "we
+             // could not read this codebase" render identically.
+             signals: {
+               files_ingested: 9, files_skipped: 2, files_analysed: 7, code_files: 7,
+               languages: { PHP: 6, SQL: 1 }, read_by: { parser: 5, heuristic: 1, default: 1 },
+               routes: 1, tables: ['employees', 'departments'], db_sites: 0,
+               entrypoints: 4, config_keys: 0,
+               blocked: [{ path: 'lib/view.php', hazards: ['extract'], dependents: 3 }],
+             },
+             contradictions: [{
+               code: 'tables_without_queries',
+               title: 'Tables were named in SQL, but no query in the code touches one',
+               detail: 'The schema and the code disagree.',
+               left: '2 table(s) - employees, departments',
+               right: '0 data-access call site(s) across 7 code file(s)',
+             }] },
+};
+
+// A gate on a codebase nothing looks wrong about. The denominators must still render: the
+// whole point is that a clean analysis and an unread one stop looking the same.
+const MOD_GATE_A_CLEAN = {
+  id: 'cp-a2', kind: 'discovery_approval', title: 'Approve the assessment', blocking: 1,
+  status: 'open', detail: 'x',
+  payload: { stage: 'assessment', files: 7,
+             estimate: { calls: 3, expected_usd: 0.21, ceiling_usd: 0.94 },
+             evidence: { route: 5 },
+             signals: { files_ingested: 7, files_skipped: 0, files_analysed: 7, code_files: 7,
+                        languages: { PHP: 7 }, read_by: { parser: 7 }, routes: 5,
+                        tables: ['employees'], db_sites: 8, entrypoints: 1, config_keys: 3,
+                        blocked: [] },
+             contradictions: [] },
 };
 
 const MOD_RUN = {
@@ -766,6 +798,46 @@ function modPlanChecks() {
     assert(html.includes('entrypoint · 1') && html.includes('route · 1'), 'the evidence tally is missing');
     assert(html.includes('over 7 ingested file(s)'), 'the file count is missing');
     assert(html.includes('id="mod-gate-evidence"'), 'no container for the evidence itself');
+  });
+
+  check('and it shows the counts with the population they were drawn from', () => {
+    // "1 route" and "we could not read this codebase" used to be the same sentence here.
+    const html = sandbox.renderCheckpointPayload(MOD_GATE_A);
+    assert(html.includes('read by a real parser'), 'how the files were read is missing');
+    assert(html.includes('could not be read at all'), 'the unreadable count is missing');
+    assert(html.includes('6 PHP'), 'the language mix is missing');
+    assert(html.includes('1 URL(s) this application answers on'), 'the route count is missing');
+    assert(html.includes('0 setting(s) that must be supplied'), 'a zero is being hidden');
+    assert(html.includes('lib/view.php') && html.includes('3 other file(s) depend on'),
+           'the file that needs a human is not named with its dependents');
+  });
+
+  check('the contradictions are on the gate, above the evidence, naming both numbers', () => {
+    const html = sandbox.renderCheckpointPayload(MOD_GATE_A);
+    assert(html.includes('contradict something else in it'), 'the warning block is missing');
+    assert(html.includes('no query in the code touches one'), 'the title is missing');
+    assert(html.includes('2 table(s) - employees'), 'the left-hand number is missing');
+    assert(html.includes('0 data-access call site(s)'), 'the right-hand number is missing');
+    assert(html.indexOf('contradict something else') < html.indexOf('What was read'),
+           'the contradictions must come before the counts they cast doubt on');
+    assert(html.includes('do not block the run'), 'a non-blocking warning must say so');
+  });
+
+  check('a clean analysis still shows its denominators, and claims no contradiction', () => {
+    const html = sandbox.renderCheckpointPayload(MOD_GATE_A_CLEAN);
+    assert(html.includes('What was read, and how well'), 'the counts vanished');
+    assert(html.includes('5 URL(s) this application answers on'), 'the route count is missing');
+    assert(!html.includes('contradict something else in it'),
+           'an empty contradiction list must render nothing at all');
+  });
+
+  check('a gate from a run predating the signals renders without them', () => {
+    // Old checkpoint rows carry no `signals`/`contradictions`, and the gate still has to draw.
+    const html = sandbox.renderCheckpointPayload({
+      kind: 'discovery_approval',
+      payload: { stage: 'assessment', files: 7, estimate: { calls: 1, ceiling_usd: 0.1 } } });
+    assert(html.includes('1 model call(s)'), 'the quote is missing');
+    assert(!html.includes('What was read'), 'it invented a denominator block from nothing');
   });
 
   check('the plan is offered from the run row, because GET /plan answers 404', () => {

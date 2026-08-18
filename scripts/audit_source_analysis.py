@@ -19,9 +19,11 @@ third-party dependencies that do not exist — and the run said nothing was wron
 **nothing compared any of these numbers against anything else.**
 
 So run this against a new codebase *before* running a conversion on it. It takes a second and
-it costs nothing. The `SUSPICIOUS` lines at the end are the cheap version of the cross-signal
-checks that belong inside the product (see `NEXT-SESSION.md`); until those exist, this script
-is where you find out that the pipeline has misread a repository.
+it costs nothing. The `SUSPICIOUS` lines at the end are not this script's own opinion any more:
+they come from `backend/services/modernization/sanity.py`, which runs inside the product on the
+path to the discovery gate of every run. What prints here is what the gate will say. This
+script's remaining value is that it says it *before* a run exists, and shows the working —
+which playbook sections get sent, which files will refuse to convert — that the gate summarises.
 """
 import argparse
 import os
@@ -31,7 +33,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.services.modernization import (  # noqa: E402
-    analyzers, evidence, graph, playbooks, repo_ingest, validation,
+    analyzers, evidence, graph, playbooks, repo_ingest, sanity, validation,
 )
 from backend.services.modernization import advice  # noqa: E402
 
@@ -157,44 +159,30 @@ def main():
             print(f"    {field['options'][0]['value'][:200]}")
 
     # ── Cross-signal checks ───────────────────────────────────────────────
-    # Each of these is a pair of numbers the pipeline already holds and does not compare.
-    # They are stated as suspicions, not errors: a small library really may have no routes.
+    # These used to be a prototype block written here, in this script. They now live in
+    # `backend/services/modernization/sanity.py` and run inside the product, on the path to
+    # the discovery gate of every run — so this script *calls* them rather than keeping a
+    # second copy. Two implementations of "what looks wrong about this analysis" that were
+    # meant to agree and drifted would be a contradiction of exactly the kind they exist to
+    # find. What is printed here is byte-for-byte what a run will show.
+    signals = sanity.collect(
+        [{"path": p, "content": t} for p, t in sorted(files.items())],
+        built["units"], rows, stats, skipped=skipped)
+
+    print("\n  -- what was read, and how well -----------------------------------")
+    for line in sanity.render_counts(signals).splitlines():
+        print(f"  {line}")
+
     print("\n  -- cross-signal checks ------------------------------------------")
-    suspicious = []
-    total = max(len(facts), 1)
-    db_sites = sum(len(((f.meta or {}).get("php") or {}).get("db_sites") or [])
-                   for f in facts.values())
-    if values("table") and not db_sites:
-        suspicious.append(f"{len(values('table'))} table(s) named in SQL but 0 data-access "
-                          f"call site(s) found — the data layer is probably unrecognised")
-    if values("datastore") and not aggregate.get("db_apis"):
-        suspicious.append("a datastore was observed but `db_apis` is empty — the evidence "
-                          "layer and the analyzer disagree about the same codebase")
-    if observed.get("has_ui") and len(values("route")) <= 1 and len(facts) > 10:
-        suspicious.append(f"{len(facts)} files that render UI and {len(values('route'))} "
-                          f"route(s) — a route table is probably being missed")
-    entrypoints = values("entrypoint")
-    if len(entrypoints) > max(3, 0.2 * total):
-        suspicious.append(f"{len(entrypoints)} entry point(s) over {total} analysed file(s) — "
-                          f"files nothing depends on are being counted as reachable")
-    if len(blocked) > max(2, 0.15 * total):
-        suspicious.append(f"{len(blocked)} of {total} file(s) refuse to convert — a hazard "
-                          f"pattern is probably over-firing")
-    if omitted:
-        suspicious.append(f"playbook section(s) {omitted} will not be sent — confirm the "
-                          f"codebase really does not use them")
-    external = stats.get("external_dependencies") or []
-    if len(external) > total:
-        suspicious.append(f"{len(external)} external dependencies over {total} file(s) — "
-                          f"name resolution is probably inventing them")
-    if not values("config_key") and any(
-            "config" in p.lower() or p.lower().endswith(".env") for p in files):
-        suspicious.append("configuration files are present but no config key was extracted")
-    if suspicious:
-        for line in suspicious:
-            print(f"    SUSPICIOUS  {line}")
-    else:
+    contradictions = sanity.evaluate(signals, args.stack)
+    if not contradictions:
         print("    nothing contradicts anything else")
+    for warning in contradictions:
+        print(f"    SUSPICIOUS  {warning['title']}")
+        print(f"                {warning['left']}")
+        print(f"                vs {warning['right']}")
+        if not args.quiet:
+            print(f"                {warning['detail']}")
     print()
     return 0
 

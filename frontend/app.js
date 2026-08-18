@@ -5978,6 +5978,8 @@ function renderCheckpointPayload(c) {
       ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}${e.price_is_estimated ? ' (indicative rates)' : ''}
       ${p.files ? ` · over ${p.files} ingested file(s)` : ''}
     </div>
+    ${renderAnalysisContradictions(p.contradictions)}
+    ${renderAnalysisDenominators(p.signals)}
     ${kinds.length ? `<div class="chip-row">${kinds.map(k =>
       `<span class="compliance-chip">${esc(k.replace(/_/g, ' '))} · ${found[k]}</span>`).join('')}</div>` : ''}
     <div class="mod-meta">Everything below was read out of your source by a parser, not proposed
@@ -5986,6 +5988,66 @@ function renderCheckpointPayload(c) {
   }
   if (!p.components || !p.components.length) return '';
   return `<div style="margin-top:10px">${renderModernizationPlanBody(p)}</div>`;
+}
+
+// Where the analysis disagrees with itself. Above the evidence table on purpose: the evidence
+// panel answers "what did we find", and this answers the question that has to be asked first —
+// "is what we found the whole story". Every row names the two numbers that disagree, because a
+// warning a reader cannot check against their own source in a minute is a warning they learn to
+// scroll past. Non-blocking by design; the gate is still approvable with these standing.
+function renderAnalysisContradictions(rows) {
+  if (!rows || !rows.length) return '';
+  return `<div class="mod-alert" style="margin-top:10px">
+    <strong>${rows.length} thing(s) in this analysis contradict something else in it</strong>
+    <div class="mod-meta" style="margin-top:4px">These do not block the run. They are pairs of
+      numbers this pipeline computed from your source by two different routes, which should
+      agree and do not — so at least one of them is wrong, and a number that is wrong here is
+      wrong in every prompt after it.</div>
+    <div class="mod-scroll" style="margin-top:8px">
+      <table class="mod-unit-table">
+        <thead><tr><th>What looks wrong</th><th>One signal says</th><th>The other says</th></tr></thead>
+        <tbody>${rows.map(r => `<tr>
+          <td><strong>${esc(r.title || r.code || '')}</strong>
+            <div class="mod-meta" style="white-space:normal">${esc(r.detail || '')}</div></td>
+          <td class="mod-unit-path">${esc(r.left || '')}</td>
+          <td class="mod-unit-path">${esc(r.right || '')}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// The denominators. "1 route" and "we could not read this codebase" are the same sentence
+// without the population the count was drawn from; with it, the reader can disbelieve a number.
+function renderAnalysisDenominators(s) {
+  if (!s || !s.files_analysed) return '';
+  const read = s.read_by || {};
+  const langs = Object.keys(s.languages || {}).sort((a, b) => s.languages[b] - s.languages[a]);
+  const n = v => (Array.isArray(v) ? v.length : (v || 0));
+  const rows = [
+    ['URL(s) this application answers on', n(s.routes)],
+    ['table(s) named in its SQL', n(s.tables)],
+    ['place(s) in the code that reach the database', n(s.db_sites)],
+    ['file(s) nothing else in the codebase depends on', n(s.entrypoints)],
+    ['setting(s) that must be supplied to run it', n(s.config_keys)],
+  ];
+  const blocked = s.blocked || [];
+  return `<div class="mod-panel" style="margin-top:10px">
+    <div class="section-title" style="margin-top:0">What was read, and how well</div>
+    <div class="mod-meta">${s.files_ingested || 0} file(s) ingested${s.files_skipped
+      ? `, ${s.files_skipped} skipped by extension` : ''}${langs.length
+      ? ' — ' + langs.map(l => `${s.languages[l]} ${esc(l)}`).join(', ') : ''}.
+      Of those, <strong>${read.parser || 0}</strong> were read by a real parser,
+      <strong>${read.heuristic || 0}</strong> by a pattern fallback, and
+      <strong>${read.default || 0}</strong> could not be read at all.</div>
+    <div class="chip-row" style="margin-top:8px">${rows.map(([label, count]) =>
+      `<span class="compliance-chip">${count} ${esc(label)}</span>`).join('')}</div>
+    ${blocked.length ? `<div class="mod-meta" style="margin-top:8px">
+      ${blocked.length} file(s) carry something that must be flagged for a human rather than
+      translated — ${esc(blocked[0].path || '')}${blocked[0].dependents
+        ? `, which ${blocked[0].dependents} other file(s) depend on` : ''}${blocked.length > 1
+        ? ` (and ${blocked.length - 1} more)` : ''}.</div>` : ''}
+  </div>`;
 }
 
 function renderModernizationComponents(components) {

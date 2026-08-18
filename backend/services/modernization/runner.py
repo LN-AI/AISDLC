@@ -37,8 +37,8 @@ from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence, graph,
-    parity, playbooks, reconcile, repo_ingest, rules, scaffold, semantics, stages, store,
-    usings, validation, wireup,
+    parity, playbooks, reconcile, repo_ingest, rules, sanity, scaffold, semantics, stages,
+    store, usings, validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -123,12 +123,26 @@ def ingest_and_analyze(run_id: str, files: List[Dict[str, str]],
     observed = evidence.collect(ingested["files"], units)
     store.insert_evidence(run_id, observed)
 
+    # Does the analysis contradict itself? Every check is a pair of numbers already computed
+    # above, from two independent extractors, that should agree — and until this existed
+    # nothing compared any pair of them, so "no database access found" was stored with exactly
+    # the confidence a correct finding would have been. Free, deterministic, non-blocking, and
+    # read at the discovery gate before any money is approved (see sanity.py).
+    #
+    # `signals` is persisted alongside the warnings because it is also the denominator set the
+    # gate is rendered from: a count without its population cannot be disbelieved.
+    signals = sanity.collect(ingested["files"], units, observed, built["stats"],
+                             ingested["redactions"], ingested["skipped"])
+    target_stack = (store.get_run(run_id) or {}).get("target_stack") or ""
+    contradictions = sanity.evaluate(signals, target_stack)
+
     stats = {
         **ingested["stats"], **built["stats"],
         "languages": analyzers.languages_seen(facts),
         "skipped": ingested["skipped"][:200],
         "cycles": built["cycles"][:50],
         "evidence": store.evidence_counts(run_id),
+        "analysis": {"signals": signals, "contradictions": contradictions},
     }
     store.update_run(
         run_id, status="awaiting_charter", phase="charter_required", stats=stats,
@@ -143,6 +157,12 @@ def ingest_and_analyze(run_id: str, files: List[Dict[str, str]],
         f"{stats['units']} unit(s), {stats['edges']} edge(s), {stats['levels']} level(s), "
         f"{stats['cycles'] and len(built['cycles'])} cycle(s), "
         f"{stats['secrets_redacted']} secret(s) redacted",
+    )
+    # Logged either way. "Nothing contradicts anything else" is a result, and a run log that
+    # only speaks up on failure cannot be read as having checked.
+    store.append_event(
+        run_id, "analysis_checked", sanity.describe(contradictions),
+        level="warning" if contradictions else "info",
     )
 
     # A cycle is broken deterministically so the run can proceed (graph.build removes the
@@ -287,25 +307,59 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
     stats = run.get("stats") or {}
     numbers = _discovery_estimate(run_id)
     found = stats.get("evidence") or {}
-    observed = ", ".join(f"{n} {k}" for k, n in sorted(found.items()) if n) or "nothing yet"
+
+    # The charter may have named a different target stack than the run was created with, and
+    # which conversion guidance is withheld depends on it — so the contradictions are
+    # re-evaluated here rather than reused from ingest. `evaluate` is pure over the persisted
+    # signals, so this costs nothing and needs no source text.
+    analysis = stats.get("analysis") or {}
+    signals = analysis.get("signals") or {}
+    contradictions = (sanity.evaluate(signals, charter["target_stack"]) if signals
+                      else analysis.get("contradictions") or [])
+    if signals and contradictions != (analysis.get("contradictions") or []):
+        store.update_run(run_id, stats={**stats, "analysis": {
+            "signals": signals, "contradictions": contradictions}})
+
+    # The counts carry their denominators (`sanity.render_counts`) rather than a bare list of
+    # what was observed. "1 route" and "we could not read this codebase" used to be the same
+    # sentence on this screen, and this is the gate where that mattered most: it is the first
+    # place money is approved, on the strength of these numbers.
+    detail = [
+        f"{counts['total']} file(s) were ingested and analysed for free — no model was called "
+        f"and nothing has been spent.",
+        "",
+        sanity.render_counts(signals) if signals else
+        (", ".join(f"{n} {k}" for k, n in sorted(found.items()) if n) or "nothing observed"),
+        "",
+        f"Structure: {stats.get('edges', 0)} dependency edge(s) over "
+        f"{stats.get('levels', 0)} level(s), {len(stats.get('cycles') or [])} circular "
+        f"group(s), {stats.get('secrets_redacted', 0)} secret(s) masked before any model saw "
+        f"the source.",
+    ]
+    if contradictions:
+        detail += [
+            "",
+            f"{len(contradictions)} thing(s) in this analysis contradict something else in it. "
+            f"None of them blocks the run, and each names the two numbers that disagree — read "
+            f"them before approving, because a number that is wrong here is wrong in every "
+            f"prompt after it:",
+        ] + [f"  · {c['title']} ({c['left']} vs {c['right']})" for c in contradictions]
+    detail += [
+        "",
+        f"The next step reads the source for what the application *does* "
+        f"({numbers.get('comprehension_calls', 0)} pass(es) over the code, each business rule "
+        f"checked against the file it cites), designs the target architecture for "
+        f"{charter['target_stack']}, and produces a costed, per-component conversion plan. "
+        f"{estimate.describe(numbers, run.get('budget_cap_usd'))}",
+        "",
+        "You will be asked again, with a real number, before any file is converted.",
+    ]
     store.create_checkpoint(
         run_id, "discovery_approval", "Approve the assessment",
-        detail=(
-            f"{counts['total']} file(s) were ingested and analysed for free: "
-            f"{stats.get('edges', 0)} dependency edge(s), {len(stats.get('cycles') or [])} "
-            f"circular group(s), {stats.get('secrets_redacted', 0)} secret(s) redacted, and "
-            f"observed {observed}.\n\n"
-            f"The next step reads the source for what the application *does* "
-            f"({numbers.get('comprehension_calls', 0)} pass(es) over the code, each business "
-            f"rule checked against the file it cites), designs the target architecture for "
-            f"{charter['target_stack']}, and produces a costed, per-component conversion "
-            f"plan. {estimate.describe(numbers, run.get('budget_cap_usd'))}\n\n"
-            f"Nothing has been spent yet. You will be asked again, with a real number, before "
-            f"any file is converted."
-        ),
+        detail="\n".join(detail),
         blocking=True,
         payload={"stage": "assessment", "files": counts["total"], "estimate": numbers,
-                 "evidence": found},
+                 "evidence": found, "signals": signals, "contradictions": contradictions},
     )
 
 
