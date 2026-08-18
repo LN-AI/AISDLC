@@ -310,6 +310,15 @@ def materialize(run_id: str, proposal: Dict[str, Any],
     components, split_notes = _split_oversized(components, by_path)
     problems.extend(split_notes)
 
+    # Projects are normalized here rather than in the scaffold, because the scaffold is the
+    # thing that has to trust them: it writes `depends_on` straight into a `.csproj` and takes
+    # the first project as the host. Both were the architect's word until now.
+    project_list, project_notes = normalize_projects(
+        proposal.get("projects") or [],
+        sorted({c["project"] for c in components if c.get("project")}),
+    )
+    problems.extend(project_notes)
+
     comp_of: Dict[str, int] = {}
     for i, component in enumerate(components):
         for member in component["members"]:
@@ -410,9 +419,122 @@ def materialize(run_id: str, proposal: Dict[str, Any],
         "files": len(units),
         "rolled_up": rolled,
         "projects": sorted({c["project"] for c in components}),
+        # The full normalized list — names, purposes and an acyclic `depends_on`, entry first.
+        # `projects` above stays a list of names because the plan view and the event line both
+        # count them; the scaffold needs the objects.
+        "project_list": project_list,
         "problems": problems,
         "estimate": totals,
     }
+
+
+# Names that mean "this project is the process that starts". Checked against the last
+# dot-segment, because a layered layout names projects `Acme.Ems.Web`, `Acme.Ems.Domain`.
+_HOST_SEGMENTS = ("web", "api", "host", "server", "site", "ui", "presentation", "app",
+                  "www", "frontend", "mvc", "razor", "blazor", "endpoints")
+
+
+def normalize_projects(raw_projects: List[Dict[str, Any]],
+                       known: List[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The project list, with an entry project first and a reference graph that can build.
+
+    Two things were taken from the architect on trust and neither survives contact with a real
+    proposal.
+
+    **References.** `_csproj` writes `depends_on` verbatim, and a project reference cycle is not
+    a matter of taste — MSBuild refuses to build it at all. On a four-project layered proposal
+    the architect emitted `Application -> Domain -> Web -> Application`, so the export could
+    not compile, and nothing anywhere said so: `normalize_proposal` condenses the *component*
+    graph with Tarjan and never looked at the project graph, `wireup` only adds references it
+    can prove are needed, and reconciliation lints text. The cycle is broken here, on the edge
+    that points *away* from the entry project, because the layered rule every one of these
+    charters states is that references run inward — so an edge from a lower layer out to the
+    host is the wrong one by construction.
+
+    **Which project is the entry.** `build_dotnet` took `projects[0]`, whatever order the model
+    happened to emit. On that same run it picked `Acme.Ems.Domain`: the Domain layer got
+    `Sdk="Microsoft.NET.Sdk.Web"`, a `Program.cs`, an `appsettings.json`, and the solution was
+    named after it. Ordering the entry first is all the scaffold needs, since that is the
+    element it reads.
+    """
+    problems: List[str] = []
+    names = [n for n in known if n]
+    projects: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for raw in raw_projects or []:
+        name = (raw.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        projects.append(dict(raw, name=name))
+    for name in names:                        # a project only the components claim
+        if name not in seen:
+            seen.add(name)
+            projects.append({"name": name, "purpose": "converted code"})
+    if not projects:
+        return [], problems
+
+    # The entry project: a host-sounding name if there is one, else the first as before.
+    # Positions are captured up front — `list.index` compares dicts by value and would be
+    # wrong the moment the list is reordered, quite apart from being O(n) per comparison.
+    order = {p["name"]: i for i, p in enumerate(projects)}
+
+    def host_rank(project: Dict[str, Any]) -> int:
+        segment = project["name"].rsplit(".", 1)[-1].lower()
+        return _HOST_SEGMENTS.index(segment) if segment in _HOST_SEGMENTS else len(_HOST_SEGMENTS)
+
+    first = projects[0]["name"]
+    entry = min(projects, key=lambda p: (host_rank(p), order[p["name"]]))
+    if entry["name"] != first:
+        problems.append(f"'{entry['name']}' is the entry project, not '{first}' — the first "
+                        f"project listed only hosts the application if it is the one that "
+                        f"starts it")
+    projects.sort(key=lambda p: (p["name"] != entry["name"], order[p["name"]]))
+
+    # References: keep only real projects, drop self-edges, then break any cycle.
+    by_name = {p["name"]: p for p in projects}
+    for project in projects:
+        refs, dropped = [], []
+        for ref in (project.get("depends_on") or []):
+            ref = (ref or "").strip()
+            if not ref or ref == project["name"] or ref not in by_name:
+                if ref:
+                    dropped.append(ref)
+                continue
+            if ref not in refs:
+                refs.append(ref)
+        project["depends_on"] = refs
+        for ref in dropped:
+            problems.append(f"project '{project['name']}' referenced '{ref}', which is not a "
+                            f"project in this run; dropped")
+
+    # One edge per pass, re-condensing after each: cutting greedily inside a group removes
+    # more than the cycle needs. On the four-project layered proposal that cost
+    # `Web -> Application`, which is a reference the host genuinely has, and every Application
+    # type used in a controller would then have been CS0246 — a worse failure than the one
+    # being fixed, and further from its cause.
+    deps = {p["name"]: set(p["depends_on"]) for p in projects}
+    while True:
+        group = next((g for g in graph.strongly_connected(deps) if len(g) > 1), None)
+        if group is None:
+            break
+        members = set(group)
+        # Prefer the edge pointing *at* the entry project: these layouts reference inward, so
+        # an edge from a lower layer out to the host is the wrong one by construction. Failing
+        # that, cut deterministically by name so the same proposal always resolves the same way.
+        candidates = sorted((source, target)
+                            for source in group
+                            for target in sorted(deps[source] & members))
+        source, target = next(((s, t) for s, t in candidates if t == entry["name"]),
+                             candidates[0])
+        deps[source].discard(target)
+        by_name[source]["depends_on"] = [r for r in by_name[source]["depends_on"]
+                                         if r != target]
+        problems.append(
+            f"project '{source}' referenced '{target}' and '{target}' reaches '{source}' "
+            f"again — a project reference cycle cannot be built at all, so that reference "
+            f"was removed")
+    return projects, problems
 
 
 def _risk_for(component: Dict[str, Any], members: List[str],

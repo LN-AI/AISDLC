@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Set
 
-from backend.services.modernization import store
+from backend.services.modernization import graph, store
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,54 @@ def _double_encoded_views(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any
                 f"HTML-encodes, so the value is encoded twice and renders as `&amp;lt;` "
                 f"where the source rendered `&lt;`. Use `@value` instead — it is just as "
                 f"safe as the source's `htmlspecialchars`."))
+    return issues
+
+
+_PROJECT_REF = re.compile(r"""ProjectReference\s+Include\s*=\s*["']([^"']+)["']""", re.I)
+
+
+def _project_reference_cycles(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A cycle between `.csproj` files, which MSBuild refuses to build at all.
+
+    The most fatal inconsistency this stage can find, and it was the one it did not look for.
+    A real four-project run shipped `Application -> Domain -> Web -> Application` and
+    reconciliation reported two failures, neither of them this: the architect proposed the
+    cycle, the scaffold wrote `depends_on` verbatim, and every check here reads C# text rather
+    than the build graph. `architecture.normalize_projects` now breaks cycles before the
+    scaffold sees them — this is the net under `wireup`, which rewrites the same references
+    after conversion from what the code turned out to need.
+
+    Read from the artifacts rather than from the component rows, for the same reason the view
+    checks are: this is about what the export contains.
+    """
+    graph_edges: Dict[str, Set[str]] = {}
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        if not path.lower().endswith(".csproj"):
+            continue
+        name = path.rsplit("/", 1)[-1][: -len(".csproj")]
+        targets = set()
+        for raw in _PROJECT_REF.findall(artifact.get("content") or ""):
+            target = raw.replace("\\", "/").rsplit("/", 1)[-1]
+            if target.lower().endswith(".csproj"):
+                target = target[: -len(".csproj")]
+            if target and target != name:
+                targets.add(target)
+        graph_edges[name] = targets
+    if not graph_edges:
+        return []
+
+    issues: List[Dict[str, Any]] = []
+    for group in graph.strongly_connected({k: v & set(graph_edges) for k, v in graph_edges.items()}):
+        if len(group) < 2:
+            continue
+        issues.append(_issue(
+            "project_reference_cycle", "fail",
+            "These projects reference each other in a cycle: "
+            + " -> ".join(sorted(group)) + f" -> {sorted(group)[0]}. MSBuild refuses to build "
+            "a project reference cycle, so `dotnet build` fails before compiling any code. "
+            "One of these references has to go — in a layered layout it is the one pointing "
+            "outward, from a lower layer to the host."))
     return issues
 
 
@@ -275,6 +323,8 @@ def run(run_id: str) -> Dict[str, Any]:
     for issue in _unresolved_views(artifacts):
         issues.append(issue)
     for issue in _double_encoded_views(artifacts):
+        issues.append(issue)
+    for issue in _project_reference_cycles(artifacts):
         issues.append(issue)
 
     counts = store.unit_status_counts(run_id)

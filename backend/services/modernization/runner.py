@@ -825,7 +825,9 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         "summary": proposal.get("summary") or "",
         "shared_conventions": proposal.get("shared_conventions") or "",
         "risks": [r for r in (proposal.get("risks") or []) if isinstance(r, str)][:20],
-        "projects": proposal.get("projects") or [],
+        # The normalized list, not the proposal's: this is what `_scaffold_one` reads, and it
+        # is the version with an entry project first and a reference graph that can build.
+        "projects": outcome.get("project_list") or proposal.get("projects") or [],
         "problems": outcome["problems"],
         "estimate": outcome["estimate"],
     })

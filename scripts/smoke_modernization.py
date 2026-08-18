@@ -3798,6 +3798,82 @@ check("and only one version of the path is current",
            if a["path"] == "Domain/Entities/Employee.cs"]) == 1)
 
 
+
+# ── 30. The project graph ──────────────────────────────────────────────────
+section("30. The project graph — the one inconsistency that stops the build outright")
+# `_csproj` writes `depends_on` verbatim and `build_dotnet` took `projects[0]` as the host.
+# Both were the architect's word. On a four-project layered run the model emitted
+# `Application -> Domain -> Web -> Application` and named Domain first, so the Domain layer
+# got Sdk="Microsoft.NET.Sdk.Web", a Program.cs, an appsettings.json, the solution was named
+# after it — and `dotnet build` refused the whole thing before compiling a line. Reconciliation
+# reported two failures, neither of them that: every check there reads C# text, not the build
+# graph.
+_proj_raw = [
+    {"name": "Acme.Domain", "depends_on": ["Acme.Web"]},
+    {"name": "Acme.Application", "depends_on": ["Acme.Domain", "Acme.Infrastructure"]},
+    {"name": "Acme.Infrastructure", "depends_on": ["Acme.Application", "Acme.Domain"]},
+    {"name": "Acme.Web", "depends_on": ["Acme.Application", "Acme.Domain",
+                                        "Acme.Infrastructure", "NotAProject"]},
+]
+_proj_names = [p["name"] for p in _proj_raw]
+_projects, _proj_problems = _architecture.normalize_projects(_proj_raw, _proj_names)
+_by_project = {p["name"]: p["depends_on"] for p in _projects}
+
+check("the host is the entry project, not whichever was listed first",
+      _projects[0]["name"] == "Acme.Web", _projects[0]["name"])
+check("and that correction is reported",
+      any("entry project" in p for p in _proj_problems), str(_proj_problems))
+_proj_deps = {p["name"]: set(p["depends_on"]) for p in _projects}
+check("no cycle survives",
+      not [g for g in graph.strongly_connected(_proj_deps) if len(g) > 1],
+      str([g for g in graph.strongly_connected(_proj_deps) if len(g) > 1]))
+# Cutting greedily inside a cycle removes more than the cycle needs. Losing this edge would
+# make every Application type used in a controller a CS0246 — a worse failure, further from
+# its cause, than the one being fixed.
+check("the host keeps the references it genuinely has",
+      set(_by_project["Acme.Web"]) == {"Acme.Application", "Acme.Domain", "Acme.Infrastructure"},
+      str(_by_project["Acme.Web"]))
+check("the outward edge is the one removed",
+      _by_project["Acme.Domain"] == [], str(_by_project["Acme.Domain"]))
+check("a reference to a project that does not exist is dropped",
+      "NotAProject" not in _by_project["Acme.Web"]
+      and any("NotAProject" in p for p in _proj_problems), str(_proj_problems))
+check("the same proposal always resolves the same way",
+      _architecture.normalize_projects(_proj_raw, _proj_names)[0] == _projects)
+_good_projects, _good_problems = _architecture.normalize_projects(
+    [{"name": "Shop.Web", "depends_on": ["Shop.Core"]}, {"name": "Shop.Core", "depends_on": []}],
+    ["Shop.Web", "Shop.Core"])
+check("a layout that was already correct is left alone",
+      [p["name"] for p in _good_projects] == ["Shop.Web", "Shop.Core"] and not _good_problems,
+      str(_good_problems))
+check("a project only the components claim still gets into the list",
+      "Acme.Extra" in [p["name"] for p in _architecture.normalize_projects(
+          [{"name": "Acme.Web"}], ["Acme.Web", "Acme.Extra"])[0]])
+
+# The net under `wireup`, which rewrites the same references after conversion.
+_cyc_arts = [
+    {"path": "A.Web/A.Web.csproj",
+     "content": '<ProjectReference Include="..\\A.Core\\A.Core.csproj" />'},
+    {"path": "A.Core/A.Core.csproj",
+     "content": '<ProjectReference Include="..\\A.Web\\A.Web.csproj" />'},
+]
+_cyc = reconcile._project_reference_cycles(_cyc_arts)
+check("reconciliation reports a cycle in the shipped .csproj files", len(_cyc) == 1,
+      str(_cyc))
+check("as a failure, not a warning", bool(_cyc) and _cyc[0]["severity"] == "fail")
+check("and names both projects",
+      bool(_cyc) and "A.Web" in _cyc[0]["detail"] and "A.Core" in _cyc[0]["detail"])
+check("an acyclic solution reports nothing",
+      not reconcile._project_reference_cycles([
+          {"path": "A.Web/A.Web.csproj",
+           "content": '<ProjectReference Include="..\\A.Core\\A.Core.csproj" />'},
+          {"path": "A.Core/A.Core.csproj", "content": "<Project />"}]))
+check("a reference to a project outside the export is not a cycle",
+      not reconcile._project_reference_cycles([
+          {"path": "A.Web/A.Web.csproj",
+           "content": '<ProjectReference Include="..\\..\\Vendor\\Vendor.csproj" />'}]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
