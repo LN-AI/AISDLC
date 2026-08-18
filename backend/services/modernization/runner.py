@@ -184,8 +184,14 @@ def set_charter(run_id: str, charter: Dict[str, Any], actor: str = "system") -> 
         )
     cleaned = charter_module.validate(charter)
     previous = run.get("charter") or {}
+    # `discovery_approval`, not `plan_approval`: this function raises the *discovery* gate
+    # (below), and naming the other one meant the manifest told the screen the run was waiting
+    # at Gate B while Gate A was the thing actually open. `plan_approval` is also not a stage
+    # id — it is the `gate` on the `taskplan` stage — so `_run_view`'s `stages.get(phase)`
+    # returned None and the stage strip rendered blank at the first gate of every run, which
+    # is the one moment the operator most needs to know where they are.
     store.update_run(run_id, charter=cleaned, target_stack=cleaned["target_stack"],
-                     status="awaiting_approval", phase="plan_approval")
+                     status="awaiting_approval", phase="discovery_approval")
     store.append_event(run_id, "charter_set", f"target={cleaned['target_stack']} by {actor}")
 
     # The charter's own docstring promises this and nothing implemented it: a file converted
@@ -522,7 +528,19 @@ def _drain(run_id: str, stage, run: Dict[str, Any], caller: dict,
         if unit is None:
             return {"converted": converted, "failed": failed, "stopped": False}
 
-        progress.tick(f"{stage.label}: {unit.get('component_name') or unit['path']}")
+        label = unit.get("component_name") or unit["path"]
+        progress.tick(f"{stage.label}: {label}")
+        # Emitted *before* the work, which is the whole point. Every other event in a run is
+        # written after the fact, so an LLM stage produces no event at all while it is running:
+        # a 45-file codebase sat at `comprehending`, 0%, $0.00, with the last event being
+        # `run_started`, for the entire length of a stage. That is indistinguishable from a
+        # wedged provider — and with `LLM_TIMEOUT_SECONDS` at 900 and two retries, the
+        # indistinguishable period is up to 45 minutes per call. `progress_pct` is measured
+        # over source *files*, so it cannot move during comprehension or design either; this
+        # line is the only thing that can tell an operator the run is alive.
+        if stage.llm:
+            store.append_event(run_id, "unit_started", f"{stage.label}: {label}",
+                               unit_id=unit["id"])
         outcome = _produce(run_id, stage, unit, charter, caller, llm_override, project_name)
         if outcome == "converted":
             converted += 1
@@ -1260,7 +1278,10 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     # unit failed inline sends a byte-identical prompt, produces byte-identical output and
     # burns all three attempts arguing with itself. Stored on the unit rather than
     # recomputed because a failed attempt writes no artifacts to re-examine.
-    prior_findings = semantics.summarize_for_prompt(meta.get("semantic_issues") or [])
+    prior_findings = "\n\n".join(block for block in (
+        semantics.summarize_for_prompt(meta.get("semantic_issues") or []),
+        validation.summarize_for_prompt(meta.get("validation_issues") or []),
+    ) if block)
 
     try:
         result = agent_guard.guarded_call(
@@ -1380,6 +1401,15 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
 
     if report["status"] == "fail":
         detail = "; ".join(i["detail"] for i in report["issues"] if i["severity"] == "fail")[:400]
+        # Persisted before the unit is failed, for the same reason `semantic_issues` is: the
+        # retry prompt is built from this, and a crash between the two would send the prompt
+        # that produced the rejected output. Without it a Tier-0 failure retried byte-identical
+        # — the trap the rework loop and `semantics` each document, in the one place that still
+        # had it — so all three attempts argued with the same output and the reason a human
+        # eventually read ("no MIGRATION-BLOCKED marker") described the third identical attempt.
+        store.set_unit_meta(unit["id"], {
+            "validation_issues": [i for i in report["issues"] if i["severity"] == "fail"],
+        })
         # A structurally broken file is worth one more attempt — a truncated generation
         # often succeeds second time. A reintroduced secret is not: it is a behaviour, not
         # a transient, and committing it anywhere is the failure `autofix_pr` refuses too.
@@ -1437,8 +1467,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                            unit_id=unit["id"], level="warning")
     # Cleared on the way through, so a unit that failed twice and then succeeded does not
     # carry last time's findings into a later rework prompt as if they were still true.
-    if meta.get("semantic_issues"):
-        store.set_unit_meta(unit["id"], {"semantic_issues": []})
+    if meta.get("semantic_issues") or meta.get("validation_issues"):
+        store.set_unit_meta(unit["id"], {"semantic_issues": [], "validation_issues": []})
 
     # What the plan promised, against what arrived. The architect wrote `expected_files` for
     # this component and it is already rendered into the prompt — but nothing compared the

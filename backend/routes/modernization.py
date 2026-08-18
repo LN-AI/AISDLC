@@ -170,7 +170,15 @@ def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
     checkpoints = store.list_checkpoints(run["id"], "open")
     total = counts["total"] or 1
     settled = counts["converted"] + counts["failed"] + counts["skipped"]
+    # `stages.get` is exact and returns None for the phases that are not stages —
+    # `charter_required`, `discovery_approval`, and anything written by an older build. Those
+    # are all "the run has not reached stage one yet", which is what the strip should say; it
+    # used to say nothing at all. A finished or abandoned run keeps `None`, because there is no
+    # stage in progress and highlighting one would claim there is. This is the same fallback
+    # `stages.current()` documents, restricted to runs that can still move.
     stage = stages.get(run.get("phase") or "")
+    if stage is None and run.get("status") not in store.TERMINAL_RUN_STATES:
+        stage = stages.get(stages.FIRST)
     # Both are one small query and both change what the screen offers, so they ride on the
     # poll rather than costing a second round trip: a run that has compiled is in a different
     # conversation with its operator than one that never has.

@@ -37,7 +37,7 @@ import logging
 import os
 import posixpath
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from backend.services.modernization.analyzers import Symbol, UnitFacts, generic, register
 
@@ -64,6 +64,72 @@ _DB_FUNCTIONS = {
     "oci_parse": "oracle", "oci_connect": "oracle",
     "sqlsrv_query": "sqlsrv",
 }
+
+# PDO, which the procedural table above cannot express: every one of these is a *method* on a
+# connection or statement object, so `\bname\s*\(` would match a same-named function anywhere.
+# Leaving them out meant a codebase that reaches its database exclusively through PDO — the
+# form PHP's own documentation has recommended since 5.1, and the majority of anything written
+# this decade — reported `db_apis: []`. The consequences were not subtle: `playbooks.select`
+# omits the data-access mapping table when `db_apis` is empty, so the single most important
+# section of the corpus was withheld from every conversion of a PDO application, and
+# `advice._engine` had nothing to name the database with.
+_PDO_METHODS = {
+    "prepare": "PDO", "query": "PDO", "exec": "PDO", "execute": "PDO",
+    "fetch": "PDO", "fetchAll": "PDO", "fetchColumn": "PDO", "fetchObject": "PDO",
+    "lastInsertId": "PDO", "rowCount": "PDO", "columnCount": "PDO",
+    "beginTransaction": "PDO", "commit": "PDO", "rollBack": "PDO", "quote": "PDO",
+}
+_PDO_METHOD_CALL = re.compile(
+    r"->\s*(" + "|".join(sorted(_PDO_METHODS, key=len, reverse=True)) + r")\s*\(")
+_PDO_CONSTRUCT = re.compile(r"\bnew\s+\\?PDO\s*\(")
+
+# Any method call whose first argument is a SQL statement. A fixed method list only sees code
+# that talks to PDO directly, and the common shape in a layered application is a thin wrapper —
+# `Database::select()`, `selectOne()`, `fetchRow()`, `q()` — named however that codebase likes.
+# Matching the *statement* instead of the method name needs no list and cannot go stale: the
+# evidence that a call is data access is the SQL sitting in it.
+_SQL_ARGUMENT_CALL = re.compile(
+    r"""->\s*(\w+)\s*\(\s*(?P<q>['"])\s*"""
+    r"""(?=(?:SELECT|INSERT|UPDATE|DELETE|REPLACE|MERGE|WITH|CALL)\b)""", re.I)
+
+# A template named by a string that the framework turns into a path:
+# `$this->view('employees.index')`, `View::render('auth/login')`, `$twig->render(...)`.
+#
+# Without this the controller-to-view relationship does not exist in the graph at all, because
+# the only thing connecting them is a string. Two consequences, both visible on a real app:
+# every template came out as an "entry point" (nothing depends on a file nothing links to), so
+# a 45-file app reported thirteen entry points where it has one — inflating the coverage check
+# in `reconcile` and seeding the parity recorder with paths that cannot be requested; and a
+# view was converted with no idea which action renders it, in an order that gave no guarantee
+# its controller had been designed yet.
+_VIEW_CALL = re.compile(
+    r"""(?ix) (?: ->|:: ) \s* (?: view | render | display | make | partial | include )
+        \s* \(\s* ['"] (?P<name>[A-Za-z0-9_\-./]{2,80}) ['"] """)
+# Where templates live, by convention. Offered as alternatives; `graph.resolve_edges` keeps
+# whichever matches a real file and — because these are `soft_requires` — says nothing about
+# the rest.
+_VIEW_ROOTS = ("views", "templates", "resources/views", "template", "tpl", "app/views")
+
+# The engine, from the one place it is stated unambiguously: a PDO DSN's scheme. `new
+# PDO('sqlite:' . $path)` says SQLite as plainly as a codebase ever says anything, and
+# recording only the string "PDO" threw that away — which is why the charter used to read
+# "against the existing the source's engine database".
+_PDO_DSN = re.compile(r"""(?i)\bnew\s+\\?PDO\s*\(\s*['"]([a-z0-9]{2,12})\s*:""")
+_DSN_ENGINES = {"sqlite", "sqlite3", "mysql", "mysqli", "pgsql", "postgres", "postgresql",
+                "sqlsrv", "mssql", "dblib", "oci", "oracle", "odbc", "firebird", "ibm",
+                "informix", "4d"}
+
+# `shell_exec` is in `validation.BLOCKING_HAZARDS`, so this pattern decides whether a file is
+# allowed to convert at all. `\b(exec|...)` matched `->exec(` — `>` is a non-word character, so
+# the boundary succeeds — and `PDO::exec()` is how every PDO codebase runs DDL and pragmas.
+# The effect was that `src/Core/Database.php`, the connection wrapper every repository depends
+# on, was classified as shelling out: a faithful EF Core translation of it then failed Tier 0
+# for carrying no `MIGRATION-BLOCKED` marker, retried twice against a byte-identical prompt,
+# and the data layer of a perfectly convertible application produced no output at all.
+#
+# So the name must be a *free function* call: not preceded by `->`, `::`, `$`, or a word
+# character. `\b` alone cannot express that, because it is satisfied by the `>`.
+_SHELL_EXEC = r"(?<![>:$\w])\b(exec|system|passthru|shell_exec|proc_open|popen)\s*\("
 
 _SQL_START = re.compile(r"(?is)^\s*\(?\s*(SELECT|INSERT|UPDATE|DELETE|REPLACE|CALL|WITH)\b")
 _SQL_TABLE = re.compile(
@@ -168,9 +234,21 @@ def _path_spellings(path: str) -> List[str]:
 
 # ── tree-sitter engine ─────────────────────────────────────────────────────
 
+# On the `.` anchor in the `class_constant_access_expression` pattern: it is load-bearing, and
+# tree-sitter query syntax has no comments worth putting it in (`;` starts one, `#` is a
+# predicate), so it is explained here.
+#
+# That node has no named fields in this grammar — both sides of the `::` are anonymous `name`
+# children — so the unanchored `(name) @static` captured the constant as well as the class.
+# `PDO::ATTR_ERRMODE` became a dependency on a class named `ATTR_ERRMODE` and `Foo::class` one
+# on a class named `class`; `_name_spellings` then qualified each with the current namespace,
+# so one file contributed `App\\Core\\ATTR_ERRMODE`, `App\\Core\\FETCH_ASSOC` and
+# `App\\Core\\class` to the third-party dependency list a customer approves at the discovery
+# gate. The anchor restricts the capture to the first child, which is the scope.
 _QUERY_SOURCE = """
 (namespace_definition name: (namespace_name) @namespace)
 (namespace_use_clause (qualified_name) @use)
+(namespace_use_clause (name) @use)
 (class_declaration name: (name) @class)
 (interface_declaration name: (name) @interface)
 (trait_declaration name: (name) @trait)
@@ -185,7 +263,7 @@ _QUERY_SOURCE = """
 (object_creation_expression (qualified_name) @new)
 (scoped_call_expression scope: (name) @static)
 (scoped_call_expression scope: (qualified_name) @static)
-(class_constant_access_expression (name) @static)
+(class_constant_access_expression . [(name) (qualified_name)] @static)
 (function_call_expression function: (name) @call)
 (subscript_expression (variable_name) @sg_var (string) @sg_key)
 (text) @html
@@ -254,9 +332,13 @@ def _analyze_treesitter(path: str, content: str) -> UnitFacts:
         provides.append(name)
         exports.append(Symbol(name=name, kind="constant", signature=f"const {name}"))
 
+    # The `use` map first, so the references below resolve against the file's own imports
+    # rather than against a guess. `use A\B\C;` binds the leaf `C` to `A\B\C` for this file.
+    imports = _import_map(_text(node) for node in caps.get("use", []))
+
     for capture in ("use", "extends", "implements", "new", "static"):
         for node in caps.get(capture, []):
-            requires.extend(_name_spellings(_text(node), namespace))
+            requires.extend(_name_spellings(_text(node), namespace, imports))
 
     # `define('X', ...)` — a constant, and the pre-namespace idiom for one.
     for node in caps.get("call", []):
@@ -270,6 +352,7 @@ def _analyze_treesitter(path: str, content: str) -> UnitFacts:
 
     facts = _php_facts(path, content, caps)
     requires.extend(facts.pop("_include_edges", []))
+    view_edges = facts.pop("_view_edges", [])
 
     return UnitFacts(
         path=path,
@@ -279,6 +362,7 @@ def _analyze_treesitter(path: str, content: str) -> UnitFacts:
                                                 for s in exports)),
         provides=sorted(set(p for p in provides if p)),
         requires=sorted(set(r for r in requires if r)),
+        soft_requires=sorted(set(v for v in view_edges if v)),
         exports=exports,
         confidence=1.0,
         source="parser",
@@ -312,8 +396,40 @@ def _first_string_argument(call_node) -> str:
     return ""
 
 
-def _name_spellings(raw: str, namespace: str) -> List[str]:
-    """A referenced name, in every form that might match a `provides`."""
+def _import_map(used: Iterable[str]) -> Dict[str, str]:
+    """`use A\\B\\C;` -> {"C": "A\\B\\C"} — the file's own name bindings.
+
+    Aliases (`use A\\B\\C as D`) are not represented: the tree-sitter capture is the qualified
+    name only, and an alias that shadowed a same-named import would be the rare case where
+    falling back to the namespace guess is no worse than today's behaviour.
+    """
+    out: Dict[str, str] = {}
+    for name in used:
+        name = (name or "").lstrip("\\").strip()
+        if not name:
+            continue
+        out.setdefault(name.rsplit("\\", 1)[-1], name)
+    return out
+
+
+def _name_spellings(raw: str, namespace: str,
+                    imports: Optional[Dict[str, str]] = None) -> List[str]:
+    """A referenced name, in every form that might match a `provides`.
+
+    `imports` is the file's `use` map, leaf name -> fully-qualified name, and it is what PHP
+    itself resolves an unqualified reference against: inside `namespace App\\Controllers`, a
+    bare `EmployeeService` means `App\\Services\\EmployeeService` when the file says
+    `use App\\Services\\EmployeeService;`, and only means `App\\Controllers\\EmployeeService`
+    when it says nothing.
+
+    The old code skipped that step and offered both spellings on the grounds that "the one
+    that matches nothing costs nothing". It does cost something. `graph.resolve_edges` reports
+    every candidate that resolved to no file as an **external dependency**, and that list is
+    shown at the discovery gate as the third-party surface a customer has to plan for. A
+    layered application produced thirty entries like `App\\Controllers\\EmployeeRepository` and
+    `App\\Core\\PDO` — none of them real, all of them this function's own guesses — which is
+    the kind of noise that makes a genuine missing dependency impossible to spot.
+    """
     name = raw.lstrip("\\").strip()
     if not name or name.lower() in ("self", "static", "parent", "$this"):
         return []
@@ -321,9 +437,13 @@ def _name_spellings(raw: str, namespace: str) -> List[str]:
     leaf = name.rsplit("\\", 1)[-1]
     if leaf != name:
         out.append(leaf)
+        return out
+    imported = (imports or {}).get(name)
+    if imported:
+        # The `use` map is authoritative for this name in this file. No namespace guess.
+        if imported != name:
+            out.append(imported)
     elif namespace:
-        # An unqualified name inside a namespace could be either this namespace's or a
-        # global. Offer both; the one that matches nothing costs nothing.
         out.append(f"{namespace}\\{name}")
     return out
 
@@ -346,6 +466,17 @@ def _php_facts(path: str, content: str, caps: Optional[Dict[str, List[Any]]] = N
         if resolved:
             include_edges.extend(_path_spellings(resolved)[:1] or [resolved])
     facts["_include_edges"] = include_edges
+
+    # Templates named by string. `'employees.index'` and `'employees/index'` are the same view;
+    # the dot form is the more common convention and is what this codebase uses.
+    view_edges: List[str] = []
+    for match in _VIEW_CALL.finditer(content):
+        name = match.group("name").replace(".", "/").strip("/")
+        if not name or name.endswith(("/", ".php")):
+            continue
+        for root in _VIEW_ROOTS:
+            view_edges.append(f"{root}/{name}.php")
+    facts["_view_edges"] = view_edges[:MAX_FACT_ROWS]
 
     # Superglobals, *with their keys* — the keys are the payload. `$_GET['id']` is a query
     # parameter named id, which is a bindable action argument; knowing only that the file
@@ -379,6 +510,51 @@ def _php_facts(path: str, content: str, caps: Optional[Dict[str, List[Any]]] = N
             db_sites.append(site)
             if len(db_sites) >= MAX_FACT_ROWS:
                 break
+
+    # PDO, matched on the `->method(` form so a plain function of the same name cannot
+    # masquerade as data access. `_sql_near` is reused unchanged: it already looks both ways
+    # for the statement, and `$db->select('SELECT ...')` puts the literal in exactly the place
+    # `mysqli_query($c, '...')` does.
+    for match in _PDO_METHOD_CALL.finditer(content):
+        if len(db_sites) >= MAX_FACT_ROWS:
+            break
+        method = match.group(1)
+        line = content.count("\n", 0, match.start()) + 1
+        sql, interpolated = _sql_near(content, match.start())
+        site = {"api": _PDO_METHODS[method], "fn": f"->{method}", "line": line}
+        if sql:
+            site["sql"] = sql[:300]
+            site["interpolated"] = interpolated
+            tables.update(t.lower() for t in _SQL_TABLE.findall(sql))
+        db_sites.append(site)
+    for match in _PDO_CONSTRUCT.finditer(content):
+        if len(db_sites) >= MAX_FACT_ROWS:
+            break
+        db_sites.append({"api": "PDO", "fn": "new PDO",
+                         "line": content.count("\n", 0, match.start()) + 1})
+
+    # Wrapper methods, found by the statement rather than the name. Deduplicated against what
+    # the two loops above already recorded, since `->query('SELECT ...')` is both.
+    seen_lines = {(s["line"], s.get("sql", "")) for s in db_sites}
+    for match in _SQL_ARGUMENT_CALL.finditer(content):
+        if len(db_sites) >= MAX_FACT_ROWS:
+            break
+        line = content.count("\n", 0, match.start()) + 1
+        sql, interpolated = _sql_near(content, match.start())
+        if not sql or (line, sql[:300]) in seen_lines:
+            continue
+        seen_lines.add((line, sql[:300]))
+        db_sites.append({"api": "PDO", "fn": f"->{match.group(1)}", "line": line,
+                         "sql": sql[:300], "interpolated": interpolated})
+        tables.update(t.lower() for t in _SQL_TABLE.findall(sql))
+
+    # The engine itself, so the charter can name a concrete EF Core provider. Only the DSN
+    # here; `composer.json` states it too but is not a PHP file and never reaches this
+    # function, so `evidence.py` reads that one — see `_DATASTORE_ENGINES` there.
+    engines = {m.group(1).lower() for m in _PDO_DSN.finditer(content)} & _DSN_ENGINES
+    if engines:
+        facts["db_engines"] = sorted(engines)
+
     if db_sites:
         # Two calls on one line — `mysqli_fetch_assoc(mysqli_query(...))` is the classic —
         # resolve to the same SQL, and reporting the same statement twice reads as two
@@ -431,7 +607,7 @@ def _php_facts(path: str, content: str, caps: Optional[Dict[str, List[Any]]] = N
         ("variable_include", None),
         ("extract", r"\bextract\s*\(|\bimport_request_variables\s*\("),
         ("unserialize_request", r"\bunserialize\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)"),
-        ("shell_exec", r"\b(exec|system|passthru|shell_exec|proc_open|popen)\s*\("),
+        ("shell_exec", _SHELL_EXEC),
         ("globals_write", r"\$GLOBALS\s*\[[^\]]+\]\s*="),
         ("removed_mysql_ext", r"\bmysql_(connect|query|fetch_assoc|fetch_array)\s*\("),
         ("weak_password_hash", r"(?i)\b(md5|sha1)\s*\(\s*\$?(pass|pwd|password)"),
@@ -466,21 +642,59 @@ def _sql_near(content: str, call_start: int) -> Tuple[str, bool]:
     pivot = call_start - window_start
 
     best, interpolated, distance = "", False, None
-    for match in re.finditer(r"""(['"])(.{6,600}?)\1""", window, re.S):
-        literal = match.group(2)
+    for start, end, literal, quote in _string_literals(window):
         if not _SQL_START.search(literal):
             continue
         # Nearest literal to the call wins, in either direction.
-        gap = 0 if match.start() <= pivot <= match.end() else min(
-            abs(pivot - match.start()), abs(pivot - match.end()))
+        gap = 0 if start <= pivot <= end else min(abs(pivot - start), abs(pivot - end))
         if distance is not None and gap >= distance:
             continue
-        after = window[match.end():match.end() + 80]
+        after = window[end + 1:end + 81]        # `end` is the closing quote itself
         distance = gap
         best = " ".join(literal.split())
-        interpolated = bool(re.match(r"\s*\.", after)) or bool(
-            re.search(r"\$[A-Za-z_{]", literal))
+        # Two ways a statement gets a value spliced into it, and only two. A `$var` inside a
+        # **single**-quoted literal is a literal dollar sign in PHP, not interpolation, so
+        # checking for one regardless of the quote character reported an injection in
+        # `'... WHERE id = $id'` — which is a broken query, not a vulnerable one.
+        interpolated = bool(re.match(r"\s*\.", after)) or (
+            quote == '"' and bool(re.search(r"\$[A-Za-z_{]", literal)))
     return best, interpolated
+
+
+def _string_literals(text: str):
+    """(start, end, contents, quote) for every string literal, in order.
+
+    A scanner rather than a regex, because the regex this replaced —
+    `(['"])(.{6,600}?)\\1` — paired quotes greedily from the left with a six-character minimum,
+    and a literal shorter than that desynchronised the pairing for everything after it. In
+    `selectOne('SELECT ...', ['id' => $id])` the `'id'` cannot close against its own partner,
+    so the scan swallowed the rest of the method and re-opened on a later statement's quote.
+    The visible effect was worse than a miss: every call site after the first short literal was
+    handed a *different* statement's SQL, at its own correct line number. A converter told that
+    line 14 runs a query it does not run has been actively misinformed, which no amount of
+    later validation can detect.
+
+    Bound parameters are exactly what produces short literals, so this got worse the more
+    correctly the source was written.
+    """
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch not in "'\"":
+            i += 1
+            continue
+        quote, j = ch, i + 1
+        while j < n:
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == quote:
+                break
+            j += 1
+        if j >= n:                      # unterminated — a truncated file, not a literal
+            return
+        yield i + 1, j, text[i + 1:j], quote
+        i = j + 1
 
 
 # ── Classification ─────────────────────────────────────────────────────────
@@ -562,23 +776,29 @@ def _analyze_regex(path: str, content: str, confidence: float = 0.6) -> UnitFact
         provides.append(name)
         exports.append(Symbol(name=name, kind="constant", signature=f"const {name}"))
 
-    for prefix, group in _RX_USE_GROUP.findall(content):
-        for member in group.split(","):
-            member = member.strip()
-            if member:
-                requires.extend(_name_spellings(f"{prefix}\\{member}", namespace))
+    # Built before any reference is spelled, for the reason `_name_spellings` documents: the
+    # `use` map is what PHP resolves an unqualified name against, and guessing the current
+    # namespace instead invents dependencies that do not exist.
+    grouped = [f"{prefix}\\{member.strip()}"
+               for prefix, group in _RX_USE_GROUP.findall(content)
+               for member in group.split(",") if member.strip()]
+    imports = _import_map(grouped + list(_RX_USE.findall(content)))
+
+    for name in grouped:
+        requires.extend(_name_spellings(name, namespace, imports))
     for name in _RX_USE.findall(content):
-        requires.extend(_name_spellings(name, namespace))
+        requires.extend(_name_spellings(name, namespace, imports))
     for name in _RX_EXTENDS.findall(content):
-        requires.extend(_name_spellings(name, namespace))
+        requires.extend(_name_spellings(name, namespace, imports))
     for group in _RX_IMPLEMENTS.findall(content):
         for name in group.split(","):
-            requires.extend(_name_spellings(name.strip(), namespace))
+            requires.extend(_name_spellings(name.strip(), namespace, imports))
     for name in _RX_NEW.findall(content) + _RX_STATIC.findall(content):
-        requires.extend(_name_spellings(name, namespace))
+        requires.extend(_name_spellings(name, namespace, imports))
 
     facts = _php_facts(path, content, caps=None)
     requires.extend(facts.pop("_include_edges", []))
+    view_edges = facts.pop("_view_edges", [])
 
     return UnitFacts(
         path=path,
@@ -588,6 +808,7 @@ def _analyze_regex(path: str, content: str, confidence: float = 0.6) -> UnitFact
                                                 for s in exports)),
         provides=sorted(set(p for p in provides if p)),
         requires=sorted(set(r for r in requires if r)),
+        soft_requires=sorted(set(v for v in view_edges if v)),
         exports=exports,
         confidence=confidence,
         source="heuristic",

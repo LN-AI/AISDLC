@@ -26,6 +26,38 @@ from backend.services.modernization.analyzers import UnitFacts
 logger = logging.getLogger(__name__)
 
 
+# Types the runtime supplies, per language, which are "unresolved" only in the sense that no
+# file in the repository declares them. Kept short and literal on purpose: a broad pattern
+# here would hide a genuinely missing dependency, which is the one thing this list is for.
+_RUNTIME_TYPES = frozenset(name.lower() for name in (
+    # PHP — SPL, PDO and the exception hierarchy
+    "PDO", "PDOStatement", "PDOException", "Exception", "Error", "Throwable",
+    "RuntimeException", "LogicException", "InvalidArgumentException", "TypeError",
+    "ValueError", "ArgumentCountError", "DomainException", "LengthException",
+    "OutOfRangeException", "OutOfBoundsException", "RangeException", "OverflowException",
+    "UnderflowException", "UnexpectedValueException", "BadFunctionCallException",
+    "BadMethodCallException", "JsonException", "ErrorException",
+    "ArrayObject", "ArrayIterator", "SplStack", "SplQueue", "SplObjectStorage",
+    "SplFileObject", "SplFileInfo", "Generator", "Closure", "stdClass", "WeakMap",
+    "DateTime", "DateTimeImmutable", "DateTimeZone", "DateInterval", "DatePeriod",
+    "IntlDateFormatter", "NumberFormatter", "Collator",
+    "Iterator", "IteratorAggregate", "ArrayAccess", "Countable", "Traversable",
+    "JsonSerializable", "Serializable", "Stringable", "UnitEnum", "BackedEnum",
+    "mysqli", "mysqli_stmt", "mysqli_result", "SQLite3", "Redis", "SoapClient",
+    "DOMDocument", "DOMElement", "DOMXPath", "SimpleXMLElement", "XMLReader", "XMLWriter",
+    "ZipArchive", "CurlHandle", "finfo", "Directory", "NumberFormatException",
+    "ReflectionClass", "ReflectionMethod", "ReflectionProperty", "ReflectionFunction",
+    # A `Foo::class` fetch used to arrive here as a class literally named `class`. The query
+    # that produced it is fixed; this stays as a floor under the regex fallback.
+    "class", "parent", "self", "static",
+))
+
+
+def _is_runtime_type(name: str) -> bool:
+    """True for a name the target runtime provides rather than the repository."""
+    return (name or "").rsplit("\\", 1)[-1].lower() in _RUNTIME_TYPES
+
+
 def _provider_index(facts: Sequence[UnitFacts]) -> Dict[str, List[str]]:
     """name -> the paths that provide it.
 
@@ -53,6 +85,13 @@ def resolve_edges(facts: Sequence[UnitFacts]) -> Tuple[Dict[str, Set[str]], Dict
                 continue
             for provider in providers:
                 if provider != fact.path:          # a self-edge is never a dependency
+                    deps[fact.path].add(provider)
+        # Inferred references: an edge when they land, nothing when they miss. A template name
+        # that resolves to no file is a template this analyzer guessed wrong about, not a
+        # dependency the customer has to go and find.
+        for name in getattr(fact, "soft_requires", ()):
+            for provider in index.get(name) or ():
+                if provider != fact.path:
                     deps[fact.path].add(provider)
         if unresolved:
             external[fact.path] = sorted(set(unresolved))
@@ -214,8 +253,14 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
         "cycles": len(cycles),
         "units_in_cycles": sum(c["size"] for c in cycles),
         "roots": sum(1 for u in units if not u["depends_on"]),
+        # Runtime-provided types are filtered out. This list is shown at the discovery gate as
+        # the third-party surface a migration has to account for, and `PDO`, `PDOStatement`
+        # and `RuntimeException` are not third-party — they are the language. Leaving them in
+        # meant the honest answer for a self-contained application ("nothing external") was
+        # never visible, so the field carried no information either way.
         "external_dependencies": sorted({
             name for names in external.values() for name in names
+            if not _is_runtime_type(name)
         })[:200],
     }
     logger.info(

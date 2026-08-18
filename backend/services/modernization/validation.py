@@ -224,6 +224,40 @@ BLOCKING_HAZARDS = frozenset({
 })
 
 
+def summarize_for_prompt(issues: List[Dict[str, Any]]) -> str:
+    """The Tier-0 failures as a markdown block for the next attempt at the same unit.
+
+    The mirror of `semantics.summarize_for_prompt`, and it exists for the same reason: without
+    it a failed unit re-sent a byte-identical prompt, produced the same output, and spent all
+    three attempts arguing with itself. Every other feedback path in this pipeline — build
+    diagnostics, behaviour drift — already tells the next attempt what the last one got wrong;
+    structural validation was the one that did not, and it is the one that fires first.
+
+    Belongs in the *user* message, never the cached system block (D-06): it is per-unit.
+
+    Phrased as a statement about the previous output rather than as a rule, because the rules
+    were already in the prompt when that output was produced. Repeating a rule the model has
+    already read and not followed is the least effective thing available; naming what it
+    actually emitted is not.
+    """
+    if not issues:
+        return ""
+    lines = [
+        "## Your previous output for this unit was rejected",
+        "",
+        "These are mechanical checks on the files you returned last time — not style "
+        "opinions, and not re-statements of the rules above. Each one describes something "
+        "about that output. Return the whole unit again with every one of them resolved, and "
+        "change nothing else.",
+        "",
+    ]
+    for issue in issues:
+        where = issue.get("path") or "this unit"
+        lines.append(f"- **{issue.get('check') or 'check'}** ({where}): "
+                     f"{issue.get('detail') or ''}")
+    return "\n".join(lines)
+
+
 def check_blocked_hazards(artifacts: List[Dict[str, Any]], hazard_kinds: List[str],
                           manual_followup: Optional[List[str]] = None) -> List[Dict[str, str]]:
     """The third and only enforced layer of the hazard rule.

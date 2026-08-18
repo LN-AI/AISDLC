@@ -3316,6 +3316,427 @@ finally:
 
 
 
+
+# ── 27. A layered, namespaced, PDO codebase ────────────────────────────────
+section("27. A layered PDO codebase — what the procedural fixtures never asked")
+# Every PHP fixture above this line is procedural: `mysqli_*` at file scope, one page per URL,
+# includes for dependencies. That is the 2005 shape, and it is the only shape the analyzers
+# were ever measured against. When a real application arrived — PSR-4 namespaces, a front
+# controller, a route table, repositories over PDO — the deterministic layer got the most
+# important facts about it wrong, and each of those mistakes either steers a paid call or
+# refuses one outright.
+#
+# Each check names its consequence, because a regression here is invisible in an output diff.
+# It shows up three stages later as a component that will not convert, or a charter that
+# names no database.
+from backend.services.modernization.advice import php_dotnet as advice_php  # noqa: E402
+
+LAYERED = {
+    "composer.json":
+        '{"name": "acme/ems", "description": "Employee management system (sample app for '
+        'migration testing).", "require": {"php": ">=8.0", "ext-pdo_sqlite": "*"}}',
+    "src/Core/Database.php": (
+        "<?php\n"
+        "namespace App\\Core;\n"
+        "use PDO;\n"
+        "use PDOStatement;\n"
+        "class Database\n"
+        "{\n"
+        "    private static ?Database $instance = null;\n"
+        "    private PDO $pdo;\n"
+        "    private function __construct()\n"
+        "    {\n"
+        "        $config = require __DIR__ . '/../../config/database.php';\n"
+        "        $this->pdo = new PDO('sqlite:' . $config['path']);\n"
+        "        $this->pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);\n"
+        "        $this->pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);\n"
+        "        $this->pdo->exec('PRAGMA foreign_keys = ON;');\n"
+        "    }\n"
+        "    public function statement(string $sql, array $params = []): PDOStatement\n"
+        "    {\n"
+        "        $stmt = $this->pdo->prepare($sql);\n"
+        "        $stmt->execute($params);\n"
+        "        return $stmt;\n"
+        "    }\n"
+        "    public function lastInsertId(): int { return (int) $this->pdo->lastInsertId(); }\n"
+        "}\n"
+    ),
+    "src/Repositories/EmployeeRepository.php": (
+        "<?php\n"
+        "namespace App\\Repositories;\n"
+        "use App\\Core\\Database;\n"
+        "class EmployeeRepository\n"
+        "{\n"
+        "    private Database $db;\n"
+        "    /** Normalise input array into bound SQL parameters. */\n"
+        "    public function find(int $id): ?array\n"
+        "    {\n"
+        "        return $this->db->selectOne('SELECT * FROM employees WHERE id = :id',"
+        " ['id' => $id]);\n"
+        "    }\n"
+        "    public function recent(int $limit): array\n"
+        "    {\n"
+        "        return $this->db->select('SELECT * FROM employees ORDER BY id DESC LIMIT '"
+        " . $limit);\n"
+        "    }\n"
+        "    public function search(string $term): array\n"
+        "    {\n"
+        '        return $this->db->select("SELECT * FROM employees WHERE last_name = \'$term\'");\n'
+        "    }\n"
+        "}\n"
+    ),
+    "src/Controllers/EmployeeController.php": (
+        "<?php\n"
+        "namespace App\\Controllers;\n"
+        "use App\\Core\\Controller;\n"
+        "use App\\Repositories\\EmployeeRepository;\n"
+        "class EmployeeController extends Controller\n"
+        "{\n"
+        "    public function index(): void\n"
+        "    {\n"
+        "        $repo = new EmployeeRepository();\n"
+        "        $this->view('employees/index', ['rows' => $repo->recent(20)]);\n"
+        "    }\n"
+        "}\n"
+    ),
+    "routes/web.php": (
+        "<?php\n"
+        "use App\\Controllers\\AuthController;\n"
+        "use App\\Controllers\\EmployeeController;\n"
+        "return function ($router): void {\n"
+        "    $router->get('/login',  [AuthController::class, 'showLogin']);\n"
+        "    $router->post('/login', [AuthController::class, 'login']);\n"
+        "    $router->get('/', [EmployeeController::class, 'index'], ['auth']);\n"
+        "    $router->get('/employees/{id}', [EmployeeController::class, 'show'], ['auth']);\n"
+        "    $router->post('/employees/{id}/delete', [EmployeeController::class, 'destroy'],"
+        " ['auth', 'admin']);\n"
+        "    // $router->get('/disabled', [EmployeeController::class, 'gone']);\n"
+        "};\n"
+    ),
+    "database/schema.sql": (
+        "DROP TABLE IF EXISTS attendance;\n"
+        "CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);\n"
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, department_id INTEGER);\n"
+    ),
+    "views/employees/index.php":
+        "<?php foreach ($rows as $r): ?><div><?= $r['id'] ?></div><?php endforeach; ?>",
+}
+
+LAY_FACTS = {p: analyzers.analyze_file(p, t) for p, t in LAYERED.items() if p.endswith(".php")}
+
+
+def _facts_of(path):
+    return (LAY_FACTS[path].meta or {}).get("php") or {}
+
+
+DB_FACTS = _facts_of("src/Core/Database.php")
+REPO_FACTS = _facts_of("src/Repositories/EmployeeRepository.php")
+
+# ── PDO is data access ─────────────────────────────────────────────────────
+# `_DB_FUNCTIONS` held only procedural names, so a file whose every line is a PDO call
+# reported `db_apis: []`. Not cosmetic: `playbooks.select` keys the data-access mapping table
+# on `db_apis`, so the section that tells the converter how to translate a query was withheld
+# from every conversion of a PDO application.
+check("PDO counts as data access", DB_FACTS.get("db_apis") == ["PDO"],
+      str(DB_FACTS.get("db_apis")))
+check("and its call sites are reported with their SQL",
+      len(DB_FACTS.get("db_sites") or []) >= 4, str(len(DB_FACTS.get("db_sites") or [])))
+check("a repository's tables are read out of its own statements",
+      REPO_FACTS.get("tables") == ["employees"], str(REPO_FACTS.get("tables")))
+check("a concatenated LIMIT is marked interpolated",
+      any(s.get("interpolated") for s in (REPO_FACTS.get("db_sites") or [])
+          if "LIMIT" in (s.get("sql") or "")),
+      str([(s.get("fn"), s.get("interpolated")) for s in (REPO_FACTS.get("db_sites") or [])]))
+
+LAY_AGG = playbooks.aggregate_facts(
+    [{"language": "PHP", "meta": f.meta} for f in LAY_FACTS.values()])
+LAY_BOOK = playbooks.find("PHP", ".NET 8 / ASP.NET Core MVC with Razor views")
+LAY_KEYS = playbooks.select(LAY_BOOK, LAY_AGG)
+check("so the data-access playbook section reaches the prompt", "data" in LAY_KEYS,
+      f"selected {LAY_KEYS}")
+LAY_BODY = playbooks.render(LAY_BOOK, LAY_KEYS)
+for _needle in ("->prepare", "->fetchAll", "->lastInsertId", "->exec("):
+    check(f"and it maps {_needle}", _needle in LAY_BODY)
+check("including the singleton, which must not survive as a static connection",
+      "singleton" in LAY_BODY.lower())
+
+# ── `->exec()` is not a shell escape ──────────────────────────────────────
+# The blocking-hazard check is the strictest gate here: a unit whose source carried one must
+# emit a `MIGRATION-BLOCKED` marker or fail Tier 0. `\b(exec|...)` matched `->exec(`, so
+# `PDO::exec()` — how every PDO codebase runs DDL and pragmas — classified the connection
+# wrapper as shelling out. A faithful EF Core translation of it then failed validation,
+# retried twice against a byte-identical prompt, and the data layer produced nothing.
+check("a PDO ->exec() is not a shell escape",
+      "shell_exec" not in (DB_FACTS.get("hazard_kinds") or []),
+      str(DB_FACTS.get("hazard_kinds")))
+check("so the connection wrapper is not a blocking hazard",
+      not (set(DB_FACTS.get("hazard_kinds") or []) & validation.BLOCKING_HAZARDS),
+      str(DB_FACTS.get("hazard_kinds")))
+check("and a correct translation of it passes Tier 0",
+      not validation.check_blocked_hazards(
+          [{"path": "Infrastructure/EmsDbContext.cs",
+            "content": "public sealed class EmsDbContext : DbContext { }"}],
+          sorted(set(DB_FACTS.get("hazard_kinds") or []) & validation.BLOCKING_HAZARDS),
+          manual_followup=[]))
+
+
+def _hazards_of(text):
+    return ((analyzers.analyze_file("h.php", text).meta or {}).get("php")
+            or {}).get("hazard_kinds") or []
+
+
+check("a real shell escape is still caught",
+      "shell_exec" in _hazards_of("<?php exec('rm -rf /'); ?>"))
+check("and so is one written as system()",
+      "shell_exec" in _hazards_of("<?php system($cmd); ?>"))
+
+LAY_ROWS = []
+for _p, _t in LAYERED.items():
+    LAY_ROWS.extend(evidence.from_file(_p, _t))
+
+
+def _lay_vals(kind, path=None):
+    return sorted(r["value"] for r in LAY_ROWS
+                  if r["kind"] == kind and (path is None or r["path"] == path))
+
+
+# A manifest is not code. `"...management system (sample app for migration testing)"` matched
+# `system\s*\(`, so a composer.json was reported as shelling out — and shell_exec blocks.
+check("a JSON manifest contributes no code hazards",
+      not [r for r in LAY_ROWS if r["kind"] == "hazard" and r["path"] == "composer.json"],
+      str(_lay_vals("hazard", "composer.json")))
+
+# ── Parameterised is not string-building ──────────────────────────────────
+# Reported as an injection finding the converter is told to fix, so a false positive asks for
+# a rewrite of correct code. The old pattern looked for a `$var` within 80 characters of
+# WHERE, which in `selectOne('... WHERE id = :id', ['id' => $id])` finds the *bound value*.
+_SQLB = [r for r in LAY_ROWS if r["value"] == "sql_string_building"]
+check("a bound parameter is not string-building",
+      not any("= :id" in (r.get("snippet") or "") for r in _SQLB),
+      str([(r["path"], (r.get("snippet") or "")[:50]) for r in _SQLB]))
+check("a concatenated LIMIT still is",
+      any("LIMIT ' . $" in (r.get("snippet") or "") for r in _SQLB),
+      str([(r.get("snippet") or "")[:50] for r in _SQLB]))
+check("and so is interpolation inside a double-quoted statement",
+      any("$term" in (r.get("snippet") or "") for r in _SQLB),
+      str([(r.get("snippet") or "")[:50] for r in _SQLB]))
+
+# ── Tables come from SQL, not from prose ──────────────────────────────────
+# The `_SQL_HINT` guard is per file, so one real statement licensed every phantom in the
+# comments: `/** Normalise input array into bound SQL parameters. */` yielded a table named
+# `bound`, and `DROP TABLE IF EXISTS` one named `IF`.
+_TABLES = set(_lay_vals("table"))
+check("a doc comment is not a table", "bound" not in _TABLES, str(sorted(_TABLES)))
+check("DROP TABLE IF EXISTS names no table called IF", "IF" not in _TABLES,
+      str(sorted(_TABLES)))
+check("the real tables are all found",
+      {"employees", "departments", "attendance"} <= _TABLES, str(sorted(_TABLES)))
+
+# ── The route table ───────────────────────────────────────────────────────
+# Route extraction was gated on the basename being `.htaccess`/`web.config`/`httpd.conf`, so
+# an application whose routing lived in `routes/web.php` reported one route: the catch-all
+# rewrite. For an MVC target the route table is the most convertible artifact there is, and
+# the charter's url_compatibility promise is made against it.
+_ROUTES = _lay_vals("route", "routes/web.php")
+check("routes declared in code are found", len(_ROUTES) == 5, str(_ROUTES))
+check("with the verb", any(r.startswith("POST /login") for r in _ROUTES), str(_ROUTES))
+check("with the path template intact", any("/employees/{id}" in r for r in _ROUTES),
+      str(_ROUTES))
+check("with the handler", any("EmployeeController.index" in r for r in _ROUTES), str(_ROUTES))
+check("and with the middleware that guards it", any("[admin, auth]" in r for r in _ROUTES),
+      str(_ROUTES))
+# Middleware is authorization. A fixed lookahead window ran past the end of one call into the
+# next, so `$router->post('/login', ...)` inherited a later route's `['auth']` — and an app
+# that requires authentication to reach its login page is worse than one with no guards named.
+check("an unguarded route is not given a neighbour's middleware",
+      [r for r in _ROUTES if r.startswith("POST /login")]
+      == ["POST /login -> AuthController.login"], str(_ROUTES))
+check("a commented-out route is not a route", not any("/disabled" in r for r in _ROUTES),
+      str(_ROUTES))
+
+# ── The engine ────────────────────────────────────────────────────────────
+# `PDO` is a wrapper, so recording only the API name left the charter reading "EF Core 8 with
+# the matching EF Core provider against the existing the source's engine database". The engine
+# was stated twice in plain text — the DSN scheme and `ext-pdo_sqlite` — and read neither time.
+check("the DSN scheme identifies the engine", "SQLite" in _lay_vals("datastore"),
+      str(_lay_vals("datastore")))
+_OBS = {"db_apis": LAY_AGG.get("db_apis") or [], "tables": sorted(_TABLES),
+        "datastores": _lay_vals("datastore")}
+_ENGINE, _PACKAGE = advice_php._engine(_OBS)
+check("so the charter can name a concrete provider",
+      (_ENGINE, _PACKAGE) == ("SQLite", "Microsoft.EntityFrameworkCore.Sqlite"),
+      f"{_ENGINE} / {_PACKAGE}")
+check("and no suggestion still reads 'the source's engine'",
+      all("the source's engine" not in (o.get("value") or "")
+          for f in advice.describe(".NET 8 / ASP.NET Core MVC with Razor views",
+                                   dict(_OBS, hazard_kinds=[], entrypoints=[], routes=[]))
+          for o in (f.get("options") or [])))
+
+# ── Dependencies a human is shown ─────────────────────────────────────────
+# `requires` deliberately over-generates spellings and lets the unmatched ones miss. But
+# `graph.resolve_edges` reports every unmatched candidate as an *external dependency*, and
+# that list is what a customer approves at the discovery gate as their third-party surface.
+_CTRL_REQ = LAY_FACTS["src/Controllers/EmployeeController.php"].requires
+check("an imported name resolves through the use map",
+      "App\\Repositories\\EmployeeRepository" in _CTRL_REQ, str(_CTRL_REQ))
+check("and the current-namespace guess is not also offered",
+      "App\\Controllers\\EmployeeRepository" not in _CTRL_REQ, str(_CTRL_REQ))
+_DB_REQ = LAY_FACTS["src/Core/Database.php"].requires
+check("a class constant is not a class reference",
+      not [n for n in _DB_REQ if "ATTR_ERRMODE" in n or "FETCH_ASSOC" in n], str(_DB_REQ))
+check("Foo::class does not depend on a class named 'class'",
+      not [n for n in LAY_FACTS["routes/web.php"].requires if n.endswith("class")],
+      str(LAY_FACTS["routes/web.php"].requires))
+
+LAY_GRAPH = graph.build(list(LAY_FACTS.values()))
+LAY_EXTERNAL = LAY_GRAPH["stats"]["external_dependencies"]
+check("the runtime's own types are not third-party dependencies",
+      not [n for n in LAY_EXTERNAL if n.rsplit("\\", 1)[-1] in ("PDO", "PDOStatement")],
+      str(LAY_EXTERNAL))
+# `AuthController`, `Controller` and `config/database.php` are genuinely absent from this
+# seven-file fixture, so they belong here. What must not appear is a name this analyzer
+# invented: `App\Controllers\EmployeeRepository`, the current-namespace guess for a class the
+# file imports from somewhere else entirely.
+check("a phantom namespace guess is not reported as a dependency",
+      not [n for n in LAY_EXTERNAL
+           if n.startswith("App\Controllers\\")
+           and n.rsplit("\\", 1)[-1] in ("EmployeeRepository", "Database", "Session",
+                                       "EmployeeService", "PayrollService")],
+      str(LAY_EXTERNAL))
+check("and every remaining entry is a file this fixture really does not contain",
+      {n.rsplit("\\", 1)[-1] for n in LAY_EXTERNAL}
+      <= {"AuthController", "Controller", "config/database.php"}, str(LAY_EXTERNAL))
+_EDGES = {u["path"]: set(u["depends_on"]) for u in LAY_GRAPH["units"]}
+check("while the real edges survive all of that",
+      "src/Core/Database.php" in _EDGES["src/Repositories/EmployeeRepository.php"],
+      str(_EDGES["src/Repositories/EmployeeRepository.php"]))
+
+# ── The controller-to-view edge ───────────────────────────────────────────
+# `$this->view('employees/index')` is a string, so the graph had no edge between a controller
+# and the template it renders. Inferred references live in `soft_requires`: an edge when they
+# resolve, silent when they do not, so guessing at template roots cannot put an invented path
+# on the assessment screen the way `requires` would.
+_CTRL_SOFT = LAY_FACTS["src/Controllers/EmployeeController.php"].soft_requires
+check("a view named by a string is offered as an inferred reference",
+      "views/employees/index.php" in _CTRL_SOFT, str(_CTRL_SOFT))
+check("it becomes a real edge when the template exists",
+      "views/employees/index.php" in _EDGES["src/Controllers/EmployeeController.php"],
+      str(sorted(_EDGES["src/Controllers/EmployeeController.php"])))
+check("so the template is no longer a file nothing depends on",
+      "views/employees/index.php" not in
+      [r["value"] for r in evidence.from_graph(LAY_GRAPH["units"]) if r["kind"] == "entrypoint"],
+      str([r["value"] for r in evidence.from_graph(LAY_GRAPH["units"])
+           if r["kind"] == "entrypoint"]))
+check("and the template roots that matched nothing stay off the dependency list",
+      not [n for n in LAY_EXTERNAL if "templates/" in n or "resources/" in n],
+      str(LAY_EXTERNAL))
+
+# ── A template is not an entry point ──────────────────────────────────────
+# The stem heuristic was written for procedural PHP, where `index.php` anywhere is a
+# requestable page. Behind a front controller it is a fragment, and counting it inflates the
+# entry-point coverage check in `reconcile` and seeds the parity recorder with paths that
+# cannot be requested.
+check("a view named index.php is not an entry point",
+      "views/employees/index.php" not in _lay_vals("entrypoint"),
+      str(_lay_vals("entrypoint")))
+check("the front controller still is",
+      "public/index.php" in [r["value"] for r in
+                             evidence.from_file("public/index.php", "<?php echo 1;")
+                             if r["kind"] == "entrypoint"])
+
+# ── The gate the manifest names ───────────────────────────────────────────
+# `set_charter` raises the discovery gate and used to record `phase="plan_approval"`, so the
+# manifest told the screen the run waited at Gate B while Gate A was open — and because
+# `plan_approval` is a gate name rather than a stage id, `stages.get` returned None and the
+# stage strip rendered blank at the first gate of every run.
+_PHASE_RUN = store.create_run("phase label", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_PHASE_RUN, [{"path": "a.php", "content": "<?php echo 1;"}])
+runner.set_charter(_PHASE_RUN, VALID_CHARTER, "smoke")
+check("the phase names the gate that is actually open",
+      store.get_run(_PHASE_RUN)["phase"] == "discovery_approval",
+      store.get_run(_PHASE_RUN)["phase"])
+check("and the open checkpoint agrees",
+      [c["kind"] for c in store.list_checkpoints(_PHASE_RUN, "open")] == ["discovery_approval"],
+      str([c["kind"] for c in store.list_checkpoints(_PHASE_RUN, "open")]))
+check("a phase that is not a stage still resolves to one for the strip",
+      stages.current("discovery_approval") is not None
+      and stages.current("discovery_approval").id == stages.FIRST)
+
+
+
+# ── 28. A rejected unit is told why ────────────────────────────────────────
+section("28. A rejected unit is told why — the last feedback path that was silent")
+# Build diagnostics reach the next attempt. Behaviour drift reaches the next attempt. Tier-0
+# validation — the check that fires *first*, and the one whose verdict is `fail` rather than a
+# warning — did not. So a unit rejected structurally re-sent a byte-identical prompt, got
+# byte-identical output, and spent all three attempts arguing with itself; the reason a human
+# finally read described the third identical attempt rather than anything actionable.
+#
+# Driven the same way as section 26: a stub that produces a rejectable unit until the prompt
+# tells it what was wrong, so the check is on the *link*, not on a formatting helper.
+_v_prompts = []
+
+
+def _val_conversion(system_prompt, user_content):
+    _v_prompts.append(user_content)
+    told = "previous output for this unit was rejected" in user_content
+    # An unbalanced brace is the cheapest *fail*-severity Tier-0 failure to provoke, and it is
+    # the realistic one: it is what a truncated generation looks like.
+    body = ("public class Ok { }" if told else "public class Ok { void M() { ")
+    refs = []
+    import re as _re
+    label = (_re.search(r"^# Unit to convert: `([^`]+)`", user_content, _re.M)
+             or [None, "Unit"])[1]
+    return {
+        "files": [{"path": f"{_stem(label)}.cs",
+                   "content": f"namespace Acme.App;\n{body}\n", "purpose": "converted"}],
+        "symbols_exported": [], "references": refs, "changes": [], "manual_followup": [],
+        "confidence": "high",
+    }
+
+
+def _val_call_tool(system_prompt, user_content, schema, llm_override=None,
+                   max_tokens=None, **kw):
+    if schema.get("name") == "submit_unit_conversion":
+        return _val_conversion(system_prompt, user_content)
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _val_call_tool
+try:
+    r28 = store.create_run("validation feedback", ".NET 8 / ASP.NET Core MVC", "files",
+                           created_by="smoke")
+    runner.ingest_and_analyze(r28, [{"path": "page.php", "content": "<?php echo 1;\n"}])
+    runner.set_charter(r28, VALID_CHARTER, "smoke")
+    drive(r28, rounds=10)
+
+    _v_convert = [p for p in _v_prompts if "Unit to convert" in p]
+    _v_events = store.list_events(r28, limit=500)
+    check("the structural failure was caught",
+          any(e.get("event") == "validation_failed" for e in _v_events))
+    check("the first attempt was told nothing about a rejection",
+          bool(_v_convert) and "previous output for this unit was rejected" not in _v_convert[0])
+    check("a later attempt was told its output had been rejected",
+          any("previous output for this unit was rejected" in p for p in _v_convert[1:]),
+          f"{len(_v_convert)} attempt(s)")
+    check("and was told which check rejected it",
+          any("structure" in p or "syntax" in p for p in _v_convert[1:]))
+    check("so the retry is not byte-identical to the attempt that failed",
+          len(_v_convert) < 2 or _v_convert[0] != _v_convert[1])
+    _v_units = store.list_units(r28, kind="component") or store.list_units(r28)
+    check("the unit ends converted rather than burning its whole budget",
+          any(u["status"] == "converted" for u in _v_units),
+          str([(u["path"], u["status"]) for u in _v_units]))
+    check("and carries no stale rejection into a future rework",
+          all(not ((u.get("meta") or {}).get("validation_issues"))
+              for u in _v_units if u["status"] == "converted"))
+except Exception:
+    traceback.print_exc()
+    check("the validation-feedback run raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

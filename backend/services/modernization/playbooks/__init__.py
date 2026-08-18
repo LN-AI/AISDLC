@@ -139,12 +139,13 @@ def aggregate_facts(units: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "db_apis": set(), "superglobals": set(), "hazard_kinds": set(),
         "html": False, "sessions": False, "uploads": False, "redirects": False,
-        "json": False, "tables": set(), "languages": set(),
+        "json": False, "tables": set(), "languages": set(), "db_engines": set(),
     }
     for unit in units:
         out["languages"].add(unit.get("language") or "")
         facts = (unit.get("meta") or {}).get("php") or {}
         out["db_apis"].update(facts.get("db_apis") or [])
+        out["db_engines"].update(facts.get("db_engines") or [])
         out["superglobals"].update((facts.get("superglobals") or {}).keys())
         out["hazard_kinds"].update(facts.get("hazard_kinds") or [])
         out["tables"].update(facts.get("tables") or [])
@@ -155,7 +156,8 @@ def aggregate_facts(units: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         out["uploads"] = out["uploads"] or bool(facts.get("handles_uploads"))
         out["redirects"] = out["redirects"] or bool(facts.get("redirects"))
         out["json"] = out["json"] or bool(facts.get("emits_json"))
-    for key in ("db_apis", "superglobals", "hazard_kinds", "tables", "languages"):
+    for key in ("db_apis", "superglobals", "hazard_kinds", "tables", "languages",
+                "db_engines"):
         out[key] = sorted(x for x in out[key] if x)
     return out
 

@@ -128,6 +128,29 @@ DATA = Section(
 | `mysqli_num_rows` / `affected_rows` | `Count` / the `SaveChangesAsync` return |
 | `mysql_pconnect` | delete it. Pooling is automatic and a persistent connection is a bug here |
 
+PDO is the other half, and the more likely one in anything written this decade. It is a set of
+**methods**, so the call sites you are given name them as `->prepare`, `->fetchAll` and so on.
+
+| PHP | .NET |
+|---|---|
+| `new PDO($dsn, $u, $p)` | the `DbContext` / connection from DI — **never constructed per file** |
+| `->prepare($sql)` + `->execute($params)` | one parameterised call; the two steps do not survive |
+| `->execute([':id' => $id])` / `->execute([$id])` | named or positional parameters, kept in the same order |
+| `->fetch()` | `FirstOrDefaultAsync()` — and it returns `false`, not null, when empty |
+| `->fetchAll()` | `ToListAsync()` |
+| `->fetchColumn()` | `ExecuteScalarAsync()` / a projected `Select` |
+| `->rowCount()` | the `SaveChangesAsync` / `ExecuteSqlAsync` return |
+| `->lastInsertId()` | the entity's key after `SaveChangesAsync()`, never a second query |
+| `->exec($ddl)` | `ExecuteSqlRawAsync` — schema/pragma work, **not** a shell command |
+| `PDO::ATTR_ERRMODE = ERRMODE_EXCEPTION` | drop it; EF and ADO.NET throw by default |
+| `PDO::FETCH_ASSOC` as default fetch mode | drop it; the mapping is typed here |
+| `->beginTransaction()` / `->commit()` / `->rollBack()` | one explicit transaction scope |
+| a `private static ?PDO $instance` singleton | **delete the singleton.** A scoped DI registration is the equivalent; a static connection in ASP.NET Core is a bug that only shows under load |
+
+**`->fetch()` returning `false` is a real difference, not a detail.** `$row === false ? null :
+$row` is the source saying "no row"; if you translate that to a truthiness check you change
+what happens for a row that is legitimately empty.
+
 **Concatenated SQL is both an injection and a mapping signal.** You are told which call sites
 built their SQL by concatenation. Every one becomes a parameterised query — there is no
 variant of this where the concatenation is preserved — and each one is a `changes` entry

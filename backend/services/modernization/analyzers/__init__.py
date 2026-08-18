@@ -50,6 +50,12 @@ class UnitFacts:
     module_type: str = ""        # ui | data | business | config | test | entrypoint | unknown
     provides: List[str] = field(default_factory=list)
     requires: List[str] = field(default_factory=list)
+    # References this analyzer *inferred* rather than read: a template named by a string that
+    # a framework turns into a path, a handler named in a route table. They become edges when
+    # they resolve and are silent when they do not — unlike `requires`, whose unresolved names
+    # are reported to a customer as third-party dependencies. Anything guessed belongs here, so
+    # that guessing can stay cheap without putting invented names on the assessment screen.
+    soft_requires: List[str] = field(default_factory=list)
     exports: List[Symbol] = field(default_factory=list)
     confidence: float = 1.0
     source: str = "parser"       # parser | heuristic | default — recorded on the unit row
