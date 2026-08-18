@@ -234,9 +234,12 @@ class UnitConverterAgent(BaseAgent):
         members: Optional[List[Dict[str, Any]]] = None,
         source_facts: Optional[List[Dict[str, Any]]] = None,
         build_diagnostics: str = "",
+        prior_findings: str = "",
     ) -> Dict[str, Any]:
         """`build_diagnostics` is what a real compiler said about this unit's *previous*
         output, and it is the only reason a re-conversion produces anything different.
+        `prior_findings` is the same idea one layer earlier: what `semantics.check` found
+        wrong with the previous attempt, before anything was ever compiled.
 
         It goes in the user message, never the system block: the system block is the cached
         prefix (D-06), so per-unit compiler output there would invalidate the cache for every
@@ -250,6 +253,7 @@ class UnitConverterAgent(BaseAgent):
             in_cycle_with=in_cycle_with or [], redactions=redactions or [],
             placement=placement or {}, members=members or [],
             source_facts=source_facts or [], build_diagnostics=build_diagnostics,
+            prior_findings=prior_findings,
         )
         result = llm_gateway.call_tool(
             self.system_for(charter, addendum), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
@@ -360,6 +364,7 @@ def _build_user_message(
     members: Optional[List[Dict[str, Any]]] = None,
     source_facts: Optional[List[Dict[str, Any]]] = None,
     build_diagnostics: str = "",
+    prior_findings: str = "",
 ) -> str:
     """Everything that varies per unit. Kept out of the system prompt so it cannot
     invalidate the cached prefix."""
@@ -461,6 +466,15 @@ def _build_user_message(
         # compiler, not a review opinion — which is why the instruction is to fix them rather
         # than to consider them.
         parts.append(build_diagnostics)
+
+    if prior_findings:
+        # Last, so it is the most recent thing read before the source. Kept separate from
+        # `build_diagnostics` rather than concatenated into it: a compiler error is a fact
+        # about a file that would not build, and this is a fact about a file that built
+        # perfectly and did the wrong thing. Telling the model the second is the first would
+        # invite it to "fix" behaviour drift by making the code compile, which it already
+        # does.
+        parts.append(prior_findings)
 
     if redactions:
         categories = sorted({r.get("category", "secret") for r in redactions})

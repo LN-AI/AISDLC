@@ -37,8 +37,8 @@ from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence, graph,
-    parity, playbooks, reconcile, repo_ingest, rules, scaffold, stages, store, usings,
-    validation, wireup,
+    parity, playbooks, reconcile, repo_ingest, rules, scaffold, semantics, stages, store,
+    usings, validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -1255,6 +1255,13 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     build_diagnostics = (build_results.summarize_for_prompt(run_id, unit["id"])
                          if (unit.get("rework_attempts") or 0) > 0 else "")
 
+    # What the *last attempt at this same unit* got wrong, from `semantics.check`. Without
+    # it the retry is the trap already documented for the rework loop, one layer down: a
+    # unit failed inline sends a byte-identical prompt, produces byte-identical output and
+    # burns all three attempts arguing with itself. Stored on the unit rather than
+    # recomputed because a failed attempt writes no artifacts to re-examine.
+    prior_findings = semantics.summarize_for_prompt(meta.get("semantic_issues") or [])
+
     try:
         result = agent_guard.guarded_call(
             caller, "modernization", llm_override,
@@ -1274,6 +1281,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                 members=members,
                 source_facts=source_facts,
                 build_diagnostics=build_diagnostics,
+                prior_findings=prior_findings,
             ),
         )
     except Exception as exc:
@@ -1386,6 +1394,52 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
             )
         return "failed"
 
+    # Structurally sound is not the same as faithful. This is the only check in the pipeline
+    # that reads the legacy source and the generated code *together*, and it is the one that
+    # catches output which compiles, runs, and quietly disagrees with the source about what
+    # a value means. It runs after Tier 0 rather than inside it because it needs the source,
+    # which `validation.validate_unit_output` deliberately does not take — that function
+    # judges a file on its own terms and this one judges a translation.
+    drift = semantics.check(
+        source or "\n".join(m["source_text"] for m in members),
+        safe_artifacts,
+        language=unit.get("language") or "",
+        source_paths=[m["path"] for m in members] or [path],
+    )
+    if drift["issues"]:
+        # Confirmed rules are read only now, when there is a finding to attach one to.
+        semantics.attach_rules(drift["issues"], store.list_rules(run_id, status="confirmed"),
+                               [m["path"] for m in members] or [path])
+    if drift["status"] == "fail":
+        # Persisted before failing the unit, because the retry prompt is built from it and a
+        # crash between the two would send the same prompt that produced this output.
+        store.set_unit_meta(unit["id"], {"semantic_issues": drift["issues"]})
+        detail = semantics.describe(drift["issues"])
+        store.append_event(run_id, "semantic_drift", detail[:500],
+                           unit_id=unit["id"], level="error")
+        status = store.fail_unit(unit["id"], run_id,
+                                 f"Behaviour differs from the source: {detail}"[:500],
+                                 max_attempts=MAX_UNIT_ATTEMPTS)
+        if status == "failed":
+            # Blocking, unlike a validation failure. A structurally broken file announces
+            # itself the moment anyone opens it; this one compiles and ships, and the only
+            # symptom is a number that is wrong in production.
+            store.create_checkpoint(
+                run_id, "semantic_drift",
+                f"{path} converts to code that behaves differently from the source",
+                detail=(detail + "\n\n"
+                        + semantics.summarize_for_prompt(drift["issues"]))[:4000],
+                unit_id=unit["id"], blocking=True,
+            )
+        return "failed"
+    if drift["issues"]:
+        store.append_event(run_id, "semantic_drift", semantics.describe(drift["issues"])[:500],
+                           unit_id=unit["id"], level="warning")
+    # Cleared on the way through, so a unit that failed twice and then succeeded does not
+    # carry last time's findings into a later rework prompt as if they were still true.
+    if meta.get("semantic_issues"):
+        store.set_unit_meta(unit["id"], {"semantic_issues": []})
+
     # What the plan promised, against what arrived. The architect wrote `expected_files` for
     # this component and it is already rendered into the prompt — but nothing compared the
     # two, so a component that promised ten files and returned one 52-byte stub was recorded
@@ -1420,6 +1474,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         or (result.get("confidence") or "").lower() == "low" \
         or report["status"] == "warn" \
         or bool(shortfall) \
+        or bool(drift["issues"]) \
         or bool(result.get("manual_followup"))
 
     for artifact in safe_artifacts:

@@ -3041,6 +3041,281 @@ check("a different credential in the same place is not reported as a divergence"
       _replayed.get("passed") == 1 and _replayed.get("failed") == 0, str(_replayed))
 
 
+section("25. Source-idiom fidelity — the conversion that compiles and lies")
+
+from backend.services.modernization import semantics  # noqa: E402
+
+# The real defect, verbatim from a run of the sample PHP app. Everything about it is
+# correct C# and every character of it is wrong: `4242.99` stores as 0 where PHP stores
+# 4242, and the comment above it asserts PHP semantics PHP does not have.
+_PHP_ADD = """<?php
+if($_SERVER['REQUEST_METHOD']=='POST'){
+$_SESSION['employees'][]=['salary'=>(int)$_POST['salary']];
+header('Location: employees.php'); exit;
+}
+"""
+_CS_BAD = """public class AddEmployeeController : Controller {
+    // Salary is stored as int; fractional input is truncated to 0 via TryParse,
+    // matching the (int)$_POST['salary'] cast in the source.
+    int.TryParse(model.Salary, out var salary);
+}
+"""
+_CS_GOOD = """public class AddEmployeeController : Controller {
+    var salary = (int)PhpCompat.IntVal(model.Salary);
+}
+"""
+
+_bad = semantics.check(_PHP_ADD, [{"path": "Features/Add/AddEmployeeController.cs",
+                                   "content": _CS_BAD}], language="PHP")
+check("an (int) cast converted to int.TryParse is a failure, not a warning",
+      _bad["status"] == "fail", str(_bad["status"]))
+check("and the finding names the helper that was already in the project",
+      any(i["helper"] == "PhpCompat.IntVal" for i in _bad["issues"]))
+check("and the file it is in",
+      _bad["issues"][0]["files"] == ["Features/Add/AddEmployeeController.cs"])
+
+_good = semantics.check(_PHP_ADD, [{"path": "Features/Add/AddEmployeeController.cs",
+                                    "content": _CS_GOOD}], language="PHP")
+check("the same unit calling PhpCompat.IntVal passes", _good["status"] == "ok", str(_good))
+
+# All three conditions are required. Each of these has only two of them.
+check("a target idiom whose source never used the PHP one is not a finding",
+      semantics.check("<?php echo $x; ?>", [{"path": "A.cs", "content": _CS_BAD}],
+                      language="PHP")["status"] == "ok")
+check("a source idiom whose output does not use the wrong construct is not a finding",
+      semantics.check(_PHP_ADD, [{"path": "A.cs", "content": "var x = model.Salary;"}],
+                      language="PHP")["status"] == "ok")
+
+# The trap that makes a naive version of this check useless in both directions: the
+# converter explains itself in comments, using exactly these words.
+check("the wrong construct named only in a comment is not a finding",
+      semantics.check(_PHP_ADD, [{"path": "A.cs", "content":
+                                  "// we could have used int.TryParse(model.Salary, out var s) here\n"
+                                  "var s = model.Salary;"}],
+                      language="PHP")["status"] == "ok")
+check("and the helper named only in a comment does not excuse one",
+      semantics.check(_PHP_ADD, [{"path": "A.cs", "content":
+                                  "// PhpCompat.IntVal would also work\n"
+                                  "int.TryParse(model.Salary, out var s);"}],
+                      language="PHP")["status"] == "fail")
+check("a URL in a string does not blank the rest of its line",
+      semantics.check(_PHP_ADD, [{"path": "A.cs", "content":
+                                  'var u = "http://x/y"; int.TryParse(a, out var s);'}],
+                      language="PHP")["status"] == "fail")
+
+# PhpCompat.cs implements every idiom the table looks for, so judging it would fail the
+# first unit of every PHP run.
+check("the shipped PhpCompat.cs is never judged against its own idioms",
+      semantics.check(_PHP_ADD, [{"path": "Compat/PhpCompat.cs", "content": _CS_BAD}],
+                      language="PHP")["status"] == "ok")
+check("nor are non-code artifacts",
+      semantics.check(_PHP_ADD, [{"path": "App.csproj", "content": _CS_BAD}],
+                      language="PHP")["status"] == "ok")
+
+# A language with no table is reported as unchecked rather than as clean.
+_delphi = semantics.check("procedure Foo;", [{"path": "A.cs", "content": _CS_BAD}],
+                          language="Delphi")
+check("a source language with no check table is unchecked, not clean",
+      _delphi["applicable"] is False and _delphi["status"] == "ok")
+
+# `.IndexOf` for `strpos` is the other provable one: the conditions written around it
+# invert, and it is a failure the playbook has warned about since it was written.
+check("strpos converted to .IndexOf is a failure",
+      semantics.check("<?php if(strpos($a,$b)!==false){} ?>",
+                      [{"path": "A.cs", "content": "if (a.IndexOf(b) != -1) {}"}],
+                      language="PHP")["status"] == "fail")
+check("but empty() converted to IsNullOrEmpty is only a warning",
+      semantics.check("<?php if(empty($a)){} ?>",
+                      [{"path": "A.cs", "content": "if (string.IsNullOrEmpty(a)) {}"}],
+                      language="PHP")["status"] == "warn")
+
+# The forward link (C-41): a finding that can name the confirmed rule it contradicts is a
+# different kind of finding from one that says a helper is missing.
+_RULES = [
+    {"statement": "A new employee's ID is the current count of existing employees plus one "
+                  "(the next sequential integer based on array length).",
+     "path": "add_employee.php", "line": 4},
+    {"statement": "Salary is stored as an integer - any fractional or non-numeric input is "
+                  "truncated to integer on save.",
+     "path": "add_employee.php", "line": 9},
+]
+_issues = semantics.attach_rules(list(_bad["issues"]), _RULES, ["add_employee.php"])
+check("the finding cites the confirmed rule the output contradicts",
+      "truncated to integer" in (_issues[0]["rule"] or ""), _issues[0]["rule"])
+check("and not the other rule on the same file that merely says 'integer'",
+      "sequential integer" not in (_issues[0]["rule"] or ""))
+check("a rule about something else entirely is not cited at all",
+      semantics.attach_rules(
+          list(_bad["issues"]),
+          [{"statement": "The nav bar always exposes exactly three links.",
+            "path": "add_employee.php", "line": 17}],
+          ["add_employee.php"])[0]["rule"] == "")
+check("nor is a rule read from a file this unit did not convert",
+      semantics.attach_rules(list(_bad["issues"]), _RULES, ["employees.php"])[0]["rule"] == "")
+# One shared word is a coincidence, not a subject. The ID rule says "sequential integer"
+# and is the only candidate here, so nothing outranks it — the bar has to reject it alone.
+check("a rule sharing one word with the finding is not evidence of anything",
+      semantics.attach_rules(list(_bad["issues"]), _RULES[:1],
+                             ["add_employee.php"])[0]["rule"] == "",
+      semantics.attach_rules(list(_bad["issues"]), _RULES[:1],
+                             ["add_employee.php"])[0]["rule"])
+
+# The retry block is the whole point: without it the second attempt sends a byte-identical
+# prompt, produces byte-identical output and burns all three attempts arguing with itself.
+_issues = semantics.attach_rules(list(_bad["issues"]), _RULES, ["add_employee.php"])
+_prompt = semantics.summarize_for_prompt(_issues)
+check("the retry prompt states the helper to call", "PhpCompat.IntVal" in _prompt)
+check("and quotes the rule the previous attempt broke", "truncated to integer" in _prompt)
+check("and forbids the comment the previous attempt argued with",
+      "Do not explain in a comment" in _prompt)
+check("a clean unit contributes no retry block", semantics.summarize_for_prompt([]) == "")
+
+# It has to reach the converter, or none of the above changes a single generated file.
+import inspect  # noqa: E402
+from backend.agents.modernization_intelligence import unit_converter as _uc  # noqa: E402
+check("the converter accepts prior findings",
+      "prior_findings" in inspect.signature(_uc.UnitConverterAgent.convert).parameters)
+_msg = _uc._build_user_message(
+    source="<?php ?>", path="a.php", dependency_symbols=[], module_type="", language="PHP",
+    in_cycle_with=[], redactions=[], prior_findings=_prompt)
+check("and renders them into the user message, never the cached system block",
+      "PhpCompat.IntVal" in _msg and "Behaviour drift" in _msg)
+_clean = _uc._build_user_message(
+    source="<?php ?>", path="a.php", dependency_symbols=[], module_type="", language="PHP",
+    in_cycle_with=[], redactions=[])
+check("a first attempt carries no drift block at all", "Behaviour drift" not in _clean)
+
+
+
+section("26. Drift, end to end — the unit that fails itself and then fixes itself")
+
+# The module is only worth what the runner does with it. This drives a real conversion in
+# which the stubbed converter behaves exactly as the real one did: it writes int.TryParse
+# for an (int) cast, and it only writes the right thing once the prompt tells it what it
+# got wrong. If any link is missing the run either completes with the defect (no check) or
+# never completes at all (no feedback on retry).
+_drift_prompts = []
+
+
+def _drift_conversion(system_prompt, user_content):
+    _drift_prompts.append(user_content)
+    corrected = "Behaviour drift" in user_content
+    body = ("var salary = (int)PhpCompat.IntVal(model.Salary);" if corrected
+            else "int.TryParse(model.Salary, out var salary);")
+    import re as _re
+    label = (_re.search(r"^# Unit to convert: `([^`]+)`", user_content, _re.M)
+             or [None, "Unit"])[1]
+    return {
+        "files": [{"path": f"{_stem(label)}.cs",
+                   "content": f"namespace Acme.App;\npublic class C {{ void M() {{ {body} }} }}\n",
+                   "purpose": "converted"}],
+        "symbols_exported": [], "references": [], "changes": [], "manual_followup": [],
+        "confidence": "high",
+    }
+
+
+def _drift_call_tool(system_prompt, user_content, schema, llm_override=None,
+                     max_tokens=None, **kw):
+    if schema.get("name") == "submit_unit_conversion":
+        return _drift_conversion(system_prompt, user_content)
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _drift_call_tool
+try:
+    r26 = store.create_run("drift", ".NET 8 / ASP.NET Core MVC", "files", created_by="smoke")
+    runner.ingest_and_analyze(r26, [
+        {"path": "add_employee.php",
+         "content": "<?php\n$_SESSION['e'][]=['salary'=>(int)$_POST['salary']];\n"},
+    ])
+    runner.set_charter(r26, VALID_CHARTER, "smoke")
+    drive(r26, rounds=10)
+
+    _events = store.list_events(r26, limit=500)
+    check("the drift was caught while the run was still running",
+          any(e.get("event") == "semantic_drift" for e in _events))
+    check("the unit was sent back rather than recorded as converted",
+          any(e.get("event") == "unit_retry" for e in _events))
+
+    # The link that makes the retry worth paying for.
+    _convert_prompts = [p for p in _drift_prompts if "Unit to convert" in p]
+    check("the first attempt was told nothing about drift",
+          _convert_prompts and "Behaviour drift" not in _convert_prompts[0])
+    check("a later attempt was told exactly what it got wrong",
+          any("Behaviour drift" in p for p in _convert_prompts[1:]),
+          f"{len(_convert_prompts)} conversion prompt(s)")
+    check("and named the helper to call",
+          any("PhpCompat.IntVal" in p for p in _convert_prompts[1:]))
+
+    _final = [a for a in store.list_artifacts(r26, current_only=True, include_content=True)
+              if a["path"].endswith(".cs") and "PhpCompat.cs" not in a["path"]]
+    check("the code the run ends with calls the helper",
+          any("PhpCompat.IntVal" in (a.get("content") or "") for a in _final),
+          str([a["path"] for a in _final]))
+    check("and no longer contains the construct that was wrong",
+          all("int.TryParse" not in (a.get("content") or "") for a in _final))
+
+    _units = [u for u in store.list_units(r26, kind="component")]
+    check("the unit ends converted, not failed",
+          all(u["status"] == "converted" for u in _units),
+          str([(u["component_name"], u["status"]) for u in _units]))
+    check("and carries no stale findings into any future rework",
+          all(not (u.get("meta") or {}).get("semantic_issues") for u in _units))
+except Exception:
+    traceback.print_exc()
+    check("the drift run raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+# A unit that never gets it right must not loop forever, and must not be filed as done.
+_stuck_prompts = []
+
+
+def _stuck_call_tool(system_prompt, user_content, schema, llm_override=None,
+                     max_tokens=None, **kw):
+    if schema.get("name") == "submit_unit_conversion":
+        _stuck_prompts.append(user_content)
+        return {"files": [{"path": "Stuck.cs",
+                           "content": "namespace Acme.App;\npublic class C "
+                                      "{ void M() { int.TryParse(a, out var b); } }\n",
+                           "purpose": "converted"}],
+                "symbols_exported": [], "references": [], "changes": [],
+                "manual_followup": [], "confidence": "high"}
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _stuck_call_tool
+try:
+    r26b = store.create_run("drift-stuck", ".NET 8 / ASP.NET Core MVC", "files",
+                            created_by="smoke")
+    runner.ingest_and_analyze(r26b, [
+        {"path": "add_employee.php",
+         "content": "<?php\n$_SESSION['e'][]=['salary'=>(int)$_POST['salary']];\n"},
+    ])
+    runner.set_charter(r26b, VALID_CHARTER, "smoke")
+    drive(r26b, rounds=10)
+
+    _stuck_units = store.list_units(r26b, kind="component")
+    check("a unit that never stops drifting is not filed as converted",
+          all(u["status"] != "converted" for u in _stuck_units),
+          str([(u["component_name"], u["status"]) for u in _stuck_units]))
+    check("the retry count is bounded rather than looping on the budget",
+          len([p for p in _stuck_prompts if "Unit to convert" in p]) <= 6,
+          f"{len(_stuck_prompts)} attempt(s)")
+    _cps = [c for c in store.list_checkpoints(r26b) if c["kind"] == "semantic_drift"]
+    check("and a person is asked about it, blockingly",
+          bool(_cps) and bool(_cps[0]["blocking"]),
+          str([(c["kind"], c["blocking"]) for c in store.list_checkpoints(r26b)]))
+    check("the checkpoint says which construct and which helper",
+          bool(_cps) and "PhpCompat.IntVal" in (_cps[0].get("detail") or ""))
+except Exception:
+    traceback.print_exc()
+    check("the stuck-drift run raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
