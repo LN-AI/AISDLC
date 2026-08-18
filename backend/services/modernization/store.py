@@ -956,6 +956,7 @@ def complete_unit(
     try:
         # Version rather than overwrite: a re-conversion (retry, or a human asking for
         # another pass) must not destroy what a reviewer may already have read.
+        overwritten: List[str] = []
         for artifact in artifacts:
             path = artifact.get("path") or ""
             prev = cursor.execute(
@@ -963,6 +964,22 @@ def complete_unit(
                 (run_id, path),
             ).fetchone()
             version = (prev["v"] or 0) + 1
+            # Versioning is right for the *same* unit converting again. For a **different**
+            # unit it means one component has taken over another's file, and the loser simply
+            # stops being current: it vanishes from the export and from reconciliation with no
+            # row anywhere saying so. `architecture` keeps `output_dir` unique precisely to
+            # make this impossible, so reaching here means that guarantee has been defeated —
+            # by a converter returning an absolute-ish path, or by two components legitimately
+            # sharing a directory. Silence was the wrong answer either way: this is the same
+            # class as two units emitting one symbol, which has warned since it was found.
+            if version > 1:
+                owner = cursor.execute(
+                    "SELECT unit_id FROM modernization_artifacts "
+                    "WHERE run_id = ? AND path = ? AND version = ?",
+                    (run_id, path, version - 1),
+                ).fetchone()
+                if owner and owner["unit_id"] and owner["unit_id"] != unit_id:
+                    overwritten.append(path)
             cursor.execute(
                 "UPDATE modernization_artifacts SET is_current = 0 WHERE run_id = ? AND path = ?",
                 (run_id, path),
@@ -1023,6 +1040,15 @@ def complete_unit(
                  + (f" in {prior_path}" if prior_path else "")
                  + ". The later declaration wins; both are reported by reconciliation.", now),
             )
+        for path in overwritten[:20]:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, unit_id, level, event, detail, created_at) "
+                "VALUES (?, ?, 'warning', 'artifact_overwritten', ?, ?)",
+                (run_id, unit_id,
+                 f"{path} was already produced by a different unit. This unit's version is now "
+                 f"the current one and the earlier file is no longer in the export — two "
+                 f"components have claimed the same output path.", now),
+            )
 
         cursor.execute(
             "UPDATE modernization_units SET status='converted', lease_owner=NULL, "
@@ -1066,7 +1092,8 @@ def complete_unit(
     if validation:
         logger.debug("Unit %s validation: %s", unit_id, validation)
     return {"artifacts": len(artifacts), "symbols": len(symbols), "unblocked": promoted,
-            "members_converted": members, "symbol_conflicts": len(conflicts)}
+            "members_converted": members, "symbol_conflicts": len(conflicts),
+            "overwritten_paths": list(overwritten)}
 
 
 def fail_unit(unit_id: str, run_id: str, error: str, terminal: bool = False,

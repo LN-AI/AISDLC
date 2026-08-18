@@ -17,7 +17,11 @@ What is enforced, none of it optional:
      reported, because a decomposition covering 90% of a codebase is worse than a blunt one
      covering all of it;
   2. `output_dir` is path-safe and unique, so two components can never collide on a filename;
-  3. namespaces are unique;
+  3. namespaces are legal identifier paths — but **not** unique: several components may
+     contribute types to one namespace, which is the normal shape of a domain model. Making
+     them unique fragmented it instead (`Entities`, `Entities2`, `Entities3`…), and the real
+     conflict — two components declaring the same *type* — is caught by `reconcile` and by
+     the `symbol_conflict` warning rather than by renaming;
   4. the component graph is the file graph projected onto the partition, condensed with the
      *same* Tarjan/Kahn implementation the file graph uses (`graph.condense`) — a partition
      can create cycles between components that did not exist between files, and a second
@@ -187,10 +191,25 @@ def normalize_proposal(
         namespace = _legal_namespace(_NS_OK.sub("", raw.get("namespace") or "").strip("."))
         if not namespace:
             namespace = ".".join(part for part in (project, _pascal(name)) if part)
-        # Suffixed onto the final segment, with no separator: the result has to be a legal
-        # identifier path in the target language, and every artifact in the component
-        # declares it verbatim.
-        namespace = _unique(namespace, taken_ns, 2, separator="")
+        # Deliberately **not** made unique. Two components sharing a namespace is what a
+        # namespace is for: four entity components each proposing `Acme.Ems.Domain.Entities`
+        # is the correct answer, and renaming them apart produced `Entities`, `Entities2`,
+        # `Entities3`, `Entities4` — so every consumer imported four namespaces for one
+        # logical area, `usings.py` had to repair each of them, and the emitted domain model
+        # was not something any C# developer would have written. Observed on a 45-file run.
+        #
+        # `output_dir` still has to be unique, because two components writing the same
+        # filename into the same directory lose one of them. Nothing has that problem here:
+        # C# does not couple a namespace to a directory, and the thing that genuinely
+        # conflicts is a duplicate *type* name, which `reconcile` already reports and
+        # `symbol_conflict` already warns about while the run is going.
+        #
+        # Reported rather than silent: a shared namespace is usually right, but if the
+        # architect put two unrelated areas in one it is worth a human seeing that.
+        if namespace in taken_ns:
+            problems.append(f"component '{name}' shares the namespace '{namespace}' with "
+                            f"another component; kept as proposed, since types in one "
+                            f"namespace may be split across components")
         taken_ns.add(namespace)
 
         for member in keep:

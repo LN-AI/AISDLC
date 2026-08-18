@@ -3737,6 +3737,67 @@ finally:
     llm_gateway.call_tool = _real_call_tool
 
 
+
+# ── 29. Where two components meet ──────────────────────────────────────────
+section("29. Where two components meet — a shared namespace and a claimed path")
+# Both of these only appear once a decomposition produces many components in one area, which
+# the seven-file fixtures never did. A 45-file run produced four entity components, and both
+# showed up at once.
+
+# A namespace is a thing several components may contribute to. Making it unique instead split
+# one domain model into `Entities`, `Entities2`, `Entities3`, `Entities4`, so every consumer
+# imported four namespaces for one logical area and `usings.py` had to repair each of them.
+_ns_files = [{"path": f"src/Models/{n}.php"} for n in
+             ("Employee", "Department", "User", "Attendance")]
+_ns_proposal = {"components": [
+    {"name": f"{n.lower()}-entity", "project": "Acme.Domain",
+     "namespace": "Acme.Domain.Entities", "output_dir": "Acme.Domain/Entities",
+     "members": [f"src/Models/{n}.php"]}
+    for n in ("Employee", "Department", "User", "Attendance")]}
+_ns_out = _architecture.normalize_proposal(_ns_proposal, _ns_files)
+_ns_components = _ns_out["components"] if isinstance(_ns_out, dict) else _ns_out[0]
+_ns_problems = _ns_out["problems"] if isinstance(_ns_out, dict) else _ns_out[1]
+_ns_used = [c["namespace"] for c in _ns_components]
+check("four components in one area share one namespace",
+      _ns_used == ["Acme.Domain.Entities"] * 4, str(_ns_used))
+check("no namespace ends in a digit-suffixed segment",
+      not [n for n in _ns_used if re.search(r"\d$", n)], str(_ns_used))
+check("but the sharing is reported rather than silent",
+      len([p for p in _ns_problems if "shares the namespace" in p]) == 3, str(_ns_problems))
+# The dedup that must stay: two components writing the same filename into the same directory
+# lose one of them, and artifacts are versioned by path.
+check("output directories are still made unique",
+      len({c["output_dir"] for c in _ns_components}) == 4,
+      str([c["output_dir"] for c in _ns_components]))
+check("and a namespace that is not a legal identifier is still corrected",
+      _architecture._legal_namespace("Shop.Web.2Factor") == "Shop.Web.N2Factor")
+
+# Two units, one output path. Versioning is right for a unit converting again; across units it
+# means one component has taken over another's file and the loser silently stops being current
+# — it leaves the export and reconciliation with no row anywhere saying so.
+_ovw = store.create_run("overwrite", ".NET 8", "files", created_by="smoke")
+store.insert_units(_ovw, [{"path": "#c/0", "kind": "component", "status": "ready",
+                           "topo_level": 0, "order_index": 0}])
+store.insert_units(_ovw, [{"path": "#c/1", "kind": "component", "status": "ready",
+                           "topo_level": 0, "order_index": 1}])
+_ovw_units = store.list_units(_ovw, kind="component")
+_ovw_art = [{"path": "Domain/Entities/Employee.cs", "content": "public class A { }",
+             "purpose": "converted"}]
+store.complete_unit(_ovw_units[0]["id"], _ovw, _ovw_art, [], None)
+_ovw_second = store.complete_unit(_ovw_units[1]["id"], _ovw, _ovw_art, [], None)
+check("a second unit claiming the same path is reported",
+      _ovw_second.get("overwritten_paths") == ["Domain/Entities/Employee.cs"],
+      str(_ovw_second.get("overwritten_paths")))
+check("and the run log says so",
+      any(e.get("event") == "artifact_overwritten" for e in store.list_events(_ovw, limit=50)))
+check("the same unit converting again is not a conflict",
+      not store.complete_unit(_ovw_units[1]["id"], _ovw, _ovw_art,
+                              [], None).get("overwritten_paths"))
+check("and only one version of the path is current",
+      len([a for a in store.list_artifacts(_ovw, current_only=True)
+           if a["path"] == "Domain/Entities/Employee.cs"]) == 1)
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
