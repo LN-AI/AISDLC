@@ -42,7 +42,7 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
-    evidence, graph, parity, parity_tools, reconcile, repo_ingest, runner,
+    evidence, extraction_audit, graph, parity, parity_tools, reconcile, repo_ingest, runner,
     rules as rules_module, sanity, scaffold, stages, store, usings, validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
@@ -629,6 +629,22 @@ def _fake_portrait():
     }
 
 
+def _fake_audit(user_content):
+    """One claim whose quote is real and one whose quote is invented.
+
+    Both are needed. A stub that only ever proposes findable quotes would let a broken
+    verifier pass every check here, and the verifier is the entire reason a model is allowed
+    near this inventory at all.
+    """
+    claims = [{"kind": "table", "value": "audit_log", "path": "lib/db.php",
+               "quote": "mysqli_connect", "detail": "reached through a wrapper"},
+              {"kind": "route", "value": "/invented", "path": "lib/db.php",
+               "quote": "this text is nowhere in that file at all",
+               "detail": "a claim whose quote does not exist"}]
+    return {"claims": claims,
+            "assessment": "The extraction read this codebase reasonably well."}
+
+
 def fake_call_tool(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
     name = schema.get("name")
     call_log.append(name)
@@ -640,6 +656,8 @@ def fake_call_tool(system_prompt, user_content, schema, llm_override=None, max_t
         return _fake_probe(user_content)
     if name == "submit_system_portrait":
         return _fake_portrait()
+    if name == "submit_extraction_audit":
+        return _fake_audit(user_content)
     return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
 
 
@@ -782,7 +800,15 @@ try:
     # rather than against a fixed total, so that adding an LLM stage cannot silently
     # convert this into an assertion about something else.
     _comprehension_calls = (call_log.count("submit_comprehension")
-                            + call_log.count("submit_system_portrait"))
+                            + call_log.count("submit_system_portrait")
+                            # The extraction audit closes the comprehension stage, so it is
+                            # one of the calls this composition has to account for. Counted
+                            # here rather than folded into the total, so that the *number* of
+                            # audit calls stays asserted: it is one per run, and a second one
+                            # would mean the stage was finished twice.
+                            + call_log.count("submit_extraction_audit"))
+    check("the extraction audit runs exactly once per run",
+          call_log.count("submit_extraction_audit") == 1, str(call_log))
     check("the scaffold cost no model call",
           call_log.count("submit_unit_conversion") == 6
           and call_log.count("submit_target_architecture") == 1
@@ -4280,6 +4306,224 @@ check("the entry project comes from the normalized project list, so it is the ho
       _entry_from_design == "Acme.Web", _entry_from_design)
 check("and the two disagree — which is the whole bug",
       _entry_from_design != _entry_from_first)
+
+
+
+# ── 33. The extraction audit ──────────────────────────────────────
+section("33. The extraction audit — a model allowed near the inventory, on a short leash")
+
+# `sanity.py` catches the failure where two of our own extractors disagree. It cannot catch
+# the one where both are quietly, uniformly wrong — a framework nobody wrote a recogniser for.
+# There is always a next framework, so the general-purpose net is a model that reads the source
+# and the extracted facts side by side.
+#
+# D-04 says the LLM never produces evidence. That is kept intact and it is not a compromise:
+# nothing is adopted on the model's authority, only on the authority of a quote found in the
+# customer's own file. Every check below is about that leash holding.
+
+_AUDIT_SOURCES = {
+    "app/Http/routes.php": (
+        "<?php\n"
+        "return [\n"
+        "    'GET /reports' => 'ReportController@index',\n"
+        "    'POST /reports/export' => 'ReportController@export',\n"
+        "];\n"
+    ),
+    "app/Repository.php": (
+        "<?php\n"
+        "class Repository {\n"
+        "    public function fetchAll() {\n"
+        "        return $this->run('SELECT * FROM payroll_runs');\n"
+        "    }\n"
+        "}\n"
+    ),
+}
+
+# A route table expressed as a plain array of strings: no `$router->get(`, no `Route::`, so
+# `evidence._CODE_ROUTE` cannot see it. This is exactly the shape the net exists for.
+_claims = [
+    {"kind": "route", "value": "GET /reports", "path": "app/Http/routes.php",
+     "line": 99, "quote": "'GET /reports' => 'ReportController@index'",
+     "detail": "routes are an array of strings, not method calls"},
+    {"kind": "table", "value": "payroll_runs", "path": "app/Repository.php",
+     "line": 4, "quote": "SELECT * FROM payroll_runs", "detail": "SQL inside a wrapper call"},
+]
+_out = extraction_audit.verify(_claims, _AUDIT_SOURCES)
+check("a claim whose quote is in the file it cites is confirmed",
+      len(_out["confirmed"]) == 2, str(_out["counts"]))
+check("and the line is corrected to where the quote really is, not where it was claimed",
+      [c["line"] for c in _out["confirmed"]] == [3, 4],
+      str([(c["value"], c["line"]) for c in _out["confirmed"]]))
+check("a confirmed row is marked as the model's, not the parser's",
+      all(c["source"] == "model_audit" for c in _out["confirmed"]))
+check("and carries a confidence below anything a parser proved",
+      all(c["confidence"] < 0.75 for c in _out["confirmed"]),
+      str([c["confidence"] for c in _out["confirmed"]]))
+check("the snippet is the customer's own line, not the model's retyping of it",
+      _out["confirmed"][1]["snippet"].startswith("return $this->run("),
+      _out["confirmed"][1]["snippet"])
+
+# The leash. Each of these is a way an invented fact could otherwise reach the inventory, and
+# every conversion prompt after it.
+def _rejected_for(claim):
+    result = extraction_audit.verify([claim], _AUDIT_SOURCES)
+    return (result["rejected"][0]["reject_reason"] if result["rejected"] else "")
+
+
+check("a quote that is not in the file is discarded",
+      _rejected_for({"kind": "table", "value": "ghost", "path": "app/Repository.php",
+                     "quote": "SELECT * FROM ghost_table_nobody_wrote"}) == "quote_not_found")
+check("a claim about a file that was never ingested is discarded",
+      _rejected_for({"kind": "table", "value": "x", "path": "app/Nowhere.php",
+                     "quote": "SELECT * FROM payroll_runs"}) == "unknown_path")
+check("a quote too short to mean anything is discarded",
+      _rejected_for({"kind": "table", "value": "x", "path": "app/Repository.php",
+                     "quote": "run("}) == "quote_too_short")
+check("a kind outside the closed vocabulary is discarded, not reinterpreted",
+      _rejected_for({"kind": "business_rule", "value": "x", "path": "app/Repository.php",
+                     "quote": "SELECT * FROM payroll_runs"}) == "unknown_kind")
+check("a claim with no value is discarded",
+      _rejected_for({"kind": "table", "value": "", "path": "app/Repository.php",
+                     "quote": "SELECT * FROM payroll_runs"}) == "empty_value")
+check("nothing survives a verify against no sources at all",
+      extraction_audit.verify(_claims, {})["confirmed"] == [])
+
+# Whitespace is ignored in the match and nothing else is, which is the same standard
+# `rules.verify` holds a business rule to — deliberately, via the same two functions.
+check("a quote that differs only in whitespace still matches",
+      len(extraction_audit.verify(
+          [{"kind": "table", "value": "payroll_runs", "path": "app/Repository.php",
+            "quote": "SELECT  *   FROM\n payroll_runs"}], _AUDIT_SOURCES)["confirmed"]) == 1)
+check("a path missing its directory prefix resolves when it is unambiguous",
+      len(extraction_audit.verify(
+          [{"kind": "table", "value": "payroll_runs", "path": "Repository.php",
+            "quote": "SELECT * FROM payroll_runs"}], _AUDIT_SOURCES)["confirmed"]) == 1)
+check("but an ambiguous suffix does not — it would land on whichever file sorted first",
+      extraction_audit.verify(
+          [{"kind": "table", "value": "x", "path": "Repository.php",
+            "quote": "SELECT * FROM payroll_runs"}],
+          {"a/Repository.php": "SELECT * FROM payroll_runs",
+           "b/Repository.php": "SELECT * FROM payroll_runs"})["confirmed"] == [])
+
+# Re-reporting what we already have is a distinct outcome from inventing something, and the
+# counts have to say which — a model that mostly repeats us is telling us the extraction is good.
+_known = [("table", "app/Repository.php", "payroll_runs")]
+_dup = extraction_audit.verify(_claims, _AUDIT_SOURCES, _known)
+check("a claim repeating a fact the extraction already had is dropped",
+      len(_dup["confirmed"]) == 1, str(_dup["counts"]))
+check("and it is counted as already known, not as an invention",
+      _dup["counts"]["by_reason"].get("already_known") == 1, str(_dup["counts"]))
+check("the same claim twice in one answer is stored once",
+      len(extraction_audit.verify(_claims + _claims, _AUDIT_SOURCES)["confirmed"]) == 2)
+check("more claims than the cap are not all processed",
+      extraction_audit.verify(
+          _claims * 40, _AUDIT_SOURCES)["counts"]["claimed"] == len(_claims) * 40)
+
+# The request. What it shows decides what it can find, and an absence has to be stated or it
+# reads as a category nobody was looking at.
+_request = extraction_audit.render_request(
+    [{"path": p, "content": c} for p, c in _AUDIT_SOURCES.items()],
+    [{"kind": "table", "path": "app/Repository.php", "value": "payroll_runs"}],
+    {"files_ingested": 2, "read_by": {"parser": 2}, "edges": 1, "db_apis": [], "db_sites": 0})
+check("the request shows the file tree", "app/Http/routes.php" in _request)
+check("and the source itself, which is what a claim can be checked against",
+      "ReportController@index" in _request)
+check("and what the extraction concluded, so the model argues with it rather than guessing",
+      "payroll_runs" in _request)
+check("an empty category is stated as empty rather than omitted",
+      "route: (none)" in _request, _request[:400])
+check("the model is told a claim about an unshown file cannot be checked",
+      "will be discarded" in _request)
+
+check("the audit describes what it threw away, not only what it kept",
+      "discarded" in extraction_audit.describe(_out["counts"]), str(_out["counts"]))
+check("and says so plainly when there was nothing to find",
+      "nothing" in extraction_audit.describe({"claimed": 0}))
+
+# End to end through a run: the call is made, what survives is stored as evidence, what does
+# not is not, and the run says both happened.
+llm_gateway.call_tool = fake_call_tool
+_audit_run = store.create_run("audit", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_audit_run, PHP_FIXTURE)
+runner.set_charter(_audit_run, VALID_CHARTER, "smoke")
+_before_evidence = len(store.list_evidence(_audit_run))
+_audit_calls = call_log.count("submit_extraction_audit")
+runner._audit_extraction(_audit_run, CALLER, None)
+check("the audit is one call", call_log.count("submit_extraction_audit") == _audit_calls + 1)
+_after = store.list_evidence(_audit_run)
+_recovered = [r for r in _after if r.get("source") == "model_audit"]
+check("the confirmed claim is stored as evidence", len(_recovered) == 1, str(_recovered))
+check("and the invented one is not",
+      not [r for r in _after if "invented" in str(r.get("value") or "")], str(_after[-3:]))
+check("the recovered row is distinguishable from a parser row on sight",
+      _recovered[0]["source"] == "model_audit" and _recovered[0]["confidence"] < 1,
+      str(_recovered[0]))
+_audit_events = [e for e in store.list_events(_audit_run) if e["event"] == "extraction_audited"]
+check("the run log records the audit, with both numbers", len(_audit_events) == 1,
+      str([e["event"] for e in store.list_events(_audit_run)]))
+check("and it names what was discarded as well as what was kept",
+      "discarded" in (_audit_events[0]["detail"] or ""), str(_audit_events[0]["detail"]))
+_audit_stats = (store.get_run(_audit_run).get("stats") or {}).get("extraction_audit") or {}
+check("the assessment a human reads is kept on the run",
+      "extraction" in (_audit_stats.get("assessment") or "").lower(), str(_audit_stats))
+check("a recovered fact is raised as a checkpoint, so it is not only in a log",
+      any(c["kind"] == "extraction_audit" for c in store.list_checkpoints(_audit_run)))
+check("and it does not block the run — it is a net, not a gate",
+      all(not c["blocking"] for c in store.list_checkpoints(_audit_run)
+          if c["kind"] == "extraction_audit"))
+
+# The one property that matters more than any finding: this call cannot take a run down. It is
+# optional, it is cheap, and a net that can fail the thing it watches is worse than no net.
+_boom_run = store.create_run("audit-boom", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_boom_run, PHP_FIXTURE)
+runner.set_charter(_boom_run, VALID_CHARTER, "smoke")
+_saved_audit = llm_gateway.call_tool
+
+
+def _exploding(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
+    if schema.get("name") == "submit_extraction_audit":
+        raise RuntimeError("the provider hung up")
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _exploding
+try:
+    runner._audit_extraction(_boom_run, CALLER, None)
+    check("a failing audit does not raise into the run", True)
+except Exception as exc:
+    check("a failing audit does not raise into the run", False, f"{type(exc).__name__}: {exc}")
+finally:
+    llm_gateway.call_tool = _saved_audit
+check("and the failure is recorded rather than swallowed",
+      any(e["event"] == "extraction_audit_skipped" for e in store.list_events(_boom_run)),
+      str([e["event"] for e in store.list_events(_boom_run)]))
+check("the run is still usable afterwards",
+      store.get_run(_boom_run)["status"] not in ("failed",))
+
+# Recovered facts answer contradictions rather than sitting beside them: a warning a later
+# stage has already resolved is a warning that teaches a reader to skip the list.
+_resignalled = runner._resignal(
+    {"routes": 1, "tables": [], "entrypoints": 2, "config_keys": 0, "datastores": []},
+    [{"kind": "route", "value": "/reports"}, {"kind": "table", "value": "payroll_runs"},
+     {"kind": "config_key", "value": "db.dsn"}, {"kind": "datastore", "value": "PDO"}])
+check("a recovered route raises the route count", _resignalled["routes"] == 2, str(_resignalled))
+check("a recovered table joins the table list",
+      _resignalled["tables"] == ["payroll_runs"], str(_resignalled))
+check("a recovered datastore joins the datastore list",
+      _resignalled["datastores"] == ["PDO"], str(_resignalled))
+check("but an audit cannot make a parser have succeeded — the read counts are untouched",
+      "read_by" not in runner._resignal({"routes": 0}, [{"kind": "route", "value": "/x"}]))
+check("nor can it invent query sites it never proved",
+      runner._resignal({"db_sites": 0}, [{"kind": "table", "value": "t"}])["db_sites"] == 0)
+
+# The gate has to quote it. A gate that quotes five calls for a run that makes six is the same
+# dishonesty splitting the gates in two was meant to remove.
+llm_gateway.call_tool = _real_call_tool
+
+_audit_estimate = runner._discovery_estimate(_audit_run)
+check("the assessment estimate includes the audit call",
+      _audit_estimate["calls"] >= _audit_estimate["comprehension_calls"] + 2,
+      str(_audit_estimate))
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

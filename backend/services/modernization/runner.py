@@ -31,14 +31,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from backend.agents.modernization_intelligence import architect_agent, unit_converter
 from backend.agents.modernization_intelligence import comprehension_agent as _comprehension
+from backend.agents.modernization_intelligence import extraction_audit_agent as _extraction_audit
 from backend.agents.modernization_intelligence.architect_agent import TargetArchitectAgent
 from backend.agents.modernization_intelligence.unit_converter import UnitConverterAgent
 from backend.services import agent_guard, guardrail_service
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
-    analyzers, architecture, build_results, comprehension, estimate, evidence, graph,
-    parity, playbooks, reconcile, repo_ingest, rules, sanity, scaffold, semantics, stages,
-    store, usings, validation, wireup,
+    analyzers, architecture, build_results, comprehension, estimate, evidence,
+    extraction_audit, graph, parity, playbooks, reconcile, repo_ingest, rules, sanity,
+    scaffold, semantics, stages, store, usings, validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -284,6 +285,22 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
         expected += merge["expected_usd"]
         ceiling += merge["ceiling_usd"]
         estimated = estimated or merge["estimated"]
+
+    # The extraction audit. One call, and it is quoted here for the same reason the probes
+    # are: it runs between this gate and the next one, so a gate that left it out would be
+    # quoting a number the run does not spend. Priced from the sample it actually reads
+    # (`extraction_audit.MAX_SAMPLE_CHARS`) rather than from the whole codebase, which is the
+    # difference between a few cents and a misleading headline on a large repository.
+    if units:
+        sampled = min(sum(len(u.get("source_text") or "") for u in units),
+                      extraction_audit.MAX_SAMPLE_CHARS)
+        audit = estimate.band(
+            estimate.tokens("x" * sampled) + estimate.PROMPT_FRAME_TOKENS,
+            _extraction_audit.AUDIT_MAX_TOKENS // 3, _extraction_audit.AUDIT_MAX_TOKENS)
+        calls += 1
+        expected += audit["expected_usd"]
+        ceiling += audit["ceiling_usd"]
+        estimated = estimated or audit["estimated"]
 
     return {"calls": calls, "expected_usd": round(expected, 4),
             "ceiling_usd": round(ceiling, 4), "model": numbers["model"],
@@ -707,7 +724,9 @@ def _produce(run_id: str, stage, unit: Dict[str, Any], charter: Dict[str, Any],
 
 
 def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]) -> None:
-    if stage.id == "taskplan":
+    if stage.id == "comprehension":
+        _audit_extraction(run_id, caller, llm_override)
+    elif stage.id == "taskplan":
         _build_task_plan(run_id)
     elif stage.id == "reconcile":
         report = reconcile.run(run_id)
@@ -725,6 +744,123 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
         # recorded behaviour must not reach `completed` without that behaviour having been
         # checked. Nothing is raised for a run that recorded no cases.
         parity.gate(run_id)
+
+
+def _audit_extraction(run_id: str, caller: dict, llm_override: Optional[dict]) -> None:
+    """The general-purpose net: ask what the recognisers missed, then check every word of it.
+
+    Runs at the end of comprehension rather than as a stage of its own, because it is one
+    cheap call over the whole codebase and there is nothing to drain through the claim loop.
+    Here rather than earlier for two reasons: the discovery gate's promise is that nothing has
+    been spent, and here is still before the system portrait is frozen and before the plan
+    gate — so a fact this recovers reaches the digest every conversion call reads, and reaches
+    the human who approves the conversion spend.
+
+    **Best effort, by construction.** Every failure path below leaves the run exactly as it
+    was and writes an event. A net that can fail the thing it is watching is worse than no
+    net: this is the one call in the pipeline whose absence costs nothing and whose crash
+    would cost a run that was otherwise fine.
+    """
+    run = store.get_run(run_id) or {}
+    charter = run.get("charter") or {}
+    stats = run.get("stats") or {}
+    signals = (stats.get("analysis") or {}).get("signals") or {}
+    units = store.list_units(run_id, kind="source_file", include_source=True)
+    if not units or not charter:
+        return
+
+    files = [{"path": u["path"], "content": u.get("source_text") or ""} for u in units]
+    sources = {f["path"]: f["content"] for f in files}
+    rows = store.list_evidence(run_id)
+    known = [(r.get("kind") or "", r.get("path") or "", str(r.get("value") or ""))
+             for r in rows]
+
+    try:
+        proposed = agent_guard.guarded_call(
+            caller, "modernization", llm_override,
+            project_name=run.get("project_name") or "",
+            fn=lambda: _extraction_audit.audit(
+                files, rows, signals, charter, run_id=run_id, llm_override=llm_override),
+        )
+    except Exception as exc:
+        # Includes a budget refusal, which is the most likely one: this call is optional and
+        # a run that cannot afford it should carry on and convert, not stop.
+        store.append_event(run_id, "extraction_audit_skipped",
+                           f"{type(exc).__name__}: {exc}"[:400], level="warning")
+        return
+
+    cost = ((proposed or {}).get("_budget_stats") or {}).get("cost_usd") or 0.0
+    if cost:
+        store.add_run_spend(run_id, float(cost))
+
+    outcome = extraction_audit.verify(proposed.get("claims") or [], sources, known)
+    confirmed = outcome["confirmed"]
+    if confirmed:
+        # Written with `source="model_audit"` and a confidence below every parser row, so no
+        # screen and no consumer can mistake a recovered fact for a proved one (D-04).
+        store.insert_evidence(run_id, confirmed)
+    store.append_event(
+        run_id, "extraction_audited", extraction_audit.describe(outcome["counts"]),
+        level="warning" if confirmed else "info")
+
+    assessment = str(proposed.get("assessment") or "").strip()
+    audit_record = {"counts": outcome["counts"], "assessment": assessment[:2000],
+                    "confirmed": confirmed[:50]}
+    # Re-evaluated rather than left alone: the recovered rows are exactly the ones that make a
+    # contradiction go away (a datastore with no data-access API is no longer a contradiction
+    # once the audit finds the query sites), and a warning that a later stage has answered is
+    # a warning that trains a reader to ignore the list.
+    latest = store.get_run(run_id) or {}
+    stats = latest.get("stats") or {}
+    signals = (stats.get("analysis") or {}).get("signals") or {}
+    if signals and confirmed:
+        signals = _resignal(signals, confirmed)
+    contradictions = (sanity.evaluate(signals, run.get("target_stack") or "")
+                      if signals else [])
+    store.update_run(run_id, stats={
+        **stats,
+        "analysis": {"signals": signals, "contradictions": contradictions},
+        "extraction_audit": audit_record,
+    })
+    if confirmed:
+        store.create_checkpoint(
+            run_id, "extraction_audit",
+            f"{len(confirmed)} fact(s) the deterministic extraction had missed",
+            detail=(
+                (assessment + "\n\n" if assessment else "")
+                + "Each of these was checked against your source before it was recorded — the "
+                  "quote it cites was found in the file it names, and anything that could not "
+                  "be found was discarded. They are stored with a lower confidence than what "
+                  "a parser proved, and none of them changes the conversion order.\n\n"
+                + "\n".join(f"  · {c['kind']}: {c['value']} — {c['path']}:{c['line']}"
+                            for c in confirmed[:25])
+            )[:4000],
+            blocking=False,
+            payload={"counts": outcome["counts"], "confirmed": confirmed[:50]},
+        )
+
+
+def _resignal(signals: Dict[str, Any], confirmed: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fold recovered evidence back into the counts the checks divide by.
+
+    Only the fields a confirmed row can legitimately move. `db_sites`, `blocked` and the
+    `read_by` histogram are facts about parsing, not about evidence, and an audit cannot make
+    a parser have succeeded — leaving them alone is what keeps the denominators honest.
+    """
+    updated = dict(signals)
+    for row in confirmed:
+        kind, value = row.get("kind"), str(row.get("value") or "")
+        if kind == "route":
+            updated["routes"] = int(updated.get("routes") or 0) + 1
+        elif kind == "entrypoint":
+            updated["entrypoints"] = int(updated.get("entrypoints") or 0) + 1
+        elif kind == "config_key":
+            updated["config_keys"] = int(updated.get("config_keys") or 0) + 1
+        elif kind == "table" and value not in (updated.get("tables") or []):
+            updated["tables"] = list(updated.get("tables") or []) + [value]
+        elif kind == "datastore" and value not in (updated.get("datastores") or []):
+            updated["datastores"] = list(updated.get("datastores") or []) + [value]
+    return updated
 
 
 def _probe_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
