@@ -114,8 +114,11 @@ class ParityResultsRequest(BaseModel):
     """What replaying the corpus against the *converted* application observed."""
     results: List[Dict[str, Any]] = Field(
         ..., description="One per case: {case_id, status, headers, body, location, "
-                         "duration_ms, error}. An empty list is recorded as a replay that "
-                         "ran nothing, never as a pass.")
+                         "duration_ms, error, filled_secrets}. An empty list is recorded as "
+                         "a replay that ran nothing, never as a pass. `filled_secrets` "
+                         "carries the *names* of the credentials the replay supplied for a "
+                         "case whose recording was masked -- never their values, which this "
+                         "API refuses.")
     source: str = Field("external", description="Who replayed it — e.g. 'github_actions'.")
     base_url: str = Field("", description="Where the converted app was reachable, for the log.")
     commit_sha: str = ""
@@ -558,8 +561,18 @@ def list_parity_cases(run_id: str, status: str = "active", include_bodies: bool 
     """
     _require_run(run_id, caller)
     cases = store.list_parity_cases(run_id, status=status, include_bodies=include_bodies)
+    # Decorated here rather than stored: `secret_slots` is derived from the masked request
+    # text, so there is one definition of "what has to be supplied" and no second copy to
+    # drift from the comparator's. Decorated at the route rather than in `store` because the
+    # dependency runs that way -- `parity` imports `store`, never the reverse.
+    needed = []
+    for case in cases:
+        case["secret_slots"] = parity.secret_slots(case)
+        for slot in case["secret_slots"]:
+            if slot["name"] not in needed:
+                needed.append(slot["name"])
     return {"count": len(cases), "total_active": store.parity_case_count(run_id),
-            "cases": cases}
+            "secrets_required": needed, "cases": cases}
 
 
 @router.post("/runs/{run_id}/parity-results", summary="Report a replay of the golden corpus")

@@ -5632,6 +5632,9 @@ loadDashboard();
 // died, which shows as `paused` with a Resume button rather than a spinner that never ends.
 
 let _modRunId = null;
+// Names only, and never values: what the corpus needs supplied before it can be
+// replayed at all. Set by the parity badge, read by its help dialog.
+let _modParitySecrets = [];
 let _modPollTimer = null;
 let _modCharterFields = null;
 // Last run object handed back by a successful refresh, so a skipped repaint (see
@@ -5964,7 +5967,18 @@ function renderModernizationParityBadge(run) {
     passed: `${p.cases} recorded behaviour(s) — all matched on round ${p.round}`,
   }[p.status] || `${p.cases} recorded behaviour(s) — ${p.failed || 0} differed, ` +
                  `${p.passed || 0} matched, ${p.errored || 0} errored on round ${p.round}`;
-  return `<div class="mod-meta" style="margin-top:4px">Behaviour: ${esc(label)}</div>`;
+  // A corpus recorded through a login cannot be replayed until somebody supplies the
+  // credential that was masked out of it before it was stored. A reader who is not told
+  // that reads unrunnable cases as things the conversion broke — which is exactly what
+  // happened: one dead sign-in reported as 19 behavioural divergences.
+  _modParitySecrets = p.secrets_required || [];
+  const needs = _modParitySecrets.length
+    ? `<div class="mod-meta">Needs ${_modParitySecrets.map(esc).join(', ')} supplied at
+       replay time — the recording was stored without it.
+       <span class="mod-drill" onclick="showModernizationParityHelp()">How to supply it</span>
+       </div>`
+    : '';
+  return `<div class="mod-meta" style="margin-top:4px">Behaviour: ${esc(label)}</div>${needs}`;
 }
 
 function showModernizationParityHelp() {
@@ -5978,7 +5992,18 @@ function showModernizationParityHelp() {
     + `    curl ${location.origin}/api/v1/modernization/runs/${id}/parity-tools\n\n`
     + 'Two single-file Python programs, no dependencies. Run the recorder next to the legacy '
     + 'app and use it for a few minutes — including the journeys that fail. The replayer runs '
-    + 'the same requests against the converted app and reports back here.\n\n'
+    + 'the same requests against the converted app and reports back here:\n\n'
+    + '    python replay_parity.py --base-url <the converted app> --token <api key>'
+    + (_modParitySecrets.length
+        ? ' ' + _modParitySecrets.map(n => '--secret ' + n + '=…').join(' ') : '')
+    + '\n\n'
+    + (_modParitySecrets.length
+        ? 'Those credentials were masked out of the recording before it was stored, so this '
+          + 'platform does not have them and cannot give them back. The replayer takes them '
+          + 'from your machine and sends them only to your application — what it reports '
+          + 'back here is which ones it filled, never what they were. Run it without them '
+          + 'and it names the ones it wants.\n\n'
+        : '')
     + 'Record it while the legacy system still exists. Once it is gone, so is the only source '
     + 'of truth about what it did.');
 }

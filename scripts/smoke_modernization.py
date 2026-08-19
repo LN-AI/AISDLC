@@ -23,6 +23,7 @@ Costs nothing and is safe to run on every change.
 """
 import io
 import ast
+import json
 import os
 import re
 import sys
@@ -3026,10 +3027,11 @@ check("a stylesheet is not — it is not behaviour, and it would swamp the corpu
 check("nor an image, whatever its content-type claims",
       not _should("/img/logo.png", "text/html"))
 check("a session groups its own cases so a stateful flow replays in order",
-      _rec_ns["_session_of"]("PHPSESSID=abc") == _rec_ns["_session_of"]("PHPSESSID=abc")
-      and _rec_ns["_session_of"]("PHPSESSID=abc") != _rec_ns["_session_of"]("PHPSESSID=xyz"))
-check("requests with no cookie share the anonymous group",
-      _rec_ns["_session_of"]("") == "anonymous")
+      _rec_ns["_group_for"]("PHPSESSID=abc", "") == _rec_ns["_group_for"]("PHPSESSID=abc", "")
+      and _rec_ns["_group_for"]("PHPSESSID=abc", "")
+          != _rec_ns["_group_for"]("PHPSESSID=xyz", ""))
+check("requests with no cookie at all share the anonymous group",
+      _rec_ns["_group_for"]("", "") == "anonymous")
 
 # A replay runner must be able to send a recorded POST. `request_body` therefore has to
 # survive the lean case list, while `expected_body` must not: a runner holding the expected
@@ -5374,8 +5376,8 @@ check("a case whose request still holds a masked credential cannot be judged",
       _red["verdict"] == "error", str(_red["verdict"]))
 check("it is not reported as a behavioural difference",
       not _red["differences"], str(_red["differences"]))
-check("and the reason says what has to be supplied",
-      "supplied at replay time" in (_red.get("error") or ""), str(_red.get("error"))[:200])
+check("and the reason names the exact flag that would fix it",
+      "--secret password=" in (_red.get("error") or ""), str(_red.get("error"))[:200])
 check("which names where the placeholder is",
       "request body" in (_red.get("error") or ""), str(_red.get("error"))[:120])
 
@@ -5425,6 +5427,255 @@ check("so the replay of it is reported as unrunnable, not as a divergence",
       _report["errored"] == 1 and _report["failed"] == 0, str(_report))
 check("and the run is not told its conversion changed behaviour",
       _report["status"] != "diverged", str(_report["status"]))
+
+
+
+section("39. A credential the platform must not hold, supplied at replay time")
+
+# Section 38 stopped the false report: a case whose recorded request still holds a masked
+# credential is `error`, not `fail`. It could still never *run*. This is the other half —
+# the value is supplied by the runner, on the customer's own machine, and what comes back
+# here is the name of what was filled and never the value.
+#
+# Two of the 25 cases in the real corpus hold a placeholder. Those two cost the other 17
+# their session, which is where "19 behavioural divergences" came from.
+
+# ── What a case declares it needs ──────────────────────────────────────────
+#
+# Derived from the *masked* text, not from a column: `repo_ingest.redact` replaces only the
+# value group, so `password=` survives in front of the placeholder and the slot can be
+# named after it. That is what makes a corpus recorded before any of this existed replayable
+# without re-recording it — which matters, because re-recording means finding the legacy
+# application again.
+_SHAPES = [
+    ("a form post",     {"request_body": "username=admin&password=__REDACTED_CONNECTION_STRING__",
+                         "request_content_type": "application/x-www-form-urlencoded"},
+     "password", "the request body"),
+    ("a query string",  {"query": "page=1&key=__REDACTED_PROVIDER_API_KEY__"},
+     "key", "the query string"),
+    ("a JSON body",     {"request_body": '{"user":"admin","password":"__REDACTED_ASSIGNED_CREDENTIAL__"}',
+                         "request_content_type": "application/json"},
+     "password", "the request body"),
+    ("a request header", {"request_headers": {"x-api-key": "__REDACTED_CREDENTIAL_HEADER__"}},
+     "x-api-key", "a request header"),
+]
+for _label, _case, _name, _field in _SHAPES:
+    _slots = parity.secret_slots(_case)
+    check(f"{_label} names its secret after the field that carries it",
+          [(s["name"], s["field"]) for s in _slots] == [(_name, _field)], str(_slots))
+
+# A placeholder with no key beside it still has to be filled, so it is named for its
+# category rather than dropped — dropping it would make the case look replayable.
+check("a bare placeholder falls back to its category as a name",
+      [s["name"] for s in parity.secret_slots({"request_body": "Basic __REDACTED_JWT__"})]
+      == ["jwt"])
+check("and a case with no credential needs nothing",
+      parity.secret_slots({"request_body": "name=Ann&salary=61234", "query": "id=3"}) == [])
+
+# ── The guard is per slot, and a typo fills nothing ─────────────────────────
+_LOGIN = {"path": "/login", "method": "POST",
+          "request_body": "username=admin&password=__REDACTED_CONNECTION_STRING__",
+          "expected_status": 302, "expected_location": "/"}
+_unfilled = parity.compare(_LOGIN, {"status": 302, "location": "/login", "headers": {}})
+check("with nothing supplied the case still cannot be judged",
+      _unfilled["verdict"] == "error", str(_unfilled["verdict"]))
+check("and the message is the command that would fix it",
+      "--secret password=" in (_unfilled.get("error") or ""), str(_unfilled.get("error"))[:200])
+
+_typo = parity.compare(_LOGIN, {"status": 302, "location": "/login", "headers": {},
+                                "filled_secrets": ["pasword"]})
+check("a misspelled name satisfies nothing — it is not quietly treated as the real one",
+      _typo["verdict"] == "error", str(_typo["verdict"]))
+
+# Supplied, the case is compared for real — and can go either way. Both directions matter:
+# a guard that only ever produced passes would be a check that stopped checking.
+_pass = parity.compare(_LOGIN, {"status": 302, "location": "/", "headers": {},
+                                "filled_secrets": ["password"]})
+check("supplied, the login is judged like any other case, and matches",
+      _pass["verdict"] == "pass", str(_pass))
+_fail = parity.compare(_LOGIN, {"status": 200, "location": "", "headers": {},
+                                "filled_secrets": ["password"]})
+check("and a real difference behind the login is still a failure",
+      _fail["verdict"] == "fail" and any(d["kind"] == "status" for d in _fail["differences"]),
+      str(_fail["differences"]))
+
+# ── A name is a name. A value must never reach this API. ────────────────────
+_pv = store.create_run("secret-value-guard", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_pv, {"source": "smoke", "cases": [
+    {"name": "sign in", "request": {"method": "POST", "path": "/login",
+                                    "body": "username=admin&password=hunter2hunter2",
+                                    "content_type": "application/x-www-form-urlencoded"},
+     "expected": {"status": 302, "location": "/"}}]}, "smoke")
+_pv_case = store.list_parity_cases(_pv, status="active", include_bodies=True)[0]
+try:
+    parity.ingest(_pv, {"source": "smoke", "results": [
+        {"case_id": _pv_case["id"], "status": 302,
+         "filled_secrets": ["hunter2hunter2 is definitely not an identifier"]}]}, "smoke")
+    check("a value in 'filled_secrets' is refused", False, "no error raised")
+except parity.ParityError as exc:
+    check("a value in 'filled_secrets' is refused rather than stored", True)
+    check("and the message says the replay should be stopped",
+          "should be stopped" in str(exc), str(exc)[:200])
+
+# ── End to end: the corpus that could not run, running ──────────────────────
+_report = parity.ingest(_pv, {"source": "smoke", "base_url": "http://localhost:5000",
+                              "results": [{"case_id": _pv_case["id"], "status": 302,
+                                           "location": "/", "filled_secrets": ["password"]}]},
+                        "smoke")
+check("the same corpus that reported 'unrunnable' now reports a pass",
+      _report["status"] == "passed" and _report["passed"] == 1, str(_report))
+check("the run's summary names what has to be supplied, and nothing else",
+      parity.summary_for_run(_pv)["secrets_required"] == ["password"],
+      str(parity.summary_for_run(_pv)))
+
+# ── The gate says which, so nobody has to guess (or waive) ──────────────────
+store.update_run(_pv, status="paused", phase="reconcile")
+_pg = store.create_run("secret-gate", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_pg, {"source": "smoke", "cases": [
+    {"name": "sign in", "request": {"method": "POST", "path": "/login",
+                                    "body": "user=admin&password=hunter2hunter2",
+                                    "content_type": "application/x-www-form-urlencoded"},
+     "expected": {"status": 302, "location": "/"}}]}, "smoke")
+parity.gate(_pg)
+_gate_cp = [c for c in store.list_checkpoints(_pg, "open") if c["kind"] == "parity_required"][0]
+check("the 'never replayed' gate prints the replay command with its --secret argument",
+      "--secret password=" in (_gate_cp.get("detail") or ""), str(_gate_cp.get("detail"))[-300:])
+check("and carries the names on the checkpoint for a UI to render",
+      (_gate_cp.get("payload") or {}).get("secrets_required") == ["password"],
+      str(_gate_cp.get("payload")))
+
+# ── The recorder's other two doors, which were wide open ───────────────────
+#
+# Bodies were the only thing redaction covered, so a password posted in a form was masked
+# and the *same* credential in `?key=…` or an `X-Api-Key:` header was stored in the clear.
+# The header rule is by name, not by shape: `X-Api-Key: 9f2c8e…` has nothing a pattern could
+# recognise, and what makes it a secret is the name in front of it.
+_hd = store.create_run("secret-doors", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_hd, {"source": "smoke", "cases": [
+    {"name": "api call", "request": {
+        "method": "GET", "path": "/api/employees", "query": "key=sk-abcdefghijklmnopqrstuvwx",
+        "headers": {"X-Api-Key": "9f2c8e1122334455", "Accept": "application/json"},
+        "cookies": {"PHPSESSID": "a-live-session-token"}},
+     "expected": {"status": 200, "content_type": "application/json", "body": "[]"}}]}, "smoke")
+_hd_case = store.list_parity_cases(_hd, status="active", include_bodies=True)[0]
+check("a credential in the query string is masked before storage",
+      "sk-abcdefghijklmnopqrstuvwx" not in (_hd_case.get("query") or ""),
+      str(_hd_case.get("query")))
+check("a credential in a request header is masked, by the header's name",
+      "9f2c8e1122334455" not in json.dumps(_hd_case.get("request_headers") or {}),
+      str(_hd_case.get("request_headers")))
+check("a header that is not a credential is left alone",
+      (_hd_case.get("request_headers") or {}).get("accept") == "application/json",
+      str(_hd_case.get("request_headers")))
+check("a live session cookie is not kept either — nothing replays it",
+      "a-live-session-token" not in json.dumps(_hd_case.get("cookies") or {}),
+      str(_hd_case.get("cookies")))
+check("and both now surface as slots a runner can fill",
+      sorted(s["name"] for s in parity.secret_slots(_hd_case)) == ["key", "x-api-key"],
+      str(parity.secret_slots(_hd_case)))
+
+# Response headers are masked on **both** sides. Masking only the recording would compare a
+# placeholder against a live token and call every page carrying one a divergence — the same
+# argument `redact_recorded` already makes for bodies.
+_masked, _hits = parity.redact_headers({"Set-Cookie": "PHPSESSID=abc123; Path=/",
+                                        "Content-Type": "text/html"})
+check("a Set-Cookie is masked wherever it appears",
+      "abc123" not in json.dumps(_masked), str(_masked))
+check("and Content-Type, which the comparator needs, is untouched",
+      _masked["Content-Type"] == "text/html", str(_masked))
+check("the redaction is reported by category, never by value",
+      all("value" not in h and h["category"] for h in _hits), str(_hits))
+
+# ── The generated replayer ─────────────────────────────────────────────────
+_rt = parity_tools.render_replayer("http://localhost:8000/api/v1/modernization", "run-39")
+ast.parse(_rt)   # it is shipped to a customer; it has to at least be Python
+check("the replayer takes --secret, --secrets-file and the environment",
+      all(flag in _rt for flag in ("--secret", "--secrets-file", "LM_PARITY_SECRET_")))
+check("it reports the names it filled, and there is no path that reports a value",
+      '"filled_secrets": filled' in _rt and "filled.append(slot[\"name\"])" in _rt)
+check("it scrubs supplied values back out of what it observed",
+      "def scrub(" in _rt and "scrub(raw.decode" in _rt)
+check("a case whose secret nobody supplied is not sent at all",
+      "no value supplied for the secret" in _rt)
+check("and neither is the rest of that journey — one dead sign-in, not nineteen divergences",
+      "an earlier case in this group" in _rt and "blocked[group]" in _rt)
+check("the tools bundle still ships three files",
+      len(parity_tools.bundle("http://localhost:8000/api/v1/modernization", "run-39")) == 3)
+
+# ── One journey, one group, across the login ───────────────────────────────
+#
+# Found by replaying a real recording, and it is the defect that produced the original
+# report of "19 behavioural divergences". A correct application regenerates its session id
+# when you sign in — it is the standard defence against session fixation — and the recorder
+# named its groups by hashing the cookie header, so the identifier before the login differed
+# from the one after it. The login POST went into one group and the seventeen authenticated
+# pages into another that contained no login at all, and the replayer keeps one cookie jar
+# per group: those pages could only ever replay anonymously and redirect to the sign-in
+# screen. Supplying the password does not fix that. The grouping has to.
+_rec = parity_tools.render_recorder("http://localhost:8000/api/v1/modernization", "run-39")
+ast.parse(_rec)
+_recorder = {}
+exec(compile(_rec.split("class Handler")[0], "recorder", "exec"), _recorder)
+_group_for = _recorder["_group_for"]
+
+_journey = [
+    ("arrives with nothing, and is given a session", "", "PHPSESSID=A; Path=/"),
+    ("browses",                                      "PHPSESSID=A", ""),
+    ("signs in, and the id is regenerated",          "PHPSESSID=A", "PHPSESSID=B; Path=/"),
+    ("reads a page that needs the login",            "PHPSESSID=B", ""),
+]
+_groups = [_group_for(req, resp) for _label, req, resp in _journey]
+for (_label, _, _), _g in zip(_journey, _groups):
+    check(f"the recorder follows one browser as it {_label}", _g == _groups[0],
+          f"{_g} != {_groups[0]}")
+check("a cookieless client is still its own group, correctly",
+      _group_for("", "") == "anonymous", _group_for("", ""))
+check("and a second browser is not folded into the first",
+      _group_for("", "PHPSESSID=Z; Path=/") != _groups[0])
+
+# ── A credential the recording itself printed ──────────────────────────────
+#
+# The other half of the same replay. The legacy sign-in page prints "Demo accounts: admin /
+# admin123", so `expected_body` held a working credential in the clear — no response pattern
+# can see it, because in HTML it is prose rather than an assignment. And because the replay
+# masked the value it had been given while the recording had not, the same three pages were
+# then reported as behavioural differences. One fix for both: the value is recognisable in
+# the *request*, so it is masked out of the responses too, and the two sides carry the same
+# placeholder.
+#
+# Batch-wide, not per case, which is the part that has to be a second pass: the page that
+# prints the password is its own case and its own request carries nothing at all.
+_ec = store.create_run("echoed-credential", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_ec, {"source": "smoke", "cases": [
+    {"name": "the sign-in page", "request": {"method": "GET", "path": "/login"},
+     "expected": {"status": 200, "content_type": "text/html",
+                  "body": "<ul><li>admin / admin123</li><li>manager / manager123</li></ul>"}},
+    {"name": "sign in", "request": {"method": "POST", "path": "/login",
+                                    "body": "username=admin&password=admin123",
+                                    "content_type": "application/x-www-form-urlencoded"},
+     "expected": {"status": 302, "location": "/"}}]}, "smoke")
+_ec_pages = {c["name"]: c for c in store.list_parity_cases(_ec, include_bodies=True)}
+_ec_page = _ec_pages["the sign-in page"]["expected_body"]
+check("a page that prints the password does not store it",
+      "admin123" not in _ec_page, _ec_page)
+check("it stores the same placeholder the replay will send back",
+      "__REDACTED_CONNECTION_STRING__" in _ec_page, _ec_page)
+check("and the rest of the page is untouched — this is a replacement, not a truncation",
+      "manager / manager123" in _ec_page, _ec_page)
+# So the case compares equal to a replay that filled the same secret, which is the whole
+# point: before this, those three pages were three failures in a green run.
+check("so replaying it with the secret supplied matches",
+      parity.compare(
+          {"path": "/login", "expected_status": 200, "expected_content_type": "text/html",
+           "expected_body": _ec_page},
+          {"status": 200, "headers": {"content-type": "text/html"}, "body": _ec_page,
+           "filled_secrets": ["password"]})["verdict"] == "pass")
+# A value too short to be a credential is left alone: replacing every occurrence of `abc`
+# would shred the page, and whatever this lets through it lets through on both sides — the
+# replayer's `scrub` uses the same floor.
+check("a value below the floor is not blanket-replaced",
+      parity._echoed_values("pin=abc", "pin=__REDACTED_X__") == {},
+      str(parity._echoed_values("pin=abc", "pin=__REDACTED_X__")))
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

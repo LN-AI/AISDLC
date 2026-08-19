@@ -82,7 +82,7 @@ import json
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qsl, urljoin, urlsplit
+from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit
 
 from backend.services.modernization import repo_ingest, stages, store
 
@@ -110,6 +110,10 @@ MAX_EXTRACT_CHARS = 200_000
 
 # How many differing cases a checkpoint spells out. A display budget, not a storage limit.
 CHECKPOINT_CASES = 20
+
+# How many distinct secrets one case may need before we stop enumerating them. A case that
+# genuinely needs seventeen credentials is a recording of something other than a user journey.
+MAX_SECRET_SLOTS = 16
 
 BODY_MATCH_MODES = ("normalized", "contains", "ignore")
 VERDICTS = ("pass", "fail", "error", "missing")
@@ -429,14 +433,14 @@ def compare(case: Dict[str, Any], observed: Dict[str, Any]) -> Dict[str, Any]:
     # `error`, never `fail`. A tool artefact reported as a behavioural difference is worse
     # than no result: it is a confident, wrong answer about somebody's conversion, and it
     # buries the cases that did run.
-    redacted = _redacted_request_fields(case)
-    if redacted:
-        return {"verdict": "error", "differences": [], "error": (
-            "This case cannot be replayed: its recorded request still carries a masked "
-            "credential in " + ", ".join(redacted) + ". The value was removed when the "
-            "recording was stored and has to be supplied at replay time; until it is, the "
-            "request is sent with a placeholder and whatever comes back says nothing about "
-            "the conversion.")}
+    #
+    # Per *slot*, not per case: `observed["filled_secrets"]` is what the runner says it
+    # supplied, by name and never by value, so a corpus behind a login is replayable once
+    # somebody passes `--secret password=…`. A slot nobody filled still cannot be judged.
+    unfilled = unfilled_secret_slots(case, observed.get("filled_secrets") or ())
+    if unfilled:
+        return {"verdict": "error", "differences": [],
+                "error": describe_secret_slots(unfilled)}
 
     differences: List[Dict[str, Any]] = []
     ignore = tuple(case.get("ignore") or ())
@@ -683,22 +687,101 @@ def redact_recorded(text: Any) -> Tuple[str, List[Dict[str, Any]]]:
     return repo_ingest.redact(str(text), "parity")
 
 
-def _redact_entry(entry: Any) -> List[Dict[str, Any]]:
-    """Redact a submitted case in place, before anything reads it.
+def redact_headers(headers: Any) -> Tuple[Dict[str, str], List[Dict[str, Any]]]:
+    """Mask credentials in a set of HTTP headers. Used on both sides, like `redact_recorded`.
+
+    Two rules, because one is not enough. Pattern redaction catches a JWT or a provider-shaped
+    key wherever it appears — but `X-Api-Key: 9f2c8e…` has no shape a regex could recognise,
+    and the thing that makes it a secret is the *name* in front of it. So a header whose name
+    says credential has its whole value replaced, the same way `repo_ingest.FORBIDDEN_NAMES`
+    treats a file whose contents are a secret rather than merely containing one.
+
+    `Set-Cookie` is in that set, which costs a little fidelity and is worth it: a session
+    cookie differs on every single request, so a case comparing one could never pass anyway.
+    """
+    cleaned: Dict[str, str] = {}
+    hits: List[Dict[str, Any]] = []
+    if not isinstance(headers, dict):
+        return cleaned, hits
+    for name, value in headers.items():
+        text = str(value or "")
+        if not text:
+            cleaned[name] = text
+            continue
+        if _CREDENTIAL_HEADER.match(str(name).strip()):
+            cleaned[name] = _HEADER_PLACEHOLDER
+            hits.append({"path": "parity", "line": 0, "category": "credential_header"})
+            continue
+        masked, found = redact_recorded(text)
+        cleaned[name] = masked
+        hits.extend(found)
+    return cleaned, hits
+
+
+def _redact_request(entry: Any) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
+    """Mask a submitted case's *request* in place. -> (hits, values that were removed).
 
     Before `normalize_case`, deliberately: it derives the expected values from the recorded
     body, so redacting afterwards would leave a secret sitting in `expected_values_json`
     having already passed the door.
+
+    Bodies were the only thing this masked for its first two months, which meant a password
+    posted in a form was protected and **the same credential in `?key=…` or in an
+    `X-Api-Key:` header was stored in the clear**. Cookies go too: the replayer deliberately
+    never sends a recorded cookie value (the converted app issues its own session), so
+    masking them loses nothing and stops a live session token sitting in this table.
+    """
+    hits: List[Dict[str, Any]] = []
+    echoed: Dict[str, str] = {}
+    if not isinstance(entry, dict):
+        return hits, echoed
+    section = entry.get("request")
+    if isinstance(section, dict):
+        for key in ("body", "query", "path"):
+            if section.get(key):
+                raw = str(section[key])
+                cleaned, found = redact_recorded(raw)
+                echoed.update(_echoed_values(raw, cleaned))
+                section[key] = cleaned
+                hits.extend(found)
+        if isinstance(section.get("headers"), dict):
+            section["headers"], found = redact_headers(section["headers"])
+            hits.extend(found)
+        if isinstance(section.get("cookies"), dict):
+            section["cookies"] = {k: _HEADER_PLACEHOLDER for k in section["cookies"]}
+            hits.append({"path": "parity", "line": 0, "category": "cookie"})
+    return hits, echoed
+
+
+def _redact_response(entry: Any, echoed: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Mask a submitted case's recorded *response* in place.
+
+    `echoed` is what masking removed from the requests **of the whole batch**, not of this
+    case — which is the part that has to be a second pass. A sign-in page that prints
+    "Demo accounts: admin / admin123" is recorded as its own case, and that case's request
+    carries no credential at all; the value is only recognisable in the `POST /login` that
+    follows it. Per case, the page keeps the password. Per batch, it does not.
+
+    Found by replaying a real recording. The credential was in our database in the clear on
+    three pages, and those same three pages were then reported as behavioural divergences,
+    because the replay had masked the value and the recording had not. One fix for both: the
+    two sides carry the same placeholder, which is the invariant `redact_recorded` states.
     """
     hits: List[Dict[str, Any]] = []
     if not isinstance(entry, dict):
         return hits
-    for holder, key in (("expected", "body"), ("request", "body")):
-        section = entry.get(holder)
-        if isinstance(section, dict) and section.get(key):
-            cleaned, found = redact_recorded(section[key])
-            section[key] = cleaned
-            hits.extend(found)
+    section = entry.get("expected")
+    if not isinstance(section, dict):
+        return hits
+    if section.get("body"):
+        cleaned, found = redact_recorded(section["body"])
+        for value, placeholder in echoed.items():
+            cleaned = cleaned.replace(value, placeholder)
+        section["body"] = cleaned
+        hits.extend(found)
+    if isinstance(section.get("headers"), dict):
+        section["headers"], found = redact_headers(section["headers"])
+        hits.extend(found)
     return hits
 
 
@@ -718,8 +801,15 @@ def record_cases(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
 
     source = _text(payload.get("source"), 40)
     redactions: List[Dict[str, Any]] = []
+    # Requests first, across the whole batch, then responses — see `_redact_response`. A
+    # credential typed once in a journey is masked out of every page that journey recorded.
+    echoed: Dict[str, str] = {}
     for entry in entries:
-        redactions.extend(_redact_entry(entry))
+        found, removed = _redact_request(entry)
+        redactions.extend(found)
+        echoed.update(removed)
+    for entry in entries:
+        redactions.extend(_redact_response(entry, echoed))
     cases = [normalize_case(entry, index) for index, entry in enumerate(entries)]
     if source:
         for case in cases:
@@ -885,6 +975,7 @@ def ingest(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
 
     by_id = {case["id"]: case for case in cases}
     submitted: Dict[str, Dict[str, Any]] = {}
+    filled_by_case: Dict[str, List[str]] = {}
     unknown = 0
     for index, entry in enumerate(raw_results):
         if not isinstance(entry, dict):
@@ -901,6 +992,7 @@ def ingest(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
             unknown += 1
             continue
         submitted[case_id] = entry
+        filled_by_case[case_id] = _filled_names(entry.get("filled_secrets"), index)
 
     results: List[Dict[str, Any]] = []
     owners = _owning_units(run_id, cases)
@@ -928,9 +1020,14 @@ def ingest(run_id: str, payload: Any, actor: str = "") -> Dict[str, Any]:
         # compare `<REDACTED:api_key>` against a real token and call every page carrying one
         # a divergence.
         observed_body, _ = redact_recorded(entry.get("body"))
+        # Headers too, and for the same reason the body is: a replayed response is as live as
+        # a recorded one. Masking only the recording would compare a placeholder against a
+        # real token and call every page carrying one a divergence.
+        observed_headers, _ = redact_headers(_lower_headers(entry.get("headers")))
         outcome = compare(case, {
-            "status": status, "headers": entry.get("headers"),
+            "status": status, "headers": observed_headers,
             "body": observed_body, "location": entry.get("location"),
+            "filled_secrets": filled_by_case.get(case["id"]) or (),
         })
         results.append({
             **base, "verdict": outcome["verdict"], "differences": outcome["differences"],
@@ -1072,6 +1169,17 @@ def gate(run_id: str) -> Dict[str, Any]:
     latest = store.latest_parity_report(run_id)
     open_kinds = {c["kind"] for c in store.list_checkpoints(run_id, "open")}
 
+    needed = secrets_required(run_id)
+    # Spelled out on the gate, because the alternative is somebody running the replayer,
+    # getting 25 unrunnable cases back, and waiving the checkpoint instead (D-112).
+    secrets_note = ("\n\nThis corpus was recorded through a login, so "
+                    + str(len(needed)) + " credential(s) were masked out of it before it was "
+                    "stored and have to be supplied when it is replayed — the platform does "
+                    "not have them and never will:\n\n    python replay_parity.py "
+                    "--base-url <the converted app> --token <api key> "
+                    + " ".join("--secret %s=…" % name for name in needed)
+                    + "\n") if needed else ""
+
     if latest is None:
         if "parity_required" not in open_kinds:
             store.create_checkpoint(
@@ -1082,16 +1190,17 @@ def gate(run_id: str) -> Dict[str, Any]:
                     f"application, and no replay of them has ever been reported. Nothing here "
                     f"can run them — the converted application has to be deployed somewhere "
                     f"and the results posted back to "
-                    f"`POST /api/v1/modernization/runs/{run_id}/parity-results`.\n\n"
+                    f"`POST /api/v1/modernization/runs/{run_id}/parity-results`."
+                    f"{secrets_note}\n\n"
                     f"Answer this checkpoint to finish the run without that evidence. It is a "
                     f"real decision: every check this pipeline performs up to here is about "
                     f"the code, and none of them can see a conversion that compiles, runs, "
                     f"and does something else."
                 )[:4000],
                 blocking=True,
-                payload={"cases": cases, "reports": 0},
+                payload={"cases": cases, "reports": 0, "secrets_required": needed},
             )
-        return {"status": "never_run", "cases": cases}
+        return {"status": "never_run", "cases": cases, "secrets_required": needed}
 
     if latest.get("status") == "passed":
         return {"status": "passed", "cases": cases, "round": latest.get("round")}
@@ -1121,6 +1230,9 @@ def summary_for_run(run_id: str) -> Optional[Dict[str, Any]]:
     latest = store.latest_parity_report(run_id)
     return {
         "cases": cases,
+        # Names only. The screen needs to say "this corpus needs a password before it can be
+        # replayed"; nothing on any screen ever needs the password.
+        "secrets_required": secrets_required(run_id),
         "status": (latest or {}).get("status") or "never_run",
         "round": (latest or {}).get("round") or 0,
         "passed": (latest or {}).get("passed") or 0,
@@ -1174,7 +1286,11 @@ def invite(run_id: str) -> Dict[str, Any]:
             "recorder next to the legacy application, use the application through it for a "
             "few minutes — the journeys that matter, including the ones that fail — and it "
             "uploads what it saw. The replayer runs the same requests against the converted "
-            "application later and reports back here."
+            "application later and reports back here.\n\n"
+            "**Record the journeys behind the login, not only the public pages.** Any "
+            "credential you type is masked out before the recording is stored — this platform "
+            "will not hold your password — so the replayer asks you for it again later "
+            "(`--secret password=…`). Note down which account you used."
             + listed +
             "\n\nAcknowledge this to convert without behavioural cover. Nothing later can "
             "recover the chance: once the legacy system is gone, so is the only source of "
@@ -1190,27 +1306,196 @@ def invite(run_id: str) -> Dict[str, Any]:
     return {"status": "invited", "cases": 0}
 
 
+# -- Secrets a replay has to supply ----------------------------------------
+#
+# The recorder captures a real request, and the scanner masks the credentials out of it
+# before it is stored -- correctly; a customer's password must never live here. What that
+# leaves is `password=__REDACTED_CONNECTION_STRING__`, which the replayer then sends
+# literally: the login fails, every page behind it redirects to the sign-in screen, and the
+# report reads as a converted application that broke everything. Measured on the first real
+# replay: 19 of 25 "behavioural divergences", all of them one unusable login.
+#
+# The answer is not to store the value. It is for the *runner* -- which is already on the
+# customer's own network, next to the application it is replaying -- to be told the value at
+# replay time and to report back only the **names** of what it filled. Nothing here ever
+# receives a credential, in either direction.
+
 # The shape `repo_ingest.REDACTION_PLACEHOLDER` leaves behind. Matched rather than imported as
 # a literal because the two must agree: a change to the placeholder that this did not follow
 # would silently stop detecting unreplayable cases, which is the failure this exists to make
 # loud rather than to hide.
 _REDACTED_MARKER = re.compile(r"__REDACTED_[A-Z0-9_]+__")
 
+# What `redact_headers` leaves in place of a whole header value.
+_HEADER_PLACEHOLDER = repo_ingest.REDACTION_PLACEHOLDER.format(category="CREDENTIAL_HEADER")
 
-def _redacted_request_fields(case: Dict[str, Any]) -> List[str]:
-    """Which parts of this case's recorded *request* still hold a masked credential.
+# Headers whose value is a credential because of the name in front of it, rather than because
+# of any shape a pattern could recognise. `[\w-]*` on both sides for the same reason
+# `repo_ingest`'s assigned-credential pattern has it: real headers are called `X-Api-Key`,
+# `X-Auth-Token`, `Api-Key` -- not the canonical spelling of anything.
+_CREDENTIAL_HEADER = re.compile(
+    r"(?i)^(?:authorization|proxy-authorization|cookie|set-cookie|"
+    r"[\w-]*(?:api[-_]?key|auth[-_]?token|access[-_]?token|session[-_]?(?:id|token)"
+    r"|secret|password|passwd|pwd)[\w-]*)$")
 
-    Only the request. A redacted *response* is fine — `ingest` masks the replayed body with
-    the same function before comparing, so both sides carry the placeholder and they match.
-    A redacted request is different in kind: it is sent, and it is wrong when it arrives.
-    """
-    found: List[str] = []
-    if _REDACTED_MARKER.search(_text(case.get("request_body"), MAX_BODY_CHARS)):
-        found.append("its request body")
-    if _REDACTED_MARKER.search(_text(case.get("query"), MAX_PATH_CHARS)):
-        found.append("its query string")
-    headers = case.get("request_headers") or {}
-    if isinstance(headers, dict) and any(
-            _REDACTED_MARKER.search(str(v or "")) for v in headers.values()):
-        found.append("a request header")
+# `name=__REDACTED_X__`, which is what a form post and a query string both look like -- the
+# key survives redaction because `repo_ingest.redact` replaces only the value group. That is
+# what makes a slot nameable, and what makes a corpus recorded before any of this existed
+# replayable without re-recording it.
+_FORM_SECRET = re.compile(r"(?:^|[?&])([^=&\s]{1,60})=(__REDACTED_[A-Z0-9_]+__)")
+_JSON_SECRET = re.compile(r'"([^"\\]{1,60})"\s*:\s*"(__REDACTED_[A-Z0-9_]+__)"')
+
+
+def _category_of(placeholder: str) -> str:
+    """`__REDACTED_API_KEY__` -> `api_key`. The name of last resort."""
+    return placeholder.strip("_").replace("REDACTED_", "", 1).lower() or "secret"
+
+
+def _keyed_placeholders(raw: str) -> List[Tuple[str, str]]:
+    """-> [(slot name, placeholder)] for one field of a request."""
+    found: List[Tuple[str, str]] = []
+    for pattern in (_FORM_SECRET, _JSON_SECRET):
+        for match in pattern.finditer(raw):
+            name = unquote_plus(match.group(1)).strip().lower()
+            if name:
+                found.append((name, match.group(2)))
+    # Anything left over is a placeholder sitting in free text with no key beside it -- a
+    # basic-auth blob, a bare token in a path. It still has to be filled, so it gets the
+    # category as its name rather than being silently dropped.
+    named = {placeholder for _, placeholder in found}
+    for placeholder in _REDACTED_MARKER.findall(raw):
+        if placeholder not in named:
+            named.add(placeholder)
+            found.append((_category_of(placeholder), placeholder))
     return found
+
+
+# Short enough to catch a real credential, long enough that replacing every occurrence of
+# it does not shred the page. Whatever it lets through, it lets through on both sides: the
+# replayer's `scrub` uses the same floor.
+MIN_ECHOED_CHARS = 4
+
+
+def _echoed_values(raw: str, masked: str) -> Dict[str, str]:
+    """{the literal that masking removed: what replaced it}, for one request field.
+
+    The values exist only inside this call and the one that made it, are never logged, never
+    returned to a caller outside this module and never stored — the same discipline
+    `repo_ingest.redact` keeps, for the same reason.
+    """
+    found: Dict[str, str] = {}
+    for name, placeholder in _keyed_placeholders(masked):
+        escaped = re.escape(name)
+        for pattern in (r"(?:^|[?&])%s=([^&\s]+)" % escaped,
+                        r'"%s"\s*:\s*"([^"\\]+)"' % escaped):
+            match = re.search(pattern, raw)
+            if match and match.group(1) != placeholder:
+                value = unquote_plus(match.group(1))
+                if len(value) >= MIN_ECHOED_CHARS:
+                    found[value] = placeholder
+                break
+    return found
+
+
+def secret_slots(case: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """What a runner must be given before this case can be replayed at all.
+
+    -> `[{"name", "field", "placeholder"}]`, derived from the **stored, masked** request. No
+    column stores this: it is re-derived, so a corpus recorded before any of this existed
+    needs nothing done to it, and there is no second copy of the truth to drift.
+
+    The *request* only. A redacted response is fine -- `ingest` masks the replayed body and
+    headers with the same functions, so both sides carry the placeholder and they match. A
+    redacted request is different in kind: it is sent, and it is wrong when it arrives.
+    """
+    slots: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add(name: str, field: str, placeholder: str) -> None:
+        key = (name, field)
+        if not name or key in seen or len(slots) >= MAX_SECRET_SLOTS:
+            return
+        seen.add(key)
+        slots.append({"name": name, "field": field, "placeholder": placeholder})
+
+    headers = case.get("request_headers") or {}
+    if isinstance(headers, dict):
+        for header_name in sorted(headers):
+            for placeholder in _REDACTED_MARKER.findall(str(headers[header_name] or "")):
+                add(str(header_name).strip().lower(), "a request header", placeholder)
+
+    for raw, field in ((_text(case.get("query"), MAX_PATH_CHARS), "the query string"),
+                       (_text(case.get("request_body"), MAX_BODY_CHARS), "the request body")):
+        if raw and _REDACTED_MARKER.search(raw):
+            for name, placeholder in _keyed_placeholders(raw):
+                add(name, field, placeholder)
+    return slots
+
+
+def unfilled_secret_slots(case: Dict[str, Any],
+                          filled: Iterable[Any] = ()) -> List[Dict[str, Any]]:
+    """The slots this case needs that the runner did not say it supplied.
+
+    A name the runner claims that matches no slot simply fills nothing. That is the honest
+    reading of a typo: `--secret pasword=...` must not quietly satisfy `password`.
+    """
+    supplied = {str(name).strip().lower() for name in (filled or ())
+                if isinstance(name, str) and name.strip()}
+    return [slot for slot in secret_slots(case) if slot["name"] not in supplied]
+
+
+def describe_secret_slots(slots: List[Dict[str, Any]]) -> str:
+    """Why this case could not be judged, and the exact thing to type so that it can be.
+
+    `error`, never `fail`. A tool artefact reported as a behavioural difference is worse than
+    no result: it is a confident, wrong answer about somebody's conversion, and it buries the
+    cases that did run.
+    """
+    where = ", ".join(sorted({slot["field"] for slot in slots}))
+    flags = " ".join("--secret %s=..." % slot["name"] for slot in slots[:MAX_SECRET_SLOTS])
+    return ("This case cannot be replayed: its recorded request still carries a masked "
+            "credential in %s. The value was removed when the recording was stored -- it is "
+            "not here and cannot be -- so the replay has to be given it: re-run the replayer "
+            "with `%s`. Until then the request goes out with a placeholder and whatever comes "
+            "back says nothing about the conversion." % (where, flags))
+
+
+def secrets_required(run_id: str) -> List[str]:
+    """Every distinct secret name this run's active corpus needs, for a gate to name."""
+    names: List[str] = []
+    for case in store.list_parity_cases(run_id, status="active", include_bodies=True):
+        for slot in secret_slots(case):
+            if slot["name"] not in names:
+                names.append(slot["name"])
+    return names[:MAX_SECRET_SLOTS]
+
+
+# A slot name is an identifier, never a value. The cap and the character set are what stop a
+# runner -- ours, or somebody's reimplementation of it -- from smuggling a credential into
+# this endpoint through the one field that was supposed to be safe by construction.
+_SLOT_NAME = re.compile(r"^[A-Za-z0-9_.\[\]-]{1,60}$")
+
+
+def _filled_names(raw: Any, index: int) -> List[str]:
+    """Which secrets a runner says it supplied for one case. Names only, always."""
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise ParityError("results[%d] has a non-list 'filled_secrets'. It carries the "
+                          "*names* of the secrets the replay supplied -- never their values."
+                          % index)
+    if len(raw) > MAX_SECRET_SLOTS:
+        raise ParityError("results[%d] claims %d filled secrets; the limit is %d."
+                          % (index, len(raw), MAX_SECRET_SLOTS))
+    names: List[str] = []
+    for entry in raw:
+        name = str(entry or "").strip()
+        if not name:
+            continue
+        if not _SLOT_NAME.match(name):
+            raise ParityError(
+                "results[%d] lists %r in 'filled_secrets'. That field takes the *name* of a "
+                "secret, not its value -- if a value reached it, the replay is sending "
+                "credentials to this API and should be stopped." % (index, name[:20]))
+        names.append(name.lower())
+    return names
