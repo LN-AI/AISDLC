@@ -992,33 +992,59 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
     namespace_to_project = {c.get("target_namespace") or "": c.get("target_project") or ""
                             for c in components if c.get("target_namespace")}
     artifacts = store.list_artifacts(run_id, include_content=True)
-    needed = wireup.plan(artifacts, store.symbol_namespaces(run_id), namespace_to_project)
 
-    entry_project = next((c.get("target_project") for c in components
-                          if c.get("target_project")), "")
+    # The entry project is the *host*, and it comes from the normalized project list the
+    # architect stage stored — the same source `_scaffold_one` reads, with the host first
+    # (D-93). It used to be "whichever project the first component happens to live in", and
+    # components are ordered topologically, so on any layered codebase that resolved to the
+    # bottom layer: `Acme.Ems.Domain` on a 45-file run whose host was `Acme.Ems.Web`. The
+    # consequence was silent — `program_path` pointed at a file that does not exist, so the
+    # deterministic host wiring below did nothing at all, and the service registrations it
+    # exists to guarantee were left to whatever the model happened to write. It only ever
+    # worked on the single-project fixtures, where every answer is the same answer.
+    design_units = store.list_units(run_id, kind="design")
+    proposed = ((design_units[0].get("meta") if design_units else None) or {}).get("projects") or []
+    entry_project = next((p.get("name") for p in proposed if p.get("name")), "") or \
+        next((c.get("target_project") for c in components if c.get("target_project")), "")
+
+    needed = wireup.plan(artifacts, store.symbol_namespaces(run_id), namespace_to_project,
+                         entry_project)
     by_path = {a["path"]: a for a in artifacts}
     rewritten: List[Dict[str, Any]] = []
     notes: List[str] = []
 
-    for project in sorted(set(needed["packages"]) | set(needed["projects"])):
+    # A project may appear here only to have a cycle-forming reference taken *out* of it, so
+    # `remove` joins the union — otherwise the one file that has to change is the one file
+    # this loop never opens.
+    for project in sorted(set(needed["packages"]) | set(needed["projects"])
+                          | set(needed["remove"])):
         path = f"{project}/{project}.csproj"
         packages = needed["packages"].get(project) or []
         references = needed["projects"].get(project) or []
+        dropped = needed["remove"].get(project) or []
         existing = by_path.get(path)
         if existing is None:
             # The architect named a project the scaffold never wrote a file for. Better to
             # emit one than to leave source in a directory MSBuild will never look at.
             content = wireup.csproj_for(project, charter, project == entry_project, references)
-            updated = wireup.apply_to_csproj(content, packages, references)
+            updated = wireup.apply_to_csproj(content, packages, references, dropped)
             notes.append(f"{project}: project file created")
         else:
-            updated = wireup.apply_to_csproj(existing.get("content") or "", packages, references)
+            updated = wireup.apply_to_csproj(existing.get("content") or "", packages,
+                                             references, dropped)
             if updated == (existing.get("content") or ""):
                 continue
-            added = [p for p, _ in packages] + [f"->{r}" for r in references]
-            notes.append(f"{project}: {', '.join(added)}")
+            changed = ([p for p, _ in packages] + [f"->{r}" for r in references]
+                       + [f"-{r}" for r in dropped])
+            notes.append(f"{project}: {', '.join(changed)}")
         rewritten.append({"path": path, "content": updated,
                           "purpose": "project file, corrected from the converted code"})
+
+    # A reference that had to be cut, or a cycle that could not be cut safely, is reported —
+    # never done silently. The first is a prediction the code did not bear out; the second is
+    # a layering problem a human has to resolve, and `reconcile` fails the run over it.
+    for problem in needed["problems"][:25]:
+        store.append_event(run_id, "reference_cycle_broken", problem[:400], level="warning")
 
     # Host wiring. Without this the export compiles clean and then throws
     # `Unable to resolve service for type 'I…'` on every request — the one failure mode a

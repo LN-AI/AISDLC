@@ -24,8 +24,9 @@ original `.csproj` stays readable next to the corrected one.
 """
 import logging
 import re
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Sequence, Set, Tuple
 
+from backend.services.modernization import graph
 from backend.services.modernization import usings
 from backend.services.modernization.scaffold import dotnet as dotnet_scaffold
 
@@ -272,8 +273,93 @@ def _project_of(path: str, projects: List[str]) -> str:
     return best
 
 
+def existing_references(artifacts: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+    """project -> the projects its shipped `.csproj` already references.
+
+    The same parse `reconcile._project_reference_cycles` does, because these two must agree
+    about what the build graph is: one of them decides the references and the other reports
+    when they cannot build, and a disagreement between them would be a check that passes on a
+    graph the compiler refuses.
+    """
+    edges: Dict[str, Set[str]] = {}
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        if not path.lower().endswith(".csproj"):
+            continue
+        name = path.rsplit("/", 1)[-1][: -len(".csproj")]
+        targets = {t for t in _PROJECT_REF.findall(artifact.get("content") or "") if t != name}
+        edges[name] = targets
+    return edges
+
+
+def resolve_reference_cycles(existing: Dict[str, Set[str]], needed: Dict[str, Set[str]],
+                             entry_project: str = "") -> Tuple[Dict[str, Set[str]], List[str]]:
+    """Keep the shipped project graph acyclic. -> ({project: references to drop}, problems).
+
+    `architecture.normalize_projects` (D-93) makes the *proposed* graph acyclic before the
+    scaffold writes a single `.csproj`. This is the other end of the same problem, and it was
+    missing: `plan` derives references from the types the converted code actually names, and
+    adding those on top of the architect's predicted edges can close a cycle that was not
+    there before. MSBuild refuses a reference cycle outright, so `dotnet build` fails during
+    *restore* with MSB4006 — before compiling a line, and naming a target rather than a file.
+    Observed on a 45-file run: the architect predicted `Infrastructure -> Application`, the
+    converted services genuinely used Infrastructure types, and the export could not restore.
+
+    **Only an unjustified edge is ever cut.** An edge in `needed` was derived from a type some
+    file really names, so removing it converts a build-graph error into a CS0246 per use —
+    worse, and further from its cause, which is exactly the trap D-93 documents. An edge that
+    is only in `existing` is a prediction the code did not bear out, and dropping it costs
+    nothing. If every edge around a cycle is code-justified, nothing is cut: that is a real
+    layering violation between two projects that call each other, and the honest output is to
+    say so and let `reconcile` fail the run rather than to guess which half was the mistake.
+    """
+    graph_edges: Dict[str, Set[str]] = {}
+    for project in set(existing) | set(needed):
+        graph_edges[project] = set(existing.get(project) or ()) | set(needed.get(project) or ())
+    # Only edges between projects we actually have; a reference to something outside the
+    # export cannot take part in a cycle inside it.
+    known = set(graph_edges)
+    graph_edges = {p: (t & known) for p, t in graph_edges.items()}
+
+    removed: Dict[str, Set[str]] = {}
+    problems: List[str] = []
+    # One edge per pass, re-running the SCC search each time: cutting greedily inside a group
+    # removes edges a later pass would have found unnecessary to touch (D-93).
+    for _ in range(len(known) + 1):
+        groups = [g for g in graph.strongly_connected(graph_edges) if len(g) > 1]
+        if not groups:
+            break
+        group = sorted(groups, key=lambda g: (len(g), sorted(g)))[0]
+        members = set(group)
+        candidates = [
+            (source, target)
+            for source in sorted(members)
+            for target in sorted(graph_edges[source] & members)
+            if target not in (needed.get(source) or set())
+        ]
+        if not candidates:
+            problems.append(
+                "projects " + " and ".join(sorted(members)) + " use each other's types, so "
+                "their project references form a cycle MSBuild will not build. Nothing was "
+                "removed: every reference in the cycle is backed by code that names a type "
+                "across it, so this is a layering problem in how the components were split, "
+                "not a wrong reference.")
+            break
+        # Prefer cutting an edge that points *at* the host: a lower layer referencing the
+        # application it is hosted by is the shape that is always wrong.
+        source, target = sorted(
+            candidates, key=lambda e: (e[1] != entry_project, e[0], e[1]))[0]
+        graph_edges[source].discard(target)
+        removed.setdefault(source, set()).add(target)
+        problems.append(
+            f"project '{source}' referenced '{target}', which formed a reference cycle "
+            f"MSBuild refuses to build; removed it, since no converted file in '{source}' "
+            f"names a type from '{target}'")
+    return removed, problems
+
+
 def plan(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
-         namespace_to_project: Dict[str, str]) -> Dict[str, Any]:
+         namespace_to_project: Dict[str, str], entry_project: str = "") -> Dict[str, Any]:
     """Work out what each project file is missing. Pure — no database, no I/O.
 
     `namespace_to_project` maps a component's namespace to the project it lives in, which is
@@ -302,23 +388,39 @@ def plan(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
             if target and target != owner:
                 needed_projects[owner].add(target)
 
+    removed, problems = resolve_reference_cycles(
+        existing_references(artifacts), needed_projects, entry_project)
     return {"packages": {p: sorted(v) for p, v in needed_packages.items() if v},
-            "projects": {p: sorted(v) for p, v in needed_projects.items() if v}}
+            "projects": {p: sorted(v) for p, v in needed_projects.items() if v},
+            "remove": {p: sorted(v) for p, v in removed.items() if v},
+            "problems": problems}
 
 
 def apply_to_csproj(content: str, packages: List[Tuple[str, str]],
-                    project_refs: List[str]) -> str:
-    """Add whatever the `.csproj` is missing. Never removes anything.
+                    project_refs: List[str], remove: Sequence[str] = ()) -> str:
+    """Add whatever the `.csproj` is missing, and drop only what `remove` names.
 
     Removing an unused `PackageReference` would be the tidy thing to do and is not safe: a
     package can be needed at runtime by a type that never appears in source (a provider
     registered by configuration, an analyzer), and dropping it turns a working build into a
-    runtime failure — the one direction this pipeline must not move in.
+    runtime failure — the one direction this pipeline must not move in. The same argument
+    holds for a `ProjectReference`, which is why nothing is removed on the strength of being
+    unused either.
+
+    `remove` is the one exception, and it is narrow: `resolve_reference_cycles` names an
+    edge only when keeping it means MSBuild will not build the solution at all. A reference
+    that might be unnecessary is a smaller problem than a solution that cannot restore.
     """
+    drop = {r for r in remove or ()}
+    if drop:
+        content = "".join(
+            line for line in (content or "").splitlines(True)
+            if not ("<ProjectReference" in line
+                    and set(_PROJECT_REF.findall(line)) & drop))
     have_packages = set(_PACKAGE_REF.findall(content or ""))
     have_projects = set(_PROJECT_REF.findall(content or ""))
     add_packages = [(p, v) for p, v in packages if p not in have_packages]
-    add_projects = [r for r in project_refs if r not in have_projects]
+    add_projects = [r for r in project_refs if r not in have_projects and r not in drop]
     if not add_packages and not add_projects:
         return content
 

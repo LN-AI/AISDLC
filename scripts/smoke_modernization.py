@@ -4124,6 +4124,164 @@ check("the gate's contradictions are the ones for the charter's stack, not the r
 
 
 
+
+# ── 32. Wire-up and the project graph ──────────────────────────────
+section("32. Wire-up must not rebuild the cycle the architect's graph was cleared of")
+
+# Found by building the export of a real 45-file run, which is the only way it could have been
+# found: every offline check passed, reconciliation reported it correctly, and `dotnet build`
+# still failed during *restore* with MSB4006 before compiling a line.
+#
+# D-93 makes the *proposed* project graph acyclic before the scaffold writes a `.csproj`. This
+# stage rewrites the same references afterwards, from the types the converted code actually
+# names — and adding those on top of the architect's predicted edges closed the cycle again.
+# The architect had predicted `Infrastructure -> Application`; the converted services genuinely
+# used Infrastructure types; the export could not restore.
+
+_EMS_CSPROJ = [
+    {"path": "Acme.Web/Acme.Web.csproj",
+     "content": '<Project Sdk="Microsoft.NET.Sdk.Web">\n  <ItemGroup>\n'
+                '    <ProjectReference Include="..\\Acme.App\\Acme.App.csproj" />\n'
+                '  </ItemGroup>\n</Project>\n'},
+    {"path": "Acme.App/Acme.App.csproj",
+     "content": '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n'
+                '    <ProjectReference Include="..\\Acme.Domain\\Acme.Domain.csproj" />\n'
+                '  </ItemGroup>\n</Project>\n'},
+    {"path": "Acme.Infra/Acme.Infra.csproj",
+     # The architect's prediction, which no converted file bore out.
+     "content": '<Project Sdk="Microsoft.NET.Sdk">\n  <ItemGroup>\n'
+                '    <ProjectReference Include="..\\Acme.App\\Acme.App.csproj" />\n'
+                '  </ItemGroup>\n</Project>\n'},
+    {"path": "Acme.Domain/Acme.Domain.csproj",
+     "content": '<Project Sdk="Microsoft.NET.Sdk">\n</Project>\n'},
+]
+
+_edges = wireup.existing_references(_EMS_CSPROJ)
+check("the shipped project references are read out of the .csproj files",
+      _edges.get("Acme.Infra") == {"Acme.App"}, str(_edges))
+check("and a project referencing nothing reads as no edges, not as missing",
+      _edges.get("Acme.Domain") == set(), str(_edges))
+
+# `Acme.App` really does use an `Acme.Infra` type, so that edge is a fact. `Acme.Infra -> Acme.App`
+# is a prediction nothing bore out. Exactly one of them can survive.
+_cut, _problems = wireup.resolve_reference_cycles(
+    _edges, {"Acme.App": {"Acme.Domain", "Acme.Infra"}, "Acme.Web": {"Acme.App"}}, "Acme.Web")
+check("the cycle is broken", _cut == {"Acme.Infra": {"Acme.App"}}, str(_cut))
+check("and the edge cut is the one no converted file justifies",
+      "Acme.App" not in (_cut.get("Acme.App") or set()), str(_cut))
+check("the cut is reported, never silent",
+      any("reference cycle" in p for p in _problems), str(_problems))
+check("and the report names both projects and why that one went",
+      _problems and "Acme.Infra" in _problems[0] and "Acme.App" in _problems[0]
+      and "names a type" in _problems[0], str(_problems))
+check("resolving twice gives the same answer",
+      wireup.resolve_reference_cycles(
+          _edges, {"Acme.App": {"Acme.Domain", "Acme.Infra"}, "Acme.Web": {"Acme.App"}},
+          "Acme.Web")[0] == _cut)
+
+# The trap D-93 documents: cutting a *justified* edge turns one build-graph error into a CS0246
+# per use, which is a worse failure and further from its cause. So when every edge around the
+# cycle is backed by code, nothing is cut and a human is told.
+_both, _both_problems = wireup.resolve_reference_cycles(
+    {"A": {"B"}, "B": {"A"}}, {"A": {"B"}, "B": {"A"}}, "Web")
+check("a cycle where every reference is backed by code is not cut", _both == {}, str(_both))
+check("it is reported as a layering problem instead",
+      any("layering problem" in p for p in _both_problems), str(_both_problems))
+
+check("an acyclic graph is left completely alone",
+      wireup.resolve_reference_cycles(
+          {"Web": {"App"}, "App": {"Domain"}, "Domain": set()},
+          {"Web": {"App"}, "App": {"Domain"}}, "Web") == ({}, []))
+check("a reference to a project outside the export cannot form a cycle",
+      wireup.resolve_reference_cycles({"Web": {"Vendor"}}, {"Web": {"Vendor"}}, "Web") == ({}, []))
+# Preference, when more than one unjustified edge would do: the one pointing at the host. A
+# lower layer referencing the application that hosts it is the shape that is always wrong.
+_host_cut, _ = wireup.resolve_reference_cycles(
+    {"Web": {"Data"}, "Data": {"Web"}}, {"Web": {"Data"}}, "Web")
+check("given a choice, the edge pointing at the host is the one that goes",
+      _host_cut == {"Data": {"Web"}}, str(_host_cut))
+
+# Removal is the narrow exception to "never removes anything": an unnecessary reference is a
+# smaller problem than a solution that cannot restore.
+_infra = _EMS_CSPROJ[2]["content"]
+_trimmed = wireup.apply_to_csproj(_infra, [], [], ["Acme.App"])
+check("the named reference is gone from the project file",
+      "Acme.App.csproj" not in _trimmed, _trimmed)
+check("and the file is still XML MSBuild can read", _parses_as_xml(_trimmed), _trimmed)
+check("a removed reference is not added straight back by the same call",
+      "Acme.App.csproj" not in wireup.apply_to_csproj(_infra, [], ["Acme.App"], ["Acme.App"]))
+check("nothing else is removed",
+      wireup.apply_to_csproj(_EMS_CSPROJ[0]["content"], [], [], ["Acme.Data"])
+      == _EMS_CSPROJ[0]["content"])
+check("removing nothing leaves the file byte-identical",
+      wireup.apply_to_csproj(_infra, [], [], []) == _infra)
+
+# End to end through `plan`, on the shape that shipped: the code-derived edge is added, the
+# unjustified one is dropped, and what ships can restore.
+_ems_plan = wireup.plan(
+    _EMS_CSPROJ + [
+        {"path": "Acme.App/Services/AuthService.cs",
+         "content": "namespace Acme.App;\npublic class AuthService { UserRepository r; }"},
+        {"path": "Acme.Infra/UserRepository.cs",
+         "content": "namespace Acme.Infra;\npublic class UserRepository { }"}],
+    {"UserRepository": "Acme.Infra", "AuthService": "Acme.App"},
+    {"Acme.App": "Acme.App", "Acme.Infra": "Acme.Infra", "Acme.Web": "Acme.Web",
+     "Acme.Domain": "Acme.Domain"},
+    "Acme.Web")
+check("plan adds the reference the code proves is needed",
+      "Acme.Infra" in (_ems_plan["projects"].get("Acme.App") or []), str(_ems_plan["projects"]))
+check("and removes the one that would make the solution unbuildable",
+      _ems_plan["remove"].get("Acme.Infra") == ["Acme.App"], str(_ems_plan["remove"]))
+
+
+def _shipped_graph(plan_result, existing):
+    """What the .csproj files will contain once this plan is applied."""
+    out = {}
+    for project in set(existing) | set(plan_result["projects"]):
+        out[project] = ((set(existing.get(project) or ())
+                         | set(plan_result["projects"].get(project) or []))
+                        - set(plan_result["remove"].get(project) or []))
+    return out
+
+
+check("so the graph that ships is acyclic",
+      not [g for g in graph.strongly_connected(_shipped_graph(_ems_plan, _edges)) if len(g) > 1],
+      str(_shipped_graph(_ems_plan, _edges)))
+
+# The other half of the same bug, and the one that made no sound at all. `entry_project` was
+# "whichever project the first component lives in" — and components are ordered topologically,
+# so on any layered codebase that is the *bottom* layer. On the 45-file run it resolved to
+# `Acme.Ems.Domain` when the host was `Acme.Ems.Web`, so `program_path` named a file that does
+# not exist and the deterministic host wiring below it did nothing whatsoever. The service
+# registrations it exists to guarantee were left to whatever the model happened to write.
+_entry_run = store.create_run("entry-project", ".NET 8", "files", created_by="smoke")
+store.insert_units(_entry_run, [
+    {"path": "#design/0000", "kind": "design", "status": "converted", "topo_level": 0,
+     "order_index": 0},
+    {"path": "#component/0000-entities", "kind": "component", "status": "converted",
+     "topo_level": 0, "order_index": 1, "target_project": "Acme.Domain",
+     "target_namespace": "Acme.Domain.Entities"},
+    {"path": "#component/0001-web", "kind": "component", "status": "converted",
+     "topo_level": 1, "order_index": 2, "target_project": "Acme.Web",
+     "target_namespace": "Acme.Web.Controllers"},
+])
+_design_unit = [u for u in store.list_units(_entry_run, kind="design")][0]
+store.set_unit_meta(_design_unit["id"], {"projects": [{"name": "Acme.Web"},
+                                                      {"name": "Acme.Domain"}]})
+_entry_components = store.list_units(_entry_run, kind="component")
+_entry_design = store.list_units(_entry_run, kind="design")
+_entry_proposed = ((_entry_design[0].get("meta") if _entry_design else None) or {}).get("projects") or []
+_entry_from_design = next((p.get("name") for p in _entry_proposed if p.get("name")), "")
+_entry_from_first = next((c.get("target_project") for c in _entry_components
+                          if c.get("target_project")), "")
+check("components really are ordered with the host last, which is what made this silent",
+      _entry_from_first == "Acme.Domain", _entry_from_first)
+check("the entry project comes from the normalized project list, so it is the host",
+      _entry_from_design == "Acme.Web", _entry_from_design)
+check("and the two disagree — which is the whole bug",
+      _entry_from_design != _entry_from_first)
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
