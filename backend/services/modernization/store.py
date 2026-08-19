@@ -1962,24 +1962,57 @@ def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, An
     return [dict(r) for r in rows]
 
 
+# Symbol kinds that name a *type*. The registry also records methods, constants, properties
+# and — when a converter emits a project file — a pseudo-symbol for the project itself, and
+# none of those is something another file can reference by name.
+TYPE_SYMBOL_KINDS = frozenset({
+    "class", "interface", "struct", "enum", "record", "type", "delegate",
+})
+
+
 def symbol_namespaces(run_id: str) -> Dict[str, str]:
-    """Every generated type in the run -> the namespace it lives in.
+    """Every generated **type** in the run -> the namespace it lives in.
 
     The whole map, unlimited and in one query, because the using-resolver has to scan an
     artifact against *all* of them: a file may reference a type from any component, not only
     from the ones its unit declared a dependency on. Same reasoning as `symbol_names`, which
     is the equivalent for the unresolved-symbol check.
+
+    **Types only, which this did not do despite saying so.** On a real 45-file run, 116 of the
+    161 registered symbols were not types: 110 methods (`EmployeeService.CreateAsync`), four
+    constants, and one `Acme.Ems.Web (project)` a converter registered for its own `.csproj`.
+    Both consumers scan artifacts for these names, so a repository that happened to define its
+    own `CreateAsync` was recorded as referencing the Application layer, and every file at all
+    was recorded as referencing the web host. `wireup` turned that into `Domain -> Web` in the
+    project graph and MSBuild refused to restore the solution.
+
+    A member also arrives dotted (`Foo.Bar`) and so is indistinguishable by shape from a
+    namespace-qualified type (`Shop.Domain.Cart`) — so a dotted name whose first segment is
+    itself a registered symbol is dropped as a member, which is the one signal that separates
+    them.
     """
     conn = get_connection()
     rows = conn.execute(
-        "SELECT s.name AS name, "
+        "SELECT s.name AS name, s.kind AS kind, "
         "       COALESCE(NULLIF(s.namespace, ''), u.target_namespace) AS namespace "
         "FROM modernization_symbols s "
         "LEFT JOIN modernization_units u ON u.id = s.unit_id "
         "WHERE s.run_id = ?", (run_id,),
     ).fetchall()
     conn.close()
-    return {r["name"]: r["namespace"] for r in rows if r["name"] and r["namespace"]}
+
+    declared = {r["name"] for r in rows if r["name"]}
+    out: Dict[str, str] = {}
+    for row in rows:
+        name, namespace = row["name"], row["namespace"]
+        if not name or not namespace:
+            continue
+        if (row["kind"] or "").strip().lower() not in TYPE_SYMBOL_KINDS:
+            continue
+        if "." in name and name.split(".", 1)[0] in declared:
+            continue
+        out[name] = namespace
+    return out
 
 
 def list_artifacts(run_id: str, current_only: bool = True,

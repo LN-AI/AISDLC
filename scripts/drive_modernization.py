@@ -81,11 +81,25 @@ class Client:
 
 
 def say(message, log):
+    """Print a line, and never let printing be the thing that kills the run monitor.
+
+    A Windows console is cp1252, and everything this prints is *someone else's text* — event
+    details written by a model, file paths from a customer's repository. One `→` in a
+    `manual_followup` raised `UnicodeEncodeError` here and took the driver down mid-conversion,
+    which is the worst possible moment: the run is spending money, the server carries on
+    perfectly well, and the only thing watching it has gone. The log file is already UTF-8; it
+    is the terminal that cannot take it, so the terminal gets a lossy copy and the log keeps
+    the real thing.
+    """
     line = f"[{time.strftime('%H:%M:%S')}] {message}"
-    print(line, flush=True)
     if log:
         log.write(line + "\n")
         log.flush()
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(line.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
 
 
 def main():

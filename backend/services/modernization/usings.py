@@ -118,16 +118,28 @@ def referenced_types(content: str, known: Iterable[str]) -> Set[str]:
         return set()
     found: Set[str] = set()
     for name in known:
-        if not name or not name.isidentifier():
-            # Dotted or generic names (`Shop.Domain.Cart`, `List<Cart>`) are matched on their
-            # last plain segment instead, which is how they appear in code.
-            name_tail = re.split(r"[.<]", name)[0].strip()
-            if not name_tail.isidentifier():
-                continue
-            if re.search(rf"\b{re.escape(name_tail)}\b", code):
+        if not name:
+            continue
+        if name.isidentifier():
+            if re.search(rf"\b{re.escape(name)}\b", code):
                 found.add(name)
             continue
-        if re.search(rf"\b{re.escape(name)}\b", code):
+        # A qualified or generic name is matched on the type's *own* name, which is what
+        # appears in code: `Shop.Domain.Cart` -> `Cart`, `List<Cart>` -> `List`.
+        #
+        # This used to take the **first** segment — `re.split(r"[.<]", name)[0]` — while the
+        # comment above it said "last". Two consequences, both measured on a real run. A
+        # symbol registered as `Shop.Domain.Cart` was searched for as `Shop`, which appears in
+        # the namespace declaration of every file in the solution, so every file "referenced"
+        # it. And a converter that registered its `.csproj` under the display name
+        # `Acme.Ems.Web (project)` had it searched for as `Acme` — so all four Domain entities
+        # were recorded as depending on the *web host*, `wireup` wrote `Domain -> Web` into
+        # the project graph, and `dotnet build` could not restore the solution. The name has
+        # to survive being a real type name, which `(project)` does not.
+        tail = name.rsplit(".", 1)[-1].split("<", 1)[0].strip()
+        if not tail.isidentifier():
+            continue
+        if re.search(rf"\b{re.escape(tail)}\b", code):
             found.add(name)
     return found
 

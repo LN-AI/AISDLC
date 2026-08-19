@@ -24,7 +24,7 @@ original `.csproj` stays readable next to the corrected one.
 """
 import logging
 import re
-from typing import Any, Dict, List, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from backend.services.modernization import graph
 from backend.services.modernization import usings
@@ -293,7 +293,9 @@ def existing_references(artifacts: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
 
 
 def resolve_reference_cycles(existing: Dict[str, Set[str]], needed: Dict[str, Set[str]],
-                             entry_project: str = "") -> Tuple[Dict[str, Set[str]], List[str]]:
+                             entry_project: str = "",
+                             weights: Optional[Dict[Tuple[str, str], int]] = None
+                             ) -> Tuple[Dict[str, Set[str]], List[str]]:
     """Keep the shipped project graph acyclic. -> ({project: references to drop}, problems).
 
     `architecture.normalize_projects` (D-93) makes the *proposed* graph acyclic before the
@@ -305,13 +307,22 @@ def resolve_reference_cycles(existing: Dict[str, Set[str]], needed: Dict[str, Se
     Observed on a 45-file run: the architect predicted `Infrastructure -> Application`, the
     converted services genuinely used Infrastructure types, and the export could not restore.
 
-    **Only an unjustified edge is ever cut.** An edge in `needed` was derived from a type some
-    file really names, so removing it converts a build-graph error into a CS0246 per use —
-    worse, and further from its cause, which is exactly the trap D-93 documents. An edge that
-    is only in `existing` is a prediction the code did not bear out, and dropping it costs
-    nothing. If every edge around a cycle is code-justified, nothing is cut: that is a real
-    layering violation between two projects that call each other, and the honest output is to
-    say so and let `reconcile` fail the run rather than to guess which half was the mistake.
+    **An unjustified edge is cut first, and freely.** It is a prediction the code did not bear
+    out, so dropping it costs nothing.
+
+    **A justified edge is cut only as a last resort, and then the thinnest one.** D-93 warns
+    that cutting a real edge turns one build-graph error into a CS0246 per use, which is worse
+    and further from its cause — and that is right when the edge carries a layer's worth of
+    traffic. It is wrong when the edge carries one file. Measured on a real run: `Application`
+    and `Infrastructure` referenced each other, and the whole of the second direction was one
+    seeder calling `IAuthService`. Refusing to choose left a solution that could not `restore`,
+    and MSB4006 names a *project*, so `build_results` had nothing to reopen and the fix loop
+    could not even start. Cutting the thin edge yields one CS0246 in one file — which names a
+    `.cs`, reopens exactly that unit, and arrives in its next prompt. A compile error the loop
+    can consume beats a restore failure that stops everything.
+
+    `weights` carries how many files justify each edge, so "thinnest" is measured rather than
+    guessed. An edge with no entry is unjustified and goes first.
     """
     graph_edges: Dict[str, Set[str]] = {}
     for project in set(existing) | set(needed):
@@ -331,30 +342,45 @@ def resolve_reference_cycles(existing: Dict[str, Set[str]], needed: Dict[str, Se
             break
         group = sorted(groups, key=lambda g: (len(g), sorted(g)))[0]
         members = set(group)
-        candidates = [
-            (source, target)
-            for source in sorted(members)
-            for target in sorted(graph_edges[source] & members)
-            if target not in (needed.get(source) or set())
-        ]
-        if not candidates:
-            problems.append(
-                "projects " + " and ".join(sorted(members)) + " use each other's types, so "
-                "their project references form a cycle MSBuild will not build. Nothing was "
-                "removed: every reference in the cycle is backed by code that names a type "
-                "across it, so this is a layering problem in how the components were split, "
-                "not a wrong reference.")
-            break
-        # Prefer cutting an edge that points *at* the host: a lower layer referencing the
-        # application it is hosted by is the shape that is always wrong.
+        edges_here = [(source, target)
+                      for source in sorted(members)
+                      for target in sorted(graph_edges[source] & members)]
+
+        def _weight(edge: Tuple[str, str]) -> int:
+            """How much real code an edge carries. 0 means none — a prediction, free to cut.
+
+            Derived from `needed` rather than from `weights` alone, so a caller that supplies
+            no weights still gets the distinction that matters most: `needed` already says
+            which edges the code justified, and losing that would cut a real edge in
+            preference to a phantom one.
+            """
+            source, target = edge
+            if target not in (needed.get(source) or set()):
+                return 0
+            return max(1, (weights or {}).get(edge, 1))
+
+        # Unjustified first; then the edge the fewest files depend on; then the one pointing at
+        # the host, since a lower layer referencing the application that hosts it is the shape
+        # that is always wrong; then by name, so the answer is deterministic.
         source, target = sorted(
-            candidates, key=lambda e: (e[1] != entry_project, e[0], e[1]))[0]
+            edges_here, key=lambda e: (_weight(e), e[1] != entry_project, e[0], e[1]))[0]
+        carried = _weight((source, target))
         graph_edges[source].discard(target)
         removed.setdefault(source, set()).add(target)
-        problems.append(
-            f"project '{source}' referenced '{target}', which formed a reference cycle "
-            f"MSBuild refuses to build; removed it, since no converted file in '{source}' "
-            f"names a type from '{target}'")
+        if not carried:
+            problems.append(
+                f"project '{source}' referenced '{target}', which formed a reference cycle "
+                f"MSBuild refuses to build; removed it, since no converted file in '{source}' "
+                f"names a type from '{target}'")
+        else:
+            problems.append(
+                f"projects {' and '.join(sorted(members))} reference each other, which MSBuild "
+                f"will not build. Every reference in that cycle is backed by real code, so this "
+                f"is a layering problem in how the components were split — but a solution that "
+                f"cannot restore blocks everything, so the thinnest edge was cut: "
+                f"'{source}' -> '{target}', which {carried} file(s) rely on. Expect CS0246 in "
+                f"those file(s); each names a file, so the build loop reopens and re-converts "
+                f"it. The durable fix is to move the shared type down a layer.")
     return removed, problems
 
 
@@ -368,6 +394,10 @@ def plan(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
     projects = sorted({p for p in namespace_to_project.values() if p})
     needed_packages: Dict[str, Set[Tuple[str, str]]] = {p: set() for p in projects}
     needed_projects: Dict[str, Set[str]] = {p: set() for p in projects}
+    # How many *files* justify each edge. Counted rather than inferred, because it is what
+    # decides which edge to cut when a cycle is real on both sides: an edge carrying one file
+    # and an edge carrying a layer are not the same thing to break.
+    carried: Dict[Tuple[str, str], Set[str]] = {}
 
     for artifact in artifacts:
         path = artifact.get("path") or ""
@@ -387,9 +417,11 @@ def plan(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
             target = namespace_to_project.get(namespace) or ""
             if target and target != owner:
                 needed_projects[owner].add(target)
+                carried.setdefault((owner, target), set()).add(path)
 
     removed, problems = resolve_reference_cycles(
-        existing_references(artifacts), needed_projects, entry_project)
+        existing_references(artifacts), needed_projects, entry_project,
+        {edge: len(paths) for edge, paths in carried.items()})
     return {"packages": {p: sorted(v) for p, v in needed_packages.items() if v},
             "projects": {p: sorted(v) for p, v in needed_projects.items() if v},
             "remove": {p: sorted(v) for p, v in removed.items() if v},

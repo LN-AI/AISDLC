@@ -4205,14 +4205,33 @@ check("resolving twice gives the same answer",
           _edges, {"Acme.App": {"Acme.Domain", "Acme.Infra"}, "Acme.Web": {"Acme.App"}},
           "Acme.Web")[0] == _cut)
 
-# The trap D-93 documents: cutting a *justified* edge turns one build-graph error into a CS0246
-# per use, which is a worse failure and further from its cause. So when every edge around the
-# cycle is backed by code, nothing is cut and a human is told.
+# When every edge around the cycle is backed by real code, the thinnest one is cut and the
+# layering problem is reported. D-93 warns that cutting a real edge turns one build-graph error
+# into a CS0246 per use — true when the edge carries a layer, wrong when it carries one file.
+# Measured on a real run: `Application` and `Infrastructure` referenced each other and the whole
+# of the second direction was one seeder calling `IAuthService`. Refusing to choose left a
+# solution that could not `restore`, and MSB4006 names a *project*, so `build_results` had
+# nothing to reopen and the fix loop could not start at all. One CS0246 names a `.cs`, reopens
+# that unit, and lands in its next prompt.
 _both, _both_problems = wireup.resolve_reference_cycles(
-    {"A": {"B"}, "B": {"A"}}, {"A": {"B"}, "B": {"A"}}, "Web")
-check("a cycle where every reference is backed by code is not cut", _both == {}, str(_both))
-check("it is reported as a layering problem instead",
+    {"A": {"B"}, "B": {"A"}}, {"A": {"B"}, "B": {"A"}}, "Web",
+    {("A", "B"): 9, ("B", "A"): 1})
+check("a cycle backed by code on both sides is still broken, or nothing can build",
+      _both == {"B": {"A"}}, str(_both))
+check("and the edge cut is the one the fewest files rely on",
+      "B" in _both and "A" in _both["B"], str(_both))
+check("it is reported as a layering problem, not as a wrong reference",
       any("layering problem" in p for p in _both_problems), str(_both_problems))
+check("and it says how many files will now fail to compile",
+      any("1 file(s) rely on" in p for p in _both_problems), str(_both_problems))
+check("and names the durable fix rather than leaving it at the symptom",
+      any("move the shared type down a layer" in p for p in _both_problems),
+      str(_both_problems))
+# Weights only rank the justified edges. Without them the distinction that matters most still
+# has to hold: a prediction the code did not bear out goes before anything real.
+_mixed, _ = wireup.resolve_reference_cycles({"A": {"B"}, "B": {"A"}}, {"A": {"B"}}, "Web")
+check("an unjustified edge is preferred over a real one even with no weights given",
+      _mixed == {"B": {"A"}}, str(_mixed))
 
 check("an acyclic graph is left completely alone",
       wireup.resolve_reference_cycles(

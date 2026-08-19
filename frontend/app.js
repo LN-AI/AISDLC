@@ -6015,17 +6015,37 @@ function renderModernizationStages(run) {
   </div>`;
 }
 
+// A blocking checkpoint whose answer means "carry on **without** the evidence I am asking for".
+// These are not approvals of anything and must never be labelled or styled as one: the button
+// on `parity_required` used to read "Approve", in primary blue, on a gate whose own text says
+// "answer this to finish the run without that evidence". Faced with one prominent button
+// called Approve and no other action, everybody clicks Approve — and then the check that
+// exists to catch a conversion which compiles, runs and does something else is a check nobody
+// has ever run. That is the same failure this whole layer is about, arriving through the UI.
+const MOD_WAIVER_CHECKPOINTS = {
+  parity_required:   { label: 'Finish without checking behaviour', help: 'showModernizationParityHelp' },
+  parity_divergence: { label: 'Finish with the differences unresolved', help: 'showModernizationParityHelp' },
+  parity_incomplete: { label: 'Finish with the replay incomplete', help: 'showModernizationParityHelp' },
+  build_required:    { label: 'Finish without compiling', help: 'showModernizationBuildHelp' },
+};
+
 function renderModernizationCheckpoints(checkpoints) {
   return `<div class="mod-panel">
     <div class="section-title" style="margin-top:0">Waiting on you (${checkpoints.length})</div>
-    ${checkpoints.map(c => `
+    ${checkpoints.map(c => {
+      const waiver = MOD_WAIVER_CHECKPOINTS[c.kind];
+      return `
       <div class="mod-alert">
         <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks the run' : ' — informational'}
         <div style="margin-top:6px;white-space:pre-wrap">${esc(c.detail || '')}</div>
         ${renderCheckpointPayload(c)}
-        <button class="btn ${c.blocking ? 'btn-primary' : 'btn-secondary'} btn-sm" style="margin-top:8px"
-                onclick="answerModernizationCheckpoint('${esc(c.id)}')">${c.blocking ? 'Approve' : 'Acknowledge'}</button>
-      </div>`).join('')}
+        ${waiver ? `<button class="btn btn-primary btn-sm" style="margin-top:8px"
+                onclick="${waiver.help}()">Show me how to do it</button>` : ''}
+        <button class="btn ${waiver || !c.blocking ? 'btn-secondary' : 'btn-primary'} btn-sm" style="margin-top:8px"
+                onclick="answerModernizationCheckpoint('${esc(c.id)}')">${
+                  waiver ? esc(waiver.label) : (c.blocking ? 'Approve' : 'Acknowledge')}</button>
+      </div>`;
+    }).join('')}
   </div>`;
 }
 
