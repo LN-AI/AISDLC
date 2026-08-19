@@ -337,12 +337,20 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
         f"the source.",
     ]
     if contradictions:
+        # Written out both ways rather than with "(s)". This paragraph is the one asking a
+        # customer to read something before they approve a spend, and a sentence that reads
+        # like a form is a sentence people skip.
+        one = len(contradictions) == 1
         detail += [
             "",
-            f"{len(contradictions)} thing(s) in this analysis contradict something else in it. "
-            f"None of them blocks the run, and each names the two numbers that disagree — read "
-            f"them before approving, because a number that is wrong here is wrong in every "
-            f"prompt after it:",
+            (("One thing in this analysis contradicts something else in it. It does not block "
+              "the run, and it names the two numbers that disagree — read it")
+             if one else
+             (f"{len(contradictions)} things in this analysis contradict something else in it. "
+              f"They do not block the run, and each names the two numbers that disagree — read "
+              f"them"))
+            + " before approving, because a number that is wrong here is wrong in every prompt "
+              "after it:",
         ] + [f"  · {c['title']} ({c['left']} vs {c['right']})" for c in contradictions]
     detail += [
         "",
