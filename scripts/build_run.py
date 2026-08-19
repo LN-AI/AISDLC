@@ -1,6 +1,7 @@
 """Build a converted codebase and report the compiler's verdict back to the platform.
 
     python scripts/build_run.py --fixture
+    python scripts/build_run.py --run <run_id> --user admin --password ...
     python scripts/build_run.py --run <run_id> --api http://localhost:8000 --key lmsdlc_xxx
 
 This is the shortest path from "the run finished" to "does it actually compile", and it needs
@@ -54,10 +55,40 @@ def _run_build(directory: str) -> tuple:
     return proc.returncode, proc.stdout
 
 
-def _http(url: str, key: str, method: str = "GET", payload: dict = None) -> tuple:
+def login(api: str, user: str, password: str) -> str:
+    """Exchange a username and password for a bearer token, as the browser does.
+
+    This exists because the friction was the point of failure. `build_run.py` has been in the
+    repository, working, since the build loop was written, and the first thing it asked for
+    was an API key somebody had to go and provision — so the export of a real 45-file run was
+    never compiled, and shipped with a project reference cycle MSBuild refuses outright
+    (D-99). `get_caller` already accepts a bearer token on every one of these endpoints; only
+    this script did not offer one.
+    """
+    request = urllib.request.Request(
+        f"{api}/api/auth/login",
+        data=json.dumps({"username": user, "password": password}).encode(),
+        method="POST", headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        # `token`, which is what `POST /api/auth/login` returns and what
+        # `drive_modernization.py` reads. `access_token` is accepted too so a deployment that
+        # renames it does not turn a working script into a silent 401.
+        payload = json.loads(response.read().decode())
+    return payload.get("token") or payload.get("access_token") or ""
+
+
+def _http(url: str, key: str, method: str = "GET", payload: dict = None,
+          token: str = "", project_id: str = "") -> tuple:
     body = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(url, data=body, method=method)
-    request.add_header("X-API-Key", key)
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    if key:
+        request.add_header("X-API-Key", key)
+    if project_id:
+        # Some deployments bind every call to a project and answer 403 without this, with a
+        # message that does not mention the header. See NEXT-SESSION's landmine list.
+        request.add_header("X-Project-Id", project_id)
     if body:
         request.add_header("Content-Type", "application/json")
     try:
@@ -67,8 +98,10 @@ def _http(url: str, key: str, method: str = "GET", payload: dict = None) -> tupl
         return exc.code, exc.read()
 
 
-def build_export(api: str, key: str, run_id: str, keep: str = "") -> int:
-    status, blob = _http(f"{api}/api/v1/modernization/runs/{run_id}/export", key)
+def build_export(api: str, key: str, run_id: str, keep: str = "",
+                 token: str = "", project_id: str = "") -> int:
+    status, blob = _http(f"{api}/api/v1/modernization/runs/{run_id}/export", key,
+                         token=token, project_id=project_id)
     if status != 200:
         print(f"Could not download the export: HTTP {status}\n{blob[:400].decode(errors='replace')}")
         return 2
@@ -97,7 +130,8 @@ def build_export(api: str, key: str, run_id: str, keep: str = "") -> int:
         # nothing could be read out of, and the platform refuses the latter.
         payload["diagnostics"] = []
     status, response = _http(
-        f"{api}/api/v1/modernization/runs/{run_id}/build-results", key, "POST", payload)
+        f"{api}/api/v1/modernization/runs/{run_id}/build-results", key, "POST", payload,
+        token=token, project_id=project_id)
     if status != 200:
         print(f"Reporting failed: HTTP {status}\n{response[:400].decode(errors='replace')}")
         return 4
@@ -156,6 +190,11 @@ def main() -> int:
     parser.add_argument("--api", default="http://localhost:8000", help="Platform base URL.")
     parser.add_argument("--key", default=os.getenv("LM_API_KEY", ""),
                         help="Platform API key (or set LM_API_KEY).")
+    parser.add_argument("--user", default="", help="Username, if you have no API key.")
+    parser.add_argument("--password", default=os.getenv("LM_PASSWORD", ""),
+                        help="Password for --user (or set LM_PASSWORD).")
+    parser.add_argument("--project", default="", help="X-Project-Id. Required where the "
+                                                      "deployment binds every call to a project.")
     parser.add_argument("--keep", default="", help="Extract to this directory instead of a "
                                                    "temp one, and leave it in place.")
     args = parser.parse_args()
@@ -164,9 +203,22 @@ def main() -> int:
         return build_fixture()
     if not args.run:
         parser.error("one of --fixture or --run is required")
+    api = args.api.rstrip("/")
+
+    token = ""
     if not args.key:
-        parser.error("--key or LM_API_KEY is required to reach the platform")
-    return build_export(args.api.rstrip("/"), args.key, args.run, args.keep)
+        if not args.user:
+            parser.error("--key/LM_API_KEY, or --user with --password, is required to reach "
+                         "the platform")
+        try:
+            token = login(api, args.user, args.password)
+        except Exception as exc:
+            print(f"Could not log in as {args.user!r}: {exc}")
+            return 5
+        if not token:
+            print("The login succeeded but returned no token.")
+            return 5
+    return build_export(api, args.key, args.run, args.keep, token, args.project)
 
 
 if __name__ == "__main__":

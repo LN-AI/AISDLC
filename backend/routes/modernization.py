@@ -196,6 +196,11 @@ def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
         "open_checkpoints": len(checkpoints),
         "blocking_checkpoints": sum(1 for c in checkpoints if c.get("blocking")),
         "last_build": last_build,
+        # Always present, and `never_built` is one of its states. `last_build` alone could
+        # not say that: it is `None` both for a run nobody compiled and for a run whose
+        # build row is missing, and the screen rendered nothing in either case — which reads
+        # as an absence of problems rather than an absence of evidence.
+        "build": build_results.summary_for_run(run["id"]),
         # `None` when no case was ever recorded, which the screen has to render differently
         # from "checked and matching" — a run nobody checked behaviourally and a run that
         # passed parity must never look the same.

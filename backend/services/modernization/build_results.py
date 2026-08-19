@@ -811,3 +811,81 @@ def summarize_for_prompt(run_id: str, unit_id: str, build_id: str = "") -> str:
         lines.append(f"… and {qualifier}{remaining} more diagnostic(s) in this unit are not "
                      f"shown. Fixing the causes above will usually clear them.")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def gate(run_id: str) -> Dict[str, Any]:
+    """Ask, at the end of the run, whether anybody ever compiled this.
+
+    The exact shape as `parity.gate`, and for the same reason: "we never checked" and "we
+    checked and it was clean" must not look the same in the record. Until this existed they
+    did — a run that had never been compiled rendered *nothing* where the build badge goes,
+    which reads as an absence of problems rather than an absence of evidence.
+
+    It is not idle worry. A 45-file run reported 45 converted, 0 failed, and its export could
+    not `dotnet restore`: two projects referenced each other, so MSBuild refused the whole
+    solution before compiling a line (D-99). Every offline check had passed. One build would
+    have said so in thirty seconds, and nothing in the normal flow asked for one.
+
+    **Not blocking, and not automatic.** D-05 forbids compiling on this host, so the platform
+    cannot answer this question itself — it can only make sure the question gets asked, of
+    someone who can. The checkpoint carries the command, because "run a build" is advice and
+    a command that can be pasted is an action.
+    """
+    run = store.get_run(run_id) or {}
+    if run.get("build_round"):
+        latest = store.latest_build(run_id) or {}
+        return {"status": "clean" if not latest.get("error_count") else "errors",
+                "round": run.get("build_round"), "errors": latest.get("error_count") or 0}
+
+    store.append_event(
+        run_id, "build_not_checked",
+        "Nothing has compiled this export. Every check that ran reads code; none of them "
+        "runs a compiler, and a conversion can pass all of them and still not build.",
+        level="warning")
+    if not any(c["kind"] == "build_required" for c in store.list_checkpoints(run_id)):
+        store.create_checkpoint(
+            run_id, "build_required",
+            "This export has never been compiled",
+            detail=(
+                "Every check this run performed reads the converted code: whether each file "
+                "is whole, whether the files agree with each other, whether a symbol one "
+                "file uses is one another file exported. None of them runs a compiler, and "
+                "nothing here can — building code generated from a customer's source is "
+                "arbitrary code execution, so it happens where the customer's own CI does.\n\n"
+                "The shortest path is a machine with the .NET SDK on it:\n\n"
+                f"    python scripts/build_run.py --run {run_id} \\n"
+                "        --api <this deployment> --user <you> --password <yours>\n\n"
+                "It downloads the export, runs `dotnet build`, and posts the compiler's own "
+                "output back to this run. Failing units go back into the queue with those "
+                "errors in their prompt, so a build is not only a verdict — it is the input "
+                "to the next attempt.\n\n"
+                "Or open a pull request against a repository you own "
+                "(`POST /runs/{id}/github-pr`), which carries a workflow that does the same "
+                "thing from GitHub Actions and reports back here.\n\n"
+                "Acknowledge this to close the run without that evidence."
+            )[:4000],
+            blocking=False,
+            payload={"round": 0, "command": f"python scripts/build_run.py --run {run_id}"},
+        )
+    return {"status": "never_built", "round": 0, "errors": 0}
+
+
+def summary_for_run(run_id: str) -> Dict[str, Any]:
+    """The one-line build state a run manifest carries.
+
+    Always a dict, never `None` — unlike parity, where no recorded case means the customer
+    never opted in. Every run produces something that either builds or does not, so
+    "never_built" is a state this has to be able to say out loud rather than an opt-out.
+    """
+    run = store.get_run(run_id) or {}
+    if not run.get("build_round"):
+        return {"status": "never_built", "round": 0, "errors": 0, "warnings": 0}
+    latest = store.latest_build(run_id) or {}
+    errors = int(latest.get("error_count") or 0)
+    return {
+        "status": "clean" if not errors else "errors",
+        "round": int(run.get("build_round") or 0),
+        "errors": errors,
+        "warnings": int(latest.get("warning_count") or 0),
+        "source": latest.get("source") or "",
+    }

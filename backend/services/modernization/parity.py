@@ -1109,3 +1109,62 @@ def summary_for_run(run_id: str) -> Optional[Dict[str, Any]]:
         "missing": (latest or {}).get("missing") or 0,
         "report_id": (latest or {}).get("id") or "",
     }
+
+
+def invite(run_id: str) -> Dict[str, Any]:
+    """Ask for golden cases *before* the conversion runs, which is the only time it works.
+
+    `gate` asks at the end whether the behaviour was checked, and by then the answer can only
+    be no. Recording a golden case means watching the **legacy** application serve real
+    requests — so the moment to ask is before a single file is converted, while the old system
+    is still the only one that exists and a human is already standing at the plan gate with
+    their hand on a spend approval. A real 45-file run finished with
+    `parity_not_recorded` in its log and nobody had ever been asked.
+
+    Non-blocking, and deliberately so. Parity is a customer choosing to buy the strongest
+    guarantee available; a run that would rather have converted code sooner is a legitimate
+    run, and blocking on it would make the pipeline refuse work it can do.
+
+    The invitation carries the URLs the deterministic analysis already found, because "record
+    the important journeys" is a question and "these are the fifteen URLs this application
+    answers on" is a prompt somebody can act on.
+    """
+    if store.parity_case_count(run_id):
+        return {"status": "recorded", "cases": store.parity_case_count(run_id)}
+    if any(c["kind"] == "parity_invitation" for c in store.list_checkpoints(run_id)):
+        return {"status": "invited", "cases": 0}
+
+    routes = [r["value"] for r in store.list_evidence(run_id, kind="route")][:20]
+    listed = ("\n\nThe analysis already found these URLs, which is a reasonable list to cover:"
+              "\n" + "\n".join(f"  · {r}" for r in routes)) if routes else ""
+    store.create_checkpoint(
+        run_id, "parity_invitation",
+        "Record what the old system does, before it is converted",
+        detail=(
+            "Everything this pipeline checks from here on reads *code*: whether each file is "
+            "whole, whether the files agree, whether a compiler accepts them. A conversion "
+            "can pass all of that and still behave differently — `(int)$_POST['salary']` "
+            "became `int.TryParse`, so a stored 61234 became 0, and that is valid C# no "
+            "check here can see.\n\n"
+            "The only thing that catches it is a recording of what the legacy application "
+            "actually did, replayed against the converted one. That recording has to be made "
+            "**now**, from the system that still exists.\n\n"
+            f"    curl <this deployment>/api/v1/modernization/runs/{run_id}/parity-tools\n\n"
+            "That returns two single-file Python programs with no dependencies. Run the "
+            "recorder next to the legacy application, use the application through it for a "
+            "few minutes — the journeys that matter, including the ones that fail — and it "
+            "uploads what it saw. The replayer runs the same requests against the converted "
+            "application later and reports back here."
+            + listed +
+            "\n\nAcknowledge this to convert without behavioural cover. Nothing later can "
+            "recover the chance: once the legacy system is gone, so is the only source of "
+            "truth about what it did."
+        )[:4000],
+        blocking=False,
+        payload={"cases": 0, "routes": routes},
+    )
+    store.append_event(
+        run_id, "parity_invited",
+        "Asked for golden cases before conversion — the only point at which the legacy "
+        "application can still be recorded.", level="info")
+    return {"status": "invited", "cases": 0}

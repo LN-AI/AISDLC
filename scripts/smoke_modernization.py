@@ -4526,6 +4526,203 @@ check("the assessment estimate includes the audit call",
       str(_audit_estimate))
 
 
+
+# ── 34. The build question ────────────────────────────────────────
+section("34. Nobody ever compiled it — making the run ask")
+
+# The build loop has been complete and working since it was written: `build_run.py`,
+# `POST /runs/{id}/build-results`, the PR workflow, `commit_tree`. Nothing routine used any of
+# it, so a 45-file run reported 45 converted, 0 failed, and shipped an export that could not
+# `dotnet restore` — two projects referencing each other, which MSBuild refuses outright
+# before compiling a line (D-99). Every offline check was green.
+#
+# The platform cannot answer "does it build" itself (D-05: no compiling on the API host). What
+# it can do is make sure the question is asked, of someone who can, and record that it was.
+
+_bld_run = store.create_run("never-built", ".NET 8", "files", created_by="smoke")
+check("a run that has never been compiled says so, rather than saying nothing",
+      build_results.summary_for_run(_bld_run)["status"] == "never_built",
+      str(build_results.summary_for_run(_bld_run)))
+check("and the summary always exists — this is not an opt-in like parity",
+      build_results.summary_for_run(_bld_run) is not None)
+
+_bld_gate = build_results.gate(_bld_run)
+check("the gate reports never_built", _bld_gate["status"] == "never_built", str(_bld_gate))
+check("the run log records that nothing compiled this",
+      any(e["event"] == "build_not_checked" for e in store.list_events(_bld_run)),
+      str([e["event"] for e in store.list_events(_bld_run)]))
+_bld_cp = [c for c in store.list_checkpoints(_bld_run) if c["kind"] == "build_required"]
+check("and a checkpoint asks for it", len(_bld_cp) == 1, str(len(_bld_cp)))
+check("which does not block the run — the platform cannot compile, so it cannot insist",
+      not _bld_cp[0]["blocking"])
+check("the checkpoint carries the command, not advice about the command",
+      "build_run.py" in (_bld_cp[0]["detail"] or "") and _bld_run in (_bld_cp[0]["detail"] or ""),
+      (_bld_cp[0]["detail"] or "")[:200])
+check("and says why the platform will not do it itself",
+      "arbitrary code execution" in (_bld_cp[0]["detail"] or ""))
+check("it names the other route too, for someone whose CI is GitHub",
+      "github-pr" in (_bld_cp[0]["detail"] or ""))
+build_results.gate(_bld_run)
+check("asking twice does not queue a second checkpoint",
+      len([c for c in store.list_checkpoints(_bld_run) if c["kind"] == "build_required"]) == 1)
+
+# A run that *has* been compiled is in a different conversation, and the two must not read
+# the same. This is the same argument `parity.gate` makes about never-checked versus checked.
+_ok_run = store.create_run("built-clean", ".NET 8", "files", created_by="smoke")
+store.insert_units(_ok_run, [{"path": "a.cs", "kind": "source_file", "status": "converted",
+                              "topo_level": 0, "order_index": 0}])
+build_results.ingest(_ok_run, {"log": "Build succeeded.\n    0 Warning(s)\n    0 Error(s)\n",
+                               "source": "local_dotnet", "diagnostics": []}, "smoke")
+_ok = build_results.summary_for_run(_ok_run)
+check("a clean build reads as clean", _ok["status"] == "clean" and _ok["errors"] == 0, str(_ok))
+check("and it is a different state from never having built",
+      _ok["status"] != build_results.summary_for_run(_bld_run)["status"])
+check("a run that compiled is not asked to compile again",
+      build_results.gate(_ok_run)["status"] == "clean")
+check("and no checkpoint is raised for it",
+      not [c for c in store.list_checkpoints(_ok_run) if c["kind"] == "build_required"])
+
+_bad_run = store.create_run("built-broken", ".NET 8", "files", created_by="smoke")
+store.insert_units(_bad_run, [{"path": "a.cs", "kind": "source_file", "status": "converted",
+                               "topo_level": 0, "order_index": 0}])
+build_results.ingest(_bad_run, {
+    "log": "a.cs(3,9): error CS0246: The type or namespace name 'Foo' could not be found "
+           "[/x/A.csproj]\n    1 Error(s)\n", "source": "local_dotnet"}, "smoke")
+_bad = build_results.summary_for_run(_bad_run)
+check("a failing build reports its error count", _bad["status"] == "errors" and _bad["errors"] >= 1,
+      str(_bad))
+
+# The gate is reached by finishing the run, not by someone remembering to call it.
+_flow = store.create_run("build-in-flow", ".NET 8", "files", created_by="smoke")
+runner._finish_stage(_flow, stages.BY_ID["reconcile"], CALLER, None)
+check("finishing reconcile asks the build question as part of the normal flow",
+      any(e["event"] == "build_not_checked" for e in store.list_events(_flow)),
+      str([e["event"] for e in store.list_events(_flow)]))
+check("and the parity question too — both are asked at the same moment",
+      any(e["event"] == "parity_not_recorded" for e in store.list_events(_flow)),
+      str([e["event"] for e in store.list_events(_flow)]))
+
+# The friction that actually stopped this being used: the script asked for an API key nobody
+# had provisioned. `get_caller` has always accepted a bearer token on these endpoints.
+_build_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "scripts", "build_run.py"), encoding="utf-8").read()
+check("build_run.py can authenticate with a username and password",
+      "--user" in _build_src and "def login(" in _build_src)
+check("and reads the key this deployment's login actually returns",
+      '"token"' in _build_src, "expected the `token` key")
+check("it can send the project header some deployments demand",
+      "X-Project-Id" in _build_src)
+check("the offline fixture path still needs neither", "--fixture" in _build_src)
+
+
+
+# ── 35. Asking for behaviour in time ────────────────────────────────
+section("35. Asking for the old system's behaviour while the old system still exists")
+
+# Everything for parity was built — the comparator, the recorder, the replayer, the
+# adjudicator, the gate — and a real 45-file run still finished with `parity_not_recorded` in
+# its log. Not because anything was broken: because nobody was ever asked, and by the time
+# `gate` asks at the end of the run the answer can only be no. A golden case is a recording of
+# the *legacy* application, so the question has to be asked before it is replaced.
+
+_inv_run = store.create_run("parity-invite", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_inv_run, PHP_FIXTURE)
+_inv = parity.invite(_inv_run)
+check("a run with no recorded behaviour is invited to record some",
+      _inv["status"] == "invited", str(_inv))
+_inv_cp = [c for c in store.list_checkpoints(_inv_run) if c["kind"] == "parity_invitation"]
+check("the invitation is a checkpoint, so it is on the screen and not only in a log",
+      len(_inv_cp) == 1, str(len(_inv_cp)))
+check("it does not block — parity is a customer buying the strongest guarantee, not a rule",
+      not _inv_cp[0]["blocking"])
+check("it says why no later check can substitute for it",
+      "valid C#" in (_inv_cp[0]["detail"] or "") or "no check here can see"
+      in (_inv_cp[0]["detail"] or ""), (_inv_cp[0]["detail"] or "")[:300])
+check("and hands over the command that produces the recorder",
+      "parity-tools" in (_inv_cp[0]["detail"] or ""))
+check("it warns that the chance does not come back",
+      "once the legacy system is gone" in (_inv_cp[0]["detail"] or "").lower())
+check("the run log records that the question was asked",
+      any(e["event"] == "parity_invited" for e in store.list_events(_inv_run)))
+parity.invite(_inv_run)
+check("asking twice does not queue a second invitation",
+      len([c for c in store.list_checkpoints(_inv_run)
+           if c["kind"] == "parity_invitation"]) == 1)
+
+# The invitation carries the URLs the deterministic analysis already found. "Record the
+# important journeys" is a question; a list of the fifteen URLs the application answers on is
+# something somebody can act on.
+_routed = store.create_run("parity-routes", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_routed, [{"path": p, "content": t} for p, t in LAYERED.items()])
+parity.invite(_routed)
+_routed_cp = [c for c in store.list_checkpoints(_routed)
+              if c["kind"] == "parity_invitation"][0]
+check("the invitation lists the URLs the analysis already found",
+      len((_routed_cp["payload"] or {}).get("routes") or []) >= 4,
+      str((_routed_cp["payload"] or {}).get("routes")))
+check("and puts them in the text, where they will actually be read",
+      "/login" in (_routed_cp["detail"] or ""), (_routed_cp["detail"] or "")[-400:])
+
+# A run that already recorded behaviour is not nagged about recording it.
+parity.record_cases(_inv_run, {"source": "smoke", "cases": [
+    {"name": "list employees", "request": {"method": "GET", "path": "/employees.php"},
+     "expected": {"status": 200, "content_type": "text/html",
+                  "body": "<html><body><h1>Employees</h1></body></html>"}}]}, "smoke")
+_again = store.create_run("parity-have-cases", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_again, {"source": "smoke", "cases": [
+    {"name": "home", "request": {"method": "GET", "path": "/"},
+     "expected": {"status": 200, "content_type": "text/html",
+                  "body": "<html>hi</html>"}}]}, "smoke")
+check("a run that already has cases is not invited",
+      parity.invite(_again)["status"] == "recorded")
+check("and no invitation checkpoint is raised for it",
+      not [c for c in store.list_checkpoints(_again) if c["kind"] == "parity_invitation"])
+
+# The moment matters more than the wording: it has to be asked at the plan gate, which is the
+# last point before anything is converted.
+_gate_run = store.create_run("parity-at-gate", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_gate_run, PHP_FIXTURE)
+runner.set_charter(_gate_run, VALID_CHARTER, "smoke")
+for _c in store.list_checkpoints(_gate_run, "open"):
+    store.answer_checkpoint(_c["id"], {"decision": "approved"}, "smoke")
+store.insert_units(_gate_run, [
+    {"path": "#component/0000-only", "kind": "component", "status": "ready", "topo_level": 0,
+     "order_index": 0, "target_project": "Acme.Web", "target_namespace": "Acme.Web",
+     "meta": {"members": ["index.php"], "expected_files": ["Home.cshtml"]}}])
+runner._build_task_plan(_gate_run)
+_open_kinds = [c["kind"] for c in store.list_checkpoints(_gate_run, "open")]
+check("the plan gate is raised", "plan_approval" in _open_kinds, str(_open_kinds))
+check("and the parity question is asked at the same moment, before anything converts",
+      "parity_invitation" in _open_kinds, str(_open_kinds))
+check("the conversion is still blocked only by the spend gate",
+      [c["kind"] for c in store.list_checkpoints(_gate_run, "open") if c["blocking"]]
+      == ["plan_approval"],
+      str([(c["kind"], c["blocking"]) for c in store.list_checkpoints(_gate_run, "open")]))
+
+# The manifest has carried `parity` since parity was written, and nothing rendered it — so a
+# run that verified its behaviour and one that never looked read the same on screen.
+check("a run with no cases reports no parity summary at all",
+      parity.summary_for_run(_gate_run) is None)
+_summary = parity.summary_for_run(_again)
+check("a run with cases and no replay says exactly that",
+      _summary["status"] == "never_run" and _summary["cases"] == 1, str(_summary))
+
+# The tools ship inside the export, next to the code they check — but only when the platform
+# has an address a customer's machine could upload to. A recorder that cannot phone home is
+# worse than none, and that is a configuration fact, not a code path to guess at.
+_tools = parity_tools.bundle("https://example.test/api/v1/modernization", _inv_run)
+check("the export bundle carries a recorder, a replayer and the note explaining them",
+      sorted(p.rsplit("/", 1)[-1] for p in _tools)
+      == ["README.md", parity_tools.RECORDER_FILENAME, parity_tools.REPLAYER_FILENAME],
+      str(sorted(_tools)))
+check("both are single files under one directory",
+      all(p.startswith(parity_tools.PARITY_TOOLS_DIR + "/") for p in _tools), str(list(_tools)))
+check("and both carry this run's own id, so they cannot upload to the wrong run",
+      all(_inv_run in body for body in _tools.values()))
+check("a bundle with no address to upload to is refused rather than rendered useless",
+      _raises(ValueError, lambda: parity_tools.bundle("", _inv_run)))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

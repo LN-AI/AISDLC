@@ -840,6 +840,59 @@ function modPlanChecks() {
     assert(!html.includes('What was read'), 'it invented a denominator block from nothing');
   });
 
+  check('a run nobody compiled says so, instead of rendering nothing', () => {
+    // It used to render nothing at all when `build_round` was 0, which reads as an absence of
+    // problems rather than an absence of evidence. A real run shipped 45 converted files whose
+    // solution could not even restore, with every offline check green.
+    const html = sandbox.renderModernizationBuildBadge(
+      { build_round: 0, units: { total: 45, converted: 45 } });
+    assert(html.includes('Never compiled'), 'the absence is invisible again');
+    assert(html.includes('How to check it builds'), 'no way to act on it');
+  });
+
+  check('but it stays quiet until there is something to compile', () => {
+    assert(sandbox.renderModernizationBuildBadge(
+      { build_round: 0, units: { total: 45, converted: 0 } }) === '');
+  });
+
+  check('a run that has compiled reports the round, not the absence', () => {
+    const html = sandbox.renderModernizationBuildBadge(
+      { build_round: 2, units: { converted: 45 },
+        last_build: { error_count: 0, warning_count: 3, source: 'local_dotnet' } });
+    assert(html.includes('Build round 2'), 'the round is missing');
+    assert(html.includes('compiled with no errors'), 'the verdict is missing');
+    assert(!html.includes('Never compiled'), 'it claims both at once');
+  });
+
+  check('a run whose behaviour nobody recorded says so', () => {
+    // The manifest has carried `parity` since parity was written and this screen never read
+    // it, so a run that verified its behaviour and one that never looked rendered the same.
+    const html = sandbox.renderModernizationParityBadge(
+      { parity: null, units: { converted: 45 } });
+    assert(html.includes('No recorded behaviour'), 'the absence is invisible');
+    assert(html.includes('How to record it'), 'no way to act on it');
+  });
+
+  check('recorded but never replayed is its own state, not a pass', () => {
+    const html = sandbox.renderModernizationParityBadge(
+      { parity: { cases: 12, status: 'never_run', round: 0 }, units: { converted: 45 } });
+    assert(html.includes('12 recorded behaviour(s), never replayed'), html);
+    assert(!html.includes('matched'), 'it reads as though something passed');
+  });
+
+  check('and a pass says which round it passed on', () => {
+    const html = sandbox.renderModernizationParityBadge(
+      { parity: { cases: 12, status: 'passed', round: 2 }, units: { converted: 45 } });
+    assert(html.includes('all matched on round 2'), html);
+  });
+
+  check('a divergence reports the split, not just a verdict', () => {
+    const html = sandbox.renderModernizationParityBadge(
+      { parity: { cases: 12, status: 'failed', round: 1, passed: 9, failed: 3, errored: 0 },
+        units: { converted: 45 } });
+    assert(html.includes('3 differed') && html.includes('9 matched'), html);
+  });
+
   check('the plan is offered from the run row, because GET /plan answers 404', () => {
     // `store.get_run` decodes charter/stats/redactions/error and not plan_json/estimate_json,
     // so `run.plan` is never populated. Reading the raw column is what makes the chip appear

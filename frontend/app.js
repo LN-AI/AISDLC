@@ -5867,7 +5867,8 @@ function renderModernizationRun(run, checkpoints, units, components) {
         ${run.rules_confirmed ? '<button class="btn btn-secondary" onclick="showModernizationRules()">Business rules</button>' : ''}
         ${terminal ? '' : '<button class="btn btn-link" onclick="cancelModernizationRun()">Cancel run</button>'}
       </div>
-      ${run.build_round ? renderModernizationBuildBadge(run) : ''}
+      ${renderModernizationBuildBadge(run)}
+      ${renderModernizationParityBadge(run)}
       <div class="mod-inspect" id="mod-inspect">${renderModernizationInspect(run, units)}</div>
     </div>
 
@@ -5920,6 +5921,19 @@ function renderModernizationBuildBadge(run) {
   // A run that has been through a build round is in a different conversation with the user
   // than one that never compiled: the question is no longer "did it convert" but "does it
   // build". Surfacing the round on the header is what makes the loop visible at all.
+  //
+  // "Never compiled" is now one of the things it says. It used to render nothing at all,
+  // which reads as an absence of problems rather than an absence of evidence — and a real
+  // run shipped 45 converted files whose solution could not `dotnet restore`, with every
+  // offline check green. The line only appears once there is something to compile.
+  if (!run.build_round) {
+    const converted = (run.units || {}).converted || 0;
+    if (!converted) return '';
+    return `<div class="mod-meta" style="margin-top:8px">
+      Never compiled — every check that ran reads the code; none of them runs a compiler.
+      <span class="mod-drill" onclick="showModernizationBuildHelp()">How to check it builds</span>
+    </div>`;
+  }
   const b = run.last_build || {};
   const clean = b.error_count === 0;
   return `<div class="mod-meta" style="margin-top:8px">
@@ -5928,6 +5942,63 @@ function renderModernizationBuildBadge(run) {
     ${b.warning_count ? ` · ${b.warning_count} warning(s)` : ''}
     ${b.reopened_count ? ` · ${b.reopened_count} unit(s) sent back for rework` : ''}
   </div>`;
+}
+
+// The other question no check above can answer: does it still *do* the same thing. The run
+// manifest has carried `parity` since parity was written and nothing on this screen read it,
+// so a run that verified its behaviour and one that never looked rendered identically — which
+// is the exact failure the summary's own comment says must not happen.
+function renderModernizationParityBadge(run) {
+  const p = run.parity;
+  const converted = (run.units || {}).converted || 0;
+  if (!p) {
+    if (!converted) return '';
+    return `<div class="mod-meta" style="margin-top:4px">
+      No recorded behaviour — nothing checked that the converted application does what the
+      legacy one did.
+      <span class="mod-drill" onclick="showModernizationParityHelp()">How to record it</span>
+    </div>`;
+  }
+  const label = {
+    never_run: `${p.cases} recorded behaviour(s), never replayed`,
+    passed: `${p.cases} recorded behaviour(s) — all matched on round ${p.round}`,
+  }[p.status] || `${p.cases} recorded behaviour(s) — ${p.failed || 0} differed, ` +
+                 `${p.passed || 0} matched, ${p.errored || 0} errored on round ${p.round}`;
+  return `<div class="mod-meta" style="margin-top:4px">Behaviour: ${esc(label)}</div>`;
+}
+
+function showModernizationParityHelp() {
+  const id = _modRunId || '<run id>';
+  alert(
+    'A conversion can compile, pass every consistency check, and still behave differently. '
+    + "`(int)$_POST['salary']` became `int.TryParse`, so a stored 61234 became 0 — valid C# "
+    + 'that no check here can see.\n\n'
+    + 'The only thing that catches it is a recording of the legacy application, replayed '
+    + 'against the converted one:\n\n'
+    + `    curl ${location.origin}/api/v1/modernization/runs/${id}/parity-tools\n\n`
+    + 'Two single-file Python programs, no dependencies. Run the recorder next to the legacy '
+    + 'app and use it for a few minutes — including the journeys that fail. The replayer runs '
+    + 'the same requests against the converted app and reports back here.\n\n'
+    + 'Record it while the legacy system still exists. Once it is gone, so is the only source '
+    + 'of truth about what it did.');
+}
+
+// The command, not advice about the command. "Run a build" is something a reader agrees with
+// and does not do; a line they can paste is an action. Nothing here compiles anything — the
+// platform cannot (D-05), so what it can do is make the question easy to answer.
+function showModernizationBuildHelp() {
+  const id = _modRunId || '<run id>';
+  alert(
+    'Nothing here can compile this export — building code generated from your source is '
+    + 'arbitrary code execution, so it happens where your own CI does.\n\n'
+    + 'On a machine with the .NET SDK:\n\n'
+    + `    python scripts/build_run.py --run ${id} --api ${location.origin} \\\n`
+    + '        --user <you> --password <yours>\n\n'
+    + 'It downloads the export, runs `dotnet build`, and posts the compiler output back to '
+    + 'this run. Units that failed go back into the queue with those errors in their prompt, '
+    + 'so a build is not only a verdict — it is the input to the next attempt.\n\n'
+    + 'Or open a PR against a repository you own, which carries a workflow that does the '
+    + 'same thing from GitHub Actions and reports back here.');
 }
 
 function renderModernizationStages(run) {

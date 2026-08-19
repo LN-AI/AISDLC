@@ -737,12 +737,19 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
                 detail=reconcile.describe(report)[:4000],
                 blocking=False,
             )
-        # Behavioural parity is the last thing asked and the only one that is about what the
-        # application *does*. It is not a stage of its own (D-45 is about stages that drain
-        # rows through the claim loop; a parity replay happens on someone else's machine and
-        # reports back hours later), so what belongs in the run is the gate: a run carrying
-        # recorded behaviour must not reach `completed` without that behaviour having been
-        # checked. Nothing is raised for a run that recorded no cases.
+        # Two questions the platform cannot answer itself, asked here because this is the
+        # last moment anyone is looking. Both follow the same shape (D-05): nothing is
+        # compiled or executed on this host, so the run's job is to make sure the question
+        # reaches someone who can answer it, and to record that it was asked.
+        #
+        # Does it build? Every check above reads code; none runs a compiler, and a run that
+        # was never compiled used to render exactly like one that compiled clean.
+        build_results.gate(run_id)
+        # Does it still behave the same? The only question that is about what the application
+        # *does*. Not a stage of its own (D-45 is about stages that drain rows through the
+        # claim loop; a parity replay happens on someone else's machine and reports back
+        # hours later), so what belongs in the run is the gate: a run carrying recorded
+        # behaviour must not reach `completed` without that behaviour having been checked.
         parity.gate(run_id)
 
 
@@ -1379,6 +1386,12 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
         run_id, "plan_approval", "Approve the conversion plan", detail=detail,
         blocking=True, payload=plan,
     )
+    # Asked here because here is the last moment it can be answered. A golden case is a
+    # recording of the *legacy* application, and after this gate the pipeline starts
+    # replacing it — so a question asked at the end of the run (`parity.gate`) can only ever
+    # be answered "no". Non-blocking: this is a customer choosing the strongest guarantee
+    # available, not a requirement the run can enforce.
+    parity.invite(run_id)
     store.append_event(run_id, "plan_ready",
                        f"{len(components)} component(s), est ${totals['expected_usd']:.2f}, "
                        f"ceiling ${totals['ceiling_usd']:.2f}")
