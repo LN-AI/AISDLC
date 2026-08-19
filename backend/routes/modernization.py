@@ -71,6 +71,30 @@ class CreateRunRequest(BaseModel):
     budget_cap_usd: Optional[float] = Field(
         None, description="Hard stop. The run pauses when it reaches this, keeping everything "
                           "converted so far. Strongly recommended on a first run.")
+    conversion_mode: str = Field(
+        "single",
+        description="'single' (default) converts each component in one model call, which is "
+                    "what this product has always done. 'agentic' lets each component look "
+                    "things up first - read another source file, search the codebase, read "
+                    "what an earlier component produced - up to a bounded number of times "
+                    "before it answers. It costs more per component, and the plan gate "
+                    "quotes a ceiling that accounts for it.")
+
+
+CONVERSION_MODES = ("single", "agentic")
+
+
+def _conversion_mode(raw: str) -> str:
+    """Refused rather than defaulted.
+
+    A typo silently converting in the cheap mode is a customer who paid attention to this
+    setting, did not get what they asked for, and has nothing anywhere telling them so.
+    """
+    mode = (raw or "single").strip().lower()
+    if mode not in CONVERSION_MODES:
+        raise HTTPException(
+            400, f"conversion_mode must be one of {', '.join(CONVERSION_MODES)}; got {mode!r}.")
+    return mode
 
 
 class CharterRequest(BaseModel):
@@ -278,6 +302,7 @@ def create_run(req: CreateRunRequest, caller: dict = Depends(get_caller)):
         project_name=getattr(subject, "project_name", "") or "",
         budget_cap_usd=req.budget_cap_usd, created_by=_actor(caller),
     )
+    store.update_run(run_id, conversion_mode=_conversion_mode(req.conversion_mode))
     _ingest(run_id, files, _extensions(req.extensions))
     return _run_view(store.get_run(run_id))
 
@@ -289,6 +314,8 @@ async def create_run_from_zip(
     target_stack: str = Form(...),
     extensions: str = Form("", description="Comma-separated extension override, e.g. '.cbl,.cpy'."),
     budget_cap_usd: Optional[float] = Form(None),
+    conversion_mode: str = Form("single", description="'single' or 'agentic' — see the JSON "
+                                                      "create endpoint."),
     caller: dict = Depends(get_caller),
 ):
     agent_guard.preflight(caller, "modernization")
@@ -306,6 +333,7 @@ async def create_run_from_zip(
         project_name=getattr(subject, "project_name", "") or "",
         budget_cap_usd=budget_cap_usd, created_by=_actor(caller),
     )
+    store.update_run(run_id, conversion_mode=_conversion_mode(conversion_mode))
     # `from_zip` decodes only; filtering and redaction happen once, inside `_ingest`, so the
     # per-run extension override is honoured rather than pre-empted.
     _ingest(run_id, members, _extensions(extensions.split(",")) if extensions else None)

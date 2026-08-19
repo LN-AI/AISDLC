@@ -235,6 +235,8 @@ class UnitConverterAgent(BaseAgent):
         source_facts: Optional[List[Dict[str, Any]]] = None,
         build_diagnostics: str = "",
         prior_findings: str = "",
+        lookup_tools: Optional[List[Dict[str, Any]]] = None,
+        lookup_dispatch=None,
     ) -> Dict[str, Any]:
         """`build_diagnostics` is what a real compiler said about this unit's *previous*
         output, and it is the only reason a re-conversion produces anything different.
@@ -255,10 +257,21 @@ class UnitConverterAgent(BaseAgent):
             source_facts=source_facts or [], build_diagnostics=build_diagnostics,
             prior_findings=prior_findings,
         )
-        result = llm_gateway.call_tool(
-            self.system_for(charter, addendum), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
-            llm_override, max_tokens=CONVERSION_MAX_TOKENS,
-        )
+        # With lookups, the same forced-tool contract with a bounded number of read-only
+        # questions in front of it. Without them, byte-identical to what this has always
+        # done — the loop is opt-in per run and the default is off, so a run that did not
+        # ask for it cannot be charged for it.
+        if lookup_tools and lookup_dispatch:
+            result = llm_gateway.call_agentic(
+                self.system_for(charter, addendum), user_content,
+                UNIT_CONVERSION_TOOL_SCHEMA, lookup_tools, lookup_dispatch,
+                llm_override, max_tokens=CONVERSION_MAX_TOKENS,
+            )
+        else:
+            result = llm_gateway.call_tool(
+                self.system_for(charter, addendum), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
+                llm_override, max_tokens=CONVERSION_MAX_TOKENS,
+            )
         result["agent_name"] = self.agent_name
         return result
 

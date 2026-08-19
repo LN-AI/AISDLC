@@ -444,6 +444,12 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
 # backfill UPDATE is needed even on a large populated database. A non-constant default
 # (CURRENT_TIMESTAMP, an expression) would not have that property.
 _ADDED_COLUMNS = (
+    # `single` (one forced tool call per component, which is everything this product has ever
+    # done) or `agentic` (a bounded loop that may look things up first). Defaulted to `single`
+    # so every existing run, every quote already given at a spend gate and every fixture keeps
+    # the behaviour it had — this is a thing a customer opts into, not a thing that happens
+    # to them between deploys.
+    ("modernization_runs", "conversion_mode", "TEXT DEFAULT 'single'"),
     ("modernization_units", "kind", "TEXT DEFAULT 'source_file'"),
     ("modernization_units", "component_name", "TEXT"),
     ("modernization_units", "target_project", "TEXT"),

@@ -34,12 +34,12 @@ from backend.agents.modernization_intelligence import comprehension_agent as _co
 from backend.agents.modernization_intelligence import extraction_audit_agent as _extraction_audit
 from backend.agents.modernization_intelligence.architect_agent import TargetArchitectAgent
 from backend.agents.modernization_intelligence.unit_converter import UnitConverterAgent
-from backend.services import agent_guard, guardrail_service
+from backend.services import agent_guard, guardrail_service, llm_gateway
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence,
-    extraction_audit, graph, parity, playbooks, reconcile, repo_ingest, rules, sanity,
-    scaffold, semantics, stages, store, usings, validation, wireup,
+    extraction_audit, graph, lookup, parity, playbooks, reconcile, repo_ingest, rules,
+    sanity, scaffold, semantics, stages, store, usings, validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -1329,9 +1329,15 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     design_units = store.list_units(run_id, kind="design")
     design_meta = (design_units[0].get("meta") if design_units else None) or {}
 
+    # A component's ceiling is "the provider cannot generate more than `max_tokens`" — which
+    # is still true per *call*, and this mode makes up to `AGENTIC_MAX_TURNS + 1` of them.
+    # The bound has to move with it, or the one number on this gate that is a fact rather
+    # than a forecast (D-48) quietly stops being one.
+    agentic = (run.get("conversion_mode") or "single") == "agentic"
+    turns = (llm_gateway.AGENTIC_MAX_TURNS + 1) if agentic else 1
     per_unit = [{
         "est_cost_usd": c.get("est_cost_usd") or 0.0,
-        "ceiling_usd": (c.get("meta") or {}).get("ceiling_usd") or 0.0,
+        "ceiling_usd": ((c.get("meta") or {}).get("ceiling_usd") or 0.0) * turns,
         "model": "",
         "estimated": False,
     } for c in components]
@@ -1382,6 +1388,17 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     )
     if plan["corrections"]:
         detail += f" {len(plan['corrections'])} correction(s) were applied to the proposed layout."
+    if agentic:
+        # Said plainly, because the expectation is the half that is not yet measured. The
+        # ceiling above already carries the multiplier; the estimate does not, and quoting a
+        # forecast as though it were calibrated for a mode nobody has run is exactly the
+        # dishonesty the two-gate split exists to remove.
+        detail += (
+            f" This run converts in **agentic** mode: each component may look things up in "
+            f"the source and in what has already been converted before it answers, up to "
+            f"{llm_gateway.AGENTIC_MAX_TURNS} times. The ceiling above accounts for that. "
+            f"The estimate does not — expected cost for this mode has not been measured yet, "
+            f"so read the ceiling, not the estimate.")
     store.create_checkpoint(
         run_id, "plan_approval", "Approve the conversion plan", detail=detail,
         blocking=True, payload=plan,
@@ -1494,7 +1511,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                         for p in _component_members(run_id, c)]
         dependency_symbols = store.symbols_for_paths(run_id, member_paths)
 
-    addendum = store.get_run(run_id).get("system_addendum") or "" \
+    run_row = store.get_run(run_id) or {}
+    addendum = (run_row.get("system_addendum") or "") \
         if unit.get("kind") == "component" else ""
     placement = {
         "component_name": unit.get("component_name") or "",
@@ -1522,28 +1540,47 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         validation.summarize_for_prompt(meta.get("validation_issues") or []),
     ) if block)
 
+    # Whether this unit may look things up before it answers. Components only: the other
+    # stages are different agents with different questions, and a run that did not ask for
+    # the loop must convert exactly as it always has (`conversion_mode` defaults to
+    # `single`).
+    agentic = (run_row.get("conversion_mode") or "single") == "agentic" \
+        and unit.get("kind") == "component"
+    lookup_tools = lookup.TOOL_SCHEMAS if agentic else None
+    lookup_dispatch = lookup.dispatcher(run_id) if agentic else None
+
     try:
-        result = agent_guard.guarded_call(
-            caller, "modernization", llm_override,
-            project_name=project_name,
-            fn=lambda: _agent.convert(
-                source=source,
-                path=path,
-                charter=charter,
-                dependency_symbols=dependency_symbols,
-                module_type=unit.get("module_type", ""),
-                language=unit.get("language", ""),
-                in_cycle_with=meta.get("in_cycle_with") or [],
-                redactions=redactions,
-                llm_override=llm_override,
-                addendum=addendum,
-                placement=placement,
-                members=members,
-                source_facts=source_facts,
-                build_diagnostics=build_diagnostics,
-                prior_findings=prior_findings,
-            ),
-        )
+        # `expect_calls` is the one thing the loop changes about billing. `track_usage`
+        # already sums every provider call inside a `guarded_call`, so the *cost* recorded
+        # against this unit stays right on its own; what would be wrong is the budget
+        # **reservation**, which is sized from a per-product call count that assumes one
+        # (D-20, D-46). This is the mechanism D-25 built for exactly that discovery — the
+        # real number is only known here, deep inside, and the guard is taken at the door.
+        with agent_guard.expect_calls(
+                llm_gateway.AGENTIC_MAX_TURNS + 1 if agentic else 1):
+            result = agent_guard.guarded_call(
+                caller, "modernization", llm_override,
+                project_name=project_name,
+                fn=lambda: _agent.convert(
+                    source=source,
+                    path=path,
+                    charter=charter,
+                    dependency_symbols=dependency_symbols,
+                    module_type=unit.get("module_type", ""),
+                    language=unit.get("language", ""),
+                    in_cycle_with=meta.get("in_cycle_with") or [],
+                    redactions=redactions,
+                    llm_override=llm_override,
+                    addendum=addendum,
+                    placement=placement,
+                    members=members,
+                    source_facts=source_facts,
+                    build_diagnostics=build_diagnostics,
+                    prior_findings=prior_findings,
+                    lookup_tools=lookup_tools,
+                    lookup_dispatch=lookup_dispatch,
+                ),
+            )
     except Exception as exc:
         # Entitlement, budget and quota errors are not the unit's fault and retrying them
         # would burn every remaining attempt on every remaining unit. Pause instead.
