@@ -4723,6 +4723,500 @@ check("a bundle with no address to upload to is refused rather than rendered use
       _raises(ValueError, lambda: parity_tools.bundle("", _inv_run)))
 
 
+
+# ── 36. A corpus of framework shapes ───────────────────────────────
+section("36. Five frameworks the fixtures had never seen")
+
+# The root cause of D-80…D-93 was one fixture shape. Sections 1–26 are procedural PHP and
+# section 27 is one layered PSR-4 application; between them they are two data points, and the
+# analyzers were tuned until both passed. This section is the corpus: Laravel, Symfony,
+# CodeIgniter, a WordPress plugin and an API-only service, each expressing routing, data
+# access and templating in a way the previous two do not.
+#
+# It found six defects the moment it was written, and every one of them is fixed below rather
+# than asserted as expected behaviour:
+#
+#   * Laravel reported `db_apis: []` — Eloquent has no SQL literal anywhere, so the D-80
+#     failure recurred on the most widely used PHP framework there is, and `playbooks.select`
+#     withheld the data-access section from every conversion call.
+#   * Symfony reported **zero routes**: `#[Route(...)]` is a PHP 8 attribute and `#` was being
+#     blanked as a shell comment before anything could read it.
+#   * CodeIgniter reported one route of four, because `$routes->get('employees', …)` has no
+#     leading slash and the guard against `->get('id')` refused every relative path.
+#   * `$router->add('GET', '/api/x', …)` was not a route shape at all.
+#   * `$wpdb` was not a datastore, so a plugin whose every query goes through it reported none.
+#   * `sanity.template_without_renderer` fired on `includes/class-directory.php` — a false
+#     positive of exactly the kind that gets a check switched off, since a WordPress
+#     `includes/` holds classes rather than templates.
+#
+# **What this section cannot do.** It stops these six from coming back. It does not stop the
+# seventh framework, which is why the extraction audit (§33) and the cross-signal checks (§31)
+# exist — a corpus is a floor under known shapes, not a substitute for noticing an unknown one.
+
+_CORPUS_STACK = ".NET 8 / ASP.NET Core MVC with Razor views"
+
+
+def _corpus_facts(fixture):
+    """Everything the deterministic layer concludes about one fixture, as a run would."""
+    normalized = repo_ingest.normalize_files(
+        [{"path": p, "content": c} for p, c in fixture.items()])
+    built = graph.build(analyzers.discover(normalized["files"]))
+    rows = evidence.collect(normalized["files"], built["units"])
+    signals = sanity.collect(normalized["files"], built["units"], rows, built["stats"],
+                             normalized["redactions"], normalized["skipped"])
+    aggregate = playbooks.aggregate_facts(built["units"])
+    book = playbooks.find(signals["dominant_language"], _CORPUS_STACK)
+    return {
+        "signals": signals,
+        "routes": sorted({r["value"] for r in rows if r["kind"] == "route"}),
+        "sections": playbooks.select(book, aggregate) if book else [],
+        "warnings": [w["code"] for w in sanity.evaluate(signals, _CORPUS_STACK)],
+    }
+
+
+LARAVEL = {
+    "public/index.php": (
+        "<?php\n"
+        "define('LARAVEL_START', microtime(true));\n"
+        "require __DIR__.'/../vendor/autoload.php';\n"
+        "$app = require_once __DIR__.'/../bootstrap/app.php';\n"
+        "$kernel = $app->make(Illuminate\\Contracts\\Http\\Kernel::class);\n"
+        "$response = $kernel->handle($request = Illuminate\\Http\\Request::capture());\n"
+        "$response->send();\n"
+    ),
+    "routes/web.php": (
+        "<?php\n"
+        "use App\\Http\\Controllers\\EmployeeController;\n"
+        "use Illuminate\\Support\\Facades\\Route;\n"
+        "Route::get('/', [EmployeeController::class, 'index'])->name('home');\n"
+        "Route::get('/employees', [EmployeeController::class, 'index']);\n"
+        "Route::post('/employees', [EmployeeController::class, 'store']);\n"
+        "Route::get('/employees/{employee}/edit', [EmployeeController::class, 'edit']);\n"
+        "Route::delete('/employees/{employee}', [EmployeeController::class, 'destroy']);\n"
+    ),
+    "app/Http/Controllers/EmployeeController.php": (
+        "<?php\n"
+        "namespace App\\Http\\Controllers;\n"
+        "use App\\Models\\Employee;\n"
+        "use Illuminate\\Http\\Request;\n"
+        "class EmployeeController extends Controller\n"
+        "{\n"
+        "    public function index()\n"
+        "    {\n"
+        "        $employees = Employee::orderBy('last_name')->paginate(25);\n"
+        "        return view('employees.index', compact('employees'));\n"
+        "    }\n"
+        "    public function store(Request $request)\n"
+        "    {\n"
+        "        $data = $request->validate(['last_name' => 'required|max:80']);\n"
+        "        Employee::create($data);\n"
+        "        return redirect('/employees');\n"
+        "    }\n"
+        "}\n"
+    ),
+    "app/Models/Employee.php": (
+        "<?php\n"
+        "namespace App\\Models;\n"
+        "use Illuminate\\Database\\Eloquent\\Model;\n"
+        "class Employee extends Model\n"
+        "{\n"
+        "    protected $table = 'employees';\n"
+        "    protected $fillable = ['last_name', 'department_id', 'salary'];\n"
+        "}\n"
+    ),
+    "app/Repositories/ReportRepository.php": (
+        "<?php\n"
+        "namespace App\\Repositories;\n"
+        "use Illuminate\\Support\\Facades\\DB;\n"
+        "class ReportRepository\n"
+        "{\n"
+        "    public function headcount(): array\n"
+        "    {\n"
+        "        return DB::select('SELECT department_id, COUNT(*) c FROM employees "
+        "GROUP BY department_id');\n"
+        "    }\n"
+        "}\n"
+    ),
+    "config/database.php": (
+        "<?php\n"
+        "return [\n"
+        "    'default' => env('DB_CONNECTION', 'mysql'),\n"
+        "    'connections' => ['mysql' => ['driver' => 'mysql', "
+        "'host' => env('DB_HOST', '127.0.0.1')]],\n"
+        "];\n"
+    ),
+    "resources/views/employees/index.blade.php": (
+        "<h1>Employees</h1>\n"
+        "<table><tbody>\n"
+        "@foreach ($employees as $e)\n"
+        "  <tr><td>{{ $e->last_name }}</td><td>{{ $e->salary }}</td></tr>\n"
+        "@endforeach\n"
+        "</tbody></table>\n"
+    ),
+}
+
+SYMFONY = {
+    "public/index.php": (
+        "<?php\n"
+        "use App\\Kernel;\n"
+        "require_once dirname(__DIR__).'/vendor/autoload_runtime.php';\n"
+        "return function (array $context) {\n"
+        "    return new Kernel($context['APP_ENV'], (bool) $context['APP_DEBUG']);\n"
+        "};\n"
+    ),
+    "src/Controller/EmployeeController.php": (
+        "<?php\n"
+        "namespace App\\Controller;\n"
+        "use App\\Entity\\Employee;\n"
+        "use App\\Repository\\EmployeeRepository;\n"
+        "use Symfony\\Bundle\\FrameworkBundle\\Controller\\AbstractController;\n"
+        "use Symfony\\Component\\HttpFoundation\\Response;\n"
+        "use Symfony\\Component\\Routing\\Attribute\\Route;\n"
+        "class EmployeeController extends AbstractController\n"
+        "{\n"
+        "    #[Route('/employees', name: 'employee_index', methods: ['GET'])]\n"
+        "    public function index(EmployeeRepository $repo): Response\n"
+        "    {\n"
+        "        return $this->render('employee/index.html.twig', "
+        "['employees' => $repo->findAll()]);\n"
+        "    }\n"
+        "    #[Route('/employees/{id}', name: 'employee_show', methods: ['GET'])]\n"
+        "    public function show(Employee $employee): Response\n"
+        "    {\n"
+        "        return $this->render('employee/show.html.twig', ['employee' => $employee]);\n"
+        "    }\n"
+        "}\n"
+    ),
+    "src/Entity/Employee.php": (
+        "<?php\n"
+        "namespace App\\Entity;\n"
+        "use Doctrine\\ORM\\Mapping as ORM;\n"
+        "#[ORM\\Entity(repositoryClass: EmployeeRepository::class)]\n"
+        "#[ORM\\Table(name: 'employees')]\n"
+        "class Employee\n"
+        "{\n"
+        "    #[ORM\\Id]\n"
+        "    #[ORM\\Column]\n"
+        "    private ?int $id = null;\n"
+        "    #[ORM\\Column(length: 80)]\n"
+        "    private ?string $lastName = null;\n"
+        "}\n"
+    ),
+    "src/Repository/EmployeeRepository.php": (
+        "<?php\n"
+        "namespace App\\Repository;\n"
+        "use App\\Entity\\Employee;\n"
+        "use Doctrine\\Bundle\\DoctrineBundle\\Repository\\ServiceEntityRepository;\n"
+        "class EmployeeRepository extends ServiceEntityRepository\n"
+        "{\n"
+        "    public function headcount(): array\n"
+        "    {\n"
+        "        $conn = $this->getEntityManager()->getConnection();\n"
+        "        return $conn->executeQuery('SELECT COUNT(*) FROM employees')"
+        "->fetchAllAssociative();\n"
+        "    }\n"
+        "}\n"
+    ),
+    "config/packages/doctrine.yaml": (
+        "doctrine:\n"
+        "    dbal:\n"
+        "        url: '%env(resolve:DATABASE_URL)%'\n"
+    ),
+    "templates/employee/index.html.twig": (
+        "<h1>Employees</h1>\n"
+        "<ul>{% for e in employees %}<li>{{ e.lastName }}</li>{% endfor %}</ul>\n"
+    ),
+}
+
+CODEIGNITER = {
+    "public/index.php": (
+        "<?php\n"
+        "$pathsPath = realpath(FCPATH . '../app/Config/Paths.php');\n"
+        "require rtrim($pathsPath, '/ ');\n"
+        "$app = require realpath(SYSTEMPATH . 'bootstrap.php');\n"
+        "$app->run();\n"
+    ),
+    "app/Config/Routes.php": (
+        "<?php\n"
+        "namespace Config;\n"
+        "$routes->get('/', 'Home::index');\n"
+        "$routes->get('employees', 'Employee::index');\n"
+        "$routes->post('employees/create', 'Employee::create');\n"
+        "$routes->get('employees/(:num)', 'Employee::show/$1');\n"
+    ),
+    "app/Controllers/Employee.php": (
+        "<?php\n"
+        "namespace App\\Controllers;\n"
+        "use App\\Models\\EmployeeModel;\n"
+        "class Employee extends BaseController\n"
+        "{\n"
+        "    public function index()\n"
+        "    {\n"
+        "        $model = new EmployeeModel();\n"
+        "        return view('employees/index', ['rows' => $model->findAll()]);\n"
+        "    }\n"
+        "}\n"
+    ),
+    "app/Models/EmployeeModel.php": (
+        "<?php\n"
+        "namespace App\\Models;\n"
+        "use CodeIgniter\\Model;\n"
+        "class EmployeeModel extends Model\n"
+        "{\n"
+        "    protected $table = 'employees';\n"
+        "    protected $allowedFields = ['last_name', 'salary'];\n"
+        "    public function recent(int $limit): array\n"
+        "    {\n"
+        "        return $this->db->query('SELECT * FROM employees ORDER BY id DESC')"
+        "->getResultArray();\n"
+        "    }\n"
+        "}\n"
+    ),
+    "app/Config/Database.php": (
+        "<?php\n"
+        "namespace Config;\n"
+        "class Database extends \\CodeIgniter\\Database\\Config\n"
+        "{\n"
+        "    public $default = ['DSN' => '', 'hostname' => 'localhost', "
+        "'DBDriver' => 'MySQLi'];\n"
+        "}\n"
+    ),
+    "app/Views/employees/index.php": (
+        "<h1>Employees</h1>\n"
+        "<?php foreach ($rows as $r): ?><div><?= esc($r['last_name']) ?></div>"
+        "<?php endforeach; ?>\n"
+    ),
+}
+
+WORDPRESS = {
+    "employee-directory.php": (
+        "<?php\n"
+        "/**\n"
+        " * Plugin Name: Employee Directory\n"
+        " * Description: Staff listing shortcode and admin screen.\n"
+        " * Version: 2.1.0\n"
+        " */\n"
+        "if (!defined('ABSPATH')) { exit; }\n"
+        "require_once plugin_dir_path(__FILE__) . 'includes/class-directory.php';\n"
+        "add_action('init', ['Employee_Directory', 'register']);\n"
+        "add_shortcode('employee_list', ['Employee_Directory', 'render_list']);\n"
+        "register_activation_hook(__FILE__, ['Employee_Directory', 'install']);\n"
+    ),
+    "includes/class-directory.php": (
+        "<?php\n"
+        "class Employee_Directory\n"
+        "{\n"
+        "    public static function install()\n"
+        "    {\n"
+        "        global $wpdb;\n"
+        "        $table = $wpdb->prefix . 'employees';\n"
+        "        $wpdb->query(\"CREATE TABLE IF NOT EXISTS $table "
+        "(id BIGINT, last_name VARCHAR(80))\");\n"
+        "    }\n"
+        "    public static function render_list($atts)\n"
+        "    {\n"
+        "        global $wpdb;\n"
+        "        $rows = $wpdb->get_results('SELECT id, last_name FROM wp_employees "
+        "ORDER BY last_name');\n"
+        "        $out = '<ul>';\n"
+        "        foreach ($rows as $r) { $out .= '<li>' . esc_html($r->last_name) . '</li>'; }\n"
+        "        return $out . '</ul>';\n"
+        "    }\n"
+        "}\n"
+    ),
+    "admin/settings.php": (
+        "<?php\n"
+        "add_action('admin_menu', function () {\n"
+        "    add_options_page('Employee Directory', 'Employees', 'manage_options',\n"
+        "        'employee-directory', 'employee_directory_settings_page');\n"
+        "});\n"
+        "function employee_directory_settings_page()\n"
+        "{\n"
+        "    echo '<div class=\"wrap\"><h1>Employee Directory</h1></div>';\n"
+        "}\n"
+    ),
+}
+
+API_ONLY = {
+    "public/index.php": (
+        "<?php\n"
+        "require __DIR__ . '/../src/Router.php';\n"
+        "require __DIR__ . '/../src/EmployeeApi.php';\n"
+        "header('Content-Type: application/json');\n"
+        "$router = new Router();\n"
+        "$router->add('GET', '/api/employees', 'EmployeeApi::index');\n"
+        "$router->add('POST', '/api/employees', 'EmployeeApi::create');\n"
+        "$router->add('GET', '/api/employees/{id}', 'EmployeeApi::show');\n"
+        "echo json_encode($router->dispatch($_SERVER['REQUEST_METHOD'], "
+        "$_SERVER['REQUEST_URI']));\n"
+    ),
+    "src/Router.php": (
+        "<?php\n"
+        "class Router\n"
+        "{\n"
+        "    private array $routes = [];\n"
+        "    public function add(string $verb, string $path, string $handler): void\n"
+        "    {\n"
+        "        $this->routes[$verb . ' ' . $path] = $handler;\n"
+        "    }\n"
+        "    public function dispatch(string $verb, string $uri): array\n"
+        "    {\n"
+        "        $key = $verb . ' ' . parse_url($uri, PHP_URL_PATH);\n"
+        "        return isset($this->routes[$key]) ? ['ok' => true] : ['error' => 'not found'];\n"
+        "    }\n"
+        "}\n"
+    ),
+    "src/EmployeeApi.php": (
+        "<?php\n"
+        "require_once __DIR__ . '/Db.php';\n"
+        "class EmployeeApi\n"
+        "{\n"
+        "    public static function index(): array\n"
+        "    {\n"
+        "        $pdo = Db::handle();\n"
+        "        $stmt = $pdo->prepare('SELECT id, last_name FROM employees ORDER BY id');\n"
+        "        $stmt->execute();\n"
+        "        return $stmt->fetchAll();\n"
+        "    }\n"
+        "}\n"
+    ),
+    "src/Db.php": (
+        "<?php\n"
+        "class Db\n"
+        "{\n"
+        "    public static function handle(): PDO\n"
+        "    {\n"
+        "        return new PDO('pgsql:host=localhost;dbname=hr', 'app', getenv('DB_PASS'));\n"
+        "    }\n"
+        "}\n"
+    ),
+}
+
+
+# ── Laravel ────────────────────────────────────────────────────────────────
+_LARAVEL_FACTS = _corpus_facts(LARAVEL)
+_lv = _LARAVEL_FACTS["signals"]
+check("Laravel: every route in routes/web.php is found",
+      len(_LARAVEL_FACTS["routes"]) == 5, str(_LARAVEL_FACTS["routes"]))
+check("Laravel: a DELETE route keeps its verb",
+      any(r.startswith("DELETE /employees/") for r in _LARAVEL_FACTS["routes"]),
+      str(_LARAVEL_FACTS["routes"]))
+check("Laravel: the controller a route points at is named",
+      any("EmployeeController.store" in r for r in _LARAVEL_FACTS["routes"]),
+      str(_LARAVEL_FACTS["routes"]))
+# The one that matters most. Eloquent leaves no SQL anywhere, so before this the whole app
+# read as touching no database — and the data-access section was withheld from every call.
+check("Laravel: Eloquent counts as data access", "Eloquent" in _lv["db_apis"], str(_lv["db_apis"]))
+check("Laravel: so the data-access playbook section reaches the prompt",
+      "data" in _LARAVEL_FACTS["sections"], str(_LARAVEL_FACTS["sections"]))
+check("Laravel: the table a model maps to is read off `protected $table`",
+      _lv["tables"] == ["employees"], str(_lv["tables"]))
+check("Laravel: a raw DB::select is a query site too",
+      _lv["db_sites"] >= 3, str(_lv["db_sites"]))
+check("Laravel: Blade templates are rendered, not entry points",
+      not _lv["entrypoint_templates"], str(_lv["entrypoint_templates"]))
+check("Laravel: nothing contradicts anything, except the known config gap",
+      _LARAVEL_FACTS["warnings"] == ["config_files_without_keys"],
+      str(_LARAVEL_FACTS["warnings"]))
+
+# ── Symfony ────────────────────────────────────────────────────────────────
+_SYMFONY_FACTS = _corpus_facts(SYMFONY)
+_sf = _SYMFONY_FACTS["signals"]
+check("Symfony: attribute routes are found at all", len(_SYMFONY_FACTS["routes"]) == 2,
+      str(_SYMFONY_FACTS["routes"]))
+check("Symfony: and `methods: ['GET']` is read, not defaulted to ANY",
+      all(r.startswith("GET ") for r in _SYMFONY_FACTS["routes"]), str(_SYMFONY_FACTS["routes"]))
+check("Symfony: the decorated method is the handler",
+      any("EmployeeController.show" in r for r in _SYMFONY_FACTS["routes"]),
+      str(_SYMFONY_FACTS["routes"]))
+check("Symfony: Doctrine counts as data access", "Doctrine" in _sf["db_apis"], str(_sf["db_apis"]))
+check("Symfony: #[ORM\\Table(name: 'employees')] names the table",
+      "employees" in _sf["tables"], str(_sf["tables"]))
+check("Symfony: nothing contradicts anything", _SYMFONY_FACTS["warnings"] == [],
+      str(_SYMFONY_FACTS["warnings"]))
+# The single character this turned on. `#` opens a comment in PHP *except* before `[`.
+check("a PHP 8 attribute is not a comment",
+      "#[Route" in evidence._blank_comments("#[Route('/x')]\n# a real comment\n"))
+check("and a real # comment still is",
+      "a real comment" not in evidence._blank_comments("#[Route('/x')]\n# a real comment\n"))
+
+# ── CodeIgniter ────────────────────────────────────────────────────────────
+_CI_FACTS = _corpus_facts(CODEIGNITER)
+_ci = _CI_FACTS["signals"]
+check("CodeIgniter: a route table written without leading slashes is read",
+      len(_CI_FACTS["routes"]) == 4, str(_CI_FACTS["routes"]))
+check("CodeIgniter: and those paths are normalised to a leading slash",
+      all(r.split(" ", 1)[1].startswith("/") for r in _CI_FACTS["routes"]),
+      str(_CI_FACTS["routes"]))
+check("CodeIgniter: a placeholder segment survives",
+      any("(:num)" in r for r in _CI_FACTS["routes"]), str(_CI_FACTS["routes"]))
+check("CodeIgniter: a model extending Model is data access",
+      bool(_ci["db_apis"]), str(_ci["db_apis"]))
+check("CodeIgniter: its $table is the table", "employees" in _ci["tables"], str(_ci["tables"]))
+check("CodeIgniter: app/Views templates resolve, so they are not entry points",
+      not _ci["entrypoint_templates"], str(_ci["entrypoint_templates"]))
+check("CodeIgniter: nothing contradicts anything, except the known config gap",
+      _CI_FACTS["warnings"] == ["config_files_without_keys"], str(_CI_FACTS["warnings"]))
+
+# ── WordPress plugin ───────────────────────────────────────────────────────
+_WP_FACTS = _corpus_facts(WORDPRESS)
+_wp = _WP_FACTS["signals"]
+check("WordPress: $wpdb is recognised as the datastore",
+      any("wpdb" in d for d in _wp["datastores"]), str(_wp["datastores"]))
+check("WordPress: and as data access", "wpdb" in _wp["db_apis"], str(_wp["db_apis"]))
+check("WordPress: the table its queries name is extracted",
+      "wp_employees" in _wp["tables"], str(_wp["tables"]))
+# A plugin has no routes and that is the correct answer, not a miss. Asserting it is what
+# stops somebody "fixing" the route extractor until this reports something.
+check("WordPress: a hook-driven plugin has no routes, and that is right",
+      _WP_FACTS["routes"] == [], str(_WP_FACTS["routes"]))
+check("WordPress: an includes/ directory of classes is not a stranded template",
+      "template_without_renderer" not in _WP_FACTS["warnings"], str(_WP_FACTS["warnings"]))
+check("WordPress: nothing contradicts anything, except the known config gap",
+      _WP_FACTS["warnings"] == ["config_files_without_keys"], str(_WP_FACTS["warnings"]))
+
+# ── API-only ───────────────────────────────────────────────────────────────
+_API_FACTS = _corpus_facts(API_ONLY)
+_api = _API_FACTS["signals"]
+check("API-only: a router taking the verb as its first argument is read",
+      len(_API_FACTS["routes"]) == 3, str(_API_FACTS["routes"]))
+check("API-only: the verbs are the ones declared",
+      sorted({r.split(" ", 1)[0] for r in _API_FACTS["routes"]}) == ["GET", "POST"],
+      str(_API_FACTS["routes"]))
+check("API-only: PDO and its engine are both found",
+      "PDO" in _api["db_apis"] and "PostgreSQL" in _api["datastores"],
+      f"{_api['db_apis']} {_api['datastores']}")
+# A service that emits JSON has no presentation layer, and sending Razor guidance to one is
+# cost with no benefit. The absence is the assertion.
+check("API-only: no UI is claimed", not _api["has_ui"], str(_api["has_ui"]))
+check("API-only: so the presentation section is not sent",
+      "presentation" not in _API_FACTS["sections"], str(_API_FACTS["sections"]))
+check("API-only: nothing contradicts anything", _API_FACTS["warnings"] == [],
+      str(_API_FACTS["warnings"]))
+
+# ── Across the corpus ──────────────────────────────────────────────────────
+_ALL_CORPUS = {"laravel": _LARAVEL_FACTS, "symfony": _SYMFONY_FACTS,
+               "codeigniter": _CI_FACTS, "wordpress": _WP_FACTS, "api": _API_FACTS}
+check("every shape in the corpus is recognised as PHP",
+      all(f["signals"]["dominant_language"] == "php" for f in _ALL_CORPUS.values()),
+      str({k: f["signals"]["dominant_language"] for k, f in _ALL_CORPUS.items()}))
+check("every one of them gets the data-access section — all five have a database",
+      all("data" in f["sections"] for f in _ALL_CORPUS.values()),
+      str({k: f["sections"] for k, f in _ALL_CORPUS.items()}))
+check("every file in every shape was read by a real parser, not a fallback",
+      all(not (f["signals"]["read_by"].get("default") or 0) for f in _ALL_CORPUS.values()),
+      str({k: f["signals"]["read_by"] for k, f in _ALL_CORPUS.items()}))
+check("no shape refuses to convert",
+      all(not f["signals"]["blocked"] for f in _ALL_CORPUS.values()),
+      str({k: f["signals"]["blocked"] for k, f in _ALL_CORPUS.items()}))
+# The bar for the whole corpus: the only thing any of them may report is the one gap that is
+# genuinely open (C-70). A sixth warning appearing here is a check that has started crying wolf.
+check("and the only warning any of them produces is the one open gap",
+      set(w for f in _ALL_CORPUS.values() for w in f["warnings"])
+      <= {"config_files_without_keys"},
+      str({k: f["warnings"] for k, f in _ALL_CORPUS.items()}))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

@@ -121,6 +121,18 @@ def _in_template_dir(path: str) -> bool:
                for part in (path or "").lower().split("/")[:-1])
 
 
+def _renders_markup(unit: Dict[str, Any]) -> bool:
+    """True for a file with inline markup in it — which is what a template is.
+
+    Read off the analyzer's own facts rather than re-scanning: `html_ratio` and
+    `has_html_document` are how `playbooks.aggregate_facts` already decides a codebase has a
+    presentation layer, and a second opinion about the same question is a contradiction
+    waiting to be found by this module.
+    """
+    facts = (unit.get("meta") or {}).get("php") or {}
+    return bool(facts.get("has_html_document")) or float(facts.get("html_ratio") or 0) > 0
+
+
 # ── Signals ────────────────────────────────────────────────────────────────
 
 def collect(files: Sequence[Dict[str, Any]], units: Sequence[Dict[str, Any]],
@@ -199,12 +211,21 @@ def collect(files: Sequence[Dict[str, Any]], units: Sequence[Dict[str, Any]],
                  if os.path.splitext(f.get("path", ""))[1].lower() == ".sql"
                  and _CREATE_TABLE.search(f.get("content") or "")]
     config_files = [f.get("path", "") for f in files if _CONFIG_NAME.search(f.get("path", ""))]
-    template_files = [f.get("path", "") for f in files if _in_template_dir(f.get("path", ""))]
+    renders_markup = {u.get("path", "") for u in units if _renders_markup(u)}
+    template_files = [f.get("path", "") for f in files
+                      if _in_template_dir(f.get("path", "")) and f.get("path") in renders_markup]
     # An entry point is a file nothing in the codebase depends on. A template is rendered by
     # something, so a template in that list is a missing edge and never a fact about the
     # application — which is the one thing a plain entry-point ratio could not distinguish.
+    #
+    # A template has to actually *be* one, though, not merely live somewhere with a
+    # template-shaped name. `_TEMPLATE_DIRS` includes `includes`, which in a WordPress plugin
+    # holds classes — so this check reported a missing edge for `includes/class-directory.php`,
+    # which is a false positive of exactly the kind that gets a check switched off. Emitting
+    # markup is the difference, and it is a fact the analyzer already recorded.
     entrypoints = list(observed.get("entrypoints") or [])
-    entrypoint_templates = [p for p in entrypoints if _in_template_dir(p)]
+    entrypoint_templates = [p for p in entrypoints
+                            if _in_template_dir(p) and p in renders_markup]
 
     stats = graph_stats or {}
     return {

@@ -89,8 +89,43 @@ _PDO_CONSTRUCT = re.compile(r"\bnew\s+\\?PDO\s*\(")
 # Matching the *statement* instead of the method name needs no list and cannot go stale: the
 # evidence that a call is data access is the SQL sitting in it.
 _SQL_ARGUMENT_CALL = re.compile(
-    r"""->\s*(\w+)\s*\(\s*(?P<q>['"])\s*"""
+    r"""(?:->|::)\s*(\w+)\s*\(\s*(?P<q>['"])\s*"""
     r"""(?=(?:SELECT|INSERT|UPDATE|DELETE|REPLACE|MERGE|WITH|CALL)\b)""", re.I)
+
+# ── Data access with no SQL in it at all ──────────────────────────────────
+#
+# The two rules above both need a statement to point at. An ORM has none: Laravel's
+# `Employee::create($data)`, Doctrine's `$repo->findAll()`, CodeIgniter's `$model->findAll()`
+# are data access with no SQL anywhere in the file. Measured on a seven-file Laravel fixture,
+# that reported `db_apis: []` and `db_sites: 0` — the D-80 failure exactly, on the most widely
+# used PHP framework there is, and with the same consequence: `playbooks.select` withheld the
+# data-access section from every conversion call.
+#
+# The signal is the *declaration*, not the call: a class extending a framework's model or
+# repository base, or declaring the table it maps to. Both are unambiguous — nothing that is
+# not data access says `protected $table = 'employees'` — and neither depends on knowing which
+# method names that framework happens to use, which is the assumption that keeps going stale.
+_ORM_BASES = {
+    "model": "Eloquent",                    # Laravel, and CodeIgniter's `CodeIgniter\Model`
+    "eloquent": "Eloquent",
+    "activerecord": "ActiveRecord",
+    "serviceentityrepository": "Doctrine",
+    "entityrepository": "Doctrine",
+    "documentrepository": "Doctrine",
+    "abstractrepository": "Doctrine",
+}
+_EXTENDS = re.compile(r"""(?ix) \b class \s+ (\w+) \s+ extends \s+ \\?([\w\\]+)""")
+# The table a model maps to, stated outright. Laravel and CodeIgniter both spell it this way.
+_TABLE_PROPERTY = re.compile(
+    r"""(?ix) (?:protected|public|private) \s+ (?:static \s+)? \$table \s* = \s* ['"](\w{1,64})['"]""")
+# A query builder naming its table: `DB::table('employees')`, `$this->db->table('x')`.
+_BUILDER_TABLE = re.compile(r"""(?ix) (?:->|::) \s* table \s* \(\s* ['"](\w{1,64})['"]""")
+# Doctrine states it as an attribute, which is the same fact in a different syntax.
+_ORM_TABLE_ATTRIBUTE = re.compile(
+    r"""(?ix) \#\[\s* (?:\\?[\w\\]*\\)? ORM\\?Table \s* \(\s* (?:name\s*:\s*)? ['"](\w{1,64})['"]""")
+# WordPress reaches its database through one global object and nothing else. Recognising it
+# by name is exact: `$wpdb` is a reserved global, not a variable anybody chooses.
+_WPDB_CALL = re.compile(r"""(?ix) \$wpdb \s* -> \s* (\w+) \s* \(""")
 
 # A template named by a string that the framework turns into a path:
 # `$this->view('employees.index')`, `View::render('auth/login')`, `$twig->render(...)`.
@@ -102,13 +137,29 @@ _SQL_ARGUMENT_CALL = re.compile(
 # in `reconcile` and seeding the parity recorder with paths that cannot be requested; and a
 # view was converted with no idea which action renders it, in an order that gave no guarantee
 # its controller had been designed yet.
+#
+# The bare-function form (`view('employees.index')`, no `$this->`) is Laravel's and
+# CodeIgniter's spelling, and leaving it out meant every Blade and every CI view came out as a
+# file nothing depends on — an entry point, on a framework where templates are never
+# requestable. Anchored so it cannot match `preview(` or `$this->overview(`.
 _VIEW_CALL = re.compile(
-    r"""(?ix) (?: ->|:: ) \s* (?: view | render | display | make | partial | include )
+    r"""(?ix) (?: (?:->|::) \s* (?: view | render | display | make | partial | include )
+                | (?<![\w>$-]) (?: view | render ) )
         \s* \(\s* ['"] (?P<name>[A-Za-z0-9_\-./]{2,80}) ['"] """)
 # Where templates live, by convention. Offered as alternatives; `graph.resolve_edges` keeps
 # whichever matches a real file and — because these are `soft_requires` — says nothing about
 # the rest.
-_VIEW_ROOTS = ("views", "templates", "resources/views", "template", "tpl", "app/views")
+_VIEW_ROOTS = ("views", "templates", "resources/views", "template", "tpl", "app/views",
+               # Capitalised as CodeIgniter 4 and several others ship them. `resolve_edges`
+               # matches a provided path exactly, so `app/Views/...` and `app/views/...` are
+               # two different names and offering only one loses every CI template.
+               "Views", "Templates", "app/Views", "src/Views")
+# A template is not always a `.php` file. Blade and Twig are the two that matter, and a Laravel
+# app whose views are all `.blade.php` had an edge to none of them — so every Blade template
+# was a file nothing depends on, which `evidence.from_graph` then reported as an entry point.
+# These are `soft_requires`: a candidate that matches nothing costs nothing and is never shown
+# to a customer (D-86), which is what makes offering several safe.
+_VIEW_EXTENSIONS = (".php", ".blade.php", ".html.twig", ".twig", ".tpl")
 
 # The engine, from the one place it is stated unambiguously: a PDO DSN's scheme. `new
 # PDO('sqlite:' . $path)` says SQLite as plainly as a codebase ever says anything, and
@@ -469,14 +520,28 @@ def _php_facts(path: str, content: str, caps: Optional[Dict[str, List[Any]]] = N
 
     # Templates named by string. `'employees.index'` and `'employees/index'` are the same view;
     # the dot form is the more common convention and is what this codebase uses.
-    view_edges: List[str] = []
+    # Capped by how many distinct templates were *named*, not by how many candidate paths
+    # that expands to. Capping the expansion truncated it mid-name once the roots and
+    # extensions grew: a controller rendering four views had candidates for the first two and
+    # none at all for the rest, so those templates lost every edge and came back out as entry
+    # points. The cap is there to stop one pathological file dominating, and the thing worth
+    # counting for that is names.
+    view_names: List[str] = []
     for match in _VIEW_CALL.finditer(content):
         name = match.group("name").replace(".", "/").strip("/")
-        if not name or name.endswith(("/", ".php")):
+        if not name or name.endswith("/") or name in view_names:
             continue
+        view_names.append(name)
+        if len(view_names) >= MAX_FACT_ROWS:
+            break
+    view_edges: List[str] = []
+    for name in view_names:
+        # A name that already carries its extension is a path, not a template key.
+        candidates = ([""] if name.endswith(_VIEW_EXTENSIONS) else _VIEW_EXTENSIONS)
         for root in _VIEW_ROOTS:
-            view_edges.append(f"{root}/{name}.php")
-    facts["_view_edges"] = view_edges[:MAX_FACT_ROWS]
+            for extension in candidates:
+                view_edges.append(f"{root}/{name}{extension}")
+    facts["_view_edges"] = view_edges
 
     # Superglobals, *with their keys* — the keys are the payload. `$_GET['id']` is a query
     # parameter named id, which is a bindable action argument; knowing only that the file
@@ -547,6 +612,36 @@ def _php_facts(path: str, content: str, caps: Optional[Dict[str, List[Any]]] = N
         db_sites.append({"api": "PDO", "fn": f"->{match.group(1)}", "line": line,
                          "sql": sql[:300], "interpolated": interpolated})
         tables.update(t.lower() for t in _SQL_TABLE.findall(sql))
+
+    # ORM data access, which has no statement for either loop above to find. Recorded as a
+    # site with no `sql`, which is the honest shape: there is nothing to translate, and what
+    # the converter needs to be told is "these are entities" rather than "here are queries".
+    for match in _EXTENDS.finditer(content):
+        if len(db_sites) >= MAX_FACT_ROWS:
+            break
+        base = match.group(2).rsplit("\\", 1)[-1].lower()
+        api = _ORM_BASES.get(base)
+        if api:
+            db_sites.append({"api": api, "fn": f"class {match.group(1)} extends {match.group(2)}",
+                             "line": content.count("\n", 0, match.start()) + 1})
+    for pattern in (_TABLE_PROPERTY, _BUILDER_TABLE, _ORM_TABLE_ATTRIBUTE):
+        for match in pattern.finditer(content):
+            if len(db_sites) >= MAX_FACT_ROWS:
+                break
+            tables.add(match.group(1).lower())
+            db_sites.append({"api": "ORM", "fn": f"table {match.group(1)}",
+                             "line": content.count("\n", 0, match.start()) + 1})
+    for match in _WPDB_CALL.finditer(content):
+        if len(db_sites) >= MAX_FACT_ROWS:
+            break
+        line = content.count("\n", 0, match.start()) + 1
+        sql, interpolated = _sql_near(content, match.start())
+        site = {"api": "wpdb", "fn": f"$wpdb->{match.group(1)}", "line": line}
+        if sql:
+            site["sql"] = sql[:300]
+            site["interpolated"] = interpolated
+            tables.update(t.lower() for t in _SQL_TABLE.findall(sql))
+        db_sites.append(site)
 
     # The engine itself, so the charter can name a concrete EF Core provider. Only the DSN
     # here; `composer.json` states it too but is not a PHP file and never reaches this

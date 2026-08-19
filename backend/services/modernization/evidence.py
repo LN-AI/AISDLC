@@ -107,6 +107,14 @@ _DATASTORE_MARKERS = (
     ("mysqli", re.compile(r"\bmysqli_[a-z_]+\s*\(|\bnew\s+mysqli\b")),
     ("PDO", re.compile(r"\bnew\s+PDO\b|->\s*prepare\s*\(")),
     ("ADOdb", re.compile(r"(?i)\bADONewConnection\b|\badodb\b")),
+    # A reserved global, not a variable anybody picks, so the name alone is exact. A plugin
+    # reaches its database through this and nothing else, and reported no datastore at all.
+    ("WordPress ($wpdb)", re.compile(r"\$wpdb\s*->")),
+    # The two ORMs that account for most PHP written since 2015. Neither leaves a statement
+    # anywhere for the SQL-shaped rules to find.
+    ("Eloquent", re.compile(r"(?i)\bextends\s+\\?(?:Illuminate\\Database\\Eloquent\\)?Model\b"
+                            r"|\bIlluminate\\Database\b")),
+    ("Doctrine", re.compile(r"(?i)\bDoctrine\\ORM\b|\bextends\s+\\?ServiceEntityRepository\b")),
     ("JDBC", re.compile(r"\bjava\.sql\.|DriverManager\.getConnection")),
     ("ADO.NET", re.compile(r"\b(SqlConnection|OleDbConnection|OdbcConnection)\b")),
     ("Oracle", re.compile(r"(?i)\b(oci_connect|OracleConnection|OCI8)\b")),
@@ -199,11 +207,44 @@ _DISPATCH_MARKERS = (
 _CODE_ROUTE = re.compile(
     r"""(?ix)
     (?: \$\w+ \s* -> \s* | [A-Z]\w* \s* :: \s* )      # $router->  |  Route::
-    (get|post|put|patch|delete|options|head|any|all|map|match|addroute|route)
+    (get|post|put|patch|delete|options|head|any|all|map|match|addroute|route|add)
     \s* \(\s*
     (?: \[?\s* ['"](?P<verb>GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)['"] \s*\]? \s*, \s* )?
     ['"](?P<path>[^'"\n]{1,200})['"]
     """)
+
+# Methods whose name is not evidence of anything on its own. `->add('x')` and `->route('x')`
+# appear on collections, containers and query builders far more often than on routers, so they
+# count only when the call also names an HTTP verb first — `$r->add('GET', '/api/x', …)`.
+# Without that requirement this pattern reports a route for every `$config->add('debug', …)`.
+_GENERIC_ROUTE_METHODS = {"add", "route", "map", "match", "addroute"}
+
+# PHP 8 attribute routing, which is how Symfony has declared routes since 5.2 and how a
+# Laravel or Slim application increasingly does too. It is not a method call at all, so the
+# shape above cannot see it — and a Symfony application reported **zero URLs**, which is the
+# same failure D-83 fixed for route tables, arriving through a different door.
+_ATTRIBUTE_ROUTE = re.compile(
+    r"""(?ix)
+    \#\[\s* (?:\\?[\w\\]*\\)? Route \s* \(\s*
+    (?: (?:path\s*:\s*)? )?
+    ['"](?P<path>[^'"\n]{1,200})['"]
+    # To the end of the line, not to the first `]` — `methods: ['GET']` contains one, so
+    # stopping there read every attribute route as answering any verb.
+    (?P<tail>[^\n]{0,300})
+    """)
+_ATTRIBUTE_VERBS = re.compile(r"""(?ix) methods \s* : \s* \[ (?P<verbs>[^\]]{0,120}) \]""")
+# The method that follows the attribute, which is the handler it decorates.
+_ATTRIBUTE_HANDLER = re.compile(r"""(?ix) function \s+ (?P<method>\w+) \s* \(""")
+_CLASS_DECL = re.compile(r"""(?ix) \b class \s+ (\w+)""")
+
+# A second argument that looks like a request handler: `'Employee::index'`, `'Ctrl@show'`,
+# `[Ctrl::class, 'show']`, or a closure. This is what makes it safe to accept a route path
+# with no leading slash — CodeIgniter writes `$routes->get('employees', 'Employee::index')`,
+# and refusing every relative path (the old rule) reported one route on a table of four,
+# while accepting every relative path would report `->get('id')` on any object as a URL.
+_ROUTE_HANDLER_ARG = re.compile(
+    r"""(?ix) ^\s*,\s* (?: ['"][\w\\]+ (?:::|@) \w+[^'"\n]{0,40}['"] | \[ | function \s*\( |
+                           fn \s*\( | \\? [\w\\]+ ::\s*class )""")
 
 # The handler and middleware that follow the path, read from the rest of the call so a route
 # row can say what answers it. Deliberately tolerant: a route whose handler is a closure is
@@ -243,7 +284,10 @@ _NON_CODE_EXTENSIONS = {".json", ".md", ".markdown", ".txt", ".csv", ".yml", ".y
 _COMMENT_SPANS = re.compile(
     r"/\*.*?\*/"                 # C-style, PHP and SQL block comments
     r"|//[^\n]*"                 # PHP/C line comment
-    r"|\#[^\n]*"                 # PHP/shell line comment
+    # PHP/shell line comment — but `#[` is a PHP 8 *attribute*, not a comment, and blanking
+    # it erased every `#[Route('/employees', methods: ['GET'])]` in a Symfony codebase before
+    # anything could read it. A Symfony application reported zero URLs for this one character.
+    r"|\#(?!\[)[^\n]*"
     r"|--[^\n]*",                # SQL line comment
     re.S)
 
@@ -398,16 +442,26 @@ def from_file(path: str, content: str, language: str = "",
             if verb in ("MAP", "MATCH", "ADDROUTE", "ROUTE", "ALL"):
                 verb = "ANY"
             url = match.group("path").strip()
-            # A path literal is a path. Filters out `->get('id')` on some unrelated object,
-            # which is otherwise the same shape.
-            if not url.startswith("/") and not url.startswith("^"):
-                continue
             # Bounded by the statement, not by a character count. A fixed window ran past the
             # end of the call and into the next route, so `$router->post('/login', [...])`
             # picked up the `['auth']` belonging to a route two lines below it — and middleware
             # here is authorization. A converted app that requires authentication to reach its
             # login page is worse than one with no middleware list at all.
             tail = code[match.end():match.end() + 400].split(";", 1)[0]
+            # A generic method name is not evidence on its own; the HTTP verb is what makes
+            # `->add('GET', '/x', …)` a route and `->add('debug', true)` not one.
+            if match.group(1).lower() in _GENERIC_ROUTE_METHODS and not match.group("verb"):
+                continue
+            # A path literal is a path — but only a leading `/` says so on its own. A relative
+            # path counts when the call also names a handler, which is how CodeIgniter and
+            # several micro-frameworks write it: `$routes->get('employees', 'Employee::index')`.
+            # Refusing those outright reported one route on a table of four; accepting them all
+            # would report `->get('id')` on any object as a URL. Normalised to a leading slash,
+            # because it is the same URL and `url_compatibility` compares these as strings.
+            if not url.startswith(("/", "^")):
+                if not _ROUTE_HANDLER_ARG.match(tail):
+                    continue
+                url = "/" + url.lstrip("/")
             handler = _ROUTE_HANDLER.search(tail)
             target = (f"{handler.group('class').rsplit(chr(92), 1)[-1]}."
                       f"{handler.group('method')}" if handler else "")
@@ -424,6 +478,35 @@ def from_file(path: str, content: str, language: str = "",
                              confidence=0.9))
             if len(seen_routes) >= MAX_PER_FILE_PER_KIND:
                 break
+
+        # Attribute routing, which is not a call and so cannot be found by the shape above.
+        # A Symfony application declares every one of its URLs this way and reported none.
+        for match in _ATTRIBUTE_ROUTE.finditer(code):
+            if len(seen_routes) >= MAX_PER_FILE_PER_KIND:
+                break
+            url = match.group("path").strip()
+            if not url.startswith("/"):
+                continue
+            verbs = _ATTRIBUTE_VERBS.search(match.group("tail") or "")
+            listed = sorted({v.strip(" '\"").upper() for v in verbs.group("verbs").split(",")
+                             if v.strip()}) if verbs else ["ANY"]
+            # The handler is the method the attribute decorates, which is the next `function`
+            # after it — the one thing about an attribute that is positional rather than named.
+            # The class is the last one declared before it, so the row reads the same way a
+            # route-table row does rather than naming a bare method.
+            after = code[match.end():match.end() + 400]
+            handler = _ATTRIBUTE_HANDLER.search(after)
+            owner = _CLASS_DECL.findall(code[:match.start()])
+            target = (f"{owner[-1] if owner else ''}.{handler.group('method')}".lstrip(".")
+                      if handler else "")
+            for verb in listed or ["ANY"]:
+                value = f"{verb} {url}" + (f" -> {target}" if target else "")
+                if value in seen_routes:
+                    continue
+                seen_routes.add(value)
+                rows.append(_row(path, "route", value, _line_of(code, match.start()),
+                                 _snippet(content, match.start(), match.end()),
+                                 confidence=0.9))
 
     stem = os.path.splitext(basename)[0]
     # A template is not an entry point, however it is named. The stem heuristic was written for
