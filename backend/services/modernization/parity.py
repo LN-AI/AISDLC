@@ -418,6 +418,26 @@ def compare(case: Dict[str, Any], observed: Dict[str, Any]) -> Dict[str, Any]:
     no network. Everything it needs is in its two arguments, which is what makes it testable
     against a fixture and what makes two adjudications of the same inputs agree.
     """
+    # A case whose *request* still carries a redaction placeholder cannot be a comparison at
+    # all. The scanner masks credentials out of recordings on the way in — correctly; a
+    # customer's password must never be stored here — but that leaves the replayed request
+    # sending the literal `__REDACTED_…__`, so the login fails, every page after it redirects
+    # to the sign-in screen, and the report reads as a converted application that broke
+    # everything. Observed on the first real replay: 19 of 25 "behavioural divergences", all
+    # of them one unusable login.
+    #
+    # `error`, never `fail`. A tool artefact reported as a behavioural difference is worse
+    # than no result: it is a confident, wrong answer about somebody's conversion, and it
+    # buries the cases that did run.
+    redacted = _redacted_request_fields(case)
+    if redacted:
+        return {"verdict": "error", "differences": [], "error": (
+            "This case cannot be replayed: its recorded request still carries a masked "
+            "credential in " + ", ".join(redacted) + ". The value was removed when the "
+            "recording was stored and has to be supplied at replay time; until it is, the "
+            "request is sent with a placeholder and whatever comes back says nothing about "
+            "the conversion.")}
+
     differences: List[Dict[str, Any]] = []
     ignore = tuple(case.get("ignore") or ())
     headers = _lower_headers(observed.get("headers"))
@@ -1168,3 +1188,29 @@ def invite(run_id: str) -> Dict[str, Any]:
         "Asked for golden cases before conversion — the only point at which the legacy "
         "application can still be recorded.", level="info")
     return {"status": "invited", "cases": 0}
+
+
+# The shape `repo_ingest.REDACTION_PLACEHOLDER` leaves behind. Matched rather than imported as
+# a literal because the two must agree: a change to the placeholder that this did not follow
+# would silently stop detecting unreplayable cases, which is the failure this exists to make
+# loud rather than to hide.
+_REDACTED_MARKER = re.compile(r"__REDACTED_[A-Z0-9_]+__")
+
+
+def _redacted_request_fields(case: Dict[str, Any]) -> List[str]:
+    """Which parts of this case's recorded *request* still hold a masked credential.
+
+    Only the request. A redacted *response* is fine — `ingest` masks the replayed body with
+    the same function before comparing, so both sides carry the placeholder and they match.
+    A redacted request is different in kind: it is sent, and it is wrong when it arrives.
+    """
+    found: List[str] = []
+    if _REDACTED_MARKER.search(_text(case.get("request_body"), MAX_BODY_CHARS)):
+        found.append("its request body")
+    if _REDACTED_MARKER.search(_text(case.get("query"), MAX_PATH_CHARS)):
+        found.append("its query string")
+    headers = case.get("request_headers") or {}
+    if isinstance(headers, dict) and any(
+            _REDACTED_MARKER.search(str(v or "")) for v in headers.values()):
+        found.append("a request header")
+    return found

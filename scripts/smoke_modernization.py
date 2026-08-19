@@ -5236,6 +5236,197 @@ check("and the only warning any of them produces is the one open gap",
       str({k: f["warnings"] for k, f in _ALL_CORPUS.items()}))
 
 
+
+# ── 37. The build loop deadlocks ───────────────────────────────────
+section("37. The build loop's own two deadlocks, found by running it")
+
+# Sections 27-36 were all found by reading a codebase. These two were found by running the
+# whole loop end to end on a run that had recorded parity and a failing build — a combination
+# that had never existed before, because until this week nothing had ever recorded parity and
+# nothing routine had ever built an export.
+
+# ── A gate about finishing must not block the work that makes finishing possible ──
+#
+# `parity.gate` raises a blocking `parity_required` when the run reaches reconcile. A build
+# round then reopens units and says "resume to convert them again" — and `resume` refuses,
+# because a blocking checkpoint is open. The only way out was to *waive* parity in order to fix
+# the build, after which the waiver stands and the behaviour is never checked: exactly the
+# outcome the gate exists to prevent, reached by following the product's own instructions.
+_dl = store.create_run("gate-deadlock", ".NET 8", "files", created_by="smoke")
+store.insert_units(_dl, [{"path": "#component/0000-a", "kind": "component",
+                          "status": "converted", "topo_level": 0, "order_index": 0}])
+_dl_unit = store.list_units(_dl, kind="component")[0]
+store.complete_unit(unit_id=_dl_unit["id"], run_id=_dl, symbols=[],
+                    artifacts=[{"path": "A/Widget.cs", "content": "class Widget {}"}])
+parity.record_cases(_dl, {"source": "smoke", "cases": [
+    {"name": "home", "request": {"method": "GET", "path": "/"},
+     "expected": {"status": 200, "content_type": "text/html", "body": "<html>hi</html>"}}]},
+    "smoke")
+store.update_run(_dl, status="paused", phase="reconcile")
+parity.gate(_dl)
+check("the parity gate blocks a run that is finishing",
+      "parity_required" in [c["kind"] for c in store.list_checkpoints(_dl, "open") if c["blocking"]],
+      str([c["kind"] for c in store.list_checkpoints(_dl, "open")]))
+
+build_results.ingest(_dl, {"log": "A/Widget.cs(1,1): error CS0246: nope [A/A.csproj]\n",
+                           "source": "local_dotnet"}, "smoke")
+check("but a build round that reopens work takes it back down",
+      not [c for c in store.list_checkpoints(_dl, "open")
+           if c["blocking"] and c["kind"] == "parity_required"],
+      str([(c["kind"], c["status"]) for c in store.list_checkpoints(_dl)]))
+check("withdrawn, not answered — nobody decided anything",
+      any((c.get("answer") or {}).get("decision") == "withdrawn"
+          for c in store.list_checkpoints(_dl) if c["kind"] == "parity_required"),
+      str([c.get("answer") for c in store.list_checkpoints(_dl) if c["kind"] == "parity_required"]))
+check("and the run log says it will be asked again",
+      any(e["event"] == "gate_withdrawn" for e in store.list_events(_dl)),
+      str([e["event"] for e in store.list_events(_dl)]))
+check("the recorded behaviour is untouched — withdrawing a gate loses no evidence",
+      store.parity_case_count(_dl) == 1)
+# And it comes back, because the question was never answered.
+store.update_run(_dl, status="paused", phase="reconcile")
+parity.gate(_dl)
+check("reaching the end again re-raises it",
+      "parity_required" in [c["kind"] for c in store.list_checkpoints(_dl, "open") if c["blocking"]],
+      str([c["kind"] for c in store.list_checkpoints(_dl, "open")]))
+
+# ── Reopened work is only claimed if the run rewinds to the stage that owns it ──
+#
+# `_rework_phase` exists for this and its docstring describes exactly this failure, but it was
+# applied only to a *completed* run. A run paused at `reconcile` re-entered at reconciliation,
+# walked straight to `completed`, and three reopened components sat in `ready` having never
+# been re-converted — while the build loop reported success at scheduling them.
+_pz = store.create_run("phase-rewind", ".NET 8", "files", created_by="smoke")
+store.insert_units(_pz, [{"path": "#component/0000-b", "kind": "component",
+                          "status": "converted", "topo_level": 0, "order_index": 0}])
+_pz_unit = store.list_units(_pz, kind="component")[0]
+store.complete_unit(unit_id=_pz_unit["id"], run_id=_pz, symbols=[],
+                    artifacts=[{"path": "B/Gadget.cs", "content": "class Gadget {}"}])
+store.update_run(_pz, status="paused", phase="reconcile")
+_pz_out = build_results.ingest(
+    _pz, {"log": "B/Gadget.cs(1,1): error CS0246: nope [B/B.csproj]\n",
+          "source": "local_dotnet"}, "smoke")
+check("a build round reopens the unit that produced the error",
+      _pz_out["reopened"] == 1, str(_pz_out))
+check("and a paused run is rewound to the stage that will claim it",
+      store.get_run(_pz)["phase"] == "convert", str(store.get_run(_pz)["phase"]))
+check("the reason says so, rather than leaving the previous one standing",
+      "reopened for rework" in (store.get_run(_pz)["paused_reason"] or ""),
+      str(store.get_run(_pz)["paused_reason"]))
+check("the unit really is claimable again",
+      [u["status"] for u in store.list_units(_pz, kind="component")] == ["ready"],
+      str([u["status"] for u in store.list_units(_pz, kind="component")]))
+# A finished run still has to leave its terminal state as well as its phase.
+_cz = store.create_run("phase-rewind-completed", ".NET 8", "files", created_by="smoke")
+store.insert_units(_cz, [{"path": "#component/0000-c", "kind": "component",
+                          "status": "converted", "topo_level": 0, "order_index": 0}])
+_cz_unit = store.list_units(_cz, kind="component")[0]
+store.complete_unit(unit_id=_cz_unit["id"], run_id=_cz, symbols=[],
+                    artifacts=[{"path": "C/Thing.cs", "content": "class Thing {}"}])
+store.update_run(_cz, status="completed", phase="completed")
+build_results.ingest(_cz, {"log": "C/Thing.cs(1,1): error CS0246: nope [C/C.csproj]\n",
+                           "source": "local_dotnet"}, "smoke")
+check("a completed run leaves both its status and its phase",
+      (store.get_run(_cz)["status"], store.get_run(_cz)["phase"]) == ("paused", "convert"),
+      str((store.get_run(_cz)["status"], store.get_run(_cz)["phase"])))
+# A cancelled run must not be restarted by a build report: the branch is still there and CI
+# keeps firing on it long after somebody decided to stop.
+_xz = store.create_run("phase-rewind-cancelled", ".NET 8", "files", created_by="smoke")
+store.insert_units(_xz, [{"path": "#component/0000-d", "kind": "component",
+                          "status": "converted", "topo_level": 0, "order_index": 0}])
+_xz_unit = store.list_units(_xz, kind="component")[0]
+store.complete_unit(unit_id=_xz_unit["id"], run_id=_xz, symbols=[],
+                    artifacts=[{"path": "D/Thing.cs", "content": "class Thing {}"}])
+store.update_run(_xz, status="cancelled", phase="completed")
+build_results.ingest(_xz, {"log": "D/Thing.cs(1,1): error CS0246: nope [D/D.csproj]\n",
+                           "source": "local_dotnet"}, "smoke")
+check("a cancelled run is not quietly un-cancelled by a build report",
+      store.get_run(_xz)["status"] == "cancelled", str(store.get_run(_xz)["status"]))
+
+
+
+# ── 38. Redaction vs parity ────────────────────────────────────────
+section("38. A redacted password is not a behavioural difference")
+
+# The first real replay: 25 cases recorded from a live legacy PHP application, replayed, and
+# adjudicated. It reported **19 behavioural divergences** in the converted application. Every
+# one of them was one unusable login.
+#
+# The recorder captures the request as it went past, and the platform's credential scanner
+# masks secrets out of it on the way in — correctly; a customer's password must never be
+# stored here. What it leaves is `username=admin&password=__REDACTED_CONNECTION_STRING__`.
+# The replayer then sends that literally, authentication fails, every authenticated page
+# redirects to the sign-in screen, and the report reads as a conversion that broke everything.
+#
+# `error`, never `fail`. A tool artefact reported as a behavioural difference is worse than no
+# result at all: it is a confident, wrong answer about somebody's conversion, and it buries the
+# cases that really did run. This is the same principle as the rest of this work — a check that
+# cannot answer must say so rather than answer wrongly.
+
+_REDACTED_CASE = {
+    "path": "/login", "method": "POST",
+    "request_body": "username=admin&password=__REDACTED_CONNECTION_STRING__",
+    "expected_status": 302, "expected_location": "/",
+}
+_red = parity.compare(_REDACTED_CASE, {"status": 302, "location": "/login",
+                                       "headers": {}, "body": ""})
+check("a case whose request still holds a masked credential cannot be judged",
+      _red["verdict"] == "error", str(_red["verdict"]))
+check("it is not reported as a behavioural difference",
+      not _red["differences"], str(_red["differences"]))
+check("and the reason says what has to be supplied",
+      "supplied at replay time" in (_red.get("error") or ""), str(_red.get("error"))[:200])
+check("which names where the placeholder is",
+      "request body" in (_red.get("error") or ""), str(_red.get("error"))[:120])
+
+# The same in a query string and in a header, which is how an API key usually travels.
+check("a masked value in the query string is caught too",
+      parity.compare({"path": "/api", "query": "key=__REDACTED_API_KEY__",
+                      "expected_status": 200}, {"status": 500})["verdict"] == "error")
+check("and one in a request header",
+      parity.compare({"path": "/api", "request_headers": {"X-Api-Key": "__REDACTED_API_KEY__"},
+                      "expected_status": 200}, {"status": 500})["verdict"] == "error")
+
+# The guard is on the *request* only. A redacted response body is fine and must still compare:
+# `ingest` masks the replayed body with the same function, so both sides carry the placeholder
+# and they match. Treating that as unjudgeable would throw away every page that displays a
+# configuration value.
+_resp = parity.compare(
+    {"path": "/settings", "expected_status": 200,
+     "expected_body": "<p>dsn: __REDACTED_CONNECTION_STRING__</p>"},
+    {"status": 200, "body": "<p>dsn: __REDACTED_CONNECTION_STRING__</p>", "headers": {}})
+check("a redacted *response* still compares, and matches itself",
+      _resp["verdict"] == "pass", str(_resp))
+
+# And an ordinary case is untouched — the guard must not swallow real divergences.
+_real = parity.compare(
+    {"path": "/employees/1", "expected_status": 200, "expected_body": "<td>61234.99</td>"},
+    {"status": 200, "body": "<td>0</td>", "headers": {}})
+check("a real behavioural difference is still a failure",
+      _real["verdict"] == "fail", str(_real["verdict"]))
+check("and it is still described as one",
+      any(d["kind"] == "body" for d in _real["differences"]), str(_real["differences"]))
+
+# End to end: a corpus that cannot be replayed reports as unrunnable rather than as a
+# conversion that broke everything.
+_rp = store.create_run("redacted-parity", ".NET 8", "files", created_by="smoke")
+parity.record_cases(_rp, {"source": "smoke", "cases": [
+    {"name": "sign in", "request": {"method": "POST", "path": "/login",
+                                    "body": "username=admin&password=hunter2hunter2",
+                                    "content_type": "application/x-www-form-urlencoded"},
+     "expected": {"status": 302, "location": "/"}}]}, "smoke")
+_stored = store.list_parity_cases(_rp, status="active", include_bodies=True)[0]
+check("the recorder's password is masked before it is stored — this part is right",
+      "__REDACTED_" in (_stored.get("request_body") or ""), str(_stored.get("request_body")))
+_report = parity.ingest(_rp, {"source": "smoke", "base_url": "http://localhost:5000",
+                              "results": [{"case_id": _stored["id"], "status": 302,
+                                           "location": "/login"}]}, "smoke")
+check("so the replay of it is reported as unrunnable, not as a divergence",
+      _report["errored"] == 1 and _report["failed"] == 0, str(_report))
+check("and the run is not told its conversion changed behaviour",
+      _report["status"] != "diverged", str(_report["status"]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

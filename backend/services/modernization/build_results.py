@@ -650,29 +650,38 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
         if reopened:
             reopened_kinds = {unit_kinds.get(u["unit_id"], "")
                               for u in (outcome.get("units") or [])}
-            # `completed` only — deliberately not every terminal state. A build report
-            # arriving for a run somebody *cancelled* must not restart it: the branch is
+            _withdraw_end_of_run_gates(run_id, round_no)
+            # `completed` and `paused` only — deliberately not every terminal state. A build
+            # report arriving for a run somebody *cancelled* must not restart it: the branch is
             # still there and CI keeps firing on it long after a human decided to stop, and
             # "cancel" that quietly un-cancels is the worst kind of control. `failed` is
             # excluded for the same reason — it stopped for a recorded reason that a compiler
             # error is not evidence against.
-            if run_status == "completed":
-                # A finished run has to leave its terminal state before `runner.resume` will
-                # touch it at all, and has to leave `phase='completed'` before the resumed
-                # driver will look at the stage the reopened work lives in. `update_run`
-                # clears `finished_at` on the way out (see its comment) — nothing to do here.
+            #
+            # **The phase is rewound for a paused run too**, which it was not. `_rework_phase`
+            # exists because a run whose phase sits past the stage the reopened work lives in
+            # never claims it — its own docstring says so — and that is as true of a run paused
+            # at `reconcile` as of a finished one. Measured: a build round reopened three
+            # components, the run was paused at `reconcile`, the resume re-entered at
+            # reconciliation, walked straight to `completed`, and the three units sat in
+            # `ready` having never been re-converted. The build loop reported success at
+            # reopening work that then silently never happened.
+            if run_status in ("completed", "paused"):
+                rewound = _rework_phase(reopened_kinds)
                 store.update_run(
-                    run_id, status="paused", phase=_rework_phase(reopened_kinds),
+                    run_id, status="paused", phase=rewound,
                     paused_reason=(
                         f"Build round {round_no} reported {len(errors)} compiler error(s). "
                         f"{reopened} unit(s) were reopened for rework — resume to convert "
                         f"them again."
                     ),
                 )
-                notes.append("The run was moved out of its finished state and paused; "
-                             "resume it to convert them again.")
-            elif run_status == "paused":
-                notes.append("The run is paused; resume it to convert them again.")
+                if run_status == "completed":
+                    notes.append("The run was moved out of its finished state and paused; "
+                                 "resume it to convert them again.")
+                else:
+                    notes.append(f"The run is paused at '{rewound}'; resume it to convert "
+                                 f"them again.")
 
         if exhausted:
             store.create_checkpoint(
@@ -889,3 +898,44 @@ def summary_for_run(run_id: str) -> Dict[str, Any]:
         "warnings": int(latest.get("warning_count") or 0),
         "source": latest.get("source") or "",
     }
+
+
+# Gates that ask "are you finishing without this evidence?". They belong at the end of a run
+# and nowhere else — and `runner.resume` refuses to start while *any* blocking checkpoint is
+# open, which turns them into a deadlock the moment a build round reopens work.
+_END_OF_RUN_GATES = ("parity_required", "parity_divergence", "parity_incomplete")
+
+
+def _withdraw_end_of_run_gates(run_id: str, round_no: int) -> int:
+    """Take the end-of-run gates back down when a build round schedules more conversion.
+
+    Found by running the loop end to end on a run that had recorded parity, which had never
+    happened before. `parity.gate` raises a blocking `parity_required` when the run reaches
+    reconcile; a build round then reopens three units and asks for a resume; and `resume`
+    refuses, because a blocking checkpoint is open. The two gates deadlock each other, and the
+    only way out was to *waive* parity in order to fix the build — after which the waiver
+    stands and the behaviour is never checked. Exactly the outcome the gate exists to prevent.
+
+    Withdrawn rather than answered, and re-raised by `parity.gate` when reconcile finishes
+    again. That is the honest sequence: the question is "did you check the behaviour of the
+    code you are shipping", and while three units are queued for rework there is no such code
+    to have checked yet. Nothing is lost — the cases are still recorded, and the gate returns.
+    """
+    withdrawn = 0
+    for checkpoint in store.list_checkpoints(run_id, "open"):
+        if checkpoint["kind"] not in _END_OF_RUN_GATES:
+            continue
+        store.answer_checkpoint(
+            checkpoint["id"],
+            {"decision": "withdrawn",
+             "note": (f"Withdrawn automatically: build round {round_no} reopened units for "
+                      f"rework, so this run is no longer finishing. It will be asked again "
+                      f"once the rework is converted and reconciliation runs.")},
+            "system")
+        withdrawn += 1
+    if withdrawn:
+        store.append_event(
+            run_id, "gate_withdrawn",
+            f"{withdrawn} end-of-run gate(s) withdrawn: build round {round_no} reopened work, "
+            f"so they will be asked again when the run next reaches the end.", level="info")
+    return withdrawn

@@ -45,6 +45,33 @@ _PACKAGE_TYPES: Tuple[Tuple[str, str, str], ...] = (
     (r"\bUseSqlServer\(", "Microsoft.EntityFrameworkCore.SqlServer", "8.0.10"),
     (r"\bUseMySql\(|\bServerVersion\b", "Pomelo.EntityFrameworkCore.MySql", "8.0.2"),
     (r"\bUseNpgsql\(", "Npgsql.EntityFrameworkCore.PostgreSQL", "8.0.10"),
+    # SQLite was simply missing, and it is the provider a small legacy application is most
+    # often converted onto — a 45-file run whose charter said SQLite emitted a solution that
+    # referenced the provider nowhere at all.
+    (r"\bUseSqlite\(", "Microsoft.EntityFrameworkCore.Sqlite", "8.0.10"),
+    # ── Packages a class library needs and a Web SDK project gets for free ──
+    #
+    # These are the ones a converted *library* project asks for and does not receive. The
+    # entry project resolves them through `Microsoft.NET.Sdk.Web`'s framework reference, so
+    # they never showed up until a run put a DbContext factory and a connection interceptor
+    # in `Acme.Ems.Infrastructure` — a plain class library — and the build failed with four
+    # errors that no rewrite of a `.cs` file could ever fix. That is the sharp edge: the
+    # rework loop reopens the *unit*, the model rewrites correct C# again, and the missing
+    # thing is a line in a `.csproj` only this module writes. The model had already written
+    # `using Microsoft.EntityFrameworkCore.Diagnostics;` correctly both times.
+    (r"\bDbConnectionInterceptor\b|\bDbCommandInterceptor\b|\bConnectionEndEventData\b"
+     r"|\bCommandEventData\b|\bRelationalEventId\b",
+     "Microsoft.EntityFrameworkCore.Relational", "8.0.10"),
+    (r"\bIDesignTimeDbContextFactory<", "Microsoft.EntityFrameworkCore.Design", "8.0.10"),
+    (r"\bIConfiguration\b|\bConfigurationBuilder\b",
+     "Microsoft.Extensions.Configuration.Abstractions", "8.0.0"),
+    (r"\.AddJsonFile\(", "Microsoft.Extensions.Configuration.Json", "8.0.1"),
+    (r"\.AddEnvironmentVariables\(",
+     "Microsoft.Extensions.Configuration.EnvironmentVariables", "8.0.0"),
+    (r"\bIServiceCollection\b",
+     "Microsoft.Extensions.DependencyInjection.Abstractions", "8.0.2"),
+    (r"\bILogger<", "Microsoft.Extensions.Logging.Abstractions", "8.0.2"),
+    (r"\bIOptions<|\bIOptionsMonitor<", "Microsoft.Extensions.Options", "8.0.2"),
     (r"\bMySqlConnection\b", "MySqlConnector", "2.3.7"),
     (r"\bSqlConnection\b", "Microsoft.Data.SqlClient", "5.2.2"),
     (r"\bNpgsqlConnection\b", "Npgsql", "8.0.5"),
