@@ -34,6 +34,15 @@ SPEND_GATES = {"discovery_approval", "plan_approval"}
 
 
 class Client:
+    """Talks to the platform as whatever credential it was given.
+
+    A bearer token or an API key, decided by the shape of the value: `get_caller` has always
+    accepted either, and which one you happen to have depends entirely on how you got here.
+    A password is what a person has; a key is what a CI job has and what somebody who has
+    already provisioned one has. Requiring the password was the same friction that kept
+    `build_run.py` unused until it learned to log in (D-102), pointing the other way.
+    """
+
     def __init__(self, base, token, project_id):
         self.base, self.token, self.project_id = base.rstrip("/"), token, project_id
 
@@ -43,7 +52,10 @@ class Client:
             data=json.dumps(body).encode() if body is not None else None,
             method=method,
         )
-        request.add_header("Authorization", f"Bearer {self.token}")
+        if self.token.startswith("lmsdlc_"):
+            request.add_header("X-API-Key", self.token)
+        else:
+            request.add_header("Authorization", f"Bearer {self.token}")
         if self.project_id:
             request.add_header("X-Project-Id", self.project_id)
         if body is not None:
@@ -107,6 +119,8 @@ def main():
     parser.add_argument("--api", default="http://localhost:8000")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--password", default=os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@1234"))
+    parser.add_argument("--token", default=os.getenv("LM_TOKEN", ""),
+                        help="An API key or bearer token to use instead of logging in.")
     parser.add_argument("--project", default="", help="X-Project-Id. Required where the "
                                                       "deployment binds every call to a project.")
     parser.add_argument("--zip", help="Source repository to convert.")
@@ -122,12 +136,15 @@ def main():
 
     log = open(args.log, "a", encoding="utf-8") if args.log else None
 
-    status, auth = Client(args.api, "", "").call(
-        "/api/auth/login", "POST", {"username": args.user, "password": args.password})
-    if status != 200:
-        say(f"login failed ({status}): {json.dumps(auth)[:200]}", log)
-        return 1
-    client = Client(args.api, auth["token"], args.project)
+    if args.token:
+        client = Client(args.api, args.token, args.project)
+    else:
+        status, auth = Client(args.api, "", "").call(
+            "/api/auth/login", "POST", {"username": args.user, "password": args.password})
+        if status != 200:
+            say(f"login failed ({status}): {json.dumps(auth)[:200]}", log)
+            return 1
+        client = Client(args.api, auth["token"], args.project)
 
     # If no project was named and the deployment needs one, take the first visible project
     # rather than failing with a 403 the caller has to go and decode.
