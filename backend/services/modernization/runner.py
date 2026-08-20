@@ -1317,6 +1317,27 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
     return placed
 
 
+def _design_failure_reason(run_id: str, design_units: List[Dict[str, Any]]) -> str:
+    """Why there is no architecture, in words the person reading the run can act on.
+
+    Read off the design unit's own error rather than described in general terms: "the design
+    call could not reach the model" and "the design call came back without any components"
+    are different problems with different next steps, and the run already knows which it hit.
+    """
+    for unit in design_units:
+        error = (unit.get("error") or {})
+        detail = str(error.get("error") or error or "").strip()
+        if unit.get("status") in ("failed", "needs_human") and detail:
+            tries = int(unit.get("attempts") or 0)
+            after = f" after {tries} attempt(s)" if tries else ""
+            return f"The design stage failed{after}: {detail[:600]}"
+    if not design_units:
+        return ("The design stage never ran, so the run stopped before it could decide what "
+                "the components are.")
+    return ("The design stage finished without proposing any component, so there is nothing "
+            "to convert. Its response carried no usable architecture.")
+
+
 def _build_task_plan(run_id: str) -> Dict[str, Any]:
     """The approvable plan, and the gate that carries it.
 
@@ -1328,6 +1349,31 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     components = store.list_units(run_id, kind="component")
     design_units = store.list_units(run_id, kind="design")
     design_meta = (design_units[0].get("meta") if design_units else None) or {}
+
+    # Zero components means the design stage never produced a target architecture, so there
+    # is nothing to convert and nothing to price. Raising the gate anyway asks a human to
+    # approve **"0 component(s), 0 model call(s), estimated $0.00, hard ceiling $0.00"** —
+    # and approving it walks the run through scaffold, finds nothing to convert, and hands
+    # over an archive that is nine deterministic project files wearing a finished run's
+    # status. Seen twice now: once on a provider with no credit, once on a provider whose
+    # 5-hour quota was exhausted before the run started.
+    #
+    # A gate exists to put a decision in front of someone. There is no decision here: the
+    # run cannot proceed, and the only honest thing to do is say so and name the reason.
+    if not components:
+        why = _design_failure_reason(run_id, design_units)
+        store.update_run(
+            run_id, status="failed", phase="design",
+            paused_reason="",
+            error={"stage": "design", "detail": why})
+        store.append_event(
+            run_id, "run_failed",
+            f"No target architecture was produced, so there is nothing to convert and "
+            f"nothing to approve. {why}",
+            level="error")
+        logger.warning("Modernization run %s produced no components: %s", run_id, why)
+        return {"components": [], "totals": {"expected_usd": 0.0, "ceiling_usd": 0.0},
+                "blocked": why}
 
     # A component's ceiling is "the provider cannot generate more than `max_tokens`" — which
     # is still true per *call*, and this mode makes up to `AGENTIC_MAX_TURNS + 1` of them.
@@ -1470,7 +1516,8 @@ def _handle_stage_exception(run_id: str, unit: Dict[str, Any], exc: Exception,
                             what: str) -> str:
     """Shared failure policy for a stage unit. Same reasoning as `_convert_one`'s."""
     if isinstance(exc, (agent_guard.BudgetExceededError, agent_guard.ScopeDeniedError,
-                        agent_guard.QuotaExceededError)):
+                        agent_guard.QuotaExceededError,
+                        llm_gateway.LLMProviderUnavailableError)):
         store.fail_unit(unit["id"], run_id, str(exc), terminal=False,
                         max_attempts=MAX_UNIT_ATTEMPTS + 1)
         store.update_run(run_id, status="paused", paused_reason=str(exc))
@@ -1584,8 +1631,14 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     except Exception as exc:
         # Entitlement, budget and quota errors are not the unit's fault and retrying them
         # would burn every remaining attempt on every remaining unit. Pause instead.
+        # A provider that has stopped answering joins the list for the same reason the
+        # others are on it: retrying spends the unit's attempts on a question only the
+        # provider can answer, and the unit itself was never the problem. Keeping it
+        # `ready` is what lets a resume — after the quota resets, or against a different
+        # connection — pick up exactly where this stopped.
         if isinstance(exc, (agent_guard.BudgetExceededError, agent_guard.ScopeDeniedError,
-                            agent_guard.QuotaExceededError)):
+                            agent_guard.QuotaExceededError,
+                            llm_gateway.LLMProviderUnavailableError)):
             store.fail_unit(unit["id"], run_id, str(exc), terminal=False,
                             max_attempts=MAX_UNIT_ATTEMPTS + 1)
             store.update_run(run_id, status="paused", paused_reason=str(exc))

@@ -102,6 +102,72 @@ class LLMProviderError(RuntimeError):
         super().__init__(detail)
 
 
+class LLMProviderUnavailableError(LLMProviderError):
+    """The provider refused for a reason no retry can fix: the account is out of quota or
+    credit, or the rate limit it hit resets further away than we are willing to wait.
+
+    Separated from `LLMProviderError` because the two want opposite handling. A timeout or a
+    502 may well succeed on the next attempt, so the unit that hit it should be retried and,
+    past its attempt limit, failed. This will not succeed for *anybody* until something
+    outside this process changes — so retrying is waste, and the damage is worse than waste:
+    each attempt spends one of the unit's three, and a whole run's units can be retired as
+    permanently failed by an outage that lasted an afternoon.
+
+    Observed: a run against a local router where every call returned
+    `429 … You've reached your 5-hour usage limit for your plan … reset after 3h 21m`. Four
+    comprehension probes and the design call each burned three attempts discovering the same
+    thing, which retired all five units terminally and left the run unable to resume even
+    after the quota came back.
+    """
+
+
+# How long a rate limit may ask us to wait and still count as a blip. A burst limiter says
+# "one second"; a plan limit says "three hours". Only the first is worth sleeping through.
+RATE_LIMIT_RETRY_CEILING_SECONDS = 120
+
+# Words a provider uses when the account, rather than the moment, is the problem. Matched on
+# the message because the status code cannot distinguish them: 429 is both "too fast" and
+# "you have used everything you bought".
+_EXHAUSTED_MARKERS = (
+    "usage limit", "quota", "insufficient", "credit", "billing", "out of funds",
+    "exceeded your current", "spending limit", "hard limit",
+)
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    """What the provider itself said to wait, if it said anything."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    for name in ("retry-after", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        raw = headers.get(name) if hasattr(headers, "get") else None
+        if not raw:
+            continue
+        try:
+            return float(str(raw).rstrip("s"))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _unavailable_reason(exc: Exception) -> str:
+    """-> a sentence when retrying cannot help, else "".
+
+    Deliberately generous about what counts. Treating a transient limit as permanent costs
+    one paused run that a resume fixes; treating a permanent one as transient retires units
+    that had nothing wrong with them, which is the failure this exists to prevent.
+    """
+    wait = _retry_after_seconds(exc)
+    if wait and wait > RATE_LIMIT_RETRY_CEILING_SECONDS:
+        return (f"the provider asked us to wait {int(wait)}s before trying again, which is "
+                f"longer than a run should sit inside one call")
+    lowered = str(exc).lower()
+    for marker in _EXHAUSTED_MARKERS:
+        if marker in lowered:
+            return ("the account behind this connection is out of quota or credit — the "
+                    "provider refused the request rather than answering it")
+    return ""
+
+
 @contextmanager
 def track_usage():
     """Every call_tool() invocation inside this block records its token usage;
@@ -220,6 +286,13 @@ def _anthropic_send(client, params: Dict[str, Any], label: str,
             break
         except _RETRYABLE_ANTHROPIC as e:
             last_err = e
+            unavailable = _unavailable_reason(e)
+            if unavailable:
+                logger.error("Anthropic call for tool '%s' cannot proceed: %s",
+                             label, unavailable)
+                raise LLMProviderUnavailableError(
+                    "anthropic", label, attempt + 1, e,
+                    elapsed_ms=(time.perf_counter() - start) * 1000) from e
             if attempt < config.LLM_MAX_RETRIES:
                 logger.warning(
                     "Anthropic call for tool '%s' failed (attempt %d/%d): %s — retrying",
@@ -332,6 +405,15 @@ def _call_openai(
             )
             break
         except _RETRYABLE_OPENAI as e:
+            unavailable = _unavailable_reason(e)
+            if unavailable:
+                # This is the path the OmniRoute run took, three times per unit, against a
+                # limit that reset three hours later.
+                logger.error("OpenAI call for tool '%s' cannot proceed: %s",
+                             tool_schema["name"], unavailable)
+                raise LLMProviderUnavailableError(
+                    "openai", tool_schema["name"], attempt + 1, e,
+                    elapsed_ms=(time.perf_counter() - start) * 1000) from e
             if attempt < config.LLM_MAX_RETRIES:
                 logger.warning(
                     "OpenAI call for tool '%s' failed (attempt %d/%d): %s — retrying",

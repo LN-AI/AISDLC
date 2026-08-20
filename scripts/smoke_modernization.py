@@ -5914,6 +5914,122 @@ check("and the refusal names what is valid",
       "single" in _mode_run.text and "agentic" in _mode_run.text, _mode_run.text[:160])
 
 
+section("41. A provider that stopped answering, and a gate with nothing to approve")
+
+# A real run, 2026-08-20, against a local router carrying GLM 5.2: every call came back
+#
+#   429 … You've reached your 5-hour usage limit for your plan … (reset after 3h 21m 10s)
+#
+# Nothing reached a model. Four comprehension probes and the design call each burned three
+# attempts discovering the same thing, which retired all five units as terminally failed —
+# so the run could not be resumed even after the quota returned. Then, with zero components,
+# the plan gate asked a human to approve **"0 component(s), 0 model call(s), estimated $0.00,
+# hard ceiling $0.00"**, and approving it would have produced an archive of nine deterministic
+# project files wearing a finished run's status.
+#
+# Three separate defects in one screenshot, and only the first belongs to the provider.
+
+# ── Retrying cannot fix an exhausted account, so it does not try ───────────
+_REAL_429 = ("Error code: 429 - {'error': {'message': \"[command-code/zai-org/GLM-5.2] "
+             "[429]: You've reached your 5-hour usage limit for your plan. Your limit "
+             "resets at 2026-08-20T14:37:0 (reset after 3h 21m 10s)\"}}")
+
+
+class _FakeResponse:
+    status_code = 429
+
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
+class _ProviderRefusal(Exception):
+    def __init__(self, message, headers=None):
+        super().__init__(message)
+        self.response = _FakeResponse(headers)
+
+
+check("the message a real exhausted account sends is recognised",
+      "out of quota or credit" in llm_gateway._unavailable_reason(_ProviderRefusal(_REAL_429)),
+      llm_gateway._unavailable_reason(_ProviderRefusal(_REAL_429))[:80])
+check("so is a 402 with no credit — the other provider that has killed a run",
+      llm_gateway._unavailable_reason(_ProviderRefusal("402: insufficient credits")) != "")
+check("and a retry-after longer than a call should wait for",
+      "3600s" in llm_gateway._unavailable_reason(
+          _ProviderRefusal("slow down", {"retry-after": "3600"})),
+      llm_gateway._unavailable_reason(_ProviderRefusal("slow down", {"retry-after": "3600"})))
+# The other direction matters as much: a burst limiter saying "one second" is exactly what
+# the retry loop is for, and treating it as permanent would pause runs that would have
+# succeeded.
+check("a two-second burst limit is still an ordinary retry",
+      llm_gateway._unavailable_reason(
+          _ProviderRefusal("rate limited", {"retry-after": "2"})) == "")
+check("and so is a plain timeout",
+      llm_gateway._unavailable_reason(_ProviderRefusal("Request timed out")) == "")
+
+# ── A unit is not spent on a question only the provider can answer ─────────
+#
+# This is the part that made the real run unrecoverable. The unit had nothing wrong with it;
+# it stays `ready`, so a resume after the quota resets — or against a different connection —
+# picks up exactly where this stopped.
+_pv = store.create_run("provider-gone", ".NET 8", "files", created_by="smoke")
+store.insert_units(_pv, [{"path": "#design/0001", "kind": "design", "status": "ready",
+                          "topo_level": 0, "order_index": 0}])
+_pv_unit = store.list_units(_pv, kind="design")[0]
+_outcome = runner._handle_stage_exception(
+    _pv, _pv_unit,
+    llm_gateway.LLMProviderUnavailableError(
+        "openai", "submit_target_architecture", 1, RuntimeError(_REAL_429)),
+    "the target architecture")
+check("the run pauses rather than grinding through every remaining unit",
+      store.get_run(_pv)["status"] == "paused", str(store.get_run(_pv)["status"]))
+check("the unit stays claimable, so a resume actually retries it",
+      store.list_units(_pv, kind="design")[0]["status"] == "ready",
+      str(store.list_units(_pv, kind="design")[0]["status"]))
+check("and the reason on the run is the provider's own words",
+      "usage limit" in (store.get_run(_pv)["paused_reason"] or ""),
+      str(store.get_run(_pv)["paused_reason"])[:120])
+
+# ── A gate exists to put a decision in front of someone ───────────────────
+#
+# With no components there is no decision: the run cannot proceed. Raising the gate anyway
+# offers approval of nothing, and approving it ships a scaffold as a conversion.
+_nc = store.create_run("nothing-to-approve", ".NET 8", "files", created_by="smoke")
+store.insert_units(_nc, [{"path": "f%d.php" % i, "kind": "source_file", "status": "ready",
+                          "source_text": "<?php echo %d;" % i} for i in range(45)])
+store.insert_units(_nc, [{"path": "#design/0001", "kind": "design", "status": "ready",
+                          "topo_level": 0, "order_index": 0}])
+store.fail_unit(store.list_units(_nc, kind="design")[0]["id"], _nc,
+                "LLMProviderError: " + _REAL_429, terminal=True)
+runner._build_task_plan(_nc)
+check("no plan gate is raised over zero components",
+      "plan_approval" not in [c["kind"] for c in store.list_checkpoints(_nc)],
+      str([c["kind"] for c in store.list_checkpoints(_nc)]))
+check("the run fails instead of waiting for an approval it cannot use",
+      store.get_run(_nc)["status"] == "failed", str(store.get_run(_nc)["status"]))
+check("and it says why, in the words of whatever actually refused",
+      "usage limit" in json.dumps(store.get_run(_nc).get("error") or {}),
+      json.dumps(store.get_run(_nc).get("error") or {})[:160])
+check("the 45 ingested files are not reported as converted",
+      store.unit_status_counts(_nc)["converted"] == 0)
+
+# The counter-case, which is the one that must not have broken: a design that *did* produce
+# components still raises the gate, with real numbers on it.
+_ok = store.create_run("something-to-approve", ".NET 8", "files", created_by="smoke")
+store.insert_units(_ok, [{"path": "a.php", "kind": "source_file", "status": "rolled_up",
+                          "source_text": "<?php echo 1;"}])
+store.insert_units(_ok, [{"path": "#component/0000-a", "kind": "component", "status": "ready",
+                          "component_name": "Widgets", "target_project": "Acme.Widgets",
+                          "target_namespace": "Acme.Widgets", "output_dir": "Acme.Widgets",
+                          "est_cost_usd": 0.09, "topo_level": 0, "order_index": 0,
+                          "meta": {"members": ["a.php"], "ceiling_usd": 0.4}}])
+_plan = runner._build_task_plan(_ok)
+check("a run that has an architecture still reaches its spend gate",
+      "plan_approval" in [c["kind"] for c in store.list_checkpoints(_ok)],
+      str([c["kind"] for c in store.list_checkpoints(_ok)]))
+check("and the gate carries a number rather than zero",
+      _plan["totals"]["ceiling_usd"] > 0, str(_plan["totals"]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
