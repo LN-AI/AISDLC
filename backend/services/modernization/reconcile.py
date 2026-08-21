@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Set
 
-from backend.services.modernization import graph, layering, store
+from backend.services.modernization import graph, layering, store, wireup
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +335,22 @@ def run(run_id: str) -> Dict[str, Any]:
             if project and symbol.get("name"):
                 _declared[project].add(str(symbol["name"]).rsplit(".", 1)[-1])
         for issue in layering.unclosed_seams(_seams, _declared):
+            issues.append(_issue(issue["kind"], issue["severity"], issue["detail"]))
+
+    # N. Services the container will not resolve. The one failure a build gate cannot catch
+    #    and the reason C-59 was the most severe finding this product has had: the solution
+    #    compiles, the host starts, and the first request that needs the service throws.
+    #    `wireup.host_plan` registers an interface only when exactly one class implements it,
+    #    which leaves an interface with none and — more commonly — a constructor taking a
+    #    concrete class, registered by nobody and never a candidate to be.
+    _program = next((a for a in artifacts
+                     if (a.get("path") or "").replace("\\", "/").endswith("Program.cs")), None)
+    if _program:
+        # `registrations_in` strips comments first — a commented-out registration is not a
+        # registration, and counting one is how this check reported a clean host that
+        # registers nothing.
+        _registrations = wireup.registrations_in(_program.get("content") or "")
+        for issue in wireup.unregistered_dependencies(artifacts, _registrations):
             issues.append(_issue(issue["kind"], issue["severity"], issue["detail"]))
 
     for issue in _unresolved_views(artifacts):

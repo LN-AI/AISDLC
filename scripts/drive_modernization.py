@@ -204,7 +204,11 @@ def main():
         for point in open_points:
             kind = point.get("kind")
             if kind in SPEND_GATES:
-                quote = (point.get("payload") or {}).get("estimate") or {}
+                # `discovery_approval` carries its numbers under `estimate` and
+                # `plan_approval` under `totals`. Reading only the first printed
+                # "expected $None, ceiling $None" on the larger of the two spend gates.
+                _payload = point.get("payload") or {}
+                quote = _payload.get("estimate") or _payload.get("totals") or {}
                 say(f"  GATE {kind}: {point.get('title')} — expected "
                     f"${quote.get('expected_usd')}, ceiling ${quote.get('ceiling_usd')}", log)
                 client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",

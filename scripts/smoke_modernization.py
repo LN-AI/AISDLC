@@ -6222,6 +6222,124 @@ check("and a run with no layout says so rather than inventing rules",
           "project_rules", {}))
 
 
+section("43. Services the container will not resolve")
+
+# The one failure a build gate cannot catch, and the reason C-59 was the most severe finding
+# this product has had: the solution compiles, the host starts, and the first request that
+# needs a service throws `Unable to resolve service for type '…'`.
+#
+# `wireup.host_plan` registers an interface only when exactly one class implements it, and
+# says nothing about the two cases that are just as fatal — an interface with none, and a
+# constructor taking a **concrete** class, which was never a candidate for registration at
+# all. The second is what a converter writes whenever the interface it should have depended
+# on was never declared, which is exactly what run 9c8cf4fe did.
+
+_SERVICE = [
+    {"path": "App/AuthService.cs", "content": (
+        "namespace Acme.App;\n"
+        "public interface IAuthService { }\n"
+        "public class AuthService : IAuthService {\n"
+        "    public AuthService(UserRepository users, ILogger<AuthService> log) { }\n"
+        "}\n")},
+    {"path": "Infra/UserRepository.cs", "content": (
+        "namespace Acme.Infra;\n"
+        "public class UserRepository { public UserRepository(EmsDbContext db) { } }\n")},
+    {"path": "Infra/EmsDbContext.cs", "content": "namespace Acme.Infra;\npublic class EmsDbContext { }\n"},
+]
+_REGISTERED_IFACE = ["builder.Services.AddScoped<Acme.App.IAuthService, Acme.App.AuthService>();"]
+
+_unresolved = wireup.unregistered_dependencies(_SERVICE, _REGISTERED_IFACE)
+check("a constructor taking a concrete class nobody registers is a failure",
+      sorted(i["type"] for i in _unresolved) == ["EmsDbContext", "UserRepository"],
+      str([i["type"] for i in _unresolved]))
+check("every one is a fail, not a warning — the request throws",
+      all(i["severity"] == "fail" for i in _unresolved))
+check("the message says it compiles and starts anyway, which is why nothing else caught it",
+      "compiles and the application starts" in _unresolved[0]["detail"],
+      _unresolved[0]["detail"][:160])
+check("and it names the exact runtime error the reader will see",
+      "Unable to resolve service for type" in _unresolved[0]["detail"])
+check("a concrete class is told the two ways out",
+      "declare an interface for it" in
+      next(i for i in _unresolved if i["type"] == "UserRepository")["detail"])
+
+check("registering them silences it",
+      not wireup.unregistered_dependencies(_SERVICE, _REGISTERED_IFACE + [
+          "builder.Services.AddScoped<Acme.Infra.UserRepository>();",
+          "builder.Services.AddScoped<Acme.Infra.EmsDbContext>();"]))
+check("an interface nothing implements is caught too — reconcile only warns about those",
+      [i["type"] for i in wireup.unregistered_dependencies(
+          [{"path": "a/S.cs", "content":
+            "public interface IGone { }\npublic class S { public S(IGone g) { } }"}], [])]
+      == ["IGone"])
+
+# The container supplies these itself, and a type from a package is not ours to register —
+# guessing at a NuGet type's lifetime is not this stage's business. Both must stay quiet, or
+# the check fires on every correct file in the run.
+check("framework services are never flagged",
+      not wireup.unregistered_dependencies(
+          [{"path": "a/C.cs", "content":
+            "public class C { public C(IConfiguration c, ILogger<C> l, "
+            "IHttpContextAccessor h, IOptions<Thing> o) { } }"}], []))
+check("nor a type this run never declared",
+      not wireup.unregistered_dependencies(
+          [{"path": "a/C.cs", "content": "public class C { public C(IStripeClient s) { } }"}], []))
+check("a parameterless constructor needs nothing",
+      not wireup.unregistered_dependencies(
+          [{"path": "a/C.cs", "content": "public class C { public C() { } }"}], []))
+
+# ── A commented-out registration is not a registration ────────────────────
+#
+# The bug this check had on its first run against real output, and the sharpest one available:
+# a false negative in the check whose entire job is catching a false negative. Run 9c8cf4fe's
+# `Program.cs` carries five registrations as commented-out suggestions, and a filter that
+# looked for `AddScoped` anywhere in the text counted all five — so a host that registers
+# nothing for those types was reported clean.
+_PROGRAM = ("var builder = WebApplication.CreateBuilder(args);\n"
+            "builder.Services.AddDbContext<EmsDbContext>();\n"
+            "//   builder.Services.AddScoped<IUserRepository, UserRepository>();\n"
+            "/* builder.Services.AddScoped<IEmployeeRepository, EmployeeRepository>(); */\n"
+            "builder.Services.AddScoped<IAuthService, AuthService>();\n")
+_real = wireup.registrations_in(_PROGRAM)
+check("only the registrations that actually run are counted",
+      len(_real) == 2, str(_real))
+check("a line comment is not a registration",
+      not any("IUserRepository" in line for line in _real), str(_real))
+check("nor a block comment",
+      not any("IEmployeeRepository" in line for line in _real), str(_real))
+check("and the real ones survive",
+      any("AddDbContext" in line for line in _real)
+      and any("IAuthService" in line for line in _real), str(_real))
+
+# ── End to end through reconciliation ─────────────────────────────────────
+_di = store.create_run("di-resolution", ".NET 8", "files", created_by="smoke")
+store.insert_units(_di, [{"path": "a.php", "kind": "source_file", "status": "rolled_up",
+                          "source_text": "<?php echo 1;"}])
+store.insert_units(_di, [{"path": "#component/0000-svc", "kind": "component",
+                          "status": "converted", "component_name": "svc",
+                          "target_project": "Acme.Web", "target_namespace": "Acme.Web",
+                          "output_dir": "Acme.Web", "topo_level": 0, "order_index": 0,
+                          "meta": {"members": ["a.php"]}}])
+store.complete_unit(
+    unit_id=store.list_units(_di, kind="component")[0]["id"], run_id=_di, symbols=[],
+    artifacts=[
+        {"path": "Acme.Web/Controllers/HomeController.cs",
+         "content": "namespace Acme.Web;\npublic class HomeController {\n"
+                    "    public HomeController(EmployeeRepository repo) { }\n}\n"},
+        {"path": "Acme.Web/EmployeeRepository.cs",
+         "content": "namespace Acme.Web;\npublic class EmployeeRepository { }\n"},
+        {"path": "Acme.Web/Program.cs",
+         "content": "var builder = WebApplication.CreateBuilder(args);\n"
+                    "// builder.Services.AddScoped<EmployeeRepository>();\n"
+                    "app.Run();\n"}])
+_report = reconcile.run(_di)
+check("reconciliation reports a service the host will not resolve",
+      any(i["kind"] == "unregistered_dependency" for i in _report["issues"]),
+      str([i["kind"] for i in _report["issues"]]))
+check("and counts it as a failure, so the run cannot read as clean",
+      _report["counts"]["fail"] >= 1, str(_report["counts"]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

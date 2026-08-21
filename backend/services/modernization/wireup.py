@@ -24,7 +24,7 @@ original `.csproj` stays readable next to the corrected one.
 """
 import logging
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from backend.services.modernization import graph
 from backend.services.modernization import usings
@@ -112,6 +112,158 @@ _CONTROLLER = re.compile(r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+)*clas
 def _namespace_of(content: str) -> str:
     m = _NAMESPACE.search(content or "")
     return m.group(1) if m else ""
+
+
+# `public SomeClass(IFoo foo, Bar bar)` — the constructor the container has to satisfy. Only
+# the first parameter list after a class-shaped name, and only `public`, because a private or
+# a copy constructor is not what dependency injection calls.
+_CONSTRUCTOR = re.compile(
+    r"\bpublic\s+([A-Z]\w*)\s*\(([^)]*)\)\s*(?::\s*(?:base|this)\s*\([^)]*\)\s*)?\{",
+    re.DOTALL)
+
+# Every class this run declares, with or without a base list. `_CLASS` above requires
+# `: Bases` because its job is finding *implementations* — reusing it here silently skipped
+# every plain class, which is precisely the population this check exists for: `UserRepository`
+# and `EmsDbContext` derive from nothing and are exactly what goes unregistered.
+_ANY_CLASS = re.compile(
+    r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+|static\s+|abstract\s+)*class\s+(\w+)")
+
+# One parameter: optional attributes, then a type, then a name. The type may be generic or
+# nullable; the last identifier before the parameter name is what has to be registered.
+_PARAM_TYPE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*(?:params\s+|in\s+|out\s+|ref\s+)?"
+                         r"([A-Za-z_][\w.]*(?:<[^>]*>)?\??)\s+[A-Za-z_]\w*\s*(?:=.*)?$")
+
+# Types the container supplies itself, or that are never injected. Everything else that this
+# run declared and nothing registered is a service that will not resolve.
+_FRAMEWORK_INJECTED = frozenset({
+    "ILogger", "IConfiguration", "IHttpContextAccessor", "IWebHostEnvironment",
+    "IHostEnvironment", "IServiceProvider", "IMemoryCache", "IOptions", "IOptionsMonitor",
+    "IOptionsSnapshot", "DbContextOptions", "IUrlHelper", "IActionContextAccessor",
+    "IAntiforgery", "IAuthorizationService", "IMapper", "HttpClient", "IHttpClientFactory",
+})
+
+MAX_UNREGISTERED = 20
+
+
+def _parameter_types(argument_list: str) -> List[str]:
+    """The bare type name of each parameter in one constructor signature."""
+    found: List[str] = []
+    depth = 0
+    current = ""
+    # Split on commas that are not inside a generic argument list: `IRepo<A, B> x, C y`.
+    for char in argument_list:
+        if char in "<([":
+            depth += 1
+        elif char in ">)]":
+            depth = max(0, depth - 1)
+        if char == "," and depth == 0:
+            found.append(current)
+            current = ""
+        else:
+            current += char
+    found.append(current)
+    types: List[str] = []
+    for chunk in found:
+        match = _PARAM_TYPE.match(chunk)
+        if not match:
+            continue
+        bare = match.group(1).split("<")[0].rstrip("?").rsplit(".", 1)[-1]
+        if bare:
+            types.append(bare)
+    return types
+
+
+_REGISTRATION_CALL = re.compile(
+    r"\.Add(?:Scoped|Singleton|Transient|DbContext|DbContextFactory|HttpClient)\b")
+
+
+def registrations_in(program_content: str) -> List[str]:
+    """The service registrations `Program.cs` really performs.
+
+    Comments are stripped **first**, and that is the whole reason this is a function rather
+    than a line filter at the call site. Run 9c8cf4fe's `Program.cs` carries five registrations
+    as commented-out suggestions —
+
+        //   builder.Services.AddScoped<IUserRepository, UserRepository>();
+
+    — and a filter that merely looked for `AddScoped` in the text counted every one of them,
+    so the check for unresolvable services reported none on a host that registers nothing for
+    those types. A false negative in the check whose entire job is catching a false negative.
+    """
+    code = usings.strip_non_code(program_content or "")
+    return [line for line in code.splitlines() if _REGISTRATION_CALL.search(line)]
+
+
+def unregistered_dependencies(artifacts: List[Dict[str, Any]],
+                             registrations: Iterable[str]) -> List[Dict[str, Any]]:
+    """Constructor parameters this run declared and `Program.cs` will not resolve.
+
+    The remaining half of C-59, which is the one failure a build gate cannot catch: the
+    solution compiles, the host starts, and the first request that needs the service throws
+    `Unable to resolve service for type '…'`. `host_plan` registers an interface only when
+    exactly one class implements it, and deliberately says nothing about two cases that are
+    just as fatal —
+
+    * an interface with **no** implementation in the conversion, which `reconcile` reports as
+      a *warning* while the run completes and ships;
+    * a constructor taking a **concrete** class, which was never a candidate for registration
+      at all. Run 9c8cf4fe's `AuthService(UserRepository)` is exactly this shape, and it is
+      what a converter writes whenever the interface it should have depended on was never
+      declared.
+
+    Framework services are excluded because the container supplies them. A type this run
+    never declared is excluded too: it comes from a package, and guessing at a NuGet type's
+    lifetime is not this stage's business.
+    """
+    declared: Set[str] = set()
+    constructors: List[Tuple[str, str, List[str]]] = []
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        if not path.lower().endswith(".cs"):
+            continue
+        code = usings.strip_non_code(artifact.get("content") or "")
+        declared.update(_INTERFACE.findall(code))
+        declared.update(_ANY_CLASS.findall(code))
+        for owner, arguments in ((m.group(1), m.group(2)) for m in _CONSTRUCTOR.finditer(code)):
+            if arguments.strip():
+                constructors.append((path, owner, _parameter_types(arguments)))
+
+    registered: Set[str] = set()
+    for line in registrations or ():
+        for name in re.findall(r"[<,]\s*([A-Za-z_][\w.]*)", str(line)):
+            registered.add(name.rsplit(".", 1)[-1])
+
+    missing: Dict[str, List[str]] = {}
+    for path, owner, types in constructors:
+        # A type is only a *dependency* if something else constructs the owner. Every class
+        # here is either registered, a controller, or constructed by another service — all
+        # three are resolved by the container, so the parameter has to be resolvable.
+        for name in types:
+            if name in _FRAMEWORK_INJECTED or name not in declared or name in registered:
+                continue
+            if name == owner:
+                continue
+            missing.setdefault(name, []).append(f"{owner} ({path})")
+
+    issues: List[Dict[str, Any]] = []
+    for name in sorted(missing)[:MAX_UNREGISTERED]:
+        wanted_by = sorted(set(missing[name]))
+        issues.append({
+            "kind": "unregistered_dependency",
+            "severity": "fail",
+            "type": name,
+            "detail": (
+                f"`{name}` is taken as a constructor parameter by "
+                + ", ".join(f"`{w}`" for w in wanted_by[:6])
+                + (f" and {len(wanted_by) - 6} more" if len(wanted_by) > 6 else "")
+                + ", and nothing registers it with the container. This compiles and the "
+                  "application starts; the first request that needs it fails with "
+                  f"`Unable to resolve service for type '{name}'`."
+                + ("" if name.startswith("I") else
+                   " It is a concrete class — either register it, or declare an interface "
+                   "for it and register that.")),
+        })
+    return issues
 
 
 def host_plan(artifacts: List[Dict[str, Any]], entry_project: str) -> Dict[str, Any]:
