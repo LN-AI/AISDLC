@@ -39,7 +39,7 @@ import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from backend.services.modernization import usings
+from backend.services.modernization import graph, usings
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +400,182 @@ def plan_gaps(components: List[Dict[str, Any]], projects: List[Dict[str, Any]],
                 f"one of the two components to the other project."),
         })
     return issues
+
+
+# ── Repairing a plan that cannot be built ──────────────────────────────────
+
+def _project_edges(projects: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
+    return {_root(p.get("name") or ""): {_root(d) for d in (p.get("depends_on") or []) if d}
+            for p in projects if p.get("name")}
+
+
+def _acyclic(edges: Dict[str, Set[str]]) -> bool:
+    """Whether a project reference graph is one MSBuild would accept.
+
+    `graph.strongly_connected` rather than a second traversal: an SCC of more than one node is
+    a cycle by definition, and this repo has had the same cycle-detection written twice before
+    and had the two disagree.
+    """
+    return all(len(group) < 2 for group in graph.strongly_connected(
+        {node: set(targets) for node, targets in edges.items()}))
+
+
+def _pascal(name: str) -> str:
+    parts = re.split(r"[^A-Za-z0-9]+", str(name or ""))
+    return "".join(p[:1].upper() + p[1:] for p in parts if p)
+
+
+def repair_options(gaps: List[Dict[str, Any]], components: List[Dict[str, Any]],
+                   projects: List[Dict[str, Any]], seams: Iterable[Dict[str, Any]],
+                   source_edges: Iterable[Tuple[str, str]]) -> List[Dict[str, Any]]:
+    """Concrete, deterministic ways to make a plan buildable. -> a list of options.
+
+    `plan_gaps` names the problem before any conversion spend, and on run 9c8cf4fe it predicted
+    all twelve eventual build errors while $0.67 had been spent instead of $6.43. It was
+    reported and nothing more, so the run proceeded into a decomposition already known to be
+    unbuildable and the prediction came true.
+
+    Reported-only was the right default while there was nothing to offer. The alternative to a
+    bare block is not silent auto-repair — a customer who approved four projects and receives
+    three, with nothing saying so, is the class of silent correction D-90 and D-98 argue
+    against. It is to compute the repair, show it, and apply the one a human picks.
+
+    Every option carries `closes` and `opens`, computed by re-running `plan_gaps` over a
+    **mutated copy** of the inputs. So the numbers on the gate are arithmetic rather than
+    assertion, and an option that would trade one gap for another says so.
+
+    Lives here rather than in `architecture` because the predictor lives here: two functions
+    that must agree about what a gap *is*, written in two modules, eventually disagree — and
+    the symptom would be a repair that closes nothing.
+    """
+    if not gaps:
+        return []
+    edges = _project_edges(projects)
+    seam_list = [s for s in (seams or ()) if isinstance(s, dict)]
+    edge_list = [(str(a), str(b)) for a, b in (source_edges or ())]
+    options: List[Dict[str, Any]] = []
+
+    def _score(new_projects, new_seams, new_components) -> Tuple[List[str], List[str]]:
+        """(gap keys this closes, gap keys it opens) — measured, not claimed."""
+        before = {f"{g['consumer']}->{g['provider']}" for g in gaps}
+        after = {f"{g['consumer']}->{g['provider']}"
+                 for g in plan_gaps(new_components, new_projects, new_seams, edge_list)}
+        return sorted(before - after), sorted(after - before)
+
+    for gap in gaps:
+        consumer, provider = gap.get("consumer") or "", gap.get("provider") or ""
+        if not consumer or not provider:
+            continue
+        weight = int(gap.get("count") or 0)
+
+        # 1. Allow the reference. The cheapest repair there is — the plan simply did not state
+        #    an edge the code needs — and it is what `plan_gaps`' own detail text recommends
+        #    first. Offered only when the graph stays acyclic: MSBuild refuses a cycle outright
+        #    (D-93/D-99), so an option that closed one would be an option that cannot build, and
+        #    showing an unbuildable choice on a gate is worse than showing one fewer.
+        trial = _project_edges(projects)
+        trial.setdefault(consumer, set()).add(provider)
+        if _acyclic(trial):
+            new_projects = [dict(p, depends_on=sorted(trial.get(_root(p.get("name") or ""), set())))
+                            for p in projects]
+            closes, opens = _score(new_projects, seam_list, components)
+            options.append({
+                "id": f"allow:{consumer}->{provider}",
+                "kind": "allow_reference", "consumer": consumer, "provider": provider,
+                "title": f"Let {consumer} reference {provider}",
+                "detail": (f"Adds `{provider}` to `{consumer}`'s project references. The "
+                           f"{weight} dependency in the source becomes legal as written, and "
+                           f"the project graph stays acyclic."),
+                "closes": closes, "opens": opens, "feasible": True, "why_not": "",
+                "projects": new_projects,
+            })
+        else:
+            options.append({
+                "id": f"allow:{consumer}->{provider}",
+                "kind": "allow_reference", "consumer": consumer, "provider": provider,
+                "title": f"Let {consumer} reference {provider}",
+                "detail": "", "closes": [], "opens": [], "feasible": False,
+                "why_not": (f"`{provider}` already reaches `{consumer}`, so this edge would "
+                            f"close a reference cycle and MSBuild refuses to build one."),
+            })
+
+        # 2. Declare a seam. The layered answer: an interface the consumer owns and the provider
+        #    implements, which is what the architect's own `purpose` lines usually already say in
+        #    English. The implementer needs to be allowed to reference the declarer, or the seam
+        #    only moves the same problem in the other direction.
+        seam_edges = _project_edges(projects)
+        seam_edges.setdefault(provider, set()).add(consumer)
+        interface = f"I{_pascal(provider.rsplit('.', 1)[-1])}Gateway"
+        if _acyclic(seam_edges):
+            new_seams = seam_list + [{"interface": interface, "declared_in": consumer,
+                                      "implemented_in": provider}]
+            new_projects = [dict(p, depends_on=sorted(seam_edges.get(_root(p.get("name") or ""), set())))
+                            for p in projects]
+            closes, opens = _score(new_projects, new_seams, components)
+            options.append({
+                "id": f"seam:{consumer}->{provider}",
+                "kind": "declare_seam", "consumer": consumer, "provider": provider,
+                "title": f"Declare {interface} in {consumer}, implemented by {provider}",
+                "detail": (f"`{consumer}` declares the interface and depends on nothing new; "
+                           f"`{provider}` implements it. Both ends are rendered into the "
+                           f"relevant conversion prompts (D-128), so neither side is left "
+                           f"implementing nothing."),
+                "closes": closes, "opens": opens, "feasible": True, "why_not": "",
+                "projects": new_projects, "seams": new_seams,
+            })
+        else:
+            options.append({
+                "id": f"seam:{consumer}->{provider}",
+                "kind": "declare_seam", "consumer": consumer, "provider": provider,
+                "title": f"Declare an interface in {consumer} for {provider}",
+                "detail": "", "closes": [], "opens": [], "feasible": False,
+                "why_not": (f"The implementer has to reference the declarer, and "
+                            f"`{provider}` -> `{consumer}` would close a reference cycle."),
+            })
+
+    # 3. Merge the two projects. The fallback, and it always works, which is why it is last:
+    #    it delivers a coarser architecture than the one approved. The entry project is never
+    #    absorbed — it owns the host, the solution name and `Program.cs` (D-93/D-100) — and
+    #    otherwise the project with fewer components goes, ties broken by name so two runs over
+    #    one codebase cannot disagree.
+    entry = _root((projects[0].get("name") or "")) if projects else ""
+    per_project: Dict[str, int] = {}
+    for component in components:
+        key = _root(component.get("target_project") or component.get("project") or "")
+        if key:
+            per_project[key] = per_project.get(key, 0) + 1
+    for pair in sorted({tuple(sorted((g.get("consumer") or "", g.get("provider") or "")))
+                        for g in gaps if g.get("consumer") and g.get("provider")}):
+        left, right = pair
+        candidates = [p for p in (left, right) if p != entry]
+        if not candidates:
+            continue
+        absorb = min(candidates, key=lambda p: (per_project.get(p, 0), p))
+        keep = right if absorb == left else left
+        new_projects = [p for p in projects if _root(p.get("name") or "") != absorb]
+        new_projects = [dict(p, depends_on=sorted(
+            {d for d in (p.get("depends_on") or []) if _root(d) != absorb}))
+            for p in new_projects]
+        new_components = [
+            dict(c, target_project=keep, project=keep)
+            if _root(c.get("target_project") or c.get("project") or "") == absorb else c
+            for c in components]
+        closes, opens = _score(new_projects, seam_list, new_components)
+        options.append({
+            "id": f"merge:{absorb}->{keep}",
+            "kind": "merge_projects", "keep": keep, "absorb": absorb,
+            "title": f"Merge {absorb} into {keep}",
+            "detail": (f"Moves {per_project.get(absorb, 0)} component(s) from `{absorb}` into "
+                       f"`{keep}` and drops `{absorb}` from the solution. Always buildable, and "
+                       f"a coarser architecture than the one on this plan — the boundary stops "
+                       f"existing rather than being crossed legally."),
+            "closes": closes, "opens": opens, "feasible": True, "why_not": "",
+            "projects": new_projects, "components": new_components,
+        })
+
+    # A repair that closes nothing is noise on a gate. An infeasible one is kept, because
+    # "you cannot do this, and here is why" is what stops somebody proposing it again.
+    return [o for o in options if o["closes"] or not o["feasible"]]
 
 
 # What a type declaration says it derives from. Two families in one pattern: C#/Kotlin put the

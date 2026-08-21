@@ -1107,7 +1107,8 @@ def summary_for_run(run_id: str) -> Dict[str, Any]:
 # deadlocks — the trap `_withdraw_end_of_run_gates` was written for. The two build
 # gates belong here for exactly that reason: they are the ones a rework round answers.
 _END_OF_RUN_GATES = ("parity_required", "parity_divergence", "parity_incomplete",
-                     "build_required", "build_errors_outstanding")
+                     "build_required", "build_errors_outstanding",
+                     "runtime_required", "runtime_failed")
 
 
 def _withdraw_end_of_run_gates(run_id: str, round_no: int) -> int:

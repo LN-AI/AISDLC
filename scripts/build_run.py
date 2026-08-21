@@ -2,7 +2,7 @@
 
     python scripts/build_run.py --fixture
     python scripts/build_run.py --run <run_id> --user admin --password ...
-    python scripts/build_run.py --loop --run <run_id> --user admin --password ...
+    python scripts/build_run.py --loop --serve --run <run_id> --user admin --password ...
 
 This is the shortest path from "the run finished" to "does it actually compile", and it needs
 no GitHub, no Actions secret and no Docker — only the .NET SDK already on the machine. It
@@ -17,10 +17,18 @@ and nobody ever built again. The loop alternates build, report, resume, build un
 compiles or the platform says another build cannot help. It never answers a blocking checkpoint
 it was not told to answer: that is a decision the product deliberately handed to a human.
 
+`--serve` asks the question after that one: does it *start*, and does it answer its own URLs.
+Compiling is not the bar. This product has twice shipped an export that built with zero errors
+and failed on its first request — a view emitted under a name its controller does not ask for,
+and a container missing a registration — and both were found by a human running it. The URLs
+come from the run's own route evidence via `GET /runs/{id}/startup-plan`, so what is probed is
+the application's declared surface rather than a list maintained beside it.
+
 **This does not weaken D-05.** That decision says no compiling or subprocess execution *on the
 API host*. This is a developer-run script — the same tier as the customer's CI, which is
-exactly the path D-05 named — and the backend still only ever receives diagnostics. Nothing
-here imports the FastAPI app or runs inside it.
+exactly the path D-05 named — and the backend still only ever receives diagnostics and
+observations. Nothing here imports the FastAPI app or runs inside it, and nothing in `backend/`
+may import this.
 
 `--fixture` builds the scaffold for a synthetic project offline, with no server and no API
 key, and exits non-zero if it does not compile. That check exists because a `global.json`
@@ -167,6 +175,213 @@ def build_export(api: str, key: str, run_id: str, keep: str = "",
     return 0 if code == 0 else 1
 
 
+# ── Does it start, and does it answer? ─────────────────────────────────────
+#
+# The question between "does it compile" and "does it behave the same", and the one this
+# product has twice shipped the wrong answer to with every offline check green: a view emitted
+# under a name its controller does not ask for (C-60) and a container missing a registration
+# (C-59). The first throws on one route, the second on all of them, and no compiler sees either.
+#
+# D-05 covers this exactly as it covers `dotnet build` above: the API host runs nothing, and a
+# developer's machine or the customer's CI is the tier the decision names. Nothing in `backend/`
+# may import this.
+
+STARTUP_TIMEOUT_SECONDS = 90
+PROBE_TIMEOUT_SECONDS = 20
+
+# What the generated host reads for its connection string (`wireup.CONNECTION_NAME`), as the
+# environment-variable spelling ASP.NET Core maps onto configuration.
+_CONNECTION_ENV = "ConnectionStrings__DefaultConnection"
+
+# Providers the generated `Program.cs` can register. Only SQLite can be stood up with nothing
+# installed, so it is the only one this gets a free default for.
+_PROVIDERS = (("UseSqlite", "sqlite"), ("UseSqlServer", "sqlserver"),
+              ("UseNpgsql", "postgresql"), ("UseMySql", "mysql"), ("UseMySQL", "mysql"),
+              ("UseOracle", "oracle"))
+
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _find_entry(workdir: str, named: str = "") -> str:
+    """The project directory to run. `named` is what the platform's plan said."""
+    if named and os.path.isdir(os.path.join(workdir, named)):
+        return named
+    hosts = []
+    for root, _dirs, files in os.walk(workdir):
+        if "Program.cs" in files:
+            hosts.append(os.path.relpath(root, workdir).replace("\\", "/"))
+    # Only when there is no ambiguity. Guessing between two hosts would start the wrong one and
+    # report its 404s as the conversion's fault.
+    return hosts[0] if len(hosts) == 1 else ""
+
+
+def _db_provider(workdir: str, entry: str) -> str:
+    try:
+        with io.open(os.path.join(workdir, entry, "Program.cs"), encoding="utf-8",
+                     errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return ""
+    for needle, name in _PROVIDERS:
+        if needle in text:
+            return name
+    return ""
+
+
+def _seed_sqlite(workdir: str, db_path: str) -> str:
+    """Apply any `schema*.sql` the export carries. -> a note, or ""."""
+    import glob
+    import sqlite3
+    scripts = sorted(glob.glob(os.path.join(workdir, "**", "schema*.sql"), recursive=True))
+    if not scripts:
+        return "no schema*.sql in the export, so the database is empty"
+    applied = []
+    for script in scripts:
+        try:
+            with io.open(script, encoding="utf-8", errors="replace") as handle:
+                sql = handle.read()
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.executescript(sql)
+                connection.commit()
+            finally:
+                connection.close()
+            applied.append(os.path.basename(script))
+        except Exception as exc:  # noqa: BLE001
+            # A MySQL dump is not SQLite, and that is a fact about the source rather than a
+            # defect in the conversion. Reported and carried on: an empty database still tells
+            # us whether the application starts.
+            return f"{os.path.basename(script)} would not apply to SQLite ({exc})"
+    return f"seeded from {', '.join(applied)}"
+
+
+def _probe(base_url: str, urls: list) -> list:
+    checks = []
+    for entry in urls:
+        if not entry.get("probe"):
+            continue
+        method, path = entry.get("method") or "GET", entry.get("path") or "/"
+        request = urllib.request.Request(base_url.rstrip("/") + path, method=method)
+        started = time.time()
+        try:
+            with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT_SECONDS) as response:
+                status, error = response.status, ""
+        except urllib.error.HTTPError as exc:
+            status, error = exc.code, ""
+        except Exception as exc:  # noqa: BLE001
+            status, error = 0, str(exc)[:200]
+        checks.append({"method": method, "path": path, "status": status, "error": error,
+                       "ms": int((time.time() - started) * 1000)})
+        print(f"  {method} {path} -> {status or error}")
+    return checks
+
+
+def serve_export(api: str, key: str, run_id: str, workdir: str, token: str = "",
+                 project_id: str = "", connection: str = "") -> int:
+    """Start the built export, request its own URLs, and report what answered."""
+    status, body = _http(f"{api}/api/v1/modernization/runs/{run_id}/startup-plan", key,
+                         token=token, project_id=project_id)
+    if status != 200:
+        print(f"Could not read the startup plan: HTTP {status}")
+        return 4
+    plan = json.loads(body)
+    urls = plan.get("urls") or []
+
+    entry = _find_entry(workdir, plan.get("entry_project") or "")
+    if not entry:
+        return _report_runtime(api, key, run_id, token, project_id, started=False, checks=[],
+                              skipped_reason="no single project with a Program.cs to start")
+
+    provider = _db_provider(workdir, entry)
+    note = ""
+    if connection:
+        pass
+    elif provider in ("", "sqlite"):
+        db_path = os.path.join(workdir, "startup-smoke.db")
+        connection = f"Data Source={db_path}"
+        note = _seed_sqlite(workdir, db_path)
+    else:
+        # Not a conversion defect, and it must not read as a pass. A skip is its own state.
+        return _report_runtime(
+            api, key, run_id, token, project_id, started=False, checks=[],
+            skipped_reason=(f"the generated host registers {provider}, which is not available "
+                            f"on this machine — pass --connection to point it at one"))
+
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    environment = dict(os.environ)
+    environment.update({
+        "ASPNETCORE_URLS": base_url,
+        # Better exception bodies in the log tail. It must not change pass/fail, and does not:
+        # the verdict is computed from status codes.
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        # Mandatory. `wireup.apply_to_appsettings` writes the connection string deliberately
+        # empty, because it refuses to commit a credential — so with nothing here the host
+        # fails on its first query rather than on anything the conversion got wrong.
+        _CONNECTION_ENV: connection,
+    })
+    print(f"Starting {entry} on {base_url}" + (f" ({note})" if note else ""))
+    process = subprocess.Popen(
+        ["dotnet", "run", "--project", os.path.join(entry, f"{os.path.basename(entry)}.csproj"),
+         "--no-build", "--no-launch-profile"],
+        cwd=workdir, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace")
+    try:
+        deadline = time.time() + STARTUP_TIMEOUT_SECONDS
+        alive = False
+        while time.time() < deadline:
+            if process.poll() is not None:
+                break
+            try:
+                with urllib.request.urlopen(base_url + "/", timeout=3):
+                    alive = True
+                    break
+            except urllib.error.HTTPError:
+                # Any HTTP answer at all means the host is up; the status is the probe's
+                # business, not the readiness check's.
+                alive = True
+                break
+            except Exception:  # noqa: BLE001
+                time.sleep(1)
+        checks = _probe(base_url, urls) if alive else []
+    finally:
+        process.terminate()
+        try:
+            tail = process.communicate(timeout=20)[0] or ""
+        except subprocess.TimeoutExpired:
+            process.kill()
+            tail = process.communicate()[0] or ""
+    if not alive:
+        print("The application never answered on its port.")
+    print(tail[-2000:])
+    return _report_runtime(api, key, run_id, token, project_id, started=alive, checks=checks,
+                           base_url=base_url, log_tail=tail[-20000:])
+
+
+def _report_runtime(api: str, key: str, run_id: str, token: str, project_id: str, *,
+                    started: bool, checks: list, skipped_reason: str = "",
+                    base_url: str = "", log_tail: str = "") -> int:
+    payload = {"checks": checks, "started": started, "skipped_reason": skipped_reason,
+               "source": "local_dotnet", "base_url": base_url, "log_tail": log_tail,
+               "command": "dotnet run"}
+    status, body = _http(f"{api}/api/v1/modernization/runs/{run_id}/runtime-results", key,
+                         "POST", payload, token=token, project_id=project_id)
+    if status != 200:
+        print(f"Reporting failed: HTTP {status}\n{body[:400].decode(errors='replace')}")
+        return 4
+    result = json.loads(body)
+    print(f"\nStartup check: {result.get('status')} — {result.get('checks')} URL(s) probed, "
+          f"{result.get('failing')} failing")
+    if skipped_reason:
+        print(f"Skipped: {skipped_reason}")
+    return 0 if result.get("status") == "passed" else 1
+
+
 # ── The loop ───────────────────────────────────────────────────────────────
 
 # Statuses `ingest` returns that mean the platform has stopped trying. Each one already raised
@@ -198,7 +413,8 @@ def _blocking_kinds(api: str, key: str, run_id: str, token: str, project_id: str
 
 
 def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
-         project_id: str = "", max_rounds: int = 5, deadline_hours: float = 3.0) -> int:
+         project_id: str = "", max_rounds: int = 5, deadline_hours: float = 3.0,
+         serve: bool = False, connection: str = "") -> int:
     """Build, report, resume, build again — until it compiles or provably cannot.
 
     The single-shot path prints "resume the run to re-convert them" and stops, so getting to a
@@ -235,6 +451,11 @@ def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
 
         if status == "passed":
             print(f"Clean build after {round_no} round(s).")
+            if serve:
+                # The bar is "compiles and runs", so a clean build is the middle of the check
+                # rather than the end of it. Same workdir: the export was just built there, so
+                # a failure here is provably a runtime failure and not a stale binary.
+                return serve_export(api, key, run_id, workdir, token, project_id, connection)
             return 0
         if status in _TERMINAL_BUILD_STATUSES:
             print(f"Stopping: the platform reported {status!r}. "
@@ -316,6 +537,56 @@ def build_fixture() -> int:
               "on top of it, so this is the first thing to fix.")
         return 1
     print("\nOK: the generated scaffold compiles.")
+
+    # And does it *start*? The compile check exists because a `global.json` pinning an SDK band
+    # nobody had installed shipped undetected; this one exists for the same reason one layer up.
+    # A host that builds and throws on startup — a service the container cannot construct, a
+    # configuration key read before it is set — is invisible to every offline check in the repo,
+    # and it is the whole reason `--serve` exists. Only "it answered", not "it served a route":
+    # the fixture has no controllers, so a 404 is the correct response and not a defect.
+    entry = _find_entry(workdir)
+    if not entry:
+        print("SKIP: the fixture has no single project with a Program.cs.")
+        shutil.rmtree(workdir, ignore_errors=True)
+        return 0
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    environment = dict(os.environ)
+    environment.update({"ASPNETCORE_URLS": base_url, "ASPNETCORE_ENVIRONMENT": "Development",
+                        _CONNECTION_ENV: f"Data Source={os.path.join(workdir, 'fixture.db')}"})
+    process = subprocess.Popen(
+        ["dotnet", "run", "--project",
+         os.path.join(entry, f"{os.path.basename(entry)}.csproj"),
+         "--no-build", "--no-launch-profile"],
+        cwd=workdir, env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace")
+    answered = False
+    try:
+        deadline = time.time() + STARTUP_TIMEOUT_SECONDS
+        while time.time() < deadline and process.poll() is None:
+            try:
+                with urllib.request.urlopen(base_url + "/", timeout=3):
+                    answered = True
+                    break
+            except urllib.error.HTTPError:
+                answered = True          # any HTTP answer means the host is up
+                break
+            except Exception:            # noqa: BLE001
+                time.sleep(1)
+    finally:
+        process.terminate()
+        try:
+            tail = process.communicate(timeout=20)[0] or ""
+        except subprocess.TimeoutExpired:
+            process.kill()
+            tail = process.communicate()[0] or ""
+    if not answered:
+        print(tail[-2000:])
+        print("\nFAIL: the generated scaffold compiles and does not start. Every conversion "
+              "built on it would ship an application that throws on its first request.")
+        shutil.rmtree(workdir, ignore_errors=True)
+        return 1
+    print("OK: and it starts and answers on its port.")
     shutil.rmtree(workdir, ignore_errors=True)
     return 0
 
@@ -342,6 +613,12 @@ def main() -> int:
                         help="Rounds the loop may use (default 5, matching MAX_BUILD_ROUNDS).")
     parser.add_argument("--hours", type=float, default=3.0,
                         help="Give up after this many hours (default 3).")
+    parser.add_argument("--serve", action="store_true",
+                        help="After a clean build, start the app and request every URL the "
+                             "run's own analysis found. Reports to /runtime-results.")
+    parser.add_argument("--connection", default="",
+                        help="Connection string for the startup check. Only needed when the "
+                             "generated host registers something other than SQLite.")
     args = parser.parse_args()
 
     if args.fixture:
@@ -365,7 +642,24 @@ def main() -> int:
             return 5
     if args.loop:
         return loop(api, args.key, args.run, args.keep, token, args.project,
-                    max_rounds=args.max_rounds, deadline_hours=args.hours)
+                    max_rounds=args.max_rounds, deadline_hours=args.hours,
+                    serve=args.serve, connection=args.connection)
+    if args.serve:
+        # Without --loop, start whatever is already in the export. Useful when the build is
+        # known good and only the runtime question is open.
+        workdir, err = download_export(api, args.key, args.run, args.keep, token, args.project)
+        if err:
+            return err
+        if not _dotnet_available():
+            print("No `dotnet` on PATH — install the .NET SDK to run the app.")
+            return 3
+        code, log = _run_build(workdir)
+        if code != 0:
+            print(log[-3000:])
+            print("The export does not compile, so there is nothing to start.")
+            return 1
+        return serve_export(api, args.key, args.run, workdir, token, args.project,
+                            args.connection)
     return build_export(api, args.key, args.run, args.keep, token, args.project)
 
 

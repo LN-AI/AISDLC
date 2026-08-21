@@ -39,8 +39,8 @@ from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence,
     extraction_audit, graph, layering, lookup, ownership, parity, playbooks, reconcile,
-    repo_ingest,
-    rules, sanity, scaffold, semantics, stages, store, usings, validation, wireup,
+    repo_ingest, rules, runtime, sanity, scaffold, semantics, stages, store, usings,
+    validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -506,6 +506,14 @@ def convert_run(
 
         store.update_run(run_id, status=stage.run_status, phase=stage.id)
 
+        # The plan gate has been answered by the time the scaffold runs, and the scaffold is
+        # what turns a project from a row into a `.csproj` on disk — so this is the one window
+        # in which a repair a human picked can still be applied. Before `_plan_stage`, because
+        # the scaffold's rows are derived from the project list this may change.
+        if stage.id == "scaffold":
+            _apply_plan_repair(run_id)
+            run = store.get_run(run_id) or run
+
         # `plan` is idempotent by construction: `insert_units` is one transaction, so a
         # stage's rows are either all present or all absent and this check cannot see a
         # half-planned stage.
@@ -763,6 +771,12 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
         # Does it build? Every check above reads code; none runs a compiler, and a run that
         # was never compiled used to render exactly like one that compiled clean.
         build_results.gate(run_id)
+        # Does it start, and does it answer its own URLs? Between "compiles" and "behaves the
+        # same" there is a question neither of them asks, and this product has shipped the
+        # answer being no twice with every offline check green: a view emitted under a name its
+        # controller does not request (C-60), and a container missing a registration (C-59).
+        # The first throws on one route, the second on all of them, and a compiler sees neither.
+        runtime.gate(run_id)
         # Does it still behave the same? The only question that is about what the application
         # *does*. Not a stage of its own (D-45 is about stages that drain rows through the
         # claim loop; a parity replay happens on someone else's machine and reports back
@@ -1102,7 +1116,19 @@ def _scaffold_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) ->
 
     config_keys = sorted({r.get("category", "") for r in (run.get("redactions") or [])
                           if r.get("category")})
-    files = scaffold.build(run.get("target_stack") or "", charter, proposed, config_keys)
+    # Settings that were never secrets, which is most of them. Redactions were the only source
+    # of a config key, so `appsettings.json` was written without one key the application reads
+    # (C-70) — and a key the host reads and cannot find is a null at startup, which is the
+    # failure the runtime gate exists to catch. First default wins per key: two files stating
+    # the same setting differently is a fact about the source, and picking the earlier one is
+    # at least deterministic.
+    observed: Dict[str, str] = {}
+    for row in store.list_evidence(run_id, kind="config_key"):
+        key, default = row.get("value") or "", row.get("value_default") or ""
+        if key and default and key not in observed:
+            observed[key] = default
+    files = scaffold.build(run.get("target_stack") or "", charter, proposed, config_keys,
+                           settings=observed)
     if not files:
         store.set_unit_status(unit["id"], "skipped",
                               "no scaffold template for this target stack")
@@ -1279,15 +1305,37 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
 
     # An interface with two implementations cannot be registered without choosing, and that
     # choice is not this stage's to make. Say so rather than registering neither in silence.
+    # Choices made on a discriminator rather than left open. Reported, because a correction the
+    # reader is not told about is the problem D-90 and D-98 name.
+    if host_plan.get("chosen"):
+        store.append_event(
+            run_id, "registration_chosen",
+            "; ".join(host_plan["chosen"][:10])
+            + " — the conventional pairing, or the one that is not a test double.",
+            unit_id=unit["id"], level="info")
+
     if host_plan["ambiguous"]:
+        # Blocking, where this used to be advisory. An unregistered interface is not a tidiness
+        # problem: the app compiles, starts, and throws on the first request that needs it —
+        # the one failure a build gate cannot catch and the acceptance bar for this phase
+        # explicitly covers. Run 38ee8e01 shipped exactly that with four seams declared and
+        # implemented correctly. Waivable, and the waiver is on the record.
         store.create_checkpoint(
             run_id, "wireup_ambiguous",
             f"{len(host_plan['ambiguous'])} interface(s) need a registration decision",
-            detail=("More than one converted type implements each of these, so the container "
-                    "cannot be told which to use without a decision:\n  "
+            detail=("More than one converted type implements each of these, and none of them is "
+                    "the conventional pairing or the only one that is not a test double — so "
+                    "there is a real choice here and the container cannot make it:\n  "
                     + "\n  ".join(host_plan["ambiguous"])
-                    + "\n\nRegister the intended one in Program.cs before running."),
-            unit_id=unit["id"], blocking=False,
+                    + "\n\nUntil one is registered the application compiles, starts, and throws "
+                      "on the first request that needs the interface. Pick one and the next "
+                      "wire-up pass writes it into Program.cs, or register it by hand.\n\n"
+                      "Answer this to finish the run with the interface unregistered."),
+            unit_id=unit["id"], blocking=True,
+            options=[f"{a['interface']}={c['class']}"
+                     for a in host_plan.get("ambiguous_detail") or []
+                     for c in a.get("candidates") or []],
+            payload={"ambiguous": host_plan.get("ambiguous_detail") or []},
         )
 
     if not rewritten:
@@ -1488,6 +1536,144 @@ def _design_failure_reason(run_id: str, design_units: List[Dict[str, Any]]) -> s
             "to convert. Its response carried no usable architecture.")
 
 
+def _freeze_plan(run_id: str, run: Dict[str, Any], design_meta: Dict[str, Any],
+                 components: List[Dict[str, Any]], totals: Dict[str, Any]) -> Dict[str, Any]:
+    """Write `run.plan` and the frozen `run.system_addendum` from the settled design.
+
+    Extracted from `_build_task_plan` because a plan repair applied *after* the gate has to
+    rewrite both, and rewriting only one is a specific and nasty failure: the addendum bakes a
+    `component | project | namespace` table into the cached prefix, while `layering.render_rules`
+    is rendered live per unit. Leave the addendum stale and every conversion call reads the
+    pre-repair architecture from the cached block while the rules block beside it describes the
+    post-repair one — the two halves of one prompt contradicting each other, on every call.
+
+    Called exactly twice, and both times before the first conversion call of the run, so the
+    cached prefix is still written once (D-06). Calling it mid-conversion would break that.
+    """
+    rows = [{
+        "component": c.get("component_name") or c["path"],
+        "project": c.get("target_project") or "",
+        "namespace": c.get("target_namespace") or "",
+        "output_dir": c.get("output_dir") or "",
+        "files": len((c.get("meta") or {}).get("members") or []),
+        "loc": c.get("loc") or 0,
+        "risk": c.get("risk") or "low",
+        "level": c.get("topo_level") or 0,
+        "est_cost_usd": round(float(c.get("est_cost_usd") or 0.0), 4),
+    } for c in components]
+
+    plan = {
+        "summary": design_meta.get("summary") or "",
+        "projects": design_meta.get("projects") or [],
+        "risks": design_meta.get("risks") or [],
+        "corrections": design_meta.get("problems") or [],
+        "components": rows,
+        "layering_gaps": design_meta.get("layering_gaps") or [],
+        "totals": totals,
+        "by_risk": {level: sum(1 for r in rows if r["risk"] == level)
+                    for level in ("high", "medium", "low")},
+    }
+    if design_meta.get("repair_applied"):
+        plan["repair_applied"] = design_meta["repair_applied"]
+    store.update_run(run_id, plan=plan, estimate=totals)
+
+    # Freeze the system addendum now, at the gate, and never re-derive it per unit. Two
+    # halves: what the codebase is (deterministic, from evidence) and the conventions the
+    # architect settled. Both are byte-identical for every conversion call that follows,
+    # which is what makes them one prompt-cache write instead of one per file (D-06).
+    digest = comprehension.render_digest(run_id, run.get("stats") or {})
+    conventions = (design_meta.get("shared_conventions") or "").strip()
+    addendum_parts = [p for p in (digest, _render_conventions(conventions, plan),
+                                  _render_playbook(run_id, run)) if p]
+    store.update_run(run_id, system_addendum="\n\n".join(addendum_parts))
+    return plan
+
+
+def _apply_plan_repair(run_id: str) -> None:
+    """Apply the plan repair a human picked at the gate, if they picked one. Never raises.
+
+    Runs once, immediately before the scaffold stage — the last moment a project's existence is
+    still a row rather than a `.csproj` on disk.
+
+    The option applied is looked up in **the checkpoint's own payload**, never recomputed. The
+    source graph has not changed, so a recomputation would almost always agree — but "almost
+    always" is not a property to build a spend gate on, and what a human approved is what must
+    happen.
+
+    An unanswered gate, an answer with no repair, or `"none"` all return immediately, so every
+    existing run and every fixture behaves exactly as it did.
+    """
+    try:
+        answered = [c for c in store.list_checkpoints(run_id)
+                    if c["kind"] == "plan_approval" and c["status"] != "open"]
+        if not answered:
+            return
+        checkpoint = answered[-1]
+        chosen = str(((checkpoint.get("answer") or {}).get("repair") or "")).strip()
+        if not chosen or chosen == "none":
+            return
+
+        design_units = store.list_units(run_id, kind="design")
+        design_meta = (design_units[0].get("meta") if design_units else None) or {}
+        already = (design_meta.get("repair_applied") or {}).get("id")
+        if already:
+            # Idempotent: `convert_run` re-enters this stage after a crash or a resume, and a
+            # merge applied twice would look for a project that no longer exists.
+            return
+
+        option = next((r for r in ((checkpoint.get("payload") or {}).get("repairs") or [])
+                       if r.get("id") == chosen), None)
+        if option is None:
+            store.append_event(run_id, "plan_repair_missing",
+                               f"The plan gate was answered with repair {chosen!r}, which is not "
+                               f"one of the options that gate offered. Nothing was changed.",
+                               level="warning")
+            return
+        if not option.get("feasible", True):
+            store.append_event(run_id, "plan_repair_refused",
+                               f"{option.get('title')} was marked not possible on the gate that "
+                               f"offered it: {option.get('why_not')}. Nothing was changed.",
+                               level="warning")
+            return
+
+        outcome = architecture.apply_repair(run_id, option)
+        if not outcome.get("applied"):
+            store.append_event(run_id, "plan_repair_failed",
+                               f"{option.get('title')} could not be applied: "
+                               f"{outcome.get('reason')}", level="warning")
+            return
+
+        # The residual, from the new layout over the same real source graph. Recomputed rather
+        # than taken from the option's own `closes`, because that was measured against the plan
+        # as it stood at the gate and this is measured against what is now on the rows.
+        design_units = store.list_units(run_id, kind="design")
+        design_meta = (design_units[0].get("meta") if design_units else None) or {}
+        store.set_unit_meta(design_units[0]["id"], {
+            "layering_gaps": _plan_layering_gaps(
+                run_id, design_meta.get("projects") or [], design_meta.get("seams") or []),
+        })
+        design_meta = (store.list_units(run_id, kind="design")[0].get("meta")) or {}
+
+        run = store.get_run(run_id) or {}
+        _freeze_plan(run_id, run, design_meta,
+                     store.list_units(run_id, kind="component"),
+                     (run.get("estimate") or {}))
+        store.append_event(
+            run_id, "plan_repair_applied",
+            f"{option.get('title')}. "
+            + (f"{len(outcome.get('moved') or [])} component(s) moved: "
+               + "; ".join((outcome.get("moved") or [])[:8])
+               if outcome.get("moved") else "The project reference graph was updated.")
+            + f" {len(design_meta.get('layering_gaps') or [])} dependency direction(s) remain "
+              f"without a legal expression.",
+        )
+    except Exception:  # noqa: BLE001
+        # A net that can fail the thing it watches is worse than no net (D-101). A run whose
+        # repair could not be applied converts into the layout that was approved, which is the
+        # behaviour every run had before this existed.
+        logger.exception("Could not apply the plan repair for run %s (continuing)", run_id)
+
+
 def _build_task_plan(run_id: str) -> Dict[str, Any]:
     """The approvable plan, and the gate that carries it.
 
@@ -1539,46 +1725,12 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     } for c in components]
     totals = estimate.roll_up(per_unit)
     cap = run.get("budget_cap_usd")
-
-    rows = [{
-        "component": c.get("component_name") or c["path"],
-        "project": c.get("target_project") or "",
-        "namespace": c.get("target_namespace") or "",
-        "output_dir": c.get("output_dir") or "",
-        "files": len((c.get("meta") or {}).get("members") or []),
-        "loc": c.get("loc") or 0,
-        "risk": c.get("risk") or "low",
-        "level": c.get("topo_level") or 0,
-        "est_cost_usd": round(float(c.get("est_cost_usd") or 0.0), 4),
-    } for c in components]
-
-    plan = {
-        "summary": design_meta.get("summary") or "",
-        "projects": design_meta.get("projects") or [],
-        "risks": design_meta.get("risks") or [],
-        "corrections": design_meta.get("problems") or [],
-        "components": rows,
-        "layering_gaps": design_meta.get("layering_gaps") or [],
-        "totals": totals,
-        "by_risk": {level: sum(1 for r in rows if r["risk"] == level)
-                    for level in ("high", "medium", "low")},
-    }
-    store.update_run(run_id, plan=plan, estimate=totals)
-
-    # Freeze the system addendum now, at the gate, and never re-derive it per unit. Two
-    # halves: what the codebase is (deterministic, from evidence) and the conventions the
-    # architect settled. Both are byte-identical for every conversion call that follows,
-    # which is what makes them one prompt-cache write instead of one per file (D-06).
-    digest = comprehension.render_digest(run_id, run.get("stats") or {})
-    conventions = (design_meta.get("shared_conventions") or "").strip()
-    addendum_parts = [p for p in (digest, _render_conventions(conventions, plan),
-                                  _render_playbook(run_id, run)) if p]
-    store.update_run(run_id, system_addendum="\n\n".join(addendum_parts))
+    plan = _freeze_plan(run_id, run, design_meta, components, totals)
 
     files = store.unit_status_counts(run_id)["total"]
     detail = (
         f"{len(components)} component(s) over {files} source file(s), in "
-        f"{len(plan['projects']) or len({r['project'] for r in rows})} project(s). "
+        f"{len(plan['projects']) or len({r['project'] for r in plan['components']})} project(s). "
         f"{estimate.describe(totals, cap)} "
         f"Risk: {plan['by_risk']['high']} high, {plan['by_risk']['medium']} medium, "
         f"{plan['by_risk']['low']} low."
@@ -1598,6 +1750,39 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
             f"each affected component must either reference a project it may not — which "
             f"MSBuild refuses to build at all — or leave the work out.\n\n"
             + "\n\n".join(g["detail"] for g in gaps[:6]))
+
+    # Naming the problem on the gate was better than nothing, and it was not enough: run
+    # 9c8cf4fe's plan carried this warning, was approved, and produced exactly the twelve build
+    # errors it predicted. So the gate now carries the *repairs* as well — computed
+    # deterministically, each with what it measurably closes and opens, and applied only if a
+    # human picks one. Not a bare block (there is a decision here, and the architect may be
+    # right), and not a silent auto-fix (a customer who approved four projects and receives
+    # three, with nothing saying so, is the correction D-90 and D-98 argue against).
+    repairs: List[Dict[str, Any]] = []
+    if gaps:
+        try:
+            repairs = layering.repair_options(
+                gaps, store.list_units(run_id, kind="component"),
+                design_meta.get("projects") or [], design_meta.get("seams") or [],
+                [(unit["path"], dep) for unit in store.list_units(run_id, kind="source_file")
+                 for dep in (unit.get("depends_on") or [])])
+        except Exception:  # noqa: BLE001
+            # A net that can fail the thing it watches is worse than no net (D-101). Without
+            # repairs the gate reads exactly as it did before.
+            logger.exception("Could not compute plan repairs for run %s (continuing)", run_id)
+        if repairs:
+            plan["repairs"] = repairs
+            detail += (
+                f"\n\n**{len(repairs)} way(s) to make this layout buildable, before anything "
+                f"is converted.** Pick one to have it applied to the plan, or approve as it "
+                f"stands and the run converts into the layout above.\n\n"
+                + "\n\n".join(
+                    f"- **{r['title']}**"
+                    + (f" — closes {len(r['closes'])} of {len(gaps)}"
+                       + (f", opens {len(r['opens'])} new" if r["opens"] else "")
+                       + f". {r['detail']}" if r["feasible"] else
+                       f" — **not possible here.** {r['why_not']}")
+                    for r in repairs[:8]))
     if agentic:
         # Said plainly, because the expectation is the half that is not yet measured. The
         # ceiling above already carries the multiplier; the estimate does not, and quoting a
@@ -1609,9 +1794,15 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
             f"{llm_gateway.AGENTIC_MAX_TURNS} times. The ceiling above accounts for that. "
             f"The estimate does not — expected cost for this mode has not been measured yet, "
             f"so read the ceiling, not the estimate.")
+    # One gate, not two. `start` refuses to begin while *any* blocking checkpoint is open, so a
+    # separate repair gate raised in the same breath would give an operator who answered one a
+    # Resume button that silently did nothing. Safe to fold in because no repair changes the
+    # quote: component count and source characters are identical under all of them, so the
+    # number approved here stays true whichever is picked.
     store.create_checkpoint(
         run_id, "plan_approval", "Approve the conversion plan", detail=detail,
         blocking=True, payload=plan,
+        options=([r["id"] for r in repairs if r["feasible"]] + ["none"]) if repairs else None,
     )
     # Asked here because here is the last moment it can be answered. A golden case is a
     # recording of the *legacy* application, and after this gate the pipeline starts

@@ -256,6 +256,49 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
         -- error will happily regenerate the same file forever; two consecutive builds with
         -- the same fingerprint mean the loop is not converging, and the run stops for a
         -- human instead of spending the budget discovering that slowly.
+        -- Did the converted application start, and did it answer its own URLs? A separate
+        -- pair from the builds tables on purpose: a runtime 500 has no file and no line, so
+        -- recording one as a diagnostic would make every row `unmapped` — which raises a
+        -- blocking checkpoint and halts the run for the wrong reason — and it would consume a
+        -- `build_round`, which is what the round cap and the convergence fingerprint count in.
+        CREATE TABLE IF NOT EXISTS modernization_runtime_reports (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            round INTEGER DEFAULT 1,
+            source TEXT DEFAULT 'external',
+            status TEXT NOT NULL DEFAULT 'never_run',
+            started INTEGER DEFAULT 0,
+            skipped_reason TEXT,
+            base_url TEXT,
+            command TEXT,
+            check_count INTEGER DEFAULT 0,
+            failing_count INTEGER DEFAULT 0,
+            log_tail TEXT,
+            actor TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_runtime_run
+            ON modernization_runtime_reports(run_id, round);
+
+        -- One probed URL. `status` is the HTTP status observed, 0 when nothing answered, and
+        -- `error` carries why in that case — a connection refused and a 500 are different
+        -- failures and the checkpoint has to be able to say which.
+        CREATE TABLE IF NOT EXISTS modernization_runtime_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            method TEXT DEFAULT 'GET',
+            path TEXT NOT NULL,
+            status INTEGER DEFAULT 0,
+            error TEXT,
+            ms INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_runtime_checks
+            ON modernization_runtime_checks(report_id);
+
         CREATE TABLE IF NOT EXISTS modernization_builds (
             id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -480,6 +523,11 @@ _ADDED_COLUMNS = (
     ("modernization_diagnostics", "project", "TEXT"),
     # Which of the two resolved: the file the diagnostic named, or the project it named.
     ("modernization_diagnostics", "routed_by", "TEXT"),
+    # The literal a `config_key` row had in the source. Carried so `appsettings.json`
+    # can be written with the value the application actually read rather than a
+    # marker — a timezone or a database path is not a credential, and reproducing it
+    # is the only way the converted host boots the way the old one did (C-70).
+    ("modernization_evidence", "value_default", "TEXT"),
 )
 
 
@@ -1143,6 +1191,36 @@ def fail_unit(unit_id: str, run_id: str, error: str, terminal: bool = False,
     return status
 
 
+def set_unit_placement(unit_id: str, target_project: str = "", target_namespace: str = "",
+                       output_dir: str = "") -> None:
+    """Move a component to a different project, namespace and/or directory. One UPDATE.
+
+    Written for the plan-repair path, where a merge moves components between projects after
+    the gate and before the scaffold. Only the arguments given are written, so a caller
+    changing the project without the directory cannot blank the directory by omission — but
+    it should almost never want to: `_place_artifacts` joins every emitted file onto
+    `output_dir`, and an SDK-style `.csproj` globs `**/*.cs` *beneath itself only*. A merge
+    that renames the project and leaves the directory alone moves the label and leaves the
+    code where MSBuild never looks for it.
+    """
+    sets, values = [], []
+    for column, value in (("target_project", target_project),
+                          ("target_namespace", target_namespace),
+                          ("output_dir", output_dir)):
+        if value:
+            sets.append(f"{column} = ?")
+            values.append(value)
+    if not sets:
+        return
+    conn = get_connection()
+    try:
+        conn.execute(f"UPDATE modernization_units SET {', '.join(sets)} WHERE id = ?",
+                     (*values, unit_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def set_unit_meta(unit_id: str, updates: Dict[str, Any]) -> None:
     """Merge keys into a unit's `meta_json`. Read-modify-write in one connection.
 
@@ -1320,14 +1398,14 @@ def insert_evidence(run_id: str, rows: List[Dict[str, Any]]) -> int:
         (run_id, r.get("unit_id"), r.get("path", ""), r.get("kind", ""),
          str(r.get("value", ""))[:500], int(r.get("line") or 0),
          (r.get("snippet") or "")[:200], float(r.get("confidence", 1.0)),
-         r.get("source", "parser"), now)
+         r.get("source", "parser"), (r.get("value_default") or "")[:200], now)
         for r in rows
     ]
     conn = get_connection()
     conn.executemany(
         "INSERT INTO modernization_evidence "
-        "(run_id, unit_id, path, kind, value, line, snippet, confidence, source, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "(run_id, unit_id, path, kind, value, line, snippet, confidence, source, "
+        " value_default, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         payload,
     )
     conn.commit()
@@ -1647,6 +1725,88 @@ def units_by_path(run_id: str, paths: List[str], include_source: bool = True
     finally:
         conn.close()
     return out
+
+
+def record_runtime(run_id: str, checks: List[Dict[str, Any]], *, status: str,
+                   started: bool, skipped_reason: str = "", base_url: str = "",
+                   command: str = "", source: str = "external", log_tail: str = "",
+                   actor: str = "") -> str:
+    """Store one startup attempt and its probed URLs. -> the report id.
+
+    One transaction, like `record_build`: a report and its checks are either both on the record
+    or neither is. The round is `MAX(round)+1` over this run's own reports and is independent of
+    `build_round` — a startup check is not a build round, and counting them together would make
+    the build loop's round cap and its convergence fingerprint mean something else.
+    """
+    now = _now()
+    report_id = str(uuid.uuid4())
+    failing = sum(1 for c in checks
+                  if (c.get("status") or 0) >= 500
+                  or (c.get("error") and not c.get("status")))
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        row = cursor.execute(
+            "SELECT MAX(round) AS r FROM modernization_runtime_reports WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        round_no = int((row["r"] if row and row["r"] else 0)) + 1
+        cursor.execute(
+            "INSERT INTO modernization_runtime_reports "
+            "(id, run_id, round, source, status, started, skipped_reason, base_url, command, "
+            " check_count, failing_count, log_tail, actor, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (report_id, run_id, round_no, source, status, 1 if started else 0, skipped_reason,
+             base_url, command, len(checks), failing, log_tail, actor, now),
+        )
+        cursor.executemany(
+            "INSERT INTO modernization_runtime_checks "
+            "(report_id, run_id, method, path, status, error, ms, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [(report_id, run_id, c.get("method") or "GET", c.get("path") or "",
+              int(c.get("status") or 0), c.get("error") or "", int(c.get("ms") or 0), now)
+             for c in checks],
+        )
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, ?, 'runtime_reported', ?, ?)",
+            (run_id, "warning" if status == "failed" else "info",
+             f"startup round {round_no} from {source}: {status}, {len(checks)} URL(s) probed, "
+             f"{failing} failing", now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return report_id
+
+
+def latest_runtime(run_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM modernization_runtime_reports WHERE run_id = ? "
+        "ORDER BY round DESC LIMIT 1", (run_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def runtime_checks(run_id: str, report_id: str = "") -> List[Dict[str, Any]]:
+    conn = get_connection()
+    if report_id:
+        rows = conn.execute(
+            "SELECT * FROM modernization_runtime_checks WHERE run_id = ? AND report_id = ? "
+            "ORDER BY id", (run_id, report_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM modernization_runtime_checks WHERE run_id = ? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def artifacts_changed_since(run_id: str, since: str) -> int:

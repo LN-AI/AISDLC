@@ -45,7 +45,8 @@ from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
     evidence, extraction_audit, graph, layering, lookup, ownership, parity, parity_tools,
     reconcile,
-    repo_ingest, runner, rules as rules_module, sanity, scaffold, stages, store, usings,
+    repo_ingest, runner, rules as rules_module, runtime, sanity, scaffold, stages, store,
+    usings,
     validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
@@ -4724,6 +4725,40 @@ check("its round cap matches the platform's own",
 check("and it is bounded in wall-clock too, so a wedged provider cannot hold it forever",
       "--hours" in _build_src and "deadline_hours" in _build_src)
 
+# Compiling is not the bar. `--serve` asks the question two real defects hid behind a clean
+# build: a view emitted under a name its controller does not request, and a container missing a
+# registration.
+check("build_run.py can start the app, not only compile it",
+      "--serve" in _build_src and "def serve_export(" in _build_src)
+check("it takes the URLs from the run's own analysis rather than a list beside it",
+      "startup-plan" in _build_src)
+check("it supplies the connection string the host is given deliberately empty",
+      "ConnectionStrings__DefaultConnection" in _build_src)
+check("a database it cannot stand up is a skip with a reason, never a pass",
+      "skipped_reason" in _build_src and "--connection" in _build_src)
+check("it starts on an ephemeral port, so a busy machine cannot make it look broken",
+      "_free_port" in _build_src)
+check("and it refuses to guess between two hosts",
+      "hosts[0] if len(hosts) == 1 else" in _build_src)
+check("the offline fixture now proves the scaffold starts, not only that it compiles",
+      "and it starts and answers on its port" in _build_src)
+# D-05 is a rule about what the API host may *execute*, so the thing to check is an import, not
+# a mention: several checkpoints legitimately print `python scripts/build_run.py` as the command
+# a human should run, and that is the whole point of them.
+_backend_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "backend")
+_imports_script = []
+for _root, _dirs, _files in os.walk(_backend_root):
+    for _f in _files:
+        if not _f.endswith(".py"):
+            continue
+        with open(os.path.join(_root, _f), encoding="utf-8", errors="replace") as _h:
+            _src = _h.read()
+        if "import build_run" in _src or "from scripts" in _src or "import scripts" in _src:
+            _imports_script.append(_f)
+check("D-05 holds: nothing under backend/ imports the script that starts a process",
+      not _imports_script, str(_imports_script))
+
 
 
 # ── 35. Asking for behaviour in time ────────────────────────────────
@@ -5225,9 +5260,11 @@ check("Laravel: a raw DB::select is a query site too",
       _lv["db_sites"] >= 3, str(_lv["db_sites"]))
 check("Laravel: Blade templates are rendered, not entry points",
       not _lv["entrypoint_templates"], str(_lv["entrypoint_templates"]))
-check("Laravel: nothing contradicts anything, except the known config gap",
-      _LARAVEL_FACTS["warnings"] == ["config_files_without_keys"],
-      str(_LARAVEL_FACTS["warnings"]))
+# D-108's bar was "the only warning any fixture may produce is the one open gap (C-70)". That
+# gap is closed: a `return [...]` config file now contributes its keys and their literals, so
+# the bar is now zero warnings and this is the check that holds it there.
+check("Laravel: nothing contradicts anything at all",
+      _LARAVEL_FACTS["warnings"] == [], str(_LARAVEL_FACTS["warnings"]))
 
 # ── Symfony ────────────────────────────────────────────────────────────────
 _SYMFONY_FACTS = _corpus_facts(SYMFONY)
@@ -5265,8 +5302,8 @@ check("CodeIgniter: a model extending Model is data access",
 check("CodeIgniter: its $table is the table", "employees" in _ci["tables"], str(_ci["tables"]))
 check("CodeIgniter: app/Views templates resolve, so they are not entry points",
       not _ci["entrypoint_templates"], str(_ci["entrypoint_templates"]))
-check("CodeIgniter: nothing contradicts anything, except the known config gap",
-      _CI_FACTS["warnings"] == ["config_files_without_keys"], str(_CI_FACTS["warnings"]))
+check("CodeIgniter: nothing contradicts anything at all",
+      _CI_FACTS["warnings"] == [], str(_CI_FACTS["warnings"]))
 
 # ── WordPress plugin ───────────────────────────────────────────────────────
 _WP_FACTS = _corpus_facts(WORDPRESS)
@@ -7475,6 +7512,458 @@ check("the unit that actually produced output is the one reopened",
       [u["path"] for u in _rw_out["units"]] == ["r.py"], str(_rw_out["units"]))
 check("and the refusal is reported rather than silent",
       len(_rw_out["unreworkable"]) == 2, str(_rw_out))
+
+section("48. A plan that cannot be built, repaired before it is paid for")
+
+# `plan_gaps` has predicted this since D-127 and was reported and nothing more — so run
+# 9c8cf4fe's plan carried the warning, was approved, and produced exactly the twelve build
+# errors it predicted. The gate now carries the repairs too, each with what it *measurably*
+# closes, and applies the one a human picks. Not a bare block (the architect may have a
+# reason) and not a silent auto-fix (D-90/D-98: a correction nobody is told about).
+
+_REPAIR_PROJECTS = [
+    {"name": "Acme.Web", "purpose": "host", "depends_on": ["Acme.Application"]},
+    {"name": "Acme.Application", "purpose": "logic", "depends_on": ["Acme.Domain"]},
+    {"name": "Acme.Infrastructure", "purpose": "data", "depends_on": ["Acme.Domain"]},
+    {"name": "Acme.Domain", "purpose": "types", "depends_on": []},
+]
+
+
+def _repair_architecture(user_content):
+    """svc.py in Application, repo.py in Infrastructure — and svc.py imports repo.py, which
+    the project graph forbids and no seam covers."""
+    return {
+        "projects": _REPAIR_PROJECTS,
+        "components": [
+            {"name": "service", "project": "Acme.Application",
+             "namespace": "Acme.Application.Services", "output_dir": "Acme.Application/Services",
+             "members": ["svc.py"], "role": "business", "rationale": "the service",
+             "expected_files": ["Svc.cs"]},
+            {"name": "repository", "project": "Acme.Infrastructure",
+             "namespace": "Acme.Infrastructure.Data", "output_dir": "Acme.Infrastructure/Data",
+             "members": ["repo.py"], "role": "data", "rationale": "the repository",
+             "expected_files": ["Repo.cs"]},
+        ],
+        "seams": [],
+        "shared_conventions": "Types are PascalCase.",
+        "risks": [], "summary": "Two layers, one illegal dependency.",
+    }
+
+
+def _repair_call_tool(system_prompt, user_content, schema, llm_override=None,
+                      max_tokens=None, **kw):
+    if schema.get("name") == "submit_target_architecture":
+        return _repair_architecture(user_content)
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+def _to_plan_gate(name):
+    """Drive a run until `plan_approval` is open, answering everything before it."""
+    run_id = store.create_run(name, ".NET 8", "files", created_by="smoke")
+    runner.ingest_and_analyze(run_id, [
+        {"path": "repo.py", "content": "def load():\n    return 1\n"},
+        {"path": "svc.py", "content": "from repo import load\n\ndef run():\n    return load()\n"},
+    ])
+    runner.set_charter(run_id, VALID_CHARTER, "smoke")
+    for _ in range(8):
+        runner.convert_run(run_id, CALLER)
+        gate = [c for c in store.list_checkpoints(run_id, "open")
+                if c["kind"] == "plan_approval"]
+        if gate:
+            return run_id, gate[0]
+        for cp in store.list_checkpoints(run_id, "open"):
+            if cp["blocking"]:
+                store.answer_checkpoint(cp["id"], {"decision": "approved"}, "smoke")
+        store.update_run(run_id, status="converting", paused_reason=None)
+    return run_id, None
+
+
+llm_gateway.call_tool = _repair_call_tool
+try:
+    _rp, _gate = _to_plan_gate("repair-merge")
+    check("the plan gate is reached", _gate is not None)
+    _offered = ((_gate.get("payload") or {}).get("repairs") or []) if _gate else []
+    check("the layout's illegal dependency is predicted before any conversion spend",
+          ((_gate.get("payload") or {}).get("layering_gaps") or []) if _gate else [],
+          str((_gate.get("payload") or {}).get("layering_gaps") if _gate else None))
+    check("and the gate carries repairs, not only the problem",
+          _offered, str([r.get("id") for r in _offered]))
+    check("each repair states what it measurably closes, computed by re-running the predictor",
+          all(r["closes"] or not r["feasible"] for r in _offered),
+          str([(r["id"], r["closes"]) for r in _offered]))
+    check("the options a human may pick are on the checkpoint, plus 'none'",
+          _gate and "none" in (_gate.get("options") or []),
+          str(_gate.get("options") if _gate else None))
+    check("no repair changes the quote — the number approved stays true whichever is picked",
+          all("est" not in r for r in _offered))
+
+    _merge = next((r for r in _offered if r["kind"] == "merge_projects"), None)
+    check("a merge is offered as the always-buildable fallback", _merge is not None,
+          str([r["kind"] for r in _offered]))
+    check("and it never absorbs the entry project, which owns the host and the solution name",
+          _merge and _merge["absorb"] != "Acme.Web", str(_merge))
+
+    # Apply it, the way the API does: the answer names an option the gate offered.
+    _before_addendum = (store.get_run(_rp) or {}).get("system_addendum") or ""
+    store.answer_checkpoint(_gate["id"], {"decision": "approved", "repair": _merge["id"]},
+                            "smoke")
+    store.update_run(_rp, status="converting", paused_reason=None)
+    runner.convert_run(_rp, CALLER)
+
+    _comps = store.list_units(_rp, kind="component")
+    _projects = {c.get("target_project") for c in _comps}
+    check("applying the merge moves the component to the surviving project",
+          _merge["absorb"] not in _projects, str(sorted(p for p in _projects if p)))
+    check("and its output directory moves with it — a .csproj globs beneath itself only",
+          all(not (c.get("output_dir") or "").startswith(_merge["absorb"] + "/")
+              for c in _comps),
+          str([(c.get("component_name"), c.get("output_dir")) for c in _comps]))
+    check("the absorbed project is gone from the plan the run will scaffold",
+          _merge["absorb"] not in {p.get("name") for p in
+                                   ((store.get_run(_rp) or {}).get("plan") or {}).get("projects")
+                                   or []},
+          str([p.get("name") for p in
+               ((store.get_run(_rp) or {}).get("plan") or {}).get("projects") or []]))
+    check("the residual is recomputed rather than assumed zero",
+          not (((store.get_run(_rp) or {}).get("plan") or {}).get("layering_gaps") or []),
+          str(((store.get_run(_rp) or {}).get("plan") or {}).get("layering_gaps")))
+    check("the frozen system addendum is rewritten, or every conversion call reads the old "
+          "architecture from the cache while the rules block describes the new one",
+          ((store.get_run(_rp) or {}).get("system_addendum") or "") != _before_addendum)
+    check("and it no longer names the project that was absorbed",
+          _merge["absorb"] not in ((store.get_run(_rp) or {}).get("system_addendum") or ""))
+    # A component shipping in `Acme.Application` while declaring `namespace
+    # Acme.Infrastructure.Data` compiles — a C# namespace need not match its assembly — and is
+    # not something anyone would write. Safe to move only because this runs before the first
+    # conversion call, so no symbol is registered under the old name yet.
+    check("the namespace moves with the component too",
+          all(not (c.get("target_namespace") or "").startswith(_merge["absorb"] + ".")
+              for c in _comps),
+          str([(c.get("component_name"), c.get("target_namespace")) for c in _comps]))
+    check("what was delivered is on the record beside what was approved",
+          any(e.get("event") == "plan_repair_applied" for e in store.list_events(_rp, limit=500)))
+    check("the plan says which repair was applied",
+          (((store.get_run(_rp) or {}).get("plan") or {}).get("repair_applied") or {}).get("id")
+          == _merge["id"])
+
+    # Idempotence: `convert_run` re-enters the scaffold stage on any resume.
+    _dirs_before = sorted((c.get("output_dir") or "") for c in store.list_units(_rp, kind="component"))
+    runner._apply_plan_repair(_rp)
+    check("applying it twice changes nothing — a merge repeated looks for a project that has gone",
+          sorted((c.get("output_dir") or "")
+                 for c in store.list_units(_rp, kind="component")) == _dirs_before,
+          str(_dirs_before))
+
+    # Approving without picking one has to behave exactly as it always did.
+    _rp2, _gate2 = _to_plan_gate("repair-none")
+    store.answer_checkpoint(_gate2["id"], {"decision": "approved"}, "smoke")
+    store.update_run(_rp2, status="converting", paused_reason=None)
+    runner.convert_run(_rp2, CALLER)
+    check("approving the plan as it stands applies no repair",
+          not any(e.get("event") == "plan_repair_applied"
+                  for e in store.list_events(_rp2, limit=500)))
+    check("and the layout is the one that was approved",
+          {c.get("target_project") for c in store.list_units(_rp2, kind="component")}
+          == {"Acme.Application", "Acme.Infrastructure"},
+          str({c.get("target_project") for c in store.list_units(_rp2, kind="component")}))
+
+    # An answer naming something the gate never offered must not be acted on.
+    _rp3, _gate3 = _to_plan_gate("repair-bogus")
+    store.answer_checkpoint(_gate3["id"], {"decision": "approved", "repair": "merge:X->Y"},
+                            "smoke")
+    store.update_run(_rp3, status="converting", paused_reason=None)
+    runner.convert_run(_rp3, CALLER)
+    check("a repair the gate did not offer is refused and said so, not guessed at",
+          any(e.get("event") == "plan_repair_missing" for e in store.list_events(_rp3, limit=500)))
+except Exception:
+    traceback.print_exc()
+    check("the repair runs raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+section("49. Which implementation the container gets")
+
+# Run 38ee8e01 declared four seams and implemented all four correctly, and shipped an
+# application that threw on its first request: two classes implemented each interface, so
+# `wireup` registered neither and reported `wireup_ambiguous` — non-blocking. A conversion that
+# got the hard part right shipped a container with four holes in it.
+#
+# "The container cannot choose" and "nobody can choose" are different claims. The conventional
+# pairing is a fact about the names.
+
+def _impl_pair(interface, *classes):
+    arts = [{"path": f"W/{interface}.cs",
+             "content": f"namespace W;\npublic interface {interface} {{ }}\n"}]
+    arts += [{"path": f"W/{c}.cs",
+              "content": f"namespace W;\npublic sealed class {c} : {interface} {{ }}\n"}
+             for c in classes]
+    return wireup.host_plan(arts, "W")
+
+_conv = _impl_pair("IEmployeeRepository", "EmployeeRepository", "SqlEmployeeRepository")
+check("the conventional pairing is registered rather than nothing at all",
+      any("EmployeeRepository>" in s and "Sql" not in s for s in _conv["services"]),
+      str(_conv["services"]))
+check("and the choice is reported, not made silently (D-90/D-98)",
+      _conv["chosen"] and "EmployeeRepository" in _conv["chosen"][0], str(_conv["chosen"]))
+check("so nothing is left for a human to decide",
+      not _conv["ambiguous"], str(_conv["ambiguous"]))
+
+_double = _impl_pair("IAuthService", "SqlAuthService", "FakeAuthService")
+check("a test double never wins the registration",
+      any("SqlAuthService>" in s for s in _double["services"]), str(_double["services"]))
+check("even though it is not the conventional name either",
+      not _double["ambiguous"], str(_double["ambiguous"]))
+
+# The discriminators have to *discriminate*. Two equally real variants are a real decision, and
+# so is a set where everything looks like a double — dropping them all would leave the
+# interface unregistered for a worse reason than the one being avoided.
+_tie = _impl_pair("IEmployeeRepository", "SqlEmployeeRepository", "MongoEmployeeRepository")
+check("two equally plausible implementations are still a decision",
+      not _tie["services"] and _tie["ambiguous"], str(_tie))
+check("and the candidates are offered in a shape a gate can turn into options",
+      _tie["ambiguous_detail"]
+      and {c["class"] for c in _tie["ambiguous_detail"][0]["candidates"]}
+      == {"SqlEmployeeRepository", "MongoEmployeeRepository"},
+      str(_tie["ambiguous_detail"]))
+_all_doubles = _impl_pair("IThing", "FakeThing", "StubThing")
+check("a set of nothing but doubles asks rather than registering none of them",
+      _all_doubles["ambiguous"] and not _all_doubles["services"], str(_all_doubles))
+
+# An interface nothing implements is reconciliation's business, not a registration decision.
+_none = _impl_pair("IOrphan")
+check("an interface with no implementation raises no registration question",
+      not _none["ambiguous"] and not _none["chosen"], str(_none))
+
+_wireup_waivers = _app_js.split("MOD_WAIVER_CHECKPOINTS", 1)[-1].split("};", 1)[0]
+check("the registration gate blocks, and says what waiving it costs",
+      "wireup_ambiguous" in _wireup_waivers
+      and "unregistered" in _wireup_waivers, _wireup_waivers[:240])
+
+section("50. It starts, and it answers")
+
+# Between "does it compile" and "does it behave the same" there is a question neither asks, and
+# this product has shipped the answer being no twice with every offline check green: a view
+# emitted under a name its controller does not request (C-60, throws on one route), and a
+# container missing a registration (C-59, 500s on all of them). A compiler sees neither.
+
+# ── The URL list comes from the run's own analysis, not a list maintained beside it.
+_ru = evidence.route_urls([
+    {"kind": "route", "value": "GET /employees -> EmployeeController.index [auth]",
+     "path": "routes/web.php", "line": 4},
+    {"kind": "route", "value": "POST /login -> AuthController.login", "path": "web.php", "line": 5},
+    {"kind": "route", "value": "ANY /any -> X.y", "path": "web.php", "line": 6},
+    {"kind": "route", "value": "GET /employees/{id} -> E.show", "path": "web.php", "line": 7},
+    {"kind": "route", "value": "^employees/?$ -> employees.php", "path": ".htaccess", "line": 2},
+    {"kind": "route", "value": "^admin -> AdminController", "path": ".htaccess", "line": 3},
+    {"kind": "datastore", "value": "MySQL"},
+])
+_probed = {(u["method"], u["path"]) for u in _ru if u["probe"]}
+_skipped = {u["path"]: u["reason"] for u in _ru if not u["probe"]}
+check("a declared GET route is probed", ("GET", "/employees") in _probed, str(sorted(_probed)))
+check("the front door is always probed — the generated host maps it whatever the source said",
+      ("GET", "/") in _probed, str(sorted(_probed)))
+check("ANY becomes GET rather than being dropped", ("GET", "/any") in _probed)
+check("a POST is not probed — with no body it is a 400, which is the app working",
+      "/login" in _skipped and "400" in _skipped["/login"], str(_skipped))
+check("a templated path is not probed — guessing a value invents a test",
+      "/employees/{id}" in _skipped, str(_skipped))
+check("a rewrite target that is a script *is* probed — it is the URL url_compatibility promises",
+      ("GET", "/employees.php") in _probed, str(sorted(_probed)))
+check("but a handler name is not a URL", "AdminController" in _skipped, str(_skipped))
+check("nothing is silently dropped — an unprobed URL is a gap in coverage, and says why",
+      all(u["reason"] for u in _ru if not u["probe"]), str(_ru))
+check("a non-route evidence row is ignored",
+      not any(u["path"] == "MySQL" for u in _ru), str(sorted(_probed)))
+
+# ── Adjudication. The generous readings are the dangerous ones.
+_rt1 = store.create_run("rt-pass", ".NET 8", "files", created_by="smoke")
+check("a run nobody started says so rather than rendering as nothing",
+      runtime.summary_for_run(_rt1)["status"] == "never_run",
+      str(runtime.summary_for_run(_rt1)))
+runtime.ingest(_rt1, {"started": True, "base_url": "http://127.0.0.1:1",
+                      "checks": [{"method": "GET", "path": "/", "status": 200},
+                                 {"method": "GET", "path": "/employees", "status": 302}]}, "smoke")
+check("200 and 302 both pass — an unauthenticated request to a guarded route should redirect",
+      runtime.summary_for_run(_rt1)["status"] == "passed",
+      str(runtime.summary_for_run(_rt1)))
+
+_rt2 = store.create_run("rt-500", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_rt2, {"started": True, "checks": [{"path": "/", "status": 500}],
+                      "log_tail": "Unable to resolve service for type 'IEmployeeRepository'"},
+               "smoke")
+check("a 5xx fails — this is the C-59 shape, and it compiles with zero errors",
+      runtime.summary_for_run(_rt2)["status"] == "failed")
+_rt2_cp = [c for c in store.list_checkpoints(_rt2) if c["kind"] == "runtime_failed"]
+check("and it blocks, carrying the exception text that is the whole diagnostic value",
+      _rt2_cp and _rt2_cp[0]["blocking"]
+      and "IEmployeeRepository" in (_rt2_cp[0]["detail"] or ""),
+      str([(c["kind"], c["blocking"]) for c in store.list_checkpoints(_rt2)]))
+
+_rt3 = store.create_run("rt-404", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_rt3, {"started": True,
+                      "checks": [{"path": "/", "status": 404},
+                                 {"path": "/employees.php", "status": 404}]}, "smoke")
+check("every URL 404ing is a failure — the host is up and the application is not on it",
+      runtime.summary_for_run(_rt3)["status"] == "failed",
+      str(runtime.summary_for_run(_rt3)))
+_rt3b = store.create_run("rt-one404", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_rt3b, {"started": True,
+                       "checks": [{"path": "/", "status": 200},
+                                  {"path": "/gone", "status": 404}]}, "smoke")
+check("but one missing route among several is not — a 404 is a warning worth reading",
+      runtime.summary_for_run(_rt3b)["status"] == "passed")
+
+_rt4 = store.create_run("rt-dead", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_rt4, {"started": False, "checks": [], "log_tail": "Unhandled exception. "
+                      "System.InvalidOperationException"}, "smoke")
+check("a process that never answered is a failure, not an absence",
+      runtime.summary_for_run(_rt4)["status"] == "failed")
+
+_rt5 = store.create_run("rt-skip", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_rt5, {"started": False, "checks": [],
+                      "skipped_reason": "this run's database is MySQL and the runner has none"},
+               "smoke")
+check("a skip is its own state and never a pass",
+      runtime.summary_for_run(_rt5)["status"] == "skipped")
+check("and the reason survives, so the gate can say what was not checked",
+      "MySQL" in runtime.summary_for_run(_rt5)["skipped_reason"])
+_rt6 = store.create_run("rt-nothing", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_rt6, {"started": True, "checks": []}, "smoke")
+check("started and asked nothing is a check that did not run, not a pass",
+      runtime.summary_for_run(_rt6)["status"] == "skipped")
+
+# Omitting `checks` entirely is refused, for the same reason an empty build log is (D-70): it is
+# indistinguishable from a report nothing could be read out of.
+try:
+    runtime.ingest(store.create_run("rt-bad", ".NET 8", "files", created_by="smoke"),
+                   {"started": True}, "smoke")
+    check("a report with no checks key is refused", False)
+except runtime.RuntimeReportError as exc:
+    check("a report with no checks key is refused, not read as a pass", "checks" in str(exc))
+
+# ── The gate.
+_rtg = store.create_run("rt-gate", ".NET 8", "files", created_by="smoke")
+runtime.gate(_rtg)
+_rtg_cp = [c for c in store.list_checkpoints(_rtg) if c["kind"] == "runtime_required"]
+check("a run nobody started is stopped and asked", _rtg_cp and _rtg_cp[0]["blocking"],
+      str([(c["kind"], c["blocking"]) for c in store.list_checkpoints(_rtg)]))
+check("the checkpoint carries the command, not advice about the command",
+      "build_run.py" in (_rtg_cp[0]["detail"] or "") and "--serve" in (_rtg_cp[0]["detail"] or ""))
+runtime.gate(_rtg)
+check("asking twice does not queue a second gate",
+      len([c for c in store.list_checkpoints(_rtg) if c["kind"] == "runtime_required"]) == 1)
+check("a run that passed is not asked again",
+      not [c for c in store.list_checkpoints(_rt1) if c["kind"] == "runtime_required"])
+check("both runtime gates are end-of-run gates, or a rework round cannot be resumed",
+      {"runtime_required", "runtime_failed"} <= set(build_results._END_OF_RUN_GATES),
+      str(build_results._END_OF_RUN_GATES))
+_rt_waivers = _app_js.split("MOD_WAIVER_CHECKPOINTS", 1)[-1].split("};", 1)[0]
+check("and both are waivable, with labels that say what waiving costs (D-112)",
+      "runtime_required" in _rt_waivers and "runtime_failed" in _rt_waivers
+      and "without starting it" in _rt_waivers, _rt_waivers[:400])
+
+# ── The runner's instructions come from the run, assembled in one place.
+_rtp = store.create_run("rt-plan", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_rtp, PHP_FIXTURE)
+_plan_out = runtime.startup_plan(_rtp)
+check("the startup plan lists URLs the deterministic analysis found",
+      _plan_out["probe_count"] >= 1, str(_plan_out["probe_count"]))
+check("and states what it could not probe, with the reason — a coverage number needs its "
+      "denominator (D-97)",
+      isinstance(_plan_out["unprobed"], list), str(_plan_out)[:200])
+check("it names the entry project rather than leaving the runner to guess",
+      "entry_project" in _plan_out)
+
+# ── End to end: a driven run reaches the gate.
+llm_gateway.call_tool = fake_call_tool
+try:
+    _rte = store.create_run("rt-e2e", ".NET 8", "files", created_by="smoke")
+    runner.ingest_and_analyze(_rte, [{"path": "a.py", "content": "A = 1\n"}])
+    runner.set_charter(_rte, VALID_CHARTER, "smoke")
+    drive(_rte, rounds=10)
+    check("a real run is asked whether anybody ever started it",
+          any(c["kind"] == "runtime_required" for c in store.list_checkpoints(_rte)),
+          str([c["kind"] for c in store.list_checkpoints(_rte)]))
+    check("and the run log records that nothing did",
+          any(e.get("event") == "runtime_not_checked"
+              for e in store.list_events(_rte, limit=500)))
+    check("the manifest always carries a runtime state, never nothing",
+          runtime.summary_for_run(_rte)["status"] in runtime.STATUSES)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+section("51. The settings the source actually read")
+
+# C-70: `config_key` came only from `__REDACTED_*__` placeholders, so a codebase keeping its
+# configuration in a plain array contributed none — and `appsettings.json` was written without
+# one key the application asks for, while every converted unit invented its own name for the
+# same setting. For the startup check this is not cosmetic: a key the host reads and cannot
+# find is a null at boot.
+
+_CFG_PHP = "\n".join([
+    "<?php",
+    "return [",
+    "    'timezone'     => 'Asia/Kolkata',",
+    "    'session_name' => 'ems_session',",
+    "    'db_path'      => '/../database/ems.sqlite',",
+    "    'debug'        => false,",
+    "    'per_page'     => 25,",
+    "    'columns'      => ['id', 'name', 'salary'],",
+    "];",
+])
+_cfg_rows = [r for r in evidence.from_file("config/config.php", _CFG_PHP, "php", "config")
+             if r["kind"] == "config_key"]
+_cfg = {r["value"]: r["value_default"] for r in _cfg_rows}
+check("a setting in a plain array is found at all — this is the C-70 gap",
+      "timezone" in _cfg, str(sorted(_cfg)))
+check("and its literal comes with it, because that is what reproduces the old behaviour",
+      _cfg.get("timezone") == "Asia/Kolkata", str(_cfg))
+check("a numeric and a boolean default are settings too",
+      _cfg.get("per_page") == "25" and _cfg.get("debug") == "false", str(_cfg))
+check("a list value is not a setting — there is no scalar to carry forward",
+      "columns" not in _cfg, str(sorted(_cfg)))
+check("every row still carries the citation that makes it evidence",
+      all(r["line"] > 0 and r["path"] for r in _cfg_rows), str(_cfg_rows[:1]))
+
+_CFG_BOOT = "\n".join([
+    "<?php",
+    "define('SESSION_NAME', 'ems');",
+    "$debug = $_ENV['APP_DEBUG'];",
+    "$url   = getenv('APP_URL');",
+    '$sql   = "SELECT id, name FROM users WHERE id = :id";',
+])
+_boot = {r["value"]: r["value_default"]
+         for r in evidence.from_file("bootstrap.php", _CFG_BOOT, "php", "config")
+         if r["kind"] == "config_key"}
+check("define() is a setting", _boot.get("session_name") == "ems", str(_boot))
+check("so is a read from the environment, with no literal to preserve",
+      "app_debug" in _boot and "app_url" in _boot, str(sorted(_boot)))
+check("a SQL statement is not mistaken for configuration",
+      not any(k in _boot for k in ("select", "users", "id")), str(sorted(_boot)))
+
+# A secret stays a secret. The placeholder rule runs first and its value never becomes a
+# default, or the settings file would carry the credential the redaction removed.
+_SECRET_PHP = "<?php\n$conf = ['db_pass' => '__REDACTED_PASSWORD__'];\n"
+_secret = {r["value"]: r["value_default"]
+           for r in evidence.from_file("db.php", _SECRET_PHP, "php", "config")
+           if r["kind"] == "config_key"}
+check("a redacted value is never carried forward as a default",
+      all("REDACTED" not in (v or "") for v in _secret.values()), str(_secret))
+
+# And the generated settings file carries them.
+_settings_json = json.loads(scaffold.dotnet._appsettings(
+    ["password"], {"timezone": "Asia/Kolkata", "db_path": "./ems.sqlite", "password": "nope"}))
+check("appsettings.json declares the keys the source read, with their values",
+      _settings_json["ConvertedSettings"] == {"db_path": "./ems.sqlite",
+                                              "timezone": "Asia/Kolkata"},
+      str(_settings_json.get("ConvertedSettings")))
+check("a secret category is not duplicated into the plain settings section",
+      "password" not in _settings_json["ConvertedSettings"], str(_settings_json))
+check("and it still gets its marker, never a plausible-looking value",
+      "SET-ME" in _settings_json["ConvertedSecrets"]["password"],
+      str(_settings_json["ConvertedSecrets"]))
+check("a run with no observed settings writes no empty section",
+      "ConvertedSettings" not in json.loads(scaffold.dotnet._appsettings([], {})))
 
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")

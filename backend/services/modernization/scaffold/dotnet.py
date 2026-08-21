@@ -190,10 +190,10 @@ def _program_cs(entry: Dict[str, Any], charter: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _appsettings(config_keys: List[str]) -> str:
+def _appsettings(config_keys: List[str], observed: Dict[str, str] = None) -> str:
     import json
 
-    settings: Dict[str, Any] = {
+    document: Dict[str, Any] = {
         "Logging": {"LogLevel": {"Default": "Information",
                                  "Microsoft.AspNetCore": "Warning"}},
         "AllowedHosts": "*",
@@ -201,11 +201,25 @@ def _appsettings(config_keys: List[str]) -> str:
     if config_keys:
         # One key per redaction category. The value is a marker, never a plausible-looking
         # placeholder — a fake connection string that looks real is how one gets committed.
-        settings["ConvertedSecrets"] = {
+        document["ConvertedSecrets"] = {
             key: f"SET-ME: supplied at ingest as __REDACTED_{key.upper()}__"
             for key in sorted(set(config_keys))
         }
-    return json.dumps(settings, indent=2) + "\n"
+    if observed:
+        # The settings the source actually read, with the values it read them as. Until C-70
+        # was closed, `config_key` came only from redaction placeholders — so a codebase
+        # keeping its configuration in a plain array contributed none, this file carried not
+        # one key the application asks for, and `IConfiguration["Database:Path"]` was null at
+        # boot while every converted unit invented its own name for the same setting.
+        #
+        # A real default rather than a marker, and that is the point: a timezone or a relative
+        # database path is not a credential, and it is the only value that makes the converted
+        # host start the way the old one did. Anything that *was* a secret is already a
+        # placeholder and never reaches here.
+        document["ConvertedSettings"] = {
+            key: observed[key] for key in sorted(observed) if key not in set(config_keys)
+        }
+    return json.dumps(document, indent=2) + "\n"
 
 
 def _readme(charter: Dict[str, Any], projects: List[Dict[str, Any]],
@@ -242,7 +256,8 @@ def _readme(charter: Dict[str, Any], projects: List[Dict[str, Any]],
 
 
 def build_dotnet(charter: Dict[str, Any], projects: List[Dict[str, Any]],
-                 config_keys: List[str]) -> List[Dict[str, str]]:
+                 config_keys: List[str],
+                 settings: Dict[str, str] = None) -> List[Dict[str, str]]:
     if not projects:
         projects = [{"name": "Converted", "purpose": "converted code"}]
     entry = projects[0]
@@ -260,7 +275,7 @@ def build_dotnet(charter: Dict[str, Any], projects: List[Dict[str, Any]],
                   "content": _program_cs(entry, charter),
                   "purpose": "Application host and service registration."})
     files.append({"path": f"{entry['name']}/appsettings.json",
-                  "content": _appsettings(config_keys),
+                  "content": _appsettings(config_keys, settings or {}),
                   "purpose": "Configuration, with one key per redacted value."})
     files.append({
         "path": "Directory.Build.props",

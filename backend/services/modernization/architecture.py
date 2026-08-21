@@ -446,6 +446,90 @@ _HOST_SEGMENTS = ("web", "api", "host", "server", "site", "ui", "presentation", 
                   "www", "frontend", "mvc", "razor", "blazor", "endpoints")
 
 
+def apply_repair(run_id: str, option: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply one `layering.repair_option` to a run's settled plan. -> what changed.
+
+    Runs after the plan gate is answered and **before** `_scaffold_one` reads the project list,
+    which is the only window: the scaffold writes a `.csproj` per project, and after that a
+    project's existence is a fact on disk rather than a row.
+
+    Three things here are load-bearing.
+
+    **The directory moves with the component.** `_place_artifacts` joins every emitted file onto
+    `output_dir`, and an SDK-style `.csproj` globs `**/*.cs` *beneath itself only*. A merge that
+    rewrites `target_project` and leaves the directory alone moves the label and leaves the code
+    somewhere MSBuild never looks — the same class as the `PhpCompat.cs`-at-the-export-root
+    defect D-68 records, where a file was emitted, was correct, and was never compiled.
+
+    **The graph is re-normalized.** `normalize_projects` is what guarantees an entry project
+    first and an acyclic reference graph (D-93). A repair edits `depends_on`, so it has to run
+    again or the guarantee is only as old as the last time it did.
+
+    **The residual is recomputed, not assumed zero.** A repair that closes two of three gaps
+    leaves one, and recording zero would make the plan look repaired when it is only better.
+    """
+    kind = option.get("kind") or ""
+    design_units = store.list_units(run_id, kind="design")
+    if not design_units:
+        return {"applied": False, "reason": "this run has no design unit"}
+    design = design_units[0]
+    meta = design.get("meta") or {}
+    components = store.list_units(run_id, kind="component")
+    moved: List[str] = []
+
+    if kind in ("merge_projects", "move_component"):
+        keep = (option.get("keep") or "").strip()
+        absorb = (option.get("absorb") or "").strip()
+        if not keep or not absorb:
+            return {"applied": False, "reason": "the option named no projects to merge"}
+        for component in components:
+            if (component.get("target_project") or "").strip() != absorb:
+                continue
+            directory = (component.get("output_dir") or "").replace("\\", "/").strip("/")
+            head, _, tail = directory.partition("/")
+            # Only when the leading segment really is the project being absorbed. Anything else
+            # is a layout this function did not write and must not guess at, so it is left in
+            # place and reported rather than rewritten to something plausible.
+            new_dir = f"{keep}/{tail}" if head == absorb and tail else (
+                keep if head == absorb else directory)
+            # The namespace moves on the same rule. Safe here and nowhere later: this runs
+            # before the first conversion call, so no symbol has been registered under the old
+            # name and no emitted file declares it. Left alone, the component would live in
+            # `Acme.Application` and declare `namespace Acme.Infrastructure.Data` — which
+            # compiles, because a C# namespace need not match its assembly, and is not
+            # something anyone would write. D-90's point is that namespaces may be *shared*,
+            # not that they may contradict the project they ship in.
+            namespace = (component.get("target_namespace") or "").strip()
+            new_ns = namespace
+            if namespace == absorb:
+                new_ns = keep
+            elif namespace.startswith(absorb + "."):
+                new_ns = keep + namespace[len(absorb):]
+            store.set_unit_placement(component["id"], target_project=keep,
+                                     target_namespace=new_ns, output_dir=new_dir)
+            moved.append(f"{component.get('component_name') or component['path']}: "
+                         f"{absorb} -> {keep}"
+                         + ("" if new_dir != directory else " (directory unchanged)"))
+        projects = [p for p in (option.get("projects") or meta.get("projects") or [])]
+    elif kind in ("allow_reference", "declare_seam"):
+        projects = option.get("projects") or meta.get("projects") or []
+    else:
+        return {"applied": False, "reason": f"unknown repair kind {kind!r}"}
+
+    known = [c.get("target_project") or "" for c in store.list_units(run_id, kind="component")]
+    normalized, problems = normalize_projects(projects, [k for k in known if k])
+    updates: Dict[str, Any] = {"projects": normalized}
+    if kind == "declare_seam" and option.get("seams") is not None:
+        updates["seams"] = option["seams"]
+    # Recomputed from the *new* layout, over the same real source graph. `runner` owns the
+    # edge-gathering, so the caller passes the result in rather than this module reaching for it.
+    updates["repair_applied"] = {"id": option.get("id"), "kind": kind,
+                                 "moved": moved, "problems": problems}
+    store.set_unit_meta(design["id"], updates)
+    return {"applied": True, "kind": kind, "moved": moved, "projects": normalized,
+            "problems": problems}
+
+
 def normalize_projects(raw_projects: List[Dict[str, Any]],
                        known: List[str]) -> Tuple[List[Dict[str, Any]], List[str]]:
     """The project list, with an entry project first and a reference graph that can build.

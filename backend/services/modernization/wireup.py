@@ -505,17 +505,36 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str,
 
     services: List[str] = []
     ambiguous: List[str] = []
+    ambiguous_detail: List[Dict[str, Any]] = []
+    chosen_notes: List[str] = []
     registered_names: Set[str] = set()
     db = db_plan(artifacts, charter)
     for interface in sorted(interfaces):
         found = impls.get(interface) or []
-        if len(found) != 1:
-            # Zero means the interface is implemented outside the conversion (or not at all —
-            # reconciliation already reports that). More than one means the container cannot
-            # be told which to use without a decision this stage is not entitled to make.
-            if len(found) > 1:
-                ambiguous.append(f"{interface} ({', '.join(c for c, _ in found)})")
+        if not found:
+            # Implemented outside the conversion, or not at all — reconciliation already
+            # reports the second.
             continue
+        if len(found) > 1:
+            # Registering neither is what this did, and it is the wrong default. Run 38ee8e01
+            # declared and implemented four seams *correctly* and shipped an app that threw on
+            # its first request, because four registrations were reported ambiguous and left
+            # out. A decision the container cannot make is not the same as a decision nobody
+            # can make: the conventional pairing is a fact about the names, and a discriminated
+            # choice that says so beats a container with a hole in it.
+            preferred = _preferred_implementation(interface, found)
+            if preferred is None:
+                ambiguous.append(f"{interface} ({', '.join(c for c, _ in found)})")
+                ambiguous_detail.append({
+                    "interface": interface,
+                    "namespace": interfaces[interface],
+                    "candidates": [{"class": c, "namespace": ns} for c, ns in found],
+                })
+                continue
+            found = [preferred]
+            chosen_notes.append(
+                f"{interface} -> {preferred[0]} (chosen over "
+                f"{', '.join(c for c, _ in impls[interface] if c != preferred[0])})")
         cls, impl_ns = found[0]
         iface_ns = interfaces[interface]
         lhs = f"{iface_ns}.{interface}" if iface_ns else interface
@@ -569,6 +588,12 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str,
     return {
         "services": services,
         "ambiguous": ambiguous,
+        # The same information with a shape a checkpoint can offer as options, so a genuine tie
+        # becomes a decision a human makes once rather than a registration nobody makes at all.
+        "ambiguous_detail": ambiguous_detail,
+        # Choices this stage made on a discriminator, reported rather than silent — the D-90
+        # and D-98 rule that a correction the reader is not told about is the actual problem.
+        "chosen": chosen_notes,
         "db_context": db.get("context") or "",
         "db_note": db.get("note") or "",
         "view_formats": _view_formats(view_paths, controllers, entry_project),
@@ -759,6 +784,44 @@ def existing_references(artifacts: List[Dict[str, Any]]) -> Dict[str, Set[str]]:
         targets = {t for t in _PROJECT_REF.findall(artifact.get("content") or "") if t != name}
         edges[name] = targets
     return edges
+
+
+# Names that mark an implementation as one nothing should be wired to by default. A converter
+# writes these when the source had a test double or a stub in it, and preferring one over the
+# real implementation would produce an application that runs and does nothing.
+_NOT_FOR_PRODUCTION = re.compile(r"(?i)\b|^(?:fake|stub|mock|dummy|null|noop|inmemory|test)",
+                                 re.IGNORECASE)
+_DOUBLE_MARKERS = ("fake", "stub", "mock", "dummy", "noop", "inmemory", "test")
+
+
+def _preferred_implementation(interface: str, found: List[Tuple[str, str]]):
+    """-> the one implementation to register, or None when the choice is a genuine tie.
+
+    Two discriminators, both facts about the names rather than judgements:
+
+    1. **The conventional pairing.** `IEmployeeRepository` is implemented by
+       `EmployeeRepository` in every codebase this product converts into; a
+       `SqlEmployeeRepository` beside it is the variant, not the default.
+    2. **Test doubles are not implementations.** A `FakeEmployeeRepository` in the export is
+       something the source had, and registering it produces an application that starts,
+       serves, and does nothing — the worst outcome available, because it looks like success.
+
+    Returning `None` is the honest answer when neither applies: two equally plausible classes
+    are a decision, and the caller turns that into one question rather than a silent omission.
+    """
+    real = [(cls, ns) for cls, ns in found
+            if not any(marker in cls.lower() for marker in _DOUBLE_MARKERS)]
+    # Only when it *discriminates*. If everything looks like a double, the source is a test
+    # project and dropping them all would leave the interface unregistered for a worse reason.
+    candidates = real if real and len(real) < len(found) else found
+    if len(candidates) == 1:
+        return candidates[0]
+
+    conventional = interface[1:] if interface[:1] == "I" and len(interface) > 1 else ""
+    exact = [(cls, ns) for cls, ns in candidates if cls == conventional]
+    if len(exact) == 1:
+        return exact[0]
+    return None
 
 
 def resolve_reference_cycles(existing: Dict[str, Set[str]], needed: Dict[str, Set[str]],

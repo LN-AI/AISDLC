@@ -6056,6 +6056,9 @@ const MOD_WAIVER_CHECKPOINTS = {
                      { label: 'Finish with the build failing', help: 'showModernizationBuildHelp' },
   build_not_repairable:
                      { label: 'Finish with these errors unfixed', help: 'showModernizationBuildHelp' },
+  wireup_ambiguous:  { label: 'Finish with it unregistered', help: 'showModernizationBuildHelp' },
+  runtime_required:  { label: 'Finish without starting it', help: 'showModernizationBuildHelp' },
+  runtime_failed:    { label: 'Finish with it failing to serve', help: 'showModernizationBuildHelp' },
 };
 
 function renderModernizationCheckpoints(checkpoints) {

@@ -36,7 +36,8 @@ from backend.services.orchestrator import SDLCOrchestrator
 from backend.services.modernization import advice
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
-    build_results, parity, parity_tools, reconcile, repo_ingest, runner, stages, store,
+    build_results, parity, parity_tools, reconcile, repo_ingest, runner, runtime,
+    stages, store,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,24 @@ class ParityCasesRequest(BaseModel):
         ..., description="Recorded interactions: {name, request:{method,path,headers,body,"
                          "cookies}, expected:{status,location,content_type,body}, extract:[]}.")
     source: str = Field("", description="What recorded them — e.g. 'proxy', 'access_log'.")
+
+
+class RuntimeResultsRequest(BaseModel):
+    """What starting the converted application and requesting its own URLs observed."""
+    checks: List[Dict[str, Any]] = Field(
+        ..., description="One per probed URL: {method, path, status, error, ms}. `status` 0 "
+                         "with an `error` means nothing answered. An empty list is recorded "
+                         "as a check that asked nothing -- never as a pass.")
+    started: bool = Field(False, description="Did the process answer on its port at all.")
+    skipped_reason: str = Field(
+        "", description="Why the check could not run — e.g. the run's database engine is not "
+                        "available on this runner. A skip is a state of its own; it is never "
+                        "recorded as a pass.")
+    source: str = Field("external", description="Who ran it — e.g. 'local_dotnet'.")
+    base_url: str = Field("", description="Where the app was reachable, for the log.")
+    command: str = ""
+    log_tail: str = Field("", description="The process's last output. For a .NET failure this "
+                                          "is the entire diagnostic value.")
 
 
 class ParityResultsRequest(BaseModel):
@@ -232,6 +251,10 @@ def _run_view(run: Dict[str, Any]) -> Dict[str, Any]:
         # from "checked and matching" — a run nobody checked behaviourally and a run that
         # passed parity must never look the same.
         "parity": parity.summary_for_run(run["id"]),
+        # Always present, `never_run` among its states — the same argument as `build` above and
+        # the opposite of `parity`, where nothing recorded means the customer never opted in.
+        # Every run produces something that either starts or does not.
+        "runtime": runtime.summary_for_run(run["id"]),
         "rules_confirmed": rule_counts.get("confirmed", 0),
         # Count only. The map itself carries paths and line numbers and is available on its
         # own endpoint; putting it on every poll would be noise.
@@ -624,6 +647,53 @@ def report_parity_results(run_id: str, req: ParityResultsRequest,
         return parity.ingest(run_id, req.model_dump(), _actor(caller))
     except parity.ParityError as exc:
         raise HTTPException(400, str(exc))
+
+
+@router.post("/runs/{run_id}/runtime-results",
+             summary="Report whether the converted application starts and serves")
+def report_runtime_results(run_id: str, req: RuntimeResultsRequest,
+                           caller: dict = Depends(get_caller)):
+    """The narrowest useful question after "does it compile": does it run.
+
+    Its own contract rather than `build-results`, and that is not tidiness. A runtime 500 has
+    no file and no line, so every row would arrive `unmapped` — which raises a **blocking**
+    `build_unmapped` and would halt the run for entirely the wrong reason — and it would
+    consume a `build_round`, which is the unit the loop's round cap and its non-convergence
+    fingerprint are counted in.
+
+    D-05 is untouched: nothing is started here. A developer's machine or the customer's CI runs
+    the application and posts what it saw, exactly as the compiler does.
+    """
+    _require_run(run_id, caller)
+    try:
+        return runtime.ingest(run_id, req.model_dump(), _actor(caller))
+    except runtime.RuntimeReportError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/runs/{run_id}/startup-plan",
+            summary="What to start, and which URLs to ask it for")
+def get_startup_plan(run_id: str, caller: dict = Depends(get_caller)):
+    """The runner's instructions, assembled from the run's own analysis.
+
+    The URL list is route evidence the deterministic extractors already found, so the thing
+    being probed is the application's own declared surface rather than a list somebody
+    maintains beside it. Unprobed URLs come back too, with the reason — a coverage figure
+    without the population it was drawn from is the shape D-97 exists to prevent.
+    """
+    _require_run(run_id, caller)
+    return runtime.startup_plan(run_id)
+
+
+@router.get("/runs/{run_id}/runtime", summary="Did it start, and what answered")
+def get_runtime(run_id: str, caller: dict = Depends(get_caller)):
+    _require_run(run_id, caller)
+    latest = store.latest_runtime(run_id)
+    return {
+        "summary": runtime.summary_for_run(run_id),
+        "report": latest,
+        "checks": store.runtime_checks(run_id, (latest or {}).get("id") or ""),
+    }
 
 
 @router.get("/runs/{run_id}/parity", summary="Behavioural parity — rounds and what diverged")

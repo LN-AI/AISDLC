@@ -53,14 +53,24 @@ def builder_for(target_stack: str) -> Optional[Callable[..., List[Dict[str, str]
 
 
 def build(target_stack: str, charter: Dict[str, Any], projects: List[Dict[str, Any]],
-          config_keys: List[str]) -> List[Dict[str, str]]:
-    """-> [{path, content, purpose}], or [] when no template matches the target stack."""
+          config_keys: List[str],
+          settings: Optional[Dict[str, str]] = None) -> List[Dict[str, str]]:
+    """-> [{path, content, purpose}], or [] when no template matches the target stack.
+
+    `config_keys` are the *secret* categories a redaction created — they get a marker,
+    never a plausible value. `settings` are the ordinary keys the source read with the
+    literals it read them as: a timezone, a session name, a database path. Those were
+    invisible until C-70 was closed, so the generated settings file carried not one key the
+    application actually asks for and every converted unit invented its own name for the
+    same setting.
+    """
     fn = builder_for(target_stack)
     if fn is None:
         logger.info("No scaffold template for target stack %r", target_stack)
         return []
     try:
-        return fn(charter=charter, projects=projects, config_keys=config_keys)
+        return fn(charter=charter, projects=projects, config_keys=config_keys,
+                  settings=settings or {})
     except Exception:
         logger.exception("Scaffold generation failed for %r", target_stack)
         return []
