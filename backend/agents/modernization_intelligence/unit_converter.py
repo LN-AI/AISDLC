@@ -408,6 +408,14 @@ def _build_user_message(
             lines.append(f"- **Why these files convert together**: {placement['rationale']}")
         parts.append("\n".join(lines))
 
+    # Which projects this one is allowed to name a type from. Rendered by `layering`, from
+    # the acyclic graph the design stage already settled on — so this is not a new
+    # constraint, it is the run's own constraint finally being stated to the party that has
+    # to obey it. It goes in the user message because it differs per component, and anything
+    # per-component in the cached system block costs full price on every other call (D-06).
+    if placement.get("project_rules"):
+        parts.append("\n" + placement["project_rules"])
+
     if len(members) > 1:
         parts.append(
             "\n## This unit is several source files\n\n"

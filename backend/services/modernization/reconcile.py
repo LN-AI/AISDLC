@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Set
 
-from backend.services.modernization import graph, store
+from backend.services.modernization import graph, layering, store
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +320,23 @@ def run(run_id: str) -> Dict[str, Any]:
     #    This is invisible to the compiler — the project builds clean and 500s on the first
     #    request — and it is exactly the cross-file disagreement this stage exists to catch:
     #    the controller and its view come out of one call and can still disagree.
+    # N. Seams the plan promised and the code never delivered. Run-level because a seam has
+    #    two ends in two different components and neither can see the other while it is being
+    #    converted. This is usually the *reason* a project reaches where it may not: the
+    #    interface it was told to depend on was never written, so there was nothing to depend
+    #    on, and naming the concrete class was the only way to do the work at all.
+    _design = store.list_units(run_id, kind="design")
+    _seams = ((_design[0].get("meta") if _design else None) or {}).get("seams") or []
+    if _seams:
+        _declared = defaultdict(set)
+        _project_of_unit = {c["id"]: (c.get("target_project") or "") for c in components}
+        for symbol in symbols:
+            project = _project_of_unit.get(symbol.get("unit_id") or "")
+            if project and symbol.get("name"):
+                _declared[project].add(str(symbol["name"]).rsplit(".", 1)[-1])
+        for issue in layering.unclosed_seams(_seams, _declared):
+            issues.append(_issue(issue["kind"], issue["severity"], issue["detail"]))
+
     for issue in _unresolved_views(artifacts):
         issues.append(issue)
     for issue in _double_encoded_views(artifacts):

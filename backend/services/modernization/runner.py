@@ -38,8 +38,8 @@ from backend.services import agent_guard, guardrail_service, llm_gateway
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence,
-    extraction_audit, graph, lookup, parity, playbooks, reconcile, repo_ingest, rules,
-    sanity, scaffold, semantics, stages, store, usings, validation, wireup,
+    extraction_audit, graph, layering, lookup, parity, playbooks, reconcile, repo_ingest,
+    rules, sanity, scaffold, semantics, stages, store, usings, validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
 
@@ -729,6 +729,23 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
     elif stage.id == "taskplan":
         _build_task_plan(run_id)
     elif stage.id == "reconcile":
+        # Said once per run, not per unit. "No violations" and "no reader for this target's
+        # language" must not look the same on a screen — the same reason a run with no
+        # parity report does not read as parity that passed.
+        _artifacts = store.list_artifacts(run_id, current_only=True)
+        _seen = layering.coverage(_artifacts)
+        if _seen["unread"] and not _seen["read"]:
+            store.append_event(
+                run_id, "layering_not_checked",
+                f"Project boundaries were not enforced: none of {_seen['unread']} emitted "
+                f"code file(s) are in a language this check can read. The architecture may "
+                f"be violated and nothing here would know.", level="warning")
+        elif _seen["unread"]:
+            store.append_event(
+                run_id, "layering_partly_checked",
+                f"Project boundaries were enforced on {_seen['read']} file(s); "
+                f"{_seen['unread']} were in a language this check cannot read.",
+                level="warning")
         report = reconcile.run(run_id)
         if report["issues"]:
             store.create_checkpoint(
@@ -1033,7 +1050,22 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # The normalized list, not the proposal's: this is what `_scaffold_one` reads, and it
         # is the version with an entry project first and a reference graph that can build.
         "projects": outcome.get("project_list") or proposal.get("projects") or [],
+        # Where an interface is declared and where it is implemented. Kept beside the project
+        # graph because the two are one decision: `depends_on` says which direction is
+        # forbidden and a seam is the only legitimate way to cross it. Both sides of every
+        # seam are told, so the consumer knows to declare the interface and the implementer
+        # knows to implement it — otherwise the converter's only options are to name a type
+        # it may not name or to leave the work undone, and it names the type.
+        "seams": [s for s in (proposal.get("seams") or []) if isinstance(s, dict)][:60],
         "problems": outcome["problems"],
+        # Dependencies the source really has that this layout gives no legal way to express.
+        # Computed here because here is where the plan is settled and *before* the gate that
+        # approves paying for it — the whole value is in the timing. Every one of the twelve
+        # build errors on run 9c8cf4fe was predicted by this from the source graph alone, at
+        # a point where $0.67 had been spent instead of $6.43.
+        "layering_gaps": _plan_layering_gaps(
+            run_id, outcome.get("project_list") or proposal.get("projects") or [],
+            proposal.get("seams") or []),
         "estimate": outcome["estimate"],
     })
     store.complete_unit(
@@ -1317,6 +1349,40 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
     return placed
 
 
+def _plan_layering_gaps(run_id: str, projects: List[Dict[str, Any]],
+                        seams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Run `layering.plan_gaps` over this run's real source graph. Never raises.
+
+    A net that can fail the thing it watches is worse than no net (the argument D-101 makes
+    for the extraction audit), and this one runs inside the design unit's own transaction.
+    """
+    try:
+        components = store.list_units(run_id, kind="component")
+        edges = [(unit["path"], dep)
+                 for unit in store.list_units(run_id, kind="source_file")
+                 for dep in (unit.get("depends_on") or [])]
+        return layering.plan_gaps(components, projects, seams, edges)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not check the plan's layering for run %s (continuing)", run_id)
+        return []
+
+
+def _design_projects(run_id: str) -> List[Dict[str, Any]]:
+    """The normalized, acyclic project graph the design stage settled on.
+
+    One reader, so the check, the prompt and the plan gate cannot disagree about what the
+    architecture *is* — the failure mode D-61 documents for stack-pair keying.
+    """
+    units = store.list_units(run_id, kind="design")
+    return ((units[0].get("meta") if units else None) or {}).get("projects") or []
+
+
+def _design_seams(run_id: str) -> List[Dict[str, Any]]:
+    """Where an interface is declared and where it is implemented, as the architect said."""
+    units = store.list_units(run_id, kind="design")
+    return ((units[0].get("meta") if units else None) or {}).get("seams") or []
+
+
 def _design_failure_reason(run_id: str, design_units: List[Dict[str, Any]]) -> str:
     """Why there is no architecture, in words the person reading the run can act on.
 
@@ -1408,6 +1474,7 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
         "risks": design_meta.get("risks") or [],
         "corrections": design_meta.get("problems") or [],
         "components": rows,
+        "layering_gaps": design_meta.get("layering_gaps") or [],
         "totals": totals,
         "by_risk": {level: sum(1 for r in rows if r["risk"] == level)
                     for level in ("high", "medium", "low")},
@@ -1434,6 +1501,19 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     )
     if plan["corrections"]:
         detail += f" {len(plan['corrections'])} correction(s) were applied to the proposed layout."
+    # Separate from `corrections`, and deliberately: a correction is something the pipeline
+    # already fixed, and this is something it cannot fix. Reported rather than fatal — the
+    # architect may have a reason, a parsed edge may not survive translation, and refusing a
+    # plan on a guess is worse than naming the risk in front of the person paying for it.
+    gaps = design_meta.get("layering_gaps") or []
+    if gaps:
+        detail += (
+            f"\n\n**{len(gaps)} dependency direction(s) in this layout have no legal way to "
+            f"be written.** The source has dependencies that cross a project boundary the "
+            f"plan forbids, and no interface seam covers them. Converting as planned means "
+            f"each affected component must either reference a project it may not — which "
+            f"MSBuild refuses to build at all — or leave the work out.\n\n"
+            + "\n\n".join(g["detail"] for g in gaps[:6]))
     if agentic:
         # Said plainly, because the expectation is the half that is not yet measured. The
         # ceiling above already carries the multiplier; the estimate does not, and quoting a
@@ -1585,7 +1665,18 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     prior_findings = "\n\n".join(block for block in (
         semantics.summarize_for_prompt(meta.get("semantic_issues") or []),
         validation.summarize_for_prompt(meta.get("validation_issues") or []),
+        layering.summarize_for_prompt(meta.get("layering_issues") or []),
     ) if block)
+
+    # The preventive half, and the cheap one: the answer was always in the plan, it had
+    # simply never been put in front of the converter as a rule rather than as prose in a
+    # project's `purpose` line. Costs nothing and goes in the user message, not the cached
+    # system block — it differs per component (D-06).
+    boundaries = layering.render_rules(
+        unit.get("target_project") or "", _design_projects(run_id),
+        _design_seams(run_id)) if unit.get("kind") == "component" else ""
+    if boundaries:
+        placement["project_rules"] = boundaries
 
     # Whether this unit may look things up before it answers. Components only: the other
     # stages are different agents with different questions, and a run that did not ask for
@@ -1794,10 +1885,48 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     if drift["issues"]:
         store.append_event(run_id, "semantic_drift", semantics.describe(drift["issues"])[:500],
                            unit_id=unit["id"], level="warning")
+
+    # The architecture the run already decided, enforced against what was actually written.
+    # `projects[].depends_on` is made acyclic before the scaffold writes a `.csproj` (D-93),
+    # so this is a comparison against a constraint the run has held all along and had never
+    # checked. Per component and at commit time deliberately: at the end of the run the only
+    # available move is to cut an edge and hope, while here the unit fails, the violation
+    # reaches the next attempt's prompt, and a forbidden reference that is never written
+    # needs no edge cut. Measured on run 9c8cf4fe — eight files across four components, and
+    # twelve build errors that all traced back to them.
+    boundary = layering.check(
+        safe_artifacts,
+        project=unit.get("target_project") or "",
+        projects=_design_projects(run_id),
+        components=store.list_units(run_id, kind="component"),
+    )
+    if boundary:
+        store.set_unit_meta(unit["id"], {"layering_issues": boundary})
+        detail = layering.describe(boundary)
+        store.append_event(run_id, "layering_violation", detail[:500],
+                           unit_id=unit["id"], level="error")
+        status = store.fail_unit(unit["id"], run_id,
+                                 f"Broke the project boundaries: {detail}"[:500],
+                                 max_attempts=MAX_UNIT_ATTEMPTS)
+        if status == "failed":
+            # Blocking, for the same reason a semantic drift is: this one does not merely
+            # produce a worse file, it produces a solution MSBuild refuses to build at all,
+            # and no later stage can repair it by adding a reference.
+            store.create_checkpoint(
+                run_id, "layering_violation",
+                f"{unit.get('component_name') or path} references a project it may not",
+                detail=(detail + "\n\n"
+                        + layering.summarize_for_prompt(boundary))[:4000],
+                unit_id=unit["id"], blocking=True,
+            )
+        return "failed"
+
     # Cleared on the way through, so a unit that failed twice and then succeeded does not
     # carry last time's findings into a later rework prompt as if they were still true.
-    if meta.get("semantic_issues") or meta.get("validation_issues"):
-        store.set_unit_meta(unit["id"], {"semantic_issues": [], "validation_issues": []})
+    if (meta.get("semantic_issues") or meta.get("validation_issues")
+            or meta.get("layering_issues")):
+        store.set_unit_meta(unit["id"], {"semantic_issues": [], "validation_issues": [],
+                                         "layering_issues": []})
 
     # What the plan promised, against what arrived. The architect wrote `expected_files` for
     # this component and it is already rendered into the prompt — but nothing compared the

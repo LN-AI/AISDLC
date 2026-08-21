@@ -61,7 +61,15 @@ TARGET_ARCHITECTURE_TOOL_SCHEMA = {
                         "purpose": {"type": "string", "description": "One line."},
                         "depends_on": {
                             "type": "array", "items": {"type": "string"},
-                            "description": "Other project names this one references.",
+                            "description": (
+                                "Other project names this one references. **This is "
+                                "enforced.** Every file emitted into a project is checked "
+                                "against this list, and a reference it does not permit fails "
+                                "the component and is sent back. Two projects that reference "
+                                "each other cannot be built at all, so state the direction "
+                                "you mean: list only what this project genuinely needs, and "
+                                "leave it empty for the innermost layer."
+                            ),
                         },
                     },
                 },
@@ -113,6 +121,39 @@ TARGET_ARCHITECTURE_TOOL_SCHEMA = {
                     },
                 },
             },
+            "seams": {
+                "type": "array",
+                "description": (
+                    "How a project gets behaviour that lives in a project it may not "
+                    "reference. This is the answer to the only structural problem that "
+                    "cannot be repaired after conversion: if `depends_on` says A may not "
+                    "reference B, but code in A needs something B does, then A declares an "
+                    "interface and B implements it. Declare each of those here and both "
+                    "sides will be told. A dependency you leave unstated becomes a "
+                    "forbidden reference the converter has no legitimate way to write."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["interface", "declared_in", "implemented_in"],
+                    "properties": {
+                        "interface": {
+                            "type": "string",
+                            "description": "The interface name, e.g. 'IEmployeeRepository'.",
+                        },
+                        "declared_in": {
+                            "type": "string",
+                            "description": "The project that declares it — the *consumer's* "
+                                           "project, the one that may not reference the other.",
+                        },
+                        "implemented_in": {
+                            "type": "string",
+                            "description": "The project whose component writes the class that "
+                                           "implements it.",
+                        },
+                        "purpose": {"type": "string", "description": "One line."},
+                    },
+                },
+            },
             "shared_conventions": {
                 "type": "string",
                 "description": (
@@ -139,6 +180,12 @@ You are called **once per run**, before anything is converted. Everything you de
 every conversion call that follows, and none of them can see each other. That is the whole reason
 you exist: without you, five hundred independent calls each invent their own project layout from
 one sentence, and the result is a codebase that disagrees with itself in five hundred places.
+
+Two rules about the project layout, because they are the only decisions here that cannot be corrected later.
+
+1. `depends_on` is **enforced against the emitted code**. Every file a component writes is checked against the list you give its project, and a reference the list does not permit fails that component and sends it back to be converted again. So the graph you declare has to be the graph you mean.
+
+2. A dependency that points the wrong way has no legitimate expression. If a project needs behaviour from a project it may not reference, that is a **seam**: the consumer declares an interface, the other side implements it, and you list it in `seams`. If you leave it out, the converter is left with a choice between naming a type it is forbidden to name and not doing the work — and it will name the type. Prefer fewer projects over a layout whose seams you have not thought through: a single project cannot have this problem at all.
 
 ## What you must get right
 

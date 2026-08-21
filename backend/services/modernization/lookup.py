@@ -34,7 +34,7 @@ import logging
 import re
 from typing import Any, Callable, Dict, List
 
-from backend.services.modernization import repo_ingest, store
+from backend.services.modernization import layering, repo_ingest, store
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,23 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
                                     "description": "The output path (e.g. "
                                                    "'Acme.Ems.Domain/Entities/User.cs')."}},
             "required": ["path"],
+        },
+    },
+    {
+        "name": "project_rules",
+        "description": (
+            "What the target architecture allows: which projects exist, which ones a given "
+            "project may name types from, which it may not, and where each interface is "
+            "declared and implemented. Ask before naming a type that lives outside your own "
+            "project — a reference in a forbidden direction fails the component and cannot "
+            "be repaired later, because two projects that reference each other cannot be "
+            "built at all."),
+        "input_schema": {
+            "type": "object",
+            "properties": {"project": {
+                "type": "string",
+                "description": "Optional: the project to explain. Defaults to every project.",
+            }},
         },
     },
     {
@@ -210,6 +227,30 @@ def _list_members(run_id: str, type_name: str) -> str:
     return f"Recorded for '{type_name}':\n" + "\n".join(lines) + more
 
 
+def _project_rules(run_id: str, project: str) -> str:
+    """The architecture, as rules rather than as prose.
+
+    Reads the same normalized graph the enforcement check reads, so what the converter is
+    told and what it is judged against cannot disagree — the drift D-61 documents for two
+    lookups that were meant to agree.
+    """
+    units = store.list_units(run_id, kind="design")
+    meta = (units[0].get("meta") if units else None) or {}
+    projects = meta.get("projects") or []
+    seams = meta.get("seams") or []
+    if not projects:
+        return ("This run has no declared project layout, so there are no cross-project "
+                "rules to follow.")
+    wanted = (project or "").strip()
+    names = [str(p.get("name") or "").strip() for p in projects if p.get("name")]
+    if wanted and wanted not in names:
+        return (f"There is no project called '{wanted}' in this run. The projects are: "
+                + ", ".join(names) + ".")
+    targets = [wanted] if wanted else names
+    blocks = [layering.render_rules(name, projects, seams) for name in targets]
+    return "\n\n".join(b for b in blocks if b) or "No rules are stated for that project."
+
+
 def dispatcher(run_id: str) -> Callable[[str, Dict[str, Any]], str]:
     """-> `dispatch(name, arguments) -> str`, bound to one run.
 
@@ -225,6 +266,8 @@ def dispatcher(run_id: str) -> Callable[[str, Dict[str, Any]], str]:
                                    str(arguments.get("path_contains") or ""))
         if name == "read_converted":
             return _read_converted(run_id, _clean_path(arguments.get("path")))
+        if name == "project_rules":
+            return _project_rules(run_id, str(arguments.get("project") or ""))
         if name == "list_members":
             return _list_members(run_id, str(arguments.get("type_name") or ""))
         return (f"There is no lookup called '{name}'. The ones available are: "

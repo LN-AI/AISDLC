@@ -43,9 +43,9 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
-    evidence, extraction_audit, graph, lookup, parity, parity_tools, reconcile, repo_ingest,
-    runner, rules as rules_module, sanity, scaffold, stages, store, usings, validation,
-    wireup,
+    evidence, extraction_audit, graph, layering, lookup, parity, parity_tools, reconcile,
+    repo_ingest, runner, rules as rules_module, sanity, scaffold, stages, store, usings,
+    validation, wireup,
 )
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
@@ -6028,6 +6028,198 @@ check("a run that has an architecture still reaches its spend gate",
       str([c["kind"] for c in store.list_checkpoints(_ok)]))
 check("and the gate carries a number rather than zero",
       _plan["totals"]["ceiling_usd"] > 0, str(_plan["totals"]))
+
+
+section("42. The architecture the run decided, enforced on the code it wrote")
+
+# Run 9c8cf4fe converted 45 files, passed reconciliation with zero issues, mapped every
+# database column correctly — and produced a solution MSBuild refuses to build. The plan was
+# not at fault: it declared a clean, acyclic layering and said in `purpose` that Application
+# owns the repository interfaces. The conversion wrote six files in Application naming
+# Infrastructure types directly and created none of those interfaces.
+#
+# Nothing compared the two. `projects[].depends_on` has been made acyclic before the scaffold
+# writes a `.csproj` since D-93 — the constraint was stated all along and never checked.
+#
+# Nothing below is specific to that codebase or that stack: the input is a declared module
+# graph and a set of emitted imports, and both are things any conversion has.
+
+_FOUR = [
+    {"name": "Shop.Web", "depends_on": ["Shop.App", "Shop.Domain", "Shop.Infra"]},
+    {"name": "Shop.App", "depends_on": ["Shop.Domain"]},
+    {"name": "Shop.Domain", "depends_on": []},
+    {"name": "Shop.Infra", "depends_on": ["Shop.Domain", "Shop.App"]},
+]
+_COMPS = [
+    {"target_project": "Shop.Web", "target_namespace": "Shop.Web.Controllers"},
+    {"target_project": "Shop.App", "target_namespace": "Shop.App.Services"},
+    {"target_project": "Shop.Domain", "target_namespace": "Shop.Domain.Entities"},
+    {"target_project": "Shop.Infra", "target_namespace": "Shop.Infra.Persistence"},
+]
+
+
+def _file(path, body):
+    return [{"path": path, "content": body}]
+
+
+def _flags(artifacts, project, projects=None, comps=None):
+    return layering.check(artifacts, project=project, projects=projects or _FOUR,
+                          components=comps or _COMPS)
+
+
+# ── The violation, and the directions that are fine ────────────────────────
+_bad = _flags(_file("Shop.App/EmployeeService.cs",
+                    "using Shop.Infra.Persistence;\npublic class EmployeeService { }"),
+              "Shop.App")
+check("a reference the plan forbids is a failure", len(_bad) == 1 and _bad[0]["severity"] == "fail",
+      str(_bad))
+check("and it names the direction, not just the file",
+      _bad[0]["target"] == "Shop.Infra" and _bad[0]["project"] == "Shop.App", str(_bad[0]))
+check("the message says why it cannot be fixed later",
+      "cannot be corrected later" in _bad[0]["detail"], _bad[0]["detail"][-160:])
+check("the allowed direction of the same pair is not flagged",
+      not _flags(_file("Shop.Infra/Repo.cs", "using Shop.App.Services;\nclass Repo { }"),
+                 "Shop.Infra"))
+check("a transitive reference is not flagged — a ProjectReference is transitive in MSBuild",
+      not _flags(_file("Shop.Web/C.cs", "using Shop.Domain.Entities;\nclass C { }"), "Shop.Web"))
+check("the framework is not this run's code and is never flagged",
+      not _flags(_file("Shop.App/S.cs",
+                       "using Microsoft.EntityFrameworkCore;\nusing System.Text.Json;\nclass S{}"),
+                 "Shop.App"))
+check("a type named fully-qualified inline is caught, not only an import",
+      _flags(_file("Shop.App/S.cs", "class S { Shop.Infra.Persistence.Repo r; }"), "Shop.App"))
+check("but not inside a comment or a string — the compiler does not see those either",
+      not _flags(_file("Shop.App/S.cs",
+                       '// TODO Shop.Infra.Persistence.Repo\nclass S { string s = "Shop.Infra.X"; }'),
+                 "Shop.App"))
+
+# ── It must never fire because information is missing ──────────────────────
+#
+# `depends_on` is optional in the architect's schema. Read literally, a plan that names four
+# projects and declares no edges means "nothing may reference anything" — which would fail
+# every unit in the run for a constraint nobody stated. That is the worst outcome available
+# and the fastest way to get a check switched off, so an unstated graph is not a violation.
+_BLANK = [{"name": "Shop.App"}, {"name": "Shop.Infra"}]
+check("a plan that states no dependency direction is not judged",
+      not layering.graph_is_stated(_BLANK)
+      and not _flags(_file("Shop.App/S.cs", "using Shop.Infra.Persistence;"), "Shop.App", _BLANK))
+check("one declared edge anywhere is taken as intent, and then empty means empty",
+      layering.graph_is_stated(_FOUR))
+check("a single-project conversion has no layering to break",
+      not _flags(_file("Shop.App/S.cs", "using Shop.App.X;"), "Shop.App",
+                 [{"name": "Shop.App", "depends_on": []}]))
+check("a project the plan never names is not judged against a graph it is not in",
+      not _flags(_file("Other/S.cs", "using Shop.Infra.Persistence;"), "Other"))
+
+# ── Stack-agnostic by construction ────────────────────────────────────────
+#
+# The concept is a declared module graph checked against real imports; only the *reader* is
+# per-language. A target with no reader must be counted, never reported clean.
+_JAVA_PROJECTS = [{"name": "app", "depends_on": ["domain"]},
+                  {"name": "infra", "depends_on": ["domain", "app"]},
+                  {"name": "domain", "depends_on": []}]
+_JAVA_COMPS = [{"target_project": "app", "target_namespace": "shop.app"},
+               {"target_project": "infra", "target_namespace": "shop.infra"},
+               {"target_project": "domain", "target_namespace": "shop.domain"}]
+check("the same violation is caught in Java, with the same code",
+      _flags(_file("app/Service.java", "import shop.infra.OrderRepo;\nclass Service {}"),
+             "app", _JAVA_PROJECTS, _JAVA_COMPS))
+check("and Kotlin",
+      _flags(_file("app/Service.kt", "import shop.infra.OrderRepo\nclass Service"),
+             "app", _JAVA_PROJECTS, _JAVA_COMPS))
+check("a wildcard import resolves to its package, not to a type",
+      _flags(_file("app/S.java", "import shop.infra.*;\nclass S {}"),
+             "app", _JAVA_PROJECTS, _JAVA_COMPS))
+_cov = layering.coverage([{"path": "a/s.cs"}, {"path": "a/t.py"}, {"path": "a/a.csproj"}])
+check("a language with no reader is counted rather than passed as clean",
+      _cov == {"read": 1, "unread": 1}, str(_cov))
+
+# ── The plan is checked before the money is spent ──────────────────────────
+#
+# The half that pays for itself. The file-level dependency graph comes from deterministic
+# parsers (D-04), so "this service uses that repository" is a fact — and mapping both ends
+# through component membership turns "will this layout work" into arithmetic, available at
+# the plan gate. Every one of run 9c8cf4fe's twelve build errors was predictable here, with
+# $0.67 spent instead of $6.43.
+_PLAN_COMPS = [
+    {"target_project": "Shop.App", "meta": {"members": ["src/Services/EmployeeService.php"]}},
+    {"target_project": "Shop.Infra", "meta": {"members": ["src/Repos/EmployeeRepository.php"]}},
+]
+_EDGES = [("src/Services/EmployeeService.php", "src/Repos/EmployeeRepository.php")]
+_gaps = layering.plan_gaps(_PLAN_COMPS, _FOUR, [], _EDGES)
+check("a source dependency the layout forbids is found before conversion",
+      len(_gaps) == 1 and _gaps[0]["kind"] == "unbridged_dependency", str(_gaps))
+check("it names both projects and offers the three real ways out",
+      all(t in _gaps[0]["detail"] for t in ("Declare an interface", "allow the reference",
+                                            "move one of the two")),
+      _gaps[0]["detail"][-200:])
+check("a declared seam legalises exactly that crossing",
+      not layering.plan_gaps(_PLAN_COMPS, _FOUR,
+                             [{"interface": "IEmployeeRepository",
+                               "declared_in": "Shop.App", "implemented_in": "Shop.Infra"}],
+                             _EDGES))
+check("a seam pointing the other way does not",
+      layering.plan_gaps(_PLAN_COMPS, _FOUR,
+                         [{"interface": "IThing", "declared_in": "Shop.Infra",
+                           "implemented_in": "Shop.App"}], _EDGES))
+check("a dependency in an allowed direction is not a gap",
+      not layering.plan_gaps(
+          [{"target_project": "Shop.Infra", "meta": {"members": ["a.php"]}},
+           {"target_project": "Shop.App", "meta": {"members": ["b.php"]}}],
+          _FOUR, [], [("a.php", "b.php")]))
+check("and a plan with no stated graph is not pre-judged either",
+      not layering.plan_gaps(_PLAN_COMPS, _BLANK, [], _EDGES))
+
+# ── A seam promised and not delivered ─────────────────────────────────────
+#
+# The reason a project reaches where it may not: the interface it was told to depend on was
+# never written, so there was nothing to depend on and naming the concrete class was the only
+# way to do the work at all. Closing only the first half turns a build error into a component
+# that fails three times and gives up.
+_SEAM = [{"interface": "IUserRepository", "declared_in": "Shop.App",
+          "implemented_in": "Shop.Infra"}]
+check("an interface the plan promised and nobody wrote is a failure",
+      [i["kind"] for i in layering.unclosed_seams(_SEAM, {})] == ["seam_not_declared"])
+check("declared but never implemented is a warning, not a failure",
+      [(i["kind"], i["severity"]) for i in
+       layering.unclosed_seams(_SEAM, {"Shop.App": {"IUserRepository"}})]
+      == [("seam_not_implemented", "warn")])
+check("both ends present is silent",
+      not layering.unclosed_seams(_SEAM, {"Shop.App": {"IUserRepository"},
+                                          "Shop.Infra": {"IUserRepository", "UserRepository"}}))
+
+# ── What the converter is told before it writes anything ──────────────────
+#
+# The preventive half, and the cheap one: the answer was always in the plan. It had never
+# been put in front of the converter as a rule rather than as prose in a `purpose` line.
+_rules = layering.render_rules("Shop.App", _FOUR, _SEAM)
+check("the rules state what may be referenced", "`Shop.Domain`" in _rules)
+check("and what may not", "Shop.Infra" in _rules and "may **not**" in _rules)
+check("they say declaring an interface is the way across",
+      "declare the interface you need in this project" in _rules.lower())
+check("the declaring side is told to write the interface",
+      "declares these interfaces" in _rules and "IUserRepository" in _rules)
+_impl = layering.render_rules("Shop.Infra", _FOUR, _SEAM)
+check("and the implementing side is told to implement it — both ends, or the seam stays open",
+      "implements these interfaces" in _impl and "IUserRepository" in _impl, _impl[-200:])
+check("a project with no seams and no forbidden targets still gets a usable statement",
+      "Shop.Web" in layering.render_rules("Shop.Web", _FOUR, []))
+
+# ── The converter can ask, too ────────────────────────────────────────────
+_lk = store.create_run("project-rules", ".NET 8", "files", created_by="smoke")
+store.insert_units(_lk, [{"path": "#design/0001", "kind": "design", "status": "converted",
+                          "topo_level": 0, "order_index": 0}])
+store.set_unit_meta(store.list_units(_lk, kind="design")[0]["id"],
+                    {"projects": _FOUR, "seams": _SEAM})
+_ask = lookup.dispatcher(_lk)
+check("`project_rules` answers from the same graph the check enforces",
+      "may **not**" in _ask("project_rules", {"project": "Shop.App"}))
+check("asking about a project that does not exist lists the ones that do",
+      "Shop.Web" in _ask("project_rules", {"project": "Nope"}))
+check("and a run with no layout says so rather than inventing rules",
+      "no declared project layout" in
+      lookup.dispatcher(store.create_run("no-layout", ".NET 8", "files", created_by="smoke"))(
+          "project_rules", {}))
 
 
 # ── Summary ────────────────────────────────────────────────────────────────
