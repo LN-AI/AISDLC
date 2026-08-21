@@ -402,8 +402,72 @@ def plan_gaps(components: List[Dict[str, Any]], projects: List[Dict[str, Any]],
     return issues
 
 
+# What a type declaration says it derives from. Two families in one pattern: C#/Kotlin put the
+# base list after a colon, Java after `extends`/`implements`. The optional parenthesised group is
+# Kotlin's primary constructor, which sits between the name and the colon.
+_DECLARES = re.compile(
+    r"\b(?:class|interface|struct|record|object|enum)\s+[\w.]+\s*(?:<[^>]*>)?\s*"
+    r"(?:\([^)]*\))?\s*(?::|\bextends\b|\bimplements\b)\s*(?P<bases>.+)$",
+    re.DOTALL)
+
+
+def base_types(signature: str) -> Set[str]:
+    """The type names a declaration derives from or implements, by short name.
+
+    Needed because "does project P implement interface I" is not a question the symbol
+    registry answers directly: it records what each unit *declared*, and an implementer
+    declares `EmployeeRepository`, never `IEmployeeRepository`. Asking the registry for the
+    interface name under the implementing project therefore always answers no — which is
+    what `unclosed_seams` asked, and why it reported all four seams unimplemented on the
+    first run where all four were implemented correctly.
+    """
+    match = _DECLARES.search(str(signature or ""))
+    if not match:
+        return set()
+    bases = match.group("bases")
+    # A C# generic constraint follows the base list and is not part of it; the body ends it.
+    for cut in (" where ", "{", "\n"):
+        if cut in bases:
+            bases = bases.split(cut, 1)[0]
+    # Java writes one list with two separators: `extends A implements B, C`.
+    bases = re.sub(r"\b(?:extends|implements)\b", ",", bases)
+    names: Set[str] = set()
+    depth = 0
+    current = ""
+    # Split on commas the generics do not own — `IRepo<K, V>` is one base, not two.
+    for char in bases + ",":
+        if char in "<([":
+            depth += 1
+        elif char in ">)]":
+            depth -= 1
+        if char == "," and depth <= 0:
+            root = current.split("<", 1)[0].strip().rstrip("()").strip()
+            if root:
+                names.add(root.rsplit(".", 1)[-1])
+            current = ""
+            continue
+        current += char
+    return names
+
+
+def implemented_by(symbols: Iterable[Dict[str, Any]],
+                   project_of_unit: Dict[str, str]) -> Dict[str, Set[str]]:
+    """{project: the base-type names anything in it derives from}, from the symbol registry."""
+    found: Dict[str, Set[str]] = {}
+    for symbol in symbols or ():
+        project = project_of_unit.get(symbol.get("unit_id") or "")
+        if not project:
+            continue
+        bases = base_types(symbol.get("signature") or "")
+        if bases:
+            found.setdefault(project, set()).update(bases)
+    return found
+
+
 def unclosed_seams(seams: Iterable[Dict[str, Any]],
-                   declared_by_project: Dict[str, Set[str]]) -> List[Dict[str, Any]]:
+                   declared_by_project: Dict[str, Set[str]],
+                   implemented_by_project: Optional[Dict[str, Set[str]]] = None
+                   ) -> List[Dict[str, Any]]:
     """Seams the plan promised and the code never delivered.
 
     The other half of the same failure. `check` catches a project reaching where it may not;
@@ -415,7 +479,10 @@ def unclosed_seams(seams: Iterable[Dict[str, Any]],
     components and neither one can see the other while it is being converted.
 
     `declared_by_project` is {project: {type names it declared}} — from the symbol registry,
-    which records what each unit actually emitted.
+    which records what each unit actually emitted. `implemented_by_project` is the *other*
+    relation, {project: {type names anything in it derives from}}, because an implementer
+    declares a class and never the interface; passing it as `None` drops the
+    `seam_not_implemented` half rather than answering it wrongly (D-125).
     """
     issues: List[Dict[str, Any]] = []
     for seam in seams or ():
@@ -437,7 +504,8 @@ def unclosed_seams(seams: Iterable[Dict[str, Any]],
                     f"to depend on, so it either named the concrete class — which the "
                     f"architecture forbids — or left the work undone."),
             })
-        elif implemented_in and short not in declared_by_project.get(implemented_in, set()):
+        elif (implemented_by_project is not None and implemented_in
+              and short not in implemented_by_project.get(implemented_in, set())):
             # A declared interface nobody implements is a warning rather than a failure:
             # `reconcile` already reports unimplemented interfaces, and a seam whose
             # implementation is genuinely pending is a normal mid-run state.

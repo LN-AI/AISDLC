@@ -130,7 +130,8 @@ RATE_LIMIT_RETRY_CEILING_SECONDS = 120
 # "you have used everything you bought".
 _EXHAUSTED_MARKERS = (
     "usage limit", "quota", "insufficient", "credit", "billing", "out of funds",
-    "exceeded your current", "spending limit", "hard limit",
+    "exceeded your current", "spending limit", "hard limit", "payment", "purchase credits",
+    "plans & billing", "balance is too low",
 )
 
 
@@ -308,6 +309,21 @@ def _anthropic_send(client, params: Dict[str, Any], label: str,
             raise LLMProviderError(
                 "anthropic", label, config.LLM_MAX_RETRIES + 1, e, elapsed_ms=elapsed_ms,
             ) from e
+        except Exception as e:
+            # Not on the retry list, so today this propagated as-is and the unit spent an
+            # attempt on it. Ask the same question first: a provider that has refused for a
+            # reason no retry can fix says so in the message, and the *status code cannot
+            # tell you* - Anthropic reports an exhausted balance as a 400
+            # `invalid_request_error`, not a 429, so the one classifier whose whole job is
+            # spotting "retrying cannot help" never got asked about the commonest case.
+            # Anything it does not recognise propagates exactly as before.
+            unavailable = _unavailable_reason(e)
+            if not unavailable:
+                raise
+            logger.error("Anthropic call for tool '%s' cannot proceed: %s", label, unavailable)
+            raise LLMProviderUnavailableError(
+                "anthropic", label, attempt + 1, e,
+                elapsed_ms=(time.perf_counter() - start) * 1000) from e
     duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
@@ -429,6 +445,18 @@ def _call_openai(
             raise LLMProviderError(
                 "openai", tool_schema["name"], config.LLM_MAX_RETRIES + 1, e, elapsed_ms=elapsed_ms,
             ) from e
+        except Exception as e:
+            # Same gap as the Anthropic path, and more likely here: a router in front of
+            # several providers reports an exhausted account with whatever code the upstream
+            # gave it.
+            unavailable = _unavailable_reason(e)
+            if not unavailable:
+                raise
+            logger.error("OpenAI call for tool '%s' cannot proceed: %s",
+                         tool_schema["name"], unavailable)
+            raise LLMProviderUnavailableError(
+                "openai", tool_schema["name"], attempt + 1, e,
+                elapsed_ms=(time.perf_counter() - start) * 1000) from e
     duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)

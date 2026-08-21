@@ -13,9 +13,12 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Databases
+# Databases. `-wal`/`-shm` are the WAL-mode siblings this repo's own PRAGMA creates;
+# the list predated WAL and covered only the rollback journal.
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
@@ -34,3 +37,17 @@ Thumbs.db
 
 # Node (if any tooling is ever added)
 node_modules/
+
+# Local run output. Every one of these is produced by driving a real conversion — build and
+# driver logs, a captured parity corpus, a run id, a scratch key. Regenerable, sometimes large,
+# and a recording carries a customer's own pages, so none of it belongs in history.
+.parity_key
+run_id.txt
+build.out
+drive.out
+drive-full.out
+cps.json
+parity-tools.json
+parity-results.json
+local_*_testing.py
+.commandcode/

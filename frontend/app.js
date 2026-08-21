@@ -6052,6 +6052,10 @@ const MOD_WAIVER_CHECKPOINTS = {
   parity_divergence: { label: 'Finish with the differences unresolved', help: 'showModernizationParityHelp' },
   parity_incomplete: { label: 'Finish with the replay incomplete', help: 'showModernizationParityHelp' },
   build_required:    { label: 'Finish without compiling', help: 'showModernizationBuildHelp' },
+  build_errors_outstanding:
+                     { label: 'Finish with the build failing', help: 'showModernizationBuildHelp' },
+  build_not_repairable:
+                     { label: 'Finish with these errors unfixed', help: 'showModernizationBuildHelp' },
 };
 
 function renderModernizationCheckpoints(checkpoints) {

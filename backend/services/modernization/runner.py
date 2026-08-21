@@ -38,7 +38,8 @@ from backend.services import agent_guard, guardrail_service, llm_gateway
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence,
-    extraction_audit, graph, layering, lookup, parity, playbooks, reconcile, repo_ingest,
+    extraction_audit, graph, layering, lookup, ownership, parity, playbooks, reconcile,
+    repo_ingest,
     rules, sanity, scaffold, semantics, stages, store, usings, validation, wireup,
 )
 from backend.services.modernization.scaffold import php_compat
@@ -1224,7 +1225,13 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
     # Host wiring. Without this the export compiles clean and then throws
     # `Unable to resolve service for type 'I…'` on every request — the one failure mode a
     # build gate cannot see, so it is corrected here rather than left to the build loop.
-    host_plan = wireup.host_plan(artifacts, entry_project)
+    # The charter is passed because the database provider is a decision the customer already
+    # made and wrote down, and nothing had ever read it back: run 38ee8e01's `data_access`
+    # said "EF Core 8 with Microsoft.EntityFrameworkCore.Sqlite against the existing SQLite
+    # database" and its solution referenced the provider nowhere, registered the DbContext
+    # nowhere, and would have thrown on its first query.
+    host_plan = wireup.host_plan(artifacts, entry_project,
+                                 (store.get_run(run_id) or {}).get("charter"))
     program_path = f"{entry_project}/Program.cs" if entry_project else ""
     program = by_path.get(program_path)
     if program is not None:
@@ -1239,7 +1246,34 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
                 bits.append(f"{len(host_plan['view_formats'])} view location(s)")
             if host_plan["needs_session"]:
                 bits.append("session")
+            if host_plan.get("db_context"):
+                bits.append(f"DbContext {host_plan['db_context'].rsplit('.', 1)[-1]}")
             notes.append(f"Program.cs: {', '.join(bits) or 'corrected'}")
+
+    # The registration reads a connection string; give it a declared, empty home so the gap
+    # names itself instead of surfacing as a provider error.
+    if host_plan.get("db_context") and entry_project:
+        settings_path = f"{entry_project}/appsettings.json"
+        settings = by_path.get(settings_path)
+        if settings is not None:
+            updated = wireup.apply_to_appsettings(settings.get("content") or "")
+            if updated != (settings.get("content") or ""):
+                rewritten.append({
+                    "path": settings_path, "content": updated,
+                    "purpose": "host settings, with the connection string declared"})
+                notes.append(
+                    f"appsettings.json: declared ConnectionStrings:{wireup.CONNECTION_NAME} "
+                    f"(empty — supply it as the environment variable "
+                    f"ConnectionStrings__{wireup.CONNECTION_NAME})")
+
+    # A DbContext taking `DbContextOptions` cannot be registered without a provider, and a
+    # provider is never guessed (a wrong one restores, builds, and cannot open a connection).
+    # Say what is missing instead of registering nothing in silence.
+    if host_plan.get("db_note"):
+        store.create_checkpoint(
+            run_id, "database_provider_unknown",
+            "The DbContext cannot be registered without a database provider",
+            detail=host_plan["db_note"], unit_id=unit["id"], blocking=False)
     elif program_path:
         logger.warning("No Program.cs artifact at %s — host wiring skipped", program_path)
 
@@ -1257,6 +1291,49 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
         )
 
     if not rewritten:
+        # On a first pass this is the good outcome: nothing needed correcting. On a *rework*
+        # pass it is the opposite — this unit was reopened because a build failed, and a
+        # deterministic generator that computes no change will emit byte-identical output next
+        # round too, so the loop is guaranteed to trip `build_stuck` having spent a rework
+        # attempt to discover that. C-71 measured the cost: two rounds, 13 errors to 12, $0.47,
+        # while the real fix was a `<ProjectReference>` this stage had removed on purpose.
+        if (unit.get("rework_attempts") or 0) > 0:
+            repairs = build_results.deterministic_repairs(run_id, unit["id"])
+            if not repairs["actionable"]:
+                store.create_checkpoint(
+                    run_id, "build_not_repairable",
+                    "The build errors here cannot be fixed by regenerating project files",
+                    detail=(
+                        "This run's project files and host wiring were rebuilt from the "
+                        "converted code and came out identical to what is already in the "
+                        "export — so re-running them changes nothing, and the build will fail "
+                        "the same way again.\n\n"
+                        "The errors routed to this stage were:\n"
+                        + "\n".join(f"  - {d['code']}: {d['message'][:160]}"
+                                    for d in repairs["unactionable"][:20])
+                        + "\n\nA project file cannot fix these. The usual cause is a component "
+                          "split that needs a type moved across a project boundary, or a "
+                          "reference this stage cut to break a cycle — in which case the "
+                          "durable fix is moving the shared type down a layer rather than "
+                          "restoring the edge."
+                    )[:4000],
+                    unit_id=unit["id"], blocking=True,
+                    payload={"diagnostics": repairs["unactionable"][:20]},
+                )
+                store.append_event(
+                    run_id, "build_not_repairable",
+                    f"{len(repairs['unactionable'])} error(s) reached the wireup stage with no "
+                    f"deterministic fix; stopping rather than re-emitting identical output",
+                    unit_id=unit["id"], level="warning")
+                # Committed with no artifacts, exactly as the first-pass case is: the unit did
+                # its job and there is nothing to write. The checkpoint is what stops the run,
+                # and it does not consume a further rework attempt.
+                store.complete_unit(
+                    unit_id=unit["id"], run_id=run_id, artifacts=[], symbols=[],
+                    needs_human_review=True,
+                    event_detail="project files already matched the converted code, and the "
+                                 "build errors here are not ones a project file can fix")
+                return "converted"
         store.complete_unit(unit_id=unit["id"], run_id=run_id, artifacts=[], symbols=[],
                             event_detail="project files and host already matched the "
                                          "converted code")
@@ -1308,7 +1385,8 @@ def _unit_source(run_id: str, unit: Dict[str, Any],
 
 
 def _place_artifacts(run_id: str, unit: Dict[str, Any],
-                     files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                     files: List[Dict[str, Any]],
+                     rejected: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Join each returned file name onto the directory this run already chose for it.
 
     The model gives a bare `filename` and at most a `subdir`; the component's `output_dir`
@@ -1316,10 +1394,21 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
     longer possible rather than merely detectable: the model is not given a way to express
     the disagreement. Anything that still tries — a slash in `filename`, a `..` in `subdir` —
     is dropped, not repaired, exactly as `repo_ingest` treats an archive member (D-22).
+
+    `rejected` collects the reason for every drop. Without it the caller knows only that it
+    ended up with nothing, so a unit whose every filename was malformed retried against a
+    byte-identical prompt and spent all three attempts producing the same malformed names —
+    the trap D-65 and D-89 each close on another channel.
     """
     base = (unit.get("output_dir") or "").strip("/")
     placed: List[Dict[str, Any]] = []
     seen = set()
+
+    def _drop(reason: str) -> None:
+        store.append_event(run_id, "artifact_rejected", reason,
+                           unit_id=unit["id"], level="warning")
+        if rejected is not None:
+            rejected.append(reason)
     for entry in files:
         # `path` is still accepted so an older stub or a caller mid-upgrade keeps working;
         # `filename` is what the schema asks for.
@@ -1327,21 +1416,16 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
         if not raw and entry.get("path"):
             raw = str(entry["path"]).rsplit("/", 1)[-1].strip()
         if not raw or "/" in raw or "\\" in raw or raw in (".", ".."):
-            if raw:
-                store.append_event(run_id, "artifact_rejected",
-                                   f"filename must be a bare name, got {raw!r}",
-                                   unit_id=unit["id"], level="warning")
+            _drop(f"filename must be a bare name with no directory part, got {raw!r}"
+                  if raw else "a returned file carried no filename at all")
             continue
         subdir = (entry.get("subdir") or "").strip().strip("/")
         if subdir and (".." in subdir.split("/") or subdir.startswith("/")):
-            store.append_event(run_id, "artifact_rejected",
-                               f"unsafe subdir {subdir!r}", unit_id=unit["id"], level="warning")
+            _drop(f"unsafe subdir {subdir!r}")
             subdir = ""
         path = "/".join(p for p in (base, subdir, raw) if p)
         if path in seen:
-            store.append_event(run_id, "artifact_rejected",
-                               f"{path} was emitted twice by the same unit; kept the first",
-                               unit_id=unit["id"], level="warning")
+            _drop(f"{path} was emitted twice by the same unit; kept the first")
             continue
         seen.add(path)
         placed.append({"path": path, "content": entry.get("content", ""),
@@ -1666,6 +1750,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         semantics.summarize_for_prompt(meta.get("semantic_issues") or []),
         validation.summarize_for_prompt(meta.get("validation_issues") or []),
         layering.summarize_for_prompt(meta.get("layering_issues") or []),
+        ownership.summarize_for_prompt(meta.get("ownership_issues") or []),
     ) if block)
 
     # The preventive half, and the cheap one: the answer was always in the plan, it had
@@ -1677,6 +1762,13 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         _design_seams(run_id)) if unit.get("kind") == "component" else ""
     if boundaries:
         placement["project_rules"] = boundaries
+    # The other half of the same idea, and the same reasoning about cost: the plan already
+    # knew which files belong to whom, and the converter had never been told.
+    scope = ownership.render_scope(
+        unit, store.list_units(run_id, kind="component")
+    ) if unit.get("kind") == "component" else ""
+    if scope:
+        placement["ownership_rules"] = scope
 
     # Whether this unit may look things up before it answers. Components only: the other
     # stages are different agents with different questions, and a run that did not ask for
@@ -1760,11 +1852,23 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     if cost:
         store.add_run_spend(run_id, float(cost))
 
-    artifacts = _place_artifacts(run_id, unit, result.get("files") or [])
+    rejected: List[str] = []
+    artifacts = _place_artifacts(run_id, unit, result.get("files") or [], rejected)
     if not artifacts:
-        store.fail_unit(unit["id"], run_id,
-                        "The converter returned no files for this unit.",
-                        max_attempts=MAX_UNIT_ATTEMPTS)
+        detail = ("The converter returned no files for this unit."
+                  if not rejected else
+                  "Every file the converter returned was rejected before it could be stored: "
+                  + "; ".join(rejected[:8]))
+        # Persisted before failing, for the same reason as every other inline failure here: a
+        # retry with nothing to go on re-sends a byte-identical prompt and reproduces exactly
+        # the output that was just discarded.
+        store.set_unit_meta(unit["id"], {"validation_issues": [{
+            "severity": "fail", "check": "no_files", "path": path,
+            "detail": detail + (" Return each file with a bare `filename` and, if it belongs "
+                                "below the component's directory, a relative `subdir`."
+                                if rejected else ""),
+        }]})
+        store.fail_unit(unit["id"], run_id, detail, max_attempts=MAX_UNIT_ATTEMPTS)
         return "failed"
 
     # `_place_artifacts` already joined each bare filename onto the directory this run chose,
@@ -1785,7 +1889,20 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                         terminal=True)
         return "failed"
 
-    symbols = result.get("symbols_exported") or []
+    # Claimed exports, grounded in the emitted text before any reader trusts them. The registry
+    # recorded the model's word (C-53), and three readers below believe it: the namespace map
+    # `usings.repair` uses, the `known` set the unresolved-symbol check compares against, and —
+    # via `complete_unit` — reconciliation. So the verification has to happen here, above all
+    # three, rather than at the store.
+    verified = ownership.verify_type_symbols(
+        result.get("symbols_exported") or [], safe_artifacts, store.TYPE_SYMBOL_KINDS)
+    symbols = verified["symbols"]
+    if verified["dropped"]:
+        store.append_event(
+            run_id, "symbol_unverified",
+            f"{len(verified['dropped'])} claimed type(s) declared by no emitted file, dropped "
+            f"from the registry: " + ", ".join(verified["dropped"][:12]),
+            unit_id=unit["id"], level="warning")
 
     # Missing imports, added deterministically before anything looks at this output. The
     # namespace of every generated type is already known, so asking the model to get it right
@@ -1921,19 +2038,58 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
             )
         return "failed"
 
+    # One component, one set of files. The plan assigns every source file to exactly one
+    # component; nothing checked that a component converted only its own. Run 38ee8e01's
+    # `infrastructure-db` owned a PDO wrapper, a config file and a `schema.sql`, and emitted
+    # the four repository classes as well — which `employee-repository`, whose members those
+    # four `*Repository.php` files actually are, then emitted again. Both copies are in the
+    # export, so four seams that were declared and implemented correctly became four
+    # "ambiguous" registrations and were left out of the container.
+    #
+    # Commit time, not reconcile time: at the end of a run `duplicate_symbol` can only report
+    # two copies and the fix is to delete one and guess which — and the earlier component is
+    # the wrong copy to keep, having written the class without the source file in front of
+    # it. Here the fix is exact, and the *forward* case (the owner has not run yet) is
+    # invisible to every check that waits for the end.
+    foreign = ownership.foreign_declarations(
+        safe_artifacts, component=unit,
+        components=store.list_units(run_id, kind="component"),
+    ) if unit.get("kind") == "component" else []
+    if foreign:
+        store.set_unit_meta(unit["id"], {"ownership_issues": foreign})
+        detail = ownership.describe(foreign)
+        store.append_event(run_id, "foreign_declaration", detail[:500],
+                           unit_id=unit["id"], level="error")
+        status = store.fail_unit(unit["id"], run_id,
+                                 f"Converted files it does not own: {detail}"[:500],
+                                 max_attempts=MAX_UNIT_ATTEMPTS)
+        if status == "failed":
+            store.create_checkpoint(
+                run_id, "foreign_declaration",
+                f"{unit.get('component_name') or path} declared types another component owns",
+                detail=(detail + "\n\n"
+                        + ownership.summarize_for_prompt(foreign))[:4000],
+                unit_id=unit["id"], blocking=False,
+            )
+        return "failed"
+
     # Cleared on the way through, so a unit that failed twice and then succeeded does not
     # carry last time's findings into a later rework prompt as if they were still true.
     if (meta.get("semantic_issues") or meta.get("validation_issues")
-            or meta.get("layering_issues")):
+            or meta.get("layering_issues") or meta.get("ownership_issues")):
         store.set_unit_meta(unit["id"], {"semantic_issues": [], "validation_issues": [],
-                                         "layering_issues": []})
+                                         "layering_issues": [], "ownership_issues": []})
 
     # What the plan promised, against what arrived. The architect wrote `expected_files` for
     # this component and it is already rendered into the prompt — but nothing compared the
     # two, so a component that promised ten files and returned one 52-byte stub was recorded
-    # `converted` and the run reported "0 failed". A shortfall is not automatically a failure
-    # (a converter may fold two predicted files into one, legitimately), so it is surfaced as
-    # a review flag and a checkpoint rather than a hard fail.
+    # `converted` and the run reported "0 failed".
+    #
+    # A small shortfall is not a failure: a converter may fold two predicted files into one,
+    # legitimately, and failing that would spend retries arguing with a correct answer. A
+    # *majority* shortfall is different — nine missing types means CS0246 in every file that
+    # references them, so the archive compiles nowhere and the cheapest possible fix is to ask
+    # again with the missing names in the prompt.
     expected = [f for f in (meta.get("expected_files") or []) if f]
     shortfall: List[str] = []
     if expected:
@@ -1941,22 +2097,54 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                     for a in safe_artifacts}
         shortfall = [f for f in expected
                      if os.path.basename(f.replace("\\", "/")).lower() not in produced]
-        if shortfall:
-            store.append_event(
-                run_id, "expected_files_missing",
-                f"{path}: {len(shortfall)} of {len(expected)} planned file(s) not returned: "
-                + ", ".join(shortfall[:12]), unit_id=unit["id"], level="warning")
-            store.create_checkpoint(
-                run_id, "incomplete_component",
-                f"{unit.get('component_name') or path} returned "
-                f"{len(expected) - len(shortfall)} of {len(expected)} planned files",
-                detail=("The conversion plan for this component listed these files, and the "
-                        "converter did not return them:\n  " + "\n  ".join(shortfall)
-                        + "\n\nThis is not always wrong — two planned files may have been "
-                          "folded into one. Check the output before treating the component "
-                          "as done."),
-                unit_id=unit["id"], blocking=False,
-            )
+    if shortfall:
+        store.append_event(
+            run_id, "expected_files_missing",
+            f"{path}: {len(shortfall)} of {len(expected)} planned file(s) not returned: "
+            + ", ".join(shortfall[:12]), unit_id=unit["id"], level="warning")
+
+    # Retried only while there is a later attempt to carry the feedback. On the last one the
+    # partial output is committed and flagged instead — a component that has been asked twice
+    # and still under-delivers is telling us the plan over-predicted, and shipping nothing at
+    # all is the strictly worse failure (D-23's argument: one bad file must not strand the
+    # codebase).
+    severe = bool(shortfall) and len(shortfall) * 2 > len(expected)
+    if severe and (unit.get("attempts") or 1) < MAX_UNIT_ATTEMPTS:
+        detail = (f"{len(shortfall)} of {len(expected)} planned file(s) were missing from your "
+                  f"previous output: " + ", ".join(shortfall[:12]))
+        # Persisted before the unit is failed, exactly as `validation_issues` is above and for
+        # the same reason: without it the retry is byte-identical and spends every attempt
+        # reproducing the shortfall it is being retried for.
+        store.set_unit_meta(unit["id"], {"validation_issues": [{
+            "severity": "fail", "check": "expected_files", "path": path,
+            "detail": detail + ". Return the whole component again, including those files. If "
+                               "one of them genuinely belongs inside another, say so in "
+                               "`manual_followup` and name the file that absorbed it.",
+        }]})
+        store.fail_unit(unit["id"], run_id, f"Incomplete component: {detail}",
+                        terminal=False, max_attempts=MAX_UNIT_ATTEMPTS)
+        store.append_event(run_id, "incomplete_component_retried", detail,
+                           unit_id=unit["id"], level="warning")
+        return "failed"
+
+    if shortfall:
+        store.create_checkpoint(
+            run_id, "incomplete_component",
+            f"{unit.get('component_name') or path} returned "
+            f"{len(expected) - len(shortfall)} of {len(expected)} planned files",
+            detail=("The conversion plan for this component listed these files, and the "
+                    "converter did not return them:\n  " + "\n  ".join(shortfall)
+                    + ("\n\nThis is not always wrong — two planned files may have been "
+                       "folded into one. Check the output before treating the component "
+                       "as done."
+                       if not severe else
+                       f"\n\nThis component was asked again with the missing names in its "
+                       f"prompt and still did not return them, so the plan may have "
+                       f"over-predicted. The files it did return are in the export; the "
+                       f"types in the missing ones are not, and anything referencing them "
+                       f"will not compile.")),
+            unit_id=unit["id"], blocking=False,
+        )
 
     needs_review = bool(result.get("needs_human_review")) \
         or (result.get("confidence") or "").lower() == "low" \
@@ -1986,6 +2174,38 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
             unit_id=unit["id"], level="warning",
         )
     return "converted"
+
+
+def _build_blocks_completion(run_id: str) -> bool:
+    """Whether the build state should stop this run calling itself finished.
+
+    True when nothing has compiled the export, or when the last build reported errors and no
+    rework is queued behind them. False while rework is pending — `awaiting_rework` is the
+    honest state there, and a gate on a loop that has not run yet is the false alarm D-71
+    documents for `build_stuck`.
+
+    Never raises: a run must be able to finish even if the build tables cannot be read, and
+    the gate at the end of reconcile is the primary mechanism. This is the backstop.
+    """
+    try:
+        state = build_results.summary_for_run(run_id)
+        if state["status"] == "clean":
+            return False
+        if state["status"] == "errors" and store.pending_unit_count(run_id):
+            return False
+        # A waived gate has to let the run finish, or the waiver means nothing and the run is
+        # unfinishable — which is worse than the gate not existing. The waiver stays on the
+        # permanent record either way (D-112): the run keeps its build state, and the badge
+        # says `never_built` or `errors` for good.
+        answered = {c["kind"] for c in store.list_checkpoints(run_id)
+                    if c["status"] != "open"}
+        if answered & {"build_required", "build_errors_outstanding"}:
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not read the build state for run %s (allowing completion)",
+                         run_id)
+        return False
 
 
 def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
@@ -2031,6 +2251,54 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
                     f"Everything converted, but {store.open_blocking_checkpoints(run_id)} "
                     f"blocking checkpoint(s) are unanswered. The run is not finished until "
                     f"they are."))
+        elif outstanding == 0 and not stages_left and components["failed"]:
+            # A component that exhausted its attempts is `failed`, which `outstanding` does
+            # not count — so a run could lose half its components and still land in the
+            # branch below. The message made it worse: `counts` is over *source files*, and
+            # a failed component's members stay `rolled_up` rather than `failed`, so the
+            # terminal event read "27 file(s) converted, 0 failed" while eight of sixteen
+            # components had produced nothing at all. Observed on run 38ee8e01, which lost
+            # every view component to an exhausted API balance and reported success.
+            #
+            # `failed` rather than `paused`, because these units are terminal: a resume
+            # finds nothing claimable and would land here again. The status is the only
+            # honest signal that the export is partial; `reconcile` already names each
+            # missing component and the source files stranded with it.
+            stranded = sum(
+                len(((c.get("meta") or {}).get("members")) or [])
+                for c in store.list_units(run_id, kind="component")
+                if c.get("status") in ("failed", "needs_human"))
+            store.update_run(
+                run_id, status="failed", phase=run.get("phase") or "convert",
+                paused_reason=(
+                    f"{components['failed']} of {components['total']} component(s) did not "
+                    f"convert, so {stranded} source file(s) have no output. The export is "
+                    f"partial."))
+            store.append_event(
+                run_id, "run_incomplete",
+                f"{components['converted']} of {components['total']} component(s) converted; "
+                f"{components['failed']} failed, stranding {stranded} source file(s). The "
+                f"export is missing their output entirely — it is not a finished conversion.",
+                level="error",
+            )
+        elif outstanding == 0 and not stages_left and _build_blocks_completion(run_id):
+            # `build_results.gate` runs at the end of reconcile and raises a blocking
+            # checkpoint when the export was never compiled or its last build failed, so the
+            # branch above normally catches this. This is the belt to that braces: a run that
+            # reached the end without the gate having run — an older run resumed after this
+            # change, or a path that skips reconcile — could otherwise report `completed`
+            # having never been built, which is the claim this phase exists to stop making.
+            #
+            # Reads a *reported* build row and nothing else: no compiler, no subprocess, no
+            # inference. D-05 is about what this host may execute, and this executes nothing.
+            state = build_results.summary_for_run(run_id)
+            store.update_run(
+                run_id, status="paused", phase=stages.ORDER[-1],
+                paused_reason=(
+                    "Everything converted, but nothing has compiled this export."
+                    if state["status"] == "never_built" else
+                    f"Everything converted, but the last build reported "
+                    f"{state.get('errors', 0)} error(s)."))
         elif outstanding == 0 and not stages_left:
             store.update_run(run_id, status="completed", phase="completed")
             store.append_event(

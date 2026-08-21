@@ -43,7 +43,8 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
-    evidence, extraction_audit, graph, layering, lookup, parity, parity_tools, reconcile,
+    evidence, extraction_audit, graph, layering, lookup, ownership, parity, parity_tools,
+    reconcile,
     repo_ingest, runner, rules as rules_module, sanity, scaffold, stages, store, usings,
     validation, wireup,
 )
@@ -553,7 +554,13 @@ def _fake_conversion(system_prompt, user_content):
     import re as _re
     name = _re.search(r"# Unit to convert: `([^`]+)`", user_content).group(1)
     conversion_order.append(name)
-    stem = _stem(name)
+    # Emit the file the plan asked for. A real converter is handed `expected_files` in its
+    # prompt, so a stub that names its output after the synthetic component path instead was
+    # modelling a converter that ignores the plan on every single unit — which is exactly the
+    # shortfall the runner now retries. The `_stem(name)` fallback keeps the callers that
+    # convert a bare source file (rather than a component) working unchanged.
+    _planned = _re.search(r"\*\*Expected output\*\*[^:]*:\s*`([^`]+)`", user_content)
+    stem = _stem(_planned.group(1)) if _planned else _stem(name)
     return {
         # `filename`, not `path`: the directory is the run's, joined on in Python. A stub
         # that still supplied a path would be testing a shape the schema no longer asks for.
@@ -819,8 +826,10 @@ try:
     api_component = next(c for c in components
                          if "app/api.py" in (c["meta"].get("members") or []))
     deps_symbols = store.symbols_for_paths(e2e, api_component["depends_on"])
+    # `Service`, not `AppServicePy`: the stub now emits the file its plan asked for, so the
+    # symbol is named after the planned output rather than after the synthetic component path.
     check("a component's dependency signatures are retrievable — this is what keeps files coherent",
-          [s["name"] for s in deps_symbols] == ["AppServicePy"], str(deps_symbols))
+          [s["name"] for s in deps_symbols] == ["Service"], str(deps_symbols))
 
     check("spend accrued to the run", (store.get_run(e2e)["spent_usd"] or 0) >= 0)
     check("events were recorded", len(store.list_events(e2e)) >= 6)
@@ -977,8 +986,14 @@ try:
           any(c["kind"] == "validation" for c in store.list_checkpoints(fail_run)))
     check("the file behind it still converted — one bad file does not strand the rest",
           counts["converted"] == 2, str(counts))
+    # This used to admit `completed`, because `_finalize` had no way to distinguish a run
+    # that finished from one that gave up on a component: `outstanding` counts what is still
+    # claimable and a retired unit is not. It can say it now, so this asks for the stronger
+    # thing.
     check("the run does not report 'completed' with a hole in it",
-          fail_outcome["status"] in ("completed", "paused"), str(fail_outcome))
+          fail_outcome["status"] in ("failed", "paused"), str(fail_outcome))
+    check("and says so as a terminal state rather than a pause nobody can resume",
+          fail_outcome["status"] == "failed", str(fail_outcome["status"]))
     # A failed component leaves its source files `rolled_up` — not `failed` — so a per-file
     # tally reports zero problems while a third of the codebase has no output. This is the
     # check that stops a run looking complete because the files look fine.
@@ -1641,8 +1656,18 @@ try:
             break
 
     final = store.get_run(r18)
+    # Terminal, not `completed`: this fixture deliberately contains a component whose output
+    # the hazard check refuses (see below), so a run that called itself complete would be
+    # claiming output for `admin/run.php` that does not exist. What this section is actually
+    # about is that resume never stalls — that it *reaches* an end.
     check("a run driven only by start/resume reaches the end",
-          final["status"] == "completed", f"{final['status']} at phase {final['phase']}")
+          final["status"] in store.TERMINAL_RUN_STATES,
+          f"{final['status']} at phase {final['phase']}")
+    check("and the end is honest about the component the hazard check refused",
+          final["status"] == "failed"
+          and store.unit_status_counts(r18, kind="component")["failed"] > 0,
+          f"{final['status']}, "
+          f"{store.unit_status_counts(r18, kind='component')['failed']} failed")
     check("a paused run is never left without a reason for it",
           not (final["status"] == "paused" and not final["paused_reason"]),
           f"status={final['status']} reason={final['paused_reason']!r}")
@@ -2868,7 +2893,27 @@ def _finalizable_run(with_checkpoint):
 
 _clean = _finalizable_run(False)
 runner._finalize(_clean, 1, 0)
-check("a run with nothing outstanding completes", (store.get_run(_clean) or {})["status"] == "completed")
+# Never built, so it does not get to call itself finished — the claim this phase exists to
+# stop making. The gate is waivable and the waiver is what lets the run through.
+check("a run that was never compiled does not complete",
+      (store.get_run(_clean) or {})["status"] == "paused",
+      (store.get_run(_clean) or {})["status"])
+check("and the reason names the missing evidence rather than a generic pause",
+      "compiled" in ((store.get_run(_clean) or {}).get("paused_reason") or ""),
+      (store.get_run(_clean) or {}).get("paused_reason"))
+store.create_checkpoint(_clean, "build_required", "smoke: never built", blocking=True)
+for _cp in store.list_checkpoints(_clean, "open"):
+    store.answer_checkpoint(_cp["id"], {"decision": "waived"}, "smoke")
+# The pause above moved the phase to the last stage, which is what a resume needs; put it back
+# where `_finalizable_run` left it so this second call is testing the same branch as the first.
+store.update_run(_clean, status="reconciling", phase="completed")
+runner._finalize(_clean, 1, 0)
+check("a run with nothing outstanding completes once the build gate is answered",
+      (store.get_run(_clean) or {})["status"] == "completed",
+      (store.get_run(_clean) or {})["status"])
+check("and the waiver stays on the record — the build state is still 'never built'",
+      build_results.summary_for_run(_clean)["status"] == "never_built",
+      str(build_results.summary_for_run(_clean)))
 _blocked = _finalizable_run(True)
 runner._finalize(_blocked, 1, 0)
 check("a run whose behaviour diverged cannot be declared done",
@@ -3234,8 +3279,12 @@ def _drift_conversion(system_prompt, user_content):
     import re as _re
     label = (_re.search(r"^# Unit to convert: `([^`]+)`", user_content, _re.M)
              or [None, "Unit"])[1]
+    # The planned filename, for the same reason `_fake_conversion` uses it: a stub that names
+    # its output after the synthetic component path under-delivers against the plan on every
+    # unit, which the runner now retries — and these sections are about a *different* retry.
+    _planned = _re.search(r"\*\*Expected output\*\*[^:]*:\s*`([^`]+)`", user_content)
     return {
-        "files": [{"path": f"{_stem(label)}.cs",
+        "files": [{"path": f"{_stem(_planned.group(1)) if _planned else _stem(label)}.cs",
                    "content": f"namespace Acme.App;\npublic class C {{ void M() {{ {body} }} }}\n",
                    "purpose": "converted"}],
         "symbols_exported": [], "references": [], "changes": [], "manual_followup": [],
@@ -3716,8 +3765,12 @@ def _val_conversion(system_prompt, user_content):
     import re as _re
     label = (_re.search(r"^# Unit to convert: `([^`]+)`", user_content, _re.M)
              or [None, "Unit"])[1]
+    # The planned filename, for the same reason `_fake_conversion` uses it: a stub that names
+    # its output after the synthetic component path under-delivers against the plan on every
+    # unit, which the runner now retries — and these sections are about a *different* retry.
+    _planned = _re.search(r"\*\*Expected output\*\*[^:]*:\s*`([^`]+)`", user_content)
     return {
-        "files": [{"path": f"{_stem(label)}.cs",
+        "files": [{"path": f"{_stem(_planned.group(1)) if _planned else _stem(label)}.cs",
                    "content": f"namespace Acme.App;\n{body}\n", "purpose": "converted"}],
         "symbols_exported": [], "references": refs, "changes": [], "manual_followup": [],
         "confidence": "high",
@@ -4575,8 +4628,24 @@ check("the run log records that nothing compiled this",
       str([e["event"] for e in store.list_events(_bld_run)]))
 _bld_cp = [c for c in store.list_checkpoints(_bld_run) if c["kind"] == "build_required"]
 check("and a checkpoint asks for it", len(_bld_cp) == 1, str(len(_bld_cp)))
-check("which does not block the run — the platform cannot compile, so it cannot insist",
-      not _bld_cp[0]["blocking"])
+# Inverted deliberately, and this is the reason. Raised non-blocking, the gate meant that
+# "compiles" was not a claim any run could make: `_finalize` never read the build state, so a
+# run reported `completed` having never been built — and a real 45-file run finished at round 3
+# with four errors still open and nothing objecting. The platform still cannot compile; what it
+# no longer does is call an uncompiled run a success. Waivable, and the waiver is permanent.
+check("which now blocks the run — an uncompiled export is not a finished one",
+      _bld_cp[0]["blocking"])
+_app_js = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "frontend", "app.js"), encoding="utf-8").read()
+_waiver_block = _app_js.split("MOD_WAIVER_CHECKPOINTS", 1)[-1].split("};", 1)[0]
+check("and it is waivable, so a run that cannot be built is not unfinishable",
+      "build_required:" in _waiver_block, _waiver_block[:120])
+check("as is a failing build, with a label that says what waiving costs (D-112)",
+      "build_errors_outstanding" in _waiver_block
+      and "Finish with the build failing" in _waiver_block, _waiver_block[:200])
+check("the gates a rework round reopens are withdrawn, or a resume deadlocks",
+      set(build_results._END_OF_RUN_GATES) >= {"build_required", "build_errors_outstanding"},
+      str(build_results._END_OF_RUN_GATES))
 check("the checkpoint carries the command, not advice about the command",
       "build_run.py" in (_bld_cp[0]["detail"] or "") and _bld_run in (_bld_cp[0]["detail"] or ""),
       (_bld_cp[0]["detail"] or "")[:200])
@@ -4635,6 +4704,25 @@ check("and reads the key this deployment's login actually returns",
 check("it can send the project header some deployments demand",
       "X-Project-Id" in _build_src)
 check("the offline fixture path still needs neither", "--fixture" in _build_src)
+
+# The other half of the same friction. One build reports and stops, printing "resume the run",
+# so reaching a clean build was a manual ping-pong — which is why a real 45-file run finished at
+# round 3 with four errors outstanding and nobody ever built again.
+check("build_run.py can drive the loop rather than describing it",
+      "--loop" in _build_src and "def loop(" in _build_src)
+check("it re-downloads the export each round — the point is that the artifacts changed",
+      _build_src.count("download_export(") >= 2, str(_build_src.count("download_export(")))
+check("it stops on the statuses that mean another build cannot help",
+      all(s in _build_src for s in ("stuck", "round_limit", "unmapped")))
+check("it refuses to answer a blocking checkpoint it was not told to answer",
+      "_LOOP_ANSWERS" in _build_src and "needs a human" in _build_src)
+check("but it does expect the two build gates, which a rework round withdraws",
+      '"build_required", "build_errors_outstanding"' in _build_src)
+check("its round cap matches the platform's own",
+      f"default={build_results.MAX_BUILD_ROUNDS}" in _build_src,
+      f"expected default={build_results.MAX_BUILD_ROUNDS}")
+check("and it is bounded in wall-clock too, so a wedged provider cannot hold it forever",
+      "--hours" in _build_src and "deadline_hours" in _build_src)
 
 
 
@@ -6180,13 +6268,16 @@ _SEAM = [{"interface": "IUserRepository", "declared_in": "Shop.App",
           "implemented_in": "Shop.Infra"}]
 check("an interface the plan promised and nobody wrote is a failure",
       [i["kind"] for i in layering.unclosed_seams(_SEAM, {})] == ["seam_not_declared"])
+# The third argument is the base-type relation, not the declaration set — an implementer
+# declares `UserRepository : IUserRepository` and never `IUserRepository` itself. Section 46
+# is where that distinction and its false positive live.
 check("declared but never implemented is a warning, not a failure",
       [(i["kind"], i["severity"]) for i in
-       layering.unclosed_seams(_SEAM, {"Shop.App": {"IUserRepository"}})]
+       layering.unclosed_seams(_SEAM, {"Shop.App": {"IUserRepository"}}, {})]
       == [("seam_not_implemented", "warn")])
 check("both ends present is silent",
-      not layering.unclosed_seams(_SEAM, {"Shop.App": {"IUserRepository"},
-                                          "Shop.Infra": {"IUserRepository", "UserRepository"}}))
+      not layering.unclosed_seams(_SEAM, {"Shop.App": {"IUserRepository"}},
+                                  {"Shop.Infra": {"IUserRepository"}}))
 
 # ── What the converter is told before it writes anything ──────────────────
 #
@@ -6339,6 +6430,1051 @@ check("reconciliation reports a service the host will not resolve",
 check("and counts it as a failure, so the run cannot read as clean",
       _report["counts"]["fail"] >= 1, str(_report["counts"]))
 
+
+
+section("44. A refusal no retry can fix, arriving as a 400")
+
+# Run 38ee8e01, 2026-08-21: eight components into a sixteen-component conversion, the API
+# account ran out of credit and every call after that came back
+#
+#   400 - {'type': 'error', 'error': {'type': 'invalid_request_error',
+#           'message': 'Your credit balance is too low to access the Anthropic API. …'}}
+#
+# Section 41 built `_unavailable_reason` for exactly this situation and it never got asked,
+# because it was only ever consulted inside `except _RETRYABLE_ANTHROPIC` — and a 400 is not
+# retryable. So the classifier whose entire job is spotting "retrying cannot help" was blind
+# to the commonest way a provider says it. The eight remaining components each burned three
+# attempts on it, were retired terminally, and the run reported success.
+#
+# The status code cannot be the test. An exhausted balance is a 400 here, a 402 at one
+# provider and a 429 at another; only the message distinguishes it from a genuine bad request.
+
+_REAL_400 = ("Error code: 400 - {'type': 'error', 'error': {'type': "
+             "'invalid_request_error', 'message': 'Your credit balance is too low to access "
+             "the Anthropic API. Please go to Plans & Billing to upgrade or purchase "
+             "credits.'}}")
+
+check("the exact message that ended the run is recognised as permanent",
+      "out of quota or credit" in llm_gateway._unavailable_reason(Exception(_REAL_400)),
+      llm_gateway._unavailable_reason(Exception(_REAL_400))[:80])
+
+
+class _DeadClient:
+    """A provider that refuses with a non-retryable status. Counts its attempts, because
+    "did it stop asking" is the whole point."""
+
+    def __init__(self, message):
+        self.calls = 0
+        self.messages = self
+        self._message = message
+
+    def create(self, **_kwargs):
+        self.calls += 1
+        raise _ProviderRefusal(self._message)  # a plain Exception: not on the retry list
+
+
+_dead = _DeadClient(_REAL_400)
+try:
+    llm_gateway._anthropic_send(_dead, {"model": "m", "messages": []}, "convert_unit", 30.0)
+    _raised = None
+except Exception as exc:                                        # noqa: BLE001
+    _raised = exc
+check("it is raised as the error the runner knows how to pause on",
+      isinstance(_raised, llm_gateway.LLMProviderUnavailableError), type(_raised).__name__)
+check("and asked exactly once — a permanent refusal is not retried",
+      _dead.calls == 1, f"{_dead.calls} call(s)")
+
+# The other direction, and the one that would be expensive to get wrong: a 400 that is a real
+# bad request must keep behaving exactly as it did. Misclassifying it would pause the run and
+# leave the unit `ready` forever, waiting for a quota that was never the problem.
+_bad = _DeadClient("Error code: 400 - tools.0.custom.input_schema: unexpected keyword")
+try:
+    llm_gateway._anthropic_send(_bad, {"model": "m", "messages": []}, "convert_unit", 30.0)
+    _raised2 = None
+except Exception as exc:                                        # noqa: BLE001
+    _raised2 = exc
+check("a genuine bad request still propagates untouched",
+      isinstance(_raised2, _ProviderRefusal), type(_raised2).__name__)
+check("and is not dressed up as a provider outage",
+      not isinstance(_raised2, llm_gateway.LLMProviderError))
+check("also asked once — it was never retryable and still is not",
+      _bad.calls == 1, f"{_bad.calls} call(s)")
+
+# And the unit that hit it survives, which is the difference between a run you resume and a
+# run you re-pay for.
+_cr = store.create_run("credit-gone", ".NET 8", "files", created_by="smoke")
+store.insert_units(_cr, [{"path": "#component/0000-views", "kind": "component",
+                          "status": "ready", "component_name": "views",
+                          "topo_level": 0, "order_index": 0}])
+_cr_unit = store.list_units(_cr, kind="component")[0]
+runner._handle_stage_exception(
+    _cr, _cr_unit,
+    llm_gateway.LLMProviderUnavailableError("anthropic", "convert_unit", 1,
+                                            RuntimeError(_REAL_400)),
+    "the conversion")
+check("the run pauses instead of retiring the rest of the codebase",
+      store.get_run(_cr)["status"] == "paused", str(store.get_run(_cr)["status"]))
+check("the component is still claimable once the account is topped up",
+      store.list_units(_cr, kind="component")[0]["status"] == "ready",
+      str(store.list_units(_cr, kind="component")[0]["status"]))
+check("and the reason a human reads names the billing problem",
+      "credit" in (store.get_run(_cr)["paused_reason"] or "").lower(),
+      str(store.get_run(_cr)["paused_reason"])[:120])
+
+
+section("45. A run that lost half its components does not report success")
+
+# The second half of the same failure. `_finalize` decides the run's terminal state from
+# `outstanding = ready + blocked + in_progress`, which does not count a component that
+# exhausted its attempts — so run 38ee8e01 lost all eight of its view components and landed
+# in the `completed` branch. The event made it worse: `counts` is over *source files*, and a
+# failed component's members stay `rolled_up` rather than `failed`, so the last line of the
+# run read
+#
+#   run_completed: 27 file(s) converted, 0 failed, 8 component(s)
+#
+# — three true numbers arranged into a false statement. `_finalize`'s own comment, two
+# branches down, says what it was guarding against: "a run reported 'completed' with a third
+# of the codebase unconverted is a lie."
+
+_pf = store.create_run("partial-export", ".NET 8", "files", created_by="smoke")
+store.insert_units(_pf, [
+    {"path": "src/A.php", "kind": "source_file", "status": "rolled_up", "source_text": "<?php"},
+    {"path": "src/B.php", "kind": "source_file", "status": "rolled_up", "source_text": "<?php"}])
+store.insert_units(_pf, [
+    {"path": "#component/0000-good", "kind": "component", "status": "converted",
+     "component_name": "good", "target_project": "Acme.Web", "topo_level": 0,
+     "order_index": 0, "meta": {"members": ["src/A.php"]}},
+    {"path": "#component/0001-lost", "kind": "component", "status": "failed",
+     "component_name": "lost", "target_project": "Acme.Web", "topo_level": 0,
+     "order_index": 1, "meta": {"members": ["src/B.php"]}}])
+store.update_run(_pf, status="converting", phase="completed")
+_final = runner._finalize(_pf, converted=1, failed=1)
+check("the run is not called completed",
+      store.get_run(_pf)["status"] != "completed", str(store.get_run(_pf)["status"]))
+check("it is called failed, because the units are terminal and a resume finds nothing",
+      store.get_run(_pf)["status"] == "failed", str(store.get_run(_pf)["status"]))
+_pf_events = [e for e in store.list_events(_pf, limit=50) if e["event"] == "run_incomplete"]
+check("and an event says how many components are missing", len(_pf_events) == 1,
+      str([e["event"] for e in store.list_events(_pf, limit=50)]))
+check("naming the count a reader cares about, out of the total",
+      "1 of 2 component(s)" in _pf_events[0]["detail"], _pf_events[0]["detail"][:120])
+check("and the source files stranded with them, which the per-file tally reports as zero",
+      "stranding 1 source file(s)" in _pf_events[0]["detail"], _pf_events[0]["detail"][:160])
+check("the reason on the run says the export is partial",
+      "partial" in (store.get_run(_pf)["paused_reason"] or ""),
+      str(store.get_run(_pf)["paused_reason"])[:140])
+
+# A run that genuinely finished must be unaffected, or this trades one wrong status for
+# another and every clean conversion starts reporting failure.
+_cf = store.create_run("clean-export", ".NET 8", "files", created_by="smoke")
+store.insert_units(_cf, [{"path": "src/A.php", "kind": "source_file",
+                          "status": "rolled_up", "source_text": "<?php"}])
+store.insert_units(_cf, [{"path": "#component/0000-good", "kind": "component",
+                          "status": "converted", "component_name": "good",
+                          "target_project": "Acme.Web", "topo_level": 0, "order_index": 0,
+                          "meta": {"members": ["src/A.php"]}}])
+store.update_run(_cf, status="converting", phase="completed")
+# This run compiled clean. Recorded explicitly because the build gate now blocks completion on
+# a run nobody built, and the subject here is D-130's guard rather than the build state — a
+# test that tripped the wrong gate would stop asserting what it was written for.
+store.record_build(_cf, [], source="smoke")
+runner._finalize(_cf, converted=1, failed=0)
+check("a run with nothing failed still completes",
+      store.get_run(_cf)["status"] == "completed", str(store.get_run(_cf)["status"]))
+check("and still says so in the ordinary way",
+      any(e["event"] == "run_completed" for e in store.list_events(_cf, limit=50)))
+
+# A partial export is still real code, and the build loop is what fixes it. Before
+# `_finalize` learned to say "failed" this case was recorded as `completed` and took build
+# feedback normally, so the rework path has to keep accepting it — otherwise honesty about
+# the status silently retires a working repair loop.
+check("build rework still recognises a partial export as reworkable",
+      store.unit_status_counts(_pf, kind="component")["converted"] > 0)
+
+
+section("46. Asking the implementer the right question")
+
+# `unclosed_seams` reported all four seams unimplemented on the first run where all four were
+# implemented correctly — the sharpest kind of false positive, because it fires exactly when
+# the feature it checks has started working. It asked the symbol registry whether
+# `Ems.Infrastructure` *declared* `IEmployeeRepository`. It never will: an implementer
+# declares `EmployeeRepository : IEmployeeRepository`, so the interface only ever appears
+# under the project that owns it. The question is about the base-type relation, not the
+# declaration set, and they are different columns.
+
+check("a C# implementation states what it implements",
+      layering.base_types("public sealed class EmployeeRepository : IEmployeeRepository")
+      == {"IEmployeeRepository"})
+check("several bases, and a base class among them",
+      layering.base_types("public sealed class F : Attribute, IAuthorizationFilter")
+      == {"Attribute", "IAuthorizationFilter"})
+# The comma inside `IRepo<K, V>` belongs to the generic argument list, not to the base list —
+# splitting on it naively invents a base called `V>` and loses the real one.
+check("a generic base is one base, not two",
+      layering.base_types("public class Repo<K,V> : IRepo<K, V>, IDisposable where K : class")
+      == {"IRepo", "IDisposable"})
+check("a C# generic constraint is not a base type",
+      "class" not in layering.base_types("class R<T> : IR<T> where T : class, new()"))
+check("Java writes one list with two separators",
+      layering.base_types("public class Foo extends Bar implements Baz, Qux")
+      == {"Bar", "Baz", "Qux"})
+check("and Kotlin puts a constructor between the name and the colon",
+      layering.base_types("class Kt(val db: Db) : IRepo, Closeable")
+      == {"IRepo", "Closeable"})
+check("an interface that derives from nothing derives from nothing",
+      layering.base_types("public interface IUserRepository") == set())
+
+_SEAM = [{"interface": "IEmployeeRepository", "declared_in": "Acme.Application",
+          "implemented_in": "Acme.Infrastructure"}]
+_DECLARED = {"Acme.Application": {"IEmployeeRepository", "EmployeeService"},
+             "Acme.Infrastructure": {"EmployeeRepository"}}
+
+check("a seam honoured on both ends is silent",
+      not layering.unclosed_seams(
+          _SEAM, _DECLARED, {"Acme.Infrastructure": {"IEmployeeRepository"}}))
+check("a seam nothing implements is still reported",
+      [i["kind"] for i in layering.unclosed_seams(
+          _SEAM, _DECLARED, {"Acme.Infrastructure": {"IDisposable"}})]
+      == ["seam_not_implemented"])
+# D-125's asymmetry, applied to itself: with no base-type information available, the check
+# declines to answer rather than answering the way it used to.
+check("and with no implementation data at all it declines to judge",
+      not layering.unclosed_seams(_SEAM, _DECLARED))
+check("an interface the declaring project never wrote is still the harder failure",
+      [i["kind"] for i in layering.unclosed_seams(
+          _SEAM, {"Acme.Application": {"EmployeeService"}}, {})]
+      == ["seam_not_declared"])
+
+# End to end: the registry's own signatures, through reconciliation.
+_sm = store.create_run("seam-implemented", ".NET 8", "files", created_by="smoke")
+store.insert_units(_sm, [{"path": "a.php", "kind": "source_file", "status": "rolled_up",
+                          "source_text": "<?php echo 1;"}])
+store.insert_units(_sm, [
+    {"path": "#design/0001", "kind": "design", "status": "converted", "topo_level": 0,
+     "order_index": 0, "meta": {"seams": [
+         {"interface": "IEmployeeRepository", "declared_in": "Acme.Application",
+          "implemented_in": "Acme.Infrastructure"}]}},
+    {"path": "#component/0000-app", "kind": "component", "status": "converted",
+     "component_name": "app", "target_project": "Acme.Application",
+     "target_namespace": "Acme.Application", "output_dir": "Acme.Application",
+     "topo_level": 0, "order_index": 0, "meta": {"members": ["a.php"]}},
+    {"path": "#component/0001-infra", "kind": "component", "status": "converted",
+     "component_name": "infra", "target_project": "Acme.Infrastructure",
+     "target_namespace": "Acme.Infrastructure", "output_dir": "Acme.Infrastructure",
+     "topo_level": 1, "order_index": 1, "meta": {"members": []}}])
+_sm_app, _sm_infra = store.list_units(_sm, kind="component")
+store.complete_unit(
+    unit_id=_sm_app["id"], run_id=_sm,
+    symbols=[{"name": "IEmployeeRepository", "kind": "interface",
+              "signature": "public interface IEmployeeRepository",
+              "target_path": "IEmployeeRepository.cs"}],
+    artifacts=[{"path": "Acme.Application/IEmployeeRepository.cs",
+                "content": "namespace Acme.Application;\n"
+                           "public interface IEmployeeRepository { }\n"}])
+store.complete_unit(
+    unit_id=_sm_infra["id"], run_id=_sm,
+    symbols=[{"name": "EmployeeRepository", "kind": "class",
+              "signature": "public sealed class EmployeeRepository : IEmployeeRepository",
+              "target_path": "EmployeeRepository.cs"}],
+    artifacts=[{"path": "Acme.Infrastructure/EmployeeRepository.cs",
+                "content": "using Acme.Application;\nnamespace Acme.Infrastructure;\n"
+                           "public sealed class EmployeeRepository : IEmployeeRepository "
+                           "{ }\n"}])
+_sm_report = reconcile.run(_sm)
+check("reconciliation does not report a seam that was implemented",
+      not any(i["kind"].startswith("seam_") for i in _sm_report["issues"]),
+      str([i["kind"] for i in _sm_report["issues"]]))
+
+
+section("47. One component, one set of files")
+
+# Run 38ee8e01 again. Component `infrastructure-db` owned three files — a PDO wrapper, a
+# database config and a `schema.sql` — and its job was the `DbContext`. It emitted the
+# `DbContext`, and then all four repository classes as well. Component `employee-repository`,
+# whose members those four `*Repository.php` files actually are, ran next and emitted the
+# same four. The export carries both sets:
+#
+#   Ems.Infrastructure/Persistence/EmployeeRepository.cs
+#   Ems.Infrastructure/Repositories/EmployeeRepository.cs
+#
+# both `public sealed class EmployeeRepository : IEmployeeRepository`. `wireup` registers an
+# interface only when exactly one class implements it, so four seams that were declared and
+# implemented *correctly* became `wireup_ambiguous: 4 interface(s) need a registration
+# decision` and were left out of the container. A conversion that got the hard part right
+# shipped an application that throws on its first request.
+#
+# Nothing at the end of a run can repair it: `duplicate_symbol` can only report two copies
+# and the fix is to delete one and guess which — and the earlier component is the wrong copy
+# to keep, having written the class without the source file in front of it.
+
+check("a file named after a type predicts that type",
+      ownership.expected_type_name("src/Repositories/EmployeeRepository.php")
+      == "EmployeeRepository")
+# The uppercase-initial rule is the whole discrimination, and it has to hold for the files a
+# legacy codebase is mostly made of. A lowercase name is a script, a view or a config; it
+# predicts no type, so it can never be the basis of an accusation.
+check("a view predicts nothing", ownership.expected_type_name("views/employees/index.php") == "")
+check("nor does a config file", ownership.expected_type_name("config/database.php") == "")
+check("nor a schema dump", ownership.expected_type_name("database/schema.sql") == "")
+check("a path with punctuation in the stem is not an identifier",
+      ownership.expected_type_name("src/Api.v2.php") == "")
+
+_OWNED = [
+    {"path": "#component/0000-db", "component_name": "db",
+     "meta": {"members": ["src/Core/Database.php", "config/database.php",
+                          "database/schema.sql"]}},
+    {"path": "#component/0001-repos", "component_name": "repos",
+     "meta": {"members": ["src/Repositories/EmployeeRepository.php",
+                          "src/Repositories/UserRepository.php"]}},
+]
+_EMITTED = [
+    {"path": "Acme.Infrastructure/Persistence/EmsDbContext.cs",
+     "content": "namespace Acme.Infrastructure.Persistence;\npublic class EmsDbContext { }\n"},
+    {"path": "Acme.Infrastructure/Persistence/EmployeeRepository.cs",
+     "content": "namespace Acme.Infrastructure.Persistence;\n"
+                "public sealed class EmployeeRepository : IEmployeeRepository { }\n"},
+]
+_foreign = ownership.foreign_declarations(_EMITTED, component=_OWNED[0], components=_OWNED)
+check("a class another component's source file is named after is a failure",
+      [i["type"] for i in _foreign] == ["EmployeeRepository"], str([i["type"] for i in _foreign]))
+check("severity fail, because both copies end up in the export",
+      _foreign[0]["severity"] == "fail")
+check("the message names the component that owns it",
+      _foreign[0]["owner"] == "repos", _foreign[0]["owner"])
+check("and the source file, so the reader can see why",
+      "src/Repositories/EmployeeRepository.php" in _foreign[0]["detail"],
+      _foreign[0]["detail"][:160])
+check("and says what goes wrong, not just that something did",
+      "registered with the container as neither" in _foreign[0]["detail"])
+check("the DbContext it was actually asked for is not flagged",
+      not any(i["type"] == "EmsDbContext" for i in _foreign))
+check("and the owner emitting its own class is silent",
+      not ownership.foreign_declarations(
+          [{"path": "Acme.Infrastructure/EmployeeRepository.cs",
+            "content": "public class EmployeeRepository { }"}],
+          component=_OWNED[1], components=_OWNED))
+
+# The forward case is the one no end-of-run check can see: when `db` commits, `repos` has not
+# run, so there is no second copy to compare against yet. Ordering must be irrelevant.
+check("it fires whether or not the owner has converted yet",
+      len(ownership.foreign_declarations(_EMITTED, component=_OWNED[0],
+                                         components=_OWNED)) == 1)
+
+# A type folded into a file named after something else — "while I'm here" work, which is how
+# the real one arrived. The path stem says `EmsDbContext`; only the content says otherwise.
+check("a foreign class hidden in a file named after something else is still found",
+      [i["type"] for i in ownership.foreign_declarations(
+          [{"path": "Acme.Infrastructure/EmsDbContext.cs",
+            "content": "public class EmsDbContext { }\n"
+                       "public class UserRepository { }\n"}],
+          component=_OWNED[0], components=_OWNED)] == ["UserRepository"])
+# And not in a file that declares nothing — scanning a Razor view for the word `class` finds
+# CSS, which would fail every view component in the run.
+check("a view template is not scanned for declarations",
+      not ownership.foreign_declarations(
+          [{"path": "Acme.Web/Views/Index.cshtml",
+            "content": "<div class=\"UserRepository\">x</div>"}],
+          component=_OWNED[0], components=_OWNED))
+
+# Two components owning same-named files in different directories is ordinary in a legacy
+# codebase, and then neither is wrong to emit the type. An accusation would be a guess.
+_AMBIGUOUS = _OWNED + [{"path": "#component/0002-admin", "component_name": "admin",
+                        "meta": {"members": ["src/Admin/EmployeeRepository.php"]}}]
+check("a name two other components both predict is not attributed to either",
+      not ownership.foreign_declarations(_EMITTED, component=_OWNED[0],
+                                         components=_AMBIGUOUS))
+
+# The preventive half. It costs nothing, goes in the user message (D-06), and lists only
+# names somebody else actually owns — a general "stay in your lane" instruction is one the
+# model already believes it is following.
+_scope = ownership.render_scope(_OWNED[0], _OWNED)
+check("the component is told which types are not its to declare",
+      "`EmployeeRepository`" in _scope and "`UserRepository`" in _scope, _scope[:200])
+check("and the owner is not told to avoid its own",
+      "EmployeeRepository" not in ownership.render_scope(_OWNED[1], _OWNED),
+      ownership.render_scope(_OWNED[1], _OWNED)[:200])
+check("a run whose components share no predicted names says nothing at all",
+      ownership.render_scope(
+          {"path": "#component/0000-a", "meta": {"members": ["views/index.php"]}},
+          [{"path": "#component/0000-a", "meta": {"members": ["views/index.php"]}},
+           {"path": "#component/0001-b", "meta": {"members": ["config/app.php"]}}]) == "")
+
+# It reaches the prompt, which is the only reason the preventive half exists.
+_scoped_prompt = unit_converter._build_user_message(
+    "<?php class Database {}", "src/Core/Database.php", [], "class", "php", [], [],
+    placement={"project": "Acme.Infrastructure", "ownership_rules": _scope})
+check("and the conversion prompt carries it",
+      "Types other components own" in _scoped_prompt and "`UserRepository`" in _scoped_prompt)
+
+# The findings reach the next attempt, or the retry is a byte-identical no-op (D-89).
+check("a failed attempt's findings are written for the next one",
+      "belongs to" in ownership.summarize_for_prompt(_foreign),
+      ownership.summarize_for_prompt(_foreign)[:160])
+check("and describe() gives the event one line",
+      "EmployeeRepository (owned by repos)" in ownership.describe(_foreign),
+      ownership.describe(_foreign))
+check("nothing to report reports nothing",
+      ownership.describe([]) == "" and ownership.summarize_for_prompt([]) == ""
+      and not ownership.foreign_declarations([], component=_OWNED[0], components=_OWNED))
+
+
+section("48. The database the charter chose, and the services with no interface")
+
+# Run 38ee8e01's `Program.cs`, at the end of a $3.32 conversion, in full:
+#
+#   builder.Services.AddControllersWithViews();
+#   builder.Services.AddDistributedMemoryCache();
+#   builder.Services.AddSession();
+#   // Registrations for converted services are added here as components are converted.
+#
+# Not one service. `host_plan` registered an interface with exactly one implementation and
+# nothing else, which is none of the three shapes this export actually needed:
+#
+#   * the four repository interfaces had two implementations each (the ownership duplication
+#     of section 47), so all four were reported ambiguous and left out;
+#   * `AuthService`, `EmployeeService` and `PayrollService` have no interface at all, so they
+#     were never candidates;
+#   * `EmsDbContext(DbContextOptions<EmsDbContext>)` was neither registered nor given a
+#     provider package nor given a connection string — while the charter's own `data_access`
+#     decision reads "EF Core 8 with Microsoft.EntityFrameworkCore.Sqlite against the existing
+#     SQLite database". The answer was in the run the whole time and nothing read it.
+
+_DB_SRC = [
+    {"path": "Acme.Infra/EmsDbContext.cs",
+     "content": "using Microsoft.EntityFrameworkCore;\nnamespace Acme.Infra;\n"
+                "public sealed class EmsDbContext : DbContext {\n"
+                "  public EmsDbContext(DbContextOptions<EmsDbContext> o) : base(o) { }\n}\n"},
+]
+_CHARTER_SQLITE = {"data_access": "EF Core 8 with Microsoft.EntityFrameworkCore.Sqlite "
+                                 "against the existing SQLite database."}
+
+_db = wireup.db_plan(_DB_SRC, _CHARTER_SQLITE)
+check("the DbContext is found by its base type, not its name",
+      _db["context"] == "Acme.Infra.EmsDbContext", _db["context"])
+check("the provider comes from the charter the customer already wrote",
+      "UseSqlite(" in _db["registration"], _db["registration"])
+check("and it is registered as a DbContext, not as a scoped service",
+      _db["registration"].startswith(
+          "builder.Services.AddDbContext<Acme.Infra.EmsDbContext>"), _db["registration"])
+check("the connection string is read by name and never written into the code",
+      'GetConnectionString("DefaultConnection")' in _db["registration"]
+      and "Data Source" not in _db["registration"], _db["registration"])
+# Writing the line is also what adds the package: `_PACKAGE_TYPES` keys on `UseSqlite(`
+# appearing in generated code, so one mechanism closes both gaps.
+check("and writing it is what pulls in the provider package the solution never referenced",
+      ("Microsoft.EntityFrameworkCore.Sqlite", "8.0.10")
+      in wireup.packages_for_code(_db["registration"]),
+      str(sorted(wireup.packages_for_code(_db["registration"]))))
+
+check("a SQL Server charter gets SQL Server",
+      "UseSqlServer(" in wireup.db_plan(
+          _DB_SRC, {"data_access": "EF Core against SQL Server"})["registration"])
+check("a Postgres charter gets Npgsql",
+      "UseNpgsql(" in wireup.db_plan(
+          _DB_SRC, {"data_access": "EF Core 8 on PostgreSQL"})["registration"])
+# MySql cannot be configured from a connection string alone — the server version is a required
+# second argument, and `AutoDetect` is the only value derivable without asking anybody.
+check("a MySQL charter gets the server version MySql requires",
+      "ServerVersion.AutoDetect(" in wireup.db_plan(
+          _DB_SRC, {"data_access": "Pomelo EF Core provider for MySQL"})["registration"])
+
+# A provider is named or nothing happens. A wrong one restores, builds, and cannot open a
+# connection, which is a harder thing to diagnose than an absent registration.
+_no_provider = wireup.db_plan(_DB_SRC, {"data_access": "EF Core 8, one DbContext."})
+check("an unnamed provider registers nothing", _no_provider["registration"] == "")
+check("and says why, naming the context",
+      "EmsDbContext" in _no_provider["note"] and "provider" in _no_provider["note"],
+      _no_provider["note"][:140])
+# Read from the converted code first: a converter that already called `UseNpgsql` has decided,
+# and its decision outranks a charter sentence written before anything was converted.
+check("a provider the code already calls wins over the charter",
+      "UseNpgsql(" in wireup.db_plan(
+          _DB_SRC + [{"path": "Acme.Web/Program.cs",
+                      "content": "options.UseNpgsql(cs);"}],
+          _CHARTER_SQLITE)["registration"])
+
+# A context that configures itself needs no provider call and no options — registering it is
+# the whole job.
+check("a self-configuring context is registered as a plain scoped service",
+      wireup.db_plan([{"path": "a/C.cs", "content":
+                       "namespace N;\npublic class C : DbContext { public C() { } }"}],
+                     {})["registration"] == "builder.Services.AddScoped<N.C>();")
+check("and a solution with no DbContext at all is left alone",
+      wireup.db_plan([{"path": "a/C.cs", "content": "public class C { }"}],
+                     _CHARTER_SQLITE)["context"] == "")
+
+# ── Concrete services, and only the ones the container really builds ──────
+_SVC = [
+    {"path": "Web/HomeController.cs",
+     "content": "namespace Acme.Web;\npublic class HomeController {\n"
+                "  public HomeController(AuthService a) { }\n}\n"},
+    {"path": "App/AuthService.cs",
+     "content": "namespace Acme.App;\npublic sealed class AuthService {\n"
+                "  public AuthService(TokenReader r) { }\n}\n"},
+    {"path": "App/TokenReader.cs",
+     "content": "namespace Acme.App;\npublic sealed class TokenReader { }\n"},
+    # A public constructor does not make something a service. Nothing the container builds
+    # asks for a `Payslip`, so registering `Employee` because `Payslip(Employee, decimal)`
+    # exists would put an EF entity in the container.
+    {"path": "Domain/Payslip.cs",
+     "content": "namespace Acme.Domain;\npublic sealed class Payslip {\n"
+                "  public Payslip(Employee e, decimal net) { }\n}\n"},
+    {"path": "Domain/Employee.cs",
+     "content": "namespace Acme.Domain;\npublic sealed class Employee { }\n"},
+]
+_svc_plan = wireup.host_plan(_SVC, "Acme.Web")
+check("a concrete class a controller takes is registered",
+      "builder.Services.AddScoped<Acme.App.AuthService>();" in _svc_plan["services"],
+      str(_svc_plan["services"]))
+check("and so is what that class takes, transitively",
+      "builder.Services.AddScoped<Acme.App.TokenReader>();" in _svc_plan["services"],
+      str(_svc_plan["services"]))
+check("the controller itself is not registered — MVC builds it",
+      not any("HomeController" in s for s in _svc_plan["services"]))
+check("an entity nothing resolves is not registered as a service",
+      not any("Employee" in s or "Payslip" in s for s in _svc_plan["services"]),
+      str(_svc_plan["services"]))
+
+# The registration is generated code, so a type that cannot be a type argument is not an
+# over-eager registration — it is a compile error in the one file this stage writes.
+_BAD = [
+    {"path": "Web/HomeController.cs",
+     "content": "namespace N;\npublic class HomeController {\n"
+                "  public HomeController(Helper h, Base b, Repo<int> r, Dep d) { }\n}\n"},
+    {"path": "N/Rest.cs",
+     "content": "namespace N;\npublic static class Helper { }\n"
+                "public abstract class Base { }\npublic class Repo<T> { }\n"
+                "public class Dep { }\n"},
+]
+_bad_plan = wireup.host_plan(_BAD, "N")
+check("a static class is never registered — it is not a legal type argument",
+      not any("Helper" in s for s in _bad_plan["services"]), str(_bad_plan["services"]))
+check("nor an abstract one",
+      not any("Base" in s for s in _bad_plan["services"]), str(_bad_plan["services"]))
+check("nor an open generic, which would need its arguments supplied",
+      not any("Repo" in s for s in _bad_plan["services"]), str(_bad_plan["services"]))
+check("while the ordinary dependency beside them still is",
+      "builder.Services.AddScoped<N.Dep>();" in _bad_plan["services"],
+      str(_bad_plan["services"]))
+
+# Two types with one name is the same refusal the interface pass makes, for the same reason.
+check("a class name declared in two namespaces is reported, not chosen between",
+      any("Dep (" in a for a in wireup.host_plan(
+          _BAD + [{"path": "M/Dep.cs", "content": "namespace M;\npublic class Dep { }"}],
+          "N")["ambiguous"]))
+
+# ── Idempotence, because the build loop runs this again ───────────────────
+_prog = ("var builder = WebApplication.CreateBuilder(args);\n\n"
+         f"{wireup.MARKER}\n\nvar app = builder.Build();\n\napp.Run();\n")
+_once = wireup.apply_to_program_cs(_prog, wireup.host_plan(_DB_SRC, "Acme.Web",
+                                                           _CHARTER_SQLITE))
+_twice = wireup.apply_to_program_cs(_once, wireup.host_plan(_DB_SRC, "Acme.Web",
+                                                            _CHARTER_SQLITE))
+check("running the host wiring twice changes nothing the second time", _once == _twice)
+check("and the context is configured exactly once",
+      _once.count("AddDbContext") == 1, str(_once.count("AddDbContext")))
+# The unqualified form shares no substring with the qualified one, which is why the comparison
+# is on the call and the short type name rather than on the rendered line.
+check("a registration the converter already wrote unqualified is not written again",
+      wireup.apply_to_program_cs(
+          _prog.replace(wireup.MARKER,
+                        "builder.Services.AddDbContext<EmsDbContext>(o => o.UseSqlite(c));"),
+          wireup.host_plan(_DB_SRC, "Acme.Web", _CHARTER_SQLITE)).count("AddDbContext") == 1)
+
+# ── The connection string gets a home and no value ────────────────────────
+_settings = wireup.apply_to_appsettings('{\n  "AllowedHosts": "*"\n}\n')
+check("the connection string is declared in appsettings",
+      '"DefaultConnection"' in _settings, _settings)
+check("with no value in it — a connection string is a secret",
+      json.loads(_settings)["ConnectionStrings"]["DefaultConnection"] == "")
+check("and nothing that was already there is lost",
+      json.loads(_settings)["AllowedHosts"] == "*")
+check("running it twice does not nest it",
+      wireup.apply_to_appsettings(_settings) == _settings)
+check("a settings file that already declares one is left alone",
+      wireup.apply_to_appsettings('{"ConnectionStrings":{"Db":"x"}}')
+      == '{"ConnectionStrings":{"Db":"x"}}')
+check("and one that is not valid JSON is not rewritten into something worse",
+      wireup.apply_to_appsettings("{ not json") == "{ not json")
+
+# ── What this is worth, on the real export ────────────────────────────────
+#
+# Measured on run 38ee8e01's own artifacts, with the four duplicate repository files removed —
+# which is exactly what `ownership.foreign_declarations` now prevents at commit time. Before
+# today: `Program.cs` had no registrations and eight services would have thrown on the first
+# request that needed them.
+_REAL = _SVC + _DB_SRC + [
+    {"path": "App/IEmployeeRepository.cs",
+     "content": "namespace Acme.App;\npublic interface IEmployeeRepository { }\n"},
+    {"path": "Infra/EmployeeRepository.cs",
+     "content": "using Acme.App;\nnamespace Acme.Infra;\n"
+                "public sealed class EmployeeRepository : IEmployeeRepository {\n"
+                "  public EmployeeRepository(EmsDbContext db) { }\n}\n"},
+    {"path": "Web/EmployeeController.cs",
+     "content": "namespace Acme.Web;\npublic class EmployeeController {\n"
+                "  public EmployeeController(IEmployeeRepository r, AuthService a) { }\n}\n"},
+]
+_real_plan = wireup.host_plan(_REAL, "Acme.Web", _CHARTER_SQLITE)
+_real_wired = wireup.apply_to_program_cs(
+    _prog, _real_plan)
+check("nothing is left that the container cannot resolve",
+      not wireup.unregistered_dependencies(
+          _REAL, wireup.registrations_in(_real_wired)),
+      str([i["type"] for i in wireup.unregistered_dependencies(
+          _REAL, wireup.registrations_in(_real_wired))]))
+
+section("43. A claimed export the emitted code never declared")
+
+# The registry recorded what the model *said* it exported, never what was written (C-53). On a
+# real run a near-empty `Employee.cs` registered seven symbols, and reconciliation then reported
+# `IEmployeeRepository is declared but nothing implements it` — a type that exists in no file at
+# all. Three readers believe the claim before anything checks it, which is why the verification
+# has to sit above all three rather than at the store.
+
+_ver_arts = [{"path": "Acme.Web/Controllers/EmployeeController.cs",
+              "content": "namespace Acme.Web.Controllers;"
+                         + chr(10) + "public sealed class EmployeeController { }"}]
+_ver_syms = [
+    {"name": "EmployeeController", "kind": "class"},
+    {"name": "Acme.Web.Controllers.EmployeeController", "kind": "class"},
+    {"name": "IEmployeeRepository", "kind": "interface"},
+    {"name": "EmployeeController.Index", "kind": "method"},
+]
+_ver = ownership.verify_type_symbols(_ver_syms, _ver_arts, store.TYPE_SYMBOL_KINDS)
+_kept = {s["name"] for s in _ver["symbols"]}
+
+check("a claimed type no emitted file declares is dropped",
+      _ver["dropped"] == ["IEmployeeRepository"], str(_ver["dropped"]))
+check("the type that really was declared survives",
+      "EmployeeController" in _kept, str(sorted(_kept)))
+check("and so does its namespace-qualified spelling, matched on the last segment",
+      "Acme.Web.Controllers.EmployeeController" in _kept, str(sorted(_kept)))
+# D-110: `usings.referenced_types` matches a qualified name on its *last* segment, and taking
+# the first instead is a bug that repo has already had once. Matching the first here would drop
+# every correctly-qualified symbol in the run.
+check("matching the first segment instead would have dropped it — the D-110 trap",
+      "Acme" not in ownership.declared_names(_ver_arts))
+check("a method is not judged — `declared_names` reads declarations, not members",
+      "EmployeeController.Index" in _kept, str(sorted(_kept)))
+
+# The sharp part: a phantom in `known` *suppresses* the warning that would have caught the real
+# defect, so dropping it has to make that warning appear.
+_ver_refs = [{"name": "IEmployeeRepository", "external": False}]
+_before = validation.validate_unit_output(
+    _ver_arts, _ver_refs, {s["name"] for s in _ver_syms})
+_after = validation.validate_unit_output(
+    _ver_arts, _ver_refs, _kept)
+check("with the phantom in the known set, the unresolved symbol is invisible",
+      not [i for i in _before["issues"] if i["check"] == "unresolved_symbol"],
+      str([i["check"] for i in _before["issues"]]))
+check("with it dropped, the check reports the symbol that resolves to nothing",
+      [i for i in _after["issues"] if i["check"] == "unresolved_symbol"],
+      str([i["check"] for i in _after["issues"]]))
+check("and it stays a warn, not a fail — a forward reference in a cycle looks the same (D-23)",
+      _after["status"] != "fail", _after["status"])
+
+# A generic is a claim about its bare name; the arguments are not part of the declaration.
+check("a generic type name is matched without its arguments",
+      ownership.verify_type_symbols(
+          [{"name": "EmployeeController<T>", "kind": "class"}],
+          _ver_arts, store.TYPE_SYMBOL_KINDS)["dropped"] == [])
+check("nothing claimed, nothing dropped",
+      ownership.verify_type_symbols([], _ver_arts, store.TYPE_SYMBOL_KINDS)
+      == {"symbols": [], "dropped": []})
+
+
+section("44. Output that cannot be source at all")
+
+# C-52: every LLM-written file in one run came back as a single line with zero double-quotes,
+# single-quotes substituted throughout — `[Route('/index.php')]`, which is not compilable C#
+# because `'…'` is a char literal. Tier 0 passed all of it at `confidence=High`, because an
+# unindented single line balances its brackets perfectly. The balance scanner was the only
+# check that judged a file on its own terms, and this is the one failure it cannot see.
+#
+# The risk in this check is entirely false positives, so every payload below that *should*
+# pass is a shape a real conversion produces.
+
+def _v(path, content):
+    out = validation.validate_artifact({"path": path, "content": content})
+    return out["status"], [i["check"] for i in out["issues"]]
+
+_c52 = ("public class HomeController : Controller { [Route('/index.php')] "
+        "public IActionResult Index() { ViewData['Title'] = 'Legacy Employee Portal'; "
+        "return View(); } }")
+check("the measured C-52 payload fails, where it used to pass at High confidence",
+      _v("Web/HomeController.cs", _c52) == ("fail", ["plausible"]),
+      str(_v("Web/HomeController.cs", _c52)))
+check("and the reason names the substitution, not just 'invalid'",
+      any("character literal" in i["detail"]
+          for i in validation.validate_artifact(
+              {"path": "Web/HomeController.cs", "content": _c52})["issues"]))
+
+_real_cs = "\n".join([
+    "namespace Acme.Ems.Web.Controllers;", "",
+    "public sealed class EmployeeController : Controller", "{",
+    "    private readonly IEmployeeRepository _repo;", "",
+    "    public EmployeeController(IEmployeeRepository repo) => _repo = repo;", "",
+    '    [Route("/employees.php")]',
+    "    public async Task<IActionResult> Index()", "    {",
+    "        var rows = await _repo.AllAsync();", "        return View(rows);", "    }", "}"])
+check("a real converted controller is untouched",
+      _v("a/EmployeeController.cs", _real_cs) == ("pass", []),
+      str(_v("a/EmployeeController.cs", _real_cs)))
+
+# The three shapes that make the naive versions of each signal unusable.
+check("a three-line record is not 'unindented' — there is nothing to indent",
+      _v("a/Employee.cs", "namespace A;\n\npublic sealed record Employee(int Id);")[0] == "pass")
+check("a file of nothing but using directives has no block, so no body is missing",
+      _v("a/GlobalUsings.cs",
+         "\n".join(f"using System.Ns{i};" for i in range(12)))[0] == "pass")
+check("a flat Python settings module legitimately single-quotes and never indents",
+      _v("a/settings.py",
+         "\n".join(f"X{i} = 'value {i}'" for i in range(12)))[0] == "pass",
+      str(_v("a/settings.py", "\n".join(f"X{i} = 'value {i}'" for i in range(12)))))
+check("a C# char literal — including an escape — is not a substituted string",
+      _v("a/S.cs", "\n".join([
+          "namespace A;", "public static class S", "{",
+          "    public const char Sep = ';';",
+          "    public const char Nl = '\\n';",
+          "    public static string Join(string a) => a;", "}"]))[0] == "pass")
+check("a one-line appsettings.json is data, not source",
+      _v("a/appsettings.json",
+         '{"ConnectionStrings":{"DefaultConnection":""}}' * 8)[0] == "pass")
+
+# The quote substitution is only half of C-52; the other half is the missing line breaks, and
+# it has to fail on its own for a model that dodges newline escaping but not quote escaping.
+check("a nesting file with no indentation anywhere fails on that alone",
+      _v("a/B.cs", "\n".join([
+          "namespace A;", "public class B", "{", "public int X { get; set; }",
+          "public int Y { get; set; }", "public int Z { get; set; }",
+          "public void M() { }", "public void N() { }", "}"])) == ("fail", ["plausible"]))
+
+# It is a `fail`, so `runner` persists it into `validation_issues` and the next attempt is told
+# — the D-89 channel. A `warn` would have committed an un-compilable file and spent a build
+# round reporting errors nobody could act on.
+_c52_report = validation.validate_unit_output(
+    [{"path": "Web/HomeController.cs", "content": _c52}], [], set())
+check("it reaches the unit report as a fail, so the retry is not byte-identical",
+      _c52_report["status"] == "fail"
+      and "plausible" in [i["check"] for i in _c52_report["issues"]],
+      str(_c52_report["status"]))
+check("and summarize_for_prompt carries it to the next attempt",
+      "character literal" in validation.summarize_for_prompt(
+          [i for i in _c52_report["issues"] if i["severity"] == "fail"]),
+      validation.summarize_for_prompt(
+          [i for i in _c52_report["issues"] if i["severity"] == "fail"])[:160])
+
+section("45. A component that returns one file of four")
+
+# `expected_files` has been compared with what came back since the shortfall check landed, and
+# the result was a warning on a unit recorded `converted` — so a component that promised ten
+# files and returned one 52-byte stub shipped in the archive, flagged but present, and every
+# file referencing the nine missing types failed to compile.
+#
+# A small shortfall stays a warning: folding two planned files into one is a legitimate answer
+# and the prompt says so ("a plan, not a contract"). A *majority* shortfall is retried with the
+# missing names in the prompt, and on the last attempt the partial output is committed rather
+# than lost — a component asked twice that still under-delivers is telling us the plan
+# over-predicted, and shipping nothing is strictly worse (D-23).
+
+_short_prompts = []
+_short_returns = []          # how many of the four planned files to return, per attempt
+
+
+def _shortfall_architecture(user_content):
+    import re as _re
+    paths = _re.findall(r"^\| `([^`]+)` \|", user_content, _re.M)
+    return {
+        "projects": [{"name": "Acme.App", "purpose": "converted code"}],
+        "components": [{
+            "name": "wide", "project": "Acme.App", "namespace": "Acme.App.Wide",
+            "output_dir": "Acme.App/Wide", "members": list(paths), "role": "service",
+            "rationale": "one component, four planned files",
+            "expected_files": ["Alpha.cs", "Beta.cs", "Gamma.cs", "Delta.cs"],
+        }],
+        "shared_conventions": "Types are PascalCase.", "risks": [],
+        "summary": "One component promising four files.",
+    }
+
+
+def _shortfall_conversion(system_prompt, user_content):
+    _short_prompts.append(user_content)
+    count = _short_returns.pop(0) if _short_returns else 4
+    names = ["Alpha", "Beta", "Gamma", "Delta"][:count]
+    return {
+        "files": [{"filename": f"{n}.cs",
+                   "content": f"namespace Acme.App.Wide;\npublic class {n} {{ }}\n",
+                   "purpose": "converted"} for n in names],
+        "symbols_exported": [{"name": n, "kind": "class", "signature": f"public class {n}",
+                              "target_path": f"{n}.cs"} for n in names],
+        "references": [], "changes": [], "manual_followup": [],
+        "confidence": "High", "summary": f"returned {count} of 4",
+    }
+
+
+def _shortfall_call_tool(system_prompt, user_content, schema, llm_override=None,
+                         max_tokens=None, **kw):
+    if schema.get("name") == "submit_unit_conversion":
+        return _shortfall_conversion(system_prompt, user_content)
+    if schema.get("name") == "submit_target_architecture":
+        return _shortfall_architecture(user_content)
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+def _shortfall_run(returns):
+    """Drive a one-component run whose converter returns `returns[i]` files on attempt i."""
+    _short_prompts.clear()
+    _short_returns.clear()
+    _short_returns.extend(returns)
+    run_id = store.create_run("shortfall", ".NET 8", "files", created_by="smoke")
+    runner.ingest_and_analyze(run_id, [
+        {"path": "a.py", "content": "A = 1\n"},
+        {"path": "b.py", "content": "from a import A\nB = 2\n"},
+    ])
+    runner.set_charter(run_id, VALID_CHARTER, "smoke")
+    drive(run_id, rounds=12)
+    return run_id
+
+
+llm_gateway.call_tool = _shortfall_call_tool
+try:
+    # ── Recovers: one file, then all four.
+    _r = _shortfall_run([1, 4])
+    _units = store.list_units(_r, kind="component")
+    _events = [e.get("event") for e in store.list_events(_r, limit=500)]
+    check("a majority shortfall is retried rather than recorded as converted",
+          "incomplete_component_retried" in _events, str(_events))
+    check("and the shortfall is on the run log with its denominator",
+          any(e.get("event") == "expected_files_missing"
+              and "3 of 4" in (e.get("detail") or "")
+              for e in store.list_events(_r, limit=500)),
+          str([e.get("detail") for e in store.list_events(_r, limit=500)
+               if e.get("event") == "expected_files_missing"]))
+    _convert_prompts = [p for p in _short_prompts if "Unit to convert" in p]
+    check("the first attempt was told nothing about a shortfall",
+          _convert_prompts and "were missing from your previous output" not in _convert_prompts[0])
+    check("the retry names the files that did not arrive — not a byte-identical prompt (D-89)",
+          len(_convert_prompts) > 1
+          and "Beta.cs" in _convert_prompts[1] and "Delta.cs" in _convert_prompts[1],
+          f"{len(_convert_prompts)} conversion prompt(s)")
+    check("and offers the honest escape hatch rather than only a demand",
+          len(_convert_prompts) > 1 and "manual_followup" in _convert_prompts[1])
+    check("having delivered, the unit ends converted",
+          [u["status"] for u in _units] == ["converted"],
+          str([(u["component_name"], u["status"]) for u in _units]))
+    check("and all four files are in the export",
+          len([a for a in store.list_artifacts(_r, current_only=True)
+               if a["path"].startswith("Acme.App/Wide/")]) == 4,
+          str([a["path"] for a in store.list_artifacts(_r, current_only=True)]))
+    check("with no stale shortfall finding left to poison a later rework",
+          all(not (u.get("meta") or {}).get("validation_issues") for u in _units))
+
+    # ── Never recovers: the partial output is committed, not lost.
+    _r2 = _shortfall_run([1, 1, 1])
+    _units2 = store.list_units(_r2, kind="component")
+    _arts2 = [a for a in store.list_artifacts(_r2, current_only=True)
+              if a["path"].startswith("Acme.App/Wide/")]
+    check("a component that never delivers is not retried past its attempt limit",
+          len([p for p in _short_prompts if "Unit to convert" in p]) == 3,
+          str(len([p for p in _short_prompts if "Unit to convert" in p])))
+    check("the last attempt commits what it has rather than shipping nothing (D-23)",
+          [a["path"] for a in _arts2] == ["Acme.App/Wide/Alpha.cs"], str([a["path"] for a in _arts2]))
+    check("the unit is converted, so the codebase is not stranded on it",
+          [u["status"] for u in _units2] == ["converted"],
+          str([(u["component_name"], u["status"]) for u in _units2]))
+    _cp2 = [c for c in store.list_checkpoints(_r2) if c["kind"] == "incomplete_component"]
+    check("and a checkpoint says what is missing and what will not compile",
+          len(_cp2) == 1 and "over-predicted" in (_cp2[0]["detail"] or ""),
+          str([(c["kind"], (c["detail"] or "")[:60]) for c in _cp2]))
+    check("the unit is flagged for review, so it cannot read as clean",
+          all(u["needs_human_review"] for u in _units2))
+
+    # ── A minor shortfall is left alone, which is the whole reason for the threshold.
+    _r3 = _shortfall_run([3])
+    _units3 = store.list_units(_r3, kind="component")
+    check("three of four is committed on the first attempt, not retried",
+          len([p for p in _short_prompts if "Unit to convert" in p]) == 1,
+          str(len([p for p in _short_prompts if "Unit to convert" in p])))
+    check("a folded file is a legitimate answer, so the unit still converts",
+          [u["status"] for u in _units3] == ["converted"])
+    check("it is still reported, as a warning with the old wording",
+          any(c["kind"] == "incomplete_component"
+              and "folded into one" in (c["detail"] or "")
+              for c in store.list_checkpoints(_r3)))
+except Exception:
+    traceback.print_exc()
+    check("the shortfall runs raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+section("46. An error that names a project, not a file")
+
+# Measured on a real run: `dotnet build` failed during *restore* with
+#   NuGet.targets(1311,5): error MSB4006: circular dependency … [.../Acme.Ems.Application.csproj]
+# and the round landed in `unmapped` with 0 units reopened, so the fix loop could not start.
+# The origin is an SDK file no unit owns; the only routing information in the whole line was the
+# project in the bracket suffix, which `_strip_project_suffix` discarded to make dedup work.
+#
+# Dedup still has to work — that is not negotiable, and it is why the project stays out of
+# `DIAGNOSTIC_FIELDS` and out of `_key`.
+
+_msb = (r"C:\Program Files\dotnet\sdk\9.0.317\NuGet.targets(1311,5): error MSB4006: "
+        r"There is a circular dependency in the target dependency graph involving target "
+        r'"_GenerateRestoreProjectPathWalk". '
+        r"[C:\proj\export\Acme.Ems.Application\Acme.Ems.Application.csproj]")
+_msb_rows = build_results.parse_msbuild_log(_msb)
+check("the project the message named is kept, not discarded",
+      len(_msb_rows) == 1
+      and _msb_rows[0]["project"].endswith("Acme.Ems.Application/Acme.Ems.Application.csproj"),
+      str([(r["file"], r["project"]) for r in _msb_rows]))
+check("and the message itself is still stripped, so the fingerprint is stable",
+      "[" not in _msb_rows[0]["message"], _msb_rows[0]["message"][-60:])
+check("the origin is still honestly an SDK file, not rewritten to the project",
+      _msb_rows[0]["file"].endswith("NuGet.targets"), _msb_rows[0]["file"])
+check("the target framework is not part of the project path — it is what makes copies differ",
+      "TargetFramework" not in build_results.parse_msbuild_log(
+          r"a.cs(1,1): error CS1: x [C:\p\A\A.csproj::TargetFramework=net8.0]")[0]["project"])
+
+_dupes = "\n".join([
+    r"src\A.cs(3,5): error CS0246: type not found [C:\p\A\A.csproj]",
+    r"src\A.cs(3,5): error CS0246: type not found [C:\p\A\A.csproj::TargetFramework=net8.0]",
+    r"src\A.cs(3,5): error CS0246: type not found [C:\p\B\B.csproj]",
+])
+_dup_rows = build_results.parse_msbuild_log(_dupes)
+check("three copies of one error are still one row — the reason stripping exists",
+      len(_dup_rows) == 1, f"{len(_dup_rows)} row(s)")
+check("`project` is not part of the diagnostic contract",
+      "project" not in build_results.DIAGNOSTIC_FIELDS,
+      str(build_results.DIAGNOSTIC_FIELDS))
+check("a tool-name origin still resolves to no file and no project, honestly",
+      build_results.parse_msbuild_log(
+          "MSBUILD : error MSB1009: Project file does not exist.")[0]["file"] == ""
+      and build_results.parse_msbuild_log(
+          "MSBUILD : error MSB1009: Project file does not exist.")[0]["project"] == "")
+
+# End to end against a finished run's own artifacts: a project-level error must reopen the
+# unit that owns that `.csproj`, which is the scaffold unit before wireup runs and the wireup
+# unit after. Those are the only two units that write project files.
+_r46_csproj = [a["path"] for a in store.list_artifacts(r18) if a["path"].endswith(".csproj")]
+check("the finished run shipped a project file to attribute a project error to",
+      _r46_csproj, str([a["path"] for a in store.list_artifacts(r18)][:6]))
+if _r46_csproj:
+    _proj = _r46_csproj[0]
+    _r46_log = (r"C:\sdk\NuGet.targets(1311,5): error MSB4006: circular dependency "
+                r"[C:\ci\work\repo\%s]" % _proj.replace("/", "\\"))
+    _r46_rows = build_results.parse_msbuild_log(_r46_log)
+    _r46_kinds = build_results._map_units(r18, _r46_rows)
+    check("a project-level error reaches the unit that wrote the project file",
+          _r46_rows[0].get("unit_id"), str(_r46_rows[0]))
+    check("and is marked as routed by project, so a prompt can say so",
+          _r46_rows[0].get("routed_by") == "project", str(_r46_rows[0].get("routed_by")))
+    check("the unit it reaches is the one that owns project files",
+          set(_r46_kinds.values()) <= {"scaffold", "wireup"}, str(_r46_kinds))
+
+    # The tier is a fallback, never an override: a type error in a `.cs` file reported under a
+    # project must still reopen the component that wrote the file.
+    _cs_under_proj = build_results.parse_msbuild_log(
+        r"%s(3,5): error CS0246: type not found [C:\ci\work\repo\%s]"
+        % (_target.replace("/", "\\"), _proj.replace("/", "\\")))
+    build_results._map_units(r18, _cs_under_proj)
+    check("a .cs error carrying a project suffix still routes to its own component",
+          _cs_under_proj[0].get("artifact_path") == _target
+          and _cs_under_proj[0].get("routed_by") == "file",
+          str((_cs_under_proj[0].get("artifact_path"), _cs_under_proj[0].get("routed_by"))))
+
+section("47. A deterministic stage reopened with nothing it can fix")
+
+# `summarize_for_prompt` reaches `_convert_one` only. The scaffold and wireup stages make no
+# model call, so prose reaches nothing — yet they own every `.csproj`, `.sln` and `Program.cs`,
+# which makes them the only units a project-level error can route to. Reopened and told
+# nothing, they re-run a generator over unchanged inputs, emit byte-identical output, and the
+# next round trips `build_stuck` on an identical fingerprint. C-71 measured it: two rounds,
+# 13 errors to 12, $0.47, while the real fix was a reference this stage removed on purpose.
+
+_dr_run = store.create_run("repairs", ".NET 8", "files", created_by="smoke")
+_dr_unit = store.insert_units(_dr_run, [
+    {"path": "#wireup/0000", "kind": "wireup", "language": "", "module_type": "",
+     "source": "", "depends_on": [], "topo_level": 0, "status": "converted"}])
+_dr_unit_id = store.list_units(_dr_run, kind="wireup")[0]["id"]
+
+store.record_build(_dr_run, [
+    {"file": "", "line": 0, "col": 0, "severity": "error", "code": "MSB4006",
+     "message": "There is a circular dependency in the target dependency graph",
+     "project": "Acme.App/Acme.App.csproj", "unit_id": _dr_unit_id,
+     "artifact_path": "Acme.App/Acme.App.csproj"},
+], source="smoke")
+_dr = build_results.deterministic_repairs(_dr_run, _dr_unit_id)
+check("a project-reference cycle is something a project file can fix",
+      _dr["actionable"] and "project_cycle" in _dr["families"], str(_dr["families"]))
+
+_dr_run2 = store.create_run("repairs2", ".NET 8", "files", created_by="smoke")
+store.insert_units(_dr_run2, [
+    {"path": "#wireup/0000", "kind": "wireup", "language": "", "module_type": "",
+     "source": "", "depends_on": [], "topo_level": 0, "status": "converted"}])
+_dr_unit2 = store.list_units(_dr_run2, kind="wireup")[0]["id"]
+store.record_build(_dr_run2, [
+    {"file": "Acme.App/EmployeeService.cs", "line": 12, "col": 9, "severity": "error",
+     "code": "CS0246", "message": "The type or namespace name 'EmployeeRepository' could not "
+                                  "be found", "unit_id": _dr_unit2,
+     "artifact_path": "Acme.App/EmployeeService.cs"},
+    {"file": "", "line": 0, "col": 0, "severity": "error", "code": "NU1102",
+     "message": "Unable to find package Foo.Bar with version (>= 9.9.9)",
+     "unit_id": _dr_unit2, "artifact_path": "Acme.App/Acme.App.csproj"},
+], source="smoke")
+_dr2 = build_results.deterministic_repairs(_dr_run2, _dr_unit2)
+check("a type error is not something a project file can fix — this is C-71's family",
+      not _dr2["actionable"], str(_dr2["families"]))
+check("and a wrong package *version* is deliberately not repaired — a guess restores nothing",
+      any(d["code"] == "NU1102" for d in _dr2["unactionable"]),
+      str([d["code"] for d in _dr2["unactionable"]]))
+check("both are reported rather than dropped, so the checkpoint can name them",
+      len(_dr2["unactionable"]) == 2, str(len(_dr2["unactionable"])))
+check("a run with no build at all is not actionable and does not raise",
+      build_results.deterministic_repairs(
+          store.create_run("nobuild", ".NET 8", "files", created_by="smoke"),
+          "nope")["actionable"] is False)
+
+# Reopening the scaffold without the wireup unit silently reverts host wiring — C-59 again.
+_wu_run = store.create_run("withwireup", ".NET 8", "files", created_by="smoke")
+store.insert_units(_wu_run, [
+    {"path": "#scaffold/0000", "kind": "scaffold", "language": "", "module_type": "",
+     "source": "", "depends_on": [], "topo_level": 0, "status": "converted"},
+    {"path": "#wireup/0000", "kind": "wireup", "language": "", "module_type": "",
+     "source": "", "depends_on": [], "topo_level": 0, "status": "converted"}])
+_sc_id = store.list_units(_wu_run, kind="scaffold")[0]["id"]
+_wu_id = store.list_units(_wu_run, kind="wireup")[0]["id"]
+_paired = build_results._with_wireup(_wu_run, [_sc_id], {_sc_id: "scaffold"})
+check("reopening the scaffold drags the wireup pass with it",
+      set(_paired) == {_sc_id, _wu_id}, str(_paired))
+check("and says why, since no diagnostic named that unit",
+      any(e.get("event") == "wireup_reopened_with_scaffold"
+          for e in store.list_events(_wu_run)))
+check("reopening a component alone leaves the wireup unit where it is",
+      build_results._with_wireup(_wu_run, [_dr_unit_id], {_dr_unit_id: "component"})
+      == [_dr_unit_id])
+
+# The reopen transaction had no status predicate, so it flipped anything to `ready`.
+_rw_run = store.create_run("reworkable", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rw_run, [
+    {"path": "p.py", "kind": "source_file", "language": "python", "module_type": "business",
+     "source": "x=1", "depends_on": [], "topo_level": 0, "status": "failed"},
+    {"path": "q.py", "kind": "source_file", "language": "python", "module_type": "business",
+     "source": "y=1", "depends_on": [], "topo_level": 0, "status": "rolled_up"},
+    {"path": "r.py", "kind": "source_file", "language": "python", "module_type": "business",
+     "source": "z=1", "depends_on": [], "topo_level": 0, "status": "converted"}])
+_rw = {u["path"]: u["id"] for u in store.list_units(_rw_run)}
+_rw_out = store.reopen_units(_rw_run, list(_rw.values()), "smoke: everything")
+check("a terminally failed unit is not resurrected by a build report",
+      "p.py" in [u["path"] for u in _rw_out["unreworkable"]],
+      str(_rw_out["unreworkable"]))
+check("a component member is not made independently claimable",
+      "q.py" in [u["path"] for u in _rw_out["unreworkable"]],
+      str(_rw_out["unreworkable"]))
+check("the unit that actually produced output is the one reopened",
+      [u["path"] for u in _rw_out["units"]] == ["r.py"], str(_rw_out["units"]))
+check("and the refusal is reported rather than silent",
+      len(_rw_out["unreworkable"]) == 2, str(_rw_out))
 
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")

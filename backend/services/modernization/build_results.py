@@ -141,19 +141,35 @@ _PROJECT_HINT = re.compile(r"[/\\]|TargetFramework=|\.(?:sln|[A-Za-z]*proj)\b", 
 _LOOKS_LIKE_FILE = re.compile(r"[/\\]|\.[A-Za-z0-9_]{1,10}$")
 
 
-def _strip_project_suffix(message: str) -> str:
-    """Remove the trailing `[…\\Api.csproj]` MSBuild appends to every message.
+def _split_project_suffix(message: str) -> Tuple[str, str]:
+    """-> (message without the trailing `[…\\Api.csproj]`, the project path it named).
 
-    This is what makes deduplication work rather than being cosmetic: MSBuild repeats a
+    Stripping is what makes deduplication work rather than being cosmetic: MSBuild repeats a
     diagnostic once per project referencing the file and once per target framework, and the
     only thing that differs between those copies is this suffix
     (`[…\\Api.csproj::TargetFramework=net8.0]`). Left in place, three copies of one error
     look like three errors — in the count, in the fingerprint, and in the rework prompt.
+
+    **What changed is that the captured project is no longer thrown away.** A project-level
+    error names a project and nothing else, and the suffix was the only place it said which:
+    a real run reported
+    `NuGet.targets(1311,5): error MSB4006: circular dependency … [.../Acme.Ems.Application.csproj]`
+    and the stripped origin was `NuGet.targets` — an SDK file no unit owns — so the whole
+    round landed in `unmapped` with nothing reopened and the fix loop could not start.
+
+    The project stays *out* of `DIAGNOSTIC_FIELDS` and out of `_key`. In the contract it would
+    break "one schema, no aliases" for every producer (D-62); in the identity it would re-split
+    the copies stripping exists to collapse, which is the defect this function was written for.
+    So the first copy's project wins, and where the project is the only target there is exactly
+    one copy anyway.
     """
     match = _PROJECT_SUFFIX.search(message)
     if match and _PROJECT_HINT.search(match.group("project")):
-        return message[:match.start()].rstrip()
-    return message
+        # `Api.csproj::TargetFramework=net8.0` -> `Api.csproj`. The framework is what makes two
+        # copies of one diagnostic differ, so it can never be part of an artifact path.
+        project = match.group("project").split("::", 1)[0].strip()
+        return message[:match.start()].rstrip(), project
+    return message, ""
 
 
 def _relative_path(raw: Any) -> str:
@@ -199,8 +215,13 @@ def _severity(value: Any) -> str:
 
 
 def _diagnostic(file: Any, line: Any, col: Any, severity: Any, code: Any,
-                message: Any) -> Dict[str, Any]:
-    """One row in contract shape. Every field is coerced here and nowhere else."""
+                message: Any, project: Any = "") -> Dict[str, Any]:
+    """One row in contract shape. Every field is coerced here and nowhere else.
+
+    `project` is *derived*, not part of the contract: it is read off an MSBuild message suffix
+    rather than sent by a producer, so it is absent from `DIAGNOSTIC_FIELDS` and from `_key`
+    (see `_split_project_suffix`). A caller POSTing structured rows never supplies it.
+    """
     return {
         "file": _relative_path(file),
         "line": _int(line),
@@ -208,6 +229,7 @@ def _diagnostic(file: Any, line: Any, col: Any, severity: Any, code: Any,
         "severity": _severity(severity),
         "code": _text(code, 40),
         "message": _text(message, MAX_MESSAGE_CHARS),
+        "project": _relative_path(project),
     }
 
 
@@ -226,7 +248,7 @@ def parse_msbuild_log(text: str) -> List[Dict[str, Any]]:
 
     Output is already normalized (paths made relative, fields coerced), so it can be handed
     straight to `store.record_build`, and duplicates are removed — see
-    `_strip_project_suffix` for why there are always duplicates.
+    `_split_project_suffix` for why there are always duplicates.
     """
     if not isinstance(text, str):
         raise BuildReportError("'log' must be a string.")
@@ -243,23 +265,25 @@ def parse_msbuild_log(text: str) -> List[Dict[str, Any]]:
             continue
         match = _POSITIONAL.match(line)
         if match:
+            message, project = _split_project_suffix(match.group("message").strip())
             diagnostic = _diagnostic(
                 file=match.group("origin"), line=match.group("line"), col=match.group("col"),
                 severity=match.group("severity"), code=match.group("code"),
-                message=_strip_project_suffix(match.group("message").strip()),
+                message=message, project=project,
             )
         else:
             match = _BARE.match(line)
             if not match:
                 continue
             origin = match.group("origin").strip()
+            message, project = _split_project_suffix(match.group("message"))
             diagnostic = _diagnostic(
                 # `MSBUILD` and `CSC` are tools, not files. Recording them as the file would
                 # invent a path that can never map to a unit, so the field is left empty and
                 # the diagnostic is honestly counted as unmapped.
                 file=origin if _LOOKS_LIKE_FILE.search(origin) else "",
                 line=0, col=0, severity=match.group("severity"), code=match.group("code"),
-                message=_strip_project_suffix(match.group("message")),
+                message=message, project=project,
             )
         key = _key(diagnostic)
         if key in seen:
@@ -424,13 +448,46 @@ def _map_units(run_id: str, diagnostics: List[Dict[str, Any]]) -> Dict[str, str]
                 run_id, sorted(set(suffixed.values()))))
             resolved.update({p: a for p, a in suffixed.items() if a in owners})
 
+    # ── Third tier: the project a diagnostic named, when its file resolved to nothing.
+    #
+    # Only for the unresolved ones, and deliberately so. A `CS0246` in `X.cs` reported under
+    # `[Api.csproj]` must still reopen the component that wrote `X.cs` — routing it to the
+    # project owner instead would send a type error to a stage that only writes project files.
+    #
+    # The bracket path is a `.csproj`, which *is* an artifact of this run, so the same resolver
+    # handles it with no new matching logic. Whoever holds its current version is the wireup
+    # unit once wireup has rewritten it and the scaffold unit before — precisely the two units
+    # that can fix a project-level error, and the only two.
+    by_project: Dict[str, str] = {}
+    orphan_projects = list(dict.fromkeys(
+        d["project"] for d in diagnostics
+        if d.get("project") and not resolved.get(d["file"])))
+    if orphan_projects:
+        index = _basename_index(
+            a["path"] for a in store.list_artifacts(run_id, current_only=True))
+        for project in orphan_projects:
+            match = project if project in owners else _resolve_suffix(project, index)
+            if match:
+                by_project[project] = match
+        if by_project:
+            owners.update(store.units_for_artifact_paths(
+                run_id, sorted(set(by_project.values()))))
+            by_project = {p: a for p, a in by_project.items() if a in owners}
+
     kinds: Dict[str, str] = {}
     for diagnostic in diagnostics:
         artifact_path = resolved.get(diagnostic["file"], "")
+        routed_by = "file"
+        if not artifact_path and diagnostic.get("project"):
+            artifact_path = by_project.get(diagnostic["project"], "")
+            routed_by = "project"
         owner = owners.get(artifact_path) or {}
         if owner.get("unit_id"):
             diagnostic["unit_id"] = owner["unit_id"]
             diagnostic["artifact_path"] = artifact_path
+            # So a checkpoint and a rework prompt can say "this error names a project, not a
+            # file" — which is the difference between an actionable message and a confusing one.
+            diagnostic["routed_by"] = routed_by
             kinds[owner["unit_id"]] = owner.get("kind") or ""
     return kinds
 
@@ -473,6 +530,87 @@ def _code_histogram(diagnostics: List[Dict[str, Any]], limit: int = 6) -> str:
         counts[code] = counts.get(code, 0) + 1
     ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
     return ", ".join(f"{code} ×{n}" for code, n in ordered)
+
+
+# Diagnostic families whose fix lives in a project file, so a deterministic stage is the only
+# thing that can apply it. Anything not listed here cannot be fixed by re-running a generator,
+# which is the whole point of classifying them: a deterministic stage handed only unactionable
+# diagnostics must stop, not re-emit byte-identical output and spend the round proving it.
+_PROJECT_FILE_CODES = {
+    "MSB4006": "project_cycle",        # circular <ProjectReference> — MSBuild refuses to build
+    "MSB3202": "missing_project",      # a referenced .csproj that does not exist
+    "MSB4019": "missing_project",      # an imported project that was not found
+    "NU1101": "unresolvable_package",  # a package id NuGet cannot find at all
+    "NU1102": "package_version",       # id right, version wrong — deliberately NOT repairable
+}
+
+
+def deterministic_repairs(run_id: str, unit_id: str, build_id: str = "") -> Dict[str, Any]:
+    """What a *deterministic* stage could act on in the last build. Never a prompt.
+
+    `summarize_for_prompt` is the LLM half of this and is threaded only from `_convert_one`
+    (D-65). The scaffold and wireup stages make no model call, so prose reaches nothing — but
+    they own every `.csproj`, `.sln` and `Program.cs` in the run, which means they are the only
+    units a project-level error can be routed to (see `_map_units`' third tier). Reopened and
+    told nothing, they re-run a generator over unchanged inputs, emit byte-identical output, and
+    the next round trips `build_stuck` on an identical fingerprint. That is the trap D-65
+    documents, one stage over, and the mechanism behind C-71's measured 13 -> 12 errors for
+    $0.47.
+
+    Returns the classification only. Applying a repair is the stage's job, and a family with no
+    deterministic answer — `NU1102`, where guessing a version restores nothing — is reported as
+    unactionable rather than attempted.
+    """
+    if not build_id:
+        build_id = (store.latest_build(run_id) or {}).get("id") or ""
+    if not build_id:
+        return {"build_id": "", "actionable": False, "families": {}, "unactionable": []}
+
+    rows = store.diagnostics_for_unit(run_id, unit_id, build_id, limit=_PROMPT_FETCH)
+    errors = [r for r in rows if (r.get("severity") or "error") == "error"]
+    families: Dict[str, List[Dict[str, Any]]] = {}
+    unactionable: List[Dict[str, Any]] = []
+    for row in errors:
+        family = _PROJECT_FILE_CODES.get((row.get("code") or "").upper())
+        entry = {"code": row.get("code") or "", "message": row.get("message") or "",
+                 "project": row.get("project") or "", "file": row.get("file") or ""}
+        if family and family != "package_version":
+            families.setdefault(family, []).append(entry)
+        else:
+            unactionable.append(entry)
+    return {"build_id": build_id, "actionable": bool(families),
+            "families": families, "unactionable": unactionable}
+
+
+def _with_wireup(run_id: str, unit_ids: List[str],
+                 kinds: Dict[str, str]) -> List[Dict[str, Any]]:
+    """Add the wireup unit whenever the scaffold unit is being reopened.
+
+    `_rework_phase` rewinds a reopened scaffold unit to the `scaffold` stage, `_scaffold_one`
+    runs again, and `complete_unit` versions its **unwired** `Program.cs` and `.csproj` files as
+    current. The wireup unit is still `converted`, so it never re-runs — and the host wiring it
+    had added is gone, silently. That is C-59 reintroduced: an export that compiles and throws
+    on its first request because no service is registered.
+
+    Only when a wireup unit exists (a run that never reached the stage has nothing to add) and
+    only when it is not already in the set.
+    """
+    if not any(kinds.get(unit_id) == "scaffold" for unit_id in unit_ids):
+        return unit_ids
+    extra = [u["id"] for u in store.list_units(run_id, kind="wireup")
+             if u["id"] not in unit_ids]
+    if not extra:
+        return unit_ids
+    logger.info("Reopening wireup alongside the scaffold for run %s: %s", run_id, extra)
+    # Recorded so a reader can see why a unit no diagnostic named went back into the queue.
+    store.append_event(
+        run_id, "wireup_reopened_with_scaffold",
+        "The scaffold was reopened, so the wireup pass goes with it — re-running the scaffold "
+        "alone would re-emit the unwired host and lose every service registration.",
+        level="info")
+    for unit_id in extra:
+        kinds.setdefault(unit_id, "wireup")
+    return list(unit_ids) + extra
 
 
 def _rework_phase(kinds: Iterable[str]) -> str:
@@ -523,6 +661,7 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
     errors = [d for d in diagnostics if d["severity"] == "error"]
     warning_count = sum(1 for d in diagnostics if d["severity"] == "warning")
     error_units = list(dict.fromkeys(d["unit_id"] for d in errors if d.get("unit_id")))
+    error_units = _with_wireup(run_id, error_units, unit_kinds)
 
     recorded = store.record_build(
         run_id, diagnostics,
@@ -651,12 +790,19 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
             reopened_kinds = {unit_kinds.get(u["unit_id"], "")
                               for u in (outcome.get("units") or [])}
             _withdraw_end_of_run_gates(run_id, round_no)
-            # `completed` and `paused` only — deliberately not every terminal state. A build
-            # report arriving for a run somebody *cancelled* must not restart it: the branch is
-            # still there and CI keeps firing on it long after a human decided to stop, and
-            # "cancel" that quietly un-cancels is the worst kind of control. `failed` is
-            # excluded for the same reason — it stopped for a recorded reason that a compiler
-            # error is not evidence against.
+            # Not every terminal state. A build report arriving for a run somebody
+            # *cancelled* must not restart it: the branch is still there and CI keeps firing
+            # on it long after a human decided to stop, and "cancel" that quietly un-cancels
+            # is the worst kind of control.
+            #
+            # `failed` is admitted only when something actually converted. There are two ways
+            # to fail: no architecture was produced, so nothing converted and the export is
+            # bare scaffolding — a compiler error is no evidence against that, and rework has
+            # nothing to rework. Or some components converted and others did not, which is
+            # a *partial* export: it is real code, it can be compiled, and the errors in it
+            # are as fixable as any other run's. Before `_finalize` learned to say so, this
+            # second case was recorded as `completed` and took build feedback normally, so
+            # excluding it here would have quietly retired a working loop.
             #
             # **The phase is rewound for a paused run too**, which it was not. `_rework_phase`
             # exists because a run whose phase sits past the stage the reopened work lives in
@@ -666,7 +812,9 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
             # reconciliation, walked straight to `completed`, and the three units sat in
             # `ready` having never been re-converted. The build loop reported success at
             # reopening work that then silently never happened.
-            if run_status in ("completed", "paused"):
+            _partial = (run_status == "failed" and
+                        store.unit_status_counts(run_id, kind="component")["converted"] > 0)
+            if run_status in ("completed", "paused") or _partial:
                 rewound = _rework_phase(reopened_kinds)
                 store.update_run(
                     run_id, status="paused", phase=rewound,
@@ -676,7 +824,7 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
                         f"them again."
                     ),
                 )
-                if run_status == "completed":
+                if run_status in ("completed", "failed"):
                     notes.append("The run was moved out of its finished state and paused; "
                                  "resume it to convert them again.")
                 else:
@@ -835,16 +983,67 @@ def gate(run_id: str) -> Dict[str, Any]:
     solution before compiling a line (D-99). Every offline check had passed. One build would
     have said so in thirty seconds, and nothing in the normal flow asked for one.
 
-    **Not blocking, and not automatic.** D-05 forbids compiling on this host, so the platform
+    **Not automatic, and now blocking.** D-05 forbids compiling on this host, so the platform
     cannot answer this question itself — it can only make sure the question gets asked, of
     someone who can. The checkpoint carries the command, because "run a build" is advice and
     a command that can be pasted is an action.
+
+    What changed is the consequence of not answering. This was raised `blocking=False` on the
+    grounds that a platform which cannot compile cannot insist — but the result was that
+    "compiles" was not a claim any run could make: `_finalize` never consulted the build state,
+    so a run reported `completed` having never been built, or with errors outstanding from its
+    last round. A real 45-file run finished at round 3 with 4 errors still open and nothing
+    objecting. Both gates below are waivable, and a waiver is on the permanent record, which is
+    the same shape `parity_required` settled on (D-112): the platform still cannot compile, it
+    simply no longer calls an uncompiled run a success.
     """
     run = store.get_run(run_id) or {}
     if run.get("build_round"):
         latest = store.latest_build(run_id) or {}
-        return {"status": "clean" if not latest.get("error_count") else "errors",
-                "round": run.get("build_round"), "errors": latest.get("error_count") or 0}
+        errors = latest.get("error_count") or 0
+        if not errors:
+            return {"status": "clean", "round": run.get("build_round"), "errors": 0}
+
+        # Errors outstanding. Two honest states, and they need different sentences: nothing has
+        # been rewritten since that build, so the export in hand is the one that failed; or the
+        # rework already ran, in which case the *current* export has never been compiled at all
+        # and the error count on the record is about files that no longer exist in that form.
+        round_no = run.get("build_round")
+        changed = store.artifacts_changed_since(run_id, latest.get("created_at") or "")
+        pending = store.pending_unit_count(run_id)
+        if pending:
+            # Rework is queued. `awaiting_rework` is the honest state and a gate here would
+            # fire on a loop that has not run yet — the same guard D-71 puts on `build_stuck`.
+            return {"status": "errors", "round": round_no, "errors": errors}
+        if not any(c["kind"] == "build_errors_outstanding" and c["status"] == "open"
+                   and ((c.get("payload") or {}).get("round") or 0) >= round_no
+                   for c in store.list_checkpoints(run_id)):
+            store.create_checkpoint(
+                run_id, "build_errors_outstanding",
+                (f"{changed} file(s) have changed since the last build, so this export has "
+                 f"never been compiled" if changed else
+                 f"This export does not compile: {errors} error(s)"),
+                detail=(
+                    (f"Build round {round_no} reported {errors} error(s). Since then "
+                     f"{changed} artifact(s) have been rewritten, so the export you would "
+                     f"download now is not the one that was compiled — its errors are unknown "
+                     f"rather than known.\n\n"
+                     if changed else
+                     f"Build round {round_no} reported {errors} error(s) and nothing has been "
+                     f"rewritten since, so this is the export that failed.\n\n")
+                    + "Build it again and post the result:\n\n"
+                    f"    python scripts/build_run.py --loop --run {run_id} \\\n"
+                    "        --api <this deployment> --user <you> --password <yours>\n\n"
+                    "Failing units go back into the queue with the compiler's own errors in "
+                    "their prompt, so a build is not only a verdict — it is the input to the "
+                    "next attempt.\n\n"
+                    "Answer this to finish the run with the build failing."
+                )[:4000],
+                blocking=True,
+                payload={"round": round_no, "errors": errors, "changed": changed,
+                         "command": f"python scripts/build_run.py --loop --run {run_id}"},
+            )
+        return {"status": "errors", "round": round_no, "errors": errors}
 
     store.append_event(
         run_id, "build_not_checked",
@@ -873,8 +1072,8 @@ def gate(run_id: str) -> Dict[str, Any]:
                 "thing from GitHub Actions and reports back here.\n\n"
                 "Acknowledge this to close the run without that evidence."
             )[:4000],
-            blocking=False,
-            payload={"round": 0, "command": f"python scripts/build_run.py --run {run_id}"},
+            blocking=True,
+            payload={"round": 0, "command": f"python scripts/build_run.py --loop --run {run_id}"},
         )
     return {"status": "never_built", "round": 0, "errors": 0}
 
@@ -903,7 +1102,12 @@ def summary_for_run(run_id: str) -> Dict[str, Any]:
 # Gates that ask "are you finishing without this evidence?". They belong at the end of a run
 # and nowhere else — and `runner.resume` refuses to start while *any* blocking checkpoint is
 # open, which turns them into a deadlock the moment a build round reopens work.
-_END_OF_RUN_GATES = ("parity_required", "parity_divergence", "parity_incomplete")
+# Gates raised when a run reaches its end. A build round that reopens work has to take
+# them back down, or `runner.start` refuses to resume while one is open and the loop
+# deadlocks — the trap `_withdraw_end_of_run_gates` was written for. The two build
+# gates belong here for exactly that reason: they are the ones a rework round answers.
+_END_OF_RUN_GATES = ("parity_required", "parity_divergence", "parity_incomplete",
+                     "build_required", "build_errors_outstanding")
 
 
 def _withdraw_end_of_run_gates(run_id: str, round_no: int) -> int:

@@ -52,6 +52,35 @@ _PASCAL_LIKE = {".pas", ".dpr", ".dpk", ".inc"}
 _SQL_LIKE = {".sql", ".pls", ".pks", ".pkb", ".prc"}
 _NO_BALANCE_CHECK = {".md", ".txt", ".csv", ".properties"}
 
+# ── "Is this source at all?" ───────────────────────────────────────────────
+#
+# The balance scanner is the only thing that judged a file on its own terms, and it cannot see
+# the failure C-52 records: a whole C# file returned as one unindented line with single quotes
+# substituted for double (`[Route('/index.php')]`, `Title = 'Legacy Employee Portal'`). That is
+# not compilable C# — `'…'` is a char literal — and it passed at `confidence=High`, because an
+# unindented single line balances its brackets perfectly.
+#
+# Each signal below is individually weak and jointly unambiguous, so all three are separate
+# checks rather than a score. Data and markup are excluded throughout: a `.json` or a `.csproj`
+# may legitimately arrive on one line, and a `.cshtml` is mostly markup with its own quoting.
+_SOURCE_SUFFIXES = {".cs", ".vb", ".java", ".kt", ".kts", ".scala", ".ts", ".js", ".go",
+                    ".py", ".rb"}
+
+# Languages where `'` delimits a *character* and `"` delimits a string, so a `'`-quoted run of
+# real length is always wrong. Deliberately excludes `.py`/`.js`/`.ts`, which quote strings with
+# either, and `.vb`, where `'` opens a comment.
+_CHAR_LITERAL_SUFFIXES = {".cs", ".java", ".kt", ".kts", ".scala", ".go"}
+
+# `'x'` and `'\n'` are legitimate char literals, so the bar sits above both.
+_SINGLE_QUOTED_RUN = re.compile(r"'(?:[^'\\\n]|\\.){3,}'")
+
+# Under these, an unremarkable file trips the signal: `namespace X;` plus a one-line class has
+# no indentation, and a using-only file has no newline worth speaking of. Measured against the
+# fixtures rather than chosen — the smallest scaffold artifact is 6 lines and the smallest
+# converted `.cs` in the PHP fixture run is 9.
+_MIN_LINES_FOR_INDENT = 8
+_MIN_CHARS_FOR_NEWLINE = 400
+
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
 _CLOSERS = {v: k for k, v in _PAIRS.items()}
 
@@ -169,6 +198,44 @@ def _python_syntax(text: str) -> List[str]:
         return [f"Python syntax error at line {exc.lineno}: {exc.msg}"]
 
 
+def _implausible_source(text: str, ext: str) -> List[str]:
+    """Reasons this content cannot be source code in `ext`, or [].
+
+    Not a style opinion. Every reason here describes output no compiler could accept, which is
+    why they are `fail` rather than `warn` — a retry costs one attempt, and committing the file
+    costs a build round that reports errors nobody can act on.
+    """
+    if ext not in _SOURCE_SUFFIXES:
+        return []
+    reasons: List[str] = []
+
+    if len(text) >= _MIN_CHARS_FOR_NEWLINE and "\n" not in text.strip():
+        reasons.append(
+            f"The whole file is a single {len(text)}-character line. Source this long always "
+            f"has line breaks; a model dodging JSON escaping of newlines does not.")
+
+    # Only when the file actually *nests*. A flat module — twelve constants, a block of
+    # imports, a Python settings file — legitimately has no indentation anywhere, and firing on
+    # one is the false positive that gets a check switched off within a week (C-70's lesson via
+    # `sanity.template_without_renderer`). A brace is the evidence of a body that should have
+    # been indented; a language with no brace in the file is asserting no nesting.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if (len(lines) >= _MIN_LINES_FOR_INDENT and "{" in text
+            and not any(ln[:1] in (" ", "\t") for ln in lines)):
+        reasons.append(
+            f"None of the {len(lines)} non-empty lines is indented, though the file opens a "
+            f"block. A nested declaration is always indented by whatever wrote it as code.")
+
+    if ext in _CHAR_LITERAL_SUFFIXES and '"' not in text:
+        match = _SINGLE_QUOTED_RUN.search(text)
+        if match:
+            reasons.append(
+                f"The file holds no double quotes at all but contains {match.group(0)[:40]!r}. "
+                f"In this language that is a character literal, not a string, so the file "
+                f"cannot compile — the string delimiters were substituted.")
+    return reasons
+
+
 def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
     """Structural checks on one emitted file. Never raises."""
     path = artifact.get("path") or ""
@@ -190,6 +257,12 @@ def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
                           f"A conversion that says 'rest unchanged' has not converted the rest.",
             })
             break
+
+    # Before the balance scan, because that scan is what this failure defeats: a single
+    # unindented line balances perfectly, so the strongest structural check in the tier passes
+    # the one output in the corpus that provably cannot compile.
+    for detail in _implausible_source(content, ext):
+        issues.append({"severity": "fail", "check": "plausible", "detail": detail})
 
     if ext == ".py":
         for detail in _python_syntax(content):

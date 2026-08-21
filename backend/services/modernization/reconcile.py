@@ -334,7 +334,8 @@ def run(run_id: str) -> Dict[str, Any]:
             project = _project_of_unit.get(symbol.get("unit_id") or "")
             if project and symbol.get("name"):
                 _declared[project].add(str(symbol["name"]).rsplit(".", 1)[-1])
-        for issue in layering.unclosed_seams(_seams, _declared):
+        for issue in layering.unclosed_seams(
+                _seams, _declared, layering.implemented_by(symbols, _project_of_unit)):
             issues.append(_issue(issue["kind"], issue["severity"], issue["detail"]))
 
     # N. Services the container will not resolve. The one failure a build gate cannot catch

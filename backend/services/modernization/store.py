@@ -473,6 +473,13 @@ _ADDED_COLUMNS = (
     ("modernization_runs", "github_branch", "TEXT"),
     ("modernization_runs", "pr_url", "TEXT"),
     ("modernization_checkpoints", "payload_json", "TEXT"),
+    # The project an MSBuild message named in its `[…\Api.csproj]` suffix. Derived from the
+    # message rather than sent by a producer, so it is deliberately not part of the diagnostics
+    # contract (D-62) — it is the only routing information a project-level error carries, and
+    # stripping the suffix for deduplication used to discard it.
+    ("modernization_diagnostics", "project", "TEXT"),
+    # Which of the two resolved: the file the diagnostic named, or the project it named.
+    ("modernization_diagnostics", "routed_by", "TEXT"),
 )
 
 
@@ -1480,10 +1487,11 @@ def record_build(run_id: str, diagnostics: List[Dict[str, Any]], *, source: str 
         cursor.executemany(
             "INSERT INTO modernization_diagnostics "
             "(build_id, run_id, unit_id, artifact_path, file, line, col, severity, code, "
-            " message, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            " message, project, routed_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [(build_id, run_id, d.get("unit_id"), d.get("artifact_path", ""),
               d.get("file", ""), int(d.get("line") or 0), int(d.get("col") or 0),
-              d.get("severity") or "error", d.get("code", ""), d.get("message", ""), now)
+              d.get("severity") or "error", d.get("code", ""), d.get("message", ""),
+              d.get("project", ""), d.get("routed_by", ""), now)
              for d in diagnostics],
         )
         cursor.execute(
@@ -1518,11 +1526,12 @@ def reopen_units(run_id: str, unit_ids: List[str], reason: str,
     spends the budget rewriting the same file.
     """
     if not unit_ids:
-        return {"reopened": 0, "units": [], "exhausted": [], "deferred": [], "skipped": 0}
+        return {"reopened": 0, "units": [], "exhausted": [], "deferred": [],
+                "unreworkable": [], "skipped": 0}
     now = _now()
     conn = get_connection()
     cursor = conn.cursor()
-    reopened, exhausted, deferred, skipped = [], [], [], 0
+    reopened, exhausted, deferred, unreworkable, skipped = [], [], [], [], 0
     try:
         for unit_id in dict.fromkeys(unit_ids):
             row = cursor.execute(
@@ -1547,6 +1556,24 @@ def reopen_units(run_id: str, unit_ids: List[str], reason: str,
             if (row["rework_attempts"] or 0) >= max_rework:
                 exhausted.append({"unit_id": unit_id, "path": row["path"],
                                   "attempts": row["rework_attempts"] or 0})
+                continue
+            # The UPDATE below carried no status predicate at all, so it flipped *any* row to
+            # `ready`. Four of those are actively corrupting and are refused here:
+            #
+            #   `failed`/`skipped` — resurrecting a terminally failed unit on a diagnostic that
+            #       cannot have come from it (it produced no current artifact to complain about),
+            #       and giving it a rework attempt it never used.
+            #   `rolled_up`        — a component *member*. Making it claimable converts one
+            #       source file twice, in two units, which is the two-of-everything export
+            #       `ownership` exists to prevent.
+            #   `blocked`          — its dependencies have not converted, so the ordering the
+            #       whole graph exists to enforce would be skipped for it.
+            #
+            # `ready` is deliberately still reopenable: it is a no-op on the status and the
+            # rework counter advancing is what bounds a loop that has gone round again.
+            if row["status"] in ("failed", "skipped", "rolled_up", "blocked"):
+                unreworkable.append({"unit_id": unit_id, "path": row["path"],
+                                     "status": row["status"]})
                 continue
             # `attempts` is the *conversion* retry counter that `fail_unit` compares against
             # max_attempts; resetting it is what makes a reopened unit a fresh piece of work
@@ -1594,7 +1621,7 @@ def reopen_units(run_id: str, unit_ids: List[str], reason: str,
     finally:
         conn.close()
     return {"reopened": len(reopened), "units": reopened, "exhausted": exhausted,
-            "deferred": deferred, "skipped": skipped}
+            "deferred": deferred, "unreworkable": unreworkable, "skipped": skipped}
 
 
 def units_by_path(run_id: str, paths: List[str], include_source: bool = True
@@ -1620,6 +1647,30 @@ def units_by_path(run_id: str, paths: List[str], include_source: bool = True
     finally:
         conn.close()
     return out
+
+
+def artifacts_changed_since(run_id: str, since: str) -> int:
+    """How many current artifacts were written after `since`.
+
+    What the build gate needs to tell two different sentences apart. "Round 3 reported four
+    errors and nothing has changed since" means the export in hand is the one that failed —
+    a known quantity. "Round 3 reported four errors and eleven files have been rewritten
+    since" means the current export has never been compiled at all, and that error count is
+    about files that no longer exist in that form. Reporting the second as the first is the
+    absence-looks-like-evidence failure this subsystem keeps closing.
+
+    An empty `since` counts nothing rather than everything: no timestamp means no build to
+    compare against, and the caller already has a separate state for that.
+    """
+    if not since:
+        return 0
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_artifacts "
+        "WHERE run_id = ? AND is_current = 1 AND created_at > ?", (run_id, since),
+    ).fetchone()
+    conn.close()
+    return int(row["n"] if row else 0)
 
 
 def pending_unit_count(run_id: str) -> int:

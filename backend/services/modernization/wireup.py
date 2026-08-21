@@ -22,6 +22,7 @@ sometimes say `Microsoft.EntityFrameworkCore` and sometimes invent a version.
 `store.complete_unit` versions artifacts rather than overwriting them, so the scaffold's
 original `.csproj` stays readable next to the corrected one.
 """
+import json
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -87,6 +88,155 @@ _PACKAGE_TYPES: Tuple[Tuple[str, str, str], ...] = (
 _PACKAGE_REF = re.compile(r'<PackageReference\s+Include="([^"]+)"', re.IGNORECASE)
 _PROJECT_REF = re.compile(r'<ProjectReference\s+Include="[^"]*?([^\\/"]+)\.csproj"', re.IGNORECASE)
 
+# ── The database the charter chose, and the services with no interface ─────────────────
+#
+# `host_plan` registered an interface with exactly one implementation and nothing else, which
+# left the two shapes a converted application is most often missing. Measured on run
+# 38ee8e01's export, whose `Program.cs` ends up with **no registrations at all**:
+#
+#   * `EmsDbContext(DbContextOptions<EmsDbContext>)` — never registered, no EF provider
+#     package anywhere in the solution, and no connection string in `appsettings.json`,
+#     while the charter's own `data_access` decision reads "EF Core 8 with
+#     Microsoft.EntityFrameworkCore.Sqlite against the existing SQLite database". The
+#     information was in the run the whole time and nothing acted on it.
+#   * `AuthService`, `EmployeeService`, `PayrollService` — concrete classes with no
+#     interface, taken as constructor parameters by controllers, and never candidates for
+#     registration because the only rule was about interfaces.
+#
+# Emitting the registration is also what adds the provider package: `_PACKAGE_TYPES` keys on
+# `UseSqlite(` appearing in generated code, so writing the line closes the missing-package gap
+# without a second mechanism.
+
+_DBCONTEXT_CLASS = re.compile(
+    r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+)*class\s+(\w+)\s*:\s*"
+    r"[^\{\r\n]*\bDbContext\b")
+
+# A provider is named, never guessed. Order matters only for the charter scan: `sqlserver`
+# has to be tested before `sql`, so the longest spellings come first within each entry.
+_PROVIDERS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    ("Microsoft.EntityFrameworkCore.SqlServer", "UseSqlServer",
+     ("microsoft.entityframeworkcore.sqlserver", "sql server", "sqlserver", "mssql")),
+    ("Microsoft.EntityFrameworkCore.Sqlite", "UseSqlite",
+     ("microsoft.entityframeworkcore.sqlite", "sqlite")),
+    ("Npgsql.EntityFrameworkCore.PostgreSQL", "UseNpgsql",
+     ("npgsql.entityframeworkcore.postgresql", "postgresql", "postgres", "npgsql")),
+    ("Pomelo.EntityFrameworkCore.MySql", "UseMySql",
+     ("pomelo.entityframeworkcore.mysql", "mariadb", "mysql")),
+)
+
+# The configuration key the registration reads. A *name*, never a value: the charter this
+# product ships says "secrets come only from environment variables or a secret store — never
+# a literal in source, never a committed default in appsettings", and a connection string is
+# a secret. `ConnectionStrings__DefaultConnection` in the environment fills it.
+CONNECTION_NAME = "DefaultConnection"
+
+
+def db_provider(charter: Optional[Dict[str, Any]],
+                artifacts: Iterable[Dict[str, Any]]) -> Tuple[str, str]:
+    """-> (package, `Use…` call) for the database this run decided on, or ("", "").
+
+    Read from what the run already holds, in order of authority: a provider the converted
+    code is already calling, then the charter's own data-access decision, then a provider
+    package some project already references. Never inferred from entity mappings or a
+    comment — a wrong provider is a solution that restores, builds, and cannot open a
+    connection, which is harder to diagnose than no registration at all.
+    """
+    text = " ".join(str((a.get("content") or "")) for a in artifacts or ()
+                    if str(a.get("path") or "").lower().endswith((".cs", ".csproj")))
+    for package, call, _spellings in _PROVIDERS:
+        if call + "(" in text or package.lower() in text.lower():
+            return package, call
+    haystack = " ".join(str(v) for v in (charter or {}).values()).lower()
+    for package, call, spellings in _PROVIDERS:
+        if any(word in haystack for word in spellings):
+            return package, call
+    return "", ""
+
+
+def db_plan(artifacts: List[Dict[str, Any]],
+            charter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The DbContext registration this solution is missing, or an explained absence.
+
+    `context` is the type's fully-qualified name, `registration` the line to add (empty if it
+    cannot be written honestly), and `note` says why when it cannot.
+    """
+    context = ""
+    takes_options = False
+    for artifact in artifacts or ():
+        path = str(artifact.get("path") or "").replace("\\", "/")
+        if not path.lower().endswith(".cs"):
+            continue
+        code = usings.strip_non_code(artifact.get("content") or "")
+        found = _DBCONTEXT_CLASS.search(code)
+        if not found:
+            continue
+        name = found.group(1)
+        namespace = _namespace_of(artifact.get("content") or "")
+        context = f"{namespace}.{name}" if namespace else name
+        takes_options = bool(re.search(
+            r"\bpublic\s+" + re.escape(name) + r"\s*\([^)]*\bDbContextOptions\b", code))
+        break
+    if not context:
+        return {"context": "", "registration": "", "note": "", "package": ""}
+
+    # A context that configures itself in `OnConfiguring` needs no options and no provider
+    # call — registering it as a scoped service is the whole job.
+    if not takes_options:
+        return {"context": context, "package": "",
+                "registration": f"builder.Services.AddScoped<{context}>();",
+                "note": ""}
+
+    package, call = db_provider(charter, artifacts)
+    if not call:
+        return {
+            "context": context, "registration": "", "package": "",
+            "note": (f"`{context}` takes `DbContextOptions`, so it can only be registered "
+                     f"with a provider — and nothing in the charter, the converted code or "
+                     f"the project files names one. Add the EF provider package for the "
+                     f"target database and register it in `Program.cs`."),
+        }
+    connection = f'builder.Configuration.GetConnectionString("{CONNECTION_NAME}")'
+    # MySql cannot be configured from a connection string alone; the server version is a
+    # required second argument and `AutoDetect` is the only value derivable here.
+    inner = (f"options.{call}({connection}, ServerVersion.AutoDetect({connection}))"
+             if call == "UseMySql" else f"options.{call}({connection})")
+    # One line, and the connection string inlined rather than held in a local. A local named
+    # `connection` would be a compile error the second time `apply_to_program_cs` ran over the
+    # same file, and this stage is explicitly idempotent — the build loop re-runs it.
+    return {
+        "context": context, "package": package,
+        "registration": (
+            f"builder.Services.AddDbContext<{context}>(options => {inner});"),
+        "note": "",
+    }
+
+
+def _container_constructed(constructors: Dict[str, List[str]], seeds: Set[str],
+                           implementations: Optional[Dict[str, List[str]]] = None) -> Set[str]:
+    """Types the container itself builds: the seeds, and whatever they ask for, transitively.
+
+    The reason this closure exists rather than "every constructor parameter in the run": a
+    view model or an entity with a public constructor is not a service, and treating
+    `Employee` as a service because `PayslipResult(Employee, decimal)` exists would put an EF
+    entity in the container — or, in `unregistered_dependencies`, report a **failure** over
+    one. A parameter is only a dependency if something the container constructs asks for it,
+    and that starts at the controllers and the registered implementations.
+
+    Interfaces are followed to their implementations, or the walk stops one step short of
+    everything interesting: a controller takes `IEmployeeRepository`, and it is
+    `EmployeeRepository`'s constructor — not the interface's — that needs a `DbContext`.
+    """
+    reached = set(seeds)
+    frontier = list(seeds)
+    while frontier:
+        owner = frontier.pop()
+        for name in list(constructors.get(owner) or ()) + list(
+                (implementations or {}).get(owner) or ()):
+            if name not in reached:
+                reached.add(name)
+                frontier.append(name)
+    return reached
+
 # ── Host wiring ────────────────────────────────────────────────────────────────────────
 #
 # The scaffold writes `Program.cs` before any C# exists, so it can only leave a placeholder
@@ -127,6 +277,19 @@ _CONSTRUCTOR = re.compile(
 # and `EmsDbContext` derive from nothing and are exactly what goes unregistered.
 _ANY_CLASS = re.compile(
     r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+|static\s+|abstract\s+)*class\s+(\w+)")
+
+# A class no `AddScoped<T>()` can name. `static` and `abstract` are not legal type arguments
+# at all, and an open generic needs its arguments supplied — so registering any of the three
+# is not an over-eager registration, it is a **compile error in generated code**, which is the
+# one thing a wiring stage must never produce. `_ANY_CLASS` accepts all three modifiers by
+# design, because `unregistered_dependencies` wants the full declared set; the registration
+# pass needs the subset it can actually construct.
+_UNCONSTRUCTIBLE_CLASS = re.compile(
+    r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+)*(?:static|abstract)\s+"
+    r"(?:sealed\s+|partial\s+)*class\s+(\w+)")
+_GENERIC_CLASS = re.compile(
+    r"\b(?:public|internal)\s+(?:sealed\s+|partial\s+|static\s+|abstract\s+)*"
+    r"class\s+(\w+)\s*<")
 
 # One parameter: optional attributes, then a type, then a name. The type may be generic or
 # nullable; the last identifier before the parameter name is what has to be registered.
@@ -217,6 +380,9 @@ def unregistered_dependencies(artifacts: List[Dict[str, Any]],
     """
     declared: Set[str] = set()
     constructors: List[Tuple[str, str, List[str]]] = []
+    params_of: Dict[str, List[str]] = {}
+    impls_of: Dict[str, List[str]] = {}
+    controllers: Set[str] = set()
     for artifact in artifacts:
         path = (artifact.get("path") or "").replace("\\", "/")
         if not path.lower().endswith(".cs"):
@@ -224,20 +390,40 @@ def unregistered_dependencies(artifacts: List[Dict[str, Any]],
         code = usings.strip_non_code(artifact.get("content") or "")
         declared.update(_INTERFACE.findall(code))
         declared.update(_ANY_CLASS.findall(code))
+        controllers.update(f"{name}Controller" for name in _CONTROLLER.findall(code))
+        for cls, bases in _CLASS.findall(code):
+            for base in (b.split("<")[0].strip() for b in bases.split(",")):
+                if base.startswith("I") and len(base) > 1 and base[1:2].isupper():
+                    impls_of.setdefault(base, []).append(cls)
         for owner, arguments in ((m.group(1), m.group(2)) for m in _CONSTRUCTOR.finditer(code)):
             if arguments.strip():
                 constructors.append((path, owner, _parameter_types(arguments)))
+                params_of.setdefault(owner, []).extend(_parameter_types(arguments))
 
     registered: Set[str] = set()
     for line in registrations or ():
         for name in re.findall(r"[<,]\s*([A-Za-z_][\w.]*)", str(line)):
             registered.add(name.rsplit(".", 1)[-1])
 
+    # A type is only a *dependency* if something the container constructs asks for it. Without
+    # this the check reports a failure over any class with a public constructor — an entity
+    # taken by a value object, say — which is a false `fail` on correct output, and the fastest
+    # way to have a check switched off. Starts at the controllers and whatever is already
+    # registered, and follows interfaces to their implementations.
+    #
+    # With **no** seeds the closure is empty and would clear every finding: a minimal-API or
+    # worker-service target has no `*Controller` at all, and on the first pass nothing is
+    # registered yet. Reporting nothing there is the "absence looks like success" failure this
+    # product keeps closing, so no seeds means no narrowing — every constructor counts, which
+    # is exactly what this check did before the closure existed.
+    seeds = controllers | registered
+    resolved_by_container = (_container_constructed(params_of, seeds, impls_of)
+                             if seeds else None)
+
     missing: Dict[str, List[str]] = {}
     for path, owner, types in constructors:
-        # A type is only a *dependency* if something else constructs the owner. Every class
-        # here is either registered, a controller, or constructed by another service — all
-        # three are resolved by the container, so the parameter has to be resolvable.
+        if resolved_by_container is not None and owner not in resolved_by_container:
+            continue
         for name in types:
             if name in _FRAMEWORK_INJECTED or name not in declared or name in registered:
                 continue
@@ -266,7 +452,8 @@ def unregistered_dependencies(artifacts: List[Dict[str, Any]],
     return issues
 
 
-def host_plan(artifacts: List[Dict[str, Any]], entry_project: str) -> Dict[str, Any]:
+def host_plan(artifacts: List[Dict[str, Any]], entry_project: str,
+              charter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """What `Program.cs` is missing, read off the converted code. Pure — no I/O.
 
     Returns `services` (registration lines), `view_formats` (Razor search paths for a layout
@@ -278,6 +465,12 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str) -> Dict[str, 
     view_paths: List[str] = []
     needs_session = False
     needs_http_context = False
+    # Every class this run declares, by name -> the namespaces declaring it. A name in two
+    # namespaces is two types, and the container cannot be told which one to build; a name
+    # twice in one namespace is a `partial` class, which is one type.
+    class_namespaces: Dict[str, Set[str]] = {}
+    constructors: Dict[str, List[str]] = {}
+    unconstructible: Set[str] = set()
 
     for artifact in artifacts:
         path = (artifact.get("path") or "").replace("\\", "/")
@@ -296,6 +489,14 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str) -> Dict[str, 
                 base = base.split("<")[0].strip()
                 if base.startswith("I") and len(base) > 1 and base[1:2].isupper():
                     impls.setdefault(base, []).append((cls, namespace))
+        for cls in _ANY_CLASS.findall(code):
+            class_namespaces.setdefault(cls, set()).add(namespace)
+        unconstructible.update(_UNCONSTRUCTIBLE_CLASS.findall(code))
+        unconstructible.update(_GENERIC_CLASS.findall(code))
+        for owner, arguments in ((m.group(1), m.group(2))
+                                 for m in _CONSTRUCTOR.finditer(code)):
+            if arguments.strip():
+                constructors.setdefault(owner, []).extend(_parameter_types(arguments))
         controllers.update(_CONTROLLER.findall(code))
         if re.search(r"\bISession\b|\.Session\b", code):
             needs_session = True
@@ -304,6 +505,8 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str) -> Dict[str, 
 
     services: List[str] = []
     ambiguous: List[str] = []
+    registered_names: Set[str] = set()
+    db = db_plan(artifacts, charter)
     for interface in sorted(interfaces):
         found = impls.get(interface) or []
         if len(found) != 1:
@@ -318,10 +521,56 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str) -> Dict[str, 
         lhs = f"{iface_ns}.{interface}" if iface_ns else interface
         rhs = f"{impl_ns}.{cls}" if impl_ns else cls
         services.append(f"builder.Services.AddScoped<{lhs}, {rhs}>();")
+        registered_names.update({interface, cls})
+
+    # ── Concrete services nothing could have registered ───────────────────
+    #
+    # A class with no interface is not a candidate for the pass above, and a converter writes
+    # one whenever the source had no abstraction to preserve — `AuthService`,
+    # `EmployeeService`, `PayrollService` on run 38ee8e01, all three taken by a controller and
+    # all three unregistered. Only types the container actually constructs are followed, so an
+    # entity or a view model with a public constructor is never registered as a service.
+    seeds = {cls for pairs in impls.values() for cls, _ns in pairs}
+    seeds |= {f"{name}Controller" for name in controllers}
+    # `wanted - seeds`, not `wanted`. A seed is a starting point for the closure, not a service
+    # to register: a controller is built by MVC, and an implementation of a declared interface
+    # is either registered by the pass above or is one of two candidates that pass refused to
+    # choose between. Registering the seeds too made that refusal meaningless — an ambiguous
+    # interface got *both* its implementations registered as concrete types, so the interface
+    # still would not resolve and two useless registrations appeared beside the checkpoint
+    # asking a human to choose. Caught by the check that has asserted "two implementations
+    # register neither" since this stage was written.
+    wanted = _container_constructed(constructors, seeds) - seeds
+    for name in sorted(wanted):
+        if name in registered_names or name in _FRAMEWORK_INJECTED or name in interfaces:
+            continue
+        if name.endswith("Controller") or name == db.get("context", "").rsplit(".", 1)[-1]:
+            continue
+        if name in unconstructible:
+            continue
+        namespaces = class_namespaces.get(name) or set()
+        # Two namespaces means two different types with one name, and the container cannot be
+        # told which without a decision this stage is not entitled to make — the same rule the
+        # interface pass follows. `ownership.foreign_declarations` is what stops it happening.
+        if len(namespaces) != 1:
+            if len(namespaces) > 1:
+                ambiguous.append(f"{name} ({', '.join(sorted(namespaces))})")
+            continue
+        namespace = next(iter(namespaces))
+        services.append(
+            f"builder.Services.AddScoped<{namespace}.{name}>();" if namespace
+            else f"builder.Services.AddScoped<{name}>();")
+        registered_names.add(name)
+
+    # ── The database ──────────────────────────────────────────────────────
+    if db.get("registration"):
+        services.append(db["registration"])
 
     return {
         "services": services,
         "ambiguous": ambiguous,
+        "db_context": db.get("context") or "",
+        "db_note": db.get("note") or "",
         "view_formats": _view_formats(view_paths, controllers, entry_project),
         "needs_session": needs_session,
         "needs_http_context": needs_http_context,
@@ -395,6 +644,17 @@ def apply_to_program_cs(content: str, plan: Dict[str, Any]) -> str:
         pair = re.search(r"<\s*([^,>]+?)\s*,\s*([^>]+?)\s*>", line)
         if pair and _registers_pair(text, pair.group(1), pair.group(2)):
             continue
+        # A one-type-argument registration — `AddScoped<Foo>()`, `AddDbContext<Ctx>(…)` — is
+        # compared on the *call plus the short type name*, for the same reason the pair is
+        # compared structurally: a converter that already registered it will have written the
+        # unqualified name and a `using`, which shares no substring with the qualified form.
+        # Harmless for `AddScoped`, where a duplicate is merely redundant; not harmless for
+        # `AddDbContext`, where two calls configure the same context twice.
+        single = re.match(r"(builder\.Services\.(\w+))<\s*([\w.]+)\s*>", line)
+        if not pair and single and re.search(
+                re.escape(single.group(2)) + r"<\s*(?:[\w.]+\.)?"
+                + re.escape(single.group(3).rsplit(".", 1)[-1]) + r"\s*[>,]", text):
+            continue
         if line not in text:
             additions.append(line)
 
@@ -428,6 +688,36 @@ def apply_to_program_cs(content: str, plan: Dict[str, Any]) -> str:
     if plan.get("needs_session") and "UseSession()" not in text and "app.UseRouting();" in text:
         text = text.replace("app.UseRouting();", "app.UseRouting();\napp.UseSession();", 1)
     return text
+
+
+def apply_to_appsettings(content: str, name: str = CONNECTION_NAME) -> str:
+    """Give the connection string a declared home, with **no value** in it.
+
+    `GetConnectionString("DefaultConnection")` returns null against an `appsettings.json` that
+    has never heard of it, and EF then throws a message about the provider rather than about
+    the missing setting — a false trail for whoever has to run this. Declaring the key empty
+    makes the gap name itself, and `ConnectionStrings__DefaultConnection` in the environment
+    overrides it without editing a committed file.
+
+    The value stays empty on purpose. The charter this product ships says secrets come only
+    from the environment or a secret store, "never a committed default in appsettings", and a
+    connection string is a secret — so writing a plausible one would be the pipeline breaking
+    the customer's own stated rule to make a demo start.
+    """
+    text = content or ""
+    if not text.strip() or "ConnectionStrings" in text:
+        return text
+    try:
+        settings = json.loads(text)
+    except (ValueError, TypeError):
+        logger.warning("appsettings.json is not valid JSON — connection string not declared")
+        return text
+    if not isinstance(settings, dict):
+        return text
+    # First key, so a reader opening the file sees the one setting they have to supply.
+    merged = {"ConnectionStrings": {name: ""}}
+    merged.update(settings)
+    return json.dumps(merged, indent=2) + "\n"
 
 
 def packages_for_code(content: str) -> Set[Tuple[str, str]]:

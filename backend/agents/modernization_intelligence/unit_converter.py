@@ -416,6 +416,13 @@ def _build_user_message(
     if placement.get("project_rules"):
         parts.append("\n" + placement["project_rules"])
 
+    # And which types are somebody else's to declare. Same source — the plan — and the same
+    # reason it is here rather than in the system block. A component that emits a class
+    # another component owns produces two of it in the finished solution, and an interface
+    # with two implementations is registered with the container as neither.
+    if placement.get("ownership_rules"):
+        parts.append("\n" + placement["ownership_rules"])
+
     if len(members) > 1:
         parts.append(
             "\n## This unit is several source files\n\n"
