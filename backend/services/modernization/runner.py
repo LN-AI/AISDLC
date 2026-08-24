@@ -1526,6 +1526,35 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
     # a layering problem a human has to resolve, and `reconcile` fails the run over it.
     for problem in needed["problems"][:25]:
         store.append_event(run_id, "reference_cycle_broken", problem[:400], level="warning")
+    if needed["problems"]:
+        # An event nobody has to acknowledge was not enough. Cutting a reference is how this
+        # stage keeps a solution buildable when two projects ended up needing each other, and
+        # it is the correct move — MSBuild refuses a cycle outright, so the alternative is an
+        # export that does not build at all. But the cut is a *decomposition* fault surfacing
+        # late: the code the converter wrote genuinely needs that edge, so something now has
+        # no legal way to reach what it uses, and the person who approved the layout is the
+        # one who can decide whether to allow the reference, declare a seam, or merge the two.
+        #
+        # Non-blocking, because the export is buildable as it stands and stopping the run
+        # would trade a real deliverable for a question. Recorded so it cannot be missed.
+        store.create_checkpoint(
+            run_id, "reference_cut",
+            f"{len(needed['problems'])} project reference(s) had to be cut to keep this "
+            f"solution buildable",
+            detail=(
+                "Two projects ended up referencing each other. Nothing can build that, so the "
+                "edge was cut in the direction that keeps the rest intact — but the converted "
+                "code was written expecting it, so whatever used it across that boundary now "
+                "has no legal way to reach it.\n\n"
+                + "\n".join(f"  · {p}" for p in needed["problems"][:15])
+                + "\n\nThe durable fix is a decomposition change rather than a project file "
+                  "change: allow the reference (if the graph stays acyclic), declare an "
+                  "interface seam across the boundary, move the shared type down a layer, or "
+                  "merge the two projects. A future run over the same codebase can be given "
+                  "that layout at the plan gate, where it costs nothing."),
+            unit_id=unit["id"], blocking=False,
+            payload={"problems": needed["problems"][:25]},
+        )
 
     # Host wiring. Without this the export compiles clean and then throws
     # `Unable to resolve service for type 'I…'` on every request — the one failure mode a

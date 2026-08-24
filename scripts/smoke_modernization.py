@@ -8835,6 +8835,109 @@ check("an edge to a file that is not in the run is ignored rather than raising",
       "x.php" in _odd_paths, str(_odd_paths))
 
 
+section("59. An interface a request reaches, and a reference that had to be cut")
+
+# ── Severity by reachability ───────────────────────────────────────────────
+#
+# An interface nothing consumes is a loose end. One a controller asks the container to build,
+# with no implementation anywhere, is an application that compiles, starts, and throws on the
+# first request that needs it — the class of failure a build gate structurally cannot catch,
+# and one this product has shipped. Same finding, different consequence, so different severity.
+
+_CTRL = [{"path": "Api/Controllers/OrderController.cs",
+          "content": "public class OrderController : ControllerBase {\n"
+                     "  public OrderController(IOrderRepository repo, ILogger log) { }\n}"}]
+_reach = reconcile._controller_reachable(_CTRL)
+check("an interface a controller takes in its constructor is reachable",
+      "IOrderRepository" in _reach, str(_reach))
+check("and so is a second parameter, not only the first",
+      "ILogger" in _reach, str(_reach))
+check("a file that is not a controller contributes nothing",
+      reconcile._controller_reachable(
+          [{"path": "Domain/Order.cs", "content": "public class Order { }"}]) == set())
+check("a name merely mentioned in prose is not treated as a dependency",
+      "INotMine" not in reconcile._controller_reachable(
+          [{"path": "Api/Controllers/X.cs",
+            "content": "// TODO: consider INotMine here\npublic class XController { }"}]),
+      str(reconcile._controller_reachable(
+          [{"path": "Api/Controllers/X.cs",
+            "content": "// TODO: consider INotMine here\npublic class XController { }"}])))
+
+_ui_run = store.create_run("unimplemented", ".NET 8", "files", created_by="smoke")
+store.insert_units(_ui_run, [{"path": "#component/0001-api", "kind": "component",
+                              "component_name": "api", "status": "converted",
+                              "target_project": "Api", "meta": {"members": []}}])
+_ui_unit = store.list_units(_ui_run, kind="component")[0]
+store.complete_unit(
+    unit_id=_ui_unit["id"], run_id=_ui_run,
+    artifacts=[{"path": "Api/Controllers/OrderController.cs",
+                "content": "public class OrderController : ControllerBase {\n"
+                           "  public OrderController(IOrderRepository repo) { }\n}"},
+               {"path": "Api/IOrderRepository.cs",
+                "content": "public interface IOrderRepository { }"},
+               {"path": "Api/IUnused.cs", "content": "public interface IUnused { }"}],
+    symbols=[{"name": "IOrderRepository", "kind": "interface",
+              "signature": "public interface IOrderRepository"},
+             {"name": "IUnused", "kind": "interface", "signature": "public interface IUnused"}])
+
+_ui_report = reconcile.run(_ui_run)
+_ui_issues = {i["detail"].split("`")[1]: i for i in _ui_report["issues"]
+              if i["kind"] == "unimplemented_interface"}
+check("an unimplemented interface a controller needs fails the reconciliation",
+      _ui_issues["IOrderRepository"]["severity"] == "fail", str(_ui_issues.get("IOrderRepository")))
+check("and says what will actually happen, not that something is untidy",
+      "every request" in _ui_issues["IOrderRepository"]["detail"].lower(),
+      _ui_issues["IOrderRepository"]["detail"])
+check("an unimplemented interface nothing consumes stays a warning",
+      _ui_issues["IUnused"]["severity"] == "warn", str(_ui_issues.get("IUnused")))
+
+# ── A cut reference is a decomposition fault, not a project-file detail ─────
+#
+# Cutting the edge is the right move: MSBuild refuses a cycle outright, so the alternative is
+# an export that does not build at all. But the converted code was written expecting it, so
+# something now has no legal way to reach what it uses — and that was a run-log line nobody
+# had to acknowledge.
+_cut_run = store.create_run("cut-reference", ".NET 8", "files", created_by="smoke")
+store.insert_units(_cut_run, [
+    {"path": "#component/0001-app", "kind": "component", "component_name": "app",
+     "status": "converted", "target_project": "App", "target_namespace": "App",
+     "meta": {"members": []}},
+    {"path": "#wireup/0001", "kind": "wireup", "module_type": "wireup", "status": "ready"},
+])
+_cut_app = [u for u in store.list_units(_cut_run, kind="component")][0]
+store.complete_unit(
+    unit_id=_cut_app["id"], run_id=_cut_run,
+    artifacts=[{"path": "App/App.csproj",
+                "content": "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup>"
+                           "<ProjectReference Include=\"../Core/Core.csproj\" />"
+                           "</ItemGroup></Project>"},
+               {"path": "Core/Core.csproj",
+                "content": "<Project Sdk=\"Microsoft.NET.Sdk\"><ItemGroup>"
+                           "<ProjectReference Include=\"../App/App.csproj\" />"
+                           "</ItemGroup></Project>"}],
+    symbols=[])
+_cut_unit = store.list_units(_cut_run, kind="wireup")[0]
+runner._wireup_one(_cut_run, _cut_unit, charter.validate(VALID_CHARTER))
+
+_cut_points = [c for c in store.list_checkpoints(_cut_run) if c["kind"] == "reference_cut"]
+check("a reference that had to be cut raises a checkpoint, not only a log line",
+      len(_cut_points) == 1, str([c["kind"] for c in store.list_checkpoints(_cut_run)]))
+check("it names the durable fix as a decomposition change",
+      "decomposition change" in _cut_points[0]["detail"], _cut_points[0]["detail"][:300])
+check("it offers the repairs the plan gate can actually apply",
+      all(w in _cut_points[0]["detail"]
+          for w in ("allow the reference", "interface seam", "merge")),
+      _cut_points[0]["detail"][-400:])
+check("non-blocking — the export builds as it stands, and stopping would trade it for a question",
+      not _cut_points[0]["blocking"])
+check("the problems ride in the payload, so a screen can list them",
+      (_cut_points[0].get("payload") or {}).get("problems"),
+      str((_cut_points[0].get("payload") or {}).keys()))
+check("and the run log still records each cut",
+      any(e["event"] == "reference_cycle_broken" for e in store.list_events(_cut_run)),
+      str([e["event"] for e in store.list_events(_cut_run)][:8]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

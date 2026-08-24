@@ -44,6 +44,35 @@ _ACTION = re.compile(
 _VIEW_CALL = re.compile(r"\breturn\s+View\s*\(\s*(?:\"([^\"]+)\")?")
 
 
+# A constructor parameter of an interface type, in a file that is a controller. Deliberately
+# narrow: it matches the declaration site rather than a usage, so a name merely mentioned in a
+# comment or a string does not promote a warning into a failure.
+_CTOR_PARAM = re.compile(r"\b(I[A-Z]\w*)\s+\w+\s*(?:,|\))")
+
+
+def _controller_reachable(artifacts: List[Dict[str, Any]]) -> Set[str]:
+    """Interface names a controller asks the container to construct.
+
+    The distinction that decides severity. An interface nothing consumes is a loose end; one a
+    controller takes in its constructor with no implementation registered is an application
+    that compiles, starts, and throws on the first request that needs it — which is the whole
+    class of defect a build gate cannot see.
+
+    Judged by file rather than by call graph on purpose. A controller is recognisable from its
+    path and its own declaration, and a real reachability analysis over generated code would be
+    a second, subtly different implementation of something the runtime already answers for
+    certain (`runtime.gate`).
+    """
+    names: Set[str] = set()
+    for artifact in artifacts:
+        path = (artifact.get("path") or "").replace("\\", "/")
+        content = artifact.get("content") or ""
+        if "controller" not in path.lower() and "Controller" not in content:
+            continue
+        names.update(_CTOR_PARAM.findall(content))
+    return names
+
+
 def _unresolved_views(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Every `return View(...)` whose target `.cshtml` was never emitted.
 
@@ -256,12 +285,32 @@ def run(run_id: str) -> Dict[str, Any]:
 
     # 4. Interfaces nobody implements. A converted interface with no implementation is
     #    usually a unit that failed, and it will not surface until the build.
+    #
+    #    Severity depends on whether a request can reach it. An interface a controller asks
+    #    the container for, with no implementation registered anywhere, is not untidiness: the
+    #    application compiles, starts, and throws on the first request that needs it — the
+    #    failure a build gate structurally cannot catch, and one this product has shipped.
+    #    An interface nothing consumes yet is a warning, as it always was.
+    #
+    #    This check only became trustworthy when the symbol registry stopped taking the
+    #    model's word for what it declared (D-141): before that it reported interfaces that
+    #    exist in no file and missed ones that do, so promoting it then would have failed runs
+    #    over phantoms.
     blob = "\n".join(a.get("content") or "" for a in artifacts)
+    reachable = _controller_reachable(artifacts)
     for symbol in symbols:
         if (symbol.get("kind") or "") != "interface":
             continue
         name = symbol.get("name") or ""
-        if not name or not _implements_pattern(name).search(blob):
+        if not name or _implements_pattern(name).search(blob):
+            continue
+        if name in reachable:
+            issues.append(_issue(
+                "unimplemented_interface", "fail",
+                f"`{name}` is asked for by a controller and nothing implements it. Every "
+                f"request that reaches that controller will fail when the container tries to "
+                f"construct it."))
+        else:
             issues.append(_issue("unimplemented_interface", "warn",
                                  f"`{name}` is declared but nothing implements it."))
 
