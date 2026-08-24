@@ -27,7 +27,7 @@ import logging
 import os
 import socket
 import threading
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.agents.modernization_intelligence import architect_agent, unit_converter
 from backend.agents.modernization_intelligence import comprehension_agent as _comprehension
@@ -56,6 +56,19 @@ MAX_UNIT_ATTEMPTS = 3
 # Imported rather than hardcoded so the gate's ceiling and the call's actual budget cannot
 # drift apart — a quoted ceiling the provider is allowed to exceed is not a ceiling.
 _ARCHITECT_MAX_TOKENS = architect_agent.ARCHITECTURE_MAX_TOKENS
+
+# How many decompositions to ask for and score against each other. One call, with no source
+# and no second opinion, decides projects, every file's component, namespaces and seams —
+# every downstream constraint derives from it, and a bad answer is the most expensive failure
+# this system can produce. It is also the cheapest call to duplicate: the architect reads a
+# file inventory rather than source, so extra candidates cost cents against a conversion
+# measured in dollars.
+#
+# Scored deterministically (`architecture.rank_key`), never by another model. A judge that
+# could be argued with would let the most persuasive decomposition win, and the entire reason
+# to generate several is that they can be *measured*. Set to 1 to restore the single-call
+# behaviour exactly — `STANCES[0]` is the empty stance.
+DESIGN_CANDIDATES = 3
 
 # How much source one comprehension probe reads. Both caps are cost controls, and the file
 # cap is the one that matters: comprehension is priced per bundle at the assessment gate, so
@@ -253,15 +266,21 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
     """
     units = store.list_units(run_id, kind="source_file", include_source=True)
     # The architect is shown the inventory, not the source: one row per file, and the row is
-    # short. That is why understanding a codebase is affordable at all.
-    inventory_chars = sum(len(u["path"]) + 60 for u in units)
+    # short. That is why understanding a codebase is affordable at all. 110 rather than 60
+    # since the row gained the types a file declares and what it was observed serving
+    # (D-143) — measured at ~68 chars/row on a fixture whose files declare one type each and
+    # serve nothing, so the allowance is deliberately above the measurement rather than at it.
+    inventory_chars = sum(len(u["path"]) + 110 for u in units)
     input_tokens = estimate.tokens("x" * inventory_chars) + estimate.PROMPT_FRAME_TOKENS
     expected_output = min(400 + 60 * max(len(units), 1),
                           _ARCHITECT_MAX_TOKENS)
     numbers = estimate.band(input_tokens, expected_output, _ARCHITECT_MAX_TOKENS)
-    calls = 1
-    expected = numbers["expected_usd"]
-    ceiling = numbers["ceiling_usd"]
+    # One call per candidate decomposition. Priced here rather than discovered later because
+    # this gate's whole claim is that the call count is a fact, not a forecast — `STANCES` is
+    # a constant, so the run will make exactly this many.
+    calls = max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))
+    expected = numbers["expected_usd"] * calls
+    ceiling = numbers["ceiling_usd"] * calls
     estimated = numbers["estimated"]
 
     # Probes read the source itself, so unlike the architect they are priced from measured
@@ -306,7 +325,8 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
     return {"calls": calls, "expected_usd": round(expected, 4),
             "ceiling_usd": round(ceiling, 4), "model": numbers["model"],
             "price_is_estimated": bool(estimated),
-            "comprehension_calls": len(bundles) + (1 if len(bundles) > 1 else 0)}
+            "comprehension_calls": len(bundles) + (1 if len(bundles) > 1 else 0),
+            "design_calls": max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))}
 
 
 def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
@@ -375,7 +395,12 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
         f"The next step reads the source for what the application *does* "
         f"({numbers.get('comprehension_calls', 0)} pass(es) over the code, each business rule "
         f"checked against the file it cites), designs the target architecture for "
-        f"{charter['target_stack']}, and produces a costed, per-component conversion plan. "
+        f"{charter['target_stack']}"
+        + (f" — {numbers['design_calls']} independent decompositions, scored against each "
+           f"other on how much of the source each one leaves impossible to build, with the "
+           f"best applied and the rest reported"
+           if numbers.get('design_calls', 1) > 1 else "")
+        + f", and produces a costed, per-component conversion plan. "
         f"{estimate.describe(numbers, run.get('budget_cap_usd'))}",
         "",
         "You will be asked again, with a real number, before any file is converted.",
@@ -1064,9 +1089,57 @@ def _probe_purposes(run_id: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
+                       llm_override: Optional[dict], project_name: str,
+                       inventory: str, digest: str, cycles: List[Dict[str, Any]],
+                       source_edges: List[Tuple[str, str]],
+                       source_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Ask for several decompositions, score each deterministically, return them ranked.
+
+    **Degrades rather than fails.** Candidates are asked for one at a time and a candidate
+    that raises — a budget refusal is the likeliest — leaves the ones already in hand intact.
+    Only losing the *first* one is fatal, because then there is no architecture at all. A
+    panel that can fail a run it was meant to improve is worse than no panel (D-101).
+    """
+    scored: List[Dict[str, Any]] = []
+    for index, (stance_id, stance) in enumerate(architect_agent.STANCES[:DESIGN_CANDIDATES]):
+        try:
+            proposal = agent_guard.guarded_call(
+                caller, "modernization", llm_override, project_name=project_name,
+                fn=lambda s=stance: _architect.design(
+                    charter=charter, inventory=inventory, digest=digest, cycles=cycles,
+                    llm_override=llm_override, stance=s,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not scored:
+                raise
+            logger.warning("Design candidate %s failed for run %s (keeping %d): %s",
+                           stance_id, run_id, len(scored), exc)
+            store.append_event(
+                run_id, "design_candidate_skipped",
+                f"{stance_id}: {type(exc).__name__}: {exc}"[:400], level="warning")
+            break
+
+        cost = ((proposal or {}).get("_budget_stats") or {}).get("cost_usd") or 0.0
+        if cost:
+            store.add_run_spend(run_id, float(cost))
+        score = architecture.score_proposal(proposal, source_units, source_edges)
+        scored.append({"stance": stance_id, "index": index, "proposal": proposal,
+                       "score": score, "cost": float(cost)})
+        store.append_event(
+            run_id, "design_candidate",
+            f"{stance_id}: {architecture.describe_score(score)}")
+
+    # `index` last so a tie is broken by the order the stances are declared in, which makes the
+    # winner reproducible rather than dependent on which call happened to come back first.
+    scored.sort(key=lambda c: architecture.rank_key(c["score"]) + (c["index"],))
+    return scored
+
+
 def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                 caller: dict, llm_override: Optional[dict], project_name: str) -> str:
-    """One architect call, then deterministic materialisation of what it proposed."""
+    """Ask for the target architecture, pick the best answer, materialise it deterministically."""
     source_units = store.list_units(run_id, kind="source_file")
     if not source_units:
         store.fail_unit(unit["id"], run_id, "No source files to decompose.", terminal=True)
@@ -1076,28 +1149,37 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     stats = run.get("stats") or {}
     cycles = stats.get("cycles") or []
     digest = comprehension.render_digest(run_id, stats)
+    inventory = architecture.render_inventory(
+        source_units,
+        evidence_by_path=_evidence_by_path(run_id),
+        purposes=_probe_purposes(run_id),
+    )
+    source_edges = [(u["path"], dep) for u in source_units for dep in (u.get("depends_on") or [])]
 
     try:
-        proposal = agent_guard.guarded_call(
-            caller, "modernization", llm_override, project_name=project_name,
-            fn=lambda: _architect.design(
-                charter=charter,
-                inventory=architecture.render_inventory(
-                    source_units,
-                    evidence_by_path=_evidence_by_path(run_id),
-                    purposes=_probe_purposes(run_id),
-                ),
-                digest=digest,
-                cycles=cycles,
-                llm_override=llm_override,
-            ),
-        )
+        candidates = _design_candidates(run_id, charter, caller, llm_override, project_name,
+                                        inventory, digest, cycles, source_edges, source_units)
     except Exception as exc:
         return _handle_stage_exception(run_id, unit, exc, "the target architecture")
+    if not candidates:
+        store.fail_unit(unit["id"], run_id, "No target architecture was produced.",
+                        terminal=True)
+        return "failed"
 
-    cost = ((proposal or {}).get("_budget_stats") or {}).get("cost_usd") or 0.0
-    if cost:
-        store.add_run_spend(run_id, float(cost))
+    winner, runners_up = candidates[0], candidates[1:]
+    proposal = winner["proposal"]
+    # Every candidate, not just the one that won. A run that generated three and charged for
+    # one would understate the design stage on the very screen its cost is read from.
+    cost = sum(c["cost"] for c in candidates)
+    if runners_up:
+        # Reported, never silent. Which decomposition a run was built on is the single most
+        # consequential decision in it, and "we generated three and picked one" is not
+        # something a reader should have to infer from a cost line.
+        store.append_event(
+            run_id, "design_chosen",
+            f"{winner['stance']} — {architecture.describe_score(winner['score'])}; "
+            f"beat " + "; ".join(f"{c['stance']} ({c['score']['gaps']} gap(s))"
+                                 for c in runners_up))
 
     outcome = architecture.materialize(run_id, proposal,
                                        max_output_tokens=unit_converter.CONVERSION_MAX_TOKENS)
@@ -1127,6 +1209,11 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         "layering_gaps": _plan_layering_gaps(
             run_id, outcome.get("project_list") or proposal.get("projects") or [],
             proposal.get("seams") or []),
+        # Which decompositions were considered and how each measured. The proposals themselves
+        # are deliberately not kept: they are large, only one of them was ever going to be
+        # built, and the scores are what makes the choice reviewable.
+        "design_panel": [{"stance": c["stance"], "score": c["score"],
+                          "chosen": c is winner} for c in candidates],
         "estimate": outcome["estimate"],
     })
     store.complete_unit(

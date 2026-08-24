@@ -32,7 +32,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from backend.services.modernization import estimate, graph, repo_ingest, store
+from backend.services.modernization import estimate, graph, layering, repo_ingest, store
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +407,110 @@ def _split_oversized(components: List[Dict[str, Any]],
 
 
 # ── Materialisation ────────────────────────────────────────────────────────
+
+def score_proposal(proposal: Dict[str, Any], units: List[Dict[str, Any]],
+                   source_edges: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """Judge one candidate decomposition without writing anything.
+
+    Pure, and deliberately so: it runs the *same* `normalize_proposal` /
+    `normalize_projects` / `_split_oversized` the winner will be materialised through, so what
+    is scored is what would actually ship rather than what was proposed. Nothing here calls a
+    model — a panel judged by another model would let the most persuasively argued
+    decomposition win, and the whole reason to run several is that they can be measured.
+
+    Every number is a count of something a human can go and look at, and lower is better for
+    all of them, which is what makes `rank_key` a plain tuple.
+    """
+    by_path = {u["path"]: u for u in units}
+    components, problems = normalize_proposal(proposal, units)
+    components, split_notes = _split_oversized(components, by_path)
+
+    project_list, project_notes = normalize_projects(
+        proposal.get("projects") or [],
+        sorted({c["project"] for c in components if c.get("project")}),
+    )
+    seams = [s for s in (proposal.get("seams") or []) if isinstance(s, dict)]
+
+    # The expensive failure, and the only one measured against the *source* graph rather than
+    # against the proposal's own internal consistency: dependencies the layout gives no legal
+    # way to write. On run 9c8cf4fe this predicted all twelve eventual build errors.
+    try:
+        gaps = layering.plan_gaps(components, project_list, seams, source_edges)
+    except Exception:  # noqa: BLE001
+        # A scorer that can throw would fail a design that is merely unusual. An unscoreable
+        # candidate loses to any scoreable one rather than taking the run down.
+        logger.exception("Could not score a design candidate's layering (treating as worst)")
+        gaps = [{"detail": "this candidate's layering could not be checked"}] * 999
+
+    # Files the architect did not place. Counted against the **raw proposal**, deliberately:
+    # `normalize_proposal` puts every orphan into a mechanical per-directory fallback, so
+    # measuring after it would report zero for every candidate however much the architect
+    # forgot. A decomposition covering 90% of a codebase is worse than a blunt one covering
+    # all of it — which is what the architect's own prompt tells it — and this is the number
+    # that says which candidate did that.
+    claimed = {str(m) for c in (proposal.get("components") or []) if isinstance(c, dict)
+               for m in (c.get("members") or []) if isinstance(m, str)}
+    unplaced = sum(1 for u in units if u["path"] not in claimed)
+
+    sizes = sorted(sum(len(by_path[m].get("source_text") or "")
+                       for m in (c.get("members") or []) if m in by_path)
+                   for c in components)
+    spread = _size_spread(sizes)
+
+    return {
+        "components": len(components),
+        "projects": len(project_list),
+        "gaps": len(gaps),
+        "unplaced": unplaced,
+        "oversized": len(split_notes),
+        "problems": len(problems) + len(project_notes),
+        "size_spread": spread,
+        "gap_detail": [g.get("detail", "") for g in gaps[:6]],
+    }
+
+
+def _size_spread(sizes: List[int]) -> int:
+    """How unevenly the source is divided, as a percentage of the mean. Integer on purpose.
+
+    A float here would make the ranking tuple depend on the last bits of a division, so two
+    candidates that are the same shape could order differently between runs — and a panel
+    whose winner is not reproducible is not a measurement.
+    """
+    if len(sizes) < 2:
+        return 0
+    mean = sum(sizes) / len(sizes)
+    if mean <= 0:
+        return 0
+    variance = sum((s - mean) ** 2 for s in sizes) / len(sizes)
+    return int(round((variance ** 0.5) / mean * 100))
+
+
+def rank_key(score: Dict[str, Any]) -> Tuple[int, ...]:
+    """The order candidates are compared in. Every field is "lower is better".
+
+    The order of the fields is the argument. `gaps` first because it is the one that has been
+    measured costing real money — a layout with gaps converts into an export that does not
+    build, and no later stage can repair it by adding a reference. `unplaced` second because a
+    file nobody placed lands wherever a fallback puts it. `oversized` before `size_spread`
+    because a component too big for one call is a hard failure and imbalance is only a smell.
+    """
+    return (
+        int(score.get("gaps") or 0),
+        int(score.get("unplaced") or 0),
+        int(score.get("oversized") or 0),
+        int(score.get("size_spread") or 0),
+        int(score.get("problems") or 0),
+    )
+
+
+def describe_score(score: Dict[str, Any]) -> str:
+    """One line, for the run log and the plan gate."""
+    return (f"{score.get('components', 0)} component(s) in {score.get('projects', 0)} "
+            f"project(s), {score.get('gaps', 0)} unbuildable dependency direction(s), "
+            f"{score.get('unplaced', 0)} file(s) unplaced, "
+            f"{score.get('problems', 0)} correction(s), "
+            f"size spread {score.get('size_spread', 0)}%")
+
 
 def materialize(run_id: str, proposal: Dict[str, Any],
                 max_output_tokens: int = 32000) -> Dict[str, Any]:

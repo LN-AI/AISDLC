@@ -9,9 +9,16 @@ a queue, not a second queue.
 
 Two invariants hold the whole thing up:
 
-  1. **One unit is at most one LLM call.** That is what keeps D-20 literally true and
-     `agent_guard._EXPECTED_CALLS_BY_PRODUCT["modernization"] == 1` correct without touching
-     the guard. A stage that needed two calls per row would have to become two stages.
+  1. **One `guarded_call` is exactly one LLM call.** That is what keeps D-20 literally true
+     and `agent_guard._EXPECTED_CALLS_BY_PRODUCT["modernization"] == 1` correct without
+     touching the guard: the reservation is taken per call, so it is right per call.
+
+     A *unit* may make several of them. The design unit asks for `DESIGN_CANDIDATES`
+     decompositions and keeps the best (D-144), and each one is its own guarded call — which
+     is why the guard needs no override, unlike agentic conversion, where the several calls
+     happen *inside* one guarded call and `agent_guard.expect_calls` has to say so (D-25).
+     What a stage may not do is make a call the assessment gate did not price: `STANCES` is a
+     constant, so `_discovery_estimate` quotes the real number rather than a forecast.
   2. **`plan()` writes a stage's rows in one transaction.** `store.insert_units` is one
      `executemany` plus one commit, so a stage's rows are either all present or all absent —
      which is what makes `stage_units_exist` a safe resume cursor. A `plan()` that wrote in

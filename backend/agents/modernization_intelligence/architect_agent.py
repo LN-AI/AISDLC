@@ -22,7 +22,7 @@ printed on a plan a human approves. The same repair at conversion time would be 
 visible nor auditable, which is why output paths there are structural instead.
 """
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.agents.base_agent import BaseAgent
 from backend.services import llm_gateway
@@ -242,10 +242,11 @@ class TargetArchitectAgent(BaseAgent):
         digest: str = "",
         cycles: Optional[List[Dict[str, Any]]] = None,
         llm_override: Optional[Dict[str, Any]] = None,
+        stance: str = "",
     ) -> Dict[str, Any]:
         result = llm_gateway.call_tool(
             self.system_for(charter, digest),
-            _build_user_message(inventory, cycles or []),
+            _build_user_message(inventory, cycles or [], stance),
             TARGET_ARCHITECTURE_TOOL_SCHEMA,
             llm_override,
             max_tokens=ARCHITECTURE_MAX_TOKENS,
@@ -254,12 +255,44 @@ class TargetArchitectAgent(BaseAgent):
         return result
 
 
-def _build_user_message(inventory: str, cycles: List[Dict[str, Any]]) -> str:
+# Three ways to cut the same codebase. Asking one call three times produces three samples of
+# one opinion; asking it from three genuinely different starting positions produces three
+# decompositions that can be *measured* against each other — which is the only reason a panel
+# is worth paying for. Each is an emphasis **within** the charter's project layout, never an
+# override of it: the layout was decided by the team that owns the codebase.
+#
+# The first entry is the empty stance, so a single-candidate run sends exactly the message it
+# always did and nothing about the default path changes.
+STANCES: Tuple[Tuple[str, str], ...] = (
+    ("balanced", ""),
+    ("feature", (
+        "## How to approach this one\n\n"
+        "Prefer grouping by **business capability**. Where the charter's layout allows it, the "
+        "files that serve one feature — its page, the logic behind it, the queries it runs — "
+        "belong in one component, so that converting that feature is one call that can see all "
+        "of it. Split by technical role only where the layout requires it."
+    )),
+    ("thin-edges", (
+        "## How to approach this one\n\n"
+        "Prefer the grouping that creates the **fewest dependencies between projects**. You are "
+        "shown how many times each file references each of its dependencies: a heavy edge "
+        "crossing a project boundary is expensive and a thin one is cheap, so when two "
+        "groupings are otherwise equally reasonable, choose the one that keeps heavy edges "
+        "*inside* a project and leaves only thin ones crossing. A dependency the layout forbids "
+        "and no seam covers cannot be written at all."
+    )),
+)
+
+
+def _build_user_message(inventory: str, cycles: List[Dict[str, Any]],
+                        stance: str = "") -> str:
     parts = [
         "# The codebase to decompose",
         "",
-        "One row per source file: path, language, the role a parser guessed, size in lines, and "
-        "the paths it depends on. This is the complete inventory — there is nothing else.",
+        "One row per source file: path, language, the role a parser guessed, size in lines, the "
+        "types it declares, what the parsers observed it serving, and the paths it depends on — "
+        "heaviest first, with `×n` where it references that dependency more than once. This is "
+        "the complete inventory — there is nothing else.",
         "",
         inventory,
     ]
@@ -276,6 +309,8 @@ def _build_user_message(inventory: str, cycles: List[Dict[str, Any]]) -> str:
             "cycle into an internal detail of one conversion. Do not split a cycle across "
             "components unless you have a reason.\n\n" + listed
         )
+    if stance:
+        parts.append("\n" + stance)
     parts.append(
         "\nDecompose this now. Every path above must appear in exactly one component's `members`."
     )

@@ -49,6 +49,7 @@ from backend.services.modernization import (  # noqa: E402
     usings,
     validation, wireup,
 )
+from backend.agents.modernization_intelligence import architect_agent  # noqa: E402
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
 from backend.services.modernization.scaffold import dotnet as _dotnet_scaffold  # noqa: E402
@@ -819,10 +820,15 @@ try:
                             + call_log.count("submit_extraction_audit"))
     check("the extraction audit runs exactly once per run",
           call_log.count("submit_extraction_audit") == 1, str(call_log))
+    # Against the constant, not against 3: the panel's size is a tuning decision, and a test
+    # that hardcoded it would fail on a deliberate change while still not asserting the thing
+    # that matters — that every call in the log belongs to a stage entitled to make one.
+    _design_calls = max(1, min(runner.DESIGN_CANDIDATES, len(architect_agent.STANCES)))
+    check("the design stage asks once per candidate decomposition",
+          call_log.count("submit_target_architecture") == _design_calls, str(call_log))
     check("the scaffold cost no model call",
           call_log.count("submit_unit_conversion") == 6
-          and call_log.count("submit_target_architecture") == 1
-          and len(call_log) == 7 + _comprehension_calls, str(call_log))
+          and len(call_log) == 6 + _design_calls + _comprehension_calls, str(call_log))
 
     api_component = next(c for c in components
                          if "app/api.py" in (c["meta"].get("members") or []))
@@ -8085,6 +8091,187 @@ check("and a run with no comprehension renders no empty purpose section",
 check("a purpose with no members is not rendered as a heading with nothing under it",
       "What each area of the source does"
       not in _architecture.render_inventory(_inv_units, purposes=[{"members": [], "purpose": "x"}]))
+
+section("53. Three ways to cut the same codebase, measured against each other")
+
+# The design call decides projects, every file's component, namespaces and seams, and every
+# downstream constraint derives from it. Asking once and taking the answer was the single
+# largest unreviewed decision in a run; asking several times is only worth paying for if the
+# answers can be *measured*, so everything below is about the scorer being arithmetic.
+
+_PANEL_UNITS = [
+    {"path": "web/Page.php", "source_text": "x" * 1000, "language": "PHP"},
+    {"path": "core/Repo.php", "source_text": "x" * 1000, "language": "PHP"},
+]
+_PANEL_EDGES = [("web/Page.php", "core/Repo.php")]
+
+
+def _panel_proposal(page_project, repo_project, members=None):
+    """`Web` may reference `Core`; `Core` may reference nothing. Putting the page in `Core`
+    and the repository in `Web` therefore points the one real dependency the wrong way."""
+    return {
+        "projects": [{"name": "Web", "purpose": "ui", "depends_on": ["Core"]},
+                     {"name": "Core", "purpose": "domain", "depends_on": []}],
+        "components": [
+            {"name": "page", "project": page_project, "namespace": page_project + ".Pages",
+             "output_dir": page_project + "/Pages",
+             "members": ["web/Page.php"] if members is None else members},
+            {"name": "repo", "project": repo_project, "namespace": repo_project + ".Data",
+             "output_dir": repo_project + "/Data", "members": ["core/Repo.php"]},
+        ],
+        "summary": "two components",
+    }
+
+
+_good = _architecture.score_proposal(_panel_proposal("Web", "Core"), _PANEL_UNITS, _PANEL_EDGES)
+_bad = _architecture.score_proposal(_panel_proposal("Core", "Web"), _PANEL_UNITS, _PANEL_EDGES)
+check("a layout that points a real dependency the wrong way is scored as unbuildable",
+      _bad["gaps"] == 1, str(_bad))
+check("and the same two components placed correctly score clean",
+      _good["gaps"] == 0, str(_good))
+check("so the buildable layout ranks ahead of the one that cannot be built",
+      _architecture.rank_key(_good) < _architecture.rank_key(_bad),
+      str(_architecture.rank_key(_good)) + " vs " + str(_architecture.rank_key(_bad)))
+check("the gap the scorer counted is one a human can go and read",
+      "web/Page.php" in (_bad["gap_detail"][0] if _bad["gap_detail"] else ""),
+      str(_bad["gap_detail"]))
+
+# Scoring must not depend on anything but its inputs: a panel whose winner is not reproducible
+# is not a measurement, and the same plan must survive a resume unchanged.
+check("scoring the same proposal twice gives the same answer",
+      _architecture.score_proposal(_panel_proposal("Core", "Web"), _PANEL_UNITS, _PANEL_EDGES)
+      == _bad, str(_bad))
+check("the size spread is a whole number, so two equal candidates cannot order by float noise",
+      isinstance(_architecture._size_spread([10, 1000]), int)
+      and _architecture._size_spread([100, 100]) == 0)
+
+# Measured against the raw proposal, never against the normalised one: `normalize_proposal`
+# invents a fallback component for every orphan, so a scorer reading its output would report
+# a perfect score for an architect that forgot half the codebase.
+_forgot = _architecture.score_proposal(_panel_proposal("Web", "Core", members=[]),
+                                       _PANEL_UNITS, _PANEL_EDGES)
+check("a file the architect never placed is counted, despite the fallback that rescues it",
+      _forgot["unplaced"] == 1, str(_forgot))
+check("an unbuildable direction still outranks a merely forgotten file",
+      _architecture.rank_key(_forgot) < _architecture.rank_key(_bad),
+      str(_architecture.rank_key(_forgot)))
+check("the score reads as a sentence, for the run log and the gate",
+      "unbuildable dependency direction(s)" in _architecture.describe_score(_bad),
+      _architecture.describe_score(_bad))
+
+# The panel end to end.
+
+_panel_run = store.create_run("panel", ".NET 8", "files", created_by="smoke")
+_panel_calls = []
+
+
+def _panel_call_tool(system_prompt, user_content, schema, llm_override=None,
+                     max_tokens=None, **kw):
+    """One proposal per stance. Only `thin-edges` gets the placement right, so the winner is
+    decided by the scorer rather than by which call happened to come back first."""
+    if schema.get("name") != "submit_target_architecture":
+        return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+    if "business capability" in user_content:
+        stance = "feature"
+    elif "fewest dependencies between projects" in user_content:
+        stance = "thin-edges"
+    else:
+        stance = "balanced"
+    _panel_calls.append(stance)
+    if stance == "thin-edges":
+        return _panel_proposal("Web", "Core")
+    return _panel_proposal("Core", "Web")
+
+
+_saved_call_tool = llm_gateway.call_tool
+llm_gateway.call_tool = _panel_call_tool
+try:
+    _ranked = runner._design_candidates(
+        _panel_run, {"target_stack": ".NET 8"}, CALLER, None, "panel",
+        "| path |", "", [], _PANEL_EDGES, _PANEL_UNITS)
+    check("every stance was asked, once each",
+          sorted(_panel_calls) == sorted(s[0] for s in architect_agent.STANCES),
+          str(_panel_calls))
+    check("the candidate that can actually be built wins",
+          _ranked[0]["stance"] == "thin-edges", str([c["stance"] for c in _ranked]))
+    check("and the ones it beat are kept, not discarded",
+          len(_ranked) == len(architect_agent.STANCES), str(len(_ranked)))
+    _panel_events = [e["event"] for e in store.list_events(_panel_run)]
+    check("each candidate is on the record with what it measured",
+          _panel_events.count("design_candidate") == len(architect_agent.STANCES),
+          str(_panel_events))
+
+    # Same inputs, second time: the winner must be the same one.
+    _panel_calls.clear()
+    _again = runner._design_candidates(
+        _panel_run, {"target_stack": ".NET 8"}, CALLER, None, "panel",
+        "| path |", "", [], _PANEL_EDGES, _PANEL_UNITS)
+    check("running the panel again picks the same winner",
+          [c["stance"] for c in _again] == [c["stance"] for c in _ranked],
+          str([c["stance"] for c in _again]))
+
+    # A tie must break on the order the stances are declared in rather than on arrival order,
+    # or the plan a customer approved changes between two identical runs.
+    llm_gateway.call_tool = lambda s, u, sc, o=None, m=None, **k: (
+        _panel_proposal("Web", "Core") if sc.get("name") == "submit_target_architecture"
+        else _real_call_tool(s, u, sc, o, m, **k))
+    _tied = runner._design_candidates(
+        _panel_run, {"target_stack": ".NET 8"}, CALLER, None, "panel",
+        "| path |", "", [], _PANEL_EDGES, _PANEL_UNITS)
+    check("candidates that measure identically fall back to the declared order",
+          _tied[0]["stance"] == architect_agent.STANCES[0][0], str([c["stance"] for c in _tied]))
+
+    # Degrading rather than failing: a panel that can take down a run it was meant to improve
+    # is worse than no panel.
+    _attempts = []
+
+    def _second_fails(system_prompt, user_content, schema, llm_override=None,
+                      max_tokens=None, **kw):
+        if schema.get("name") != "submit_target_architecture":
+            return _real_call_tool(system_prompt, user_content, schema, llm_override,
+                                   max_tokens, **kw)
+        _attempts.append(1)
+        if len(_attempts) > 1:
+            raise RuntimeError("provider said no")
+        return _panel_proposal("Web", "Core")
+
+    llm_gateway.call_tool = _second_fails
+    _partial = runner._design_candidates(
+        _panel_run, {"target_stack": ".NET 8"}, CALLER, None, "panel",
+        "| path |", "", [], _PANEL_EDGES, _PANEL_UNITS)
+    check("losing a later candidate keeps the ones already in hand",
+          len(_partial) == 1 and _partial[0]["score"]["gaps"] == 0, str(_partial))
+    check("and the run says which candidate it lost",
+          "design_candidate_skipped" in [e["event"] for e in store.list_events(_panel_run)])
+
+    # Losing the *first* one is different: there is no architecture at all, and pretending
+    # otherwise would hand over a scaffold wearing a finished run's status.
+    def _all_fail(system_prompt, user_content, schema, llm_override=None,
+                  max_tokens=None, **kw):
+        if schema.get("name") != "submit_target_architecture":
+            return _real_call_tool(system_prompt, user_content, schema, llm_override,
+                                   max_tokens, **kw)
+        raise RuntimeError("provider said no")
+
+    llm_gateway.call_tool = _all_fail
+    try:
+        runner._design_candidates(_panel_run, {"target_stack": ".NET 8"}, CALLER, None, "panel",
+                                  "| path |", "", [], _PANEL_EDGES, _PANEL_UNITS)
+        _panel_raised = False
+    except Exception:
+        _panel_raised = True
+    check("losing the first candidate is fatal, because then there is no architecture",
+          _panel_raised)
+finally:
+    llm_gateway.call_tool = _saved_call_tool
+
+# The panel is priced where it is approved. A gate quoting one call for a run that makes three
+# is the dishonesty the two-gate split exists to remove.
+check("the assessment gate prices one design call per candidate",
+      runner._discovery_estimate(e2e)["design_calls"]
+      == max(1, min(runner.DESIGN_CANDIDATES, len(architect_agent.STANCES))),
+      str(runner._discovery_estimate(e2e)))
+
 
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
