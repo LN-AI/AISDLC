@@ -34,7 +34,12 @@ class Stage:
     run_status: str                # what `modernization_runs.status` reads while it runs
     llm: bool                      # does draining a row here call a model?
     gate: str = ""                 # blocking checkpoint kind raised when the stage finishes
-    optional: bool = False         # skipped when `plan()` produces no rows
+
+    # There is deliberately no `optional` flag. A stage IS skipped when its `plan()` writes
+    # no rows — comprehension with no source, synthesis with fewer than two probes — but
+    # that is decided in `runner._plan_stage`, not here. A field declaring it that nothing
+    # read described the behaviour without causing it, and its comment went stale claiming
+    # probes did not ship at all.
 
 
 # Order matters and is the point. `run.phase` holds the id of the stage in progress, which
@@ -51,7 +56,6 @@ STAGES: Tuple[Stage, ...] = (
         kind="comprehension",
         run_status="comprehending",
         llm=True,
-        optional=True,          # Phase 1a ships the deterministic digest and no probes
     ),
     Stage(
         id="synthesis",
@@ -59,7 +63,6 @@ STAGES: Tuple[Stage, ...] = (
         kind="synthesis",
         run_status="comprehending",
         llm=True,
-        optional=True,
     ),
     Stage(
         id="design",

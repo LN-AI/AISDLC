@@ -1022,6 +1022,48 @@ def _synthesize_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     return "converted"
 
 
+# Evidence kinds that say something about *where a file belongs*. A framework or a redaction
+# is a fact about the codebase; a route served or a table touched is a fact about this file's
+# layer, and that is the decision the architect is making.
+_PLACEMENT_EVIDENCE = ("route", "entrypoint", "table", "datastore", "integration", "config_key")
+
+
+def _evidence_by_path(run_id: str) -> Dict[str, Dict[str, int]]:
+    """path -> {evidence kind: how many}. What the parsers saw each file doing.
+
+    Already in the evidence table since ingest, and never shown to the design call — so the
+    architect has been deciding which files are controllers and which are data access from
+    their names and their dependency shape, while the pipeline already knew.
+    """
+    counts: Dict[str, Dict[str, int]] = {}
+    for row in store.list_evidence(run_id):
+        kind, path = row.get("kind") or "", row.get("path") or ""
+        if not path or kind not in _PLACEMENT_EVIDENCE:
+            continue
+        counts.setdefault(path, {})
+        counts[path][kind] = counts[path].get(kind, 0) + 1
+    return counts
+
+
+def _probe_purposes(run_id: str) -> List[Dict[str, Any]]:
+    """What each bundle of files was read to be *for*, from the comprehension pass.
+
+    Empty when comprehension produced nothing, which is the honest state — an empty section is
+    not rendered at all rather than rendered as "no purposes found", since the architect cannot
+    act on the difference and the tokens are not free.
+    """
+    out: List[Dict[str, Any]] = []
+    for probe in store.list_units(run_id, kind="comprehension"):
+        if probe.get("status") != "converted":
+            continue
+        meta = probe.get("meta") or {}
+        purpose = str(meta.get("purpose") or "").strip()
+        members = [m for m in (meta.get("members") or []) if m]
+        if purpose and members:
+            out.append({"members": members, "purpose": purpose})
+    return out
+
+
 def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                 caller: dict, llm_override: Optional[dict], project_name: str) -> str:
     """One architect call, then deterministic materialisation of what it proposed."""
@@ -1040,7 +1082,11 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
             caller, "modernization", llm_override, project_name=project_name,
             fn=lambda: _architect.design(
                 charter=charter,
-                inventory=architecture.render_inventory(source_units),
+                inventory=architecture.render_inventory(
+                    source_units,
+                    evidence_by_path=_evidence_by_path(run_id),
+                    purposes=_probe_purposes(run_id),
+                ),
                 digest=digest,
                 cycles=cycles,
                 llm_override=llm_override,

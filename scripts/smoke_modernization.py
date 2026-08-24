@@ -7965,6 +7965,127 @@ check("and it still gets its marker, never a plausible-looking value",
 check("a run with no observed settings writes no empty section",
       "ConvertedSettings" not in json.loads(scaffold.dotnet._appsettings([], {})))
 
+
+section("52. How heavily one file leans on another")
+
+# `requires` is a set, so until now "A depends on B" could not tell one helper call from
+# thirty — and every merge/split decision the architect makes is exactly that question.
+# Weights are carried analyzer -> graph -> unit row -> the inventory the design call reads.
+_B = chr(92)          # a literal backslash, kept out of any heredoc that could mangle it
+WEIGHT_FIXTURE = [
+    {"path": "lib/db.php", "content":
+        "<?php\nclass Db { public function q($s) { return 1; } }\n"},
+    {"path": "lib/Mailer.php", "content": "<?php\nclass Mailer {}\n"},
+    {"path": "app/Orders.php", "content":
+        "<?php\n"
+        "class Orders {\n"
+        "  public function a() { return new Db(); }\n"
+        "  public function b() { return new Db(); }\n"
+        "  public function c() { return new Db(); }\n"
+        "  public function m() { return new Mailer(); }\n"
+        "}\n"},
+    # One reference, several spellings: `Cart` and `Shop\Domain\Cart` both resolve to the
+    # same file because that file lists both in `provides`.
+    {"path": "lib/Cart.php", "content":
+        f"<?php\nnamespace Shop{_B}Domain;\nclass Cart {{}}\n"},
+    {"path": "app/Checkout.php", "content":
+        f"<?php\nnamespace Shop{_B}Domain;\n"
+        "class Checkout { public function go() { return new Cart(); } }\n"},
+]
+
+
+def _weight_facts(engine_available):
+    saved = php._PARSER
+    if not engine_available:
+        php._PARSER = None
+    try:
+        return {f.path: f for f in analyzers.discover(WEIGHT_FIXTURE)}
+    finally:
+        php._PARSER = saved
+
+
+for _engine, _label in ((True, "tree-sitter"), (False, "regex fallback")):
+    if _engine and not php.parser_available():
+        continue
+    # Both engines, because a fallback nobody exercises is a fallback that does not work —
+    # and a weight the two engines disagree about would make one run's architecture depend
+    # on which wheels happened to be installed.
+    _wf = _weight_facts(_engine)
+    _orders = _wf["app/Orders.php"]
+    check(f"[{_label}] a name referenced three times is counted three times",
+          _orders.requires_weight.get("Db") == 3, str(_orders.requires_weight))
+    check(f"[{_label}] and one referenced once is counted once",
+          _orders.requires_weight.get("Mailer") == 1, str(_orders.requires_weight))
+    check(f"[{_label}] `requires` itself is still the deduplicated name list it always was",
+          sorted(_orders.requires) == sorted(set(_orders.requires)), str(_orders.requires))
+
+    _deps, _ext, _weights = graph.resolve_edges(list(_wf.values()))
+    check(f"[{_label}] the weight survives resolution onto the file it resolved to",
+          _weights["app/Orders.php"]["lib/db.php"] == 3,
+          str(_weights["app/Orders.php"]))
+    # The subtle one. Without dedup by leaf name this is 2, and every namespaced reference in
+    # a real codebase would be inflated by however many spellings its provider happens to list.
+    check(f"[{_label}] several spellings of ONE reference count once, not once per spelling",
+          _weights["app/Checkout.php"]["lib/Cart.php"] == 1,
+          str(_weights["app/Checkout.php"]))
+
+    _built = graph.build(list(_wf.values()))
+    _row = [u for u in _built["units"] if u["path"] == "app/Orders.php"][0]
+    check(f"[{_label}] the weight reaches the unit row, keyed exactly like depends_on",
+          _row["meta"]["dependency_weights"] == {"lib/Mailer.php": 1, "lib/db.php": 3},
+          str(_row["meta"].get("dependency_weights")))
+    check(f"[{_label}] every weighted target is a real dependency of that unit",
+          set(_row["meta"]["dependency_weights"]) <= set(_row["depends_on"]),
+          str(_row["depends_on"]))
+
+# An analyzer that does not count must not change behaviour: every resolved edge weighs 1.
+_PY_FIXTURE = [
+    {"path": "a.py", "content": "import b\nimport b\n"},
+    {"path": "b.py", "content": "X = 1\n"},
+]
+_py_facts = analyzers.discover(_PY_FIXTURE)
+_py_deps, _py_ext, _py_weights = graph.resolve_edges(_py_facts)
+check("a language with no weight support still resolves its edges",
+      "b.py" in _py_deps["a.py"], str(_py_deps))
+check("and every one of those edges weighs 1 rather than nothing",
+      _py_weights["a.py"] == {"b.py": 1}, str(_py_weights["a.py"]))
+
+# The inventory the architect reads.
+_inv_units = _built["units"]
+_inventory = _architecture.render_inventory(_inv_units)
+check("the inventory names the heaviest dependency with its count",
+      "`lib/db.php` ×3" in _inventory, _inventory)
+check("a dependency referenced once carries no count — absence reads as 'once'",
+      "`lib/Mailer.php` ×1" not in _inventory and "lib/Mailer.php" in _inventory,
+      _inventory)
+# Within the row's own cell, not across the document: every path also appears as its own row,
+# and `lib/Mailer.php` sorts before `lib/db.php` there.
+_orders_row = next(l for l in _inventory.splitlines() if l.startswith("| `app/Orders.php`"))
+_orders_deps = _orders_row.rsplit("|", 2)[-2]
+check("the heaviest dependency is listed before the thinner one",
+      _orders_deps.index("lib/db.php") < _orders_deps.index("lib/Mailer.php"), _orders_row)
+check("the inventory names the types each file declares",
+      "`Orders`" in _inventory and "`Cart`" in _inventory, _inventory)
+check("a file that declares nothing and depends on nothing renders as em-dashes, not blanks",
+      "|  |" not in _inventory, _inventory)
+
+_inv_with_evidence = _architecture.render_inventory(
+    _inv_units, evidence_by_path={"app/Orders.php": {"route": 3, "table": 1}})
+check("what the parsers saw a file serving reaches the design call",
+      "3 routes, 1 table" in _inv_with_evidence, _inv_with_evidence)
+check("a file with no observed evidence is not described as having some",
+      _inv_with_evidence.count("3 routes") == 1, _inv_with_evidence)
+
+_inv_with_purpose = _architecture.render_inventory(
+    _inv_units, purposes=[{"members": ["app/Orders.php"], "purpose": "Places and cancels orders."}])
+check("the comprehension purpose reaches the call that decides placement",
+      "Places and cancels orders." in _inv_with_purpose, _inv_with_purpose)
+check("and a run with no comprehension renders no empty purpose section",
+      "What each area of the source does" not in _inventory, _inventory)
+check("a purpose with no members is not rendered as a heading with nothing under it",
+      "What each area of the source does"
+      not in _architecture.render_inventory(_inv_units, purposes=[{"members": [], "purpose": "x"}]))
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

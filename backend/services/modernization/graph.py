@@ -71,31 +71,70 @@ def _provider_index(facts: Sequence[UnitFacts]) -> Dict[str, List[str]]:
     return index
 
 
-def resolve_edges(facts: Sequence[UnitFacts]) -> Tuple[Dict[str, Set[str]], Dict[str, List[str]]]:
-    """-> (path -> set of paths it depends on, path -> names that resolved to nothing)."""
+def _leaf(name: str) -> str:
+    """The last segment of a name, however it is separated.
+
+    Used only to tell "two spellings of one reference" from "two different references". PHP
+    offers a type as `Foo` *and* `App\\Foo`, and a provider file lists both in its `provides`,
+    so both spellings resolve to the same file — counting each would score one `new Foo()` as
+    two. Same rule `ownership.verify_type_symbols` matches on (D-110).
+    """
+    return name.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def resolve_edges(
+    facts: Sequence[UnitFacts],
+) -> Tuple[Dict[str, Set[str]], Dict[str, List[str]], Dict[str, Dict[str, int]]]:
+    """-> (path -> paths it depends on, path -> names that resolved to nothing, edge weights).
+
+    The third value is how many times each dependency was actually referenced — the signal
+    `requires` destroys by being a set. It is what lets a reader (and the architect) tell an
+    edge that is one helper call from an edge that is thirty, which is the difference between
+    a component boundary that is cheap to draw and one that is not.
+    """
     index = _provider_index(facts)
     deps: Dict[str, Set[str]] = {f.path: set() for f in facts}
+    weights: Dict[str, Dict[str, int]] = {f.path: {} for f in facts}
     external: Dict[str, List[str]] = {}
     for fact in facts:
         unresolved = []
+        per_name = getattr(fact, "requires_weight", None) or {}
+        # Which (provider, reference) pairs this file has already been charged for. Several
+        # spellings of one reference land on the same provider and must count once; two
+        # genuinely different references to the same provider must count twice.
+        charged: Set[Tuple[str, str]] = set()
         for name in fact.requires:
             providers = index.get(name)
             if not providers:
                 unresolved.append(name)
                 continue
             for provider in providers:
-                if provider != fact.path:          # a self-edge is never a dependency
-                    deps[fact.path].add(provider)
+                if provider == fact.path:          # a self-edge is never a dependency
+                    continue
+                deps[fact.path].add(provider)
+                key = (provider, _leaf(name))
+                if key in charged:
+                    continue
+                charged.add(key)
+                # An analyzer that does not count leaves this at 1 per resolved reference,
+                # which is exactly the behaviour before weights existed.
+                weights[fact.path][provider] = (weights[fact.path].get(provider, 0)
+                                                + max(1, int(per_name.get(name, 1))))
         # Inferred references: an edge when they land, nothing when they miss. A template name
         # that resolves to no file is a template this analyzer guessed wrong about, not a
         # dependency the customer has to go and find.
+        #
+        # Deliberately unweighted. A soft edge is a guess, and letting a guess add to a number
+        # the architect reads as measured coupling would put invented weight on a real
+        # decision — the same argument that keeps `soft_requires` out of `external_requires`.
         for name in getattr(fact, "soft_requires", ()):
             for provider in index.get(name) or ():
                 if provider != fact.path:
                     deps[fact.path].add(provider)
+                    weights[fact.path].setdefault(provider, 1)
         if unresolved:
             external[fact.path] = sorted(set(unresolved))
-    return deps, external
+    return deps, external, weights
 
 
 def strongly_connected(deps: Dict[str, Set[str]]) -> List[List[str]]:
@@ -187,7 +226,7 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
     of independence rather than a guess — which is what makes it safe to widen parallelism
     later without re-deriving anything.
     """
-    deps, external = resolve_edges(facts)
+    deps, external, weights = resolve_edges(facts)
     condensed = condense(deps)
     components = condensed["components"]
     levels = condensed["levels"]
@@ -231,6 +270,15 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
                 "requires": unit.pop("requires", []),
                 "in_cycle_with": sorted(member_set - {path}),
                 "external_requires": external.get(path, []),
+                # Weights for the edges that survived, keyed the same way `depends_on` is.
+                # Scoped to `depends_on` rather than to every resolved provider so the two
+                # cannot disagree: an intra-cycle edge is not a dependency here, so its
+                # weight is not a fact about this unit's dependencies either.
+                "dependency_weights": {
+                    target: weight
+                    for target, weight in sorted((weights.get(path) or {}).items())
+                    if target in unit["depends_on"]
+                },
             }
             unit["topo_level"] = levels[comp_id]
             unit["scc_group"] = comp_id if len(members) > 1 else None

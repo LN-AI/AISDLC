@@ -346,6 +346,30 @@ def _line(node) -> int:
     return node.start_point[0] + 1
 
 
+def _reference(weights: Dict[str, int], spellings: Iterable[str]) -> List[str]:
+    """One reference site, counted once against every spelling it could resolve to.
+
+    `_name_spellings` returns several spellings of a *single* reference — `Foo`, `App\\Foo`,
+    `Vendor\\Foo` — of which at most one normally matches a real file. Counting the returned
+    list directly would score one `new Foo()` as three references, so the occurrence
+    contributes exactly one to each *distinct* spelling and whichever spelling resolves
+    carries the true count. `graph.resolve_edges` then collapses the alternatives back
+    together, which is where the arithmetic is finished.
+
+    Call it once per reference site. A name written twice in a file is two calls and scores
+    two, which is the entire point.
+    """
+    fresh: List[str] = []
+    seen: Set[str] = set()
+    for name in spellings:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        fresh.append(name)
+        weights[name] = weights.get(name, 0) + 1
+    return fresh
+
+
 def _analyze_treesitter(path: str, content: str) -> UnitFacts:
     tree = _PARSER.parse(content.encode("utf-8"))
     caps = _captures(tree)
@@ -355,6 +379,7 @@ def _analyze_treesitter(path: str, content: str) -> UnitFacts:
 
     provides: List[str] = list(_path_spellings(path))
     requires: List[str] = []
+    weights: Dict[str, int] = {}
     exports: List[Symbol] = []
 
     if namespace:
@@ -389,7 +414,7 @@ def _analyze_treesitter(path: str, content: str) -> UnitFacts:
 
     for capture in ("use", "extends", "implements", "new", "static"):
         for node in caps.get(capture, []):
-            requires.extend(_name_spellings(_text(node), namespace, imports))
+            requires.extend(_reference(weights, _name_spellings(_text(node), namespace, imports)))
 
     # `define('X', ...)` — a constant, and the pre-namespace idiom for one.
     for node in caps.get("call", []):
@@ -402,7 +427,10 @@ def _analyze_treesitter(path: str, content: str) -> UnitFacts:
                                       signature=f"define('{literal}', ...)"))
 
     facts = _php_facts(path, content, caps)
-    requires.extend(facts.pop("_include_edges", []))
+    # One entry per include *site* (`_php_facts` keeps a single spelling each), so each is its
+    # own reference and a file included twice scores two.
+    for edge in facts.pop("_include_edges", []):
+        requires.extend(_reference(weights, (edge,)))
     view_edges = facts.pop("_view_edges", [])
 
     return UnitFacts(
@@ -413,6 +441,7 @@ def _analyze_treesitter(path: str, content: str) -> UnitFacts:
                                                 for s in exports)),
         provides=sorted(set(p for p in provides if p)),
         requires=sorted(set(r for r in requires if r)),
+        requires_weight=weights,
         soft_requires=sorted(set(v for v in view_edges if v)),
         exports=exports,
         confidence=1.0,
@@ -848,6 +877,7 @@ def _analyze_regex(path: str, content: str, confidence: float = 0.6) -> UnitFact
 
     provides = list(_path_spellings(path))
     requires: List[str] = []
+    weights: Dict[str, int] = {}
     exports: List[Symbol] = []
 
     if namespace:
@@ -880,19 +910,21 @@ def _analyze_regex(path: str, content: str, confidence: float = 0.6) -> UnitFact
     imports = _import_map(grouped + list(_RX_USE.findall(content)))
 
     for name in grouped:
-        requires.extend(_name_spellings(name, namespace, imports))
+        requires.extend(_reference(weights, _name_spellings(name, namespace, imports)))
     for name in _RX_USE.findall(content):
-        requires.extend(_name_spellings(name, namespace, imports))
+        requires.extend(_reference(weights, _name_spellings(name, namespace, imports)))
     for name in _RX_EXTENDS.findall(content):
-        requires.extend(_name_spellings(name, namespace, imports))
+        requires.extend(_reference(weights, _name_spellings(name, namespace, imports)))
     for group in _RX_IMPLEMENTS.findall(content):
         for name in group.split(","):
-            requires.extend(_name_spellings(name.strip(), namespace, imports))
+            requires.extend(_reference(weights, _name_spellings(name.strip(), namespace, imports)))
     for name in _RX_NEW.findall(content) + _RX_STATIC.findall(content):
-        requires.extend(_name_spellings(name, namespace, imports))
+        requires.extend(_reference(weights, _name_spellings(name, namespace, imports)))
 
     facts = _php_facts(path, content, caps=None)
-    requires.extend(facts.pop("_include_edges", []))
+    # Per include site, exactly as the tree-sitter path counts them.
+    for edge in facts.pop("_include_edges", []):
+        requires.extend(_reference(weights, (edge,)))
     view_edges = facts.pop("_view_edges", [])
 
     return UnitFacts(
@@ -903,6 +935,7 @@ def _analyze_regex(path: str, content: str, confidence: float = 0.6) -> UnitFact
                                                 for s in exports)),
         provides=sorted(set(p for p in provides if p)),
         requires=sorted(set(r for r in requires if r)),
+        requires_weight=weights,
         soft_requires=sorted(set(v for v in view_edges if v)),
         exports=exports,
         confidence=confidence,

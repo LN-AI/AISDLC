@@ -71,18 +71,88 @@ def is_synthetic(path: str) -> bool:
 
 # ── The inventory the architect is shown ───────────────────────────────────
 
-def render_inventory(units: List[Dict[str, Any]], max_chars: int = 120_000) -> str:
-    """One row per source file. No bodies — the architect decides placement, not content."""
-    lines = ["| path | language | role | lines | depends on |",
-             "|---|---|---|---|---|"]
+_MAX_DEPS_SHOWN = 4
+_MAX_DECLARES_SHOWN = 3
+
+# Kinds worth naming to someone deciding placement. A constant tells you nothing about which
+# component a file belongs in; a class or an interface tells you almost everything.
+_PLACEMENT_KINDS = ("class", "interface", "trait", "enum", "record", "struct")
+
+
+def _declares(unit: Dict[str, Any]) -> str:
+    """The types this file owns, which is most of what decides where it belongs."""
+    exports = unit.get("exports") or []
+    names = [str(e.get("name") or "") for e in exports
+             if isinstance(e, dict) and str(e.get("kind") or "") in _PLACEMENT_KINDS]
+    if not names:
+        # Falling back to functions rather than printing nothing: a procedural codebase has no
+        # classes at all, and "this file declares nothing" would be false for every file in it.
+        names = [str(e.get("name") or "") for e in exports
+                 if isinstance(e, dict) and str(e.get("kind") or "") == "function"]
+    names = [n for n in names if n]
+    shown = ", ".join(f"`{n}`" for n in names[:_MAX_DECLARES_SHOWN])
+    if len(names) > _MAX_DECLARES_SHOWN:
+        shown += f" +{len(names) - _MAX_DECLARES_SHOWN}"
+    return shown or "—"
+
+
+def _dependency_cell(unit: Dict[str, Any]) -> str:
+    """Dependencies heaviest first, with how many times each was referenced.
+
+    Ordering by weight rather than alphabetically is the point of having weights at all: with
+    only four shown, the alphabetically-first four are an arbitrary sample, while the heaviest
+    four are the edges that decide whether a component boundary is cheap to draw.
+    """
+    deps = list(unit.get("depends_on") or [])
+    if not deps:
+        return "—"
+    weights = (unit.get("meta") or {}).get("dependency_weights") or {}
+    ranked = sorted(deps, key=lambda d: (-int(weights.get(d) or 1), d))
+    parts = []
+    for dep in ranked[:_MAX_DEPS_SHOWN]:
+        weight = int(weights.get(dep) or 1)
+        # `×1` on every thin edge would be noise on the majority of rows, so only a repeated
+        # reference is annotated — the absence then reads as "once", which is what it means.
+        parts.append(f"`{dep}`" + (f" ×{weight}" if weight > 1 else ""))
+    shown = ", ".join(parts)
+    if len(ranked) > _MAX_DEPS_SHOWN:
+        shown += f" +{len(ranked) - _MAX_DEPS_SHOWN}"
+    return shown
+
+
+def _serves_cell(path: str, evidence_by_path: Dict[str, Dict[str, int]]) -> str:
+    """What the parsers observed this file doing — routes served, tables touched.
+
+    A file with three routes is a controller wherever it happens to live in the directory
+    tree, and a file touching four tables is a data-access site. Both are facts already in the
+    evidence table, and neither had ever been shown to the call that decides layering.
+    """
+    counts = evidence_by_path.get(path) or {}
+    parts = [f"{n} {kind.replace('_', ' ')}" + ("s" if n != 1 else "")
+             for kind, n in sorted(counts.items()) if n]
+    return ", ".join(parts) if parts else "—"
+
+
+def render_inventory(units: List[Dict[str, Any]], max_chars: int = 120_000,
+                     evidence_by_path: Optional[Dict[str, Dict[str, int]]] = None,
+                     purposes: Optional[List[Dict[str, Any]]] = None) -> str:
+    """One row per source file. No bodies — the architect decides placement, not content.
+
+    What it *is* given, beyond the path, is everything the deterministic passes already know
+    and had never been passed on: which types the file declares, what the parsers observed it
+    doing, and how heavily it leans on each of its dependencies. None of this is new analysis
+    — it is the same rows the digest and the evidence table are built from, aimed at the one
+    call that has to decide which files belong together.
+    """
+    evidence_by_path = evidence_by_path or {}
+    lines = ["| path | language | role | lines | declares | serves | depends on |",
+             "|---|---|---|---|---|---|---|"]
     for unit in units:
-        deps = unit.get("depends_on") or []
-        shown = ", ".join(f"`{d}`" for d in deps[:4])
-        if len(deps) > 4:
-            shown += f" +{len(deps) - 4}"
         lines.append(
             f"| `{unit['path']}` | {unit.get('language') or '?'} | "
-            f"{unit.get('module_type') or '?'} | {unit.get('loc') or 0} | {shown or '—'} |"
+            f"{unit.get('module_type') or '?'} | {unit.get('loc') or 0} | "
+            f"{_declares(unit)} | {_serves_cell(unit['path'], evidence_by_path)} | "
+            f"{_dependency_cell(unit)} |"
         )
     text = "\n".join(lines)
     if len(text) > max_chars:
@@ -92,7 +162,35 @@ def render_inventory(units: List[Dict[str, Any]], max_chars: int = 120_000) -> s
         # have assigned those files, and the fallback below will have to.
         text = kept + f"\n\n_({omitted} further file(s) omitted for length — they will be " \
                       f"assigned mechanically.)_"
-    return text
+    return text + _purpose_section(purposes)
+
+
+def _purpose_section(purposes: Optional[List[Dict[str, Any]]]) -> str:
+    """What the comprehension pass found each area of the codebase to be *for*.
+
+    Rendered as a section rather than a table column because a purpose belongs to a bundle of
+    files, and repeating it on every member's row would pay for the same sentence twelve times
+    in a block the architect reads once.
+
+    This is the one enrichment that was already bought and never delivered: the probes write a
+    purpose per bundle, it reaches the digest that conversion calls read, and it never reached
+    the call that decides which files belong together — which is the decision it describes.
+    """
+    usable = [p for p in (purposes or [])
+              if isinstance(p, dict) and str(p.get("purpose") or "").strip()
+              and (p.get("members") or [])]
+    if not usable:
+        return ""
+    out = ["", "", "## What each area of the source does", "",
+           "From reading the code, one entry per group of files that were read together. "
+           "Files not listed here were not covered by a reading.", ""]
+    for entry in usable:
+        members = [str(m) for m in (entry.get("members") or []) if m]
+        shown = ", ".join(f"`{m}`" for m in members[:12])
+        if len(members) > 12:
+            shown += f" +{len(members) - 12} more"
+        out.append(f"- **{shown}** — {str(entry['purpose']).strip()}")
+    return "\n".join(out)
 
 
 # ── Normalising what came back ─────────────────────────────────────────────

@@ -17,6 +17,9 @@ An analyzer answers two questions about one file, and nothing else:
     a Java FQCN, a .NET namespace, a Pascal unit name)
   * `requires` — the names this file refers to
 
+An analyzer may additionally report `requires_weight` — how many times each of those names was
+referenced. That is optional, and an analyzer that omits it leaves every edge weighing 1.
+
 `graph.build()` then resolves `requires` against every file's `provides`. Keeping resolution
 out of the analyzers is what lets one topological sort serve every language: an analyzer
 only has to know its own syntax, never the shape of the repository.
@@ -50,6 +53,16 @@ class UnitFacts:
     module_type: str = ""        # ui | data | business | config | test | entrypoint | unknown
     provides: List[str] = field(default_factory=list)
     requires: List[str] = field(default_factory=list)
+    # How many times each name in `requires` was actually referenced. `requires` is a *set* of
+    # names — it has to be, because resolution is string equality against another file's
+    # `provides` — and collapsing to a set is what destroyed the only signal of coupling
+    # strength this pipeline could have had. "A depends on B" cannot distinguish one helper
+    # call from thirty, so every merge and split decision the architect makes is blind to
+    # which edges are thin.
+    #
+    # Optional by design: an analyzer that does not count leaves this empty and every resolved
+    # edge weighs 1, which is exactly today's behaviour. Only PHP populates it.
+    requires_weight: Dict[str, int] = field(default_factory=dict)
     # References this analyzer *inferred* rather than read: a template named by a string that
     # a framework turns into a path, a handler named in a route table. They become edges when
     # they resolve and are silent when they do not — unlike `requires`, whose unresolved names
