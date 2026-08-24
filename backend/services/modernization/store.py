@@ -486,13 +486,26 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
 # returns it for rows written before the column existed, so `ADD COLUMN` stays O(1) and no
 # backfill UPDATE is needed even on a large populated database. A non-constant default
 # (CURRENT_TIMESTAMP, an expression) would not have that property.
+# How a component is converted unless a caller says otherwise. `agentic` lets each component
+# look things up before it answers — read another source file, search the codebase, read what an
+# earlier component produced — instead of guessing from the prompt it was given.
+#
+# The default because it is the only head-to-head accuracy comparison this product has: 18 of 18
+# columns mapped correctly where the single-shot call guessed, on a `DbContext` that shipped
+# naming a column the schema does not have. It costs more per component and the plan gate quotes
+# a ceiling that accounts for it. Named here rather than repeated at each entry point, because
+# three copies of a default are three chances for the API, the form and the worker to disagree
+# about what a run that did not choose is getting.
+DEFAULT_CONVERSION_MODE = "agentic"
+
 _ADDED_COLUMNS = (
     # `single` (one forced tool call per component, which is everything this product has ever
     # done) or `agentic` (a bounded loop that may look things up first). Defaulted to `single`
     # so every existing run, every quote already given at a spend gate and every fixture keeps
     # the behaviour it had — this is a thing a customer opts into, not a thing that happens
     # to them between deploys.
-    ("modernization_runs", "conversion_mode", "TEXT DEFAULT 'single'"),
+    ("modernization_runs", "conversion_mode",
+     f"TEXT DEFAULT '{DEFAULT_CONVERSION_MODE}'"),
     ("modernization_units", "kind", "TEXT DEFAULT 'source_file'"),
     ("modernization_units", "component_name", "TEXT"),
     ("modernization_units", "target_project", "TEXT"),

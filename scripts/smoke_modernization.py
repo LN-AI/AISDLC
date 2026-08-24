@@ -6069,10 +6069,20 @@ check("one run's lookups cannot see another run's source",
       "no source file" in lookup.dispatcher(_lk)("read_source", {"path": "src/Secret.php"}),
       lookup.dispatcher(_lk)("read_source", {"path": "src/Secret.php"})[:80])
 
-# ── Off unless the run asked for it ────────────────────────────────────────
-check("a run converts in single mode unless it says otherwise",
-      (store.get_run(_lk) or {}).get("conversion_mode") in ("single", None),
+# ── What a run gets when it does not choose ────────────────────────────────
+#
+# The lookups are on by default: it is the only head-to-head accuracy comparison this product
+# has, and the mode that guesses lost it. Asserted against the constant rather than the literal
+# so that changing the default stays a deliberate act rather than a test nobody updated.
+check("a run that does not choose gets the platform default",
+      (store.get_run(_lk) or {}).get("conversion_mode")
+      in (store.DEFAULT_CONVERSION_MODE, None),
       str((store.get_run(_lk) or {}).get("conversion_mode")))
+check("and that default is the mode that looks things up rather than guessing",
+      store.DEFAULT_CONVERSION_MODE == "agentic", store.DEFAULT_CONVERSION_MODE)
+store.update_run(_lk, conversion_mode="single")
+check("a run that explicitly asks for one call keeps it",
+      store.get_run(_lk)["conversion_mode"] == "single")
 store.update_run(_lk, conversion_mode="agentic")
 check("and the mode is durable once set",
       store.get_run(_lk)["conversion_mode"] == "agentic")
@@ -8762,6 +8772,67 @@ check("the gate is still the ordinary blocking spend gate, not a second one",
       _lint_gate["blocking"] and len(
           [c for c in store.list_checkpoints(_lint_run) if c["blocking"]]) == 1,
       str([c["kind"] for c in store.list_checkpoints(_lint_run)]))
+
+
+section("58. Reading files together because they belong together")
+
+# A probe boundary decides which files are read as one, which decides which business rules can
+# be found at all: a rule implemented across two files is invisible to both probes if the cap
+# falls between them, and neither knows the other exists. The boundary used to be decided by
+# byte count alone — a cost question answering a semantic one.
+
+
+def _bu(path, deps=(), size=100):
+    return {"path": path, "depends_on": list(deps), "source_text": "x" * size}
+
+
+_pairs = [_bu("a/one.php", ["a/two.php"]), _bu("a/two.php"),
+          _bu("b/three.php", ["b/four.php"]), _bu("b/four.php")]
+_paired = [[u["path"] for u in g] for g in rules_module.bundle(_pairs, 10_000, max_files=2)]
+check("two files that reference each other are read by the same probe",
+      ["a/one.php", "a/two.php"] in [sorted(g) for g in _paired]
+      and ["b/four.php", "b/three.php"] in [sorted(g) for g in _paired],
+      str(_paired))
+check("and unrelated files are not forced together to fill a bundle",
+      all(len(g) <= 2 for g in _paired), str(_paired))
+
+# The cap that could not fit the pair still wins — a bundle that overflowed to keep a cluster
+# whole would be a probe the assessment gate did not price.
+_tight = [[u["path"] for u in g] for g in rules_module.bundle(_pairs, 10_000, max_files=1)]
+check("a cluster that cannot fit is still split rather than overflowing its cap",
+      all(len(g) == 1 for g in _tight), str(_tight))
+
+# The case that makes naive clustering worse than no clustering: one shared include reachable
+# from everything makes the naive component the entire repository, and packing that would throw
+# away the directory heuristic for nothing.
+_hub = [_bu("lib/header.php")] + [_bu(f"p{i}.php", ["lib/header.php"]) for i in range(6)]
+_hubbed = rules_module.bundle(_hub, 10_000, max_files=3)
+check("a hub every file includes does not collapse the codebase into one cluster",
+      len(_hubbed) >= 2 and all(len(g) <= 3 for g in _hubbed),
+      str([[u["path"] for u in g] for g in _hubbed]))
+check("every file still lands in exactly one probe",
+      sorted(u["path"] for g in _hubbed for u in g) == sorted(u["path"] for u in _hub),
+      str(sorted(u["path"] for g in _hubbed for u in g)))
+
+# Determinism is the property the whole module exists to preserve: a bundler that shuffled
+# would make two runs over one codebase disagree about what the application does.
+check("the same files in a different order bundle identically",
+      rules_module.bundle(list(reversed(_pairs)), 10_000, 2)
+      == rules_module.bundle(_pairs, 10_000, 2))
+check("and bundling twice gives the same answer",
+      rules_module.bundle(_hub, 10_000, 3) == rules_module.bundle(_hub, 10_000, 3))
+
+# Still total: nothing dropped, nothing duplicated, however odd the input.
+_odd = [_bu("x.php", ["missing.php"]), _bu("x.php"), _bu("", []),
+        _bu("big.php", [], size=50_000)]
+_odd_out = rules_module.bundle(_odd, 1_000, 3)
+_odd_paths = [u["path"] for g in _odd_out for u in g]
+check("a duplicate path is read once, not twice at twice the price",
+      _odd_paths.count("x.php") == 1, str(_odd_paths))
+check("a file larger than the whole cap still gets a probe rather than being dropped",
+      "big.php" in _odd_paths, str(_odd_paths))
+check("an edge to a file that is not in the run is ignored rather than raising",
+      "x.php" in _odd_paths, str(_odd_paths))
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

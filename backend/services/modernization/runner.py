@@ -2035,7 +2035,7 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     # is still true per *call*, and this mode makes up to `AGENTIC_MAX_TURNS + 1` of them.
     # The bound has to move with it, or the one number on this gate that is a fact rather
     # than a forecast (D-48) quietly stops being one.
-    agentic = (run.get("conversion_mode") or "single") == "agentic"
+    agentic = (run.get("conversion_mode") or store.DEFAULT_CONVERSION_MODE) == "agentic"
     turns = (llm_gateway.AGENTIC_MAX_TURNS + 1) if agentic else 1
     per_unit = [{
         "est_cost_usd": c.get("est_cost_usd") or 0.0,
@@ -2332,7 +2332,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     # stages are different agents with different questions, and a run that did not ask for
     # the loop must convert exactly as it always has (`conversion_mode` defaults to
     # `single`).
-    agentic = (run_row.get("conversion_mode") or "single") == "agentic" \
+    agentic = (run_row.get("conversion_mode") or store.DEFAULT_CONVERSION_MODE) == "agentic" \
         and unit.get("kind") == "component"
     lookup_tools = lookup.TOOL_SCHEMAS if agentic else None
     lookup_dispatch = lookup.dispatcher(run_id) if agentic else None

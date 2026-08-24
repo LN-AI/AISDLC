@@ -73,13 +73,13 @@ class CreateRunRequest(BaseModel):
         None, description="Hard stop. The run pauses when it reaches this, keeping everything "
                           "converted so far. Strongly recommended on a first run.")
     conversion_mode: str = Field(
-        "single",
-        description="'single' (default) converts each component in one model call, which is "
-                    "what this product has always done. 'agentic' lets each component look "
-                    "things up first - read another source file, search the codebase, read "
-                    "what an earlier component produced - up to a bounded number of times "
-                    "before it answers. It costs more per component, and the plan gate "
-                    "quotes a ceiling that accounts for it.")
+        store.DEFAULT_CONVERSION_MODE,
+        description="'agentic' (default) lets each component look things up before it answers "
+                    "- read another source file, search the codebase, read what an earlier "
+                    "component produced - up to a bounded number of times. It is the mode that "
+                    "has been measured more accurate, and it costs more per component; the "
+                    "plan gate quotes a ceiling that accounts for it. 'single' converts each "
+                    "component in one model call, which is what this product did before.")
 
 
 CONVERSION_MODES = ("single", "agentic")
@@ -91,7 +91,7 @@ def _conversion_mode(raw: str) -> str:
     A typo silently converting in the cheap mode is a customer who paid attention to this
     setting, did not get what they asked for, and has nothing anywhere telling them so.
     """
-    mode = (raw or "single").strip().lower()
+    mode = (raw or store.DEFAULT_CONVERSION_MODE).strip().lower()
     if mode not in CONVERSION_MODES:
         raise HTTPException(
             400, f"conversion_mode must be one of {', '.join(CONVERSION_MODES)}; got {mode!r}.")
@@ -337,7 +337,8 @@ async def create_run_from_zip(
     target_stack: str = Form(...),
     extensions: str = Form("", description="Comma-separated extension override, e.g. '.cbl,.cpy'."),
     budget_cap_usd: Optional[float] = Form(None),
-    conversion_mode: str = Form("single", description="'single' or 'agentic' — see the JSON "
+    conversion_mode: str = Form(store.DEFAULT_CONVERSION_MODE,
+                                description="'single' or 'agentic' — see the JSON "
                                                       "create endpoint."),
     caller: dict = Depends(get_caller),
 ):

@@ -130,16 +130,92 @@ def bundle(units: List[Dict[str, Any]], max_chars: int,
     current: List[Dict[str, Any]] = []
     current_chars = 0
 
-    for unit in _probe_order(units):
-        size = _source_chars(unit)
-        if current and (len(current) >= max_files or current_chars + size > max_chars):
+    # Packed cluster by cluster rather than file by file. Packing individually let a cap fall
+    # in the middle of a group of files that reference each other, so a rule implemented
+    # across two of them was invisible to both probes and neither knew the other existed —
+    # and the boundary was decided by byte count, which is a cost question being asked to
+    # answer a semantic one. A cluster that fits in an empty bundle is never split.
+    for cluster in _clusters(units, max_chars, max_files):
+        size = sum(_source_chars(u) for u in cluster)
+        if current and (len(current) + len(cluster) > max_files
+                        or current_chars + size > max_chars):
             groups.append(current)
             current, current_chars = [], 0
-        current.append(unit)
-        current_chars += size
+        for unit in cluster:
+            unit_size = _source_chars(unit)
+            # Only reachable for a cluster too big to fit anywhere, which `_clusters` has
+            # already broken down — so this is the same file-by-file packing as before,
+            # applied to the remainder rather than to everything.
+            if current and (len(current) >= max_files
+                            or current_chars + unit_size > max_chars):
+                groups.append(current)
+                current, current_chars = [], 0
+            current.append(unit)
+            current_chars += unit_size
     if current:
         groups.append(current)
     return groups
+
+
+def _clusters(units: List[Dict[str, Any]], max_chars: int,
+              max_files: int) -> List[List[Dict[str, Any]]]:
+    """Files that reference each other, grouped, in a fixed order.
+
+    Connected components of the *undirected* dependency graph — undirected because "worth
+    reading together" is symmetric even though a dependency is not.
+
+    Two properties keep this from making things worse:
+
+    **A cluster too large to be one probe is not a cluster.** In a legacy codebase a single
+    shared include (`header.php`, `db.php`) is reachable from nearly every file, so the naive
+    component containing it is the whole repository — and packing that "cluster" would be
+    path-order packing with the directory heuristic thrown away, which is strictly worse than
+    what this replaces. An oversized component is therefore handed back in the existing
+    directory-major order and packed exactly as it always was.
+
+    **Order is total and derived only from paths.** Clusters sort by their lowest member,
+    members by the existing breadth-first walk, so two runs over one codebase group
+    identically — the property the whole module exists to preserve.
+    """
+    ordered = _probe_order(units)
+    by_path = {_path_of(u): u for u in ordered}
+    neighbours: Dict[str, Set[str]] = {path: set() for path in by_path}
+    for path, unit in by_path.items():
+        for dep in unit.get("depends_on") or []:
+            dep = str(dep)
+            if dep in by_path and dep != path:
+                neighbours[path].add(dep)
+                neighbours[dep].add(path)
+
+    seen: Set[str] = set()
+    components: List[List[str]] = []
+    for seed in sorted(by_path):
+        if seed in seen:
+            continue
+        seen.add(seed)
+        queue, members = [seed], [seed]
+        while queue:
+            path = queue.pop(0)
+            for neighbour in sorted(neighbours[path]):
+                if neighbour not in seen:
+                    seen.add(neighbour)
+                    members.append(neighbour)
+                    queue.append(neighbour)
+        components.append(sorted(members))
+
+    position = {_path_of(u): i for i, u in enumerate(ordered)}
+    out: List[List[Dict[str, Any]]] = []
+    for members in sorted(components, key=lambda m: m[0]):
+        group = sorted((by_path[p] for p in members), key=lambda u: position[_path_of(u)])
+        fits = (len(group) <= max_files
+                and sum(_source_chars(u) for u in group) <= max_chars)
+        if fits:
+            out.append(group)
+        else:
+            # Degraded to the directory-major order it already had, one file per entry, so the
+            # packer treats it exactly as it did before clusters existed.
+            out.extend([unit] for unit in group)
+    return out
 
 
 def _probe_order(units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
