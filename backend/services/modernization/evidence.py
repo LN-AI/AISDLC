@@ -42,6 +42,7 @@ EVIDENCE_KINDS = (
     "output",        # a site that writes to the response
     "hazard",        # something that must not be silently translated
     "dispatch",      # dynamic/indirect control flow a parser cannot resolve
+    "auth",          # how a user is identified, and how that state is carried
 )
 
 MAX_SNIPPET = 200
@@ -147,6 +148,25 @@ _OUTPUT_MARKERS = (
     ("json", re.compile(r"(?i)\b(json_encode|JsonResult|application/json)\b")),
     ("html", re.compile(r"(?i)<(html|body|table|div|form)\b")),
     ("download", re.compile(r"""(?i)\bheader\s*\(\s*['"]\s*Content-(Disposition|Type)\s*:""")),
+)
+
+# How the application knows who is asking, and how it remembers between requests.
+#
+# Its own kind rather than a hazard or an integration, because it answers a charter question
+# nothing else could: `auth_model` was `applies_when=None` and therefore never required, so a
+# codebase with sessions and a password check could be converted with nobody having decided
+# how either becomes the target's equivalent. Every one of these is also a thing that compiles
+# perfectly while being wrong — a rehashed password locks out every existing user, and a
+# session that silently becomes a cookie changes who can read it.
+#
+# Matched narrowly, on the call rather than on the word: `password` appears in a hundred
+# variable names and only `password_verify(` tells you a credential is being checked.
+_AUTH_MARKERS = (
+    ("session", re.compile(r"\bsession_start\s*\(|\$_SESSION\s*\[")),
+    ("password_check", re.compile(r"\bpassword_verify\s*\(")),
+    ("password_hash", re.compile(r"\bpassword_hash\s*\(|\bcrypt\s*\(")),
+    ("cookie", re.compile(r"\bsetcookie\s*\(")),
+    ("http_auth", re.compile(r"\$_SERVER\s*\[\s*['\"]PHP_AUTH_")),
 )
 
 # Constructs that must reach a human rather than a translation. `dispatch` is separate
@@ -494,6 +514,12 @@ def from_file(path: str, content: str, language: str = "",
         match = pattern.search(content)
         if match:
             rows.append(_row(path, "output", label, _line_of(content, match.start()),
+                             _snippet(content, match.start(), match.end())))
+
+    for label, pattern in _AUTH_MARKERS:
+        match = pattern.search(content)
+        if match:
+            rows.append(_row(path, "auth", label, _line_of(content, match.start()),
                              _snippet(content, match.start(), match.end())))
 
     is_code = os.path.splitext(path)[1].lower() not in _NON_CODE_EXTENSIONS

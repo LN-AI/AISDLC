@@ -97,6 +97,14 @@ _DESIGN_SATURATION_WARN = 0.8
 # about to pay for a conversion built on it.
 _SYNTHESIS_COMPRESSION_WARN = 8
 
+# Whether a component reads its own output back before committing, at the cost of one more call
+# per component. **Off**, and honestly so: it is the one change in the accuracy plan that could
+# plausibly cost more than it saves, and the number it has to beat — what a build round actually
+# costs — has never been measured on a real run. Built so that measurement can settle it rather
+# than an argument. Turn on, convert a real codebase, and compare rounds-to-clean against the
+# extra calls.
+SELF_REVIEW = False
+
 # How much source one comprehension probe reads. Both caps are cost controls, and the file
 # cap is the one that matters: comprehension is priced per bundle at the assessment gate, so
 # these two numbers are what the operator is really approving. Deliberately well under the
@@ -331,6 +339,17 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
         expected += probe["expected_usd"]
         ceiling += probe["ceiling_usd"]
         estimated = estimated or probe["estimated"]
+    if bundles:
+        # The citation recheck. One call per run whatever the codebase size, which is the
+        # reason it is batched — priced from what the probes could emit, since that bounds
+        # both the rules it re-reads and the files it is shown.
+        recheck = estimate.band(
+            len(bundles) * _comprehension.PROBE_MAX_TOKENS // 2 + estimate.PROMPT_FRAME_TOKENS,
+            _comprehension.RECHECK_MAX_TOKENS // 2, _comprehension.RECHECK_MAX_TOKENS)
+        calls += 1
+        expected += recheck["expected_usd"]
+        ceiling += recheck["ceiling_usd"]
+        estimated = estimated or recheck["estimated"]
     if len(bundles) > 1:
         # Synthesis reads probe output, not source — bounded by what the probes could emit.
         merge = estimate.band(
@@ -846,6 +865,9 @@ def _produce(run_id: str, stage, unit: Dict[str, Any], charter: Dict[str, Any],
 
 def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]) -> None:
     if stage.id == "comprehension":
+        # Before the audit, so a rule recovered here is in the digest the audit reads and in
+        # the portrait the architect is shown — both of which are built after this point.
+        _recheck_rules(run_id, caller, llm_override)
         _audit_extraction(run_id, caller, llm_override)
     elif stage.id == "taskplan":
         _build_task_plan(run_id)
@@ -895,6 +917,60 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
         # hours later), so what belongs in the run is the gate: a run carrying recorded
         # behaviour must not reach `completed` without that behaviour having been checked.
         parity.gate(run_id)
+
+
+def _recheck_rules(run_id: str, caller: dict, llm_override: Optional[dict]) -> None:
+    """One batched pass over rules that were rejected for an unfindable quote.
+
+    `rules.verify` is right to refuse them — an unverified claim must never reach a prompt
+    (D-04) — but discarding is not the only alternative to trusting. A rule can be a correct
+    reading of the code and still be rejected for quoting a paraphrase or naming the
+    neighbouring file, and the reject list was where those went to be forgotten.
+
+    One call per run rather than one per probe, so the cost is a constant a gate can quote
+    instead of growing with the number of readings. Corrected rules go back through the *same*
+    `rules.verify`, so nothing reaches a prompt on the strength of having been re-asked.
+
+    Best effort throughout: this recovers findings that are currently thrown away, so every
+    failure path leaves the run exactly as it was (D-101).
+    """
+    rejected = [r for r in store.list_rules(run_id, status="rejected")
+                if r.get("reject_reason") == "quote_not_found"]
+    if not rejected:
+        return
+    cited = {r.get("path") for r in rejected if r.get("path")}
+    sources = {u["path"]: (u.get("source_text") or "")
+               for u in store.list_units(run_id, kind="source_file", include_source=True)
+               if u["path"] in cited}
+    if not sources:
+        return
+
+    try:
+        outcome = agent_guard.guarded_call(
+            caller, "modernization", llm_override,
+            project_name=(store.get_run(run_id) or {}).get("project_name") or "",
+            fn=lambda: _comprehension.recheck_citations(rejected[:40], sources, llm_override),
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.append_event(run_id, "rule_recheck_skipped", f"{type(exc).__name__}: {exc}"[:300],
+                           level="warning")
+        return
+    cost = ((outcome or {}).get("_budget_stats") or {}).get("cost_usd") or 0.0
+    if cost:
+        store.add_run_spend(run_id, float(cost))
+
+    checked = rules.verify(run_id, (outcome or {}).get("corrected") or [], sources)
+    recovered = checked["confirmed"]
+    if recovered:
+        # Stored as ordinary confirmed rules: they passed the same check every other confirmed
+        # rule passed, against the same files, so treating them as second class would be a
+        # distinction with nothing behind it.
+        store.insert_rules(run_id, recovered)
+    store.append_event(
+        run_id, "rules_rechecked",
+        f"{len(rejected)} rule(s) had been rejected for a quote that could not be found; "
+        f"{len(recovered)} were re-cited correctly and are now confirmed.",
+        level="info" if recovered else "warning")
 
 
 def _audit_extraction(run_id: str, caller: dict, llm_override: Optional[dict]) -> None:
@@ -2264,6 +2340,43 @@ def _handle_stage_exception(run_id: str, unit: Dict[str, Any], exc: Exception,
     return "failed"
 
 
+def _self_review(run_id: str, unit: Dict[str, Any], artifacts: List[Dict[str, Any]],
+                 dependency_symbols: List[Dict[str, Any]], caller: dict,
+                 llm_override: Optional[dict], project_name: str) -> List[Dict[str, str]]:
+    """Ask the converter to read back what it just wrote. -> the problems it reports.
+
+    **Best effort.** A review that raises must not fail a conversion that already passed every
+    deterministic check — the output is no worse for the review having failed, and a net that
+    can drown the thing it is watching is worse than no net (D-101). A budget refusal is the
+    likeliest failure and the least alarming: this call is optional by construction.
+    """
+    try:
+        outcome = agent_guard.guarded_call(
+            caller, "modernization", llm_override, project_name=project_name,
+            fn=lambda: unit_converter.review_output(artifacts, dependency_symbols, llm_override),
+        )
+    except Exception as exc:  # noqa: BLE001
+        store.append_event(run_id, "self_review_skipped", f"{type(exc).__name__}: {exc}"[:300],
+                           unit_id=unit["id"], level="warning")
+        return []
+    cost = ((outcome or {}).get("_budget_stats") or {}).get("cost_usd") or 0.0
+    if cost:
+        store.add_run_spend(run_id, float(cost))
+    emitted = {os.path.basename((a.get("path") or "").replace("\\", "/")).lower()
+               for a in artifacts}
+    problems = []
+    for entry in (outcome or {}).get("problems") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("file") or "").strip()
+        problem = str(entry.get("problem") or "").strip()
+        # A problem in a file this unit did not emit is a review that has lost its footing, and
+        # acting on it would fail a correct component over a file it does not own.
+        if problem and os.path.basename(name.replace("\\", "/")).lower() in emitted:
+            problems.append({"file": name, "problem": problem})
+    return problems[:20]
+
+
 def _followups_for_prompt(followups: List[str]) -> str:
     """What the last attempt said it could not finish, handed back to the next one.
 
@@ -2732,6 +2845,28 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                        f"will not compile.")),
             unit_id=unit["id"], blocking=False,
         )
+
+    # One more turn, reading back what was just written. Last, deliberately: every check above
+    # is free and deterministic, so paying a model to find what a regex already found would be
+    # spending money to learn nothing. Off by default — see `SELF_REVIEW`.
+    if SELF_REVIEW and unit.get("kind") == "component":
+        found = _self_review(run_id, unit, safe_artifacts, dependency_symbols,
+                             caller, llm_override, project_name)
+        if found and (unit.get("attempts") or 1) < MAX_UNIT_ATTEMPTS:
+            detail = "; ".join(f"{p['file']}: {p['problem']}" for p in found)[:600]
+            # Persisted before failing, as every other inline failure here is: without it the
+            # retry sends a byte-identical prompt and reproduces exactly what was rejected.
+            store.set_unit_meta(unit["id"], {"validation_issues": [{
+                "severity": "fail", "check": "self_review", "path": path,
+                "detail": f"Reading your own output back, you reported: {detail}. Fix these, "
+                          f"or if one of them is not actually a problem, emit the file "
+                          f"unchanged and say why in `manual_followup`.",
+            }]})
+            store.fail_unit(unit["id"], run_id, f"Self-review found: {detail}",
+                            terminal=False, max_attempts=MAX_UNIT_ATTEMPTS)
+            store.append_event(run_id, "self_review_failed", detail,
+                               unit_id=unit["id"], level="warning")
+            return "failed"
 
     needs_review = bool(result.get("needs_human_review")) \
         or (result.get("confidence") or "").lower() == "low" \

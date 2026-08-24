@@ -8938,6 +8938,250 @@ check("and the run log still records each cut",
       str([e["event"] for e in store.list_events(_cut_run)][:8]))
 
 
+section("60. Reading back what was just written, before committing it")
+
+# The only feedback on whether generated code compiles travels through a real compiler on
+# someone else's machine and comes back a build round later. A defect caught inline costs one
+# call; the same defect caught by that loop costs a round trip plus a full re-conversion.
+#
+# Off by default, and honestly so: this is the one change in the accuracy plan that could
+# plausibly cost more than it saves, and what a build round actually costs has never been
+# measured. It is built so the measurement can settle it.
+
+check("it is off until someone measures what it displaces",
+      runner.SELF_REVIEW is False)
+
+_sr_calls = []
+_sr_convert_prompts = []
+_sr_problems = []
+_sr_raises = [False]
+
+
+def _sr_call_tool(system_prompt, user_content, schema, llm_override=None,
+                  max_tokens=None, **kw):
+    name = schema.get("name")
+    if name == "submit_self_review":
+        _sr_calls.append(user_content)
+        if _sr_raises[0]:
+            raise RuntimeError("the reviewer fell over")
+        return {"problems": list(_sr_problems)}
+    if name == "submit_unit_conversion":
+        _sr_convert_prompts.append(user_content)
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+def _sr_run(problems, raises=False, review=True):
+    _sr_calls.clear()
+    _sr_convert_prompts.clear()
+    _sr_problems[:] = problems
+    _sr_raises[0] = raises
+    saved_flag, runner.SELF_REVIEW = runner.SELF_REVIEW, review
+    saved_tool, llm_gateway.call_tool = llm_gateway.call_tool, _sr_call_tool
+    try:
+        run_id = store.create_run("self-review", ".NET 8", "files", created_by="smoke")
+        runner.ingest_and_analyze(run_id, [{"path": "a.py", "content": "A = 1\n"}])
+        runner.set_charter(run_id, VALID_CHARTER, "smoke")
+        drive(run_id, rounds=12)
+        return run_id
+    finally:
+        runner.SELF_REVIEW = saved_flag
+        llm_gateway.call_tool = saved_tool
+
+
+# Off: not one extra call, and the prompt shape is exactly what it always was.
+_sr_off = _sr_run([], review=False)
+check("with it off, nothing reads the output back and nothing is charged for it",
+      _sr_calls == [], f"{len(_sr_calls)} review call(s)")
+check("and the run still converts",
+      any(u["status"] == "converted"
+          for u in store.list_units(_sr_off, kind="component")))
+
+# On, and the output is fine: one call per component, and the unit commits.
+_sr_clean = _sr_run([])
+check("with it on, each component's output is read back exactly once",
+      len(_sr_calls) == len(store.list_units(_sr_clean, kind="component")),
+      f"{len(_sr_calls)} review(s) for "
+      f"{len(store.list_units(_sr_clean, kind='component'))} component(s)")
+check("the review is shown the files, not asked to imagine them",
+      _sr_calls and "The files you just produced" in _sr_calls[0], _sr_calls[0][:120])
+check("finding nothing is not a failure — the unit commits",
+      all(u["status"] == "converted"
+          for u in store.list_units(_sr_clean, kind="component")),
+      str([u["status"] for u in store.list_units(_sr_clean, kind="component")]))
+
+# On, and it reports a real problem: the unit goes back with the finding in its prompt.
+_sr_bad = _sr_run([{"file": "A.cs", "problem": "IThing is named but never defined"}])
+_sr_events = [e["event"] for e in store.list_events(_sr_bad)]
+check("a reported problem sends the component back rather than committing it",
+      "self_review_failed" in _sr_events, str(_sr_events[:10]))
+check("and the retry is told what it said, so the prompt is not byte-identical (D-89)",
+      any("IThing is named but never defined" in p for p in _sr_convert_prompts),
+      f"{len(_sr_convert_prompts)} conversion prompt(s)")
+check("the retry is also offered the way out, if the review was wrong",
+      any("manual_followup" in p for p in _sr_convert_prompts),
+      f"{len(_sr_convert_prompts)} conversion prompt(s)")
+
+# A problem in a file this unit did not emit is a reviewer that has lost its footing. Acting on
+# it would fail a correct component over a file it does not own.
+_sr_foreign = _sr_run([{"file": "SomeoneElse.cs", "problem": "broken"}])
+check("a problem in a file the unit never emitted is ignored",
+      "self_review_failed" not in [e["event"] for e in store.list_events(_sr_foreign)],
+      str([e["event"] for e in store.list_events(_sr_foreign)][:10]))
+check("and the component still commits",
+      any(u["status"] == "converted"
+          for u in store.list_units(_sr_foreign, kind="component")))
+
+# Best effort: a review that falls over must not fail a conversion that passed every
+# deterministic check. The output is no worse for the reviewer having crashed.
+_sr_crash = _sr_run([], raises=True)
+check("a review that raises does not take down a conversion that was already sound",
+      any(u["status"] == "converted"
+          for u in store.list_units(_sr_crash, kind="component")),
+      str([u["status"] for u in store.list_units(_sr_crash, kind="component")]))
+check("and the run says the review was skipped rather than staying silent",
+      "self_review_skipped" in [e["event"] for e in store.list_events(_sr_crash)],
+      str([e["event"] for e in store.list_events(_sr_crash)][:10]))
+
+
+section("61. Citations corrected, capabilities hedged, and who the user is")
+
+# ── A rule that was right about the code and wrong about the quote ─────────
+#
+# `rules.verify` refuses a rule whose quote is not in the file it names, and it is right to:
+# an unverified claim must never reach a prompt. But discarding is not the only alternative to
+# trusting — a rule can be a correct reading and still be rejected for quoting a paraphrase or
+# naming the neighbouring file, and the reject list is where those went to be forgotten.
+
+_rc_run = store.create_run("recheck", ".NET 8", "files", created_by="smoke")
+_rc_source = "<?php\nif ($order->total > 500) { require_second_approval(); }\n"
+store.insert_units(_rc_run, [
+    {"path": "order.php", "kind": "source_file", "language": "php", "status": "converted",
+     "source_text": _rc_source}])
+store.insert_rules(_rc_run, [{
+    "statement": "Orders over 500 need a second approval.", "category": "validation",
+    "path": "order.php", "line": 2, "quote": "orders above five hundred need approval",
+    "status": "rejected", "reject_reason": "quote_not_found", "confidence": 0.0}])
+
+_rc_calls = []
+
+
+def _rc_call_tool(system_prompt, user_content, schema, llm_override=None,
+                  max_tokens=None, **kw):
+    if schema.get("name") == "submit_rule_citations":
+        _rc_calls.append(user_content)
+        return {"corrected": [{
+            "statement": "Orders over 500 need a second approval.", "category": "validation",
+            "path": "order.php", "quote": "$order->total > 500", "line": 2}]}
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+_saved_rc = llm_gateway.call_tool
+llm_gateway.call_tool = _rc_call_tool
+try:
+    runner._recheck_rules(_rc_run, CALLER, None)
+finally:
+    llm_gateway.call_tool = _saved_rc
+
+check("the rejected rule is re-asked, once, with the file in hand",
+      len(_rc_calls) == 1 and "order.php" in _rc_calls[0], f"{len(_rc_calls)} call(s)")
+check("the prompt shows the source rather than asking it to remember",
+      "$order->total > 500" in _rc_calls[0], _rc_calls[0][:200])
+check("a corrected citation that checks out becomes a confirmed rule",
+      any("second approval" in (r.get("statement") or "")
+          for r in store.list_rules(_rc_run, status="confirmed")),
+      str([r.get("statement") for r in store.list_rules(_rc_run, status="confirmed")]))
+check("and the run says how many were recovered out of how many were rejected",
+      any(e["event"] == "rules_rechecked" and "1 rule(s)" in (e["detail"] or "")
+          for e in store.list_events(_rc_run)),
+      str([e["detail"] for e in store.list_events(_rc_run)
+           if e["event"] == "rules_rechecked"]))
+
+# The correction goes through the same verifier. Nothing reaches a prompt on the strength of
+# having been re-asked — a second wrong quote is worse than the rejection it replaces, because
+# it has now been through a check and reads as verified.
+_rc2 = store.create_run("recheck-liar", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rc2, [{"path": "order.php", "kind": "source_file", "language": "php",
+                           "status": "converted", "source_text": _rc_source}])
+store.insert_rules(_rc2, [{
+    "statement": "Something else entirely.", "category": "validation", "path": "order.php",
+    "line": 2, "quote": "nope", "status": "rejected",
+    "reject_reason": "quote_not_found", "confidence": 0.0}])
+
+
+def _rc_liar(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
+    if schema.get("name") == "submit_rule_citations":
+        return {"corrected": [{"statement": "Something else entirely.", "path": "order.php",
+                               "quote": "still not in the file", "line": 1}]}
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _rc_liar
+try:
+    runner._recheck_rules(_rc2, CALLER, None)
+finally:
+    llm_gateway.call_tool = _saved_rc
+check("a second quote that is also not in the file is refused again",
+      not store.list_rules(_rc2, status="confirmed"),
+      str([r.get("statement") for r in store.list_rules(_rc2, status="confirmed")]))
+
+check("a run with nothing rejected does not pay for a recheck",
+      runner._recheck_rules(
+          store.create_run("no-rejects", ".NET 8", "files", created_by="smoke"),
+          CALLER, None) is None)
+
+# ── A capability nobody could point at ─────────────────────────────────────
+#
+# The portrait is read by every conversion call in the run. A capability the readings only
+# half-supported carried exactly the authority of one several probes saw plainly, and the
+# converter has no way to tell them apart or to go and check.
+check("a well-evidenced capability is stated plainly",
+      comprehension._capability_bullets([{"name": "approve leave", "confidence": "high"}])
+      == ["- approve leave"])
+check("one reading only is marked as such",
+      "seen by one reading only" in comprehension._capability_bullets(
+          [{"name": "export ledger", "confidence": "medium"}])[0])
+check("an inferred one says nobody pointed at it",
+      "no reading pointed at it directly" in comprehension._capability_bullets(
+          [{"name": "bulk import", "confidence": "low"}])[0])
+check("a portrait stored before confidence existed still renders",
+      comprehension._capability_bullets(["cancel an order"]) == ["- cancel an order"])
+check("and junk is dropped rather than rendered as an empty bullet",
+      comprehension._capability_bullets([{"name": "  "}, None, 7]) == [])
+
+# ── How the source knows who is asking ─────────────────────────────────────
+#
+# Its own evidence kind because it answers a charter question nothing else could: `auth_model`
+# is optional, so a codebase with sessions and a password check could be converted with nobody
+# having decided how either becomes the target's equivalent.
+_auth_rows = evidence.collect(
+    [{"path": "login.php",
+      "content": "<?php\nsession_start();\nif (password_verify($p, $h)) {\n"
+                 "  $_SESSION['uid'] = 1;\n  setcookie('remember', 1);\n}\n"}],
+    [{"path": "login.php"}])
+_auth_values = sorted({r["value"] for r in _auth_rows if r["kind"] == "auth"})
+check("a session, a password check and a cookie are all recognised",
+      _auth_values == ["cookie", "password_check", "session"], str(_auth_values))
+check("every auth row carries the citation that makes it evidence",
+      all(r.get("path") and r.get("line") for r in _auth_rows if r["kind"] == "auth"),
+      str([r for r in _auth_rows if r["kind"] == "auth"][:1]))
+check("a file that does none of it contributes no auth evidence",
+      not [r for r in evidence.collect([{"path": "math.php",
+                                         "content": "<?php function add($a,$b){return $a+$b;}"}],
+                                       [{"path": "math.php"}]) if r["kind"] == "auth"])
+check("a variable merely named like a password is not a credential check",
+      not [r for r in evidence.collect(
+          [{"path": "f.php", "content": "<?php $my_password_verify = 1; $passwordish = 2;"}],
+          [{"path": "f.php"}]) if r["kind"] == "auth" and r["value"] == "password_check"])
+check("auth is part of the closed vocabulary, so consumers can switch on it",
+      "auth" in evidence.EVIDENCE_KINDS)
+check("and it reaches the digest every conversion call reads",
+      "auth" in comprehension._DIGEST_KINDS
+      and "auth" in comprehension._SECTION_TITLES)
+check("the charter linter asks for an auth model on the evidence, not just the PHP flag",
+      [f["key"] for f in charter.lint({}, {"evidence_counts": {"auth": 3}})] == ["auth_model"],
+      str(charter.lint({}, {"evidence_counts": {"auth": 3}})))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

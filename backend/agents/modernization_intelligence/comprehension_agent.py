@@ -201,7 +201,27 @@ SYNTHESIS_TOOL_SCHEMA = {
             "primary_capabilities": {
                 "type": "array",
                 "maxItems": 20,
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "required": ["name", "confidence"],
+                    "properties": {
+                        "name": {"type": "string",
+                                 "description": "One noun phrase, e.g. 'approve a leave "
+                                                "request'."},
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["high", "medium", "low"],
+                            "description": (
+                                "How well the readings actually support this. **high**: "
+                                "several probes saw it, or one saw it plainly. **medium**: one "
+                                "probe reported it and nothing contradicts it. **low**: you "
+                                "inferred it from names, or the readings only partly agree. "
+                                "Low is a useful answer — this portrait is read by every "
+                                "conversion call, and a capability nobody can point at is "
+                                "worse than one marked uncertain."),
+                        },
+                    },
+                },
                 "description": "The things the system does, deduplicated across probes and "
                                "ordered with the most central first.",
             },
@@ -652,3 +672,83 @@ def _int(value: Any) -> int:
 
 def _len(value: Any) -> int:
     return len(value) if isinstance(value, (list, tuple)) else 0
+
+
+# ── Rules that were right about the code and wrong about the citation ──────
+#
+# `rules.verify` refuses a rule whose quote is not in the file it names, and it is right to:
+# an unverified claim must never reach a prompt (D-04). But discarding is not the only
+# alternative to trusting. A rule can be a correct reading of the code and still be rejected
+# for quoting a paraphrase, normalising whitespace, or citing the neighbouring file — and the
+# reject list is where the most confidently-stated findings went to be forgotten.
+#
+# One call per run, batched across every probe, so the cost is bounded and priceable rather
+# than growing with the number of readings.
+
+RECHECK_MAX_TOKENS = 4000
+
+RECHECK_TOOL_SCHEMA = {
+    "name": "submit_rule_citations",
+    "description": (
+        "Correct the citation on rules that were rejected because the quote could not be "
+        "found in the file they named."),
+    "input_schema": {
+        "type": "object",
+        "required": ["corrected"],
+        "properties": {
+            "corrected": {
+                "type": "array",
+                "maxItems": 40,
+                "description": (
+                    "Only rules you can now cite exactly. Drop any you cannot — a rule with a "
+                    "second wrong quote is worse than one that was already discarded, because "
+                    "it has been through a check and looks verified."),
+                "items": {
+                    "type": "object",
+                    "required": ["statement", "path", "quote"],
+                    "properties": {
+                        "statement": {"type": "string",
+                                      "description": "The rule, unchanged from before."},
+                        "category": {"type": "string"},
+                        "path": {"type": "string",
+                                 "description": "The file that really contains the quote."},
+                        "quote": {"type": "string",
+                                  "description": "Text copied character for character out of "
+                                                 "that file. Not a paraphrase."},
+                        "line": {"type": "integer"},
+                    },
+                },
+            },
+        },
+    },
+}
+
+RECHECK_SYSTEM_PROMPT = """You are correcting citations, not finding rules.
+
+Each rule below was reported by a reading of this codebase and then rejected, because the text
+it quoted could not be found in the file it named. The rule may still be a correct reading —
+the usual causes are quoting a paraphrase rather than the source, normalising whitespace, or
+naming the neighbouring file.
+
+You are shown the files. For each rule, either quote the exact text that supports it, copied
+character for character out of one of them, or leave it out entirely.
+
+Leaving it out is the right answer more often than not, and it costs nothing. A second wrong
+quote is worse than the rejection it replaces, because it has now been through a check and
+will read as verified.
+"""
+
+
+def recheck_citations(rejected, sources, llm_override=None):
+    """One batched pass over rejected rules, with the files in hand. -> {corrected: [...]}"""
+    parts = ["# Rules that could not be cited", ""]
+    for rule in rejected:
+        parts.append(f"- **{rule.get('statement')}** — claimed to be in `{rule.get('path')}`, "
+                     f"quoting: {str(rule.get('quote') or '')[:200]!r}")
+    parts.append("\n# The files\n")
+    for path, text in sorted(sources.items()):
+        parts.append(f"## `{path}`\n\n```\n{text}\n```")
+    parts.append("\nCorrect the citations you can. Leave out the ones you cannot.")
+    return llm_gateway.call_tool(
+        RECHECK_SYSTEM_PROMPT, "\n".join(parts), RECHECK_TOOL_SCHEMA,
+        llm_override, max_tokens=RECHECK_MAX_TOKENS)

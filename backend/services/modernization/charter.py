@@ -367,14 +367,19 @@ def lint(charter: Dict[str, Any], signals: Dict[str, Any]) -> List[Dict[str, str
                 "by each of them."),
         })
 
-    if signals.get("sessions") and not _stated(charter, "auth_model"):
+    # Evidence first, the analyzer's flag second. `sessions` is a PHP-specific observation; an
+    # `auth` evidence row is the language-neutral fact, and a codebase that checks a password
+    # without ever calling `session_start` still has an authentication model to decide.
+    auth_sites = int(((signals.get("evidence_counts") or {}).get("auth")) or 0)
+    if (signals.get("sessions") or auth_sites) and not _stated(charter, "auth_model"):
         findings.append({
             "key": "auth_model",
             "title": "Per-user state was observed, and the authentication model is unstated",
             "detail": (
-                "Session use was found in the source. How a user is authenticated, and how "
-                "that state is carried between requests, binds every entry point that reads "
-                "it."),
+                "Authentication or per-user state was found in the source. How a user is "
+                "authenticated, and how that state is carried between requests, binds every "
+                "entry point that reads it, and it is the decision most expensive to get "
+                "wrong: rehashing a password locks out every existing user."),
         })
 
     return findings

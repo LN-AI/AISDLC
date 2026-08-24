@@ -50,9 +50,11 @@ _TOP_N = {
     "entrypoint": 40,
     "route": 40,
     "config_key": 30,
+    "auth": 8,
 }
 
 _SECTION_TITLES = {
+    "auth": "How the source identifies a user and remembers them",
     "framework": "Frameworks and libraries detected in the source",
     "datastore": "Persistence APIs the source uses",
     "table": "Database tables named in SQL literals",
@@ -67,7 +69,7 @@ _SECTION_TITLES = {
 # also pays for — and a global list of hazards invites a converter to "handle" one it was
 # never shown.
 _DIGEST_KINDS = ("framework", "datastore", "entrypoint", "route", "table", "integration",
-                 "config_key")
+                 "config_key", "auth")
 
 
 def digest_coverage(run_id: str) -> Dict[str, Dict[str, int]]:
@@ -203,6 +205,38 @@ def _bullets(value: Any) -> List[str]:
     return out
 
 
+def _capability_bullets(value: Any) -> List[str]:
+    """What the system does, with the shaky ones marked as shaky.
+
+    This block is read by every conversion call in the run, so a capability the readings only
+    half-supported carried exactly the authority of one several probes saw plainly — and the
+    converter has no way to tell them apart or to go and check. Marking it is cheap and it is
+    the difference between a portrait and an assertion.
+
+    Only `medium` and `low` are annotated: well-evidenced is the expected case, and a marker on
+    every line would be noise in a block that is paid for on every call. Plain strings are
+    still accepted, so a portrait stored before this existed renders unchanged.
+    """
+    out: List[str] = []
+    for item in value or []:
+        if isinstance(item, str):
+            name, confidence = item.strip(), "high"
+        elif isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            confidence = str(item.get("confidence") or "high").strip().lower()
+        else:
+            continue
+        if not name:
+            continue
+        if confidence == "low":
+            out.append(f"- {name} — *inferred; no reading pointed at it directly*")
+        elif confidence == "medium":
+            out.append(f"- {name} — *seen by one reading only*")
+        else:
+            out.append(f"- {name}")
+    return out
+
+
 def _portrait_section(run_id: str) -> List[str]:
     """What the synthesis pass concluded the system is for.
 
@@ -224,7 +258,8 @@ def _portrait_section(run_id: str) -> List[str]:
         ("cross_cutting_concerns", "Patterns that appear throughout"),
         ("conventions", "Conventions every converted file must honour"),
     ):
-        rendered = _bullets(meta.get(key))
+        rendered = (_capability_bullets(meta.get(key)) if key == "primary_capabilities"
+                    else _bullets(meta.get(key)))
         if not rendered:
             # Emitted only when there is something under it. A heading with nothing beneath
             # it is worse than an absent one here: it is frozen into the cached system block

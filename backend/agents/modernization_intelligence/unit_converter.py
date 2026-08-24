@@ -532,3 +532,81 @@ def _build_user_message(
         "needs a human."
     )
     return "\n".join(parts)
+
+
+# ── Reading back what was just written ─────────────────────────────────────
+#
+# The only feedback on whether generated code compiles travels through a real compiler on
+# someone else's machine and comes back a build round later — download, build, post, reopen,
+# re-convert, resume. A defect caught here costs one call; the same defect caught by that loop
+# costs a round trip plus a full re-conversion of the component.
+#
+# **Off by default** (`runner.SELF_REVIEW`), and honestly so: this is the one change in the
+# accuracy plan that could plausibly cost more than it saves, and nothing has measured a build
+# round yet. Built so the measurement can be made rather than argued about.
+
+SELF_REVIEW_MAX_TOKENS = 4000
+
+SELF_REVIEW_TOOL_SCHEMA = {
+    "name": "submit_self_review",
+    "description": (
+        "Report what will not compile in the files you just produced, and nothing else."),
+    "input_schema": {
+        "type": "object",
+        "required": ["problems"],
+        "properties": {
+            "problems": {
+                "type": "array",
+                "maxItems": 20,
+                "description": (
+                    "Only things that stop this code compiling: a type you named that you did "
+                    "not define and were not given, a member that does not exist on a type "
+                    "whose signature you were shown, a method whose signature does not match "
+                    "the interface it claims to implement, an unbalanced or unfinished file. "
+                    "Not style, not naming, not anything that merely reads oddly. An empty "
+                    "list is the expected answer and is not a failure — say nothing rather "
+                    "than finding something to say."),
+                "items": {
+                    "type": "object",
+                    "required": ["file", "problem"],
+                    "properties": {
+                        "file": {"type": "string",
+                                 "description": "The file name, exactly as you emitted it."},
+                        "problem": {"type": "string",
+                                    "description": "One sentence: what will not compile."},
+                    },
+                },
+            },
+        },
+    },
+}
+
+SELF_REVIEW_SYSTEM_PROMPT = """You are reviewing target-stack code that you produced a moment
+ago, before it is committed.
+
+One question only: **will this compile?** You are looking for names that resolve to nothing,
+members that do not exist on the types you were shown, signatures that do not match the
+interface they claim, and files that are unfinished or unbalanced.
+
+You are not reviewing style, naming, structure or idiom. Those are settled by the charter and
+are not yours to revisit here.
+
+Report nothing unless you are confident. An empty list is the normal answer, and a made-up
+problem is worse than a missed one: it costs a full re-conversion of a component that was
+already correct.
+"""
+
+
+def review_output(artifacts, dependency_symbols, llm_override=None):
+    """One extra turn: the model reads back what it just emitted. -> {problems: [...]}"""
+    parts = ["# The files you just produced", ""]
+    for artifact in artifacts:
+        parts.append(f"## `{artifact.get('path')}`\n\n```\n{artifact.get('content') or ''}\n```")
+    if dependency_symbols:
+        parts.append("\n## Signatures you were given, as they actually exist\n")
+        parts.append("\n".join(f"- `{s.get('signature') or s.get('name')}`"
+                               for s in dependency_symbols[:120]))
+    parts.append("\nList what will not compile. An empty list is the expected answer.")
+    return llm_gateway.call_tool(
+        SELF_REVIEW_SYSTEM_PROMPT, "\n".join(parts), SELF_REVIEW_TOOL_SCHEMA,
+        llm_override, max_tokens=SELF_REVIEW_MAX_TOKENS)
