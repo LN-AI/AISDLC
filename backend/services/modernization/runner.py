@@ -91,6 +91,12 @@ _DESIGN_FILE_CEILING = (_ARCHITECT_MAX_TOKENS - 400) // 60
 # refactor away from not fitting, and the gate is the last free moment to say so.
 _DESIGN_SATURATION_WARN = 0.8
 
+# Above this, the system portrait is a summary of summaries and the specifics it is asked to
+# keep — thresholds, status values, role names — are the first thing to go. Not a failure, and
+# not something the pipeline can fix by itself; a number worth putting in front of whoever is
+# about to pay for a conversion built on it.
+_SYNTHESIS_COMPRESSION_WARN = 8
+
 # How much source one comprehension probe reads. Both caps are cost controls, and the file
 # cap is the one that matters: comprehension is priced per bundle at the assessment gate, so
 # these two numbers are what the operator is really approving. Deliberately well under the
@@ -952,21 +958,32 @@ def _audit_extraction(run_id: str, caller: dict, llm_override: Optional[dict]) -
         "analysis": {"signals": signals, "contradictions": contradictions},
         "extraction_audit": audit_record,
     })
-    if confirmed:
+    # Raised when there is *anything* to say, not only when a fact was recovered. An audit that
+    # confirms nothing and reports "this codebase routes through a dispatcher I could not
+    # follow" is telling you the extraction is thin — which matters more than a run where it
+    # found three config keys, and it was being filed into `stats` and shown to nobody.
+    if confirmed or assessment:
         store.create_checkpoint(
             run_id, "extraction_audit",
-            f"{len(confirmed)} fact(s) the deterministic extraction had missed",
+            f"{len(confirmed)} fact(s) the deterministic extraction had missed" if confirmed
+            else "What the extraction audit could not pin down",
             detail=(
                 (assessment + "\n\n" if assessment else "")
-                + "Each of these was checked against your source before it was recorded — the "
-                  "quote it cites was found in the file it names, and anything that could not "
-                  "be found was discarded. They are stored with a lower confidence than what "
-                  "a parser proved, and none of them changes the conversion order.\n\n"
-                + "\n".join(f"  · {c['kind']}: {c['value']} — {c['path']}:{c['line']}"
-                            for c in confirmed[:25])
+                + ("Each of these was checked against your source before it was recorded — the "
+                   "quote it cites was found in the file it names, and anything that could not "
+                   "be found was discarded. They are stored with a lower confidence than what "
+                   "a parser proved, and none of them changes the conversion order.\n\n"
+                   + "\n".join(f"  · {c['kind']}: {c['value']} — {c['path']}:{c['line']}"
+                               for c in confirmed[:25])
+                   if confirmed else
+                   "Nothing it proposed could be verified against your source, so nothing was "
+                   "recorded — which is not the same as there being nothing there. The note "
+                   "above is its own account of what it could not pin down, and it is the "
+                   "reason to read the conversion output of those areas more closely.")
             )[:4000],
             blocking=False,
-            payload={"counts": outcome["counts"], "confirmed": confirmed[:50]},
+            payload={"counts": outcome["counts"], "confirmed": confirmed[:50],
+                     "assessment": assessment[:2000]},
         )
 
 
@@ -1038,6 +1055,20 @@ def _probe_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         rule["unit_id"] = unit["id"]
     store.insert_rules(run_id, checked["confirmed"] + checked["rejected"])
 
+    # A cap that can bind must say when it binds. The schema tells the model it may return at
+    # most `MAX_RULES_PER_PROBE` rules, so a probe returning exactly that many is a probe that
+    # ran out of room — and "this slice has 25 rules" and "this slice has 200 and you were
+    # given the first 25" were the same sentence. Suggestive rather than proof, which is why
+    # the wording says what was observed rather than asserting what was lost.
+    proposed_rules = len((result or {}).get("rules") or [])
+    capped = proposed_rules >= _comprehension.MAX_RULES_PER_PROBE
+    if capped:
+        store.append_event(
+            run_id, "rules_capped",
+            f"{unit['path']} returned the maximum {proposed_rules} rule(s) it was allowed over "
+            f"{len(files)} file(s), so this slice may hold more that were never reported.",
+            unit_id=unit["id"], level="warning")
+
     store.set_unit_meta(unit["id"], {
         "purpose": (result or {}).get("purpose") or "",
         "capabilities": (result or {}).get("capabilities") or [],
@@ -1045,6 +1076,7 @@ def _probe_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         "risks": (result or {}).get("risks") or [],
         "open_questions": (result or {}).get("open_questions") or [],
         "rule_counts": checked["counts"],
+        "rules_capped": capped,
     })
     store.complete_unit(
         unit_id=unit["id"], run_id=run_id, artifacts=[], symbols=[], cost_usd=float(cost),
@@ -1084,11 +1116,29 @@ def _synthesize_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     if cost:
         store.add_run_spend(run_id, float(cost))
 
-    store.set_unit_meta(unit["id"], {k: (portrait or {}).get(k)
-                                     for k in ("system_purpose", "primary_capabilities",
-                                               "actors", "data_lifecycle",
-                                               "cross_cutting_concerns", "conventions",
-                                               "contradictions")})
+    # How much was compressed to get here. Synthesis reads every probe's output and answers in
+    # at most `SYNTHESIS_MAX_TOKENS`, so the ratio grows with the codebase and nothing was
+    # watching it: forty probes merged into one portrait is a different act from three, and
+    # only one of them can keep the specifics it is asked to keep.
+    merged_chars = sum(len(str(r)) for r in results)
+    portrait_chars = sum(len(str(v)) for k, v in (portrait or {}).items()
+                         if not k.startswith("_"))
+    ratio = int(merged_chars / portrait_chars) if portrait_chars else 0
+    if ratio >= _SYNTHESIS_COMPRESSION_WARN:
+        store.append_event(
+            run_id, "synthesis_compressed",
+            f"{len(results)} reading(s) of this codebase were merged into a portrait "
+            f"about {ratio}x shorter than what went in. Specifics survive that less well the "
+            f"larger it gets, and every conversion call reads the result.",
+            unit_id=unit["id"], level="warning")
+
+    store.set_unit_meta(unit["id"], {**{k: (portrait or {}).get(k)
+                                        for k in ("system_purpose", "primary_capabilities",
+                                                  "actors", "data_lifecycle",
+                                                  "cross_cutting_concerns", "conventions",
+                                                  "contradictions")},
+                                     "compression_ratio": ratio,
+                                     "probes_merged": len(results)})
     contradictions = (portrait or {}).get("contradictions") or []
     if contradictions:
         # Two probes reading the same system differently is worth a human's attention before
@@ -1888,6 +1938,47 @@ def _apply_plan_repair(run_id: str) -> None:
         logger.exception("Could not apply the plan repair for run %s (continuing)", run_id)
 
 
+def _coverage_note(run_id: str) -> str:
+    """What the understanding of this codebase does *not* cover, said before it is paid for.
+
+    Three caps stand between the source and every conversion prompt, and each was silent. A
+    probe that returned the maximum rules it was allowed, a digest that names 40 of 300 routes,
+    and a portrait compressed twenty-fold all rendered exactly like the complete article. None
+    of them is a fault — they are deliberate cost controls — but a reader deciding whether to
+    spend needs to know which parts of the picture are partial. Never raises: a note that can
+    fail the gate it annotates is worse than no note.
+    """
+    try:
+        parts: List[str] = []
+        capped_probes = [u for u in store.list_units(run_id, kind="comprehension")
+                         if (u.get("meta") or {}).get("rules_capped")]
+        if capped_probes:
+            parts.append(
+                f"{len(capped_probes)} of {len(store.list_units(run_id, kind='comprehension'))} "
+                f"reading(s) returned the most business rules they were allowed, so those "
+                f"parts of the source may implement more than were reported")
+        coverage = comprehension.describe_coverage(comprehension.digest_coverage(run_id))
+        if coverage:
+            parts.append(f"the summary every conversion call reads names only some of what was "
+                         f"found ({coverage})")
+        synthesis = [u for u in store.list_units(run_id, kind="synthesis")
+                     if (u.get("meta") or {}).get("compression_ratio", 0)
+                     >= _SYNTHESIS_COMPRESSION_WARN]
+        if synthesis:
+            ratio = (synthesis[0].get("meta") or {}).get("compression_ratio")
+            parts.append(f"the system portrait is about {ratio}x shorter than the readings it "
+                         f"was merged from, so specifics survive it less well")
+        if not parts:
+            return ""
+        return ("\n\n**What this understanding does not cover.** These are cost controls "
+                "working as intended, not faults — but they bound what the conversion is "
+                "working from, so they belong in front of the number: "
+                + "; ".join(parts) + ".")
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not describe comprehension coverage for run %s", run_id)
+        return ""
+
+
 def _build_task_plan(run_id: str) -> Dict[str, Any]:
     """The approvable plan, and the gate that carries it.
 
@@ -1951,6 +2042,7 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     )
     if plan["corrections"]:
         detail += f" {len(plan['corrections'])} correction(s) were applied to the proposed layout."
+    detail += _coverage_note(run_id)
     # Separate from `corrections`, and deliberately: a correction is something the pipeline
     # already fixed, and this is something it cannot fix. Reported rather than fatal — the
     # architect may have a reason, a parsed edge may not survive translation, and refusing a
@@ -2128,6 +2220,25 @@ def _handle_stage_exception(run_id: str, unit: Dict[str, Any], exc: Exception,
     return "failed"
 
 
+def _followups_for_prompt(followups: List[str]) -> str:
+    """What the last attempt said it could not finish, handed back to the next one.
+
+    A followup is the converter's own diagnosis, written when it knew something was wrong and
+    could not fix it — "the original calls a stored procedure I was not shown", "this file
+    references a constant that is defined nowhere". A rework attempt that is not told about it
+    starts from the same blank page, rediscovers the same obstacle, and reports it again.
+    """
+    listed = [f for f in (followups or []) if str(f).strip()][:12]
+    if not listed:
+        return ""
+    return ("## What the previous attempt could not finish\n\n"
+            "You reported these yourself, converting this same component. They are not "
+            "necessarily faults in your output — but if one of them is why a compiler error "
+            "was raised against this component, fix it now or say plainly that it cannot be "
+            "fixed here and why.\n\n"
+            + "\n".join(f"- {f}" for f in listed))
+
+
 def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                  caller: dict, llm_override: Optional[dict], project_name: str = "") -> str:
     """One unit: build context, call the model under the guard, validate, commit."""
@@ -2182,6 +2293,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         validation.summarize_for_prompt(meta.get("validation_issues") or []),
         layering.summarize_for_prompt(meta.get("layering_issues") or []),
         ownership.summarize_for_prompt(meta.get("ownership_issues") or []),
+        _followups_for_prompt(meta.get("followups") or []),
     ) if block)
 
     # The preventive half, and the cheap one: the answer was always in the plan, it had
@@ -2598,10 +2710,16 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
             f"validation={report['status']}, confidence={result.get('confidence', '?')}"
         ),
     )
-    if result.get("manual_followup"):
+    # Kept on the unit as well as on the log. This is the model's own account of what it could
+    # not do — the one place in the pipeline where the thing that knows what went wrong says
+    # so in plain words — and until it was stored, an event was written and nothing read it.
+    # Written unconditionally so a component that resolves its followups on a rework does not
+    # keep answering for the previous attempt.
+    followups = [str(x).strip() for x in (result.get("manual_followup") or []) if str(x).strip()]
+    store.set_unit_meta(unit["id"], {"followups": followups[:20]})
+    if followups:
         store.append_event(
-            run_id, "manual_followup",
-            " | ".join(str(x) for x in result["manual_followup"][:10]),
+            run_id, "manual_followup", " | ".join(followups[:10]),
             unit_id=unit["id"], level="warning",
         )
     return "converted"

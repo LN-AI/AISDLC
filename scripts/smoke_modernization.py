@@ -50,6 +50,7 @@ from backend.services.modernization import (  # noqa: E402
     validation, wireup,
 )
 from backend.agents.modernization_intelligence import architect_agent  # noqa: E402
+from backend.agents.modernization_intelligence import comprehension_agent  # noqa: E402
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
 from backend.services.modernization.scaffold import dotnet as _dotnet_scaffold  # noqa: E402
@@ -8454,6 +8455,217 @@ check("the run log records it as an error, not a warning",
       any(e["event"] == "output_truncated" and e["level"] == "error"
           for e in store.list_events(_trunc_run)),
       str([(e["event"], e["level"]) for e in store.list_events(_trunc_run)][:6]))
+
+
+section("55. The model's own account of what it could not do")
+
+# Every other check in this pipeline is the platform's opinion of the output. `manual_followup`
+# is the converter's — written at the moment it knew something was wrong and could not fix it.
+# It was appended to the run log and read by nothing: no report, no gate, and not the prompt of
+# the rework attempt sent to fix exactly the error it had already diagnosed.
+
+check("nothing to report renders nothing, rather than an empty heading",
+      runner._followups_for_prompt([]) == "" and runner._followups_for_prompt(["  "]) == "")
+_fu = runner._followups_for_prompt(["calls sp_recalc, which was not in the files I was shown"])
+check("a followup is handed back as the model's own words",
+      "sp_recalc" in _fu, _fu)
+check("and framed so it is not mistaken for a fault in the output",
+      "not necessarily faults" in _fu, _fu)
+check("it offers the honest way out rather than only a demand",
+      "cannot be fixed here" in _fu, _fu)
+
+_fu_run = store.create_run("followups", ".NET 8", "files", created_by="smoke")
+_fu_notes = ["the original calls sp_recalc, which is not in the source I was given"]
+_fu_prompts = []
+
+
+def _followup_call_tool(system_prompt, user_content, schema, llm_override=None,
+                        max_tokens=None, **kw):
+    if schema.get("name") == "submit_unit_conversion":
+        _fu_prompts.append(user_content)
+        out = _fake_conversion(system_prompt, user_content)
+        out["manual_followup"] = list(_fu_notes)
+        return out
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+_saved_fu = llm_gateway.call_tool
+llm_gateway.call_tool = _followup_call_tool
+try:
+    runner.ingest_and_analyze(_fu_run, [{"path": "a.py", "content": "A = 1\n"}])
+    runner.set_charter(_fu_run, VALID_CHARTER, "smoke")
+    drive(_fu_run, rounds=12)
+finally:
+    llm_gateway.call_tool = _saved_fu
+
+_fu_components = store.list_units(_fu_run, kind="component")
+check("a followup is kept on the unit, not only written to the log",
+      any((c.get("meta") or {}).get("followups") for c in _fu_components),
+      str([(c.get("meta") or {}).get("followups") for c in _fu_components]))
+
+_fu_report = reconcile.run(_fu_run)
+_fu_issues = [i for i in _fu_report["issues"] if i["kind"] == "manual_followup"]
+check("and it reaches the reconciliation report, which is where anyone would look",
+      len(_fu_issues) >= 1, str([i["kind"] for i in _fu_report["issues"]]))
+check("the report quotes it rather than counting it",
+      "sp_recalc" in _fu_issues[0]["detail"], str(_fu_issues[0]))
+check("reported as a warning — converted-with-something-left-over is not a failure",
+      _fu_issues[0]["severity"] == "warn", str(_fu_issues[0]))
+check("a component that says so honestly does not rank below one that stayed quiet",
+      all(i["severity"] != "fail" for i in _fu_issues))
+
+# The rework prompt. This is the whole point: the compiler error a build round is sent to fix
+# is regularly the very thing the converter already told us it could not do.
+_fu_prompts.clear()
+_fu_unit = _fu_components[0]
+store.set_unit_meta(_fu_unit["id"], {"followups": _fu_notes})
+llm_gateway.call_tool = _followup_call_tool
+try:
+    runner._convert_one(_fu_run, store.get_unit(_fu_unit["id"]),
+                        charter.validate(VALID_CHARTER), CALLER, None, "followups")
+finally:
+    llm_gateway.call_tool = _saved_fu
+check("the next attempt at that component is told what the last one could not finish",
+      any("sp_recalc" in p for p in _fu_prompts),
+      f"{len(_fu_prompts)} prompt(s)")
+
+# Cleared on success, so a resolved followup does not answer for a later attempt.
+_fu_notes.clear()
+llm_gateway.call_tool = _followup_call_tool
+try:
+    runner._convert_one(_fu_run, store.get_unit(_fu_unit["id"]),
+                        charter.validate(VALID_CHARTER), CALLER, None, "followups")
+finally:
+    llm_gateway.call_tool = _saved_fu
+check("a component that resolves its followups stops carrying the old ones",
+      (store.get_unit(_fu_unit["id"]).get("meta") or {}).get("followups") == [],
+      str((store.get_unit(_fu_unit["id"]).get("meta") or {}).get("followups")))
+
+# ── The audit's own assessment ─────────────────────────────────────────────
+#
+# An audit that verifies nothing and reports "this codebase routes through a dispatcher I could
+# not follow" is telling you the extraction is thin — which matters more than a run where it
+# recovered three config keys. It was being filed into `stats` and shown to nobody.
+_as_run = store.create_run("assessment-only", ".NET 8", "files", created_by="smoke")
+
+
+def _assessment_only(system_prompt, user_content, schema, llm_override=None,
+                     max_tokens=None, **kw):
+    if schema.get("name") == "submit_extraction_audit":
+        return {"claims": [],
+                "assessment": "Routing goes through a dispatcher I could not follow."}
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _assessment_only
+try:
+    runner.ingest_and_analyze(_as_run, [{"path": "a.py", "content": "A = 1\n"}])
+    runner.set_charter(_as_run, VALID_CHARTER, "smoke")
+    drive(_as_run, rounds=12)
+finally:
+    llm_gateway.call_tool = _saved_fu
+
+_as_points = [c for c in store.list_checkpoints(_as_run) if c["kind"] == "extraction_audit"]
+check("an audit that confirms nothing but has something to say still says it",
+      len(_as_points) == 1, str([c["kind"] for c in store.list_checkpoints(_as_run)]))
+check("its assessment is the body of the checkpoint, not a field in stats",
+      "dispatcher I could not follow" in _as_points[0]["detail"], _as_points[0]["detail"][:200])
+check("and it says an unverified claim is not the same as nothing being there",
+      "not the same as there being nothing" in _as_points[0]["detail"],
+      _as_points[0]["detail"][:400])
+check("the title does not promise facts it did not find",
+      "could not pin down" in _as_points[0]["title"], _as_points[0]["title"])
+
+
+section("56. Caps that say when they bind")
+
+# Three caps stand between the source and every conversion prompt: how many business rules one
+# reading may report, how many of each kind of evidence the shared digest names, and how far the
+# system portrait compresses what it was merged from. Each is a deliberate cost control, and
+# each was silent — so a codebase the pipeline could only partly describe rendered exactly like
+# one it described completely. That is the failure the sanity layer exists to prevent everywhere
+# else in this run.
+
+# ── The digest names only some of what was found ───────────────────────────
+_cov_run = store.create_run("coverage", ".NET 8", "files", created_by="smoke")
+_route_limit = comprehension._TOP_N["route"]
+store.insert_evidence(_cov_run, [
+    {"kind": "route", "value": f"GET /r{i}", "path": "a.php", "line": i,
+     "source": "parser", "confidence": 1.0}
+    for i in range(_route_limit + 12)
+] + [{"kind": "table", "value": "users", "path": "a.php", "line": 1,
+      "source": "parser", "confidence": 1.0}])
+
+_cov = comprehension.digest_coverage(_cov_run)
+check("a kind the digest had to truncate is reported with both numbers",
+      _cov.get("route") == {"shown": _route_limit, "total": _route_limit + 12}, str(_cov))
+check("a kind that fits entirely is not reported, because it is not a coverage finding",
+      "table" not in _cov, str(_cov))
+check("the description names the kind and the fraction, not just a count",
+      f"{_route_limit} of {_route_limit + 12}" in comprehension.describe_coverage(_cov),
+      comprehension.describe_coverage(_cov))
+check("nothing capped describes itself as nothing, rather than as complete coverage",
+      comprehension.describe_coverage({}) == "")
+# The cap itself must stay — the digest is in the cached system block and every conversion call
+# in the run pays for its size. Reporting it is the fix; raising it is not.
+check("the digest still truncates rather than growing without bound",
+      comprehension.render_digest(_cov_run).count("GET /r") <= _route_limit,
+      str(comprehension.render_digest(_cov_run).count("GET /r")))
+check("and the block says how many it left out",
+      "and 12 more" in comprehension.render_digest(_cov_run),
+      comprehension.render_digest(_cov_run)[:300])
+
+# ── A reading that ran out of room ─────────────────────────────────────────
+#
+# The schema tells the model it may return at most `MAX_RULES_PER_PROBE`. A probe that returns
+# exactly that many ran out of room, and "this slice has 25 rules" and "this slice has 200 and
+# you were given the first 25" were the same sentence.
+_cap_run = store.create_run("rules-capped", ".NET 8", "files", created_by="smoke")
+_cap_max = comprehension_agent.MAX_RULES_PER_PROBE
+
+
+def _capped_probe(system_prompt, user_content, schema, llm_override=None,
+                  max_tokens=None, **kw):
+    if schema.get("name") == "submit_comprehension":
+        return {"purpose": "Does many things.", "capabilities": [],
+                "rules": [{"statement": f"rule {i}", "category": "validation",
+                           "path": "a.py", "line": 1, "quote": "A = 1"}
+                          for i in range(_cap_max)]}
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+_saved_cap = llm_gateway.call_tool
+llm_gateway.call_tool = _capped_probe
+try:
+    runner.ingest_and_analyze(_cap_run, [{"path": "a.py", "content": "A = 1\n"}])
+    runner.set_charter(_cap_run, VALID_CHARTER, "smoke")
+    drive(_cap_run, rounds=12)
+finally:
+    llm_gateway.call_tool = _saved_cap
+
+check("a reading that returned the maximum it was allowed says so",
+      any(e["event"] == "rules_capped" for e in store.list_events(_cap_run)),
+      str([e["event"] for e in store.list_events(_cap_run)][:10]))
+check("and it is recorded on the reading, not only in the log",
+      any((u.get("meta") or {}).get("rules_capped")
+          for u in store.list_units(_cap_run, kind="comprehension")))
+check("the wording claims only what was observed, never that rules were lost",
+      all("may hold more" in (e["detail"] or "")
+          for e in store.list_events(_cap_run) if e["event"] == "rules_capped"),
+      str([e["detail"] for e in store.list_events(_cap_run)
+           if e["event"] == "rules_capped"]))
+
+# ── It reaches the gate where the conversion is paid for ───────────────────
+_cap_note = runner._coverage_note(_cap_run)
+check("what the understanding does not cover reaches the plan gate",
+      "does not cover" in _cap_note, _cap_note)
+check("the note says these are cost controls, not faults",
+      "not faults" in _cap_note, _cap_note)
+check("a run with nothing capped adds nothing to its gate",
+      runner._coverage_note(store.create_run("clean-cov", ".NET 8", "files",
+                                             created_by="smoke")) == "")
+check("the note never raises, whatever state the run is in",
+      runner._coverage_note("no-such-run") == "")
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

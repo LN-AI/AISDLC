@@ -287,6 +287,23 @@ def run(run_id: str) -> Dict[str, Any]:
                 + (" …" if len(missing) > 15 else ""),
             ))
 
+    # 5b. What the converter itself said it could not finish.
+    #
+    #     Every other check here is the platform's opinion of the output. This one is the
+    #     model's, written at the moment it knew something was wrong — a stored procedure it
+    #     was never shown, a constant defined nowhere, a behaviour it could not reproduce in
+    #     the target idiom. It was recorded as a run event and read by nothing, so the one
+    #     party that knew was reporting into a void.
+    #
+    #     `warn`, not `fail`: a followup means "converted, with something left over", and a
+    #     component that says so honestly must not rank below one that stayed quiet.
+    for component in components:
+        for note in ((component.get("meta") or {}).get("followups") or [])[:10]:
+            issues.append(_issue(
+                "manual_followup", "warn",
+                f"`{component.get('component_name') or component['path']}`: {note}",
+                unit_id=component["id"]))
+
     # 6. Components that produced nothing at all.
     empty = [c for c in components
              if c.get("status") == "converted" and not by_unit.get(c["id"])]

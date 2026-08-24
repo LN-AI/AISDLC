@@ -70,6 +70,37 @@ _DIGEST_KINDS = ("framework", "datastore", "entrypoint", "route", "table", "inte
                  "config_key")
 
 
+def digest_coverage(run_id: str) -> Dict[str, Dict[str, int]]:
+    """Per evidence kind: how many the digest names, and how many exist. `{kind: {shown,total}}`.
+
+    The digest caps each kind — routes at 40, tables at 60 — because it sits in the *cached*
+    system block and every conversion call in the run pays for its size. That is the right
+    trade. What was wrong is that it was silent: the block appends "… and N more" and no gate,
+    no check and no reader has ever divided by it, so a codebase whose routes the digest could
+    only partly describe rendered exactly like one it described completely.
+
+    Only kinds that are actually capped are returned; a kind that fits entirely is not a
+    coverage finding and would only add noise to the gate.
+    """
+    summary = evidence_module.summarize(store.list_evidence(run_id))
+    capped: Dict[str, Dict[str, int]] = {}
+    for kind in _DIGEST_KINDS:
+        total = len(summary.get(kind) or [])
+        limit = _TOP_N.get(kind, 20)
+        if total > limit:
+            capped[kind] = {"shown": limit, "total": total}
+    return capped
+
+
+def describe_coverage(capped: Dict[str, Dict[str, int]]) -> str:
+    """One sentence per capped kind, for the gate that approves the conversion."""
+    if not capped:
+        return ""
+    return "; ".join(
+        f"{_SECTION_TITLES.get(kind, kind).lower()}: {counts['shown']} of {counts['total']}"
+        for kind, counts in sorted(capped.items()))
+
+
 def render_digest(run_id: str, stats: Dict[str, Any] = None) -> str:
     """The frozen system-prompt block. Deterministic given the same evidence."""
     rows = store.list_evidence(run_id)
