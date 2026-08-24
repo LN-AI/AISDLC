@@ -32,7 +32,7 @@ wrong would make the loop more fragile than the single turn it replaces.
 """
 import logging
 import re
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.services.modernization import layering, repo_ingest, store
 
@@ -130,6 +130,19 @@ TOOL_SCHEMAS: List[Dict[str, Any]] = [
 ]
 
 TOOL_NAMES = frozenset(schema["name"] for schema in TOOL_SCHEMAS)
+
+# The lookups that can answer *before* anything has been converted.
+#
+# The other three cannot, and offering them at design time would be worse than not offering
+# them at all: `read_converted` and `list_members` read artifacts and symbols that do not
+# exist until the convert stage, and `project_rules` reads the layering rules derived from the
+# very decision the design call is being asked to make. Each would return an honest "nothing
+# found" that reads exactly like evidence of absence — so the architect would spend a turn
+# learning nothing and could reasonably conclude the codebase declares no types at all.
+DESIGN_TOOL_NAMES = frozenset({"read_source", "find_in_source"})
+DESIGN_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    schema for schema in TOOL_SCHEMAS if schema["name"] in DESIGN_TOOL_NAMES
+]
 
 
 def _clean_path(raw: Any) -> str:
@@ -251,14 +264,27 @@ def _project_rules(run_id: str, project: str) -> str:
     return "\n\n".join(b for b in blocks if b) or "No rules are stated for that project."
 
 
-def dispatcher(run_id: str) -> Callable[[str, Dict[str, Any]], str]:
+def dispatcher(run_id: str,
+               allowed: Optional[frozenset] = None) -> Callable[[str, Dict[str, Any]], str]:
     """-> `dispatch(name, arguments) -> str`, bound to one run.
 
     The run id is closed over rather than taken as an argument, which is the whole security
     story for these tools: there is no parameter the model can vary to read another run.
+
+    `allowed` narrows the set for a caller whose stage cannot answer all of them — the design
+    call gets `DESIGN_TOOL_NAMES`. It is belt to the braces of only publishing those schemas:
+    a model that names a tool it was not offered gets told so, rather than an empty result it
+    would read as "this codebase has none of those".
     """
+    permitted = allowed if allowed is not None else TOOL_NAMES
+
     def dispatch(name: str, arguments: Dict[str, Any]) -> str:
         arguments = arguments if isinstance(arguments, dict) else {}
+        if name in TOOL_NAMES and name not in permitted:
+            return (f"'{name}' is not available at this stage of the run. Nothing has been "
+                    f"converted yet, so it has nothing to report — this is not evidence that "
+                    f"the answer is empty. Available here: "
+                    + ", ".join(sorted(permitted)) + ".")
         if name == "read_source":
             return _read_source(run_id, _clean_path(arguments.get("path")))
         if name == "find_in_source":
@@ -271,6 +297,6 @@ def dispatcher(run_id: str) -> Callable[[str, Dict[str, Any]], str]:
         if name == "list_members":
             return _list_members(run_id, str(arguments.get("type_name") or ""))
         return (f"There is no lookup called '{name}'. The ones available are: "
-                + ", ".join(sorted(TOOL_NAMES)) + ".")
+                + ", ".join(sorted(permitted)) + ".")
 
     return dispatch

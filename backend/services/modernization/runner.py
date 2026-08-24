@@ -70,6 +70,17 @@ _ARCHITECT_MAX_TOKENS = architect_agent.ARCHITECTURE_MAX_TOKENS
 # behaviour exactly — `STANCES[0]` is the empty stance.
 DESIGN_CANDIDATES = 3
 
+# How many read-only turns each design candidate may spend before it answers. The architect
+# decides placement from a table of rows, and the one thing a table cannot settle is what an
+# ambiguous file actually *is*: `role` is a heuristic guess, and a 300-line file may be one
+# class or six unrelated functions that belong in different components. A wrong guess there
+# puts a file in the wrong project, which is a build error the conversion cannot repair.
+#
+# Deliberately well below the converter's budget. This is checking a handful of rows, not
+# reading a codebase — and the reading is multiplied by `DESIGN_CANDIDATES`. Set to 0 to send
+# the single-shot call this always made.
+DESIGN_LOOKUP_TURNS = 3
+
 # How much source one comprehension probe reads. Both caps are cost controls, and the file
 # cap is the one that matters: comprehension is priced per bundle at the assessment gate, so
 # these two numbers are what the operator is really approving. Deliberately well under the
@@ -279,8 +290,13 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
     # this gate's whole claim is that the call count is a fact, not a forecast — `STANCES` is
     # a constant, so the run will make exactly this many.
     calls = max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))
+    # Each candidate may also spend read-only turns before it answers. Only the *ceiling*
+    # carries that multiplier: a candidate that needs no lookup makes one call, so charging
+    # the expectation for turns nobody has been measured taking would overstate the quote in
+    # the other direction. Same split the plan gate makes for agentic conversion.
+    turns = DESIGN_LOOKUP_TURNS + 1 if DESIGN_LOOKUP_TURNS > 0 else 1
     expected = numbers["expected_usd"] * calls
-    ceiling = numbers["ceiling_usd"] * calls
+    ceiling = numbers["ceiling_usd"] * calls * turns
     estimated = numbers["estimated"]
 
     # Probes read the source itself, so unlike the architect they are priced from measured
@@ -400,6 +416,9 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
            f"other on how much of the source each one leaves impossible to build, with the "
            f"best applied and the rest reported"
            if numbers.get('design_calls', 1) > 1 else "")
+        + (f" (each may read up to {DESIGN_LOOKUP_TURNS} file(s) of your source before "
+           f"answering, which the ceiling above allows for and the estimate does not)"
+           if DESIGN_LOOKUP_TURNS > 0 else "")
         + f", and produces a costed, per-component conversion plan. "
         f"{estimate.describe(numbers, run.get('budget_cap_usd'))}",
         "",
@@ -1102,15 +1121,25 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
     panel that can fail a run it was meant to improve is worse than no panel (D-101).
     """
     scored: List[Dict[str, Any]] = []
+    # Only the lookups that can answer before anything is converted. The dispatcher is bound to
+    # this run, so there is no argument the model can vary to read another one.
+    tools = lookup.DESIGN_TOOL_SCHEMAS if DESIGN_LOOKUP_TURNS > 0 else None
+    dispatch = lookup.dispatcher(run_id, lookup.DESIGN_TOOL_NAMES) \
+        if DESIGN_LOOKUP_TURNS > 0 else None
     for index, (stance_id, stance) in enumerate(architect_agent.STANCES[:DESIGN_CANDIDATES]):
         try:
-            proposal = agent_guard.guarded_call(
-                caller, "modernization", llm_override, project_name=project_name,
-                fn=lambda s=stance: _architect.design(
-                    charter=charter, inventory=inventory, digest=digest, cycles=cycles,
-                    llm_override=llm_override, stance=s,
-                ),
-            )
+            # The turns happen *inside* one guarded call, so the reservation has to be told —
+            # the same mechanism agentic conversion uses, and for the same reason (D-25).
+            with agent_guard.expect_calls(DESIGN_LOOKUP_TURNS + 1 if tools else 1):
+                proposal = agent_guard.guarded_call(
+                    caller, "modernization", llm_override, project_name=project_name,
+                    fn=lambda s=stance: _architect.design(
+                        charter=charter, inventory=inventory, digest=digest, cycles=cycles,
+                        llm_override=llm_override, stance=s,
+                        lookup_tools=tools, lookup_dispatch=dispatch,
+                        max_turns=DESIGN_LOOKUP_TURNS,
+                    ),
+                )
         except Exception as exc:  # noqa: BLE001
             if not scored:
                 raise
@@ -1127,9 +1156,14 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
         score = architecture.score_proposal(proposal, source_units, source_edges)
         scored.append({"stance": stance_id, "index": index, "proposal": proposal,
                        "score": score, "cost": float(cost)})
+        # What it read to get there, on the record. This is the number that says whether the
+        # lookup budget is worth its money — a candidate that never asks anything is paying
+        # for a tier it does not use, and one that always exhausts its turns needs a bigger one.
+        looked_up = (proposal or {}).get("_agentic_lookups") or []
         store.append_event(
             run_id, "design_candidate",
-            f"{stance_id}: {architecture.describe_score(score)}")
+            f"{stance_id}: {architecture.describe_score(score)}"
+            + (f"; read {len(looked_up)} thing(s) first" if looked_up else ""))
 
     # `index` last so a tie is broken by the order the stances are declared in, which makes the
     # winner reproducible rather than dependent on which call happened to come back first.

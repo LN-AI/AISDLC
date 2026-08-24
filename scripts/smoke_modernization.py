@@ -511,7 +511,9 @@ check("re-declaring the same symbol does not abort the checkpoint",
 section("10. A whole run — order, artifacts, coherence, export")
 
 _real_call_tool = llm_gateway.call_tool
+_real_call_agentic = llm_gateway.call_agentic
 conversion_order = []          # component names, in the order they were converted
+agentic_lookups = []           # what the offline lookup loop actually fetched
 call_log = []                  # every stubbed schema name, so "no model call" is testable
 
 
@@ -672,6 +674,30 @@ def fake_call_tool(system_prompt, user_content, schema, llm_override=None, max_t
     return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
 
 
+def fake_call_agentic(system_prompt, user_content, tool_schema, read_tools, dispatch,
+                      llm_override=None, max_tokens=None, max_turns=None, **kw):
+    """The lookup loop, offline.
+
+    One real dispatch before answering, so every run that takes this path exercises the
+    dispatcher rather than only the schemas — a lookup the model may call and the platform
+    cannot answer is a defect no schema check would find. Then it answers exactly as the
+    single-shot stub would, and logs one entry, because one guarded call is still one
+    logical call however many turns it took.
+    """
+    if read_tools and dispatch:
+        agentic_lookups.append(
+            dispatch(read_tools[0]["name"], {"path": "app/api.py", "pattern": "class"}))
+    # Resolved at call time, never captured: several sections install their own `call_tool`
+    # stub, and this has to follow whichever one is live or it would answer with the wrong
+    # fixture — or, worse, fall through to the real provider and put the offline suite on the
+    # network.
+    result = llm_gateway.call_tool(system_prompt, user_content, tool_schema,
+                                   llm_override, max_tokens)
+    result["_agentic_turns"] = 2
+    result["_agentic_lookups"] = [t["name"] for t in (read_tools or [])[:1]]
+    return result
+
+
 def drive(run_id, caller=CALLER, rounds=8):
     """Run the driver until it stops making progress.
 
@@ -692,6 +718,7 @@ def drive(run_id, caller=CALLER, rounds=8):
 
 
 llm_gateway.call_tool = fake_call_tool
+llm_gateway.call_agentic = fake_call_agentic
 try:
     e2e = store.create_run("e2e", ".NET 8", "files", created_by="smoke")
     result = runner.ingest_and_analyze(e2e, FIXTURE + [
@@ -882,6 +909,7 @@ finally:
 section("11. Crash mid-run — resume converts only what is left")
 
 llm_gateway.call_tool = fake_call_tool
+llm_gateway.call_agentic = fake_call_agentic
 try:
     crash_run = store.create_run("crash", ".NET 8", "files", created_by="smoke")
     runner.ingest_and_analyze(crash_run, [
@@ -1189,6 +1217,7 @@ check("and it does not appear in their list",
 # route handler runs in FastAPI's threadpool where there is no loop, so this check is
 # specifically here to catch that handler being written as `def` instead of `async def`.
 llm_gateway.call_tool = fake_call_tool
+llm_gateway.call_agentic = fake_call_agentic
 try:
     cp = [c for c in store.list_checkpoints(api_run_id, "open")
           if c["kind"] == "discovery_approval"][0]
@@ -1627,6 +1656,7 @@ def sync_start_job(agent_name, total_steps, run_fn):
 
 job_service.start_job = sync_start_job
 llm_gateway.call_tool = fake_call_tool
+llm_gateway.call_agentic = fake_call_agentic
 # Three files per probe rather than twelve, so the 9-file fixture produces *several* probes
 # and the synthesis stage actually runs. At the production cap this fixture fits in one
 # bundle — which would leave `_synthesize_one`, the portrait renderer and the contradictions
@@ -1981,6 +2011,7 @@ check("and it charges no rework attempt for a pass that has not run",
 # the same file forever, and spending a budget to discover that slowly is the obvious
 # failure mode of any build/fix loop.
 llm_gateway.call_tool = fake_call_tool
+llm_gateway.call_agentic = fake_call_agentic
 try:
     store.update_run(_ing_run, status="converting", paused_reason=None)
     runner.convert_run(_ing_run, CALLER)
@@ -4525,6 +4556,7 @@ check("and says so plainly when there was nothing to find",
 # End to end through a run: the call is made, what survives is stored as evidence, what does
 # not is not, and the run says both happened.
 llm_gateway.call_tool = fake_call_tool
+llm_gateway.call_agentic = fake_call_agentic
 _audit_run = store.create_run("audit", ".NET 8", "files", created_by="smoke")
 runner.ingest_and_analyze(_audit_run, PHP_FIXTURE)
 runner.set_charter(_audit_run, VALID_CHARTER, "smoke")
@@ -5842,6 +5874,9 @@ class _Response:
 _ANSWER = {"name": "submit_conversion", "input_schema": {"type": "object", "properties": {}}}
 _READ = [{"name": "read_source", "input_schema": {"type": "object", "properties": {}}}]
 _real_send = llm_gateway._anthropic_send
+# This section drives the real loop, with only the provider scripted — so the offline
+# stub installed for the run fixtures has to come back off first.
+llm_gateway.call_agentic = _real_call_agentic
 
 
 def _scripted(*responses, obedient=True):
@@ -5980,6 +6015,10 @@ try:
           _degraded["_agentic_lookups"] == [])
 finally:
     llm_gateway.call_tool = _real_call_tool
+    # The last thing that needed the genuine loop. Everything after this drives a run,
+    # and a run whose design stage reached the real provider would put the offline suite
+    # on the network — which it did, until this line existed.
+    llm_gateway.call_agentic = fake_call_agentic
 
 # ── The lookups themselves ─────────────────────────────────────────────────
 #
@@ -7882,6 +7921,7 @@ check("it names the entry project rather than leaving the runner to guess",
 
 # ── End to end: a driven run reaches the gate.
 llm_gateway.call_tool = fake_call_tool
+llm_gateway.call_agentic = fake_call_agentic
 try:
     _rte = store.create_run("rt-e2e", ".NET 8", "files", created_by="smoke")
     runner.ingest_and_analyze(_rte, [{"path": "a.py", "content": "A = 1\n"}])
@@ -8267,11 +8307,66 @@ finally:
 
 # The panel is priced where it is approved. A gate quoting one call for a run that makes three
 # is the dishonesty the two-gate split exists to remove.
+_panel_gate_detail = next(
+    c["detail"] for c in store.list_checkpoints(e2e)
+    if c["kind"] == "discovery_approval")
 check("the assessment gate prices one design call per candidate",
       runner._discovery_estimate(e2e)["design_calls"]
       == max(1, min(runner.DESIGN_CANDIDATES, len(architect_agent.STANCES))),
       str(runner._discovery_estimate(e2e)))
 
+
+
+# ── What a design candidate may look at ────────────────────────────────────
+#
+# The architect decides placement from a table of rows. The one thing a table cannot settle is
+# what an ambiguous file actually *is* — `role` is a parser's guess, and a 300-line file may be
+# one class or six unrelated functions belonging in different components. A wrong guess there
+# puts a file in the wrong project, which is a build error the conversion cannot repair.
+
+check("the design call is offered the lookups that can answer before conversion",
+      sorted(s["name"] for s in lookup.DESIGN_TOOL_SCHEMAS)
+      == ["find_in_source", "read_source"],
+      str([s["name"] for s in lookup.DESIGN_TOOL_SCHEMAS]))
+check("and not the three that read things this stage has not produced yet",
+      lookup.DESIGN_TOOL_NAMES.isdisjoint(
+          {"read_converted", "project_rules", "list_members"}))
+
+# A lookup that structurally cannot answer must say so. Returning an honest empty result would
+# read exactly like evidence of absence, and an architect told "no types found" would decompose
+# a codebase it believes declares nothing.
+_design_ask = lookup.dispatcher(_panel_run, lookup.DESIGN_TOOL_NAMES)
+_refused = _design_ask("read_converted", {"path": "Acme/User.cs"})
+check("asking at design time for something only conversion produces is refused, with a reason",
+      "not available at this stage" in _refused, _refused)
+check("and the refusal says it is not evidence that the answer is empty",
+      "not evidence" in _refused, _refused)
+check("an unscoped dispatcher still answers all five, so the converter is unaffected",
+      "not available at this stage"
+      not in lookup.dispatcher(_panel_run)("read_converted", {"path": "Acme/User.cs"}))
+
+# The prompt has to match what is actually attached. Telling a model the table is everything it
+# gets, and then handing it a file reader, wastes the turn it was given.
+_msg_plain = architect_agent._build_user_message("| path |", [], "", False)
+_msg_tools = architect_agent._build_user_message("| path |", [], "", True)
+check("without lookups the architect is told the inventory is all there is",
+      "there is nothing else" in _msg_plain, _msg_plain[:400])
+check("with lookups it is not told that, because it would no longer be true",
+      "there is nothing else" not in _msg_tools, _msg_tools[:400])
+check("and it is told to read the ambiguous files rather than all of them",
+      "not all of them" in _msg_tools, _msg_tools[-400:])
+check("it is also told nothing is converted yet, so it does not go looking",
+      "Nothing is converted yet" in _msg_tools or "nothing is converted yet" in _msg_tools,
+      _msg_tools[-400:])
+
+# The turns are inside one guarded call, so the reservation has to be told about them, and the
+# gate that approves the spend has to say they may happen.
+check("the assessment gate says the design may read source before answering",
+      ("read up to" in _panel_gate_detail) == (runner.DESIGN_LOOKUP_TURNS > 0),
+      _panel_gate_detail[-500:])
+check("and it says which side of the quote covers it",
+      runner.DESIGN_LOOKUP_TURNS == 0 or "ceiling above allows for it" in _panel_gate_detail
+      or "ceiling above allows" in _panel_gate_detail, _panel_gate_detail[-500:])
 
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")

@@ -243,14 +243,28 @@ class TargetArchitectAgent(BaseAgent):
         cycles: Optional[List[Dict[str, Any]]] = None,
         llm_override: Optional[Dict[str, Any]] = None,
         stance: str = "",
+        lookup_tools: Optional[List[Dict[str, Any]]] = None,
+        lookup_dispatch=None,
+        max_turns: int = 0,
     ) -> Dict[str, Any]:
-        result = llm_gateway.call_tool(
-            self.system_for(charter, digest),
-            _build_user_message(inventory, cycles or [], stance),
-            TARGET_ARCHITECTURE_TOOL_SCHEMA,
-            llm_override,
-            max_tokens=ARCHITECTURE_MAX_TOKENS,
-        )
+        system = self.system_for(charter, digest)
+        user_content = _build_user_message(inventory, cycles or [], stance,
+                                           bool(lookup_tools and lookup_dispatch))
+        # With lookups, the same forced-tool contract with a few read-only questions in front
+        # of it — the architect decides placement from a table of rows, and the one thing it
+        # cannot do from a table is settle what an ambiguous file actually is. Without them,
+        # byte-identical to the single call this has always made.
+        if lookup_tools and lookup_dispatch and max_turns > 0:
+            result = llm_gateway.call_agentic(
+                system, user_content, TARGET_ARCHITECTURE_TOOL_SCHEMA,
+                lookup_tools, lookup_dispatch, llm_override,
+                max_tokens=ARCHITECTURE_MAX_TOKENS, max_turns=max_turns,
+            )
+        else:
+            result = llm_gateway.call_tool(
+                system, user_content, TARGET_ARCHITECTURE_TOOL_SCHEMA,
+                llm_override, max_tokens=ARCHITECTURE_MAX_TOKENS,
+            )
         result["agent_name"] = self.agent_name
         return result
 
@@ -285,17 +299,33 @@ STANCES: Tuple[Tuple[str, str], ...] = (
 
 
 def _build_user_message(inventory: str, cycles: List[Dict[str, Any]],
-                        stance: str = "") -> str:
+                        stance: str = "", can_look_up: bool = False) -> str:
     parts = [
         "# The codebase to decompose",
         "",
         "One row per source file: path, language, the role a parser guessed, size in lines, the "
         "types it declares, what the parsers observed it serving, and the paths it depends on — "
-        "heaviest first, with `×n` where it references that dependency more than once. This is "
-        "the complete inventory — there is nothing else.",
+        "heaviest first, with `×n` where it references that dependency more than once."
+        + (" Every file in the codebase is listed here."
+           if can_look_up else
+           " This is the complete inventory — there is nothing else."),
         "",
         inventory,
     ]
+    if can_look_up:
+        # Only when the tools are actually attached: promising a lookup that is not there
+        # would spend a turn on a refusal, and the line above already told a single-shot call
+        # that the table is all it gets.
+        parts.append(
+            "\n## Before you answer\n\n"
+            "You can read any of these files, or search all of them, before deciding. Do that "
+            "for the few whose row does not settle what they are — a `role` a parser guessed "
+            "wrong puts a file in the wrong project, and the row cannot tell you whether a "
+            "300-line file is one class or six loosely related functions that should be split "
+            "across components.\n\n"
+            "Read the ambiguous ones, not all of them. Nothing is converted yet, so there is "
+            "no generated code to inspect — only the legacy source."
+        )
     if cycles:
         listed = "\n".join(
             f"- {c['size']} files: " + ", ".join(f"`{p}`" for p in c["paths"][:10])
