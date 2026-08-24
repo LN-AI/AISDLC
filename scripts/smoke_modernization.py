@@ -8368,6 +8368,94 @@ check("and it says which side of the quote covers it",
       runner.DESIGN_LOOKUP_TURNS == 0 or "ceiling above allows for it" in _panel_gate_detail
       or "ceiling above allows" in _panel_gate_detail, _panel_gate_detail[-500:])
 
+section("54. An answer that does not fit in one response")
+
+# The design call has to name every file in a single response. Past a computable file count it
+# provably cannot, and the failure mode before this existed was the expensive one: the run took
+# payment for the assessment, spent it, then discovered at the design stage that its answer had
+# been cut off — and retried the identical prompt twice more at full price.
+
+check("the file ceiling is derived from the same arithmetic the gate prices with",
+      runner._DESIGN_FILE_CEILING
+      == (architect_agent.ARCHITECTURE_MAX_TOKENS - 400) // 60,
+      str(runner._DESIGN_FILE_CEILING))
+
+_small = {"design_output_tokens": 400 + 60 * 40,
+          "design_output_cap": architect_agent.ARCHITECTURE_MAX_TOKENS,
+          "design_file_ceiling": runner._DESIGN_FILE_CEILING}
+_near = {"design_output_tokens": int(architect_agent.ARCHITECTURE_MAX_TOKENS * 0.85),
+         "design_output_cap": architect_agent.ARCHITECTURE_MAX_TOKENS,
+         "design_file_ceiling": runner._DESIGN_FILE_CEILING}
+_over = {"design_output_tokens": architect_agent.ARCHITECTURE_MAX_TOKENS + 5000,
+         "design_output_cap": architect_agent.ARCHITECTURE_MAX_TOKENS,
+         "design_file_ceiling": runner._DESIGN_FILE_CEILING}
+
+check("an ordinary codebase gets no size warning at all",
+      runner._design_size_warning(_small, 40) == "",
+      runner._design_size_warning(_small, 40))
+check("one approaching the ceiling is told it should still fit",
+      "should fit" in runner._design_size_warning(_near, 450),
+      runner._design_size_warning(_near, 450))
+check("and one past it is told plainly that it cannot be done in one pass",
+      "too large to decompose in one pass" in runner._design_size_warning(_over, 900),
+      runner._design_size_warning(_over, 900))
+check("the warning names the ceiling, so the reader can act on it",
+      str(runner._DESIGN_FILE_CEILING) in runner._design_size_warning(_over, 900))
+check("and says the analysis is still worth buying, because it is",
+      "worth having" in runner._design_size_warning(_over, 900))
+check("a gate with no size numbers at all renders nothing rather than raising",
+      runner._design_size_warning({}, 10) == "")
+
+# A truncated response is not a transient failure. The same prompt truncates the same way, so
+# the remaining attempts reproduce it at full price — and three identical failures read to an
+# operator as flakiness, which is the wrong diagnosis.
+_trunc_run = store.create_run("truncated", ".NET 8", "files", created_by="smoke")
+store.insert_units(_trunc_run, [
+    {"path": "a.php", "kind": "source_file", "language": "php", "status": "ready",
+     "source_text": "<?php class A {}"},
+])
+store.update_run(_trunc_run, charter=charter.validate(VALID_CHARTER))
+runner._plan_stage(_trunc_run, stages.BY_ID["design"], store.get_run(_trunc_run))
+_design_unit = store.list_units(_trunc_run, kind="design")[0]
+
+_trunc_attempts = []
+
+
+def _truncating(system_prompt, user_content, schema, llm_override=None, max_tokens=None, **kw):
+    if schema.get("name") == "submit_target_architecture":
+        _trunc_attempts.append(1)
+        raise llm_gateway.LLMTruncatedResponseError("submit_target_architecture", 32000)
+    return _real_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+_saved_trunc = llm_gateway.call_tool
+llm_gateway.call_tool = _truncating
+try:
+    runner._design_one(_trunc_run, _design_unit, charter.validate(VALID_CHARTER),
+                       CALLER, None, "truncated")
+finally:
+    llm_gateway.call_tool = _saved_trunc
+
+check("a truncated design is not retried, because the same prompt truncates the same way",
+      len(_trunc_attempts) == 1, str(len(_trunc_attempts)) + " attempt(s)")
+check("the unit is failed terminally rather than left to burn its attempts",
+      store.list_units(_trunc_run, kind="design")[0]["status"] == "failed",
+      store.list_units(_trunc_run, kind="design")[0]["status"])
+_trunc_points = [c for c in store.list_checkpoints(_trunc_run)
+                 if c["kind"] == "output_truncated"]
+check("a checkpoint says what happened, in words that name the cause",
+      len(_trunc_points) == 1 and "incomplete" in _trunc_points[0]["detail"],
+      str([c["kind"] for c in store.list_checkpoints(_trunc_run)]))
+check("and says nothing further was spent on it",
+      "Nothing further was spent" in _trunc_points[0]["detail"])
+check("it is not blocking — the run has already failed the unit, and a gate would only stall it",
+      not _trunc_points[0]["blocking"])
+check("the run log records it as an error, not a warning",
+      any(e["event"] == "output_truncated" and e["level"] == "error"
+          for e in store.list_events(_trunc_run)),
+      str([(e["event"], e["level"]) for e in store.list_events(_trunc_run)][:6]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

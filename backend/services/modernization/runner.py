@@ -81,6 +81,16 @@ DESIGN_CANDIDATES = 3
 # the single-shot call this always made.
 DESIGN_LOOKUP_TURNS = 3
 
+# Above this the architect's answer provably does not fit in one response, so the design call
+# can only come back truncated. Derived from the same arithmetic `_discovery_estimate` prices
+# with (400 tokens of preamble plus ~60 per file) rather than stated independently, because two
+# numbers that must agree and are written down twice are two numbers that will disagree.
+_DESIGN_FILE_CEILING = (_ARCHITECT_MAX_TOKENS - 400) // 60
+
+# How close to that ceiling is close enough to warn. A codebase at four fifths of it is one
+# refactor away from not fitting, and the gate is the last free moment to say so.
+_DESIGN_SATURATION_WARN = 0.8
+
 # How much source one comprehension probe reads. Both caps are cost controls, and the file
 # cap is the one that matters: comprehension is priced per bundle at the assessment gate, so
 # these two numbers are what the operator is really approving. Deliberately well under the
@@ -283,8 +293,11 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
     # serve nothing, so the allowance is deliberately above the measurement rather than at it.
     inventory_chars = sum(len(u["path"]) + 110 for u in units)
     input_tokens = estimate.tokens("x" * inventory_chars) + estimate.PROMPT_FRAME_TOKENS
-    expected_output = min(400 + 60 * max(len(units), 1),
-                          _ARCHITECT_MAX_TOKENS)
+    # Unclamped, so the clamp itself becomes visible: a decomposition of every file has to fit
+    # in one response, and past a certain file count it provably cannot. Clamping silently was
+    # what let a run take payment for a design call that could only ever come back truncated.
+    projected_output = 400 + 60 * max(len(units), 1)
+    expected_output = min(projected_output, _ARCHITECT_MAX_TOKENS)
     numbers = estimate.band(input_tokens, expected_output, _ARCHITECT_MAX_TOKENS)
     # One call per candidate decomposition. Priced here rather than discovered later because
     # this gate's whole claim is that the call count is a fact, not a forecast — `STANCES` is
@@ -342,7 +355,40 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
             "ceiling_usd": round(ceiling, 4), "model": numbers["model"],
             "price_is_estimated": bool(estimated),
             "comprehension_calls": len(bundles) + (1 if len(bundles) > 1 else 0),
-            "design_calls": max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))}
+            "design_calls": max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES))),
+            "design_output_tokens": projected_output,
+            "design_output_cap": _ARCHITECT_MAX_TOKENS,
+            "design_file_ceiling": _DESIGN_FILE_CEILING}
+
+
+def _design_size_warning(numbers: Dict[str, Any], files: int) -> str:
+    """Said at the gate, because the gate is the last free moment to say it.
+
+    The design call has to name every file in one response. Past `_DESIGN_FILE_CEILING` it
+    provably cannot, so the call can only come back truncated — and until this existed the
+    run took payment for the assessment, spent it, and discovered that at the design stage
+    with nothing to show. A number this gate can compute for free belongs on this gate.
+    """
+    projected = int(numbers.get("design_output_tokens") or 0)
+    cap = int(numbers.get("design_output_cap") or 0)
+    ceiling = int(numbers.get("design_file_ceiling") or 0)
+    if not projected or not cap or projected < cap * _DESIGN_SATURATION_WARN:
+        return ""
+    if projected >= cap:
+        return (
+            f"\n\n**This codebase is too large to decompose in one pass.** The design step has "
+            f"to name all {files} files in a single response, and beyond about {ceiling} it "
+            f"does not fit — so that step will stop rather than return half a plan with the "
+            f"rest silently missing. Convert this in slices: upload the parts separately and "
+            f"run each one. Approving here still buys you the full analysis of what is in the "
+            f"codebase, which is worth having either way."
+        )
+    return (
+        f"\n\nA note on size: this codebase is close to the largest that can be decomposed in "
+        f"one pass ({files} files against a practical ceiling of about {ceiling}). It should "
+        f"fit. If the design step reports that its answer was cut off, that is what happened, "
+        f"and the run will say so rather than convert a partial plan."
+    )
 
 
 def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
@@ -419,6 +465,7 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
         + (f" (each may read up to {DESIGN_LOOKUP_TURNS} file(s) of your source before "
            f"answering, which the ceiling above allows for and the estimate does not)"
            if DESIGN_LOOKUP_TURNS > 0 else "")
+        + _design_size_warning(numbers, counts["total"])
         + f", and produces a costed, per-component conversion plan. "
         f"{estimate.describe(numbers, run.get('budget_cap_usd'))}",
         "",
@@ -2048,6 +2095,32 @@ def _handle_stage_exception(run_id: str, unit: Dict[str, Any], exc: Exception,
         return "failed"
     if isinstance(exc, guardrail_service.GuardrailViolation):
         store.fail_unit(unit["id"], run_id, f"Too large: {exc}", terminal=True)
+        return "failed"
+    if isinstance(exc, llm_gateway.LLMTruncatedResponseError):
+        # Terminal on the first attempt, for the same reason an oversize input is: the same
+        # prompt produces the same truncation every time, so the remaining attempts are spent
+        # reproducing it. Three identical failures also read to an operator as flakiness,
+        # which is the wrong diagnosis — the answer did not fit, and the fix is a smaller
+        # question rather than another go at the same one.
+        store.fail_unit(unit["id"], run_id,
+                        f"The answer did not fit in one response: {exc}", terminal=True)
+        store.create_checkpoint(
+            run_id, "output_truncated",
+            f"{what.capitalize()} produced more than one response can hold",
+            detail=(
+                f"The model was still generating when it reached its {exc.max_tokens}-token "
+                f"limit, so what came back is incomplete and cannot be trusted — a half-written "
+                f"decomposition would place some files and silently drop the rest.\n\n"
+                f"This is not a transient failure and it has not been retried: the same input "
+                f"produces the same truncation, so the remaining attempts would reproduce it at "
+                f"full price. Nothing further was spent.\n\n"
+                f"A codebase this size needs to be converted in slices — split the upload and "
+                f"run each part, or raise the limit for this call if the provider allows it."
+            ),
+            unit_id=unit["id"], blocking=False,
+        )
+        store.append_event(run_id, "output_truncated",
+                           f"{what}: {exc}"[:400], unit_id=unit["id"], level="error")
         return "failed"
     logger.exception("Could not determine %s for run %s", what, run_id)
     store.fail_unit(unit["id"], run_id, f"{type(exc).__name__}: {exc}",
