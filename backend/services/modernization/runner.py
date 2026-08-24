@@ -426,6 +426,19 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
         store.update_run(run_id, stats={**stats, "analysis": {
             "signals": signals, "contradictions": contradictions}})
 
+    # The charter read against the codebase it binds. Free, deterministic, and here because
+    # here is the last moment before anything is spent — a decision that does not fit is not
+    # one mistake, it is one mistake repeated in every conversion call in the run.
+    try:
+        charter_findings = charter_module.lint(charter, signals)
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not lint the charter for run %s (continuing)", run_id)
+        charter_findings = []
+    if charter_findings:
+        store.append_event(
+            run_id, "charter_mismatch",
+            "; ".join(f["title"] for f in charter_findings)[:400], level="warning")
+
     # The counts carry their denominators (`sanity.render_counts`) rather than a bare list of
     # what was observed. "1 route" and "we could not read this codebase" used to be the same
     # sentence on this screen, and this is the gate where that mattered most: it is the first
@@ -472,6 +485,7 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
            f"answering, which the ceiling above allows for and the estimate does not)"
            if DESIGN_LOOKUP_TURNS > 0 else "")
         + _design_size_warning(numbers, counts["total"])
+        + charter_module.describe_lint(charter_findings)
         + f", and produces a costed, per-component conversion plan. "
         f"{estimate.describe(numbers, run.get('budget_cap_usd'))}",
         "",
@@ -482,7 +496,8 @@ def _raise_discovery_gate(run_id: str, charter: Dict[str, Any]) -> None:
         detail="\n".join(detail),
         blocking=True,
         payload={"stage": "assessment", "files": counts["total"], "estimate": numbers,
-                 "evidence": found, "signals": signals, "contradictions": contradictions},
+                 "evidence": found, "signals": signals, "contradictions": contradictions,
+                 "charter_findings": charter_findings},
     )
 
 

@@ -263,3 +263,133 @@ def describe_fields() -> List[Dict[str, Any]]:
          "conditional": f.applies_when is not None}
         for f in CHARTER_FIELDS
     ]
+
+
+# ── The charter, read against the codebase it binds ────────────────────────
+#
+# `validate()` enforces that the five required decisions are present. Nothing checked whether
+# the answers make sense *for this codebase*, and the charter binds every conversion call in
+# the run — so a decision that does not fit is a mistake repeated hundreds of times, at full
+# price, in a shape no later stage can see.
+#
+# All of it is arithmetic over signals the analysis already computed, so it is free and it runs
+# at the assessment gate: the last moment before anything is spent. Every finding is a warning.
+# The customer may have a reason, and refusing a charter on a heuristic would be worse than the
+# problem — the point is to put the mismatch in front of someone who can recognise it.
+
+# Wording that indicates a promise to keep the source's URLs working unchanged.
+_KEEPS_URLS = ("unchanged", "same url", "same path", "preserve", "keep", "compatib", "identical")
+
+
+def _stated(charter: Dict[str, Any], key: str) -> str:
+    return str((charter or {}).get(key) or "").strip()
+
+
+def _has_data(signals: Dict[str, Any]) -> bool:
+    return bool(signals.get("db_apis") or signals.get("datastores") or signals.get("tables"))
+
+
+def lint(charter: Dict[str, Any], signals: Dict[str, Any]) -> List[Dict[str, str]]:
+    """-> [{key, title, detail}]. Deterministic, free, and never raises on odd input.
+
+    Two shapes of finding, and both matter:
+
+      * a decision left blank that this codebase plainly needs — it will then be re-made,
+        differently, by every call that runs into it;
+      * a decision that was made about something the codebase does not appear to contain,
+        which usually means the analysis missed that area rather than that the answer is wrong.
+    """
+    charter, signals = charter or {}, signals or {}
+    findings: List[Dict[str, str]] = []
+    data = _has_data(signals)
+
+    if data and not _stated(charter, "datastore_fate"):
+        findings.append({
+            "key": "datastore_fate",
+            "title": "The database's fate is unstated, and this codebase has one",
+            "detail": (
+                f"{len(signals.get('tables') or [])} table(s) and "
+                f"{len(signals.get('db_apis') or [])} data-access API(s) were observed, but "
+                f"nothing says whether the same engine is kept or replaced, or whether the "
+                f"existing schema is reused as it stands. Every file that touches data has to "
+                f"assume one, and without this they will not all assume the same one."),
+        })
+
+    if data and not _stated(charter, "concurrency_model"):
+        findings.append({
+            "key": "concurrency_model",
+            "title": "Asynchronous or synchronous is unstated for a codebase that does I/O",
+            "detail": (
+                "In most target stacks this decides the signature of nearly every function "
+                "that touches the database, so it cannot be settled per file — and left blank "
+                "it will be, one call at a time."),
+        })
+
+    if _stated(charter, "data_access") and not data:
+        findings.append({
+            "key": "data_access",
+            "title": "A data-access decision was made, and no data access was found",
+            "detail": (
+                "Nothing in this codebase parsed as a database call, a table or a datastore. "
+                "Either this decision binds nothing, or the analysis could not see the data "
+                "layer — and the second is worth checking before converting, because every "
+                "file that reaches the database would then be converted with no guidance."),
+        })
+
+    routes = int(signals.get("routes") or 0)
+    if routes and not _stated(charter, "url_compatibility"):
+        findings.append({
+            "key": "url_compatibility",
+            "title": f"{routes} route(s) were found, and nothing says whether they must keep working",
+            "detail": (
+                "Whether callers can be moved to new paths, or the source's URLs have to answer "
+                "unchanged, changes how nearly every entry point is converted."),
+        })
+
+    keeps_urls = any(w in _stated(charter, "url_compatibility").lower() for w in _KEEPS_URLS)
+    if keeps_urls and not routes:
+        findings.append({
+            "key": "url_compatibility",
+            "title": "The URLs are promised to keep working, and no routes were found",
+            "detail": (
+                "No route was observed anywhere in this codebase, so there is nothing to hold "
+                "the conversion to and nothing to check it against afterwards. That usually "
+                "means the routing is done in a way the analysis could not read."),
+        })
+
+    if signals.get("has_ui") and not _stated(charter, "ui_strategy"):
+        findings.append({
+            "key": "ui_strategy",
+            "title": "This codebase renders a user interface, and nothing says what it becomes",
+            "detail": (
+                "How much of the existing screen structure survives is a decision every view "
+                "conversion needs, and it is the one most likely to be answered differently "
+                "by each of them."),
+        })
+
+    if signals.get("sessions") and not _stated(charter, "auth_model"):
+        findings.append({
+            "key": "auth_model",
+            "title": "Per-user state was observed, and the authentication model is unstated",
+            "detail": (
+                "Session use was found in the source. How a user is authenticated, and how "
+                "that state is carried between requests, binds every entry point that reads "
+                "it."),
+        })
+
+    return findings
+
+
+def describe_lint(findings: List[Dict[str, str]]) -> str:
+    """The findings as gate prose. Empty when there is nothing to say."""
+    if not findings:
+        return ""
+    one = len(findings) == 1
+    head = ("\n\nOne decision in this charter does not fit what was found in the codebase. It "
+            "does not block the run — you may have a reason — but the charter binds every "
+            "file, so a mismatch here is repeated in every conversion call:"
+            if one else
+            f"\n\n{len(findings)} decisions in this charter do not fit what was found in the "
+            f"codebase. They do not block the run — you may have reasons — but the charter "
+            f"binds every file, so a mismatch here is repeated in every conversion call:")
+    return head + "\n" + "\n".join(f"  · {f['title']}. {f['detail']}" for f in findings)

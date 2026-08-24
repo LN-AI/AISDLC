@@ -8668,6 +8668,102 @@ check("the note never raises, whatever state the run is in",
       runner._coverage_note("no-such-run") == "")
 
 
+section("57. The charter, read against the codebase it binds")
+
+# `validate()` checks the five required decisions are present. Nothing checked whether the
+# answers fit *this* codebase — and the charter binds every conversion call in the run, so a
+# decision that does not fit is not one mistake, it is one mistake repeated hundreds of times
+# at full price, in a shape no later stage can see.
+
+_DATA_SIGNALS = {"tables": ["users"], "db_apis": ["pdo"], "datastores": ["mysql"]}
+
+check("a charter answering everything its codebase needs is not nagged",
+      charter.lint(
+          {"data_access": "EF Core", "datastore_fate": "keep the schema",
+           "concurrency_model": "async throughout"}, dict(_DATA_SIGNALS)) == [],
+      str(charter.lint({"data_access": "EF Core", "datastore_fate": "keep the schema",
+                        "concurrency_model": "async throughout"}, dict(_DATA_SIGNALS))))
+
+_data_only = charter.lint({"data_access": "EF Core", "concurrency_model": "async"},
+                          dict(_DATA_SIGNALS))
+check("a codebase with a database and no stated fate for it is flagged",
+      [f["key"] for f in _data_only] == ["datastore_fate"], str(_data_only))
+check("and the finding counts what it found, rather than asserting in the abstract",
+      "1 table(s)" in _data_only[0]["detail"], _data_only[0]["detail"])
+
+check("a codebase that does I/O with no stated concurrency model is flagged",
+      any(f["key"] == "concurrency_model"
+          for f in charter.lint({"data_access": "EF Core", "datastore_fate": "keep"},
+                                dict(_DATA_SIGNALS))))
+
+# The other shape of finding: a decision made about something that does not appear to be there.
+# Usually that means the analysis missed the area, which is the more expensive reading.
+_no_data = charter.lint({"data_access": "EF Core 8 against the existing schema"}, {})
+check("a data-access decision with no data access found is flagged the other way",
+      [f["key"] for f in _no_data] == ["data_access"], str(_no_data))
+check("and it names the likelier cause rather than assuming the answer is wrong",
+      "could not see the data layer" in _no_data[0]["detail"], _no_data[0]["detail"])
+
+check("routes with no stated URL policy are flagged, with the count",
+      any(f["key"] == "url_compatibility" and "3 route(s)" in f["title"]
+          for f in charter.lint({}, {"routes": 3})),
+      str(charter.lint({}, {"routes": 3})))
+check("promising the URLs keep working when none were found is flagged",
+      any("no routes were found" in f["title"]
+          for f in charter.lint({"url_compatibility": "every path answers unchanged"},
+                                {"routes": 0})),
+      str(charter.lint({"url_compatibility": "every path answers unchanged"}, {"routes": 0})))
+check("a URL policy that moves callers is not mistaken for a promise to keep them",
+      not any("no routes were found" in f["title"]
+              for f in charter.lint({"url_compatibility": "callers move to new REST paths"},
+                                    {"routes": 0})))
+
+check("a codebase that renders a UI with no stated UI strategy is flagged",
+      any(f["key"] == "ui_strategy" for f in charter.lint({}, {"has_ui": True})))
+check("sessions observed with no stated auth model is flagged",
+      any(f["key"] == "auth_model" for f in charter.lint({}, {"sessions": True})))
+check("a codebase with none of those things is left alone",
+      charter.lint({}, {"files_ingested": 4}) == [],
+      str(charter.lint({}, {"files_ingested": 4})))
+
+check("nothing to report renders no prose at all",
+      charter.describe_lint([]) == "")
+_one = charter.describe_lint([{"key": "k", "title": "T", "detail": "D"}])
+check("a single finding is written as one, not with a bracketed plural",
+      "One decision" in _one and "(s)" not in _one.split("\n")[0], _one)
+check("the prose says it does not block the run, because it does not",
+      "does not block the run" in _one, _one)
+
+# It has to reach the gate. This is the last moment before anything is spent, and the whole
+# value is in the timing.
+_lint_run = store.create_run("charter-lint", ".NET 8", "files", created_by="smoke")
+runner.ingest_and_analyze(_lint_run, [
+    {"path": "index.php",
+     "content": "<?php\n$pdo = new PDO('mysql:host=h;dbname=d');\n"
+                "$pdo->query('SELECT * FROM users');\n?>\n<html><body>hi</body></html>\n"},
+])
+runner.set_charter(_lint_run, VALID_CHARTER, "smoke")
+_lint_gate = next(c for c in store.list_checkpoints(_lint_run)
+                  if c["kind"] == "discovery_approval")
+check("a mismatch is on the gate a human reads before approving any spend",
+      "do not fit what was found" in _lint_gate["detail"]
+      or "does not fit what was found" in _lint_gate["detail"],
+      _lint_gate["detail"][-600:])
+check("and in the payload, so a screen can render it as fields rather than prose",
+      (_lint_gate.get("payload") or {}).get("charter_findings") is not None,
+      str(sorted((_lint_gate.get("payload") or {}).keys())))
+check("the run log records it too",
+      any(e["event"] == "charter_mismatch" for e in store.list_events(_lint_run)),
+      str([e["event"] for e in store.list_events(_lint_run)][:8]))
+check("and it is a warning, never a refusal — the customer may have a reason",
+      all(e["level"] == "warning" for e in store.list_events(_lint_run)
+          if e["event"] == "charter_mismatch"))
+check("the gate is still the ordinary blocking spend gate, not a second one",
+      _lint_gate["blocking"] and len(
+          [c for c in store.list_checkpoints(_lint_run) if c["blocking"]]) == 1,
+      str([c["kind"] for c in store.list_checkpoints(_lint_run)]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
