@@ -9253,6 +9253,190 @@ check("a codebase that does have a database is unaffected",
                                    _WITH_DB)[2]["options"][0]["value"])
 
 
+# ── And the linter must not argue with the answer the form recommended ─────
+#
+# `lint` warns when a data-access decision assumes a database the analysis never saw. The
+# no-database answer above agrees with the evidence rather than contradicting it, so firing on
+# it made the product warn about the suggestion it had just made — which is what the live run
+# printed: "A data-access decision was made, and no data access was found", on a charter whose
+# data-access decision was the words "No database".
+
+_NO_DB_ANSWER = advice.describe(".NET 8 / ASP.NET Core MVC with Razor views",
+                                _NO_DB)[2]["options"][0]["value"]
+check("the recommended no-database answer is not reported as a mismatch",
+      "data_access" not in [f["key"] for f in charter.lint({"data_access": _NO_DB_ANSWER}, {})],
+      str(charter.lint({"data_access": _NO_DB_ANSWER}, {})))
+check("nor the generic stack's wording of the same answer",
+      "data_access" not in [f["key"] for f in charter.lint(
+          {"data_access": advice.describe("Go 1.22", _NO_DB)[2]["options"][0]["value"]}, {})])
+check("an answer that does assume a database the analysis never saw still warns",
+      "data_access" in [f["key"] for f in charter.lint(
+          {"data_access": "EF Core 8 against the existing MySQL database."}, {})])
+# A blank answer is not this rule's business at all: required-field presence is
+# `validate()`'s job, and `lint` is only ever about an answer that disagrees with the
+# evidence. So a charter that says nothing about data access produces no `data_access`
+# finding here, even on a codebase that plainly has a database.
+check("a blank answer is left to validate(), not reported as a mismatch",
+      "data_access" not in [f["key"] for f in charter.lint({}, {"db_apis": ["pdo"]})],
+      str(charter.lint({}, {"db_apis": ["pdo"]})))
+check("the phrase is read from the answer, not inferred from what it omits",
+      not charter._denies_data({"data_access": "Dapper, statements preserved."})
+      and charter._denies_data({"data_access": "No database. Nothing is persisted."}))
+
+
+section("63. Two attributes claiming one path, and the output nobody could read")
+
+# ── The 500 that compiles ──────────────────────────────────────────────────
+#
+# Found by the first live run, and only by starting the application. A converted
+# `HomeController.Index` carried `[Route("index.php")]`, `[Route("")]` **and** `[Route("/")]`.
+# The last two are the same template, so two endpoints matched `GET /`, routing threw
+# `AmbiguousMatchException` before the action ran, and the request 500'd in four milliseconds.
+# `dotnet build` reported zero errors. Every `.php` URL answered 200 — the application's own
+# root was the one URL that did not, which is the one a smoke list is least likely to carry
+# and a browser is most likely to open first.
+
+_HOME = ('using Microsoft.AspNetCore.Mvc;\n'
+         'public class HomeController : Controller {\n'
+         '    [Route("index.php")]\n    [Route("")]\n    [Route("/")]\n'
+         '    public Task<IActionResult> Index() => Task.FromResult<IActionResult>(View());\n}')
+
+_found = reconcile._ambiguous_routes([{"path": "Home/HomeController.cs", "content": _HOME}])
+check("the empty template and the bare slash are recognised as one path",
+      len(_found) == 1, str(_found))
+check("and it is a failure, not a note — the URL is guaranteed to 500",
+      _found and _found[0]["severity"] == "fail", str(_found[:1]))
+check("the finding names the root in words rather than as an empty string",
+      _found and "application root" in _found[0]["detail"], str(_found[:1]))
+check("and names the file, so it is repairable without a search",
+      _found and _found[0].get("path") == "Home/HomeController.cs")
+check("the surviving distinct route is not dragged in",
+      _found and "index.php" not in _found[0]["detail"], str(_found[:1]))
+
+# Routing is case-insensitive and ignores the leading slash, so two templates can differ as
+# text and be one endpoint. Comparing the strings is what made this invisible.
+check("case and a leading slash do not make two paths",
+      len(reconcile._ambiguous_routes(
+          [{"path": "C.cs", "content": '[Route("/Index.PHP")] [Route("index.php")]'}])) == 1)
+
+# ── What it must stay quiet about ──────────────────────────────────────────
+#
+# A route table is full of things that only look like duplicates, and a check that cries wolf
+# on a correct one gets switched off within a week (C-70's lesson).
+for _name, _content in (
+    ("two verbs on one path", '[HttpGet("a")] [HttpPost("a")]'),
+    ("distinct paths", '[Route("a")] [Route("b")]'),
+    ("`[controller]` expands per class", '[Route("[controller]")] [Route("[controller]")]'),
+    ("`[action]` likewise", '[Route("[action]")] [Route("[action]")]'),
+    ("a parameterised template matches a family", '[Route("x/{id}")] [Route("x/{id}")]'),
+    ("an attribute with no template takes the controller's route", '[HttpGet] [HttpPost]'),
+    ("one route on its own", '[Route("a")]'),
+    ("no routes at all", 'public class Plain { }'),
+):
+    check(f"silent — {_name}",
+          not reconcile._ambiguous_routes([{"path": "C.cs", "content": _content}]),
+          str(reconcile._ambiguous_routes([{"path": "C.cs", "content": _content}])))
+
+check("a wildcard [Route] does collide with a verb on the same path",
+      len(reconcile._ambiguous_routes(
+          [{"path": "C.cs", "content": '[Route("a")] [HttpPost("a")]'}])) == 1)
+check("and the same verb twice collides with itself",
+      len(reconcile._ambiguous_routes(
+          [{"path": "C.cs", "content": '[HttpGet("a")] [HttpGet("a")]'}])) == 1)
+check("only C# is read — a template in a .cshtml or a note is not a route table",
+      not reconcile._ambiguous_routes(
+          [{"path": "Views/Index.cshtml", "content": '[Route("")] [Route("/")]'},
+           {"path": "README.md", "content": '[Route("")] [Route("/")]'}]))
+
+# ── The verb the bare attribute is there to constrain ──────────────────────
+#
+# The first version of this check read `[Route("x")]` as claiming every HTTP method, and
+# reported the ordinary shape of a converted PHP page-script that handles its own POST:
+#
+#     [HttpGet]  [Route("add_employee.php")]     -> GET  /add_employee.php
+#     [HttpPost] [Route("add_employee.php")]     -> POST /add_employee.php
+#
+# Two endpoints, one path, no ambiguity — and the live run answered 200 on that URL while the
+# check called it a guaranteed 500. A bare verb attribute declares no path but it *constrains
+# the verb* of the `[Route]` beside it, so "which attributes belong to one action" has to be
+# decided before any of this means anything.
+
+_SPLIT_VERBS = ('[HttpGet]\n[Route("add_employee.php")]\npublic void Add(){}\n'
+                '[HttpPost]\n[Route("add_employee.php")]\npublic void AddPost(){}')
+check("a bare verb constrains the route beside it, so GET and POST on one path are fine",
+      not reconcile._ambiguous_routes([{"path": "E.cs", "content": _SPLIT_VERBS}]),
+      str(reconcile._ambiguous_routes([{"path": "E.cs", "content": _SPLIT_VERBS}])))
+check("two bare verbs above one route still claim only those two methods",
+      not reconcile._ambiguous_routes(
+          [{"path": "E.cs",
+            "content": '[HttpGet]\n[HttpPost]\n[Route("a")]\npublic void A(){}'}]))
+check("but a route with no verb beside it claims all of them, so two of those collide",
+      len(reconcile._ambiguous_routes(
+          [{"path": "E.cs",
+            "content": '[Route("a")]\npublic void A(){}\n[Route("a")]\npublic void B(){}'}])) == 1)
+check("and that finding says 'every HTTP method' rather than listing six of them",
+      "every HTTP method" in reconcile._ambiguous_routes(
+          [{"path": "E.cs",
+            "content": '[Route("a")]\npublic void A(){}\n[Route("a")]\npublic void B(){}'}]
+      )[0]["detail"])
+check("a named verb collision names only that verb",
+      "GET is claimed" in reconcile._ambiguous_routes(
+          [{"path": "E.cs", "content": '[HttpGet("a")]\n[HttpGet("a")]\npublic void A(){}'}]
+      )[0]["detail"])
+
+# `[Route]` and `[Route("")]` are a bare attribute and the application root, and `findall`
+# reports both as the empty string. Telling them apart is the whole check.
+check("an argument-less [Route] declares no path and cannot collide with the root",
+      not reconcile._ambiguous_routes(
+          [{"path": "E.cs", "content": '[Route]\n[Route("/")]\npublic void A(){}'}]),
+      str(reconcile._ambiguous_routes(
+          [{"path": "E.cs", "content": '[Route]\n[Route("/")]\npublic void A(){}'}])))
+
+# Attribute grouping: a comment between attributes does not end an action, a signature does.
+check("a comment between attributes does not split one action in two",
+      len(reconcile._ambiguous_routes(
+          [{"path": "E.cs",
+            "content": '[Route("")]\n// the legacy root\n[Route("/")]\npublic void A(){}'}])) == 1)
+
+# ── Output a check refused, kept so the check can be disbelieved ───────────
+#
+# A Tier-0 rejection persisted its *reasons* — for the retry prompt — and threw the content
+# away. So a component that failed three times left three verdicts and nothing to read them
+# against, and no way to tell a check that caught broken output from a check that was wrong
+# about good output. That is the failure mode the sanity layer exists to prevent everywhere
+# else in this pipeline: a verdict with nothing behind it cannot be disbelieved.
+
+_rej_run = store.create_run("rejected", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rej_run, [{"path": "a.php", "kind": "source_file", "language": "php",
+                               "status": "ready", "source_text": "<?php"}])
+_rej_unit = store.list_units(_rej_run)[0]
+_written = store.record_rejected_artifacts(
+    _rej_unit["id"], _rej_run,
+    [{"path": "Bad.cs", "content": "var x = 'y';"}], "the string delimiters were substituted")
+
+check("the refused file is kept", _written == 1)
+check("but never becomes part of the export",
+      [a["path"] for a in store.list_artifacts(_rej_run)] == [], "it must not be current")
+check("it is readable by anyone who asks for every version",
+      [(a["path"], a["is_current"]) for a in
+       store.list_artifacts(_rej_run, current_only=False)] == [("Bad.cs", 0)])
+check("and it says why it was refused rather than only that it was",
+      "the string delimiters were substituted" in
+      store.list_artifacts(_rej_run, current_only=False)[0]["purpose"])
+check("nothing is written when a rejection produced no files",
+      store.record_rejected_artifacts(_rej_unit["id"], _rej_run, [], "n/a") == 0)
+
+# Keeping it must not disturb what is already current: a later attempt that succeeds is the
+# export, and the refused version sits behind it rather than beside it.
+store.complete_unit(_rej_unit["id"], _rej_run,
+                    [{"path": "Bad.cs", "content": 'var x = "y";'}], [], event_detail="ok")
+check("a later attempt that passes is the one that ships",
+      [a["content"] for a in store.list_artifacts(_rej_run, include_content=True)]
+      == ['var x = "y";'])
+check("with the refused version still there to compare against",
+      len(store.list_artifacts(_rej_run, current_only=False)) == 2)
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

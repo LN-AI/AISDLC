@@ -1006,6 +1006,55 @@ def claim_next_unit(run_id: str, owner: str, lease_seconds: int = LEASE_SECONDS,
     return _decode_unit(row) if row else None
 
 
+def record_rejected_artifacts(
+    unit_id: str,
+    run_id: str,
+    artifacts: List[Dict[str, Any]],
+    reason: str = "",
+) -> int:
+    """Keep output a Tier-0 check refused, as a **non-current** version. -> rows written.
+
+    A rejection used to persist only its `validation_issues` — the reasons, for the retry
+    prompt — and throw the content itself away. So a component that failed three times left
+    three reasons and nothing to read them against, and there was no way to tell a check that
+    caught real broken output from a check that was wrong about good output. Everywhere else
+    in this pipeline that is the failure mode the sanity layer exists to prevent: a verdict
+    with nothing behind it cannot be disbelieved.
+
+    Written with `is_current = 0` and without touching any other row's flag, so this is
+    invisible to the export, to reconciliation and to `symbol_names` — everything reads
+    `is_current = 1`. It is evidence for a human, not a candidate for shipping. No symbols
+    are registered either: a type declared by a file that was refused does not exist.
+    """
+    if not artifacts:
+        return 0
+    now = _now()
+    conn = get_connection()
+    cursor = conn.cursor()
+    written = 0
+    try:
+        for artifact in artifacts:
+            path = artifact.get("path") or ""
+            prev = cursor.execute(
+                "SELECT MAX(version) AS v FROM modernization_artifacts "
+                "WHERE run_id = ? AND path = ?", (run_id, path),
+            ).fetchone()
+            cursor.execute(
+                "INSERT INTO modernization_artifacts "
+                "(id, run_id, unit_id, path, version, content, purpose, validation_json, "
+                " is_current, created_at) VALUES (?,?,?,?,?,?,?,?,0,?)",
+                (str(uuid.uuid4()), run_id, unit_id, path, (prev["v"] or 0) + 1,
+                 artifact.get("content", ""),
+                 ("REJECTED: " + reason)[:400] if reason else "REJECTED",
+                 json.dumps(artifact.get("validation")) if artifact.get("validation") else None,
+                 now),
+            )
+            written += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return written
+
 def complete_unit(
     unit_id: str,
     run_id: str,

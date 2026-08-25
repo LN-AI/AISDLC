@@ -2647,6 +2647,12 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         store.set_unit_meta(unit["id"], {
             "validation_issues": [i for i in report["issues"] if i["severity"] == "fail"],
         })
+        # And the output those issues are about. Persisting only the reasons left a
+        # component that failed three times with three verdicts and nothing to read them
+        # against — no way to tell a check that caught broken output from a check that was
+        # wrong about good output. Written non-current, so it reaches a human and nothing
+        # else: the export, reconciliation and the symbol registry all read `is_current`.
+        store.record_rejected_artifacts(unit["id"], run_id, safe_artifacts, detail)
         # A structurally broken file is worth one more attempt — a truncated generation
         # often succeeds second time. A reintroduced secret is not: it is a behaviour, not
         # a transient, and committing it anywhere is the failure `autofix_pr` refuses too.

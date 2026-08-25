@@ -289,6 +289,19 @@ def _has_data(signals: Dict[str, Any]) -> bool:
     return bool(signals.get("db_apis") or signals.get("datastores") or signals.get("tables"))
 
 
+def _denies_data(charter: Dict[str, Any]) -> bool:
+    """Does the data-access answer say there is no database, rather than how to reach one?
+
+    Matched on the phrases the recommended answers actually use, and deliberately not on the
+    mere absence of "EF Core" — a customer who wrote their own answer said something, and
+    reading silence into it is how a linter starts disagreeing with correct charters.
+    """
+    stated = _stated(charter, "data_access").lower()
+    return any(phrase in stated for phrase in
+               ("no database", "no data store", "no datastore", "not introduce one",
+                "does not reach one", "no persistence"))
+
+
 def lint(charter: Dict[str, Any], signals: Dict[str, Any]) -> List[Dict[str, str]]:
     """-> [{key, title, detail}]. Deterministic, free, and never raises on odd input.
 
@@ -325,15 +338,21 @@ def lint(charter: Dict[str, Any], signals: Dict[str, Any]) -> List[Dict[str, str
                 "it will be, one call at a time."),
         })
 
-    if _stated(charter, "data_access") and not data:
+    # The point of the rule is a decision that *assumes* a data layer the analysis never saw.
+    # An answer that says there is no database agrees with the evidence — it is the correct
+    # answer for a codebase that keeps its state in a session, and it is the one the form now
+    # recommends there (D-158). Firing on it made the linter contradict the suggestion the same
+    # product had just made, on the run that found this.
+    if _stated(charter, "data_access") and not data and not _denies_data(charter):
         findings.append({
             "key": "data_access",
             "title": "A data-access decision was made, and no data access was found",
             "detail": (
-                "Nothing in this codebase parsed as a database call, a table or a datastore. "
-                "Either this decision binds nothing, or the analysis could not see the data "
-                "layer — and the second is worth checking before converting, because every "
-                "file that reaches the database would then be converted with no guidance."),
+                "Nothing in this codebase parsed as a database call, a table or a datastore, "
+                "and this answer describes reaching one anyway. Either the decision binds "
+                "nothing, or the analysis could not see the data layer — and the second is "
+                "worth checking before converting, because every file that reaches the "
+                "database would then be converted with no guidance."),
         })
 
     routes = int(signals.get("routes") or 0)

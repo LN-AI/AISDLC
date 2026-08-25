@@ -216,6 +216,129 @@ def _project_reference_cycles(artifacts: List[Dict[str, Any]]) -> List[Dict[str,
     return issues
 
 
+
+# One attribute occurrence: the name, and its literal template if it declared one.
+# `[HttpGet]` with no template is matched too — it declares no path but it *constrains the
+# verb* of a `[Route]` beside it, which is the whole difficulty of this check.
+_ROUTE_ATTR = re.compile(
+    r'\[\s*(Route|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch|HttpHead)\s*'
+    r'(?:\(\s*"([^"]*)"[^)]*\))?\s*[\],]')
+
+# A line consisting only of attributes. The attributes for one action are the contiguous run
+# of these immediately above its signature, which is what makes "the same action" decidable
+# without parsing C#.
+_ATTR_LINE = re.compile(r'^\s*(?:\[[^\]]*\]\s*)+$')
+
+_ROUTE_VERBS = {"HttpGet": "GET", "HttpPost": "POST", "HttpPut": "PUT",
+                "HttpDelete": "DELETE", "HttpPatch": "PATCH", "HttpHead": "HEAD"}
+
+_ALL_VERBS = frozenset(_ROUTE_VERBS.values())
+
+
+def _route_key(template: str) -> str:
+    """The path two templates share, or "" for the application root.
+
+    ASP.NET Core matches case-insensitively and ignores a leading slash, so `""`, `"/"` and
+    `"/Index.PHP"` beside `"index.php"` are one endpoint to the router though they are four
+    different strings in the source. Comparing the strings is what made this invisible.
+    """
+    return template.strip().strip("/").lower()
+
+
+def _attribute_groups(content: str) -> List[List[str]]:
+    """Attribute lines gathered per action — the contiguous run above each signature."""
+    groups: List[List[str]] = []
+    current: List[str] = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if _ATTR_LINE.match(line):
+            current.append(line)
+        elif stripped and not stripped.startswith("//"):
+            # A signature, a brace, a statement: whatever ran above it belongs to it.
+            if current:
+                groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _endpoints(group: List[str]) -> List[Any]:
+    """-> [(path_key, frozenset(verbs))] for one action's attributes.
+
+    Two shapes carry a path, and they resolve their verb differently:
+
+      * `[HttpPost("x")]` names both at once;
+      * `[Route("x")]` names only the path. Its verbs are whatever bare verb attributes sit
+        beside it — `[HttpGet]` above a `[Route]` is a GET-only endpoint — and *every* verb
+        when there are none. Reading `[Route]` as always-every-verb is the bug that reported
+        `[HttpGet] [Route("add.php")]` and `[HttpPost] [Route("add.php")]` as a collision.
+        That is the ordinary way a converted PHP page-script which handles its own POST comes
+        out, and it answers 200.
+    """
+    # `finditer`, not `findall`: a non-participating group and an empty one are both "" to
+    # `findall`, and `[Route]` versus `[Route("")]` is precisely the distinction here — the
+    # first declares no path, the second declares the application root.
+    found = [(m.group(1), m.group(2)) for m in _ROUTE_ATTR.finditer("\n".join(group))]
+    bare = frozenset(_ROUTE_VERBS[name] for name, template in found
+                     if name != "Route" and template is None)
+    default = bare or _ALL_VERBS
+    endpoints = []
+    for name, template in found:
+        if template is None or any(token in template for token in ("[", "{")):
+            # No path of its own, or a template that expands per class (`[controller]`) or
+            # matches a family (`{id}`) — neither is comparable as text.
+            continue
+        verbs = default if name == "Route" else frozenset({_ROUTE_VERBS[name]})
+        endpoints.append((_route_key(template), verbs))
+    return endpoints
+
+
+def _ambiguous_routes(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Two endpoints claiming one path and one verb — a guaranteed 500 that compiles.
+
+    Found by the first live run, and only by starting the application. A converted
+    `HomeController.Index` carried `[Route("index.php")]`, `[Route("")]` **and** `[Route("/")]`.
+    The last two are the same template, so two endpoints matched `GET /`, routing threw
+    `AmbiguousMatchException` before the action ran, and the request failed in four
+    milliseconds. `dotnet build` reported zero errors. Every `.php` URL answered 200 and the
+    application's own root did not — the URL a smoke list is least likely to carry and a
+    browser is most likely to open first.
+
+    Comparison is per file. Two controllers in different files claiming one path is also
+    ambiguous, but it is not decidable from a regex without resolving the controller-level
+    route each one inherits, and a check that guesses gets switched off within a week (C-70).
+    """
+    issues: List[Dict[str, Any]] = []
+    for artifact in artifacts:
+        path = artifact.get("path") or ""
+        if not path.lower().endswith(".cs"):
+            continue
+        by_path: Dict[str, List[Any]] = defaultdict(list)
+        for group in _attribute_groups(artifact.get("content") or ""):
+            for key, verbs in _endpoints(group):
+                by_path[key].append(verbs)
+        for key, verb_sets in sorted(by_path.items()):
+            clash = sorted({verb
+                            for i, first in enumerate(verb_sets)
+                            for second in verb_sets[i + 1:]
+                            for verb in (first & second)})
+            if not clash:
+                continue
+            method = ("every HTTP method is" if set(clash) == _ALL_VERBS
+                      else f"{', '.join(clash)} is")
+            issues.append(_issue(
+                "ambiguous_route", "fail",
+                f"{path} declares "
+                f"{('/' + key) if key else '/ (the application root)'} "
+                f"{len(verb_sets)} times, and {method} claimed by more than one of them. "
+                f"Routing treats these as one template, so several endpoints match and the "
+                f"request fails with AmbiguousMatchException — a 500 on that URL, in a file "
+                f"that compiles.",
+                path=path))
+    return issues
+
+
 def run(run_id: str) -> Dict[str, Any]:
     """-> {issues, counts, checked}. Deterministic; no model call, no execution."""
     artifacts = store.list_artifacts(run_id, current_only=True, include_content=True)
@@ -425,6 +548,8 @@ def run(run_id: str) -> Dict[str, Any]:
     for issue in _double_encoded_views(artifacts):
         issues.append(issue)
     for issue in _project_reference_cycles(artifacts):
+        issues.append(issue)
+    for issue in _ambiguous_routes(artifacts):
         issues.append(issue)
 
     counts = store.unit_status_counts(run_id)
