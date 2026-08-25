@@ -9575,6 +9575,69 @@ check("ordering is total, so two runs over one gate choose the same repair",
       == [r["id"] for r in _driver.feasible_repairs(
           {"payload": {"repairs": list(reversed(_GATE["payload"]["repairs"]))}})])
 
+# ── Findings that say it cannot work, acknowledged without being read ──────
+#
+# `reconcile` is advisory by design: repairing what it finds would mean a second conversion
+# pass nobody approved, so it raises a **non-blocking** checkpoint. The driver acknowledged
+# non-blocking checkpoints without reading them, which is right for a note and wrong for a
+# verdict. On the 45-file run seven `fail` findings went past unread — six services taken as
+# constructor parameters and never registered, and one type reached by name that nothing
+# declares — and every one of them was a guaranteed crash. The run built, and the application
+# would not start.
+
+_REPORT = {"payload": {"issues": [
+    {"kind": "unregistered_dependency", "severity": "fail",
+     "detail": "`IUserRepository` is taken as a constructor parameter and never registered."},
+    {"kind": "manual_followup", "severity": "warn", "detail": "someone should look at this"},
+    {"kind": "reflected_type_missing", "severity": "fail",
+     "detail": "names `Ems.Infrastructure.ServiceCollectionExtensions` as a string"},
+]}}
+
+check("a finding that says the code cannot work is picked out",
+      [i["kind"] for i in _driver.will_not_work(_REPORT)]
+      == ["unregistered_dependency", "reflected_type_missing"],
+      str([i["kind"] for i in _driver.will_not_work(_REPORT)]))
+check("a warning is not — there were 103 of those on the same report",
+      all(i["severity"] == "fail" for i in _driver.will_not_work(_REPORT)))
+check("a clean report stops nothing",
+      _driver.will_not_work({"payload": {"issues": [{"severity": "warn"}]}}) == [])
+check("and a checkpoint with no report at all does not raise",
+      _driver.will_not_work({}) == [] and _driver.will_not_work({"payload": {}}) == [])
+check("carrying on anyway is possible, but has to be asked for",
+      "--ignore-fatal" in io.open(
+          os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "scripts", "drive_modernization.py"), encoding="utf-8").read())
+
+# The two `fail` kinds this stops on are the two the 45-file run actually produced, and both
+# are checks this repo owns — so a rename would silently empty this guard.
+# Both kinds are checks this repo owns, and the guard above matches on the strings. A rename
+# would empty it silently, so the strings are asserted where they are actually produced:
+# `unregistered_dependency` comes from `wireup`, which `reconcile` calls.
+check("the reconciliation report can still produce both of those kinds",
+      "unregistered_dependency" in io.open(
+          os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "backend", "services", "modernization", "wireup.py"),
+          encoding="utf-8").read()
+      and "reflected_type_missing" in io.open(
+          os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "backend", "services", "modernization", "reconcile.py"),
+          encoding="utf-8").read())
+
+# ── How many rounds the build loop gets ────────────────────────────────────
+#
+# Raised from five on the first real measurement. A 45-file conversion went 3, 3, 7, 22, 2, 1
+# errors and hit the cap one error short of a clean build — and the sequence is not monotonic,
+# so a cap tuned to "errors fall every round" cuts off loops that were about to succeed.
+check("the build loop gets more than the five rounds that proved too few",
+      build_results.MAX_BUILD_ROUNDS >= 8, str(build_results.MAX_BUILD_ROUNDS))
+check("an unused round still costs nothing, because two identical rounds stop it anyway",
+      "_fingerprint" in io.open(
+          os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "backend", "services", "modernization", "build_results.py"),
+          encoding="utf-8").read())
+check("and per-unit attempts are unchanged — this raises the run's rounds, not a unit's tries",
+      build_results.MAX_REWORK_ATTEMPTS == 3)
+
 # `plan_approval` is still a spend gate. A layout with nothing wrong with it offers no repairs,
 # and an unattended run must sail through it exactly as before — the change is about the case
 # where the product has something to say, not about making every run need a human.

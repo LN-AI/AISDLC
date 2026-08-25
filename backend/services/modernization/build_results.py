@@ -40,9 +40,16 @@ logger = logging.getLogger(__name__)
 # Per unit, per run. Passed to `store.reopen_units`, which is where it is enforced.
 MAX_REWORK_ATTEMPTS = 3
 
-# Per run. Five rounds of "build, fix, build again" is already generous for a loop that is
-# converging; past that the evidence is that it is not.
-MAX_BUILD_ROUNDS = 5
+# Per run. Raised from five on the first real measurement: a 45-file conversion went
+# 3, 3, 7, 22, 2, 1 errors across six rounds and hit the cap **one error short** of a clean
+# build. Two things in that sequence matter more than its length. It is not monotonic — the
+# spike to 22 was one reconversion introducing one wrong namespace in twenty-two places, and
+# the round after it dropped to 2 — so a cap tuned to "errors should fall every round" cuts
+# off loops that were about to succeed. And the cost of an unused round is nothing: the loop
+# stops the moment a build is clean, and `_fingerprint` still halts it as soon as two rounds
+# report the identical errors, which is the real non-convergence signal. Five was a guess
+# made before any codebase had been through this; eight is a guess informed by one.
+MAX_BUILD_ROUNDS = 8
 
 # The contract, in one place. A producer sends exactly these keys — no aliases are accepted,
 # because "one schema" stops being true the moment `path` and `file` both work here and only

@@ -609,8 +609,8 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true",
                         help="Build, report, resume, build again until it compiles or the "
                              "platform says another build cannot help.")
-    parser.add_argument("--max-rounds", type=int, default=5,
-                        help="Rounds the loop may use (default 5, matching MAX_BUILD_ROUNDS).")
+    parser.add_argument("--max-rounds", type=int, default=8,
+                        help="Rounds the loop may use (default 8, matching MAX_BUILD_ROUNDS).")
     parser.add_argument("--hours", type=float, default=3.0,
                         help="Give up after this many hours (default 3).")
     parser.add_argument("--serve", action="store_true",

@@ -33,6 +33,25 @@ import urllib.request
 SPEND_GATES = {"discovery_approval", "plan_approval"}
 
 
+def will_not_work(point):
+    """Consistency findings that say the converted code cannot work, or [].
+
+    `reconcile` is deliberately advisory — repairing what it finds would mean a second
+    conversion pass nobody approved — so it raises a **non-blocking** checkpoint, and this
+    driver acknowledged non-blocking checkpoints without reading them. On the first 45-file
+    run that sent seven findings past unread, and each of the seven was a guaranteed crash:
+    six services taken as constructor parameters and never registered, and one type reached by
+    name that nothing declares. The run then built and the application would not start.
+
+    Advisory is right for the *product*: a human decides whether to spend money repairing.
+    Unread is wrong for a *driver*, which is standing in for that human. `fail` is the report's
+    own word for "this will not work", so it is the line to stop at — `warn` is left alone,
+    and there were 103 of those on the same run.
+    """
+    issues = (point.get("payload") or {}).get("issues") or []
+    return [i for i in issues if i.get("severity") == "fail"]
+
+
 def feasible_repairs(point):
     """The layout repairs a plan gate is offering, best first, or [].
 
@@ -149,6 +168,10 @@ def main():
     parser.add_argument("--cap", type=float, default=None, help="budget_cap_usd.")
     parser.add_argument("--log", default="", help="Append the transcript to this file too.")
     parser.add_argument("--hours", type=float, default=3.0, help="Give up after this long.")
+    parser.add_argument("--ignore-fatal", action="store_true",
+                        help="Carry on past consistency findings that say the converted code "
+                             "cannot work. Off by default: they are the difference between a "
+                             "build that succeeds and an application that starts.")
     parser.add_argument("--repair", default="stop",
                         help="What to do when the plan gate offers layout repairs: 'stop' "
                              "(default — print them and let a human choose), 'best' (take the "
@@ -259,6 +282,16 @@ def main():
                 client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",
                             "POST", {"decision": "approve",
                                      "answer": {"repair": chosen} if chosen else {}})
+            elif kind == "reconciliation" and will_not_work(point) and not args.ignore_fatal:
+                fatal = will_not_work(point)
+                say(f"  !! {len(fatal)} finding(s) say the converted code cannot work", log)
+                for issue in fatal[:12]:
+                    say(f"     [{issue.get('kind')}] {(issue.get('detail') or '')[:200]}", log)
+                if len(fatal) > 12:
+                    say(f"     … and {len(fatal) - 12} more", log)
+                say("  stopping — building this will produce something that does not run. "
+                    "Re-run with --ignore-fatal to carry on anyway", log)
+                return 2
             elif not point.get("blocking"):
                 say(f"  noting {kind}: {point.get('title')}", log)
                 client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",
