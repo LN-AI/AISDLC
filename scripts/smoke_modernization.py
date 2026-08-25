@@ -9182,6 +9182,77 @@ check("the charter linter asks for an auth model on the evidence, not just the P
       str(charter.lint({}, {"evidence_counts": {"auth": 3}})))
 
 
+section("62. A required question the form gives no way to answer")
+
+# ── Found by the first live run, in its first 30 seconds ───────────────────
+#
+# An app that keeps its data in `$_SESSION` has no database, so `_data_access` returned no
+# options — and `charter.validate()` requires `data_access` unconditionally and always will
+# (its required list is static on purpose: this is a public API, and required-ness that moved
+# with the evidence would turn a caller's working POST into a 400 for a reason they never
+# asked about). The form therefore asked a required question with nothing on offer, and every
+# scripted path — `drive_modernization.py`, any integration — was refused at the charter with
+# `missing: ["data_access"]` and no way forward.
+#
+# `advice.describe` already carries half this fix: `required` is read from the static list
+# rather than `required_for(observed)`, so the field at least renders as required. This is the
+# other half, stated as the invariant rather than as a fix for one field.
+
+_NO_DB = {"file_count": 7, "dominant_language": "php", "sessions": True,
+          "languages": ["php"], "entrypoints": ["index.php"], "config_keys": ["db_host"]}
+_WITH_DB = {"file_count": 20, "dominant_language": "php", "db_apis": ["pdo"],
+            "tables": ["employees"], "datastores": ["mysql"]}
+
+for _label, _observed in (("a codebase with no database", _NO_DB),
+                          ("a codebase with one", _WITH_DB),
+                          ("a codebase we know nothing about", {}),
+                          ("a stack with no specific advisor", {"file_count": 4})):
+    # Not the empty stack: a run cannot exist without one (both create routes declare it
+    # required), so `_target_stack` returning nothing for it is deliberate and documented
+    # rather than the same gap. Asserted directly below instead of smuggled in here.
+    for _stack in (".NET 8 / ASP.NET Core MVC with Razor views", "Go 1.22", "Python 3.12 / FastAPI"):
+        _fields = advice.describe(_stack, _observed)
+        _unanswerable = [f["key"] for f in _fields if f["required"] and not f["options"]]
+        check(f"every required field can be answered from the form — {_label}, {_stack or 'no stack'}",
+              not _unanswerable, str(_unanswerable))
+
+check("the target stack is the one field answered before the form is ever shown",
+      not advice.describe("", _NO_DB)[0]["options"]
+      and advice.describe("x", _NO_DB)[0]["options"],
+      "an empty stack is unreachable: a run is created with one")
+
+# And the invariant that makes the one above worth having: accepting the first suggestion for
+# every field is a charter `validate()` accepts. This is exactly what the driver does, and it
+# is the difference between "the defaults are sensible" and "the defaults are a valid answer".
+for _label, _observed in (("no database", _NO_DB), ("a database", _WITH_DB)):
+    _charter = {f["key"]: f["options"][0]["value"]
+                for f in advice.describe(".NET 8 / ASP.NET Core MVC with Razor views", _observed)
+                if f.get("options")}
+    try:
+        charter.validate(_charter)
+        _ok, _why = True, ""
+    except Exception as exc:                                          # noqa: BLE001
+        _ok, _why = False, str(exc)
+    check(f"taking every first suggestion produces a charter that validates — {_label}",
+          _ok, _why)
+
+# The no-database answer has to say so out loud rather than being blank. The charter is
+# concatenated into every conversion call in the run, and a converter handed `$_SESSION['x']`
+# with nothing stated about persistence is free to decide a DbContext was always implied.
+_answer = advice.describe(".NET 8 / ASP.NET Core MVC with Razor views",
+                          _NO_DB)[2]["options"][0]["value"].lower()
+check("the recommended answer names the absence rather than leaving it to be inferred",
+      "no database" in _answer, _answer[:120])
+check("and forbids inventing one rather than only omitting it",
+      "manual_followup" in _answer or "not introduce" in _answer, _answer[:200])
+check("while still offering the other choice, because adding a store is a real decision",
+      len(advice.describe(".NET 8 / ASP.NET Core MVC with Razor views",
+                          _NO_DB)[2]["options"]) == 2)
+check("a codebase that does have a database is unaffected",
+      "EF Core" in advice.describe(".NET 8 / ASP.NET Core MVC with Razor views",
+                                   _WITH_DB)[2]["options"][0]["value"])
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

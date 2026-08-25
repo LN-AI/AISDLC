@@ -82,7 +82,32 @@ def _project_layout(observed: Dict[str, Any]) -> List[Option]:
 
 def _data_access(observed: Dict[str, Any]) -> List[Option]:
     if not (observed.get("tables") or observed.get("datastores") or observed.get("db_apis")):
-        return []
+        # Not `[]`. `data_access` is required by `charter.validate()` unconditionally, so an
+        # empty list is a required question with no answer on offer — the save is then
+        # refused for a field the form gave no way to fill. See `php_dotnet._no_database`.
+        return [
+            Option(
+                value=("No database. This codebase does not reach one, and the conversion "
+                       "does not introduce one: state the source keeps in memory or in a "
+                       "session stays in the target's equivalent, with the same lifetime. "
+                       "A file that appears to need persistence is raised for a human "
+                       "rather than given a data store."),
+                label="No database",
+                why=(f"No database API, table name or datastore was found in the "
+                     f"{observed.get('file_count') or 0} file(s) analysed. Introducing one "
+                     f"would be a behaviour change rather than a conversion."),
+                recommended=True,
+            ),
+            Option(
+                value=("Introduce a database in the target, modelled on the shapes the "
+                       "source holds in memory, reached through one mapping layer used by "
+                       "every module."),
+                label="Introduce a database",
+                why="Only if replacing the source's in-memory state is a decision already "
+                    "taken — data would then survive a restart and be shared between "
+                    "users, and the source's state is neither.",
+            ),
+        ]
     why = _cite(observed, "datastores", "tables")
     return [
         Option(

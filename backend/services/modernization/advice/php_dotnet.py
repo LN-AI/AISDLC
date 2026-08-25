@@ -135,9 +135,52 @@ def _project_layout(observed: Dict[str, Any]) -> List[Option]:
     return [feature, layered] if small else [layered, feature]
 
 
+def _no_database(observed: Dict[str, Any]) -> List[Option]:
+    """What `data_access` means for a codebase that never reaches a database.
+
+    `data_access` is required by `charter.validate()` and always will be — that list is
+    static on purpose (see its docstring). So returning `[]` here left the form asking a
+    required question with no answer on offer, and the save was refused with "…before any
+    file is converted: Data access". This is the second half of the bug fixed in
+    `describe()`: a form may ask for more than is enforced, but it must never ask a
+    question it gives no way to answer.
+
+    Saying "there is no database" out loud is also worth more than it looks. The charter
+    goes into every conversion call, and a converter handed `$_SESSION['employees']` with
+    nothing stated about persistence is free to decide a DbContext was always implied.
+    """
+    where = ("session state" if observed.get("sessions") else "process memory")
+    return [
+        Option(
+            value=("No database. This codebase does not reach one, and the conversion does "
+                   "not introduce one: state the source keeps in the session or in memory "
+                   "becomes the ASP.NET Core equivalent — session state, or a service "
+                   "registered with the same lifetime — and nothing is persisted that the "
+                   "source did not persist. A file that appears to need a database is a "
+                   "`manual_followup`, not a licence to add one."),
+            label="No database — keep the source's in-memory state",
+            why=(f"No database API, table name or datastore was found anywhere in the "
+                 f"{observed.get('file_count') or 0} file(s) analysed; the application "
+                 f"holds its data in {where}. Converting that into a real database is a "
+                 f"behaviour change, so it is a decision rather than a default."),
+            recommended=True,
+        ),
+        Option(
+            value=("EF Core 8 with Microsoft.EntityFrameworkCore.Sqlite, replacing the "
+                   "source's in-memory state with a real database. Entities modelled on "
+                   "the shapes the source holds in memory, table and property names taken "
+                   "from the source's array keys."),
+            label="Introduce a database (EF Core 8 + SQLite)",
+            why="Only if replacing the in-memory state is a decision already taken. It is "
+                "a behaviour change rather than a conversion: data would then survive a "
+                "restart and be shared between users, and the source's state is neither.",
+        ),
+    ]
+
+
 def _data_access(observed: Dict[str, Any]) -> List[Option]:
     if not _has_data(observed):
-        return []
+        return _no_database(observed)
     engine, package = _engine(observed)
     why = _db_why(observed)
     return [
