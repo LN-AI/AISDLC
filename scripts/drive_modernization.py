@@ -33,6 +33,25 @@ import urllib.request
 SPEND_GATES = {"discovery_approval", "plan_approval"}
 
 
+def feasible_repairs(point):
+    """The layout repairs a plan gate is offering, best first, or [].
+
+    `plan_approval` stopped being only a price quote when it started carrying
+    `layering.repair_options`: deterministic ways to make an unbuildable layout buildable,
+    each with what it measurably closes and opens, applied only if someone picks one. This
+    driver approved every spend gate with an empty answer, which selects "none" — so an
+    unattended run converted into a layout the product had already told it would not build,
+    and then spent the attempt budget discovering that one component at a time.
+
+    Ordered by what closes most and opens least, so `--repair best` means something defensible
+    rather than "the first one".
+    """
+    repairs = [r for r in ((point.get("payload") or {}).get("repairs") or [])
+               if r.get("feasible") and r.get("id")]
+    return sorted(repairs, key=lambda r: (-len(r.get("closes") or []),
+                                          len(r.get("opens") or []), r["id"]))
+
+
 class Client:
     """Talks to the platform as whatever credential it was given.
 
@@ -130,6 +149,11 @@ def main():
     parser.add_argument("--cap", type=float, default=None, help="budget_cap_usd.")
     parser.add_argument("--log", default="", help="Append the transcript to this file too.")
     parser.add_argument("--hours", type=float, default=3.0, help="Give up after this long.")
+    parser.add_argument("--repair", default="stop",
+                        help="What to do when the plan gate offers layout repairs: 'stop' "
+                             "(default — print them and let a human choose), 'best' (take the "
+                             "one that closes most and opens least), 'none' (convert into the "
+                             "layout as designed), or a specific option id.")
     args = parser.parse_args()
     if not args.zip and not args.run:
         parser.error("one of --zip or --run is required")
@@ -203,6 +227,20 @@ def main():
         open_points = client.call(f"{base}/checkpoints?status=open")[1].get("checkpoints") or []
         for point in open_points:
             kind = point.get("kind")
+            repairs = feasible_repairs(point) if kind == "plan_approval" else []
+            if repairs and args.repair == "stop":
+                # The driver's own rule, applied to what this gate has become: it stops on a
+                # decision the product deliberately handed to a human. A layout repair is
+                # exactly that — the architect may be right and the repair may be the wrong
+                # trade — so it is not auto-picked by default. `--repair best` opts in.
+                say(f"  !! PLAN GATE offers {len(repairs)} layout repair(s), and none is "
+                    f"chosen by default", log)
+                for repair in repairs:
+                    say(f"     {repair['id']}: {repair.get('title')} — closes "
+                        f"{len(repair.get('closes') or [])}, opens "
+                        f"{len(repair.get('opens') or [])}", log)
+                say("  re-run with --repair best, --repair none, or --repair <id>", log)
+                return 2
             if kind in SPEND_GATES:
                 # `discovery_approval` carries its numbers under `estimate` and
                 # `plan_approval` under `totals`. Reading only the first printed
@@ -211,8 +249,16 @@ def main():
                 quote = _payload.get("estimate") or _payload.get("totals") or {}
                 say(f"  GATE {kind}: {point.get('title')} — expected "
                     f"${quote.get('expected_usd')}, ceiling ${quote.get('ceiling_usd')}", log)
+                chosen = ""
+                if repairs and args.repair == "best":
+                    chosen = repairs[0]["id"]
+                elif repairs and args.repair not in ("none", "stop"):
+                    chosen = args.repair
+                if chosen:
+                    say(f"  applying layout repair {chosen}", log)
                 client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",
-                            "POST", {"decision": "approve", "answer": {}})
+                            "POST", {"decision": "approve",
+                                     "answer": {"repair": chosen} if chosen else {}})
             elif not point.get("blocking"):
                 say(f"  noting {kind}: {point.get('title')}", log)
                 client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",

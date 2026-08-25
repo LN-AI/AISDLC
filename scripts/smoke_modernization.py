@@ -9528,6 +9528,75 @@ for _project in _EMS:
 
 
 
+section("65. A repair the product computed and the automation declined")
+
+# ── The gate that stopped being only a price ───────────────────────────────
+#
+# `plan_approval` computes `layering.repair_options` when the chosen layout has dependency
+# directions MSBuild would refuse: deterministic ways to make it buildable, each with what it
+# measurably closes and opens, applied only if someone picks one. Deliberately not a bare
+# block (the architect may be right) and deliberately not a silent auto-fix (D-90, D-98).
+#
+# `drive_modernization.py` answered every spend gate with an empty answer, which selects
+# "none". Its exemption list was written when that gate only quoted a price, and it kept
+# applying after the gate started carrying architecture. So the unattended run converted into
+# a layout the product had already told it would not build, and then spent the attempt budget
+# rediscovering that one component at a time — on the 45-file live run, six feasible repairs
+# were offered and every one was declined without being read.
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+import drive_modernization as _driver  # noqa: E402
+
+_GATE = {"payload": {"repairs": [
+    {"id": "merge", "title": "Merge A into B", "feasible": True,
+     "closes": ["x"], "opens": ["y"]},
+    {"id": "seam", "title": "Declare an interface", "feasible": True,
+     "closes": ["x", "z"], "opens": []},
+    {"id": "cycle", "title": "Let A reference B", "feasible": False,
+     "closes": [], "opens": []},
+    {"id": "allow", "title": "Allow the reference", "feasible": True,
+     "closes": ["x"], "opens": []},
+]}}
+
+check("repairs are ordered by what they close, then by what they open",
+      [r["id"] for r in _driver.feasible_repairs(_GATE)] == ["seam", "allow", "merge"],
+      str([r["id"] for r in _driver.feasible_repairs(_GATE)]))
+check("one the product marked impossible is never offered as a choice",
+      "cycle" not in [r["id"] for r in _driver.feasible_repairs(_GATE)])
+check("a gate with no repairs offers none, rather than raising",
+      _driver.feasible_repairs({"payload": {}}) == []
+      and _driver.feasible_repairs({}) == [])
+check("a repair with no id cannot be picked, because nothing could be sent for it",
+      _driver.feasible_repairs(
+          {"payload": {"repairs": [{"title": "nameless", "feasible": True}]}}) == [])
+check("ordering is total, so two runs over one gate choose the same repair",
+      [r["id"] for r in _driver.feasible_repairs(_GATE)]
+      == [r["id"] for r in _driver.feasible_repairs(
+          {"payload": {"repairs": list(reversed(_GATE["payload"]["repairs"]))}})])
+
+# `plan_approval` is still a spend gate. A layout with nothing wrong with it offers no repairs,
+# and an unattended run must sail through it exactly as before — the change is about the case
+# where the product has something to say, not about making every run need a human.
+check("a buildable layout still approves without a human",
+      not _driver.feasible_repairs({"payload": {"totals": {"expected_usd": 1.0}}}))
+
+# The answer key is `repair`. `runner` reads `answer["repair"]` and logs `plan_repair_missing`
+# for anything it cannot find among that gate's own options, so a driver sending the right id
+# under the wrong key would be silently ignored — the failure this section exists to prevent
+# is precisely one nobody notices.
+check("the runner reads the key the driver writes",
+      'answer") or {}).get("repair")' in io.open(
+          os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "backend", "services", "modernization", "runner.py"),
+          encoding="utf-8").read())
+check("and the driver writes the key the runner reads",
+      '{"repair": chosen}' in io.open(
+          os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "scripts", "drive_modernization.py"), encoding="utf-8").read())
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
