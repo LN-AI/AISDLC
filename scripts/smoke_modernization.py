@@ -9437,6 +9437,97 @@ check("with the refused version still there to compare against",
       len(store.list_artifacts(_rej_run, current_only=False)) == 2)
 
 
+section("64. A shim every layer must call, in a project three of them may not reach")
+
+# ── Three deterministic subsystems, mutually exclusive ─────────────────────
+#
+# Found by the first multi-project live run, at the cost of $2.67 and a blocked conversion.
+# The PHP semantics shim is scaffolded once and the playbook then instructs *every converted
+# file* to call it rather than re-derive PHP's `==`. It went wherever `proposed[0]` pointed —
+# the project the architect happened to list first — which on a single-project layout is
+# trivially right and is why nothing caught it for so long.
+#
+# On a four-project clean-architecture layout it landed in `Acme.Ems.Web`, and then:
+#
+#   * `semantics.check` failed a repository for using `int.Parse` instead of `PhpCompat.IntVal`
+#     — correctly: PHP's `(int)"abc"` is 0 and C#'s `int.Parse("abc")` throws;
+#   * `usings.repair` added `using Acme.Ems.Web.Compat` to eight Infrastructure files —
+#     correctly, that is where the symbol lives;
+#   * `layering.check` refused the result because Infrastructure may not reference Web —
+#     correctly, MSBuild rejects the mutual reference outright.
+#
+# Every step was right and the conversion was impossible. No retry could have helped, because
+# obeying the playbook and obeying the architecture had become mutually exclusive.
+
+_EMS = [
+    {"name": "Acme.Ems.Web", "depends_on": ["Acme.Ems.Infrastructure", "Acme.Ems.Application"]},
+    {"name": "Acme.Ems.Infrastructure", "depends_on": ["Acme.Ems.Application", "Acme.Ems.Domain"]},
+    {"name": "Acme.Ems.Application", "depends_on": ["Acme.Ems.Domain"]},
+    {"name": "Acme.Ems.Domain", "depends_on": []},
+]
+
+check("the shim goes to the project every other project may reference",
+      layering.shared_base(_EMS) == "Acme.Ems.Domain", layering.shared_base(_EMS))
+check("and that really is reachable from all of them, transitively",
+      all(layering.shared_base(_EMS) in layering.allowed_targets(p["name"], _EMS)
+          for p in _EMS))
+check("the project the architect listed first is not the answer",
+      layering.shared_base(_EMS) != _EMS[0]["name"])
+
+# Order must not decide it: the same four projects shuffled pick the same base, or the shim's
+# home would depend on how the architect happened to enumerate them.
+check("the choice does not depend on the order they were listed in",
+      layering.shared_base(list(reversed(_EMS))) == "Acme.Ems.Domain")
+
+check("a single project is its own base",
+      layering.shared_base([{"name": "Solo"}]) == "Solo")
+check("a two-project layout picks the one underneath",
+      layering.shared_base([{"name": "Web", "depends_on": ["Core"]},
+                            {"name": "Core", "depends_on": []}]) == "Core")
+
+# A proposal stating no dependencies has no layering rule to honour — `graph_is_stated` is
+# false for it and `check` enforces nothing — so there is nothing to choose on and the caller
+# keeps its existing default rather than inventing a base.
+check("no stated dependencies means no answer, not a guess",
+      layering.shared_base([{"name": "A"}, {"name": "B"}]) == "")
+check("and neither does an empty proposal", layering.shared_base([]) == "")
+
+# Deepest wins. Two projects both reachable from everything is possible; the one that may
+# itself reference least is the one nothing can be forbidden from reaching later.
+_TIE = [
+    {"name": "App", "depends_on": ["Mid", "Base"]},
+    {"name": "Mid", "depends_on": ["Base"]},
+    {"name": "Base", "depends_on": []},
+]
+check("where more than one is reachable from all, the deepest is chosen",
+      layering.shared_base(_TIE) == "Base", layering.shared_base(_TIE))
+
+# The point of all of it: whatever is chosen, `layering.check` must accept a file in any
+# project that references it. That is the property, and the rest is how it is arrived at.
+# And the negative that makes all of the above mean something: the placement this replaced
+# is refused, by the same function, on the same layout. Without this the checks above would
+# pass just as well against a rule that never mattered.
+_OLD = layering.check(
+    [{"path": "Acme.Ems.Infrastructure/R.cs",
+      "content": "using Acme.Ems.Web.Compat;\nnamespace Acme.Ems.Infrastructure;\nclass R {}"}],
+    project="Acme.Ems.Infrastructure", projects=_EMS,
+    components=[{"target_project": p["name"], "target_namespace": p["name"]} for p in _EMS])
+check("the shim where it used to go is a failure, not a warning",
+      [i for i in _OLD if i.get("severity") == "fail"], str(_OLD))
+
+for _project in _EMS:
+    _base = layering.shared_base(_EMS)
+    _issues = layering.check(
+        [{"path": f"{_project['name']}/F.cs",
+          "content": f"using {_base}.Compat;\nnamespace {_project['name']};\nclass F {{}}"}],
+        project=_project["name"], projects=_EMS,
+        components=[{"target_project": p["name"],
+                     "target_namespace": p["name"]} for p in _EMS])
+    check(f"a file in {_project['name']} may reference the shim",
+          not [i for i in _issues if i.get("severity") == "fail"], str(_issues))
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

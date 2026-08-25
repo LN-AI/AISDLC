@@ -114,6 +114,45 @@ def allowed_targets(project: str, projects: List[Dict[str, Any]]) -> Set[str]:
     return seen
 
 
+def shared_base(projects: List[Dict[str, Any]]) -> str:
+    """The project every other project may reference, or "" if there is no such project.
+
+    Exists for the source-language semantics shim. `PhpCompat` is scaffolded once and the
+    playbook then *instructs every converted file* to call it rather than re-deriving PHP's
+    `==` — so it is reachable-from-everywhere or it is useless, and which project holds it is
+    a layering question, not a naming one.
+
+    It was `proposed[0]`, the first project in the architect's list. On a single-project layout
+    that is trivially correct and it went unnoticed for exactly that reason. On the first real
+    multi-project run it put the shim in `Acme.Ems.Web`, and then three deterministic
+    subsystems contradicted each other: `semantics.check` failed a repository for not calling
+    `PhpCompat.IntVal`, `usings.repair` dutifully added `using Acme.Ems.Web.Compat` to eight
+    Infrastructure files, and `layering.check` refused the result because Infrastructure may
+    not reference Web — correctly, since MSBuild rejects the mutual reference outright. The
+    run could not proceed and no retry could have helped: obeying the playbook and obeying the
+    architecture were mutually exclusive.
+
+    Transitive reachability, via `allowed_targets`, because an MSBuild `ProjectReference` is
+    transitive. Ties break toward the *deepest* project — the one that may itself reference
+    least — since that is the one nothing can be forbidden from reaching later.
+    """
+    names = [name for name in
+             (_root(entry.get("name") or "") for entry in projects or []) if name]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    reachable_from_all = [candidate for candidate in names
+                          if all(candidate in allowed_targets(other, projects)
+                                 for other in names)]
+    if not reachable_from_all:
+        # A proposal that states no dependencies between its projects. `graph_is_stated` is
+        # false for it and `check` does not enforce anything, so there is no layering rule to
+        # honour and nothing to choose on. The caller keeps its existing default.
+        return ""
+    return min(reachable_from_all, key=lambda name: (len(allowed_targets(name, projects)), name))
+
+
 def _csharp_imports(content: str) -> Set[str]:
     """`using Some.Namespace;` — reusing the one reader this repo already trusts.
 

@@ -1510,7 +1510,14 @@ def _scaffold_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) ->
     # truthiness, each of which reviews as correct on its own.
     shim_symbols: List[Dict[str, Any]] = []
     if php_compat.is_applicable(run.get("source_language") or "", charter):
-        root = proposed[0].get("name") or "Converted"
+        # The project every other project may reference — not `proposed[0]`, which is whichever
+        # project the architect happened to list first. The playbook tells every converted file
+        # to call this shim, so a shim the lower layers may not reference makes obeying the
+        # playbook and obeying the architecture mutually exclusive, and no retry can resolve
+        # that. `shared_base` returns "" for a proposal that states no dependencies, where
+        # there is no layering rule to honour and the first project is as good as any.
+        root = (layering.shared_base(proposed)
+                or proposed[0].get("name") or "Converted")
         # Under the project directory, not at the export root: an SDK-style `.csproj` globs
         # `**/*.cs` beneath itself, so a file above it is never compiled — which is the same
         # end state as never emitting it, arrived at less visibly.
