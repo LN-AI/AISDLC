@@ -9597,6 +9597,143 @@ check("and the driver writes the key the runner reads",
 
 
 
+section("66. Three ways a build fails that reading the code did not show")
+
+# All three came out of the same 45-file live run, in the order a build finds them: the
+# solution would not restore, then would not compile, then compiled and would not start.
+
+# ── 1. A package that has not existed since 2019 ───────────────────────────
+#
+# `Microsoft.AspNetCore.Authentication.Cookies` was standalone in ASP.NET Core 2.x and moved
+# into the shared framework in 3.0. `AddAuthentication().AddCookie()` is the ordinary way to
+# do cookie auth and that package is the ordinary thing to reference for it, so the converter
+# referenced it at 8.0.0 — a version that does not exist. NuGet answers `NU1102` and the
+# project does not restore at all. Two build rounds reported the identical three errors and
+# the loop correctly declared itself stuck: nothing it can reconvert lives in a `.csproj`.
+
+_CSPROJ = ('<Project Sdk="Microsoft.NET.Sdk.Web">\n  <ItemGroup>\n'
+           '    <PackageReference Include="Microsoft.AspNetCore.Authentication.Cookies" Version="8.0.0" />\n'
+           '    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="8.0.10" />\n'
+           '    <PackageReference Include="Serilog" Version="3.1.1" />\n'
+           '  </ItemGroup>\n</Project>')
+_STRIPPED = wireup.apply_to_csproj(_CSPROJ, [], [])
+
+check("a package the shared framework provides is removed from the project",
+      "Authentication.Cookies" not in _STRIPPED, _STRIPPED)
+check("and everything that is a real package stays",
+      "EntityFrameworkCore.Sqlite" in _STRIPPED and "Serilog" in _STRIPPED)
+check("it is never added either, or the strip and the add would fight",
+      "Authentication.Cookies" not in wireup.apply_to_csproj(
+          "<Project></Project>",
+          [("Microsoft.AspNetCore.Authentication.Cookies", "8.0.0")], []))
+check("while a real package asked for is still added",
+      "Serilog" in wireup.apply_to_csproj("<Project></Project>", [("Serilog", "3.1.1")], []))
+
+# A denylist, never a `Microsoft.AspNetCore.` prefix rule. Plenty of that family are real
+# packages a net8.0 project must reference, and stripping one would trade a restore failure
+# for a compile failure — the same trade in the wrong direction.
+for _real in ("Microsoft.AspNetCore.Authentication.JwtBearer",
+              "Microsoft.AspNetCore.Authentication.OpenIdConnect",
+              "Microsoft.AspNetCore.Identity.EntityFrameworkCore",
+              "Microsoft.AspNetCore.Mvc.NewtonsoftJson",
+              "Microsoft.AspNetCore.Diagnostics.EntityFrameworkCore"):
+    check(f"{_real.rsplit('.', 1)[-1]} is a real package and is left alone",
+          not wireup.framework_provided(_real))
+for _framework in ("Microsoft.AspNetCore.Authentication.Cookies", "Microsoft.AspNetCore.Mvc",
+                   "Microsoft.AspNetCore.Session", "Microsoft.AspNetCore.StaticFiles"):
+    check(f"{_framework.rsplit('.', 1)[-1]} comes from the framework and is stripped",
+          wireup.framework_provided(_framework))
+
+# ── 2. An extension method whose namespace nothing could know ──────────────
+#
+# After six build rounds the export was down to exactly one error: `Program.cs`,
+# "'DbContextOptionsBuilder' does not contain a definition for 'UseSqlite'", with the Sqlite
+# package correctly referenced and the one-line `using` absent. `symbol_namespaces` knows
+# where a generated type lives because the run emitted it; nothing tells it that `UseSqlite`
+# is an extension method in `Microsoft.EntityFrameworkCore`.
+
+_WEB_PROJ = {"path": "W/W.csproj", "content":
+             '<Project><ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" '
+             'Version="8.0.10" /></ItemGroup></Project>'}
+_APP_PROJ = {"path": "A/A.csproj", "content":
+             '<Project><ItemGroup><PackageReference Include="Serilog" Version="3.1.1" />'
+             '</ItemGroup></Project>'}
+_FILES = [{"path": "W/Program.cs", "content": "o.UseSqlite(cs);"},
+          {"path": "A/Service.cs", "content": "var x = await _repo.FindAsync(id);"}]
+_REPAIRED = usings.repair(_FILES, {}, project_files=[_WEB_PROJ, _APP_PROJ])
+
+check("the file that calls an EF extension method gets the import",
+      _REPAIRED["added"].get("W/Program.cs") == ["Microsoft.EntityFrameworkCore"],
+      str(_REPAIRED["added"]))
+check("and the project that has no EF package is left alone",
+      "A/Service.cs" not in _REPAIRED["added"], str(_REPAIRED["added"]))
+
+# `FindAsync` is an **instance** method on `DbSet<T>`, not an extension method. Having it in
+# the map added an import to an Application-layer service that compiled, and turned it into
+# CS0234 — a working build made worse, which is the one direction this pipeline must not move
+# in. The guard above catches it now; the map should not contain it either.
+check("an instance method is not in the extension map at all",
+      "FindAsync" not in usings.EXTENSION_NAMESPACES)
+check("the genuinely surprising ones are",
+      all(m in usings.EXTENSION_NAMESPACES
+          for m in ("UseSqlite", "ToListAsync", "FirstOrDefaultAsync", "Include")))
+check("a name in a comment is not a call",
+      not usings.extension_namespaces("// remember to use ToListAsync() here"))
+check("nor is one in a string",
+      not usings.extension_namespaces('var s = "ToListAsync()";'))
+check("nor is declaring a method of that name yourself",
+      not usings.extension_namespaces("public async Task ToListAsync() { }"))
+check("an import already present is not added twice",
+      not usings.required_usings(
+          "using Microsoft.EntityFrameworkCore;\nvar x = await q.ToListAsync();", {}))
+check("with no project in hand the map still applies, since that is all a caller may have",
+      usings.extension_namespaces("o.UseSqlite(cs);") == {"Microsoft.EntityFrameworkCore"})
+check("and a project that offers nothing suppresses it",
+      usings.extension_namespaces("o.UseSqlite(cs);", set()) == set())
+
+# ── 3. A type named as text, that nothing declares ─────────────────────────
+#
+# The chosen layout forbade `Ems.Web` from referencing `Ems.Infrastructure`, so the converted
+# host reached it reflectively — and named a type no converted file declares. Zero errors,
+# zero warnings, and `InvalidOperationException` on the first line of `Program.Main`. A
+# compile-time reference would have been CS0246 in the first build round; a string is
+# invisible to the compiler, to `usings`, to `layering`, and to `unimplemented_interface`,
+# which looks for interfaces and this is not one.
+
+_REG = ('public static class InfrastructureRegistrar {\n'
+        '    private const string AssemblyName = "Ems.Infrastructure";\n'
+        '    private const string TypeName = "Ems.Infrastructure.ServiceCollectionExtensions";\n}')
+_CONTAINERS = {"Ems.Web", "Ems.Infrastructure", "Ems.Domain"}
+_HITS = reconcile._reflected_types(
+    [{"path": "Ems.Web/R.cs", "content": _REG}], {"EmsDbContext"}, {"Ems"}, _CONTAINERS)
+
+check("a type reached by name and declared by nobody is a failure",
+      len(_HITS) == 1 and _HITS[0]["severity"] == "fail", str(_HITS))
+check("the finding names the missing type",
+      _HITS and "ServiceCollectionExtensions" in _HITS[0]["detail"])
+check("the assembly name beside it is not reported as a missing type",
+      _HITS and "Ems.Infrastructure`" not in _HITS[0]["detail"], str(_HITS))
+check("a reflected type that the run does declare is silent",
+      not reconcile._reflected_types(
+          [{"path": "W/R.cs", "content": 'var t = "Ems.Data.EmsDbContext";'}],
+          {"EmsDbContext"}, {"Ems"}, _CONTAINERS))
+check("a name outside this run's roots is somebody else's and is not judged",
+      not reconcile._reflected_types(
+          [{"path": "W/R.cs",
+            "content": 'var a = "System.Text.Json.JsonSerializer"; var b = "Newtonsoft.Json.Linq.JObject";'}],
+          set(), {"Ems"}, _CONTAINERS))
+check("only C# is read",
+      not reconcile._reflected_types(
+          [{"path": "notes.md", "content": '"Ems.Infrastructure.Missing"'}],
+          set(), {"Ems"}, _CONTAINERS))
+check("the same literal in one file is reported once, not once per occurrence",
+      len(reconcile._reflected_types(
+          [{"path": "W/R.cs",
+            "content": 'a="Ems.X.Gone"; b="Ems.X.Gone"; c="Ems.X.Gone";'}],
+          set(), {"Ems"}, _CONTAINERS)) == 1)
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

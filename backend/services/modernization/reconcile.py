@@ -339,6 +339,65 @@ def _ambiguous_routes(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return issues
 
 
+# A string literal shaped like a fully-qualified type name: `Ems.Infrastructure.Foo`.
+_QUALIFIED_LITERAL = re.compile(r'"([A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)+)"')
+
+
+def _reflected_types(artifacts: List[Dict[str, Any]],
+                     declared: Set[str],
+                     roots: Set[str],
+                     containers: Set[str] = frozenset()) -> List[Dict[str, Any]]:
+    """Types this codebase names as *text* and never declares.
+
+    Found by the first 45-file live run, and only by starting the application. The chosen
+    layout forbade `Ems.Web` from referencing `Ems.Infrastructure`, so the converted host
+    reached it reflectively instead:
+
+        private const string TypeName = "Ems.Infrastructure.ServiceCollectionExtensions";
+
+    Nothing in the run ever declared that type. The solution compiled with zero errors and
+    zero warnings, and threw `InvalidOperationException` on the first line of `Program.Main`.
+    A compile-time reference would have been `CS0246` in the first build round; a string is
+    invisible to the compiler, to `usings`, to `layering` and to the `unimplemented_interface`
+    check — which looks for interfaces, and this is not one.
+
+    Only names under this run's **own** namespace roots are judged, because the symbol
+    registry is exhaustive for exactly those and for nothing else. `"System.Text.Json"` or a
+    customer's third-party type would otherwise be reported as missing on the strength of us
+    not having written it. Matching is on the simple name rather than the whole path: a type
+    declared in a neighbouring namespace is a different (and much weaker) finding than one
+    that does not exist at all, and this check should only make the claim it can prove.
+    """
+    issues: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for artifact in artifacts:
+        path = artifact.get("path") or ""
+        if not path.lower().endswith(".cs"):
+            continue
+        for literal in _QUALIFIED_LITERAL.findall(artifact.get("content") or ""):
+            root = literal.split(".")[0]
+            if root not in roots:
+                continue
+            if literal in containers:
+                # An assembly or namespace name, not a type. `AssemblyName =
+                # "Ems.Infrastructure"` beside `TypeName = "Ems.Infrastructure.Foo"` is the
+                # normal shape of a reflective lookup, and reporting the first as a missing
+                # type would put a false finding next to the true one.
+                continue
+            simple = literal.rsplit(".", 1)[-1]
+            if simple in declared or (literal, path) in seen:
+                continue
+            seen.add((literal, path))
+            issues.append(_issue(
+                "reflected_type_missing", "fail",
+                f"{path} names `{literal}` as a string, and no converted file declares "
+                f"`{simple}`. A type reached by name rather than by reference is invisible to "
+                f"the compiler, so this builds cleanly and throws at the moment the lookup "
+                f"runs — which for a service registration is the first line of start-up.",
+                path=path))
+    return issues
+
+
 def run(run_id: str) -> Dict[str, Any]:
     """-> {issues, counts, checked}. Deterministic; no model call, no execution."""
     artifacts = store.list_artifacts(run_id, current_only=True, include_content=True)
@@ -550,6 +609,19 @@ def run(run_id: str) -> Dict[str, Any]:
     for issue in _project_reference_cycles(artifacts):
         issues.append(issue)
     for issue in _ambiguous_routes(artifacts):
+        issues.append(issue)
+    # Roots taken from the projects the plan actually created, so the check is exhaustive over
+    # this run's own code and silent about everything else.
+    _roots = {(c.get("target_project") or "").split(".")[0] for c in components}
+    _roots |= {(c.get("target_namespace") or "").split(".")[0] for c in components}
+    for issue in _reflected_types(artifacts,
+                                  {str(sym.get("name") or "").rsplit(".", 1)[-1]
+                                   for sym in symbols},
+                                  {root for root in _roots if root},
+                                  {name for c in components
+                                   for name in ((c.get("target_project") or ""),
+                                                (c.get("target_namespace") or "")) if name}
+                                  | {str(sym.get("namespace") or "") for sym in symbols}):
         issues.append(issue)
 
     counts = store.unit_status_counts(run_id)

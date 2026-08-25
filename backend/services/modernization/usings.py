@@ -144,27 +144,114 @@ def referenced_types(content: str, known: Iterable[str]) -> Set[str]:
     return found
 
 
+# Extension methods whose namespace is not the namespace of the type they extend, and which
+# the symbol registry therefore cannot supply: they belong to a *package*, not to anything this
+# run generated. `symbol_namespaces` knows where `EmployeeRepository` lives because the run
+# emitted it; nothing tells it that `UseSqlite` extends `DbContextOptionsBuilder` from
+# `Microsoft.EntityFrameworkCore`.
+#
+# This is the residual error class the first 45-file run finished on. After six build rounds
+# the export was down to exactly one error — `Program.cs`: "'DbContextOptionsBuilder' does not
+# contain a definition for 'UseSqlite'" — with the Sqlite package correctly referenced and the
+# one-line `using` absent. It is a compile error that reads as a missing package and is not.
+#
+# Kept short on purpose. Every entry has to be a method whose defining namespace is genuinely
+# surprising, or the map becomes a second, worse copy of the framework — and a wrong entry adds
+# an unused `using`, which is harmless, while a missing one leaves today's behaviour.
+EXTENSION_NAMESPACES: Dict[str, str] = {
+    # EF Core provider selection — called on `DbContextOptionsBuilder`, defined here.
+    "UseSqlite": "Microsoft.EntityFrameworkCore",
+    "UseSqlServer": "Microsoft.EntityFrameworkCore",
+    "UseNpgsql": "Microsoft.EntityFrameworkCore",
+    "UseMySql": "Microsoft.EntityFrameworkCore",
+    "UseMySQL": "Microsoft.EntityFrameworkCore",
+    "UseInMemoryDatabase": "Microsoft.EntityFrameworkCore",
+    "UseLazyLoadingProxies": "Microsoft.EntityFrameworkCore",
+    # EF Core's async LINQ operators — called on `IQueryable`, defined here. The single most
+    # common missing `using` in generated data-access code.
+    "ToListAsync": "Microsoft.EntityFrameworkCore",
+    "ToArrayAsync": "Microsoft.EntityFrameworkCore",
+    "ToDictionaryAsync": "Microsoft.EntityFrameworkCore",
+    "FirstOrDefaultAsync": "Microsoft.EntityFrameworkCore",
+    "SingleOrDefaultAsync": "Microsoft.EntityFrameworkCore",
+    "FirstAsync": "Microsoft.EntityFrameworkCore",
+    "SingleAsync": "Microsoft.EntityFrameworkCore",
+    "AnyAsync": "Microsoft.EntityFrameworkCore",
+    "AllAsync": "Microsoft.EntityFrameworkCore",
+    "CountAsync": "Microsoft.EntityFrameworkCore",
+    "LongCountAsync": "Microsoft.EntityFrameworkCore",
+    "SumAsync": "Microsoft.EntityFrameworkCore",
+    "MaxAsync": "Microsoft.EntityFrameworkCore",
+    "MinAsync": "Microsoft.EntityFrameworkCore",
+    "AverageAsync": "Microsoft.EntityFrameworkCore",
+    "Include": "Microsoft.EntityFrameworkCore",
+    "ThenInclude": "Microsoft.EntityFrameworkCore",
+    "AsNoTracking": "Microsoft.EntityFrameworkCore",
+    "ExecuteSqlRawAsync": "Microsoft.EntityFrameworkCore",
+    "FromSqlRaw": "Microsoft.EntityFrameworkCore",
+    "FromSqlInterpolated": "Microsoft.EntityFrameworkCore",
+}
+
+# `.Method(` or `.Method<T>(` — a call, not a declaration and not the same word inside a
+# string or a comment (`strip_non_code` has already removed those).
+_EXTENSION_CALL = re.compile(r"\.\s*([A-Z][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\(")
+
+# Which package ids provide which namespace. Prefix-matched, because every
+# `Microsoft.EntityFrameworkCore.*` provider package brings the root namespace with it.
+_PACKAGE_NAMESPACES = (("Microsoft.EntityFrameworkCore", "Microsoft.EntityFrameworkCore"),)
+
+
+def namespaces_available(csproj: str) -> Set[str]:
+    """Namespaces the project's own `PackageReference`s make available."""
+    packages = re.findall(r'<PackageReference\s+Include="([^"]+)"', csproj or "",
+                          re.IGNORECASE)
+    return {namespace for package in packages
+            for prefix, namespace in _PACKAGE_NAMESPACES
+            if package == prefix or package.startswith(prefix + ".")}
+
+
+def extension_namespaces(content: str, available: Optional[Set[str]] = None) -> Set[str]:
+    """Namespaces required by package-provided extension methods this file calls.
+
+    `available` is the set the file's own project can actually offer, from its
+    `PackageReference`s. Without it this is a guess, and a wrong guess is expensive in one
+    direction only: a name in this map can also be an ordinary method somebody wrote, and
+    importing a namespace the project does not reference turns a file that compiled into
+    `CS0234`. So when the caller knows what the project has, nothing outside it is added; when
+    the caller does not know, the map is applied as-is, which is the behaviour a unit-level
+    caller with no `.csproj` in hand can still use.
+    """
+    code = strip_non_code(content or "")
+    wanted = {EXTENSION_NAMESPACES[name]
+              for name in _EXTENSION_CALL.findall(code)
+              if name in EXTENSION_NAMESPACES}
+    return wanted if available is None else (wanted & available)
+
+
 def required_usings(content: str, symbol_namespaces: Dict[str, str],
                     declared_references: Optional[Iterable[Dict[str, Any]]] = None,
-                    is_web: bool = False) -> Set[str]:
+                    is_web: bool = False,
+                    available: Optional[Set[str]] = None) -> Set[str]:
     """Namespaces this file needs and does not have.
 
     `symbol_namespaces` maps a generated type name to the namespace it lives in
     (`store.symbol_namespaces`). `declared_references` is the model's own `references[]`,
     used as a supplement rather than as the source of truth.
     """
-    if not content or not symbol_namespaces:
+    if not content:
         return set()
 
-    wanted: Set[str] = set()
-    for name in referenced_types(content, symbol_namespaces.keys()):
-        namespace = symbol_namespaces.get(name) or ""
+    # Not gated on `symbol_namespaces`: an extension method's namespace comes from a package,
+    # so it is needed whether or not this run has generated a single type yet.
+    wanted: Set[str] = set(extension_namespaces(content, available))
+    for name in referenced_types(content, (symbol_namespaces or {}).keys()):
+        namespace = (symbol_namespaces or {}).get(name) or ""
         if namespace:
             wanted.add(namespace)
     for reference in declared_references or []:
         if not isinstance(reference, dict) or reference.get("external"):
             continue
-        namespace = symbol_namespaces.get(reference.get("name") or "") or ""
+        namespace = (symbol_namespaces or {}).get(reference.get("name") or "") or ""
         if namespace:
             wanted.add(namespace)
 
@@ -233,20 +320,43 @@ def _insertion_point(lines: List[str]) -> int:
 
 def repair(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
            declared_references: Optional[Iterable[Dict[str, Any]]] = None,
-           is_web: bool = False) -> Dict[str, Any]:
+           is_web: bool = False,
+           project_files: Iterable[Dict[str, Any]] = ()) -> Dict[str, Any]:
     """Add every missing import across a unit's C# artifacts, in place.
 
     Returns `{"repaired": n, "added": {path: [namespace, ...]}}` so the caller can record
     what the pipeline changed — a file the run edited after the model wrote it is something a
     reviewer is entitled to see named.
     """
+    # What each project's `PackageReference`s make available, keyed by project directory, so
+    # a file is never given an import its own project cannot resolve.
+    # `project_files` as well as `artifacts`: a unit emits source, not project files — the
+    # `.csproj` belongs to the scaffold — so without them every lookup below would miss and
+    # every file would be treated as "project unknown", which is exactly the case this guard
+    # exists to avoid.
+    by_project: Dict[str, Set[str]] = {}
+    for artifact in list(artifacts) + list(project_files or ()):
+        path = artifact.get("path") or ""
+        if path.lower().endswith(".csproj"):
+            by_project[path.rsplit("/", 1)[0] if "/" in path else ""] = namespaces_available(
+                artifact.get("content") or "")
+
     added: Dict[str, List[str]] = {}
     for artifact in artifacts:
         path = artifact.get("path") or ""
         if not path.lower().endswith(".cs"):
             continue
+        # The nearest enclosing directory that holds a `.csproj`. A unit's artifacts often do
+        # not include one at all — the project file belongs to the scaffold — and then this is
+        # `None`, which means "unknown" rather than "nothing available".
+        available = None
+        for directory, namespaces in by_project.items():
+            if directory and (path == directory or path.startswith(directory + "/")):
+                available = namespaces
+                break
         content = artifact.get("content") or ""
-        missing = required_usings(content, symbol_namespaces, declared_references, is_web)
+        missing = required_usings(content, symbol_namespaces, declared_references, is_web,
+                                  available)
         if not missing:
             continue
         artifact["content"] = apply(content, missing)

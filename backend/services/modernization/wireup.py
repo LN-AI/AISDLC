@@ -960,6 +960,74 @@ def plan(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
             "problems": problems}
 
 
+# Packages that were standalone in ASP.NET Core 2.x and moved **into the shared framework**
+# in 3.0. On `net5.0`+ there is no such package to restore — nuget.org's newest version of
+# `Microsoft.AspNetCore.Authentication.Cookies` is 2.3.x — so a `PackageReference` to one is
+# `NU1102: Unable to find package … with version 8.0.0`, and the project cannot restore at all.
+# The types are still there; they arrive through `Microsoft.NET.Sdk.Web`.
+#
+# Found by the first 45-file live run. `AddAuthentication().AddCookie()` is the ordinary way to
+# do cookie auth, and the package that used to carry it is the ordinary thing to reference for
+# it — the reference is wrong only because of a framework reorganisation six years ago. Two
+# build rounds reported the identical three errors and the loop correctly declared itself
+# stuck, because nothing it can reconvert lives in a `.csproj`.
+#
+# A **denylist**, never a `Microsoft.AspNetCore.` prefix rule: plenty of that family are real
+# packages a `net8.0` project must reference — `Authentication.JwtBearer`,
+# `Authentication.OpenIdConnect`, `Identity.EntityFrameworkCore`, `Mvc.NewtonsoftJson`,
+# `Diagnostics.EntityFrameworkCore` — and stripping one of those would trade a restore failure
+# for a compile failure. Only names that genuinely have no 3.0+ package belong here.
+FRAMEWORK_PROVIDED_PACKAGES = frozenset({
+    "Microsoft.AspNetCore",
+    "Microsoft.AspNetCore.All",
+    "Microsoft.AspNetCore.App",
+    "Microsoft.AspNetCore.Antiforgery",
+    "Microsoft.AspNetCore.Authentication",
+    "Microsoft.AspNetCore.Authentication.Abstractions",
+    "Microsoft.AspNetCore.Authentication.Cookies",
+    "Microsoft.AspNetCore.Authentication.Core",
+    "Microsoft.AspNetCore.Authentication.OAuth",
+    "Microsoft.AspNetCore.Authorization",
+    "Microsoft.AspNetCore.Authorization.Policy",
+    "Microsoft.AspNetCore.Cors",
+    "Microsoft.AspNetCore.Diagnostics",
+    "Microsoft.AspNetCore.Diagnostics.Abstractions",
+    "Microsoft.AspNetCore.HostFiltering",
+    "Microsoft.AspNetCore.Hosting",
+    "Microsoft.AspNetCore.Hosting.Abstractions",
+    "Microsoft.AspNetCore.Html.Abstractions",
+    "Microsoft.AspNetCore.Http",
+    "Microsoft.AspNetCore.Http.Abstractions",
+    "Microsoft.AspNetCore.Http.Extensions",
+    "Microsoft.AspNetCore.Http.Features",
+    "Microsoft.AspNetCore.HttpsPolicy",
+    "Microsoft.AspNetCore.Mvc",
+    "Microsoft.AspNetCore.Mvc.Abstractions",
+    "Microsoft.AspNetCore.Mvc.Core",
+    "Microsoft.AspNetCore.Mvc.Razor",
+    "Microsoft.AspNetCore.Mvc.RazorPages",
+    "Microsoft.AspNetCore.Mvc.TagHelpers",
+    "Microsoft.AspNetCore.Mvc.ViewFeatures",
+    "Microsoft.AspNetCore.Razor",
+    "Microsoft.AspNetCore.Razor.Runtime",
+    "Microsoft.AspNetCore.ResponseCaching",
+    "Microsoft.AspNetCore.ResponseCompression",
+    "Microsoft.AspNetCore.Routing",
+    "Microsoft.AspNetCore.Routing.Abstractions",
+    "Microsoft.AspNetCore.Server.IISIntegration",
+    "Microsoft.AspNetCore.Server.Kestrel",
+    "Microsoft.AspNetCore.Server.Kestrel.Core",
+    "Microsoft.AspNetCore.Session",
+    "Microsoft.AspNetCore.StaticFiles",
+    "Microsoft.AspNetCore.WebUtilities",
+})
+
+
+def framework_provided(name: str) -> bool:
+    """Whether a package name is one the shared framework already provides on net5.0+."""
+    return str(name or "").strip() in FRAMEWORK_PROVIDED_PACKAGES
+
+
 def apply_to_csproj(content: str, packages: List[Tuple[str, str]],
                     project_refs: List[str], remove: Sequence[str] = ()) -> str:
     """Add whatever the `.csproj` is missing, and drop only what `remove` names.
@@ -981,9 +1049,17 @@ def apply_to_csproj(content: str, packages: List[Tuple[str, str]],
             line for line in (content or "").splitlines(True)
             if not ("<ProjectReference" in line
                     and set(_PROJECT_REF.findall(line)) & drop))
+    # Unconditional, and not covered by the caution above: this is not "a package that might
+    # be unnecessary", it is a package that does not exist at this target framework, so the
+    # project cannot restore while the line is present. Leaving it is not the safe direction.
+    content = "".join(
+        line for line in (content or "").splitlines(True)
+        if not ("<PackageReference" in line
+                and any(framework_provided(name) for name in _PACKAGE_REF.findall(line))))
     have_packages = set(_PACKAGE_REF.findall(content or ""))
     have_projects = set(_PROJECT_REF.findall(content or ""))
-    add_packages = [(p, v) for p, v in packages if p not in have_packages]
+    add_packages = [(p, v) for p, v in packages
+                    if p not in have_packages and not framework_provided(p)]
     add_projects = [r for r in project_refs if r not in have_projects and r not in drop]
     if not add_packages and not add_projects:
         return content

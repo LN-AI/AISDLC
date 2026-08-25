@@ -2620,9 +2620,18 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     namespaces = dict(store.symbol_namespaces(run_id))
     if own_namespace:
         namespaces.update({s.get("name", ""): own_namespace for s in symbols if s.get("name")})
+    # The run's project files, so an import is only ever added where the project can resolve
+    # it. Some of what `usings` knows comes from packages rather than from this run's own
+    # symbols — `ToListAsync` is an extension method in `Microsoft.EntityFrameworkCore`, not a
+    # member of anything — and a name like that can equally be an ordinary method somebody
+    # wrote. Adding the import blind turned an Application-layer service that compiled into
+    # `CS0234` on the first 45-file run.
     fixed = usings.repair(safe_artifacts, namespaces,
                           declared_references=result.get("references") or [],
-                          is_web=bool(charter.get("ui_strategy") or charter.get("target_stack")))
+                          is_web=bool(charter.get("ui_strategy") or charter.get("target_stack")),
+                          project_files=[a for a in store.list_artifacts(
+                              run_id, current_only=True, include_content=True)
+                              if (a.get("path") or "").lower().endswith(".csproj")])
     if fixed["repaired"]:
         store.append_event(
             run_id, "usings_repaired",
