@@ -9797,6 +9797,115 @@ check("the same literal in one file is reported once, not once per occurrence",
 
 
 
+section("67. One bad answer, and the run that stopped for no stated reason")
+
+# ── What actually happened ─────────────────────────────────────────────────
+#
+# A 45-file run converted 22 files, spent $3.56, and then a model answered `files` with a bare
+# string where an object belonged. `_place_artifacts` called `.get("filename")` on it,
+# `AttributeError` travelled out of `_convert_one`, out of `_produce`, out of `_drain` and out
+# of `convert_run`, and the background job died. The run row still said `converting`. The unit
+# still held a lease. Nothing released it, nothing retried it, and eleven hours later the only
+# evidence that anything had gone wrong was a traceback in the server log.
+#
+# Two separate defects, and the second is the expensive one: a malformed entry should cost a
+# file, and an unhandled exception should cost a unit. Neither should cost the run.
+
+# ── A file we cannot read is a dropped file ────────────────────────────────
+
+_pl_run = store.create_run("place", ".NET 8", "files", created_by="smoke")
+store.insert_units(_pl_run, [{"path": "a.php", "kind": "source_file", "language": "php",
+                              "status": "ready", "source_text": "<?php"}])
+_pl_unit = dict(store.list_units(_pl_run)[0])
+_pl_unit["output_dir"] = "Proj/Feature"
+_pl_rejected = []
+_pl_placed = runner._place_artifacts(
+    _pl_run, _pl_unit,
+    ["Employee.cs", {"filename": "Good.cs", "content": "class Good {}"}, None, 42,
+     {"filename": "Also.cs", "content": "class Also {}"}],
+    _pl_rejected)
+
+check("a bare string in the file list is dropped, not fatal",
+      [a["path"] for a in _pl_placed] == ["Proj/Feature/Good.cs", "Proj/Feature/Also.cs"],
+      str([a["path"] for a in _pl_placed]))
+check("every unreadable entry says what it was, so the model can be told",
+      len(_pl_rejected) == 3 and all("not an object" in r for r in _pl_rejected),
+      str(_pl_rejected))
+check("the rejection quotes the value rather than only its type",
+      any("Employee.cs" in r for r in _pl_rejected), str(_pl_rejected))
+check("and each drop is on the run's own record, not just in a return value",
+      len([e for e in store.list_events(_pl_run)
+           if e["event"] == "artifact_rejected"]) == 3)
+
+# ── An unexpected failure costs a unit ─────────────────────────────────────
+#
+# Everything a stage handler *expects* is already routed to a retry or a terminal stop. This is
+# about the rest: a unit is the right blast radius, because `fail_unit` releases the lease, the
+# attempt counter bounds the retries, and a systematic bug then shows up as every unit failing
+# with the same message — visible, and still resumable — instead of a job that vanished.
+
+_dr_run = store.create_run("drain", ".NET 8", "files", created_by="smoke")
+# Component rows, because that is the kind the convert stage claims — a `source_file` is
+# rolled up into one of these long before conversion sees it.
+store.insert_units(_dr_run, [
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "ready", "order_index": 0},
+    {"path": "#component/two", "kind": "component", "component_name": "two",
+     "status": "ready", "order_index": 1}])
+store.update_run(_dr_run, status="converting")
+
+_dr_seen = []
+
+
+def _dr_produce(run_id, stage, unit, charter, caller, llm_override, project_name):
+    _dr_seen.append(unit["path"])
+    if unit["path"] == "#component/one":
+        raise AttributeError("'str' object has no attribute 'get'")
+    return "converted"
+
+
+_dr_saved = runner._produce
+runner._produce = _dr_produce
+try:
+    _dr_stage = next(st for st in stages.STAGES if st.id == "convert")
+    _dr_result = runner._drain(_dr_run, _dr_stage, store.get_run(_dr_run), CALLER, None,
+                               runner._Progress(_dr_run, None))
+finally:
+    runner._produce = _dr_saved
+
+check("the exception does not escape the drain loop",
+      isinstance(_dr_result, dict), str(_dr_result))
+# Three, not one: the unit is failed *non-terminally*, so it returns to `ready` and is
+# claimed again until `MAX_UNIT_ATTEMPTS` is spent. That is the point of routing an unexpected
+# exception here rather than letting it out — an answer that was malformed once may well be
+# fine the second time, and the attempt counter is what stops it being tried forever.
+check("the unit that raised is retried to the attempt limit and then failed",
+      _dr_result.get("failed") == runner.MAX_UNIT_ATTEMPTS, str(_dr_result))
+check("and the next unit is still converted — one bad answer, one lost file",
+      _dr_result.get("converted") == 1 and "#component/two" in _dr_seen, str(_dr_seen))
+check("the failure is on the run's record with the exception type named",
+      any(e["event"] == "unit_error" and "AttributeError" in (e["detail"] or "")
+          for e in store.list_events(_dr_run)),
+      str([e["detail"] for e in store.list_events(_dr_run) if e["event"] == "unit_error"]))
+check("the failing unit's lease is released, so a resume can pick it up again",
+      not [u for u in store.list_units(_dr_run)
+           if u["path"] == "#component/one" and u.get("lease_owner")],
+      str([(u["path"], u["lease_owner"]) for u in store.list_units(_dr_run)]))
+check("it is retryable rather than terminal — a one-off answer deserves another attempt",
+      any(u["status"] in ("ready", "failed") and (u["attempts"] or 0) <= runner.MAX_UNIT_ATTEMPTS
+          for u in store.list_units(_dr_run) if u["path"] == "#component/one"),
+      str([(u["path"], u["status"], u["attempts"]) for u in store.list_units(_dr_run)]))
+
+# The guard must not swallow the failures the stage handlers already decide about — those go
+# through `_produce` and return a string, and never reach the `except` at all.
+check("every claim is accounted for as exactly one outcome",
+      _dr_result.get("converted", 0) + _dr_result.get("failed", 0)
+      == len(_dr_seen), str((_dr_result, _dr_seen)))
+check("and the loop ends rather than claiming the exhausted unit for a fourth time",
+      _dr_seen.count("#component/one") == runner.MAX_UNIT_ATTEMPTS, str(_dr_seen))
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

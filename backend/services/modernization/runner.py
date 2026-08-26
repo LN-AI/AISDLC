@@ -760,7 +760,32 @@ def _drain(run_id: str, stage, run: Dict[str, Any], caller: dict,
         if stage.llm:
             store.append_event(run_id, "unit_started", f"{stage.label}: {label}",
                                unit_id=unit["id"])
-        outcome = _produce(run_id, stage, unit, charter, caller, llm_override, project_name)
+        try:
+            outcome = _produce(run_id, stage, unit, charter, caller, llm_override,
+                               project_name)
+        except Exception as exc:  # noqa: BLE001
+            # Every *expected* failure is already handled inside the stage handlers, which
+            # decide between a retry and a terminal stop. Reaching here means something nobody
+            # anticipated — and until now that killed the job: the exception travelled out of
+            # `_produce`, out of `_drain`, out of `convert_run`, and the run sat in
+            # `converting` with a lease nobody would ever release. A 45-file run died that way
+            # on one model response containing a string where an object belonged, after 22
+            # files and $3.56 of work that no longer had anything driving it.
+            #
+            # A unit is the right blast radius. The lease is released by `fail_unit`, the
+            # attempt counter bounds the retries, and a systematic bug therefore surfaces as
+            # every unit failing with the same message — visible, and still resumable —
+            # rather than as a run that stopped for no stated reason. The traceback goes to
+            # the log because the event detail is a customer-facing string, not a stack.
+            logger.exception("Unhandled error producing unit %s of run %s",
+                             unit.get("id"), run_id)
+            store.fail_unit(unit["id"], run_id,
+                            f"{type(exc).__name__}: {exc}"[:400],
+                            terminal=False, max_attempts=MAX_UNIT_ATTEMPTS)
+            store.append_event(run_id, "unit_error",
+                               f"{type(exc).__name__}: {exc}"[:400],
+                               unit_id=unit["id"], level="error")
+            outcome = "failed"
         if outcome == "converted":
             converted += 1
         else:
@@ -1849,6 +1874,15 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
         if rejected is not None:
             rejected.append(reason)
     for entry in files:
+        if not isinstance(entry, dict):
+            # The schema asks for objects, and a model answered with a bare string in the
+            # list. Every other malformed entry here is dropped with a reason; this one raised
+            # `AttributeError` instead, which escaped `_convert_one`, `_produce` and `_drain`
+            # and killed a 45-file run outright after 22 files and $3.56. A file we cannot
+            # read is a dropped file, exactly like a file with no name.
+            _drop(f"a returned file was {type(entry).__name__}, not an object with a "
+                  f"filename and content: {str(entry)[:80]!r}")
+            continue
         # `path` is still accepted so an older stub or a caller mid-upgrade keeps working;
         # `filename` is what the schema asks for.
         raw = (entry.get("filename") or "").strip()
