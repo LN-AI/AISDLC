@@ -74,6 +74,11 @@ _CHAR_LITERAL_SUFFIXES = {".cs", ".java", ".kt", ".kts", ".scala", ".go"}
 # `'x'` and `'\n'` are legitimate char literals, so the bar sits above both.
 _SINGLE_QUOTED_RUN = re.compile(r"'(?:[^'\\\n]|\\.){3,}'")
 
+# Comments, for the rule below only. A `//` inside a string is not a comment, so strings are
+# consumed by the same pass rather than scanned round — but a file that reaches this rule has
+# no double-quoted strings by definition, which is why the cheap version is enough here.
+_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+
 # Under these, an unremarkable file trips the signal: `namespace X;` plus a one-line class has
 # no indentation, and a using-only file has no newline worth speaking of. Measured against the
 # fixtures rather than chosen — the smallest scaffold artifact is 6 lines and the smallest
@@ -227,7 +232,17 @@ def _implausible_source(text: str, ext: str) -> List[str]:
             f"block. A nested declaration is always indented by whatever wrote it as code.")
 
     if ext in _CHAR_LITERAL_SUFFIXES and '"' not in text:
-        match = _SINGLE_QUOTED_RUN.search(text)
+        # Comments first. A view-model with no string literals at all legitimately has no
+        # double quotes, and prose in an XML doc comment legitimately quotes a value:
+        #
+        #     /// <summary>True when the current user holds the 'admin' role.</summary>
+        #
+        # That is valid C# and this rule failed it three times, then failed the component, on
+        # three separate view components of one live run — nine conversion calls spent, three
+        # components dead and seven source files never converted. The signal was only ever
+        # about *code*, and a comment is not code. Found by reading the rejected output the
+        # run now keeps (D-159); before that, the verdict was all there was to go on.
+        match = _SINGLE_QUOTED_RUN.search(_COMMENT.sub(" ", text))
         if match:
             reasons.append(
                 f"The file holds no double quotes at all but contains {match.group(0)[:40]!r}. "

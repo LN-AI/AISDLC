@@ -9906,6 +9906,77 @@ check("and the loop ends rather than claiming the exhausted unit for a fourth ti
 
 
 
+section("68. A check that was wrong about good code, three times, on three components")
+
+# ── What it cost ───────────────────────────────────────────────────────────
+#
+# The delimiter-substitution rule reads "no double quotes anywhere, and something in single
+# quotes" as proof a model wrote `'text'` where `"text"` belonged — which in C# is a character
+# literal and cannot compile. Sound reasoning about *code*. It was applied to the whole file.
+#
+# A view-model holding only properties has no string literals at all, so no double quotes; and
+# an XML doc comment quotes values in prose, because that is how prose works:
+#
+#     /// <summary>True when the current user holds the 'admin' role.</summary>
+#
+# That is valid C#. The rule failed it, the unit retried, the rule failed it again, three times,
+# on three separate view components of one live run: nine conversion calls spent, three
+# components permanently failed, and seven source files never converted at all. It was the most
+# expensive single defect in that run.
+#
+# It was only decidable because the run keeps what a check refuses now (D-159). Before that the
+# verdict was the only evidence, and a verdict cannot be argued with.
+
+_VIEWMODEL = (
+    "using System.Collections.Generic;\n"
+    "namespace Acme.Ems.Web.Views.Dashboard;\n"
+    "public sealed class DashboardViewModel\n"
+    "{\n"
+    "    /// <summary>Number of employees with status 'present' today.</summary>\n"
+    "    public int PresentToday { get; init; }\n"
+    "    /// <summary>True when the current user holds the 'admin' role.</summary>\n"
+    "    public bool IsAdmin { get; init; }\n"
+    "}")
+
+check("a view-model whose only single quotes are in doc comments passes",
+      not validation._implausible_source(_VIEWMODEL, ".cs"),
+      str(validation._implausible_source(_VIEWMODEL, ".cs")))
+check("a line comment is not code either",
+      not validation._implausible_source(
+          "// status is 'present' today\npublic class A { public int X; }", ".cs"))
+check("nor is a block comment",
+      not validation._implausible_source(
+          "/* maps 'admin' onto a role */\npublic class A { public int X; }", ".cs"))
+
+# The rule still has to catch what it was written for, or removing it would be simpler than
+# narrowing it.
+check("a substituted delimiter in real code is still caught",
+      validation._implausible_source(
+          "public class A { string s = 'hello world'; }", ".cs"),
+      "this cannot compile and must still fail")
+check("and the finding still quotes the offending text",
+      "hello world" in validation._implausible_source(
+          "public class A { string s = 'hello world'; }", ".cs")[0])
+check("a genuine char literal was never the target and still is not",
+      not validation._implausible_source("public class A { char c = 'x'; }", ".cs"))
+check("a file that has proper strings is out of scope entirely",
+      not validation._implausible_source(
+          'public class A { string s = "admin"; /* the \'admin\' role */ }', ".cs"))
+check("a language without char literals is untouched by any of this",
+      not validation._implausible_source(
+          "const s = 'hello world';\nfunction f() { return s; }", ".ts"))
+
+# Comment-stripping must not swallow the code around it, or the rule would go quiet on files
+# it should still fail.
+check("code after a comment is still read",
+      validation._implausible_source(
+          "// a note about 'x'\npublic class A { string s = 'hello world'; }", ".cs"))
+check("code before a comment is still read",
+      validation._implausible_source(
+          "public class A { string s = 'hello world'; } // a note about 'x'", ".cs"))
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
