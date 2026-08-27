@@ -32,6 +32,12 @@ import urllib.request
 # number; everything else stops the driver.
 SPEND_GATES = {"discovery_approval", "plan_approval"}
 
+# Gates that can carry a layout repair in their answer. `plan_conflicts` is not a spend gate —
+# it quotes no price and asks no money question. It asks whether to convert into a layout the
+# pipeline has already proved cannot be written, which is a different question and gets a
+# different branch below.
+REPAIR_GATES = {"plan_approval", "plan_conflicts"}
+
 
 def will_not_work(point):
     """Consistency findings that say the converted code cannot work, or [].
@@ -268,7 +274,7 @@ def main():
         open_points = client.call(f"{base}/checkpoints?status=open")[1].get("checkpoints") or []
         for point in open_points:
             kind = point.get("kind")
-            repairs = feasible_repairs(point) if kind == "plan_approval" else []
+            repairs = feasible_repairs(point) if kind in REPAIR_GATES else []
             if repairs and args.repair == "stop":
                 # The driver's own rule, applied to what this gate has become: it stops on a
                 # decision the product deliberately handed to a human. A layout repair is
@@ -300,6 +306,40 @@ def main():
                 client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",
                             "POST", {"decision": "approve",
                                      "answer": {"repair": chosen} if chosen else {}})
+            elif kind == "plan_conflicts":
+                # The run stopped because crossings survive that nothing can legally express.
+                # `--repair best` keeps answering, and the gate re-raises after each one until
+                # the residual is zero, so this converges without a second mechanism. Without
+                # that flag this is a human decision and the driver says so, because converting
+                # a layout known not to build is exactly the choice a driver must not make on
+                # somebody's behalf.
+                gaps = (point.get("payload") or {}).get("gaps") or []
+                say(f"  !! PLAN CONFLICTS: {len(gaps)} dependency direction(s) cannot be "
+                    f"written in this layout", log)
+                for gap in gaps[:8]:
+                    say(f"     {gap.get('consumer')} -> {gap.get('provider')} "
+                        f"({gap.get('count')} dependency in the source)", log)
+                chosen = ""
+                if repairs and args.repair == "best":
+                    chosen = repairs[0]["id"]
+                elif repairs and args.repair not in ("none", "stop"):
+                    chosen = next((r["id"] for r in repairs if r["id"] == args.repair), "")
+                elif args.repair == "none":
+                    # An explicit opt-out of repairs already given once. Re-asking the same
+                    # question of an unattended run would only stall it.
+                    chosen = "proceed"
+                if not chosen:
+                    for repair in repairs:
+                        say(f"     fix {repair['id']}: {repair.get('title')} — closes "
+                            f"{len(repair.get('closes') or [])}, opens "
+                            f"{len(repair.get('opens') or [])}", log)
+                    say("  stopping — converting this would produce code that compiles and "
+                        "does not run. Re-run with --repair best to close them, or "
+                        "--repair none to convert anyway", log)
+                    return 2
+                say(f"  answering plan conflicts with {chosen}", log)
+                client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",
+                            "POST", {"decision": "approve", "answer": {"repair": chosen}})
             elif kind == "reconciliation" and will_not_work(point) and not args.ignore_fatal:
                 fatal = will_not_work(point)
                 say(f"  !! {len(fatal)} finding(s) say the converted code cannot work", log)

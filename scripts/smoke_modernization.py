@@ -10452,6 +10452,286 @@ check("nothing exposed produces no sentence",
 
 
 
+section("73. The pipeline does not convert into a plan it has proved cannot be built")
+
+# ── What this is actually for ──────────────────────────────────────────────
+#
+# `plan_gaps` has been right every time it has spoken. On run 9c8cf4fe it named all twelve
+# eventual build errors while $0.67 had been spent instead of $6.43. On the 45-file run it named
+# two unbuildable crossings; one repair was applied, the survivor was left standing, and the
+# converter did what a converter forbidden from writing the obvious thing does — it routed
+# around the boundary. That compiles. It fails when the application starts, which is the
+# expensive failure precisely because no compiler can see it.
+#
+# So the proof was produced, printed, and walked past. Section 48 made the gate *offer* the
+# repairs; this makes the run *stop* until the crossings are gone or somebody says convert
+# anyway. Every improvisation check in this suite catches a shape — a name looked up at run
+# time, a service nobody registered, a context registered twice — and there is always another
+# shape. This removes the reason to improvise, which is the only intervention here that is not
+# a special case.
+#
+# Two gaps, because one was never the hard part. The gate takes one answer, and applying a
+# repair changes the plan the next one was measured against — so the second question can only
+# be asked after the first answer has landed on the rows.
+
+_TWO_GAP_PROJECTS = [
+    {"name": "Acme.Web", "purpose": "host", "depends_on": ["Acme.Application"]},
+    {"name": "Acme.Application", "purpose": "logic", "depends_on": ["Acme.Domain"]},
+    {"name": "Acme.Infrastructure", "purpose": "data", "depends_on": ["Acme.Domain"]},
+    {"name": "Acme.Domain", "purpose": "types", "depends_on": []},
+]
+
+_TWO_GAP_SOURCE = [
+    {"path": "cfg.py", "content": "SETTING = 'x'\n"},
+    {"path": "repo.py", "content": "from cfg import SETTING\n\ndef load():\n    return SETTING\n"},
+    {"path": "svc.py", "content": "from repo import load\n\ndef run():\n    return load()\n"},
+]
+
+
+def _two_gap_call_tool(system_prompt, user_content, schema, llm_override=None,
+                       max_tokens=None, **kw):
+    """svc(Application) -> repo(Infrastructure) and repo(Infrastructure) -> cfg(Web). Neither
+    direction is in the project graph and no seam covers either."""
+    if schema.get("name") == "submit_target_architecture":
+        return {
+            "projects": _TWO_GAP_PROJECTS,
+            "components": [
+                {"name": "config", "project": "Acme.Web",
+                 "namespace": "Acme.Web.Config", "output_dir": "Acme.Web/Config",
+                 "members": ["cfg.py"], "role": "config", "rationale": "settings",
+                 "expected_files": ["Cfg.cs"]},
+                {"name": "service", "project": "Acme.Application",
+                 "namespace": "Acme.Application.Services", "output_dir": "Acme.Application/Services",
+                 "members": ["svc.py"], "role": "business", "rationale": "the service",
+                 "expected_files": ["Svc.cs"]},
+                {"name": "repository", "project": "Acme.Infrastructure",
+                 "namespace": "Acme.Infrastructure.Data", "output_dir": "Acme.Infrastructure/Data",
+                 "members": ["repo.py"], "role": "data", "rationale": "the repository",
+                 "expected_files": ["Repo.cs"]},
+            ],
+            "seams": [],
+            "shared_conventions": "Types are PascalCase.",
+            "risks": [], "summary": "Three layers, two illegal dependencies.",
+        }
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+def _to_two_gap_plan(name, source=None, tool=None):
+    """Drive a run to its open `plan_approval`, answering everything before it."""
+    run_id = store.create_run(name, ".NET 8", "files", created_by="smoke")
+    runner.ingest_and_analyze(run_id, list(source or _TWO_GAP_SOURCE))
+    runner.set_charter(run_id, VALID_CHARTER, "smoke")
+    for _ in range(8):
+        runner.convert_run(run_id, CALLER)
+        gate = [c for c in store.list_checkpoints(run_id, "open")
+                if c["kind"] == "plan_approval"]
+        if gate:
+            return run_id, gate[0]
+        for cp in store.list_checkpoints(run_id, "open"):
+            if cp["blocking"]:
+                store.answer_checkpoint(cp["id"], {"decision": "approved"}, "smoke")
+        store.update_run(run_id, status="converting", paused_reason=None)
+    return run_id, None
+
+
+def _open_conflict_gate(run_id):
+    points = [c for c in store.list_checkpoints(run_id, "open")
+              if c["kind"] == "plan_conflicts"]
+    return points[-1] if points else None
+
+
+def _answer_and_run(run_id, point, answer):
+    store.answer_checkpoint(point["id"], answer, "smoke")
+    store.update_run(run_id, status="converting", paused_reason=None)
+    runner.convert_run(run_id, CALLER)
+
+
+llm_gateway.call_tool = _two_gap_call_tool
+try:
+    _tg, _plan_gate = _to_two_gap_plan("two-gap-repair")
+    check("the plan gate is reached", _plan_gate is not None)
+    _predicted = ((_plan_gate.get("payload") or {}).get("layering_gaps") or []) if _plan_gate else []
+    check("both unbuildable crossings are predicted before a penny of conversion spend",
+          len(_predicted) == 2,
+          str([(g.get("consumer"), g.get("provider")) for g in _predicted]))
+
+    # One answer, two problems — the shape of the live failure. The gate is entitled to take
+    # one; what it is not entitled to do is convert with the other still standing.
+    _first = [r for r in ((_plan_gate.get("payload") or {}).get("repairs") or [])
+              if r.get("feasible") and r["id"].startswith("seam:")][0]
+    _answer_and_run(_tg, _plan_gate, {"decision": "approved", "repair": _first["id"]})
+
+    check("the run stops instead of converting, because a crossing survived the repair",
+          (store.get_run(_tg) or {}).get("status") == "paused",
+          str((store.get_run(_tg) or {}).get("status")))
+    check("and nothing was converted while it was stopped — this costs nothing to ask",
+          not store.list_artifacts(_tg, current_only=False),
+          str(len(store.list_artifacts(_tg, current_only=False))))
+
+    _hold = _open_conflict_gate(_tg)
+    check("a blocking gate names what is left", _hold is not None and _hold["blocking"])
+    check("it says how many crossings remain, not that the plan is fine",
+          len(((_hold.get("payload") or {}).get("gaps") or [])) == 1,
+          str((_hold.get("payload") or {}).get("gaps")))
+    check("it says what has already been tried, so the reader is not answering blind",
+          ((_hold.get("payload") or {}).get("repairs_applied") or []) == [_first["id"]],
+          str((_hold.get("payload") or {}).get("repairs_applied")))
+    check("the detail explains the consequence rather than only naming the rule",
+          "compiles cleanly" in (_hold.get("detail") or "")
+          and "fails when the application starts" in (_hold.get("detail") or ""),
+          (_hold.get("detail") or "")[:200])
+    check("and 'convert anyway' is offered, because sometimes it is the right answer",
+          "proceed" in (_hold.get("options") or []), str(_hold.get("options")))
+
+    # The whole reason this is a second gate rather than a list of repairs applied in one pass.
+    # The first repair let Acme.Infrastructure reference Acme.Application; the *second* gap's
+    # cheapest fix would have Acme.Infrastructure referenced from Acme.Web — and MSBuild refuses
+    # a cycle, so an option that was feasible when measured against the original plan is not
+    # feasible now. Measured against a stale layout, this gate would offer a repair that cannot
+    # be applied.
+    _second_options = (_hold.get("payload") or {}).get("repairs") or []
+    check("the second gate's repairs are measured against the repaired layout, not the "
+          "original one",
+          {r["id"] for r in _second_options}
+          != {r["id"] for r in ((_plan_gate.get("payload") or {}).get("repairs") or [])},
+          str([r["id"] for r in _second_options]))
+    check("every repair it offers is one that can actually be applied now",
+          all(r.get("feasible") for r in _second_options),
+          str([(r["id"], r.get("feasible")) for r in _second_options]))
+    check("and each still states what it measurably closes",
+          _second_options and all(r["closes"] for r in _second_options),
+          str([(r["id"], r["closes"]) for r in _second_options]))
+
+    _second = _second_options[0]
+    _answer_and_run(_tg, _hold, {"decision": "approved", "repair": _second["id"]})
+
+    _design_meta = (store.list_units(_tg, kind="design")[0].get("meta")) or {}
+    check("both repairs are on the record, in the order they were answered",
+          (_design_meta.get("repairs_applied") or []) == [_first["id"], _second["id"]],
+          str(_design_meta.get("repairs_applied")))
+    check("nothing is left that has no legal way to be written",
+          not (_design_meta.get("layering_gaps") or []),
+          str(_design_meta.get("layering_gaps")))
+    check("the run carries on past the gate once the layout can be built",
+          (store.get_run(_tg) or {}).get("status") != "paused"
+          or "checkpoint" not in ((store.get_run(_tg) or {}).get("paused_reason") or "")
+          or not _open_conflict_gate(_tg),
+          str((store.get_run(_tg) or {}).get("paused_reason")))
+    check("and the frozen plan carries the whole sequence, not just the last one",
+          (((store.get_run(_tg) or {}).get("plan") or {}).get("repairs_applied") or [])
+          == [_first["id"], _second["id"]],
+          str(((store.get_run(_tg) or {}).get("plan") or {}).get("repairs_applied")))
+
+    # ── The override is real, and it is a word somebody has to choose ──────
+    #
+    # A customer is entitled to convert a layout we merely disapprove of. What they are not
+    # entitled to is doing it by accident, which is what an unanswered warning on a gate
+    # somebody clicked through is.
+    _ov, _ov_gate = _to_two_gap_plan("two-gap-override")
+    _answer_and_run(_ov, _ov_gate, {"decision": "approved"})
+    _ov_hold = _open_conflict_gate(_ov)
+    check("approving the plan without picking a repair stops too — 'none' is not 'proceed'",
+          _ov_hold is not None and not store.list_artifacts(_ov, current_only=False))
+    check("the gate that stopped it names both crossings",
+          len(((_ov_hold.get("payload") or {}).get("gaps") or [])) == 2,
+          str((_ov_hold.get("payload") or {}).get("gaps")))
+    _answer_and_run(_ov, _ov_hold, {"decision": "approved", "repair": "proceed"})
+    check("answering proceed converts the layout as it stands",
+          store.list_artifacts(_ov, current_only=False),
+          str((store.get_run(_ov) or {}).get("paused_reason")))
+    check("and the run log says what was accepted, at warning level, in the reader's words",
+          any(e.get("event") == "plan_conflicts_accepted" and e.get("level") == "warning"
+              and "compiles and does not start" in (e.get("detail") or "")
+              for e in store.list_events(_ov, limit=800)),
+          str([e.get("event") for e in store.list_events(_ov, limit=800)][-12:]))
+    check("proceeding does not raise the same gate again",
+          len([c for c in store.list_checkpoints(_ov) if c["kind"] == "plan_conflicts"]) == 1,
+          str([c["kind"] for c in store.list_checkpoints(_ov)]))
+
+    # ── Termination, which is the property that makes this safe to ship ────
+    #
+    # "Has a human answered?" is the wrong question — an answer that picks a repair should lead
+    # to another question, and an answer that picks nothing must not. "Has a human been shown
+    # *this* set of crossings?" is the right one, and it is decidable. An answer that changes
+    # nothing therefore proceeds rather than re-asking forever, because the property worth
+    # protecting is that somebody saw the proof and decided, not that they typed a word.
+    _tm, _tm_gate = _to_two_gap_plan("two-gap-terminates")
+    _answer_and_run(_tm, _tm_gate, {"decision": "approved"})
+    _tm_hold = _open_conflict_gate(_tm)
+    check("the run is held", _tm_hold is not None)
+    _answer_and_run(_tm, _tm_hold, {"decision": "looked at it"})
+    check("an answer that names no repair at all does not re-ask the same question forever",
+          not _open_conflict_gate(_tm)
+          and len([c for c in store.list_checkpoints(_tm)
+                   if c["kind"] == "plan_conflicts"]) == 1,
+          str([(c["kind"], c["status"]) for c in store.list_checkpoints(_tm)]))
+    check("and it still converts, with the acceptance on the record",
+          store.list_artifacts(_tm, current_only=False)
+          and any(e.get("event") == "plan_conflicts_accepted"
+                  for e in store.list_events(_tm, limit=800)))
+
+    # A repair the gate never offered is refused rather than guessed at, and refusing it must
+    # not strand the run: the crossings are unchanged, so the question has been asked and
+    # answered and the operator is not made to answer it twice.
+    _bg, _bg_gate = _to_two_gap_plan("two-gap-bogus")
+    _answer_and_run(_bg, _bg_gate, {"decision": "approved"})
+    _bg_hold = _open_conflict_gate(_bg)
+    _answer_and_run(_bg, _bg_hold, {"decision": "approved", "repair": "merge:Nope->Nope"})
+    check("a repair the gate did not offer is refused and said so",
+          any(e.get("event") == "plan_repair_missing"
+              for e in store.list_events(_bg, limit=800)))
+    check("and the refusal does not strand the run at a gate it cannot get past",
+          not _open_conflict_gate(_bg), str((store.get_run(_bg) or {}).get("paused_reason")))
+except Exception:
+    traceback.print_exc()
+    check("the plan-conflict runs raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+# ── A layout with nothing wrong with it is untouched by all of this ────────
+#
+# The check that keeps the gate honest. Every existing run, every fixture and every clean
+# conversion must behave exactly as it did — a gate that fires on a plan that is fine is a gate
+# people learn to click through, which is the failure this whole layer exists to prevent.
+
+
+def _clean_call_tool(system_prompt, user_content, schema, llm_override=None,
+                     max_tokens=None, **kw):
+    if schema.get("name") == "submit_target_architecture":
+        return {
+            "projects": [{"name": "Acme.Web", "purpose": "host", "depends_on": []}],
+            "components": [
+                {"name": "everything", "project": "Acme.Web", "namespace": "Acme.Web",
+                 "output_dir": "Acme.Web", "members": ["cfg.py", "repo.py", "svc.py"],
+                 "role": "business", "rationale": "one project", "expected_files": ["All.cs"]},
+            ],
+            "seams": [], "shared_conventions": "Types are PascalCase.",
+            "risks": [], "summary": "One project, so no boundary to cross.",
+        }
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _clean_call_tool
+try:
+    _cl, _cl_gate = _to_two_gap_plan("no-gaps")
+    check("a layout with no illegal crossing predicts none",
+          not ((_cl_gate.get("payload") or {}).get("layering_gaps") or []),
+          str((_cl_gate.get("payload") or {}).get("layering_gaps")))
+    _answer_and_run(_cl, _cl_gate, {"decision": "approved"})
+    check("so approving it raises no conflict gate at all",
+          not [c for c in store.list_checkpoints(_cl) if c["kind"] == "plan_conflicts"],
+          str([c["kind"] for c in store.list_checkpoints(_cl)]))
+    check("and the run converts, exactly as it did before any of this existed",
+          store.list_artifacts(_cl, current_only=False),
+          str((store.get_run(_cl) or {}).get("paused_reason")))
+except Exception:
+    traceback.print_exc()
+    check("the clean-layout run raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

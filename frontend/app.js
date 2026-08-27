@@ -2287,6 +2287,16 @@ function showError(targetId, message) {
   `;
 }
 
+// A value going into a single-quoted JS string inside a double-quoted HTML attribute has to
+// survive two parsers, and `esc` handles one: it escapes `"` and deliberately leaves `'` alone,
+// which is the character that ends the JS string. Fine for the UUIDs every existing onclick
+// passes; not fine for a repair id, which is built out of project names the architect chose —
+// model-controlled text on its way into an event handler.
+function jsArg(value) {
+  return esc(String(value === null || value === undefined ? '' : value)
+    .replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+}
+
 function esc(str) {
   if (!str) return '';
   return String(str)
@@ -6059,6 +6069,12 @@ const MOD_WAIVER_CHECKPOINTS = {
   wireup_ambiguous:  { label: 'Finish with it unregistered', help: 'showModernizationBuildHelp' },
   runtime_required:  { label: 'Finish without starting it', help: 'showModernizationBuildHelp' },
   runtime_failed:    { label: 'Finish with it failing to serve', help: 'showModernizationBuildHelp' },
+  // The same argument, at the other end of the run. This gate's own text says the layout has
+  // dependencies with no legal way to be written, so its plain button is not an approval of
+  // anything — it is a decision to convert code that will compile and fail to start. Labelling
+  // it "Approve" would put the one prominent blue button in the dashboard on the outcome the
+  // gate exists to prevent.
+  plan_conflicts:    { label: 'Convert this layout anyway', answer: { repair: 'proceed' } },
 };
 
 function renderModernizationCheckpoints(checkpoints) {
@@ -6071,13 +6087,49 @@ function renderModernizationCheckpoints(checkpoints) {
         <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks the run' : ' — informational'}
         <div style="margin-top:6px;white-space:pre-wrap">${esc(c.detail || '')}</div>
         ${renderCheckpointPayload(c)}
-        ${waiver ? `<button class="btn btn-primary btn-sm" style="margin-top:8px"
+        ${renderCheckpointRepairs(c)}
+        ${waiver && waiver.help ? `<button class="btn btn-primary btn-sm" style="margin-top:8px"
                 onclick="${waiver.help}()">Show me how to do it</button>` : ''}
         <button class="btn ${waiver || !c.blocking ? 'btn-secondary' : 'btn-primary'} btn-sm" style="margin-top:8px"
-                onclick="answerModernizationCheckpoint('${esc(c.id)}')">${
+                onclick="answerModernizationCheckpoint('${esc(c.id)}'${
+                  waiver && waiver.answer ? `, '${jsArg(waiver.answer.repair)}'` : ''})">${
                   waiver ? esc(waiver.label) : (c.blocking ? 'Approve' : 'Acknowledge')}</button>
       </div>`;
     }).join('')}
+  </div>`;
+}
+
+// The layout repairs a gate is offering, one button each. Until this existed the repairs
+// were computed, priced, written into the payload and reachable only from the API — so every
+// dashboard user answered "none" whether they meant to or not, and a plan the pipeline had
+// already proved unbuildable was the only thing the UI could approve.
+//
+// Ordered the way `drive_modernization.feasible_repairs` orders them and for the same reason:
+// closes most, opens least, then cheapest to the architecture. A merge dissolves a boundary
+// the customer asked for and must never win by accident.
+const MOD_REPAIR_RANK = { seam: 0, allow: 1, merge: 2 };
+
+function renderCheckpointRepairs(c) {
+  const repairs = ((c.payload || {}).repairs || []).filter(r => r.feasible && r.id);
+  if (!repairs.length) return '';
+  const ordered = repairs.slice().sort((a, b) =>
+    (b.closes || []).length - (a.closes || []).length ||
+    (a.opens || []).length - (b.opens || []).length ||
+    (MOD_REPAIR_RANK[String(a.id).split(':')[0]] ?? 3) - (MOD_REPAIR_RANK[String(b.id).split(':')[0]] ?? 3) ||
+    String(a.id).localeCompare(String(b.id)));
+  return `<div style="margin-top:10px">
+    <div class="mod-meta">Pick one to have it applied to the plan before anything is converted.
+      Each number below was measured by re-running the check against the repaired layout, not
+      claimed.</div>
+    ${ordered.map(r => `
+      <div class="mod-alert" style="margin-top:6px">
+        <strong>${esc(r.title || r.id)}</strong>
+        <div class="mod-meta">closes ${(r.closes || []).length}${
+          (r.opens || []).length ? ` · opens ${(r.opens || []).length} new` : ''}</div>
+        <div style="margin-top:4px">${esc(r.detail || '')}</div>
+        <button class="btn btn-primary btn-sm" style="margin-top:6px"
+                onclick="answerModernizationCheckpoint('${esc(c.id)}', '${jsArg(r.id)}')">Apply this</button>
+      </div>`).join('')}
   </div>`;
 }
 
@@ -7124,14 +7176,17 @@ function cancelModernizationRun() {
   _modAction('cancel', { reason: 'Cancelled from the dashboard' });
 }
 
-async function answerModernizationCheckpoint(checkpointId) {
-  const decision = prompt('Record your decision (kept in the run log):', 'Reviewed and approved');
+async function answerModernizationCheckpoint(checkpointId, repair) {
+  const decision = prompt('Record your decision (kept in the run log):',
+    repair ? `Chose ${repair}` : 'Reviewed and approved');
   if (decision === null) return;
   try {
     await apiFetch(`/api/v1/modernization/checkpoints/${checkpointId}/answer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision }),
+      // `answer` is what the run reads; `decision` is what the log reads. The repair was
+      // unreachable from here until now because only the second was ever sent.
+      body: JSON.stringify(repair ? { decision, answer: { repair } } : { decision }),
     });
     await refreshModernizationRun();
   } catch (e) {

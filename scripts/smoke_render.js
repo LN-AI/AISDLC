@@ -840,6 +840,91 @@ function modPlanChecks() {
     assert(!html.includes('What was read'), 'it invented a denominator block from nothing');
   });
 
+  // ── The layout repairs, which were unreachable from here until now ──────
+  //
+  // `layering.repair_options` has been computing these, measuring what each closes, and
+  // writing them into the gate payload since D-176 — and the dashboard's only button sent a
+  // decision string with no answer. So every human answering a plan gate here selected "none"
+  // whether they meant to or not, and the one thing the UI could approve was a layout the
+  // pipeline had already proved would not build.
+
+  const MOD_REPAIRS = [
+    { id: 'merge:Acme.Infrastructure->Acme.Application', kind: 'merge_projects', feasible: true,
+      title: 'Merge Acme.Infrastructure into Acme.Application', closes: ['a->b'], opens: [],
+      detail: 'Always buildable, and a coarser architecture than the one on this plan.' },
+    { id: 'seam:Acme.Application->Acme.Infrastructure', kind: 'declare_seam', feasible: true,
+      title: 'Declare IInfrastructureGateway in Acme.Application', closes: ['a->b'], opens: [],
+      detail: 'The layering rule survives intact.' },
+    { id: 'allow:Acme.Application->Acme.Infrastructure', kind: 'allow_reference', feasible: false,
+      title: 'Let Acme.Application reference Acme.Infrastructure', closes: [], opens: [],
+      why_not: 'It would close a reference cycle and MSBuild refuses to build one.' },
+  ];
+  const MOD_CONFLICT_GATE = {
+    id: 'cp-1', kind: 'plan_conflicts', blocking: true,
+    title: '1 dependency direction(s) in this layout cannot be built',
+    detail: 'The source has dependencies that cross a project boundary the plan forbids.',
+    payload: { gaps: [{ consumer: 'A', provider: 'B', count: 3 }], repairs: MOD_REPAIRS },
+  };
+
+  check('a gate carrying repairs offers each one as something a human can pick', () => {
+    const html = sandbox.renderCheckpointRepairs(MOD_CONFLICT_GATE);
+    assert(html.includes('Merge Acme.Infrastructure into Acme.Application'), 'the merge is missing');
+    assert(html.includes('IInfrastructureGateway'), 'the seam is missing');
+    // `-&gt;` rather than `->`: the id goes through `esc` on its way into the attribute and the
+    // browser decodes it before the handler ever sees it. Asserting on the raw arrow would be
+    // asserting that the escaping is absent.
+    assert(html.includes("answerModernizationCheckpoint('cp-1', 'seam:Acme.Application-&gt;Acme.Infrastructure')"),
+           'the repair id never reaches the handler, which is how this was broken before');
+    assert(html.includes('closes 1'), 'the measured number is missing');
+  });
+
+  check('a repair that cannot be applied is not offered as a button', () => {
+    // It stays in the payload — "you cannot do this, and here is why" is what stops somebody
+    // proposing it again — but a button that closes nothing is a trap.
+    const html = sandbox.renderCheckpointRepairs(MOD_CONFLICT_GATE);
+    assert(!html.includes("'allow:Acme.Application->Acme.Infrastructure'"),
+           'an infeasible repair is being offered as a choice');
+  });
+
+  check('a merge never wins the ordering by accident', () => {
+    // On a live 45-file run all four feasible repairs scored identically at "closes 1, opens
+    // 0", the ordering fell through to the id, and `merge:` beat `seam:` alphabetically — so a
+    // boundary between two projects was dissolved because of a letter. The seam is listed
+    // first here for the same reason `drive_modernization.feasible_repairs` ranks it first.
+    const html = sandbox.renderCheckpointRepairs(MOD_CONFLICT_GATE);
+    assert(html.indexOf('IInfrastructureGateway') < html.indexOf('Merge Acme.Infrastructure'),
+           'a merge is being offered above a seam that closes just as much');
+  });
+
+  check('a gate with no repairs renders nothing extra', () => {
+    assert(sandbox.renderCheckpointRepairs({ id: 'x', payload: {} }) === '');
+    assert(sandbox.renderCheckpointRepairs({ id: 'x' }) === '');
+  });
+
+  check('the button on a conflict gate says what it does, not "Approve"', () => {
+    // The same argument as the parity and build waivers above it. This gate's own text says the
+    // layout has dependencies with no legal way to be written; putting the dashboard's single
+    // prominent blue "Approve" button on it would make the outcome the gate exists to prevent
+    // the easiest thing in the room to click.
+    const html = sandbox.renderModernizationCheckpoints([MOD_CONFLICT_GATE]);
+    assert(html.includes('Convert this layout anyway'), 'the plain button still reads as approval');
+    assert(!html.includes('>Approve<'), 'an Approve button survived on a gate that approves nothing');
+    assert(html.includes("answerModernizationCheckpoint('cp-1', 'proceed')"),
+           'the override sends no answer, so the run would re-ask the same question forever');
+  });
+
+  check('a repair id carrying a quote cannot break out of the handler', () => {
+    // Repair ids are built from project names the architect chose, so this is model-controlled
+    // text on its way into an onclick. `esc` escapes `"` and deliberately leaves `'` alone —
+    // which is exactly the character that ends the JS string it is being placed in.
+    const html = sandbox.renderCheckpointRepairs({
+      id: 'cp-2',
+      payload: { repairs: [{ id: "merge:O'Brien->X", feasible: true, title: 'T',
+                             closes: ['a'], opens: [], detail: 'd' }] } });
+    assert(html.includes("\\'Brien"), 'the quote is unescaped and ends the argument early');
+    assert(!html.includes("'merge:O'Brien"), 'the handler argument is broken');
+  });
+
   check('a run nobody compiled says so, instead of rendering nothing', () => {
     // It used to render nothing at all when `build_round` was 0, which reads as an absence of
     // problems rather than an absence of evidence. A real run shipped 45 converted files whose
