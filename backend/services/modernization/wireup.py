@@ -305,6 +305,31 @@ _FRAMEWORK_INJECTED = frozenset({
     "IAntiforgery", "IAuthorizationService", "IMapper", "HttpClient", "IHttpClientFactory",
 })
 
+# Framework services the container does **not** hand out unless the host asks for them, and
+# the line that asks. Distinct from `_FRAMEWORK_INJECTED` above, which is types that arrive for
+# free — and the gap between the two sets is where a converted `AuthService` fell through:
+#
+#   * `unregistered_dependencies` skips it, because the run did not declare `IPasswordHasher`
+#     and guessing a NuGet type's lifetime is not that check's business;
+#   * `host_plan` skips it for the same reason;
+#   * so nothing registered it, nothing reported it, the solution compiled with zero errors and
+#     zero warnings, and the host threw `Unable to resolve service for type
+#     'IPasswordHasher<User>'` while validating the container — before the first request.
+#
+# These are canonical registrations rather than guesses: `AddHttpContextAccessor()` is the one
+# way to get an `IHttpContextAccessor`, and `PasswordHasher<T>` is the framework's own and only
+# implementation of `IPasswordHasher<T>`. Open generics (`typeof(IPasswordHasher<>)`) so the
+# type argument never has to be recovered from the signature.
+FRAMEWORK_REGISTRATIONS = {
+    "IHttpContextAccessor": "builder.Services.AddHttpContextAccessor();",
+    "IMemoryCache": "builder.Services.AddMemoryCache();",
+    "IDistributedCache": "builder.Services.AddDistributedMemoryCache();",
+    "IPasswordHasher": (
+        "builder.Services.AddScoped("
+        "typeof(Microsoft.AspNetCore.Identity.IPasswordHasher<>), "
+        "typeof(Microsoft.AspNetCore.Identity.PasswordHasher<>));"),
+}
+
 MAX_UNREGISTERED = 20
 
 
@@ -580,6 +605,17 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str,
             f"builder.Services.AddScoped<{namespace}.{name}>();" if namespace
             else f"builder.Services.AddScoped<{name}>();")
         registered_names.add(name)
+
+    # ── Framework services that have to be asked for ──────────────────────
+    #
+    # Emitted from what a constructor actually takes, so a run whose code never mentions one
+    # gets no line for it. Ordered by name for a stable `Program.cs` across two runs of the
+    # same codebase.
+    _asked_for = {name for params in constructors.values() for name in params}
+    for _name in sorted(_asked_for & set(FRAMEWORK_REGISTRATIONS)):
+        _line = FRAMEWORK_REGISTRATIONS[_name]
+        if _line not in services:
+            services.append(_line)
 
     # ── The database ──────────────────────────────────────────────────────
     if db.get("registration"):

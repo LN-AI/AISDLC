@@ -9989,6 +9989,53 @@ check("code before a comment is still read",
 
 
 
+section("69. The framework service that fell between two exemptions")
+
+# The container hands out `ILogger<T>` and `IConfiguration` for free, and `_FRAMEWORK_INJECTED`
+# says so. It does **not** hand out `IPasswordHasher<T>` — that needs a line. And the check that
+# would have caught a missing registration skips any type this run did not declare, on the
+# reasonable ground that guessing a NuGet type's lifetime is not its business.
+#
+# So a converted `AuthService(IPasswordHasher<User>)` was registered by nobody and reported by
+# nobody. The solution compiled with zero errors and zero warnings, and the host threw
+# `Unable to resolve service for type 'IPasswordHasher<User>'` while validating the container —
+# before the first request, on a live 45-file run that had just built clean.
+
+_FW = [{"path": "W/AuthService.cs", "content":
+        "namespace W;\npublic interface IAuthService {}\n"
+        "public class AuthService : IAuthService {\n"
+        "  public AuthService(Microsoft.AspNetCore.Identity.IPasswordHasher<User> h,\n"
+        "                     IHttpContextAccessor ctx) {}\n}"}]
+_LINES = wireup.host_plan(_FW, "W")["services"]
+
+check("a password hasher the code asks for is registered",
+      any("PasswordHasher" in line for line in _LINES), str(_LINES))
+check("as an open generic, so the type argument never has to be recovered",
+      any("typeof(Microsoft.AspNetCore.Identity.IPasswordHasher<>)" in line
+          for line in _LINES), str(_LINES))
+check("and the http context accessor too, which is also not free",
+      any("AddHttpContextAccessor()" in line for line in _LINES), str(_LINES))
+check("the run's own service is still registered as before",
+      any("W.IAuthService, W.AuthService" in line for line in _LINES), str(_LINES))
+
+# Emitted from what a constructor actually takes. A codebase that never mentions one gets no
+# line for it — `Program.cs` is read by people, and a registration for a service nothing uses
+# is a claim about the application that is not true.
+_PLAIN = [{"path": "W/Thing.cs", "content":
+           "namespace W; public interface IThing {} "
+           "public class Thing : IThing { public Thing() {} }"}]
+check("a codebase that asks for none gets none",
+      not [line for line in wireup.host_plan(_PLAIN, "W")["services"]
+           if "PasswordHasher" in line or "HttpContextAccessor" in line],
+      str(wireup.host_plan(_PLAIN, "W")["services"]))
+check("every entry is a canonical registration, not a guess at a lifetime",
+      all(line.startswith("builder.Services.Add")
+          for line in wireup.FRAMEWORK_REGISTRATIONS.values()))
+check("and the same inputs produce the same Program.cs, ordered by name",
+      wireup.host_plan(_FW, "W")["services"] == _LINES)
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
