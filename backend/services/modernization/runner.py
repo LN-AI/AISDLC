@@ -1873,6 +1873,23 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
                            unit_id=unit["id"], level="warning")
         if rejected is not None:
             rejected.append(reason)
+    # Build files belong to the deterministic stages, and only to them. `wireup` derives every
+    # package from a curated pattern table (`_PACKAGE_TYPES`) — an offline catalogue of ids and
+    # versions known good for the target framework — so nothing in this pipeline should ever be
+    # *guessing* a dependency. A component that writes its own `.csproj` bypasses that catalogue
+    # entirely, and on the first two live runs that is exactly where every unrestorable package
+    # came from: `Microsoft.AspNetCore.Authentication.Cookies` at 8.0.0 and
+    # `Microsoft.AspNetCore.Rewrite` at 8.0.0, neither of which has existed since 3.0 absorbed
+    # them into the shared framework. Both arrived as version 2 of a project file whose version 1
+    # the scaffold had written correctly.
+    #
+    # The cost of accepting them is not one bad line. `NU1102` stops the *restore*, so it has no
+    # file and no line to route back to a component, the rework loop reopens whatever owns the
+    # project file, that stage re-emits byte-identical output, and the run trips `build_stuck` —
+    # which reads as the conversion failing to converge rather than as a dependency nobody
+    # should have been allowed to invent.
+    build_files = (".csproj", ".sln", ".props", ".targets") if (
+        unit.get("kind") == "component") else ()
     for entry in files:
         if not isinstance(entry, dict):
             # The schema asks for objects, and a model answered with a bare string in the
@@ -1891,6 +1908,12 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
         if not raw or "/" in raw or "\\" in raw or raw in (".", ".."):
             _drop(f"filename must be a bare name with no directory part, got {raw!r}"
                   if raw else "a returned file carried no filename at all")
+            continue
+        if build_files and raw.lower().endswith(build_files):
+            _drop(f"{raw} is a build file, and those are written by the scaffold and wireup "
+                  f"stages from a catalogue of packages known to exist at this target "
+                  f"framework — not by a conversion. Anything this file needed to say about "
+                  f"dependencies is derived from the code instead.")
             continue
         subdir = (entry.get("subdir") or "").strip().strip("/")
         if subdir and (".." in subdir.split("/") or subdir.startswith("/")):

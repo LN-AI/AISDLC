@@ -179,6 +179,22 @@ def db_plan(artifacts: List[Dict[str, Any]],
     if not context:
         return {"context": "", "registration": "", "note": "", "package": ""}
 
+    # `AddDbContext<T>()` hands `T` exactly one argument, its options. A context whose only
+    # constructor asks for more cannot be built that way, and registering it anyway is a
+    # start-up failure the compiler will never see: the solution builds with zero errors and
+    # the container throws "Unable to resolve service for type 'System.String'" while
+    # validating, before the first request. Emitting nothing and saying why leaves a human
+    # one decision to make; emitting the registration leaves them a stack trace to decode.
+    if not dbcontext_is_constructible(code, name):
+        return {
+            "context": context, "registration": "", "package": "",
+            "note": (f"`{context}` declares no constructor that takes only its "
+                     f"`DbContextOptions`, so `AddDbContext` cannot construct it and no "
+                     f"registration was written. Either give it the standard constructor and "
+                     f"move the extra arguments into options, or register it by hand with a "
+                     f"factory that supplies them."),
+        }
+
     # A context that configures itself in `OnConfiguring` needs no options and no provider
     # call — registering it as a scoped service is the whole job.
     if not takes_options:
@@ -329,6 +345,33 @@ FRAMEWORK_REGISTRATIONS = {
         "typeof(Microsoft.AspNetCore.Identity.IPasswordHasher<>), "
         "typeof(Microsoft.AspNetCore.Identity.PasswordHasher<>));"),
 }
+
+# A `DbContext` constructor. `AddDbContext<T>()` constructs `T` by handing it exactly one
+# argument — its `DbContextOptions<T>` — so a context asking for anything else cannot be built
+# that way, and the container throws while validating: "Unable to resolve service for type
+# 'System.String'". It compiles perfectly; it fails before the first request.
+_DBCONTEXT_CTOR = re.compile(
+    r"public\s+(?P<name>[A-Za-z_]\w*)\s*\((?P<args>[^)]*)\)\s*:\s*base\s*\(")
+
+
+def dbcontext_is_constructible(content: str, context_name: str) -> bool:
+    """Whether `AddDbContext<T>()` could actually construct this context.
+
+    True when the context declares no constructor at all (the framework supplies one), or when
+    every constructor takes nothing but its options. False the moment one takes a second
+    parameter — a connection string, a path, a clock — because the container has no way to
+    supply it and registering it anyway guarantees a start-up failure.
+    """
+    code = usings.strip_non_code(content or "")
+    found = [m for m in _DBCONTEXT_CTOR.finditer(code) if m.group("name") == context_name]
+    if not found:
+        return True
+    for match in found:
+        types = _parameter_types(match.group("args"))
+        if all(t.startswith("DbContextOptions") for t in types if t):
+            return True
+    return False
+
 
 MAX_UNREGISTERED = 20
 

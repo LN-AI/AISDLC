@@ -277,7 +277,23 @@ def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
     # unindented line balances perfectly, so the strongest structural check in the tier passes
     # the one output in the corpus that provably cannot compile.
     for detail in _implausible_source(content, ext):
-        issues.append({"severity": "fail", "check": "plausible", "detail": detail})
+        # `warn`, not `fail`, and the reason is arithmetic rather than taste. Every reason
+        # `_implausible_source` gives describes output no compiler would accept — a file that is
+        # one enormous line, a body that opens a block and indents nothing, a string written
+        # with the wrong delimiters. Since Phase 1 a real compiler reads every export, and it
+        # settles all three definitively.
+        #
+        # So the two mistakes cost wildly different amounts. A miss costs one build round, and
+        # the diagnostic comes back with a file and a line and goes straight to the component
+        # that wrote it. A false positive costs three conversions of the same unit, then fails
+        # the component outright — and its source files are then converted by nobody at all.
+        # This rule was wrong twice in two live runs: once on the small app, and once on three
+        # separate view components whose only single quotes were inside `/// <summary>` prose.
+        # That is nine conversion calls and seven source files, spent proving a compiler right.
+        #
+        # The hard-fail tier is for what a compiler cannot catch: a reintroduced secret, a
+        # blocked hazard, an empty or placeholder file, a real parse failure.
+        issues.append({"severity": "warn", "check": "plausible", "detail": detail})
 
     if ext == ".py":
         for detail in _python_syntax(content):

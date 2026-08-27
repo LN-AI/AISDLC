@@ -7195,8 +7195,15 @@ def _v(path, content):
 _c52 = ("public class HomeController : Controller { [Route('/index.php')] "
         "public IActionResult Index() { ViewData['Title'] = 'Legacy Employee Portal'; "
         "return View(); } }")
-check("the measured C-52 payload fails, where it used to pass at High confidence",
-      _v("Web/HomeController.cs", _c52) == ("fail", ["plausible"]),
+# `warn`, not `fail`, since two live runs measured what the two mistakes actually cost. A
+# miss costs one build round and comes back with a file and a line, routed to the component
+# that wrote it. A false positive costs three conversions of the same unit and then fails the
+# component, after which its source files are converted by nobody at all — and this rule was
+# wrong twice: once on the small app, and once on three view components whose only single
+# quotes were inside `/// <summary>` prose. The payload below is still caught; what changed is
+# who settles it, and since Phase 1 that is a real compiler on every export.
+check("the measured C-52 payload is still caught",
+      _v("Web/HomeController.cs", _c52) == ("warn", ["plausible"]),
       str(_v("Web/HomeController.cs", _c52)))
 check("and the reason names the substitution, not just 'invalid'",
       any("character literal" in i["detail"]
@@ -7237,26 +7244,37 @@ check("a one-line appsettings.json is data, not source",
 
 # The quote substitution is only half of C-52; the other half is the missing line breaks, and
 # it has to fail on its own for a model that dodges newline escaping but not quote escaping.
-check("a nesting file with no indentation anywhere fails on that alone",
+check("a nesting file with no indentation anywhere is caught on that alone",
       _v("a/B.cs", "\n".join([
           "namespace A;", "public class B", "{", "public int X { get; set; }",
           "public int Y { get; set; }", "public int Z { get; set; }",
-          "public void M() { }", "public void N() { }", "}"])) == ("fail", ["plausible"]))
+          "public void M() { }", "public void N() { }", "}"])) == ("warn", ["plausible"]))
 
-# It is a `fail`, so `runner` persists it into `validation_issues` and the next attempt is told
-# — the D-89 channel. A `warn` would have committed an un-compilable file and spent a build
-# round reporting errors nobody could act on.
+# The objection this used to carry was that a `warn` "would have committed an un-compilable
+# file and spent a build round reporting errors nobody could act on". The second half stopped
+# being true when the build loop learned to route a diagnostic to the component that wrote the
+# file — a `CS1010` on this payload comes back with a path and a line and reopens exactly one
+# unit. The first half is the point: the file *is* un-compilable, and the compiler is the thing
+# entitled to say so.
 _c52_report = validation.validate_unit_output(
     [{"path": "Web/HomeController.cs", "content": _c52}], [], set())
-check("it reaches the unit report as a fail, so the retry is not byte-identical",
-      _c52_report["status"] == "fail"
+check("it reaches the unit report, so a reader is still told",
+      _c52_report["status"] == "warn"
       and "plausible" in [i["check"] for i in _c52_report["issues"]],
       str(_c52_report["status"]))
-check("and summarize_for_prompt carries it to the next attempt",
-      "character literal" in validation.summarize_for_prompt(
-          [i for i in _c52_report["issues"] if i["severity"] == "fail"]),
-      validation.summarize_for_prompt(
-          [i for i in _c52_report["issues"] if i["severity"] == "fail"])[:160])
+check("the reason survives into the report rather than being reduced to a severity",
+      any("character literal" in i["detail"] for i in _c52_report["issues"]),
+      str([i["detail"][:60] for i in _c52_report["issues"]]))
+# What must not change: the checks a compiler cannot settle stay fatal, or demoting this one
+# would have quietly demoted the tier it belongs to.
+check("a reintroduced credential is still fatal",
+      validation.validate_unit_output(
+          [{"path": "C.cs",
+            "content": 'class C { const string K = "AKIAIOSFODNN7EXAMPLE"; }'}],
+          [], set())["status"] == "fail")
+check("and an empty file still is too",
+      validation.validate_unit_output(
+          [{"path": "C.cs", "content": "  "}], [], set())["status"] == "fail")
 
 section("45. A component that returns one file of four")
 
@@ -10033,6 +10051,129 @@ check("every entry is a canonical registration, not a guess at a lifetime",
           for line in wireup.FRAMEWORK_REGISTRATIONS.values()))
 check("and the same inputs produce the same Program.cs, ordered by name",
       wireup.host_plan(_FW, "W")["services"] == _LINES)
+
+
+
+section("70. Where the invented dependencies actually came from")
+
+# ── A component authoring its own project file ─────────────────────────────
+#
+# `wireup` derives every package from `_PACKAGE_TYPES`, an offline table of ids and versions
+# known good for the target framework, so nothing here should ever be *guessing* a dependency.
+# Two live runs failed to restore anyway, on `Microsoft.AspNetCore.Authentication.Cookies` and
+# `Microsoft.AspNetCore.Rewrite`, both pinned at 8.0.0 and neither existing since 3.0 absorbed
+# them into the shared framework.
+#
+# Both arrived the same way: as version 2 of a project file whose version 1 the scaffold had
+# written correctly. A component had emitted its own `.csproj`. The catalogue was never
+# consulted because the file never went through it.
+#
+# The cost is not one bad line. `NU1102` stops the *restore*, so it carries no file and no line
+# to route back to a component; the loop reopens whatever owns the project file; that stage
+# re-emits byte-identical output; and the run trips `build_stuck`, which reads as a conversion
+# failing to converge rather than as a dependency nobody should have been able to invent.
+
+_bf_run = store.create_run("buildfiles", ".NET 8", "files", created_by="smoke")
+store.insert_units(_bf_run, [
+    {"path": "#component/web", "kind": "component", "component_name": "web", "status": "ready"},
+    {"path": "#scaffold/0", "kind": "scaffold", "status": "ready"}])
+_bf_units = {u["kind"]: dict(u) for u in store.list_units(_bf_run)}
+for _u in _bf_units.values():
+    _u["output_dir"] = "Web"
+
+_FILES = [{"filename": "Web.csproj", "content": "<Project><ItemGroup>"
+           "<PackageReference Include=\"Microsoft.AspNetCore.Rewrite\" Version=\"8.0.0\" />"
+           "</ItemGroup></Project>"},
+          {"filename": "App.sln", "content": "Microsoft Visual Studio Solution File"},
+          {"filename": "HomeController.cs", "content": "public class HomeController {}"}]
+
+_bf_rejected = []
+_bf_placed = runner._place_artifacts(_bf_run, _bf_units["component"], _FILES, _bf_rejected)
+check("a component's own project file is refused",
+      [a["path"] for a in _bf_placed] == ["Web/HomeController.cs"],
+      str([a["path"] for a in _bf_placed]))
+check("and so is a solution file",
+      any(".sln" in r or "App.sln" in r for r in _bf_rejected), str(_bf_rejected))
+check("the refusal says where dependencies actually come from",
+      any("catalogue" in r or "derived from the code" in r for r in _bf_rejected),
+      str(_bf_rejected))
+check("the code it emitted alongside is still kept — one bad file, not a lost component",
+      any(a["path"].endswith("HomeController.cs") for a in _bf_placed))
+
+# The deterministic stages own these files and must still be able to write them, or the
+# scaffold could not produce a solution at all.
+_bf_scaffold = []
+check("the scaffold may write exactly the files a component may not",
+      len(runner._place_artifacts(_bf_run, _bf_units["scaffold"], _FILES, _bf_scaffold)) == 3,
+      str(_bf_scaffold))
+
+# ── A rule a compiler settles is a warning ─────────────────────────────────
+#
+# Every reason `_implausible_source` gives describes output no compiler would accept, and since
+# Phase 1 a real compiler reads every export. So the two mistakes cost very different amounts:
+# a miss costs one build round and comes back with a file and a line; a false positive costs
+# three conversions of the same unit and then fails the component, after which its source files
+# are converted by nobody. This rule was wrong twice in two live runs — nine conversion calls
+# and seven source files spent proving a compiler right.
+
+_SUBSTITUTED = [{"path": "A.cs", "content": "public class A { string s = 'hello world'; }"}]
+_rep = validation.validate_unit_output(_SUBSTITUTED, [], set())
+check("a delimiter the compiler will reject is reported, not fatal",
+      _rep["status"] == "warn", str(_rep["status"]))
+check("and it is still reported — demoted, not deleted",
+      any(i["check"] == "plausible" for i in _rep["issues"]), str(_rep["issues"]))
+
+# The hard-fail tier is what a compiler cannot catch, and it has to stay hard.
+check("an empty file is still a failure",
+      validation.validate_unit_output(
+          [{"path": "A.cs", "content": "   "}], [], set())["status"] == "fail")
+check("a reintroduced secret is still a failure",
+      "secret" in validation.validate_unit_output(
+          [{"path": "A.cs",
+            "content": 'class C { const string K = "AKIAIOSFODNN7EXAMPLE"; }'}],
+          [], set())["failed_checks"],
+      str(validation.validate_unit_output(
+          [{"path": "A.cs",
+            "content": 'class C { const string K = "AKIAIOSFODNN7EXAMPLE"; }'}],
+          [], set())["failed_checks"]))
+
+# ── A database context the container cannot build ──────────────────────────
+#
+# `AddDbContext<T>()` hands `T` exactly one argument, its options. A context asking for a
+# second — a connection string, a path, a clock — cannot be built that way. The solution still
+# compiles with zero errors, and the container throws "Unable to resolve service for type
+# 'System.String'" while validating, before the first request. That is what a live 45-file run
+# failed on after it had just built clean.
+
+for _name, _src, _buildable in (
+    ("options only", "public Ctx(DbContextOptions<Ctx> o) : base(o) {}", True),
+    ("options and a string", "public Ctx(DbContextOptions<Ctx> o, string p) : base(o) {}", False),
+    ("no constructor at all", "public DbSet<X> Xs { get; set; }", True),
+    ("one usable among several",
+     "public Ctx(DbContextOptions<Ctx> o, string p) : base(o) {} "
+     "public Ctx(DbContextOptions<Ctx> o) : base(o) {}", True),
+):
+    check(f"constructible — {_name}: {_buildable}",
+          wireup.dbcontext_is_constructible(
+              "public class Ctx : DbContext { " + _src + " }", "Ctx") is _buildable)
+
+_ctx_bad = [{"path": "I/Ctx.cs", "content": "namespace I; public class Ctx : DbContext { "
+             "public Ctx(DbContextOptions<Ctx> o, string path) : base(o) {} }"}]
+_plan_bad = wireup.host_plan(_ctx_bad, "I",
+                             {"data_access": "EF Core 8 with Microsoft.EntityFrameworkCore.Sqlite"})
+check("no registration is written for a context that cannot be constructed",
+      not [line for line in _plan_bad["services"] if "AddDbContext" in line],
+      str(_plan_bad["services"]))
+check("and the reason is stated where a human will read it",
+      "AddDbContext` cannot construct it" in (_plan_bad.get("db_note") or ""),
+      (_plan_bad.get("db_note") or "")[:120])
+
+_ctx_ok = [{"path": "I/Ctx.cs", "content": "namespace I; public class Ctx : DbContext { "
+            "public Ctx(DbContextOptions<Ctx> o) : base(o) {} }"}]
+check("an ordinary context is registered exactly as before",
+      any("AddDbContext<I.Ctx>" in line for line in wireup.host_plan(
+          _ctx_ok, "I",
+          {"data_access": "EF Core 8 with Microsoft.EntityFrameworkCore.Sqlite"})["services"]))
 
 
 
