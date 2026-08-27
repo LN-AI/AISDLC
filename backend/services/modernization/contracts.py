@@ -105,6 +105,35 @@ def describe_for_prompt(used: Dict[str, List[str]]) -> str:
     return "\n".join(lines)
 
 
+def risk(run_id: str, unit_id: str,
+         artifacts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """How exposed a rewrite of this unit is. -> `{symbols, files, paths}`.
+
+    Measured from the **converted** side, not the original source graph, and that choice is
+    the whole point. The source graph says how many old files included this one — a fact about
+    code that no longer exists. What matters is how many *emitted* files are already calling
+    names this unit chose, because those are the ones a rewrite can break, and only the
+    converted code knows what the converter decided to call things.
+
+    Zero on a first conversion: files are converted in dependency order, so nothing downstream
+    exists yet and the unit is free to name things however it likes. It becomes non-zero only
+    on a rework, which is exactly when the question is worth asking.
+    """
+    used = consumers(run_id, unit_id, artifacts)
+    files = sorted({path for paths in used.values() for path in paths})
+    return {"symbols": len(used), "files": len(files), "paths": files[:20]}
+
+
+def describe_risk(measure: Dict[str, Any]) -> str:
+    """One sentence for the run's own record. "" when nothing depends on this unit yet."""
+    if not measure.get("files"):
+        return ""
+    return (f"{measure['symbols']} name(s) this unit declares are already used by "
+            f"{measure['files']} converted file(s), so a rewrite here can break them: "
+            + ", ".join(p.rsplit("/", 1)[-1] for p in measure["paths"][:6])
+            + (" and others" if measure["files"] > 6 else ""))
+
+
 def withdrawn(previous: Dict[str, str], emitted: Iterable[Dict[str, Any]],
               used: Dict[str, List[str]]) -> List[Dict[str, Any]]:
     """Promises this rewrite broke. -> `[{symbol, was, now, used_by}]`.

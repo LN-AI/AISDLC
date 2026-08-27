@@ -2558,6 +2558,16 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # the call verifies, because a request can be ignored and arithmetic cannot.
         promised = contracts._own_symbols(run_id, unit["id"])
         being_used = contracts.consumers(run_id, unit["id"]) if promised else {}
+        if being_used:
+            # Recorded before the money is spent, because it is the one number that says how
+            # much of the run this rewrite is putting at risk — and it is only ever non-zero on
+            # a rework, so it costs nothing on the common path. A unit twelve files are calling
+            # is a different proposition from a leaf, and until now the log said the same thing
+            # about both.
+            store.append_event(
+                run_id, "rework_exposure",
+                contracts.describe_risk(contracts.risk(run_id, unit["id"]))[:400],
+                unit_id=unit["id"], level="info")
         with agent_guard.expect_calls(
                 llm_gateway.AGENTIC_MAX_TURNS + 1 if agentic else 1):
             result = agent_guard.guarded_call(

@@ -28,6 +28,8 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Set
 
+from backend.services.modernization import csharp_syntax
+
 from backend.services import guardrail_service
 
 logger = logging.getLogger(__name__)
@@ -329,6 +331,18 @@ def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
     # character, so `'hello world'` between single quotes in code does not compile, and no
     # amount of context makes it compile. Comments and strings are removed before looking, so
     # prose that quotes a word is never read as code.
+    # A real grammar, where one exists for this language. It settles what every rule around
+    # it can only guess at — truncation, an unclosed brace, a stray token — and it settles it
+    # here, with the file in hand and the retry immediate, rather than a build round later.
+    # Silent when the grammar is not installed, so this is additive: the heuristics below stay
+    # as the weaker net for languages that have no parser here.
+    for fault in csharp_syntax.faults(content, path):
+        issues.append({
+            "severity": "fail", "check": "syntax_cs",
+            "detail": csharp_syntax.describe([fault], path),
+        })
+        break
+
     illegal = _illegal_char_literal(content, ext)
     if illegal:
         issues.append({

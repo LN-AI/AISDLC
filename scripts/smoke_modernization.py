@@ -43,7 +43,7 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
-    contracts,
+    contracts, csharp_syntax,
     evidence, extraction_audit, graph, layering, lookup, ownership, parity, parity_tools,
     reconcile,
     repo_ingest, runner, rules as rules_module, runtime, sanity, scaffold, stages, store,
@@ -7206,9 +7206,15 @@ _c52 = ("public class HomeController : Controller { [Route('/index.php')] "
 # to be a single character or one escape, which is what the language permits and nothing more.
 # That is a fact rather than an opinion, so it can be fatal — and it catches strictly more than
 # the guess did, because a file with proper strings elsewhere used to be exempt entirely.
+# Two checks now catch this and both are right: the grammar refuses the file outright, and
+# the delimiter rule names *why* in words a retry can act on. Membership rather than equality,
+# so neither check can be silently lost by the other being there.
+_c52_verdict = _v("Web/HomeController.cs", _c52)
 check("the measured C-52 payload is still caught",
-      _v("Web/HomeController.cs", _c52) == ("fail", ["char_literal"]),
-      str(_v("Web/HomeController.cs", _c52)))
+      _c52_verdict[0] == "fail" and "char_literal" in _c52_verdict[1],
+      str(_c52_verdict))
+check("and the grammar refuses it independently of that rule",
+      "syntax_cs" in _c52_verdict[1], str(_c52_verdict))
 check("and the reason names the substitution, not just 'invalid'",
       any("character literal" in i["detail"]
           for i in validation.validate_artifact(
@@ -9993,12 +9999,21 @@ check("nor one inside a verbatim string",
 
 # The rule still has to catch what it was written for, or removing it would be simpler than
 # narrowing it.
+def _detail(content, check_name):
+    """The detail of one named check on one file, or "" — the order of issues is not a
+    contract, and asserting on `issues[0]` made it one."""
+    for issue in validation.validate_artifact(
+            {"path": "A.cs", "content": content})["issues"]:
+        if issue["check"] == check_name:
+            return issue["detail"]
+    return ""
+
+
 check("a substituted delimiter in real code is caught",
-      _chars("public class A { string s = 'hello world'; }") == ("fail", ["char_literal"]))
+      "char_literal" in _chars("public class A { string s = 'hello world'; }")[1])
 check("and the finding still quotes the offending text",
-      "hello world" in validation.validate_artifact(
-          {"path": "A.cs", "content": "public class A { string s = 'hello world'; }"}
-      )["issues"][0]["detail"])
+      "hello world" in _detail("public class A { string s = 'hello world'; }",
+                               "char_literal"))
 check("a genuine char literal was never the target and still is not",
       _chars("public class A { char c = 'x'; }") == ("pass", []))
 check("nor an escaped one, nor a unicode one",
@@ -10008,19 +10023,19 @@ check("nor an escaped one, nor a unicode one",
 # which had written one proper string knew what it was doing. That exemption is gone, and this
 # is the case it used to miss entirely.
 check("a substitution sitting beside a correct string is now caught too",
-      _chars('public class A { string a = "ok"; string b = \'hello world\'; }')
-      == ("fail", ["char_literal"]))
+      "char_literal" in _chars(
+          'public class A { string a = "ok"; string b = \'hello world\'; }')[1])
 check("a language that quotes strings either way is untouched by any of this",
       _chars("const s = 'hello world';\nfunction f() { return s; }", ".ts") == ("pass", []))
 
 # Comment-stripping must not swallow the code around it, or the rule would go quiet on files
 # it should still fail.
 check("code after a comment is still read",
-      _chars("// a note about 'x'\npublic class A { string s = 'hello world'; }")
-      == ("fail", ["char_literal"]))
+      "char_literal" in _chars(
+          "// a note about 'x'\npublic class A { string s = 'hello world'; }")[1])
 check("code before a comment is still read",
-      _chars("public class A { string s = 'hello world'; } // a note about 'x'")
-      == ("fail", ["char_literal"]))
+      "char_literal" in _chars(
+          "public class A { string s = 'hello world'; } // a note about 'x'")[1])
 
 
 
@@ -10321,6 +10336,119 @@ check("and one that opens new problems still loses to one that does not",
           {"id": "seam:A->B", "feasible": True, "closes": [1], "opens": [9]},
           {"id": "merge:A->B", "feasible": True, "closes": [1], "opens": []}]}})[0]["id"]
       == "merge:A->B")
+
+
+
+section("72. A grammar for the language we write, not only the one we read")
+
+# ── The asymmetry nobody had noticed ───────────────────────────────────────
+#
+# The *source* language is parsed properly: `analyzers/php.py` runs a real tree-sitter grammar
+# over every PHP file, with a regex analyzer behind it as a fail-open fallback. The *target*
+# language had nothing — every structural check on emitted C# was a hand-written guess about
+# what broken output looks like, and two of those guesses cost three components and seven
+# source files on a live run by being confidently wrong about a doc comment.
+#
+# The same mechanism, pointed the other way. It answers syntax exactly: truncation, an unclosed
+# brace, a substituted delimiter, a stray token. It says nothing about *meaning* — a missing
+# import, a type that does not exist, a method called with the wrong arguments all parse
+# perfectly, and that is the compiler's job, which still runs on every export. The division is
+# the point: syntax is settled here in microseconds with the file in hand and the retry
+# immediate; meaning is settled by the only thing entitled to settle it.
+
+check("the grammar is installed and loads", csharp_syntax.available(),
+      csharp_syntax.load_error())
+
+for _name, _code in (
+    ("an ordinary class", "namespace A;\npublic class B { public int X { get; set; } }"),
+    ("a record and a collection expression",
+     "public record E(int Id, string Name);\npublic class A { int[] xs = []; }"),
+    ("top-level statements", "var b = X.Create(args);\nb.Run();"),
+    ("a raw string literal", 'public class A { string s = """hello"""; }'),
+    ("generics and nullable annotations",
+     "public class A<T> where T : class { T? x; List<int>? y; }"),
+    ("a doc comment quoting a value",
+     "/// <summary>the 'admin' role</summary>\npublic class A { public int X { get; init; } }"),
+):
+    check(f"valid C# parses — {_name}",
+          not csharp_syntax.faults(_code, "A.cs"),
+          str(csharp_syntax.faults(_code, "A.cs")))
+
+for _name, _code in (
+    ("a file cut off mid-statement", "public class A { public void M() { if (x) {"),
+    ("an unclosed brace", "namespace A;\npublic class B { public int X;"),
+    ("substituted string delimiters", "public class A { string s = 'hello world'; }"),
+):
+    check(f"broken C# is caught — {_name}",
+          bool(csharp_syntax.faults(_code, "A.cs")),
+          "a grammar should not accept this")
+
+check("the message says which line, and that it is a grammar rather than a guess",
+      "line" in csharp_syntax.describe(
+          csharp_syntax.faults("namespace A;\npublic class B { public int X;", "A.cs"), "A.cs")
+      and "not a heuristic" in csharp_syntax.describe(
+          csharp_syntax.faults("namespace A;\npublic class B { public int X;", "A.cs"), "A.cs"))
+
+# Scope and safety. A grammar we do not have must never fail a file, and a language it is not
+# for must never be judged by it — a check that can fail the thing it watches is worse than no
+# check (D-101), which is why the PHP analyzer fails open too.
+check("a file in another language is not judged by this grammar",
+      not csharp_syntax.faults("x = 'y'", "a.py")
+      and not csharp_syntax.faults("<?php $x = 'y';", "a.php"))
+check("an empty file is not a syntax error",
+      not csharp_syntax.faults("   ", "A.cs"))
+check("only the first few faults are reported, not the resynchronisation after them",
+      len(csharp_syntax.faults("public class A { " + "if (x) { " * 40, "A.cs"))
+      <= csharp_syntax.MAX_REPORTED)
+
+# And it reaches the check that runs on every emitted file.
+_bad = validation.validate_artifact(
+    {"path": "A.cs", "content": "public class A { public void M() { if (x) {"})
+check("a file that does not parse fails validation",
+      _bad["status"] == "fail"
+      and "syntax_cs" in [i["check"] for i in _bad["issues"]],
+      str([i["check"] for i in _bad["issues"]]))
+check("and one that parses is untouched by it",
+      "syntax_cs" not in [i["check"] for i in validation.validate_artifact(
+          {"path": "A.cs", "content": "namespace A;\npublic class B { public int X; }"}
+      )["issues"]])
+
+# ── How exposed a rewrite is, measured on the converted side ───────────────
+#
+# The source graph says how many old files included this one — a fact about code that no longer
+# exists. What matters is how many *emitted* files already call names this unit chose, because
+# those are the ones a rewrite can break, and only the converted code knows what the converter
+# decided to call things. Zero on a first conversion, since files convert in dependency order
+# and nothing downstream exists yet; non-zero only on a rework, which is when the question is
+# worth asking at all.
+
+_rk_run = store.create_run("risk", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rk_run, [
+    {"path": "#component/svc", "kind": "component", "component_name": "svc", "status": "ready"},
+    {"path": "#component/a", "kind": "component", "component_name": "a", "status": "ready"},
+    {"path": "#component/b", "kind": "component", "component_name": "b", "status": "ready"}])
+_rk = {u["component_name"]: u for u in store.list_units(_rk_run, kind="component")}
+store.complete_unit(_rk["svc"]["id"], _rk_run,
+                    [{"path": "Svc/PayrollService.cs",
+                      "content": "public class PayrollService { public void Run() {} }"}],
+                    [{"name": "PayrollService", "signature": "class PayrollService"}],
+                    event_detail="ok")
+check("a unit nothing has been converted against yet carries no exposure",
+      contracts.risk(_rk_run, _rk["svc"]["id"])["files"] == 0)
+
+for _who in ("a", "b"):
+    store.complete_unit(_rk[_who]["id"], _rk_run,
+                        [{"path": f"Web/{_who}Controller.cs",
+                          "content": "public class C { PayrollService s; }"}],
+                        [], event_detail="ok")
+_measure = contracts.risk(_rk_run, _rk["svc"]["id"])
+check("once two converted files call it, the exposure is two files",
+      _measure["files"] == 2 and _measure["symbols"] == 1, str(_measure))
+check("and the sentence names them, so the log says which rewrite was dangerous",
+      "aController.cs" in contracts.describe_risk(_measure),
+      contracts.describe_risk(_measure))
+check("nothing exposed produces no sentence",
+      contracts.describe_risk({"symbols": 0, "files": 0, "paths": []}) == "")
 
 
 

@@ -35,3 +35,9 @@ litellm<1.92.0
 #     rather than merely intended.
 tree-sitter>=0.23,<0.26
 tree-sitter-php>=0.23,<0.25
+# The same mechanism pointed at the *target* language. Every structural check on
+# emitted C# was a hand-written guess until this went in; a grammar answers exactly.
+# Ships prebuilt Windows wheels, like `tree-sitter-php` and unlike the Rust
+# extensions noted above, so it needs no MSVC toolchain. Optional at runtime:
+# `csharp_syntax` fails open and the older heuristics remain underneath.
+tree-sitter-c-sharp>=0.23,<0.25
