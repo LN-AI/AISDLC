@@ -71,13 +71,58 @@ _SOURCE_SUFFIXES = {".cs", ".vb", ".java", ".kt", ".kts", ".scala", ".ts", ".js"
 # either, and `.vb`, where `'` opens a comment.
 _CHAR_LITERAL_SUFFIXES = {".cs", ".java", ".kt", ".kts", ".scala", ".go"}
 
-# `'x'` and `'\n'` are legitimate char literals, so the bar sits above both.
-_SINGLE_QUOTED_RUN = re.compile(r"'(?:[^'\\\n]|\\.){3,}'")
+# Anything between single quotes, however long. What is *inside* decides whether it is legal,
+# so this deliberately does not try to encode the rule in the match.
+_SINGLE_QUOTED_RUN = re.compile(r"'(?:\\.|[^'\\\n])*'")
 
-# Comments, for the rule below only. A `//` inside a string is not a comment, so strings are
-# consumed by the same pass rather than scanned round — but a file that reaches this rule has
-# no double-quoted strings by definition, which is why the cheap version is enough here.
-_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
+# What a character literal may legally hold: exactly one character, or one escape. Anything
+# else between single quotes in these languages does not compile — and that is a fact about the
+# language, not an opinion about the code.
+_LEGAL_CHAR = re.compile(
+    r"^(?:[^'\\]"
+    r"|\\['\"\\0abfnrtv]"
+    r"|\\x[0-9a-fA-F]{1,4}"
+    r"|\\u[0-9a-fA-F]{4}"
+    r"|\\U[0-9a-fA-F]{8})$")
+
+# Everything that is not code: both comment forms, and every way this language family writes a
+# string — raw, verbatim, and ordinary. Single-quoted runs are deliberately **not** included,
+# because they are what the rule below is looking for.
+#
+# Reusing `usings._NON_CODE` minus its char alternative rather than writing a second, weaker
+# stripper: this repo has had two scanners disagree about what a comment is before, and the
+# whole precision of this rule rests on knowing exactly which text is code.
+_NOT_CODE = re.compile(
+    r'"""(?:.|\n)*?"""'
+    r'|@"(?:[^"]|"")*"'
+    r'|"(?:\\.|[^"\\])*"'
+    r"|//[^\n]*"
+    r"|/\*(?:.|\n)*?\*/",
+    re.MULTILINE,
+)
+
+
+def _code_only(text: str) -> str:
+    """`text` with comments and strings blanked out, line structure preserved."""
+    return _NOT_CODE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text or "")
+
+
+def _illegal_char_literal(text: str, ext: str) -> str:
+    """The first single-quoted run that cannot be a character literal, or "".
+
+    This is the one rule here that is **exact**. In these languages `'` delimits a single
+    character, so `'hello world'` does not compile — regardless of what else the file
+    contains. The rule it replaces guessed at the same thing from statistics: it fired only
+    when a file held no double quotes anywhere, on the theory that a model which had written a
+    proper string elsewhere probably knew what it was doing.
+    """
+    if ext not in _CHAR_LITERAL_SUFFIXES:
+        return ""
+    for match in _SINGLE_QUOTED_RUN.finditer(_code_only(text)):
+        inner = match.group(0)[1:-1]
+        if not _LEGAL_CHAR.match(inner):
+            return match.group(0)
+    return ""
 
 # Under these, an unremarkable file trips the signal: `namespace X;` plus a one-line class has
 # no indentation, and a using-only file has no newline worth speaking of. Measured against the
@@ -231,23 +276,6 @@ def _implausible_source(text: str, ext: str) -> List[str]:
             f"None of the {len(lines)} non-empty lines is indented, though the file opens a "
             f"block. A nested declaration is always indented by whatever wrote it as code.")
 
-    if ext in _CHAR_LITERAL_SUFFIXES and '"' not in text:
-        # Comments first. A view-model with no string literals at all legitimately has no
-        # double quotes, and prose in an XML doc comment legitimately quotes a value:
-        #
-        #     /// <summary>True when the current user holds the 'admin' role.</summary>
-        #
-        # That is valid C# and this rule failed it three times, then failed the component, on
-        # three separate view components of one live run — nine conversion calls spent, three
-        # components dead and seven source files never converted. The signal was only ever
-        # about *code*, and a comment is not code. Found by reading the rejected output the
-        # run now keeps (D-159); before that, the verdict was all there was to go on.
-        match = _SINGLE_QUOTED_RUN.search(_COMMENT.sub(" ", text))
-        if match:
-            reasons.append(
-                f"The file holds no double quotes at all but contains {match.group(0)[:40]!r}. "
-                f"In this language that is a character literal, not a string, so the file "
-                f"cannot compile — the string delimiters were substituted.")
     return reasons
 
 
@@ -294,6 +322,22 @@ def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
         # The hard-fail tier is for what a compiler cannot catch: a reintroduced secret, a
         # blocked hazard, an empty or placeholder file, a real parse failure.
         issues.append({"severity": "warn", "check": "plausible", "detail": detail})
+
+    # The exact one, and therefore the fatal one. `_implausible_source` above reasons about the
+    # *shape* of a file — one long line, nothing indented — and shape is circumstantial: a flat
+    # module legitimately has neither. This reasons about the language: `'` delimits a single
+    # character, so `'hello world'` between single quotes in code does not compile, and no
+    # amount of context makes it compile. Comments and strings are removed before looking, so
+    # prose that quotes a word is never read as code.
+    illegal = _illegal_char_literal(content, ext)
+    if illegal:
+        issues.append({
+            "severity": "fail", "check": "char_literal",
+            "detail": (f"{illegal[:40]!r} is written between single quotes where code "
+                       f"expects them to hold one character. In this language that is a "
+                       f"character literal, not a string, so the file cannot compile — the "
+                       f"string delimiters were substituted."),
+        })
 
     if ext == ".py":
         for detail in _python_syntax(content):

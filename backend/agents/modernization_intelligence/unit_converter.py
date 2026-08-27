@@ -235,6 +235,7 @@ class UnitConverterAgent(BaseAgent):
         source_facts: Optional[List[Dict[str, Any]]] = None,
         build_diagnostics: str = "",
         prior_findings: str = "",
+        load_bearing: str = "",
         lookup_tools: Optional[List[Dict[str, Any]]] = None,
         lookup_dispatch=None,
     ) -> Dict[str, Any]:
@@ -255,7 +256,7 @@ class UnitConverterAgent(BaseAgent):
             in_cycle_with=in_cycle_with or [], redactions=redactions or [],
             placement=placement or {}, members=members or [],
             source_facts=source_facts or [], build_diagnostics=build_diagnostics,
-            prior_findings=prior_findings,
+            prior_findings=prior_findings, load_bearing=load_bearing,
         )
         # With lookups, the same forced-tool contract with a bounded number of read-only
         # questions in front of it. Without them, byte-identical to what this has always
@@ -378,6 +379,7 @@ def _build_user_message(
     source_facts: Optional[List[Dict[str, Any]]] = None,
     build_diagnostics: str = "",
     prior_findings: str = "",
+    load_bearing: str = "",
 ) -> str:
     """Everything that varies per unit. Kept out of the system prompt so it cannot
     invalidate the cached prefix."""
@@ -503,6 +505,15 @@ def _build_user_message(
         # invite it to "fix" behaviour drift by making the code compile, which it already
         # does.
         parts.append(prior_findings)
+
+    if load_bearing:
+        # Which of this unit's own names other converted files already call. Empty on a first
+        # conversion — nothing downstream exists yet — so this only ever appears on a rework,
+        # which is exactly when a rename is expensive. The converter is otherwise never told
+        # who depends on it: dependencies are tracked one way and breakage travels the other,
+        # and that asymmetry is what let one reopened file put one detail wrong in twenty-two
+        # places on a live run.
+        parts.append(load_bearing)
 
     if redactions:
         categories = sorted({r.get("category", "secret") for r in redactions})

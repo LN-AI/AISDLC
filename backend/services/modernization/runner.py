@@ -36,6 +36,7 @@ from backend.agents.modernization_intelligence.architect_agent import TargetArch
 from backend.agents.modernization_intelligence.unit_converter import UnitConverterAgent
 from backend.services import agent_guard, guardrail_service, llm_gateway
 from backend.services.modernization import charter as charter_module
+from backend.services.modernization import contracts
 from backend.services.modernization import (
     analyzers, architecture, build_results, comprehension, estimate, evidence,
     extraction_audit, graph, layering, lookup, ownership, parity, playbooks, reconcile,
@@ -2550,6 +2551,13 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # **reservation**, which is sized from a per-product call count that assumes one
         # (D-20, D-46). This is the mechanism D-25 built for exactly that discovery — the
         # real number is only known here, deep inside, and the guard is taken at the door.
+        # What this unit's own names are already being used for, and by whom. Empty on a
+        # first conversion — nothing downstream has been written yet — so this costs nothing
+        # on the common path and appears only on a rework, which is when a rename is
+        # expensive. Half a request and half a guarantee: this half asks, and the check after
+        # the call verifies, because a request can be ignored and arithmetic cannot.
+        promised = contracts._own_symbols(run_id, unit["id"])
+        being_used = contracts.consumers(run_id, unit["id"]) if promised else {}
         with agent_guard.expect_calls(
                 llm_gateway.AGENTIC_MAX_TURNS + 1 if agentic else 1):
             result = agent_guard.guarded_call(
@@ -2571,6 +2579,7 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                     source_facts=source_facts,
                     build_diagnostics=build_diagnostics,
                     prior_findings=prior_findings,
+                    load_bearing=contracts.describe_for_prompt(being_used),
                     lookup_tools=lookup_tools,
                     lookup_dispatch=lookup_dispatch,
                 ),
@@ -2708,6 +2717,27 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         safe_artifacts, result.get("references") or [], known,
         hazard_kinds=hazard_kinds, manual_followup=result.get("manual_followup") or [],
     )
+
+    # A promise broken is a build error we can see before building. `semantics.check` below
+    # asks whether the translation is faithful to its own source; this asks whether it is still
+    # compatible with everything already converted around it — the direction nothing else in
+    # the pipeline looks in. Only names somebody is actually calling are considered, so a unit
+    # is still free to stop exporting something nobody used.
+    broken_promises = contracts.withdrawn(promised, symbols, being_used)
+    if broken_promises:
+        detail = contracts.describe_breakage(broken_promises)
+        store.set_unit_meta(unit["id"], {"broken_promises": broken_promises[:20]})
+        store.record_rejected_artifacts(unit["id"], run_id, safe_artifacts, detail)
+        store.append_event(run_id, "contract_broken", detail[:400],
+                           unit_id=unit["id"], level="error")
+        # Retryable, and the reason goes into the next attempt through the same channel the
+        # compiler's own errors use. The alternative — accepting it and letting the build find
+        # out — is what produced a 3 -> 22 error round on a live run, where one rewrite put one
+        # detail wrong in twenty-two dependent places and nothing noticed until the compiler
+        # counted them.
+        store.fail_unit(unit["id"], run_id, detail[:400], terminal=False,
+                        max_attempts=MAX_UNIT_ATTEMPTS)
+        return "failed"
 
     if report["status"] == "fail":
         detail = "; ".join(i["detail"] for i in report["issues"] if i["severity"] == "fail")[:400]

@@ -43,6 +43,7 @@ from backend.services import finding_pipeline  # noqa: E402
 from backend.services.subject_service import Subject  # noqa: E402
 from backend.services.modernization import (  # noqa: E402
     analyzers, architecture as _architecture, build_results, charter, comprehension,
+    contracts,
     evidence, extraction_audit, graph, layering, lookup, ownership, parity, parity_tools,
     reconcile,
     repo_ingest, runner, rules as rules_module, runtime, sanity, scaffold, stages, store,
@@ -50,6 +51,7 @@ from backend.services.modernization import (  # noqa: E402
     validation, wireup,
 )
 from backend.agents.modernization_intelligence import architect_agent  # noqa: E402
+from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.agents.modernization_intelligence import comprehension_agent  # noqa: E402
 from backend.agents.modernization_intelligence import unit_converter  # noqa: E402
 from backend.services.modernization.scaffold import php_compat  # noqa: E402
@@ -7195,15 +7197,17 @@ def _v(path, content):
 _c52 = ("public class HomeController : Controller { [Route('/index.php')] "
         "public IActionResult Index() { ViewData['Title'] = 'Legacy Employee Portal'; "
         "return View(); } }")
-# `warn`, not `fail`, since two live runs measured what the two mistakes actually cost. A
-# miss costs one build round and comes back with a file and a line, routed to the component
-# that wrote it. A false positive costs three conversions of the same unit and then fails the
-# component, after which its source files are converted by nobody at all — and this rule was
-# wrong twice: once on the small app, and once on three view components whose only single
-# quotes were inside `/// <summary>` prose. The payload below is still caught; what changed is
-# who settles it, and since Phase 1 that is a real compiler on every export.
+# Fatal again, and by a different route. Demoting this to a warning was the response to the
+# rule being *imprecise* — it guessed at "did the model get confused" from whether the file
+# held any double quotes, and rejected three view components whose only single quotes were
+# inside `/// <summary>` prose. The answer to an imprecise rule is not a quieter rule.
+#
+# It is now exact: comments and strings are removed, and what remains between single quotes has
+# to be a single character or one escape, which is what the language permits and nothing more.
+# That is a fact rather than an opinion, so it can be fatal — and it catches strictly more than
+# the guess did, because a file with proper strings elsewhere used to be exempt entirely.
 check("the measured C-52 payload is still caught",
-      _v("Web/HomeController.cs", _c52) == ("warn", ["plausible"]),
+      _v("Web/HomeController.cs", _c52) == ("fail", ["char_literal"]),
       str(_v("Web/HomeController.cs", _c52)))
 check("and the reason names the substitution, not just 'invalid'",
       any("character literal" in i["detail"]
@@ -7258,9 +7262,9 @@ check("a nesting file with no indentation anywhere is caught on that alone",
 # entitled to say so.
 _c52_report = validation.validate_unit_output(
     [{"path": "Web/HomeController.cs", "content": _c52}], [], set())
-check("it reaches the unit report, so a reader is still told",
-      _c52_report["status"] == "warn"
-      and "plausible" in [i["check"] for i in _c52_report["issues"]],
+check("it reaches the unit report as a failure, so the retry is not byte-identical",
+      _c52_report["status"] == "fail"
+      and "char_literal" in [i["check"] for i in _c52_report["issues"]],
       str(_c52_report["status"]))
 check("the reason survives into the report rather than being reduced to a severity",
       any("character literal" in i["detail"] for i in _c52_report["issues"]),
@@ -9968,42 +9972,55 @@ _VIEWMODEL = (
     "    public bool IsAdmin { get; init; }\n"
     "}")
 
+def _chars(content, ext=".cs"):
+    """The verdict and the checks that produced it, for one file."""
+    out = validation.validate_artifact({"path": "A" + ext, "content": content})
+    return out["status"], [i["check"] for i in out["issues"]]
+
+
 check("a view-model whose only single quotes are in doc comments passes",
-      not validation._implausible_source(_VIEWMODEL, ".cs"),
-      str(validation._implausible_source(_VIEWMODEL, ".cs")))
+      _chars(_VIEWMODEL) == ("pass", []), str(_chars(_VIEWMODEL)))
 check("a line comment is not code either",
-      not validation._implausible_source(
-          "// status is 'present' today\npublic class A { public int X; }", ".cs"))
+      _chars("// status is 'present' today\npublic class A { public int X; }")
+      == ("pass", []))
 check("nor is a block comment",
-      not validation._implausible_source(
-          "/* maps 'admin' onto a role */\npublic class A { public int X; }", ".cs"))
+      _chars("/* maps 'admin' onto a role */\npublic class A { public int X; }")
+      == ("pass", []))
+check("nor an apostrophe inside an ordinary string",
+      _chars('public class A { string s = "it\'s fine, really truly"; }') == ("pass", []))
+check("nor one inside a verbatim string",
+      _chars('public class A { string s = @"it\'s fine, really"; }') == ("pass", []))
 
 # The rule still has to catch what it was written for, or removing it would be simpler than
 # narrowing it.
-check("a substituted delimiter in real code is still caught",
-      validation._implausible_source(
-          "public class A { string s = 'hello world'; }", ".cs"),
-      "this cannot compile and must still fail")
+check("a substituted delimiter in real code is caught",
+      _chars("public class A { string s = 'hello world'; }") == ("fail", ["char_literal"]))
 check("and the finding still quotes the offending text",
-      "hello world" in validation._implausible_source(
-          "public class A { string s = 'hello world'; }", ".cs")[0])
+      "hello world" in validation.validate_artifact(
+          {"path": "A.cs", "content": "public class A { string s = 'hello world'; }"}
+      )["issues"][0]["detail"])
 check("a genuine char literal was never the target and still is not",
-      not validation._implausible_source("public class A { char c = 'x'; }", ".cs"))
-check("a file that has proper strings is out of scope entirely",
-      not validation._implausible_source(
-          'public class A { string s = "admin"; /* the \'admin\' role */ }', ".cs"))
-check("a language without char literals is untouched by any of this",
-      not validation._implausible_source(
-          "const s = 'hello world';\nfunction f() { return s; }", ".ts"))
+      _chars("public class A { char c = 'x'; }") == ("pass", []))
+check("nor an escaped one, nor a unicode one",
+      _chars("public class A { char n = '\\n'; char q = '\\''; char u = '\\u0041'; }")
+      == ("pass", []))
+# The old rule exempted any file that used double quotes anywhere, on the theory that a model
+# which had written one proper string knew what it was doing. That exemption is gone, and this
+# is the case it used to miss entirely.
+check("a substitution sitting beside a correct string is now caught too",
+      _chars('public class A { string a = "ok"; string b = \'hello world\'; }')
+      == ("fail", ["char_literal"]))
+check("a language that quotes strings either way is untouched by any of this",
+      _chars("const s = 'hello world';\nfunction f() { return s; }", ".ts") == ("pass", []))
 
 # Comment-stripping must not swallow the code around it, or the rule would go quiet on files
 # it should still fail.
 check("code after a comment is still read",
-      validation._implausible_source(
-          "// a note about 'x'\npublic class A { string s = 'hello world'; }", ".cs"))
+      _chars("// a note about 'x'\npublic class A { string s = 'hello world'; }")
+      == ("fail", ["char_literal"]))
 check("code before a comment is still read",
-      validation._implausible_source(
-          "public class A { string s = 'hello world'; } // a note about 'x'", ".cs"))
+      _chars("public class A { string s = 'hello world'; } // a note about 'x'")
+      == ("fail", ["char_literal"]))
 
 
 
@@ -10116,9 +10133,15 @@ check("the scaffold may write exactly the files a component may not",
 # are converted by nobody. This rule was wrong twice in two live runs — nine conversion calls
 # and seven source files spent proving a compiler right.
 
-_SUBSTITUTED = [{"path": "A.cs", "content": "public class A { string s = 'hello world'; }"}]
-_rep = validation.validate_unit_output(_SUBSTITUTED, [], set())
-check("a delimiter the compiler will reject is reported, not fatal",
+# The *shape* heuristics stay advisory — a file that is one long line, or that indents
+# nothing, is circumstantial and a compiler settles it. The delimiter rule left that tier
+# when it stopped guessing and became exact: see section 68.
+_SHAPE = [{"path": "A.cs", "content": "\n".join([
+    "namespace A;", "public class B", "{", "public int X { get; set; }",
+    "public int Y { get; set; }", "public int Z { get; set; }",
+    "public void M() { }", "public void N() { }", "}"])}]
+_rep = validation.validate_unit_output(_SHAPE, [], set())
+check("a shape the compiler will settle is reported, not fatal",
       _rep["status"] == "warn", str(_rep["status"]))
 check("and it is still reported — demoted, not deleted",
       any(i["check"] == "plausible" for i in _rep["issues"]), str(_rep["issues"]))
@@ -10174,6 +10197,130 @@ check("an ordinary context is registered exactly as before",
       any("AddDbContext<I.Ctx>" in line for line in wireup.host_plan(
           _ctx_ok, "I",
           {"data_access": "EF Core 8 with Microsoft.EntityFrameworkCore.Sqlite"})["services"]))
+
+
+
+section("71. What a unit promised the rest of the run")
+
+# ── The direction nothing was looking in ───────────────────────────────────
+#
+# The converter sees its own source, a summary of what it depends on, and — on a rework — what
+# the compiler said. It is never shown who depends on **it**. Dependencies are tracked one way;
+# breakage travels the other. So when a reopened unit renames one of its own methods, the files
+# calling that method are not reopened, not consulted, and never told anyone was watching.
+#
+# That is the shape behind a measured 3 -> 7 -> **22** -> 2 -> 1 error sequence on a live run:
+# one rewrite putting one detail wrong in twenty-two dependent places. The error count is a
+# poor proxy for it — a genuine restructuring legitimately gets worse before it gets better —
+# and "did this withdraw something another file already uses" is the question itself, checkable
+# from the emitted text without asking anyone.
+
+_PREV = {"EmployeeService.GetEmployee": "Task<Employee> GetEmployee(int id)",
+         "EmployeeService.Unused": "void Unused()"}
+_USED = {"GetEmployee": ["Web/EmployeeController.cs", "Web/DashboardController.cs"]}
+
+check("a rewrite that keeps its promises passes",
+      contracts.withdrawn(
+          _PREV, [{"name": "EmployeeService.GetEmployee",
+                   "signature": "Task<Employee> GetEmployee(int id)"}], _USED) == [])
+check("a renamed method that others call is caught",
+      [b["symbol"] for b in contracts.withdrawn(
+          _PREV, [{"name": "EmployeeService.FindEmployee",
+                   "signature": "Task<Employee> FindEmployee(int id)"}], _USED)]
+      == ["EmployeeService.GetEmployee"])
+# A kept name with a changed shape breaks its callers exactly as thoroughly, and is harder to
+# see — which is why the signature is compared and not just the name.
+check("a signature changed under the same name is caught too",
+      [(b["was"], b["now"]) for b in contracts.withdrawn(
+          _PREV, [{"name": "EmployeeService.GetEmployee",
+                   "signature": "Task<Employee> GetEmployee(string id)"}], _USED)]
+      == [("Task<Employee> GetEmployee(int id)", "Task<Employee> GetEmployee(string id)")])
+# And a unit stays free to improve. Dropping something nobody calls is ordinary tidying, and a
+# check that prevented it would be the thing stopping conversions from getting better.
+check("dropping a name nobody uses is not a broken promise",
+      contracts.withdrawn(_PREV, [{"name": "EmployeeService.GetEmployee",
+                                   "signature": "Task<Employee> GetEmployee(int id)"}],
+                          _USED) == [])
+check("the message names what went and who is left holding a reference",
+      all(word in contracts.describe_breakage(contracts.withdrawn(
+          _PREV, [{"name": "X.Y", "signature": "void Y()"}], _USED))
+          for word in ("GetEmployee", "EmployeeController.cs", "no longer declared")))
+check("nothing broken produces no message",
+      contracts.describe_breakage([]) == "")
+
+# ── Telling it before, as well as checking after ───────────────────────────
+#
+# The check is the guarantee; this is the request that keeps the guarantee from having to fire.
+_prompt = contracts.describe_for_prompt(_USED)
+check("the constraint names the symbol and where it is used",
+      "GetEmployee" in _prompt and "EmployeeController.cs" in _prompt, _prompt[:120])
+check("and says plainly that everything else is still open",
+      "yours to change" in _prompt, _prompt[:200])
+check("a first conversion constrains nothing, because nothing downstream exists yet",
+      contracts.describe_for_prompt({}) == "")
+check("the constraint reaches the converter's message",
+      "GetEmployee" in unit_converter._build_user_message(
+          source="<?php", path="a.php", dependency_symbols=[], module_type="",
+          language="php", in_cycle_with=[], redactions=[], load_bearing=_prompt))
+
+# Read from the emitted code of *other* units, so it reflects what was written rather than what
+# anyone claimed — and a unit referring to its own types promises nobody anything.
+_ct_run = store.create_run("contracts", ".NET 8", "files", created_by="smoke")
+store.insert_units(_ct_run, [
+    {"path": "#component/svc", "kind": "component", "component_name": "svc", "status": "ready"},
+    {"path": "#component/web", "kind": "component", "component_name": "web", "status": "ready"}])
+_ct = {u["component_name"]: u for u in store.list_units(_ct_run, kind="component")}
+store.complete_unit(_ct["svc"]["id"], _ct_run,
+                    [{"path": "Svc/EmployeeService.cs",
+                      "content": "public class EmployeeService { public void GetEmployee() {} }"}],
+                    [{"name": "EmployeeService", "signature": "class EmployeeService"}],
+                    event_detail="ok")
+store.complete_unit(_ct["web"]["id"], _ct_run,
+                    [{"path": "Web/Controller.cs",
+                      "content": "public class Controller { EmployeeService s; }"}],
+                    [], event_detail="ok")
+_found = contracts.consumers(_ct_run, _ct["svc"]["id"])
+check("a name another unit's emitted code uses is found",
+      list(_found) == ["EmployeeService"], str(_found))
+check("and the file using it is named",
+      _found.get("EmployeeService") == ["Web/Controller.cs"], str(_found))
+check("a unit that has converted nothing yet promises nothing",
+      contracts.consumers(_ct_run, "no-such-unit") == {})
+
+# ── A boundary dissolved because of a letter ───────────────────────────────
+#
+# On the 45-file run all four feasible layout repairs scored identically — closes 1, opens 0 —
+# so the ordering fell through to the id, and `merge:...` sorted before `seam:...`. Two
+# projects were folded into one because of alphabetical order. A merge is sometimes right; it
+# should not win by accident.
+_TIED = {"payload": {"repairs": [
+    {"id": "allow:App->Web", "feasible": False, "closes": [], "opens": []},
+    {"id": "seam:App->Web", "feasible": True, "closes": [1], "opens": []},
+    {"id": "merge:App->Web", "feasible": True, "closes": [1], "opens": []},
+    {"id": "merge:Infra->Web", "feasible": True, "closes": [1], "opens": []},
+]}}
+check("a seam beats a merge that closes the same and opens the same",
+      _driver.feasible_repairs(_TIED)[0]["id"] == "seam:App->Web",
+      str([r["id"] for r in _driver.feasible_repairs(_TIED)]))
+check("the ranking is seam, then allow, then merge",
+      [r["id"].split(":")[0] for r in _driver.feasible_repairs(
+          {"payload": {"repairs": [
+              {"id": "merge:A->B", "feasible": True, "closes": [1], "opens": []},
+              {"id": "allow:A->B", "feasible": True, "closes": [1], "opens": []},
+              {"id": "seam:A->B", "feasible": True, "closes": [1], "opens": []}]}})]
+      == ["seam", "allow", "merge"])
+# Architecture is the tie-break, never the first term: a repair that closes more of the problem
+# still wins, because a layout that does not build is worse than one that is less tidy.
+check("a merge that closes more still beats a seam that closes less",
+      _driver.feasible_repairs({"payload": {"repairs": [
+          {"id": "seam:A->B", "feasible": True, "closes": [1], "opens": []},
+          {"id": "merge:A->B", "feasible": True, "closes": [1, 2], "opens": []}]}})[0]["id"]
+      == "merge:A->B")
+check("and one that opens new problems still loses to one that does not",
+      _driver.feasible_repairs({"payload": {"repairs": [
+          {"id": "seam:A->B", "feasible": True, "closes": [1], "opens": [9]},
+          {"id": "merge:A->B", "feasible": True, "closes": [1], "opens": []}]}})[0]["id"]
+      == "merge:A->B")
 
 
 

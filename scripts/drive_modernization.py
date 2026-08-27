@@ -62,13 +62,31 @@ def feasible_repairs(point):
     unattended run converted into a layout the product had already told it would not build,
     and then spent the attempt budget discovering that one component at a time.
 
-    Ordered by what closes most and opens least, so `--repair best` means something defensible
-    rather than "the first one".
+    Ordered by what closes most and opens least, then by **what it costs the architecture** —
+    and that third term is not a nicety. On a live 45-file run all four feasible repairs scored
+    identically at "closes 1, opens 0", so the ordering fell through to the id, and
+    `merge:...` beat `seam:...` alphabetically. A boundary between two projects was dissolved
+    because of a letter.
+
+    The ranking, cheapest first:
+
+      * `seam` — declare an interface on one side, implement it on the other. The layering rule
+        survives intact and the crossing becomes a named, deliberate thing.
+      * `allow` — permit this one reference. The rule is relaxed for a single edge and stays
+        everywhere else.
+      * `merge` — fold two projects into one. The conflict cannot recur because the boundary no
+        longer exists, which is also the problem: it is the customer's architecture being spent
+        to buy a build.
+
+    A merge is sometimes genuinely right. It should not win by accident.
     """
+    rank = {"seam": 0, "allow": 1, "merge": 2}
     repairs = [r for r in ((point.get("payload") or {}).get("repairs") or [])
                if r.get("feasible") and r.get("id")]
     return sorted(repairs, key=lambda r: (-len(r.get("closes") or []),
-                                          len(r.get("opens") or []), r["id"]))
+                                          len(r.get("opens") or []),
+                                          rank.get(str(r["id"]).split(":", 1)[0], 3),
+                                          r["id"]))
 
 
 class Client:
