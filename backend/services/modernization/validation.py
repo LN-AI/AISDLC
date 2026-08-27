@@ -26,7 +26,9 @@ import ast
 import logging
 import os
 import re
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
+
+from backend.services.modernization import csharp_syntax
 
 from backend.services import guardrail_service
 
@@ -51,6 +53,85 @@ _HASH_COMMENT = {".py", ".rb", ".pl", ".pm", ".yaml", ".yml", ".toml", ".sh", ".
 _PASCAL_LIKE = {".pas", ".dpr", ".dpk", ".inc"}
 _SQL_LIKE = {".sql", ".pls", ".pks", ".pkb", ".prc"}
 _NO_BALANCE_CHECK = {".md", ".txt", ".csv", ".properties"}
+
+# ── "Is this source at all?" ───────────────────────────────────────────────
+#
+# The balance scanner is the only thing that judged a file on its own terms, and it cannot see
+# the failure C-52 records: a whole C# file returned as one unindented line with single quotes
+# substituted for double (`[Route('/index.php')]`, `Title = 'Legacy Employee Portal'`). That is
+# not compilable C# — `'…'` is a char literal — and it passed at `confidence=High`, because an
+# unindented single line balances its brackets perfectly.
+#
+# Each signal below is individually weak and jointly unambiguous, so all three are separate
+# checks rather than a score. Data and markup are excluded throughout: a `.json` or a `.csproj`
+# may legitimately arrive on one line, and a `.cshtml` is mostly markup with its own quoting.
+_SOURCE_SUFFIXES = {".cs", ".vb", ".java", ".kt", ".kts", ".scala", ".ts", ".js", ".go",
+                    ".py", ".rb"}
+
+# Languages where `'` delimits a *character* and `"` delimits a string, so a `'`-quoted run of
+# real length is always wrong. Deliberately excludes `.py`/`.js`/`.ts`, which quote strings with
+# either, and `.vb`, where `'` opens a comment.
+_CHAR_LITERAL_SUFFIXES = {".cs", ".java", ".kt", ".kts", ".scala", ".go"}
+
+# Anything between single quotes, however long. What is *inside* decides whether it is legal,
+# so this deliberately does not try to encode the rule in the match.
+_SINGLE_QUOTED_RUN = re.compile(r"'(?:\\.|[^'\\\n])*'")
+
+# What a character literal may legally hold: exactly one character, or one escape. Anything
+# else between single quotes in these languages does not compile — and that is a fact about the
+# language, not an opinion about the code.
+_LEGAL_CHAR = re.compile(
+    r"^(?:[^'\\]"
+    r"|\\['\"\\0abfnrtv]"
+    r"|\\x[0-9a-fA-F]{1,4}"
+    r"|\\u[0-9a-fA-F]{4}"
+    r"|\\U[0-9a-fA-F]{8})$")
+
+# Everything that is not code: both comment forms, and every way this language family writes a
+# string — raw, verbatim, and ordinary. Single-quoted runs are deliberately **not** included,
+# because they are what the rule below is looking for.
+#
+# Reusing `usings._NON_CODE` minus its char alternative rather than writing a second, weaker
+# stripper: this repo has had two scanners disagree about what a comment is before, and the
+# whole precision of this rule rests on knowing exactly which text is code.
+_NOT_CODE = re.compile(
+    r'"""(?:.|\n)*?"""'
+    r'|@"(?:[^"]|"")*"'
+    r'|"(?:\\.|[^"\\])*"'
+    r"|//[^\n]*"
+    r"|/\*(?:.|\n)*?\*/",
+    re.MULTILINE,
+)
+
+
+def _code_only(text: str) -> str:
+    """`text` with comments and strings blanked out, line structure preserved."""
+    return _NOT_CODE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text or "")
+
+
+def _illegal_char_literal(text: str, ext: str) -> str:
+    """The first single-quoted run that cannot be a character literal, or "".
+
+    This is the one rule here that is **exact**. In these languages `'` delimits a single
+    character, so `'hello world'` does not compile — regardless of what else the file
+    contains. The rule it replaces guessed at the same thing from statistics: it fired only
+    when a file held no double quotes anywhere, on the theory that a model which had written a
+    proper string elsewhere probably knew what it was doing.
+    """
+    if ext not in _CHAR_LITERAL_SUFFIXES:
+        return ""
+    for match in _SINGLE_QUOTED_RUN.finditer(_code_only(text)):
+        inner = match.group(0)[1:-1]
+        if not _LEGAL_CHAR.match(inner):
+            return match.group(0)
+    return ""
+
+# Under these, an unremarkable file trips the signal: `namespace X;` plus a one-line class has
+# no indentation, and a using-only file has no newline worth speaking of. Measured against the
+# fixtures rather than chosen — the smallest scaffold artifact is 6 lines and the smallest
+# converted `.cs` in the PHP fixture run is 9.
+_MIN_LINES_FOR_INDENT = 8
+_MIN_CHARS_FOR_NEWLINE = 400
 
 _PAIRS = {"(": ")", "[": "]", "{": "}"}
 _CLOSERS = {v: k for k, v in _PAIRS.items()}
@@ -169,6 +250,37 @@ def _python_syntax(text: str) -> List[str]:
         return [f"Python syntax error at line {exc.lineno}: {exc.msg}"]
 
 
+def _implausible_source(text: str, ext: str) -> List[str]:
+    """Reasons this content cannot be source code in `ext`, or [].
+
+    Not a style opinion. Every reason here describes output no compiler could accept, which is
+    why they are `fail` rather than `warn` — a retry costs one attempt, and committing the file
+    costs a build round that reports errors nobody can act on.
+    """
+    if ext not in _SOURCE_SUFFIXES:
+        return []
+    reasons: List[str] = []
+
+    if len(text) >= _MIN_CHARS_FOR_NEWLINE and "\n" not in text.strip():
+        reasons.append(
+            f"The whole file is a single {len(text)}-character line. Source this long always "
+            f"has line breaks; a model dodging JSON escaping of newlines does not.")
+
+    # Only when the file actually *nests*. A flat module — twelve constants, a block of
+    # imports, a Python settings file — legitimately has no indentation anywhere, and firing on
+    # one is the false positive that gets a check switched off within a week (C-70's lesson via
+    # `sanity.template_without_renderer`). A brace is the evidence of a body that should have
+    # been indented; a language with no brace in the file is asserting no nesting.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if (len(lines) >= _MIN_LINES_FOR_INDENT and "{" in text
+            and not any(ln[:1] in (" ", "\t") for ln in lines)):
+        reasons.append(
+            f"None of the {len(lines)} non-empty lines is indented, though the file opens a "
+            f"block. A nested declaration is always indented by whatever wrote it as code.")
+
+    return reasons
+
+
 def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
     """Structural checks on one emitted file. Never raises."""
     path = artifact.get("path") or ""
@@ -191,6 +303,56 @@ def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
             })
             break
 
+    # Before the balance scan, because that scan is what this failure defeats: a single
+    # unindented line balances perfectly, so the strongest structural check in the tier passes
+    # the one output in the corpus that provably cannot compile.
+    for detail in _implausible_source(content, ext):
+        # `warn`, not `fail`, and the reason is arithmetic rather than taste. Every reason
+        # `_implausible_source` gives describes output no compiler would accept — a file that is
+        # one enormous line, a body that opens a block and indents nothing, a string written
+        # with the wrong delimiters. Since Phase 1 a real compiler reads every export, and it
+        # settles all three definitively.
+        #
+        # So the two mistakes cost wildly different amounts. A miss costs one build round, and
+        # the diagnostic comes back with a file and a line and goes straight to the component
+        # that wrote it. A false positive costs three conversions of the same unit, then fails
+        # the component outright — and its source files are then converted by nobody at all.
+        # This rule was wrong twice in two live runs: once on the small app, and once on three
+        # separate view components whose only single quotes were inside `/// <summary>` prose.
+        # That is nine conversion calls and seven source files, spent proving a compiler right.
+        #
+        # The hard-fail tier is for what a compiler cannot catch: a reintroduced secret, a
+        # blocked hazard, an empty or placeholder file, a real parse failure.
+        issues.append({"severity": "warn", "check": "plausible", "detail": detail})
+
+    # The exact one, and therefore the fatal one. `_implausible_source` above reasons about the
+    # *shape* of a file — one long line, nothing indented — and shape is circumstantial: a flat
+    # module legitimately has neither. This reasons about the language: `'` delimits a single
+    # character, so `'hello world'` between single quotes in code does not compile, and no
+    # amount of context makes it compile. Comments and strings are removed before looking, so
+    # prose that quotes a word is never read as code.
+    # A real grammar, where one exists for this language. It settles what every rule around
+    # it can only guess at — truncation, an unclosed brace, a stray token — and it settles it
+    # here, with the file in hand and the retry immediate, rather than a build round later.
+    # Silent when the grammar is not installed, so this is additive: the heuristics below stay
+    # as the weaker net for languages that have no parser here.
+    for fault in csharp_syntax.faults(content, path):
+        issues.append({
+            "severity": "fail", "check": "syntax_cs",
+            "detail": csharp_syntax.describe([fault], path),
+        })
+        break
+
+    illegal = _illegal_char_literal(content, ext)
+    if illegal:
+        issues.append({
+            "severity": "fail", "check": "char_literal",
+            "detail": (f"{illegal[:40]!r} is written between single quotes where code "
+                       f"expects them to hold one character. In this language that is a "
+                       f"character literal, not a string, so the file cannot compile — the "
+                       f"string delimiters were substituted."),
+        })
+
     if ext == ".py":
         for detail in _python_syntax(content):
             issues.append({"severity": "fail", "check": "syntax", "detail": detail})
@@ -210,6 +372,90 @@ def validate_artifact(artifact: Dict[str, Any]) -> Dict[str, Any]:
     status = "fail" if any(i["severity"] == "fail" for i in issues) else \
              ("warn" if issues else "pass")
     return {"path": path, "status": status, "issues": issues}
+
+
+BLOCKED_MARKER = "MIGRATION-BLOCKED"
+
+# Which observed hazards actually block. Not every hazard is one: `removed_mysql_ext` and
+# `weak_password_hash` are real findings but they *do* have correct target equivalents, so
+# demanding a marker for them would fail honest conversions. These six have no safe
+# mechanical translation at all — the correct output is a gap and a note.
+BLOCKING_HAZARDS = frozenset({
+    "eval", "variable_variable", "variable_include", "extract",
+    "unserialize_request", "shell_exec",
+})
+
+
+def summarize_for_prompt(issues: List[Dict[str, Any]]) -> str:
+    """The Tier-0 failures as a markdown block for the next attempt at the same unit.
+
+    The mirror of `semantics.summarize_for_prompt`, and it exists for the same reason: without
+    it a failed unit re-sent a byte-identical prompt, produced the same output, and spent all
+    three attempts arguing with itself. Every other feedback path in this pipeline — build
+    diagnostics, behaviour drift — already tells the next attempt what the last one got wrong;
+    structural validation was the one that did not, and it is the one that fires first.
+
+    Belongs in the *user* message, never the cached system block (D-06): it is per-unit.
+
+    Phrased as a statement about the previous output rather than as a rule, because the rules
+    were already in the prompt when that output was produced. Repeating a rule the model has
+    already read and not followed is the least effective thing available; naming what it
+    actually emitted is not.
+    """
+    if not issues:
+        return ""
+    lines = [
+        "## Your previous output for this unit was rejected",
+        "",
+        "These are mechanical checks on the files you returned last time — not style "
+        "opinions, and not re-statements of the rules above. Each one describes something "
+        "about that output. Return the whole unit again with every one of them resolved, and "
+        "change nothing else.",
+        "",
+    ]
+    for issue in issues:
+        where = issue.get("path") or "this unit"
+        lines.append(f"- **{issue.get('check') or 'check'}** ({where}): "
+                     f"{issue.get('detail') or ''}")
+    return "\n".join(lines)
+
+
+def check_blocked_hazards(artifacts: List[Dict[str, Any]], hazard_kinds: List[str],
+                          manual_followup: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """The third and only enforced layer of the hazard rule.
+
+    The source of this unit contained something with no safe mechanical equivalent — an
+    `eval`, a variable variable, a dynamic include. The converter was told to leave a
+    `// MIGRATION-BLOCKED:` marker and not implement it. If the output contains neither the
+    marker nor a `manual_followup` entry, the model resolved it silently, which is the
+    outcome the whole rule exists to prevent: an `eval` helpfully turned into a `switch` over
+    the three cases visible in the file looks converted, passes review, and quietly drops
+    every case that was not visible.
+
+    A `fail` rather than a `warn`, and deliberately: a warning here is indistinguishable from
+    the noise every large run produces, and this is the one class of silent behaviour change
+    that no later stage can detect.
+    """
+    # Filtered here rather than by the caller, so a second call site cannot forget to and
+    # start failing honest conversions of a `mysql_*` call that has a perfectly good target.
+    hazard_kinds = sorted(set(hazard_kinds or []) & BLOCKING_HAZARDS)
+    if not hazard_kinds:
+        return []
+    blob = "\n".join(a.get("content") or "" for a in artifacts)
+    followup = " ".join(str(x) for x in (manual_followup or []))
+    if BLOCKED_MARKER in blob:
+        return []
+    if BLOCKED_MARKER.lower() in followup.lower() or any(
+            kind.replace("_", " ") in followup.lower() or kind in followup.lower()
+            for kind in hazard_kinds):
+        return []
+    return [{
+        "severity": "fail", "check": "blocked_hazard",
+        "detail": (f"The source contained {', '.join(sorted(set(hazard_kinds)))}, which has no "
+                   f"safe equivalent in the target — but the output contains no "
+                   f"`// {BLOCKED_MARKER}:` marker and nothing in `manual_followup` mentions "
+                   f"it. Either it was translated silently, or it was dropped silently."),
+    }]
 
 
 def check_symbols(references: Iterable[Dict[str, Any]], known: Set[str],
@@ -248,6 +494,8 @@ def validate_unit_output(
     artifacts: List[Dict[str, Any]],
     references: Iterable[Dict[str, Any]],
     known_symbols: Set[str],
+    hazard_kinds: Optional[List[str]] = None,
+    manual_followup: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Everything Tier 0 has to say about one converted unit.
 
@@ -262,6 +510,7 @@ def validate_unit_output(
         for issue in report["issues"]:
             issues.append({**issue, "path": report["path"]})
     issues.extend(check_symbols(references, known_symbols))
+    issues.extend(check_blocked_hazards(artifacts, hazard_kinds or [], manual_followup))
 
     failed = [i for i in issues if i["severity"] == "fail"]
     status = "fail" if failed else ("warn" if issues else "pass")

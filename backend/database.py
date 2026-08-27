@@ -452,6 +452,18 @@ def init_db():
         pass  # column already exists
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reports_project ON reports(project_id, created_at)")
 
+    # Same reasoning again, for approvals. Until now `approvals` carried only a free-text
+    # `project_name`, and `list_approvals` filtered on nothing at all — so the queue showed
+    # every deployment-wide approval to anyone holding a token. That was survivable only
+    # because nothing ever wrote a row; now that a blocked gate enqueues one automatically,
+    # the queue holds real customer names and has to be scoped like every other governance
+    # surface. NULL on pre-existing rows, which stay super-admin-only.
+    try:
+        cursor.execute("ALTER TABLE approvals ADD COLUMN project_id TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_project ON approvals(project_id, status, created_at)")
+
     # Modernization owns six tables of its own. Their DDL lives with the code that queries
     # them rather than here — this module is already read by everything, and those tables
     # are read by one subsystem — but they are still created in exactly one place, at
@@ -543,13 +555,25 @@ def save_review(
             ),
         )
 
-    # Auto-create approval request for Red gate or critical findings
+    # Auto-create approval request for Red gate or critical findings.
+    #
+    # `project_id` is stamped here for the same reason the review row carries one: without
+    # it every approval was unattributed, so the queue could not be scoped and showed one
+    # customer's blocked releases to anyone holding a token. Rows written before this
+    # column stay NULL and remain super-admin-only, exactly like pre-existing reviews.
     if gate_status == "Red" or critical_count > 0:
         priority = "urgent" if gate_status == "Red" else "high"
+        approval_id = str(uuid.uuid4())
         cursor.execute(
-            "INSERT INTO approvals (id, review_id, project_name, requested_by, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-            (str(uuid.uuid4()), review_id, project_name or "", "system", priority, created_at),
+            "INSERT INTO approvals (id, review_id, project_id, project_name, requested_by,"
+            " priority, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (approval_id, review_id, project_id, project_name or "", "system", priority, created_at),
         )
+        # `approval_created` is one of the event types the Audit Trail filter has always
+        # offered and nothing ever emitted, so that filter always came back empty — which
+        # on a compliance product reads as "no approvals were ever raised".
+        log_audit(cursor, "approval_created", "approval", approval_id,
+                  details=f"review={review_id} priority={priority}")
 
     log_audit(cursor, "review_created", "review", review_id, details=f"type={review_type}")
 
@@ -1010,6 +1034,14 @@ def update_last_login(user_id: str) -> None:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET last_login = ? WHERE id = ?", (datetime.utcnow().isoformat(), user_id))
+    # Called from exactly one place — a successful login — which makes it the right seam
+    # for the `user_login` audit event. The Audit Trail filter has always offered that
+    # event type and nothing ever emitted it, so "who was in the system, and when" was a
+    # question the immutable event log could not answer.
+    cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    log_audit(cursor, "user_login", "user", user_id,
+              actor=(row["username"] if row else user_id))
     conn.commit()
     conn.close()
 
@@ -1019,15 +1051,40 @@ def update_last_login(user_id: str) -> None:
 def create_approval(review_id: str, project_name: str, requested_by: str = "system", priority: str = "normal") -> Dict[str, Any]:
     approval_id = str(uuid.uuid4())
     created_at = datetime.utcnow().isoformat()
+    # Same source of truth as `save_review`: the project the call was authorised against,
+    # not the free text on the form. An approval enqueued by a workflow runs inside the
+    # request's `bind_project` block, so this is the gate's own project.
+    project_id = context.current_project_id()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO approvals (id, review_id, project_name, requested_by, priority, status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-        (approval_id, review_id, project_name, requested_by, priority, created_at),
+        "INSERT INTO approvals (id, review_id, project_id, project_name, requested_by, priority, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+        (approval_id, review_id, project_id, project_name, requested_by, priority, created_at),
     )
+    log_audit(cursor, "approval_created", "approval", approval_id, actor=requested_by,
+              details=f"review={review_id} priority={priority}")
     conn.commit()
     conn.close()
-    return {"id": approval_id, "review_id": review_id, "status": "pending", "priority": priority, "created_at": created_at}
+    return {"id": approval_id, "review_id": review_id, "project_id": project_id,
+            "status": "pending", "priority": priority, "created_at": created_at}
+
+
+def get_pending_approval_for_review(review_id: str) -> Optional[Dict[str, Any]]:
+    """The open approval for a review, if one is already queued.
+
+    Makes enqueueing idempotent: re-running a gate over the same review, or a retry after a
+    client timeout, must not stack duplicate sign-off requests on a reviewer's queue.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM approvals WHERE review_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        (review_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def get_approval(approval_id: str) -> Optional[Dict[str, Any]]:
@@ -1046,28 +1103,28 @@ def get_approval(approval_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def list_approvals(status: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+def list_approvals(status: Optional[str] = None, limit: int = 50,
+                   project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """The approval queue, newest first. `project_ids=None` means every project.
+
+    Scoped through the same `_review_scope_sql` as `list_reviews`, on `approvals.project_id`
+    — before this, the queue was the one governance surface that showed every customer's
+    rows to every caller.
+    """
+    scope, params = _review_scope_sql(project_ids, alias="a")
+    status_sql = " AND a.status = ?" if status else ""
+    status_params = (status,) if status else ()
     conn = get_connection()
     cursor = conn.cursor()
-    if status:
-        cursor.execute(
-            """SELECT a.*, r.review_type, r.gate_status as review_gate, r.risk_score,
-                      r.findings_count, r.critical_count, r.created_at as review_date
-               FROM approvals a
-               LEFT JOIN reviews r ON a.review_id = r.id
-               WHERE a.status = ?
-               ORDER BY a.created_at DESC LIMIT ?""",
-            (status, limit),
-        )
-    else:
-        cursor.execute(
-            """SELECT a.*, r.review_type, r.gate_status as review_gate, r.risk_score,
-                      r.findings_count, r.critical_count, r.created_at as review_date
-               FROM approvals a
-               LEFT JOIN reviews r ON a.review_id = r.id
-               ORDER BY a.created_at DESC LIMIT ?""",
-            (limit,),
-        )
+    cursor.execute(
+        f"""SELECT a.*, r.review_type, r.gate_status as review_gate, r.risk_score,
+                   r.findings_count, r.critical_count, r.created_at as review_date
+            FROM approvals a
+            LEFT JOIN reviews r ON a.review_id = r.id
+            WHERE 1 = 1{scope}{status_sql}
+            ORDER BY a.created_at DESC LIMIT ?""",
+        params + status_params + (limit,),
+    )
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -1085,10 +1142,14 @@ def decide_approval(approval_id: str, status: str, decision_by: str, comment: st
     conn.close()
 
 
-def get_approval_stats() -> Dict[str, Any]:
+def get_approval_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Counts behind the sidebar badge. Scoped like `list_approvals`, so the number on the
+    badge and the rows on the page can never disagree about which projects are in view."""
+    scope, params = _review_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT status, COUNT(*) as cnt FROM approvals GROUP BY status")
+    cursor.execute(
+        f"SELECT status, COUNT(*) as cnt FROM approvals WHERE 1 = 1{scope} GROUP BY status", params)
     stats = {row["status"]: row["cnt"] for row in cursor.fetchall()}
     conn.close()
     return {
@@ -2369,6 +2430,104 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
             out[row["fingerprint"]] = dict(row)
     conn.close()
     return out
+
+
+def list_findings(
+    project_ids: Optional[List[str]] = None,
+    status: Optional[str] = None,
+    min_severity: int = 0,
+    review_id: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Findings across a project's whole review history, newest review first.
+
+    The write side of the lifecycle has existed since `PATCH /api/v1/findings/{id}`, but
+    nothing could ever *read* a list — the only way to reach a finding was to open the one
+    review that produced it. So "show me every open Critical in this project", the question
+    an owner actually asks, had no answer in the UI or over the API.
+
+    Joined to `reviews` for the context a row is meaningless without: which review, of what
+    type, when. Scoped on `findings.project_id`, which `save_review` stamps.
+    """
+    scope, params = _review_scope_sql(project_ids, alias="f")
+    clauses = ""
+    extra: tuple = ()
+    if status:
+        clauses += " AND f.status = ?"
+        extra += (status,)
+    if min_severity:
+        clauses += " AND f.severity >= ?"
+        extra += (min_severity,)
+    if review_id:
+        clauses += " AND f.review_id = ?"
+        extra += (review_id,)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""SELECT f.*, r.review_type, r.project_name, r.created_at AS review_created_at
+            FROM findings f
+            LEFT JOIN reviews r ON r.id = f.review_id
+            WHERE 1 = 1{scope}{clauses}
+            ORDER BY r.created_at DESC, f.severity DESC LIMIT ? OFFSET ?""",
+        params + extra + (limit, offset),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def count_findings(
+    project_ids: Optional[List[str]] = None,
+    status: Optional[str] = None,
+    min_severity: int = 0,
+    review_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Totals for the same filter `list_findings` applies, plus a severity breakdown.
+
+    The breakdown ignores `min_severity` deliberately: it is what the filter buttons are
+    counting, so it has to describe the whole filtered-by-status set rather than the slice
+    currently on screen.
+    """
+    scope, params = _review_scope_sql(project_ids, alias="f")
+    clauses = ""
+    extra: tuple = ()
+    if status:
+        clauses += " AND f.status = ?"
+        extra += (status,)
+    if review_id:
+        clauses += " AND f.review_id = ?"
+        extra += (review_id,)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT severity, COUNT(*) AS cnt FROM findings f WHERE 1 = 1{scope}{clauses} GROUP BY severity",
+        params + extra,
+    )
+    by_severity = {int(row["severity"] or 0): row["cnt"] for row in cursor.fetchall()}
+    conn.close()
+    matching = sum(cnt for sev, cnt in by_severity.items() if sev >= min_severity)
+    return {
+        "total": matching,
+        "critical": by_severity.get(5, 0),
+        "high": by_severity.get(4, 0),
+        "medium": by_severity.get(3, 0),
+        "low": sum(cnt for sev, cnt in by_severity.items() if sev <= 2),
+    }
+
+
+def get_finding(finding_id: str) -> Optional[Dict[str, Any]]:
+    """One finding with its review context — used to authorise a status change."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT f.*, r.review_type, r.project_name FROM findings f
+           LEFT JOIN reviews r ON r.id = f.review_id WHERE f.id = ?""",
+        (finding_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def set_finding_status(

@@ -44,17 +44,35 @@ UNIT_CONVERSION_TOOL_SCHEMA = {
             "files": {
                 "type": "array",
                 "description": (
-                    "The converted output. Usually one file; more when the target stack "
-                    "splits what the source combined (e.g. a Delphi form becomes a view and "
-                    "a view-model). Every file must be complete and syntactically valid — "
+                    "The converted output. Usually several files, because the target stack "
+                    "splits what the source combined — a page script becomes a controller, a "
+                    "view and a model. Every file must be complete and syntactically valid — "
                     "never a diff, never a fragment, and never a comment standing in for "
                     "code you did not write out."
                 ),
                 "items": {
                     "type": "object",
-                    "required": ["path", "content"],
+                    "required": ["filename", "content"],
                     "properties": {
-                        "path": {"type": "string", "description": "Output path, following the charter's project layout."},
+                        # `filename`, not `path`. The directory is not the model's to choose:
+                        # it was decided once, for the whole run, and is joined on in Python.
+                        # When each call picked its own path, file 1 wrote
+                        # `Api/Controllers/X.cs` and file 200 wrote `src/Api/Controllers/X.cs`
+                        # and nothing compared them. A bare name cannot express that
+                        # disagreement, so the whole class of drift stops being possible
+                        # rather than being something we check for afterwards.
+                        "filename": {
+                            "type": "string",
+                            "description": "File name only — no directories, no slashes. "
+                                           "e.g. 'OrderController.cs'.",
+                        },
+                        "subdir": {
+                            "type": "string",
+                            "description": "Optional sub-directory *inside* this component's "
+                                           "output directory, e.g. 'Views'. No leading slash "
+                                           "and no '..'. Leave empty unless the target stack "
+                                           "requires the nesting.",
+                        },
                         "content": {"type": "string", "description": "Complete file content."},
                         "purpose": {"type": "string", "description": "One line: what this file is."},
                     },
@@ -185,9 +203,20 @@ class UnitConverterAgent(BaseAgent):
             system_prompt=BASE_SYSTEM_PROMPT,
         )
 
-    def system_for(self, charter: Dict[str, Any]) -> str:
-        """The run's system prompt. Identical for every unit — that is the point."""
-        return f"{BASE_SYSTEM_PROMPT}\n\n{charter_module.render(charter)}\n"
+    def system_for(self, charter: Dict[str, Any], addendum: str = "") -> str:
+        """The run's system prompt. Identical for every unit — that is the point.
+
+        `addendum` is the comprehension digest and the architecture's shared conventions,
+        rendered **once** at plan approval and stored verbatim on the run. It is passed in as
+        an already-rendered string rather than as data to format here, because anything
+        re-rendered per call from a dict that `json.loads` rebuilt could come out in a
+        different order and silently cost full price on every file (D-06, and the same
+        argument `charter.render` makes).
+        """
+        parts = [BASE_SYSTEM_PROMPT, charter_module.render(charter)]
+        if addendum:
+            parts.append(addendum)
+        return "\n\n".join(parts) + "\n"
 
     def convert(
         self,
@@ -200,18 +229,141 @@ class UnitConverterAgent(BaseAgent):
         in_cycle_with: Optional[List[str]] = None,
         redactions: Optional[List[Dict[str, Any]]] = None,
         llm_override: Optional[Dict[str, Any]] = None,
+        addendum: str = "",
+        placement: Optional[Dict[str, Any]] = None,
+        members: Optional[List[Dict[str, Any]]] = None,
+        source_facts: Optional[List[Dict[str, Any]]] = None,
+        build_diagnostics: str = "",
+        prior_findings: str = "",
+        load_bearing: str = "",
+        lookup_tools: Optional[List[Dict[str, Any]]] = None,
+        lookup_dispatch=None,
     ) -> Dict[str, Any]:
+        """`build_diagnostics` is what a real compiler said about this unit's *previous*
+        output, and it is the only reason a re-conversion produces anything different.
+        `prior_findings` is the same idea one layer earlier: what `semantics.check` found
+        wrong with the previous attempt, before anything was ever compiled.
+
+        It goes in the user message, never the system block: the system block is the cached
+        prefix (D-06), so per-unit compiler output there would invalidate the cache for every
+        other unit in the run — paying full price on all of them to tell one of them
+        something. It is also why the rework loop cannot be a no-op: without this the second
+        attempt sends a byte-identical prompt and the stuck-loop guard fires on round two.
+        """
         user_content = _build_user_message(
             source=source, path=path, dependency_symbols=dependency_symbols or [],
             module_type=module_type, language=language,
             in_cycle_with=in_cycle_with or [], redactions=redactions or [],
+            placement=placement or {}, members=members or [],
+            source_facts=source_facts or [], build_diagnostics=build_diagnostics,
+            prior_findings=prior_findings, load_bearing=load_bearing,
         )
-        result = llm_gateway.call_tool(
-            self.system_for(charter), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
-            llm_override, max_tokens=CONVERSION_MAX_TOKENS,
-        )
+        # With lookups, the same forced-tool contract with a bounded number of read-only
+        # questions in front of it. Without them, byte-identical to what this has always
+        # done — the loop is opt-in per run and the default is off, so a run that did not
+        # ask for it cannot be charged for it.
+        if lookup_tools and lookup_dispatch:
+            result = llm_gateway.call_agentic(
+                self.system_for(charter, addendum), user_content,
+                UNIT_CONVERSION_TOOL_SCHEMA, lookup_tools, lookup_dispatch,
+                llm_override, max_tokens=CONVERSION_MAX_TOKENS,
+            )
+        else:
+            result = llm_gateway.call_tool(
+                self.system_for(charter, addendum), user_content, UNIT_CONVERSION_TOOL_SCHEMA,
+                llm_override, max_tokens=CONVERSION_MAX_TOKENS,
+            )
         result["agent_name"] = self.agent_name
         return result
+
+
+def _render_language_facts(source_facts: List[Dict[str, Any]]) -> str:
+    """What the parser observed in *these* source files.
+
+    In the message, never the system block: it differs per unit, and anything that differs
+    per unit sitting in the cached prefix costs full price on every call in the run (D-06).
+
+    This is the difference between a converter that knows `$_GET['id']` is an integer route
+    parameter and one that sees a dictionary lookup and writes a dictionary lookup.
+    """
+    lines: List[str] = []
+    hazards_seen: List[str] = []
+    for entry in source_facts:
+        facts = entry.get("facts") or {}
+        if not facts:
+            continue
+        path = entry.get("path") or ""
+        detail: List[str] = []
+
+        superglobals = facts.get("superglobals") or {}
+        if superglobals:
+            rendered = "; ".join(
+                f"`{name}`" + (f" keys: {', '.join('`' + k + '`' for k in info['keys'][:12])}"
+                               if info.get("keys") else f" ({info['count']}x)")
+                for name, info in sorted(superglobals.items()))
+            detail.append(f"- Request/session state read: {rendered}")
+
+        sites = facts.get("db_sites") or []
+        if sites:
+            apis = ", ".join(facts.get("db_apis") or [])
+            interpolated = [s for s in sites if s.get("interpolated")]
+            detail.append(f"- Data access via {apis} at {len(sites)} site(s)"
+                          + (f", {len(interpolated)} of which build SQL by concatenation "
+                             f"(these are injections as well as mappings)" if interpolated else ""))
+            for site in sites[:6]:
+                if site.get("sql"):
+                    detail.append(f"    - line {site['line']}: `{site['sql'][:160]}`")
+        if facts.get("tables"):
+            detail.append("- Tables named in SQL: "
+                          + ", ".join(f"`{t}`" for t in facts["tables"][:20]))
+
+        shape = []
+        if facts.get("has_html_document"):
+            shape.append("emits a complete HTML document (this is a page, not a fragment)")
+        elif float(facts.get("html_ratio") or 0) > 0.3:
+            shape.append(f"{int(float(facts['html_ratio']) * 100)}% inline HTML "
+                         f"(a presentation fragment)")
+        if facts.get("redirects"):
+            shape.append("issues a redirect — that path returns a redirect result, not a view")
+        if facts.get("emits_json"):
+            shape.append("returns JSON — an API endpoint, with no view")
+        if facts.get("starts_session"):
+            shape.append("calls session_start(); session is configured once in the host, "
+                         "never per file")
+        if facts.get("handles_uploads"):
+            shape.append("handles file uploads")
+        if shape:
+            detail.append("- Shape: " + "; ".join(shape))
+
+        for hazard in facts.get("hazards") or []:
+            hazards_seen.append(f"`{hazard['kind']}` at {path}:{hazard['line']}")
+
+        if detail:
+            lines.append(f"**`{path}`**")
+            lines.extend(detail)
+            lines.append("")
+
+    if not lines and not hazards_seen:
+        return ""
+
+    parts = ["\n## What the parser found in this source", "",
+             "Observed before conversion, with line numbers. Use it — it is the difference "
+             "between binding a typed parameter and copying a dictionary lookup.", ""]
+    parts.extend(lines)
+
+    if hazards_seen:
+        parts.extend([
+            "### Constructs you must NOT translate", "",
+            "\n".join(f"- {h}" for h in hazards_seen[:25]),
+            "",
+            "For each one: emit a comment at that exact location beginning "
+            "`// MIGRATION-BLOCKED:` naming the construct, leave the behaviour "
+            "**unimplemented**, add it to `manual_followup`, and set `needs_human_review`. "
+            "The run rejects output that resolved one of these silently. A reported `eval` is "
+            "a useful result; an `eval` turned into a `switch` covering the cases you could "
+            "see is a behaviour change nobody will find.",
+        ])
+    return "\n".join(parts)
 
 
 def _build_user_message(
@@ -222,13 +374,65 @@ def _build_user_message(
     language: str,
     in_cycle_with: List[str],
     redactions: List[Dict[str, Any]],
+    placement: Optional[Dict[str, Any]] = None,
+    members: Optional[List[Dict[str, Any]]] = None,
+    source_facts: Optional[List[Dict[str, Any]]] = None,
+    build_diagnostics: str = "",
+    prior_findings: str = "",
+    load_bearing: str = "",
 ) -> str:
     """Everything that varies per unit. Kept out of the system prompt so it cannot
     invalidate the cached prefix."""
-    parts = [f"# Unit to convert: `{path}`"]
+    placement = placement or {}
+    members = members or []
+    label = placement.get("component_name") or path
+    parts = [f"# Unit to convert: `{label}`"]
     if language or module_type:
         descriptor = " · ".join(p for p in (language, f"role: {module_type}" if module_type else "") if p)
         parts.append(f"({descriptor})")
+
+    if placement.get("output_dir") or placement.get("target_namespace"):
+        lines = ["", "## Where your output goes", ""]
+        if placement.get("target_project"):
+            lines.append(f"- **Project**: `{placement['target_project']}`")
+        if placement.get("target_namespace"):
+            lines.append(f"- **Namespace**: `{placement['target_namespace']}` — "
+                         f"everything you emit declares this namespace.")
+        if placement.get("output_dir"):
+            lines.append(f"- **Directory**: `{placement['output_dir']}` — chosen for the whole "
+                         f"run. You give **file names only**; the directory is joined on for "
+                         f"you, so do not repeat it and do not invent a different one.")
+        if placement.get("expected_files"):
+            lines.append("- **Expected output** (a plan, not a contract — emit what the code "
+                         "actually needs): "
+                         + ", ".join(f"`{f}`" for f in placement["expected_files"][:12]))
+        if placement.get("rationale"):
+            lines.append(f"- **Why these files convert together**: {placement['rationale']}")
+        parts.append("\n".join(lines))
+
+    # Which projects this one is allowed to name a type from. Rendered by `layering`, from
+    # the acyclic graph the design stage already settled on — so this is not a new
+    # constraint, it is the run's own constraint finally being stated to the party that has
+    # to obey it. It goes in the user message because it differs per component, and anything
+    # per-component in the cached system block costs full price on every other call (D-06).
+    if placement.get("project_rules"):
+        parts.append("\n" + placement["project_rules"])
+
+    # And which types are somebody else's to declare. Same source — the plan — and the same
+    # reason it is here rather than in the system block. A component that emits a class
+    # another component owns produces two of it in the finished solution, and an interface
+    # with two implementations is registered with the container as neither.
+    if placement.get("ownership_rules"):
+        parts.append("\n" + placement["ownership_rules"])
+
+    if len(members) > 1:
+        parts.append(
+            "\n## This unit is several source files\n\n"
+            "They were grouped because they belong together in the target — converting them "
+            "separately would force each one to guess about the others. Emit the files the "
+            "target stack actually needs, which is usually neither one per source file nor "
+            "one in total."
+        )
 
     if dependency_symbols:
         lines = ["", "## Already converted — use these exactly as written",
@@ -237,18 +441,31 @@ def _build_user_message(
                  "in the target stack. Their bodies are not shown and you do not need them. Anything "
                  "not in this list either has not been converted yet or does not exist — do not call it.",
                  ""]
-        by_unit: Dict[str, List[str]] = {}
+        # Grouped by (path, namespace) rather than by path alone. A signature tells the model
+        # what to call; the namespace tells it what to import, and without that it could not
+        # write a correct `using` even in principle — which is the single largest class of
+        # compile error in generated C#. The run repairs missing imports deterministically
+        # afterwards, but a model that was told where a type lives mostly gets it right the
+        # first time, and a repaired import is one the reviewer has to read as a diff.
+        by_unit: Dict[tuple, List[str]] = {}
         for symbol in dependency_symbols:
-            key = symbol.get("target_path") or symbol.get("source_symbol") or "converted"
+            key = (symbol.get("target_path") or symbol.get("source_symbol") or "converted",
+                   symbol.get("namespace") or "")
             entry = f"  - `{symbol.get('signature') or symbol.get('name')}`"
             if symbol.get("source_symbol") and symbol["source_symbol"] != symbol.get("name"):
                 entry += f"   (was `{symbol['source_symbol']}`)"
             by_unit.setdefault(key, []).append(entry)
-        for unit_path in sorted(by_unit):
-            lines.append(f"- **{unit_path}**")
-            lines.extend(sorted(by_unit[unit_path]))
+        for unit_path, namespace in sorted(by_unit):
+            heading = f"- **{unit_path}**"
+            if namespace:
+                heading += f" — namespace `{namespace}`, so importing it needs `using {namespace};`"
+            lines.append(heading)
+            lines.extend(sorted(by_unit[(unit_path, namespace)]))
         parts.append("\n".join(lines))
-    else:
+    elif not in_cycle_with:
+        # Only claim this when it is true. A unit inside a cycle has dependencies — they are
+        # just not converted yet — and telling it that it sits at the root while also telling
+        # it that it sits in a cycle was contradictory and left it with nothing either way.
         parts.append(
             "\n## Dependencies\n\nThis unit has no already-converted dependencies — it is at the "
             "root of the dependency order. Everything it needs is either in the source below or "
@@ -269,6 +486,35 @@ def _build_user_message(
               "their contents."
         )
 
+    language_facts = _render_language_facts(source_facts or [])
+    if language_facts:
+        parts.append(language_facts)
+
+    if build_diagnostics:
+        # Placed after the dependency context and before the source, so the model reads what
+        # is available to it and *then* what went wrong last time. These are facts from a
+        # compiler, not a review opinion — which is why the instruction is to fix them rather
+        # than to consider them.
+        parts.append(build_diagnostics)
+
+    if prior_findings:
+        # Last, so it is the most recent thing read before the source. Kept separate from
+        # `build_diagnostics` rather than concatenated into it: a compiler error is a fact
+        # about a file that would not build, and this is a fact about a file that built
+        # perfectly and did the wrong thing. Telling the model the second is the first would
+        # invite it to "fix" behaviour drift by making the code compile, which it already
+        # does.
+        parts.append(prior_findings)
+
+    if load_bearing:
+        # Which of this unit's own names other converted files already call. Empty on a first
+        # conversion — nothing downstream exists yet — so this only ever appears on a rework,
+        # which is exactly when a rename is expensive. The converter is otherwise never told
+        # who depends on it: dependencies are tracked one way and breakage travels the other,
+        # and that asymmetry is what let one reopened file put one detail wrong in twenty-two
+        # places on a live run.
+        parts.append(load_bearing)
+
     if redactions:
         categories = sorted({r.get("category", "secret") for r in redactions})
         parts.append(
@@ -280,9 +526,98 @@ def _build_user_message(
             "knows what to supply."
         )
 
-    parts.append(f"\n## Source\n\n```\n{source}\n```")
+    if len(members) > 1:
+        # One fenced block per member, labelled. Concatenating them into one blob loses which
+        # code came from which file, and `manual_followup` has to be able to name the file.
+        blocks = []
+        for member in members:
+            blocks.append(f"### `{member['path']}`\n\n```\n{member.get('source_text') or ''}\n```")
+        parts.append("\n## Source\n\n" + "\n\n".join(blocks))
+    else:
+        parts.append(f"\n## Source\n\n```\n{source}\n```")
+
     parts.append(
-        "\nConvert this unit now, following the charter. Declare every public symbol you emit, "
-        "every symbol from other units you reference, and everything that needs a human."
+        "\nConvert this unit now, following the charter. Give **file names only** in "
+        "`files[].filename` — the directory above is applied for you. Declare every public "
+        "symbol you emit, every symbol from other units you reference, and everything that "
+        "needs a human."
     )
     return "\n".join(parts)
+
+
+# ── Reading back what was just written ─────────────────────────────────────
+#
+# The only feedback on whether generated code compiles travels through a real compiler on
+# someone else's machine and comes back a build round later — download, build, post, reopen,
+# re-convert, resume. A defect caught here costs one call; the same defect caught by that loop
+# costs a round trip plus a full re-conversion of the component.
+#
+# **Off by default** (`runner.SELF_REVIEW`), and honestly so: this is the one change in the
+# accuracy plan that could plausibly cost more than it saves, and nothing has measured a build
+# round yet. Built so the measurement can be made rather than argued about.
+
+SELF_REVIEW_MAX_TOKENS = 4000
+
+SELF_REVIEW_TOOL_SCHEMA = {
+    "name": "submit_self_review",
+    "description": (
+        "Report what will not compile in the files you just produced, and nothing else."),
+    "input_schema": {
+        "type": "object",
+        "required": ["problems"],
+        "properties": {
+            "problems": {
+                "type": "array",
+                "maxItems": 20,
+                "description": (
+                    "Only things that stop this code compiling: a type you named that you did "
+                    "not define and were not given, a member that does not exist on a type "
+                    "whose signature you were shown, a method whose signature does not match "
+                    "the interface it claims to implement, an unbalanced or unfinished file. "
+                    "Not style, not naming, not anything that merely reads oddly. An empty "
+                    "list is the expected answer and is not a failure — say nothing rather "
+                    "than finding something to say."),
+                "items": {
+                    "type": "object",
+                    "required": ["file", "problem"],
+                    "properties": {
+                        "file": {"type": "string",
+                                 "description": "The file name, exactly as you emitted it."},
+                        "problem": {"type": "string",
+                                    "description": "One sentence: what will not compile."},
+                    },
+                },
+            },
+        },
+    },
+}
+
+SELF_REVIEW_SYSTEM_PROMPT = """You are reviewing target-stack code that you produced a moment
+ago, before it is committed.
+
+One question only: **will this compile?** You are looking for names that resolve to nothing,
+members that do not exist on the types you were shown, signatures that do not match the
+interface they claim, and files that are unfinished or unbalanced.
+
+You are not reviewing style, naming, structure or idiom. Those are settled by the charter and
+are not yours to revisit here.
+
+Report nothing unless you are confident. An empty list is the normal answer, and a made-up
+problem is worse than a missed one: it costs a full re-conversion of a component that was
+already correct.
+"""
+
+
+def review_output(artifacts, dependency_symbols, llm_override=None):
+    """One extra turn: the model reads back what it just emitted. -> {problems: [...]}"""
+    parts = ["# The files you just produced", ""]
+    for artifact in artifacts:
+        parts.append(f"## `{artifact.get('path')}`\n\n```\n{artifact.get('content') or ''}\n```")
+    if dependency_symbols:
+        parts.append("\n## Signatures you were given, as they actually exist\n")
+        parts.append("\n".join(f"- `{s.get('signature') or s.get('name')}`"
+                               for s in dependency_symbols[:120]))
+    parts.append("\nList what will not compile. An empty list is the expected answer.")
+    return llm_gateway.call_tool(
+        SELF_REVIEW_SYSTEM_PROMPT, "\n".join(parts), SELF_REVIEW_TOOL_SCHEMA,
+        llm_override, max_tokens=SELF_REVIEW_MAX_TOKENS)

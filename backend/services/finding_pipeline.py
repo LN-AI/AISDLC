@@ -36,7 +36,7 @@ _SUPPRESSED_PATH_RE = re.compile(
 )
 
 
-def _normalize(text: str) -> str:
+def normalize(text: str) -> str:
     """Collapse whitespace so an evidence quote matches regardless of indentation or how
     the model re-wrapped it."""
     return re.sub(r"\s+", " ", (text or "")).strip()
@@ -46,14 +46,40 @@ def is_suppressed_path(path: str) -> bool:
     return bool(path) and bool(_SUPPRESSED_PATH_RE.search(path))
 
 
-def _line_of_offset(haystack_lines: List[str], normalized_offset: int) -> Optional[int]:
-    """Map an offset in the whitespace-normalized text back to a 1-based line number."""
+def line_of_offset(haystack_lines: List[str], normalized_offset: int) -> Optional[int]:
+    """Map an offset in the whitespace-normalized text back to a 1-based line number.
+
+    The normalized document is the non-empty normalized lines joined by *one* space, so that
+    is what this has to reconstruct. Counting `len(normalize(line)) + 1` for every line
+    instead is wrong on any file with blank lines: a blank line contributes nothing to
+    `normalize(whole_text)` — its newlines are absorbed into the surrounding `\\s+` run — but
+    the `+ 1` still advanced the accumulator, so the reported line drifted *earlier* by
+    roughly the number of blank lines above the match. On ordinary source that is a citation
+    pointing at the line before the one that matters, which is exactly the failure the
+    caller uses this to avoid.
+    """
     running = 0
+    seen_content = False
     for i, line in enumerate(haystack_lines, start=1):
-        running += len(_normalize(line)) + 1
+        piece = normalize(line)
+        if not piece:
+            continue
+        if seen_content:
+            running += 1        # the single space joining this line to the previous one
+        seen_content = True
+        running += len(piece)
         if running > normalized_offset:
             return i
     return None
+
+
+# Public since modernization's business-rule verifier needs exactly this pair: a rule citing
+# a line it cannot be found on is the same defect as a review finding citing one, and a
+# second whitespace-normalizing substring search would drift from this one the first time
+# either was fixed. The private names stay as aliases — they are used throughout this module
+# and in at least one other caller, and renaming those is churn with no reader benefit.
+_normalize = normalize
+_line_of_offset = line_of_offset
 
 
 def verify_evidence(

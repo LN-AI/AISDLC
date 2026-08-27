@@ -33,6 +33,7 @@ from backend.workflows import full_review as full_review_workflow
 from backend.workflows import issue_triage as issue_triage_workflow
 from backend.workflows import issue_triage_batch as issue_triage_batch_workflow
 from backend.workflows import migration_execute as migration_execute_workflow
+from backend.workflows import modernization_pr as modernization_pr_workflow
 from backend.workflows import release_gate as release_gate_workflow
 from backend.workflows import review_pr as review_pr_workflow
 from backend.workflows import standalone_report as standalone_report_workflow
@@ -698,15 +699,19 @@ class SDLCOrchestrator:
         release_version: str = "",
         evidence_summary: str = "",
         context: str = "",
+        findings: list = None,
     ) -> Dict[str, Any]:
         # `context` is accepted for backwards compatibility with existing callers but is
         # not used — the gate agent takes its input from findings and evidence only.
+        # `findings` is the pasted-findings path the legacy `/api/release-gate` route
+        # needs; it used to evaluate those inline and persist nothing.
         return release_gate_workflow.run(
             self,
             project_name=project_name,
             review_ids=review_ids,
             release_version=release_version,
             evidence_summary=evidence_summary,
+            findings=findings,
         )
     @_log_call
     def review_github_pr(self, pr_url: str, jira_ticket: str = "", include_prompt_review: bool = False) -> Dict[str, Any]:
@@ -718,6 +723,20 @@ class SDLCOrchestrator:
         """Review a GitHub PR, then commit fixes for its findings to a new branch off the PR's head branch
         and open a follow-up PR (head_branch -> lm-autofix/pr-N -> new PR back into head_branch)."""
         return autofix_pr_workflow.run(self, pr_url=pr_url, jira_ticket=jira_ticket, max_files=max_files)
+
+    @_log_call
+    def modernization_pr(self, run_id: str, owner: str, repo: str, callback_url: str,
+                         base_branch: str = "", dotnet_version: str = "8.0.x",
+                         on_progress=None) -> Dict[str, Any]:
+        """Push a modernization run's converted codebase to a branch and open a PR carrying a
+        build workflow that reports its diagnostics back to `callback_url`.
+
+        This is how the fix loop reaches a compiler without one running here (D-05, D-62):
+        the customer's CI builds, posts to `POST /runs/{id}/build-results`, and failing units
+        return to the conversion queue."""
+        return modernization_pr_workflow.run(
+            self, run_id=run_id, owner=owner, repo=repo, callback_url=callback_url,
+            base_branch=base_branch, dotnet_version=dotnet_version, on_progress=on_progress)
     @staticmethod
     def _fallback_gate_from_specialized(result: Dict[str, Any], specialized_severities: List[str]) -> None:
         """Safety net for security/architecture reviews: their tool schemas put

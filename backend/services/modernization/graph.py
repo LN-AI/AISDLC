@@ -26,6 +26,38 @@ from backend.services.modernization.analyzers import UnitFacts
 logger = logging.getLogger(__name__)
 
 
+# Types the runtime supplies, per language, which are "unresolved" only in the sense that no
+# file in the repository declares them. Kept short and literal on purpose: a broad pattern
+# here would hide a genuinely missing dependency, which is the one thing this list is for.
+_RUNTIME_TYPES = frozenset(name.lower() for name in (
+    # PHP — SPL, PDO and the exception hierarchy
+    "PDO", "PDOStatement", "PDOException", "Exception", "Error", "Throwable",
+    "RuntimeException", "LogicException", "InvalidArgumentException", "TypeError",
+    "ValueError", "ArgumentCountError", "DomainException", "LengthException",
+    "OutOfRangeException", "OutOfBoundsException", "RangeException", "OverflowException",
+    "UnderflowException", "UnexpectedValueException", "BadFunctionCallException",
+    "BadMethodCallException", "JsonException", "ErrorException",
+    "ArrayObject", "ArrayIterator", "SplStack", "SplQueue", "SplObjectStorage",
+    "SplFileObject", "SplFileInfo", "Generator", "Closure", "stdClass", "WeakMap",
+    "DateTime", "DateTimeImmutable", "DateTimeZone", "DateInterval", "DatePeriod",
+    "IntlDateFormatter", "NumberFormatter", "Collator",
+    "Iterator", "IteratorAggregate", "ArrayAccess", "Countable", "Traversable",
+    "JsonSerializable", "Serializable", "Stringable", "UnitEnum", "BackedEnum",
+    "mysqli", "mysqli_stmt", "mysqli_result", "SQLite3", "Redis", "SoapClient",
+    "DOMDocument", "DOMElement", "DOMXPath", "SimpleXMLElement", "XMLReader", "XMLWriter",
+    "ZipArchive", "CurlHandle", "finfo", "Directory", "NumberFormatException",
+    "ReflectionClass", "ReflectionMethod", "ReflectionProperty", "ReflectionFunction",
+    # A `Foo::class` fetch used to arrive here as a class literally named `class`. The query
+    # that produced it is fixed; this stays as a floor under the regex fallback.
+    "class", "parent", "self", "static",
+))
+
+
+def _is_runtime_type(name: str) -> bool:
+    """True for a name the target runtime provides rather than the repository."""
+    return (name or "").rsplit("\\", 1)[-1].lower() in _RUNTIME_TYPES
+
+
 def _provider_index(facts: Sequence[UnitFacts]) -> Dict[str, List[str]]:
     """name -> the paths that provide it.
 
@@ -39,24 +71,70 @@ def _provider_index(facts: Sequence[UnitFacts]) -> Dict[str, List[str]]:
     return index
 
 
-def resolve_edges(facts: Sequence[UnitFacts]) -> Tuple[Dict[str, Set[str]], Dict[str, List[str]]]:
-    """-> (path -> set of paths it depends on, path -> names that resolved to nothing)."""
+def _leaf(name: str) -> str:
+    """The last segment of a name, however it is separated.
+
+    Used only to tell "two spellings of one reference" from "two different references". PHP
+    offers a type as `Foo` *and* `App\\Foo`, and a provider file lists both in its `provides`,
+    so both spellings resolve to the same file — counting each would score one `new Foo()` as
+    two. Same rule `ownership.verify_type_symbols` matches on (D-110).
+    """
+    return name.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def resolve_edges(
+    facts: Sequence[UnitFacts],
+) -> Tuple[Dict[str, Set[str]], Dict[str, List[str]], Dict[str, Dict[str, int]]]:
+    """-> (path -> paths it depends on, path -> names that resolved to nothing, edge weights).
+
+    The third value is how many times each dependency was actually referenced — the signal
+    `requires` destroys by being a set. It is what lets a reader (and the architect) tell an
+    edge that is one helper call from an edge that is thirty, which is the difference between
+    a component boundary that is cheap to draw and one that is not.
+    """
     index = _provider_index(facts)
     deps: Dict[str, Set[str]] = {f.path: set() for f in facts}
+    weights: Dict[str, Dict[str, int]] = {f.path: {} for f in facts}
     external: Dict[str, List[str]] = {}
     for fact in facts:
         unresolved = []
+        per_name = getattr(fact, "requires_weight", None) or {}
+        # Which (provider, reference) pairs this file has already been charged for. Several
+        # spellings of one reference land on the same provider and must count once; two
+        # genuinely different references to the same provider must count twice.
+        charged: Set[Tuple[str, str]] = set()
         for name in fact.requires:
             providers = index.get(name)
             if not providers:
                 unresolved.append(name)
                 continue
             for provider in providers:
-                if provider != fact.path:          # a self-edge is never a dependency
+                if provider == fact.path:          # a self-edge is never a dependency
+                    continue
+                deps[fact.path].add(provider)
+                key = (provider, _leaf(name))
+                if key in charged:
+                    continue
+                charged.add(key)
+                # An analyzer that does not count leaves this at 1 per resolved reference,
+                # which is exactly the behaviour before weights existed.
+                weights[fact.path][provider] = (weights[fact.path].get(provider, 0)
+                                                + max(1, int(per_name.get(name, 1))))
+        # Inferred references: an edge when they land, nothing when they miss. A template name
+        # that resolves to no file is a template this analyzer guessed wrong about, not a
+        # dependency the customer has to go and find.
+        #
+        # Deliberately unweighted. A soft edge is a guess, and letting a guess add to a number
+        # the architect reads as measured coupling would put invented weight on a real
+        # decision — the same argument that keeps `soft_requires` out of `external_requires`.
+        for name in getattr(fact, "soft_requires", ()):
+            for provider in index.get(name) or ():
+                if provider != fact.path:
                     deps[fact.path].add(provider)
+                    weights[fact.path].setdefault(provider, 1)
         if unresolved:
             external[fact.path] = sorted(set(unresolved))
-    return deps, external
+    return deps, external, weights
 
 
 def strongly_connected(deps: Dict[str, Set[str]]) -> List[List[str]]:
@@ -109,6 +187,37 @@ def strongly_connected(deps: Dict[str, Set[str]]) -> List[List[str]]:
     return components
 
 
+def condense(deps: Dict[str, Set[str]]) -> Dict[str, Any]:
+    """Cycles collapsed, levels assigned. The half of `build` that is not about `UnitFacts`.
+
+    Extracted so the *component* graph can reuse it. A target architecture partitions the
+    file graph into components, and that quotient graph needs exactly the same treatment —
+    Tarjan for the cycles a partition can create between components that did not exist
+    between files, Kahn for the order. Running a second, subtly different implementation
+    over it is how the two would drift, and a drifted order is the failure D-04 describes.
+
+    Returns the components (each a sorted member list), the member -> component index, and
+    each component's longest-path level.
+    """
+    components = strongly_connected(deps)
+    comp_of: Dict[str, int] = {}
+    for i, component in enumerate(components):
+        for member in component:
+            comp_of[member] = i
+
+    comp_deps: Dict[int, Set[int]] = {i: set() for i in range(len(components))}
+    for node, targets in deps.items():
+        source_comp = comp_of[node]
+        for target in targets:
+            target_comp = comp_of.get(target)
+            if target_comp is not None and target_comp != source_comp:
+                comp_deps[source_comp].add(target_comp)
+
+    levels = _kahn_levels(comp_deps, components)
+    return {"components": components, "comp_of": comp_of, "comp_deps": comp_deps,
+            "levels": levels}
+
+
 def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
     """Full pipeline. Returns units ready for `store.insert_units`, plus the cycles found.
 
@@ -117,24 +226,10 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
     of independence rather than a guess — which is what makes it safe to widen parallelism
     later without re-deriving anything.
     """
-    deps, external = resolve_edges(facts)
-    components = strongly_connected(deps)
-
-    comp_of: Dict[str, int] = {}
-    for i, component in enumerate(components):
-        for path in component:
-            comp_of[path] = i
-
-    # Condensation: edges between components only.
-    comp_deps: Dict[int, Set[int]] = {i: set() for i in range(len(components))}
-    for path, targets in deps.items():
-        source_comp = comp_of[path]
-        for target in targets:
-            target_comp = comp_of[target]
-            if target_comp != source_comp:
-                comp_deps[source_comp].add(target_comp)
-
-    levels = _kahn_levels(comp_deps, components)
+    deps, external, weights = resolve_edges(facts)
+    condensed = condense(deps)
+    components = condensed["components"]
+    levels = condensed["levels"]
 
     # Order: by level, then by the component's lowest path, then by path inside it. Fully
     # determined by the inventory, so a re-ingest of the same repo converts in the same
@@ -165,11 +260,25 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
             # Everything the graph knows but the scheduler doesn't need travels in `meta`,
             # so `depends_on` stays exactly "what must be converted before this" and can be
             # read literally by the readiness check.
+            #
+            # The analyzer's own findings go in first and the graph's four keys overwrite
+            # them, so an analyzer cannot shadow `in_cycle_with` or `depends_on`'s companions
+            # by returning a key of the same name.
             unit["meta"] = {
+                **(unit.pop("meta", None) or {}),
                 "provides": unit.pop("provides", []),
                 "requires": unit.pop("requires", []),
                 "in_cycle_with": sorted(member_set - {path}),
                 "external_requires": external.get(path, []),
+                # Weights for the edges that survived, keyed the same way `depends_on` is.
+                # Scoped to `depends_on` rather than to every resolved provider so the two
+                # cannot disagree: an intra-cycle edge is not a dependency here, so its
+                # weight is not a fact about this unit's dependencies either.
+                "dependency_weights": {
+                    target: weight
+                    for target, weight in sorted((weights.get(path) or {}).items())
+                    if target in unit["depends_on"]
+                },
             }
             unit["topo_level"] = levels[comp_id]
             unit["scc_group"] = comp_id if len(members) > 1 else None
@@ -192,8 +301,14 @@ def build(facts: Sequence[UnitFacts]) -> Dict[str, Any]:
         "cycles": len(cycles),
         "units_in_cycles": sum(c["size"] for c in cycles),
         "roots": sum(1 for u in units if not u["depends_on"]),
+        # Runtime-provided types are filtered out. This list is shown at the discovery gate as
+        # the third-party surface a migration has to account for, and `PDO`, `PDOStatement`
+        # and `RuntimeException` are not third-party — they are the language. Leaving them in
+        # meant the honest answer for a self-contained application ("nothing external") was
+        # never visible, so the field carried no information either way.
         "external_dependencies": sorted({
             name for names in external.values() for name in names
+            if not _is_runtime_type(name)
         })[:200],
     }
     logger.info(

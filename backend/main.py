@@ -20,7 +20,7 @@ from backend.logging_config import configure_logging, request_id_ctx
 configure_logging()
 logger = logging.getLogger(__name__)
 
-from backend import database, config
+from backend import database, config, scope
 from backend.workflows import full_review as full_review_workflow
 from backend.workflows.base import count_steps
 from backend.routes.auth import router as auth_router
@@ -342,36 +342,11 @@ def require_reader(
 def _visible_project_ids(reader: dict, request: Request) -> Optional[List[str]]:
     """Which projects' reviews this caller may read. None means every project.
 
-    Selecting a project narrows these screens to it, for everyone. "Working in: Acme"
-    has to mean the same thing on every screen, or the picker means one thing for spend
-    and another for history.
-
-    With nothing selected:
-      * super admin — everything, including the unattributed rows from before reviews
-        carried a project;
-      * anyone else — every project they are a member of;
-      * an API key — its own project, and only that, selected or not.
-
-    A user who belongs to no project gets an empty list, which means no rows. That is the
-    intended answer, not a bug: their work isn't attributed to anything, so there is
-    nothing for them to be shown.
+    The rule itself now lives in `backend/scope.py` so routers other than this module can
+    apply it — `routes/approvals.py` and `routes/findings.py` list governance rows and were
+    reinventing (or, in the approvals case, simply omitting) the same scoping.
     """
-    if reader.get("type") == "api_key":
-        project_id = (reader.get("_record") or {}).get("project_id")
-        return [project_id] if project_id else []
-
-    user = reader.get("_user") or {}
-    selected = (request.headers.get("x-project-id") or "").strip()
-
-    if is_super_admin(user):
-        return [selected] if selected else None
-
-    allowed = database.list_member_project_ids(user.get("sub") or "")
-    if selected:
-        # Not a member of it: show nothing rather than falling back to everything they
-        # can see, which would quietly ignore a selection they can see on screen.
-        return [selected] if selected in allowed else []
-    return allowed
+    return scope.visible_project_ids(reader, request)
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────
@@ -667,22 +642,20 @@ async def auto_fix_github_pr(req: GithubAutoFixRequest):
 async def release_gate(req: ReleaseGateRequest):
     _require_llm()
 
-    findings = []
-    if req.findings:
-        findings = [f.model_dump() for f in req.findings]
-    elif req.review_ids:
-        for rid in req.review_ids:
-            review = database.get_review(rid)
-            if review and review.get("result"):
-                findings.extend(review["result"].get("findings", []))
-
+    # Routed through the workflow rather than calling `gate_agent` inline. The inline
+    # version evaluated the gate and returned the verdict without saving anything, so a
+    # release decision made on the Release Gate page — the platform's most consequential
+    # output — was the one result that never reached History, could never be picked up by
+    # the Governance Report's review picker, and never entered the approval queue. The
+    # v1 endpoint for the same product has always persisted; this was two behaviours for
+    # one product depending on which door you came through.
     try:
-        result = orchestrator.gate_agent.evaluate_gate(
-            all_findings=findings,
+        return orchestrator.run_release_gate(
             project_name=req.project_name or "Unnamed",
+            review_ids=req.review_ids,
             release_version=req.release_version or "",
+            findings=[f.model_dump() for f in req.findings] if req.findings else None,
         )
-        return result
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)

@@ -28,7 +28,9 @@ import anthropic
 import openai
 
 from backend import config
-from backend.services.guardrail_service import enforce_input_limit, scan_for_injection_markers
+from backend.services.guardrail_service import (
+    enforce_input_limit, scan_for_injection_markers, wrap_untrusted_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +100,73 @@ class LLMProviderError(RuntimeError):
             detail += f" ({elapsed_ms:.0f}ms elapsed)"
         detail += f": {type(original).__name__}: {original}"
         super().__init__(detail)
+
+
+class LLMProviderUnavailableError(LLMProviderError):
+    """The provider refused for a reason no retry can fix: the account is out of quota or
+    credit, or the rate limit it hit resets further away than we are willing to wait.
+
+    Separated from `LLMProviderError` because the two want opposite handling. A timeout or a
+    502 may well succeed on the next attempt, so the unit that hit it should be retried and,
+    past its attempt limit, failed. This will not succeed for *anybody* until something
+    outside this process changes — so retrying is waste, and the damage is worse than waste:
+    each attempt spends one of the unit's three, and a whole run's units can be retired as
+    permanently failed by an outage that lasted an afternoon.
+
+    Observed: a run against a local router where every call returned
+    `429 … You've reached your 5-hour usage limit for your plan … reset after 3h 21m`. Four
+    comprehension probes and the design call each burned three attempts discovering the same
+    thing, which retired all five units terminally and left the run unable to resume even
+    after the quota came back.
+    """
+
+
+# How long a rate limit may ask us to wait and still count as a blip. A burst limiter says
+# "one second"; a plan limit says "three hours". Only the first is worth sleeping through.
+RATE_LIMIT_RETRY_CEILING_SECONDS = 120
+
+# Words a provider uses when the account, rather than the moment, is the problem. Matched on
+# the message because the status code cannot distinguish them: 429 is both "too fast" and
+# "you have used everything you bought".
+_EXHAUSTED_MARKERS = (
+    "usage limit", "quota", "insufficient", "credit", "billing", "out of funds",
+    "exceeded your current", "spending limit", "hard limit", "payment", "purchase credits",
+    "plans & billing", "balance is too low",
+)
+
+
+def _retry_after_seconds(exc: Exception) -> Optional[float]:
+    """What the provider itself said to wait, if it said anything."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    for name in ("retry-after", "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        raw = headers.get(name) if hasattr(headers, "get") else None
+        if not raw:
+            continue
+        try:
+            return float(str(raw).rstrip("s"))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _unavailable_reason(exc: Exception) -> str:
+    """-> a sentence when retrying cannot help, else "".
+
+    Deliberately generous about what counts. Treating a transient limit as permanent costs
+    one paused run that a resume fixes; treating a permanent one as transient retires units
+    that had nothing wrong with them, which is the failure this exists to prevent.
+    """
+    wait = _retry_after_seconds(exc)
+    if wait and wait > RATE_LIMIT_RETRY_CEILING_SECONDS:
+        return (f"the provider asked us to wait {int(wait)}s before trying again, which is "
+                f"longer than a run should sit inside one call")
+    lowered = str(exc).lower()
+    for marker in _EXHAUSTED_MARKERS:
+        if marker in lowered:
+            return ("the account behind this connection is out of quota or credit — the "
+                    "provider refused the request rather than answering it")
+    return ""
 
 
 @contextmanager
@@ -200,49 +269,61 @@ def _cacheable_system(system_prompt: str):
     return [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
 
-def _call_anthropic(
-    api_key: Optional[str], base_url: Optional[str], model: Optional[str],
-    system_prompt: str, user_content: str, tool_schema: Dict[str, Any],
-    max_tokens: Optional[int] = None, timeout: Optional[float] = None,
-) -> Dict[str, Any]:
-    client = _default_anthropic_client if not api_key else anthropic.Anthropic(
-        api_key=api_key, base_url=base_url or None
-    )
-    timeout = timeout or config.LLM_TIMEOUT_SECONDS
-    resolved_model = model or config.MODEL
+def _anthropic_send(client, params: Dict[str, Any], label: str,
+                    timeout: float) -> Any:
+    """One request to Anthropic under the platform's retry policy, with usage recorded.
+
+    Extracted so the single-shot path and the agentic loop cannot drift on *what we retry*
+    and *what we bill*. Everything each caller does differently — how the messages are built,
+    which tool is forced, what a truncation means — stays with the caller; this is only the
+    send.
+    """
     last_err = None
     response = None
     start = time.perf_counter()
-    system_param = _cacheable_system(system_prompt)
     for attempt in range(config.LLM_MAX_RETRIES + 1):
         try:
-            response = client.messages.create(
-                model=resolved_model,
-                max_tokens=max_tokens or config.MAX_TOKENS,
-                system=system_param,
-                tools=[tool_schema],
-                tool_choice={"type": "tool", "name": tool_schema["name"]},
-                messages=[{"role": "user", "content": user_content}],
-                timeout=timeout,
-            )
+            response = client.messages.create(timeout=timeout, **params)
             break
         except _RETRYABLE_ANTHROPIC as e:
             last_err = e
+            unavailable = _unavailable_reason(e)
+            if unavailable:
+                logger.error("Anthropic call for tool '%s' cannot proceed: %s",
+                             label, unavailable)
+                raise LLMProviderUnavailableError(
+                    "anthropic", label, attempt + 1, e,
+                    elapsed_ms=(time.perf_counter() - start) * 1000) from e
             if attempt < config.LLM_MAX_RETRIES:
                 logger.warning(
                     "Anthropic call for tool '%s' failed (attempt %d/%d): %s — retrying",
-                    tool_schema["name"], attempt + 1, config.LLM_MAX_RETRIES + 1, e,
+                    label, attempt + 1, config.LLM_MAX_RETRIES + 1, e,
                 )
                 time.sleep(2 ** attempt)
                 continue
             elapsed_ms = (time.perf_counter() - start) * 1000
             logger.error(
                 "Anthropic call for tool '%s' failed after %d attempts (%.0fms): %s",
-                tool_schema["name"], config.LLM_MAX_RETRIES + 1, elapsed_ms, e,
+                label, config.LLM_MAX_RETRIES + 1, elapsed_ms, e,
             )
             raise LLMProviderError(
-                "anthropic", tool_schema["name"], config.LLM_MAX_RETRIES + 1, e, elapsed_ms=elapsed_ms,
+                "anthropic", label, config.LLM_MAX_RETRIES + 1, e, elapsed_ms=elapsed_ms,
             ) from e
+        except Exception as e:
+            # Not on the retry list, so today this propagated as-is and the unit spent an
+            # attempt on it. Ask the same question first: a provider that has refused for a
+            # reason no retry can fix says so in the message, and the *status code cannot
+            # tell you* - Anthropic reports an exhausted balance as a 400
+            # `invalid_request_error`, not a 429, so the one classifier whose whole job is
+            # spotting "retrying cannot help" never got asked about the commonest case.
+            # Anything it does not recognise propagates exactly as before.
+            unavailable = _unavailable_reason(e)
+            if not unavailable:
+                raise
+            logger.error("Anthropic call for tool '%s' cannot proceed: %s", label, unavailable)
+            raise LLMProviderUnavailableError(
+                "anthropic", label, attempt + 1, e,
+                elapsed_ms=(time.perf_counter() - start) * 1000) from e
     duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
@@ -254,13 +335,38 @@ def _call_anthropic(
     # the prefix is changing between calls and the cache is never being hit.
     cache_write = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
     cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
-    _record_usage("anthropic", resolved_model, input_tokens, output_tokens, cache_write, cache_read)
+    _record_usage("anthropic", params.get("model") or config.MODEL,
+                  input_tokens, output_tokens, cache_write, cache_read)
     logger.info(
         "Anthropic call tool='%s' model=%s tokens_in=%d tokens_out=%d cache_write=%d cache_read=%d "
         "duration=%.1fms stop_reason=%s",
-        tool_schema["name"], resolved_model, input_tokens, output_tokens, cache_write, cache_read,
+        label, params.get("model"), input_tokens, output_tokens, cache_write, cache_read,
         duration_ms, response.stop_reason,
     )
+    return response, duration_ms, input_tokens, output_tokens
+
+
+def _call_anthropic(
+    api_key: Optional[str], base_url: Optional[str], model: Optional[str],
+    system_prompt: str, user_content: str, tool_schema: Dict[str, Any],
+    max_tokens: Optional[int] = None, timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    client = _default_anthropic_client if not api_key else anthropic.Anthropic(
+        api_key=api_key, base_url=base_url or None
+    )
+    timeout = timeout or config.LLM_TIMEOUT_SECONDS
+    resolved_model = model or config.MODEL
+    response, duration_ms, input_tokens, output_tokens = _anthropic_send(
+        client,
+        {
+            "model": resolved_model,
+            "max_tokens": max_tokens or config.MAX_TOKENS,
+            "system": _cacheable_system(system_prompt),
+            "tools": [tool_schema],
+            "tool_choice": {"type": "tool", "name": tool_schema["name"]},
+            "messages": [{"role": "user", "content": user_content}],
+        },
+        tool_schema["name"], timeout)
     if response.stop_reason == "max_tokens":
         logger.warning(
             "Anthropic call for tool '%s' hit max_tokens (%d) — response is likely truncated/incomplete",
@@ -315,6 +421,15 @@ def _call_openai(
             )
             break
         except _RETRYABLE_OPENAI as e:
+            unavailable = _unavailable_reason(e)
+            if unavailable:
+                # This is the path the OmniRoute run took, three times per unit, against a
+                # limit that reset three hours later.
+                logger.error("OpenAI call for tool '%s' cannot proceed: %s",
+                             tool_schema["name"], unavailable)
+                raise LLMProviderUnavailableError(
+                    "openai", tool_schema["name"], attempt + 1, e,
+                    elapsed_ms=(time.perf_counter() - start) * 1000) from e
             if attempt < config.LLM_MAX_RETRIES:
                 logger.warning(
                     "OpenAI call for tool '%s' failed (attempt %d/%d): %s — retrying",
@@ -330,6 +445,18 @@ def _call_openai(
             raise LLMProviderError(
                 "openai", tool_schema["name"], config.LLM_MAX_RETRIES + 1, e, elapsed_ms=elapsed_ms,
             ) from e
+        except Exception as e:
+            # Same gap as the Anthropic path, and more likely here: a router in front of
+            # several providers reports an exhausted account with whatever code the upstream
+            # gave it.
+            unavailable = _unavailable_reason(e)
+            if not unavailable:
+                raise
+            logger.error("OpenAI call for tool '%s' cannot proceed: %s",
+                         tool_schema["name"], unavailable)
+            raise LLMProviderUnavailableError(
+                "openai", tool_schema["name"], attempt + 1, e,
+                elapsed_ms=(time.perf_counter() - start) * 1000) from e
     duration_ms = (time.perf_counter() - start) * 1000
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -439,6 +566,180 @@ def call_tool(
         if isinstance(result, dict):
             result["guardrail_flags"] = flags
     return result
+
+
+
+# ── The agentic loop ───────────────────────────────────────────────────────
+#
+# Everything above sends **one** turn: a system prompt, a user message, and a tool the model
+# is forced to call. That is the right shape for a reviewer, which is handed the artifact it
+# is meant to judge. It is the wrong shape for a converter, which is regularly asked a
+# question whose answer is in a file it was not given — does this entity declare `Password`
+# or `PasswordHash`, what is that column actually called, how did the component before this
+# one spell the method I have to call. With one turn it cannot ask. It guesses, and a guess
+# that compiles is the most expensive kind of wrong this pipeline produces.
+#
+# So: the same forced-tool contract, with a bounded number of read-only lookups before it.
+#
+# Three properties this must have, in the order they matter:
+#
+#   1. **It always terminates, with output.** The last turn offers the final tool and nothing
+#      else, and forces it. A loop inside a durable run that can spin, or that can come back
+#      empty after spending, would be worse than the guess it replaces.
+#   2. **Every tool result is untrusted input.** The model now *fetches* content mid-loop —
+#      a customer's source file, which may contain text written to steer it. `call_tool`
+#      scans its one user message; this has to scan every result and wrap it the same way
+#      (D-13), because the output goes into code somebody will commit.
+#   3. **Cost stays truthful without touching the ledger.** `track_usage` already accumulates
+#      across every provider call inside one `guarded_call`, so the per-unit cost sums itself.
+#      The caller sizes its *reservation* with `agent_guard.expect_calls(...)`, which exists
+#      for exactly this (D-25). Nothing about metering changes.
+
+AGENTIC_MAX_TURNS = 6
+AGENTIC_MAX_TOOL_CALLS = 12
+# One tool result. Large enough for a real source file, small enough that a careless
+# `find_in_source(".")` cannot fill the context window on its own.
+AGENTIC_RESULT_CHARS = 40_000
+
+
+def call_agentic(
+    system_prompt: str,
+    user_content: str,
+    tool_schema: Dict[str, Any],
+    read_tools: List[Dict[str, Any]],
+    dispatch,
+    llm_override: Optional[Dict[str, Any]] = None,
+    max_tokens: Optional[int] = None,
+    max_turns: int = AGENTIC_MAX_TURNS,
+    max_tool_calls: int = AGENTIC_MAX_TOOL_CALLS,
+) -> Dict[str, Any]:
+    """Let the model look things up before it answers. -> the final tool's input.
+
+    `read_tools` are schemas the model may call to fetch something; `dispatch(name, args)`
+    executes one and returns text. Both belong to the caller: this module knows how to run a
+    conversation, and nothing about what a modernization run contains.
+
+    The result carries `_agentic_turns` and `_agentic_lookups` so a caller can record what it
+    took to answer — the number that says whether this was worth its money.
+
+    **Anthropic only.** `_call_openai` is a separate implementation of the single-shot
+    contract, and half a loop on the OpenAI path would be worse than none: a caller would not
+    know which of the two it got. An OpenAI-compatible connection degrades to `call_tool`,
+    announced in the log, and produces exactly what it produces today.
+    """
+    enforce_input_limit(user_content)
+    override = resolve_override(llm_override)
+    provider = (override or {}).get("provider") or "anthropic"
+    if provider != "anthropic":
+        logger.info(
+            "Agentic loop for tool '%s' is not available on provider '%s' — sending a single "
+            "turn instead. The model cannot look anything up on this connection.",
+            tool_schema["name"], provider)
+        result = call_tool(system_prompt, user_content, tool_schema, llm_override, max_tokens)
+        if isinstance(result, dict):
+            result["_agentic_turns"] = 1
+            result["_agentic_lookups"] = []
+        return result
+
+    api_key = (override or {}).get("api_key")
+    model = (override or {}).get("model") or config.MODEL
+    requested = max_tokens or config.MAX_TOKENS
+    ceiling = (override or {}).get("max_tokens")
+    if ceiling and requested > ceiling:
+        logger.warning("Clamping max_tokens for tool '%s' from %d to the connection's "
+                       "ceiling of %d", tool_schema["name"], requested, ceiling)
+        requested = ceiling
+    timeout = (override or {}).get("timeout_seconds") or config.LLM_TIMEOUT_SECONDS
+    client = _default_anthropic_client if not api_key else anthropic.Anthropic(
+        api_key=api_key, base_url=(override or {}).get("base_url") or None)
+
+    messages: List[Dict[str, Any]] = [{"role": "user", "content": user_content}]
+    lookups: List[str] = []
+    system_param = _cacheable_system(system_prompt)
+
+    for turn in range(max_turns + 1):
+        # The final turn offers the answer tool and nothing else, and forces it. This is the
+        # termination guarantee, and it is why `max_turns + 1`: every earlier turn may
+        # legitimately be spent looking.
+        final = turn >= max_turns or len(lookups) >= max_tool_calls
+        params = {
+            "model": model,
+            "max_tokens": requested,
+            "system": system_param,
+            "tools": [tool_schema] if final else [tool_schema] + list(read_tools),
+            "tool_choice": ({"type": "tool", "name": tool_schema["name"]} if final
+                            else {"type": "any"}),
+            "messages": messages,
+        }
+        response, duration_ms, input_tokens, output_tokens = _anthropic_send(
+            client, params, tool_schema["name"], timeout)
+
+        if response.stop_reason == "max_tokens":
+            logger.warning("Agentic call for tool '%s' hit max_tokens (%d) on turn %d",
+                           tool_schema["name"], requested, turn + 1)
+            raise LLMTruncatedResponseError(
+                tool_schema["name"], requested, elapsed_ms=duration_ms,
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                model=model, provider="anthropic")
+
+        blocks = list(response.content)
+        for block in blocks:
+            if getattr(block, "type", "") == "tool_use" and block.name == tool_schema["name"]:
+                result = dict(block.input)
+                result["_agentic_turns"] = turn + 1
+                result["_agentic_lookups"] = lookups
+                logger.info("Agentic call tool='%s' answered on turn %d after %d lookup(s)",
+                            tool_schema["name"], turn + 1, len(lookups))
+                return result
+
+        requests = [b for b in blocks if getattr(b, "type", "") == "tool_use"]
+        if not requests:
+            # Nothing to execute and no answer. Continuing would re-send an identical
+            # conversation, which is the byte-identical-prompt trap D-65 and D-89 both
+            # document one layer down. Ask again with the answer forced instead.
+            logger.warning("Agentic call for tool '%s' returned no tool call on turn %d",
+                           tool_schema["name"], turn + 1)
+            messages.append({"role": "assistant", "content": blocks or "…"})
+            messages.append({"role": "user", "content":
+                             "Answer now by calling " + tool_schema["name"] + "."})
+            continue
+
+        results = []
+        for block in requests:
+            lookups.append("%s(%s)" % (block.name, json.dumps(block.input)[:200]))
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": _agentic_result(block.name, block.input, dispatch)})
+        messages.append({"role": "assistant", "content": blocks})
+        messages.append({"role": "user", "content": results})
+
+    raise ValueError(
+        "Agentic call for tool '%s' ended without calling it, which the forced final turn "
+        "should have made impossible." % tool_schema["name"])
+
+
+def _agentic_result(name: str, arguments: Any, dispatch) -> str:
+    """Run one lookup and return text safe to put back into the conversation.
+
+    A tool failure is **returned to the model, not raised**: "that file does not exist" is
+    something it can act on, and taking the whole unit down because it guessed a path wrong
+    would make the loop more fragile than the single turn it replaces.
+    """
+    try:
+        text = str(dispatch(name, arguments if isinstance(arguments, dict) else {}) or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Agentic lookup %s failed: %s", name, exc)
+        return "That lookup failed: %s: %s" % (type(exc).__name__, exc)
+    if len(text) > AGENTIC_RESULT_CHARS:
+        text = (text[:AGENTIC_RESULT_CHARS]
+                + "\n… truncated at %d characters." % AGENTIC_RESULT_CHARS)
+    flags = scan_for_injection_markers(text)
+    if flags:
+        # Not refused: a legacy file may legitimately contain the words that trip this, and
+        # refusing would make part of a customer's codebase unreadable to the converter. It
+        # is wrapped and logged instead, which is what `_resolve` does with the same content
+        # arriving through the front door (D-13).
+        logger.warning("Injection markers in an agentic lookup result (%s): %s", name, flags)
+    return wrap_untrusted_content(text, "a file from the source codebase", mode="transform")
 
 
 def count_tokens(

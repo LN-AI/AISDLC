@@ -29,6 +29,8 @@ import re
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend import config
+
 logger = logging.getLogger(__name__)
 
 # Directories that are never source. Matched as path segments, so `src/vendor/x` is
@@ -45,8 +47,12 @@ EXCLUDED_DIRS = {
 # platform to convert them.
 DEFAULT_EXTENSIONS = {
     # modern
-    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rb", ".php", ".cs", ".vb",
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go", ".rb", ".cs", ".vb",
     ".kt", ".swift", ".scala", ".rs", ".c", ".h", ".cpp", ".hpp", ".cc",
+    # PHP. `.inc` is deliberately absent: it belongs to Delphi (`analyzers/pascal.py`),
+    # analyzer registration is last-write-wins, and stealing it would silently break every
+    # Delphi run. A PHP shop that uses `.inc` passes it via the per-run override.
+    ".php", ".php3", ".php4", ".php5", ".php7", ".phtml", ".tpl",
     # legacy / mainframe / 4GL
     ".pas", ".dpr", ".dfm", ".dpk", ".inc",          # Delphi / Pascal
     ".cob", ".cbl", ".cpy", ".jcl",                   # COBOL
@@ -58,6 +64,15 @@ DEFAULT_EXTENSIONS = {
     ".csproj", ".vbproj", ".sln", ".gradle", ".pom",
 }
 
+# Files with no extension at all that a conversion still has to read. The filter below is
+# extension-based, and `os.path.splitext(".htaccess")[1]` is `""` — so the single most
+# important file in a legacy PHP application, the one carrying its entire routing table,
+# could never enter a run. Matched on basename, before the extension test.
+INGEST_BY_NAME = {
+    ".htaccess", ".user.ini", "php.ini", "httpd.conf", "web.config",
+    "composer.json", "dockerfile", "makefile",
+}
+
 # Files whose *contents* are a secret rather than merely containing one. These are skipped
 # entirely — not redacted — because there is nothing left after redaction and no reason to
 # convert them. Ported from the pattern the delphi-to-dotnet skill's security guardrails use.
@@ -66,7 +81,10 @@ FORBIDDEN_NAMES = re.compile(
     r"\.env(\..*)?|"
     r"id_rsa(\.pub)?|id_dsa|id_ecdsa|id_ed25519|"
     r".*\.(pem|pfx|p12|key|keystore|jks|ppk|asc|gpg)|"
-    r"secrets?\.(ya?ml|json|ini|txt)|credentials(\.json)?"
+    r"secrets?\.(ya?ml|json|ini|txt)|credentials(\.json)?|"
+    # `.htpasswd` sits next to `.htaccess`, which is now ingested by name — and unlike its
+    # neighbour it is nothing but password hashes.
+    r"\.htpasswd"
     r")$",
     re.IGNORECASE,
 )
@@ -98,6 +116,19 @@ _REDACTION_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
         r"\s*(?::=|=|:)\s*['\"](?P<value>[^'\"\r\n]{8,})['\"]")),
     ("connection_string", re.compile(
         r"(?i)\b(?:pwd|password)\s*=\s*(?P<value>[^;'\"\r\n]{4,}?)(?=\s*(?:;|$))")),
+    # Positional credentials in a connect call. Nothing above catches these, because the
+    # secret is identified by its *argument position* rather than by a key next to it —
+    # and `mysqli_connect('localhost', 'root', 'hunter2', 'shop')` is the single most common
+    # place a credential lives in a legacy PHP codebase. Third argument only; host, user and
+    # database name are not secrets and removing them would break the conversion.
+    ("db_connect_password", re.compile(
+        r"""(?ix) \b (?: mysqli?_connect | mysqli_real_connect | pg_connect | oci_connect
+                       | new \s+ mysqli )
+            \s* \( \s*
+            (['"])[^'"\r\n]{0,120}\1 \s*, \s*      # host
+            (['"])[^'"\r\n]{0,120}\2 \s*, \s*      # user
+            (['"])(?P<value>[^'"\r\n]{4,})\3       # password
+        """)),
 ]
 
 REDACTION_PLACEHOLDER = "__REDACTED_{category}__"
@@ -105,7 +136,15 @@ REDACTION_PLACEHOLDER = "__REDACTED_{category}__"
 # Bounds. Generous, because content goes into rows rather than into a prompt — the only
 # thing these protect is the database and the request that carries the upload.
 MAX_FILES = 5000
-MAX_FILE_CHARS = 400_000
+
+# The per-file cap is derived from the prompt cap, not set beside it. They used to be the
+# same number (400,000), which meant a file that *just* passed ingest was guaranteed to fail
+# `llm_gateway.enforce_input_limit` later — source plus the prompt frame is always larger
+# than source alone. The run then spent three attempts discovering that, without ever
+# reaching the model. `PROMPT_FRAME_CHARS` is the headroom the instructions, the charter,
+# the dependency signatures and the tool schema need.
+PROMPT_FRAME_CHARS = 32_000
+MAX_FILE_CHARS = max(50_000, config.MAX_AGENT_INPUT_CHARS - PROMPT_FRAME_CHARS)
 MAX_TOTAL_CHARS = 60_000_000
 MAX_ZIP_MEMBER_BYTES = 10_000_000       # a single member; guards against a zip bomb
 MAX_ZIP_TOTAL_BYTES = 500_000_000       # uncompressed total, same reason
@@ -235,7 +274,8 @@ def normalize_files(
             skipped.append({"path": path, "reason": "credential_file"})
             continue
         ext = os.path.splitext(path)[1].lower()
-        if allowed and ext not in allowed:
+        basename = path.rsplit("/", 1)[-1].lower()
+        if allowed and ext not in allowed and basename not in INGEST_BY_NAME:
             skipped.append({"path": path, "reason": f"extension_not_converted ({ext or 'none'})"})
             continue
         content = entry.get("content") or ""

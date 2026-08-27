@@ -25,7 +25,7 @@ import logging
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from backend.database import get_connection
 
@@ -37,17 +37,51 @@ logger = logging.getLogger(__name__)
 LEASE_SECONDS = 1200
 
 # Run states. `converting` and `paused` are the only pair that cycles.
+#
+# `comprehending` and `reconciling` are the only two stages that got their own state, and
+# the rule for that was: does displaying the existing state lie to the operator? `analyzing`
+# means "free and deterministic" — showing it while a run burns forty metered model calls is
+# a lie on the product's main screen. Design/plan/scaffold/convert/wireup do not lie under
+# `analyzing`/`converting`, so they ride on `phase`, which is free text and is what an
+# operator actually reads.
 RUN_STATES = (
-    "draft", "scanning", "awaiting_charter", "analyzing", "awaiting_approval",
-    "converting", "paused", "completed", "failed", "cancelled",
+    "draft", "scanning", "awaiting_charter", "analyzing", "comprehending",
+    "awaiting_approval", "converting", "reconciling", "paused",
+    "completed", "failed", "cancelled",
 )
 TERMINAL_RUN_STATES = ("completed", "failed", "cancelled")
+
+# States a crash can interrupt — one constant so that adding a state is a one-line change
+# rather than an edit to two spelled-out tuples inside `recover_expired_leases`.
+ACTIVE_RUN_STATES = ("converting", "scanning", "analyzing", "comprehending", "reconciling")
 
 # Unit states. `blocked` is the default: a unit becomes `ready` only when everything it
 # depends on has been converted, which is what makes the topological order real rather
 # than advisory.
+#
+# `rolled_up` is what a source file becomes once decomposition absorbs it into a component.
+# It is deliberately not `converted`: it resolves dependencies (nobody is waiting on it any
+# more) but it must not count as work done, or "417 of 523 files converted" would be a lie
+# told the moment the plan was approved. `complete_unit` flips a component's members to
+# `converted` in the same transaction that records the component.
 UNIT_STATES = (
     "blocked", "ready", "in_progress", "converted", "failed", "skipped", "needs_human",
+    "rolled_up",
+)
+
+# What a unit is. `source_file` is every row written before this column existed, which is
+# why it is the DEFAULT — see `_migrate`. Each kind is claimed and drained separately, and
+# the invariant that makes the metering story hold is: **one unit is at most one LLM call**
+# (D-20, and `agent_guard._EXPECTED_CALLS_BY_PRODUCT["modernization"] == 1`).
+UNIT_KINDS = (
+    "source_file",      # ingested source. After decomposition these are evidence, not work.
+    "comprehension",    # one bundle of source files -> one probe call
+    "synthesis",        # one call over every probe's output
+    "design",           # one call per inventory shard -> the component partition
+    "component",        # N source files -> M target files. The conversion unit.
+    "scaffold",         # the project skeleton. Deterministic; no LLM call at all.
+    "wireup",           # host/DI/config that has to see the whole component list
+    "reconcile",        # one call over the deterministic conflict report
 )
 
 
@@ -188,7 +222,334 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_mod_events_run
             ON modernization_events(run_id, id);
+
+        -- What the parsers observed, and where. Deterministic, regenerable, and never
+        -- LLM-derived (D-04 applies to evidence exactly as it applies to edges): an
+        -- invented entry point sends the architect down a path nothing can recover from.
+        -- Queried by (kind, value) across a whole run by three consumers — comprehension
+        -- bundling, the architect prompt, and reconciliation's entry-point coverage check —
+        -- which is why it is a table rather than an index over `meta_json`.
+        CREATE TABLE IF NOT EXISTS modernization_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            unit_id TEXT,
+            path TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            value TEXT NOT NULL,
+            line INTEGER DEFAULT 0,
+            snippet TEXT,
+            confidence REAL DEFAULT 1.0,
+            source TEXT DEFAULT 'parser',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_evidence_run
+            ON modernization_evidence(run_id, kind, value);
+        CREATE INDEX IF NOT EXISTS idx_mod_evidence_path
+            ON modernization_evidence(run_id, path);
+
+        -- One attempt to build the converted codebase. The row exists whether the compiler
+        -- ran here, in the customer's CI, or in a sandbox worker: the diagnostics contract
+        -- is the interface, so nothing downstream has to know which one produced it.
+        --
+        -- `fingerprint` is what stops the obvious failure mode. A model that cannot fix an
+        -- error will happily regenerate the same file forever; two consecutive builds with
+        -- the same fingerprint mean the loop is not converging, and the run stops for a
+        -- human instead of spending the budget discovering that slowly.
+        -- Did the converted application start, and did it answer its own URLs? A separate
+        -- pair from the builds tables on purpose: a runtime 500 has no file and no line, so
+        -- recording one as a diagnostic would make every row `unmapped` — which raises a
+        -- blocking checkpoint and halts the run for the wrong reason — and it would consume a
+        -- `build_round`, which is what the round cap and the convergence fingerprint count in.
+        CREATE TABLE IF NOT EXISTS modernization_runtime_reports (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            round INTEGER DEFAULT 1,
+            source TEXT DEFAULT 'external',
+            status TEXT NOT NULL DEFAULT 'never_run',
+            started INTEGER DEFAULT 0,
+            skipped_reason TEXT,
+            base_url TEXT,
+            command TEXT,
+            check_count INTEGER DEFAULT 0,
+            failing_count INTEGER DEFAULT 0,
+            log_tail TEXT,
+            actor TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_runtime_run
+            ON modernization_runtime_reports(run_id, round);
+
+        -- One probed URL. `status` is the HTTP status observed, 0 when nothing answered, and
+        -- `error` carries why in that case — a connection refused and a 500 are different
+        -- failures and the checkpoint has to be able to say which.
+        CREATE TABLE IF NOT EXISTS modernization_runtime_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            method TEXT DEFAULT 'GET',
+            path TEXT NOT NULL,
+            status INTEGER DEFAULT 0,
+            error TEXT,
+            ms INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_runtime_checks
+            ON modernization_runtime_checks(report_id);
+
+        CREATE TABLE IF NOT EXISTS modernization_builds (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            round INTEGER DEFAULT 1,
+            source TEXT DEFAULT 'external',
+            status TEXT NOT NULL DEFAULT 'reported',
+            branch TEXT,
+            commit_sha TEXT,
+            command TEXT,
+            error_count INTEGER DEFAULT 0,
+            warning_count INTEGER DEFAULT 0,
+            unmapped_count INTEGER DEFAULT 0,
+            reopened_count INTEGER DEFAULT 0,
+            fingerprint TEXT,
+            summary TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_builds_run
+            ON modernization_builds(run_id, round);
+
+        -- One compiler message. `unit_id` is resolved at ingest by mapping `file` back
+        -- through the artifact table, and stays NULL when nothing owns that path — which is
+        -- itself a finding worth surfacing (an error in a file no unit produced means the
+        -- scaffold is wrong, not the conversion).
+        CREATE TABLE IF NOT EXISTS modernization_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            build_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            unit_id TEXT,
+            artifact_path TEXT,
+            file TEXT NOT NULL,
+            line INTEGER DEFAULT 0,
+            col INTEGER DEFAULT 0,
+            severity TEXT DEFAULT 'error',
+            code TEXT,
+            message TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_diagnostics_build
+            ON modernization_diagnostics(build_id, severity);
+        CREATE INDEX IF NOT EXISTS idx_mod_diagnostics_unit
+            ON modernization_diagnostics(run_id, unit_id);
+
+        -- Business rules the comprehension pass proposed, each pinned to a line of source.
+        -- Separate from `modernization_evidence` because the lifecycle differs: evidence is
+        -- deterministic and regenerable, a rule is a model's claim that has to survive
+        -- verification against the file it cites before it is allowed to steer conversion.
+        -- `status` is that lifecycle — nothing reaches a prompt while still `proposed`.
+        CREATE TABLE IF NOT EXISTS modernization_rules (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            unit_id TEXT,
+            statement TEXT NOT NULL,
+            category TEXT,
+            path TEXT,
+            line INTEGER DEFAULT 0,
+            quote TEXT,
+            status TEXT NOT NULL DEFAULT 'proposed',
+            reject_reason TEXT,
+            confidence REAL DEFAULT 0.0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_rules_run
+            ON modernization_rules(run_id, status);
+
+        -- One recorded interaction with the *legacy* application: a request, and exactly
+        -- what came back. The golden corpus, and the only thing in this schema that
+        -- describes behaviour rather than code.
+        --
+        -- The recorded response is stored **raw**, not normalized. Normalization is what
+        -- makes two renderings comparable (see `parity.normalize_body`) and it will keep
+        -- improving; a stored normalized form would freeze whatever the comparator believed
+        -- on the day the case was recorded, and a later fix to the comparator could never
+        -- reach it. Cheap to re-derive, impossible to un-bake.
+        --
+        -- `source_path` is the forward link C-41 is about: the legacy file this case
+        -- exercises, which resolves through `modernization_units.parent_unit_id` to the
+        -- component that was supposed to reimplement it. Without it a divergence says
+        -- "something is wrong" and nothing more.
+        CREATE TABLE IF NOT EXISTS modernization_parity_cases (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            group_name TEXT,
+            seq INTEGER DEFAULT 0,
+            source_path TEXT,
+            rule_id TEXT,
+            method TEXT NOT NULL DEFAULT 'GET',
+            path TEXT NOT NULL,
+            query TEXT,
+            request_headers_json TEXT,
+            cookies_json TEXT,
+            request_body TEXT,
+            request_content_type TEXT,
+            expected_status INTEGER DEFAULT 200,
+            expected_location TEXT,
+            expected_content_type TEXT,
+            expected_headers_json TEXT,
+            expected_body TEXT,
+            expected_values_json TEXT,
+            extract_json TEXT,
+            ignore_json TEXT,
+            body_match TEXT DEFAULT 'normalized',
+            status TEXT NOT NULL DEFAULT 'active',
+            source TEXT DEFAULT 'recorded',
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            UNIQUE(run_id, name)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_cases_run
+            ON modernization_parity_cases(run_id, status, group_name, seq);
+
+        -- One adjudicated replay of the corpus against a converted deployment. Same shape
+        -- and same reason as `modernization_builds`: the thing that ran the cases lives
+        -- somewhere else (D-05), so what is durable here is the verdict, not the execution.
+        CREATE TABLE IF NOT EXISTS modernization_parity_reports (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            round INTEGER DEFAULT 1,
+            source TEXT DEFAULT 'external',
+            status TEXT NOT NULL DEFAULT 'reported',
+            base_url TEXT,
+            commit_sha TEXT,
+            total INTEGER DEFAULT 0,
+            passed INTEGER DEFAULT 0,
+            failed INTEGER DEFAULT 0,
+            errored INTEGER DEFAULT 0,
+            missing INTEGER DEFAULT 0,
+            fingerprint TEXT,
+            summary TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_reports_run
+            ON modernization_parity_reports(run_id, round);
+
+        -- One case's verdict in one report, with the differences that produced it. A table
+        -- rather than a blob on the report for the same reason `modernization_diagnostics`
+        -- is one: "which cases are still failing, and which unit owns them" is a query.
+        CREATE TABLE IF NOT EXISTS modernization_parity_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            case_id TEXT NOT NULL,
+            case_name TEXT,
+            verdict TEXT NOT NULL DEFAULT 'fail',
+            actual_status INTEGER DEFAULT 0,
+            actual_location TEXT,
+            differences_json TEXT,
+            unit_id TEXT,
+            error TEXT,
+            duration_ms INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_results_report
+            ON modernization_parity_results(report_id, verdict);
+        CREATE INDEX IF NOT EXISTS idx_mod_parity_results_case
+            ON modernization_parity_results(run_id, case_id);
     """)
+    _migrate(cursor)
+    # Strictly after `_migrate`: this one indexes `kind`, which the CREATE TABLE above does
+    # not declare. Inside the script it would fail on a fresh database — and because a
+    # failing statement aborts an `executescript`, it would take the rest of the schema
+    # with it on every boot.
+    cursor.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_mod_units_kind_claim
+            ON modernization_units(run_id, kind, status, topo_level, order_index);
+        CREATE INDEX IF NOT EXISTS idx_mod_units_parent
+            ON modernization_units(parent_unit_id);
+    """)
+
+
+# Columns added after the tables above first shipped. They are applied one statement at a
+# time rather than inside `executescript`, because a duplicate-column error aborts an entire
+# script — which would take the rest of the schema down with it on every boot after the
+# first. Same idiom as `database.py`'s column migrations.
+#
+# Every DEFAULT here is a *constant*. SQLite stores a constant default in the schema and
+# returns it for rows written before the column existed, so `ADD COLUMN` stays O(1) and no
+# backfill UPDATE is needed even on a large populated database. A non-constant default
+# (CURRENT_TIMESTAMP, an expression) would not have that property.
+# How a component is converted unless a caller says otherwise. `agentic` lets each component
+# look things up before it answers — read another source file, search the codebase, read what an
+# earlier component produced — instead of guessing from the prompt it was given.
+#
+# The default because it is the only head-to-head accuracy comparison this product has: 18 of 18
+# columns mapped correctly where the single-shot call guessed, on a `DbContext` that shipped
+# naming a column the schema does not have. It costs more per component and the plan gate quotes
+# a ceiling that accounts for it. Named here rather than repeated at each entry point, because
+# three copies of a default are three chances for the API, the form and the worker to disagree
+# about what a run that did not choose is getting.
+DEFAULT_CONVERSION_MODE = "agentic"
+
+_ADDED_COLUMNS = (
+    # `single` (one forced tool call per component, which is everything this product has ever
+    # done) or `agentic` (a bounded loop that may look things up first). Defaulted to `single`
+    # so every existing run, every quote already given at a spend gate and every fixture keeps
+    # the behaviour it had — this is a thing a customer opts into, not a thing that happens
+    # to them between deploys.
+    ("modernization_runs", "conversion_mode",
+     f"TEXT DEFAULT '{DEFAULT_CONVERSION_MODE}'"),
+    ("modernization_units", "kind", "TEXT DEFAULT 'source_file'"),
+    ("modernization_units", "component_name", "TEXT"),
+    ("modernization_units", "target_project", "TEXT"),
+    ("modernization_units", "target_namespace", "TEXT"),
+    ("modernization_units", "output_dir", "TEXT"),
+    ("modernization_units", "est_input_tokens", "INTEGER DEFAULT 0"),
+    ("modernization_units", "est_output_tokens", "INTEGER DEFAULT 0"),
+    ("modernization_units", "est_cost_usd", "REAL DEFAULT 0"),
+    ("modernization_units", "actual_cost_usd", "REAL DEFAULT 0"),
+    ("modernization_units", "risk", "TEXT"),
+    ("modernization_units", "rework_attempts", "INTEGER DEFAULT 0"),
+    # Where a generated type lives, not just what it is called. Without it the converter is
+    # told a dependency's name and signature but never its namespace, so it cannot write a
+    # correct `using` even in principle — and nothing downstream can compute one for it.
+    ("modernization_symbols", "namespace", "TEXT"),
+    ("modernization_runs", "system_addendum", "TEXT"),
+    ("modernization_runs", "plan_json", "TEXT"),
+    ("modernization_runs", "estimate_json", "TEXT"),
+    ("modernization_runs", "build_round", "INTEGER DEFAULT 0"),
+    ("modernization_runs", "build_fingerprint", "TEXT"),
+    ("modernization_runs", "github_branch", "TEXT"),
+    ("modernization_runs", "pr_url", "TEXT"),
+    ("modernization_checkpoints", "payload_json", "TEXT"),
+    # The project an MSBuild message named in its `[…\Api.csproj]` suffix. Derived from the
+    # message rather than sent by a producer, so it is deliberately not part of the diagnostics
+    # contract (D-62) — it is the only routing information a project-level error carries, and
+    # stripping the suffix for deduplication used to discard it.
+    ("modernization_diagnostics", "project", "TEXT"),
+    # Which of the two resolved: the file the diagnostic named, or the project it named.
+    ("modernization_diagnostics", "routed_by", "TEXT"),
+    # The literal a `config_key` row had in the source. Carried so `appsettings.json`
+    # can be written with the value the application actually read rather than a
+    # marker — a timezone or a database path is not a credential, and reproducing it
+    # is the only way the converted host boots the way the old one did (C-70).
+    ("modernization_evidence", "value_default", "TEXT"),
+)
+
+
+def _migrate(cursor: sqlite3.Cursor) -> None:
+    for table, column, ddl in _ADDED_COLUMNS:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        except sqlite3.OperationalError:
+            pass  # already present
 
 
 # ── Runs ───────────────────────────────────────────────────────────────────
@@ -228,8 +589,14 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
     if not row:
         return None
     run = dict(row)
+    # `plan_json` and `estimate_json` are decoded here too. They were written by the
+    # architect and the coster but never read back, so `GET /runs/{id}/plan` answered 404 for
+    # every run that had a plan, and the run header's `est. $X, ceiling $Y` line — which
+    # reads `run.estimate` — was dead the day it was written. Both are the *only* record of
+    # what a spend gate was approved against.
     for field, target in (("charter_json", "charter"), ("stats_json", "stats"),
-                          ("redaction_json", "redactions"), ("error_json", "error")):
+                          ("redaction_json", "redactions"), ("error_json", "error"),
+                          ("plan_json", "plan"), ("estimate_json", "estimate")):
         raw = run.pop(field, None)
         try:
             run[target] = json.loads(raw) if raw else None
@@ -275,14 +642,21 @@ def update_run(run_id: str, **fields: Any) -> None:
         return
     payload: Dict[str, Any] = {}
     for key, value in fields.items():
-        if key in ("charter", "stats", "redactions", "error"):
+        if key in ("charter", "stats", "redactions", "error", "plan", "estimate"):
             key = {"charter": "charter_json", "stats": "stats_json",
-                   "redactions": "redaction_json", "error": "error_json"}[key]
+                   "redactions": "redaction_json", "error": "error_json",
+                   "plan": "plan_json", "estimate": "estimate_json"}[key]
             value = json.dumps(value) if value is not None else None
         payload[key] = value
     payload["updated_at"] = _now()
     if payload.get("status") in TERMINAL_RUN_STATES:
         payload["finished_at"] = _now()
+    elif "status" in payload:
+        # Leaving a terminal state has to clear the stamp, or a run reopened by a failed
+        # build stays marked finished — and `finished_at` is what the UI and the export
+        # report read to decide whether a run is over. Without this the column could only
+        # ever be set, never unset.
+        payload.setdefault("finished_at", None)
     cols = ", ".join(f"{k} = ?" for k in payload)
     conn = get_connection()
     conn.execute(f"UPDATE modernization_runs SET {cols} WHERE id = ?",
@@ -306,11 +680,31 @@ def add_run_spend(run_id: str, cost_usd: float) -> float:
 # ── Units ──────────────────────────────────────────────────────────────────
 
 def insert_units(run_id: str, units: List[Dict[str, Any]]) -> int:
-    """Bulk-insert the inventory. One transaction — a half-written inventory would give a
-    run a dependency graph with holes in it, which is worse than no run at all."""
+    """Bulk-insert a stage's rows. One transaction — a half-written inventory would give a
+    run a dependency graph with holes in it, which is worse than no run at all.
+
+    That atomicity is also what makes the stage driver's `stage_units_exist` check safe: a
+    stage's rows are either all there or none are, so a crash midway through planning a
+    stage cannot leave it half-planned. A `plan()` that wrote in two transactions would
+    reintroduce exactly that hole.
+    """
     now = _now()
+
+    # `dependents` is the reverse of `depends_on`, and `_promote_ready` now navigates it to
+    # decide who might have become ready — so it is no longer merely informational, and a
+    # caller that supplies edges but not their reverse would leave every dependent blocked
+    # forever. Derive it here rather than trusting each caller to: `graph.build` computes
+    # the same thing, and this makes the two agree by construction.
+    derived: Dict[str, List[str]] = {}
+    for unit in units:
+        for dep in unit.get("depends_on") or []:
+            derived.setdefault(dep, []).append(unit["path"])
+
     rows = []
     for unit in units:
+        dependents = unit.get("dependents")
+        if not dependents:
+            dependents = sorted(derived.get(unit["path"], []))
         rows.append((
             unit.get("id") or str(uuid.uuid4()), run_id, unit.get("parent_unit_id"),
             unit["path"], unit.get("language", ""), unit.get("module_type", ""),
@@ -318,11 +712,16 @@ def insert_units(run_id: str, units: List[Dict[str, Any]]) -> int:
             unit.get("classification_confidence"), unit.get("loc", 0),
             unit.get("source_hash", ""), unit.get("source_text", ""),
             json.dumps(unit.get("depends_on") or []),
-            json.dumps(unit.get("dependents") or []),
+            json.dumps(dependents),
             json.dumps(unit.get("exports") or []),
             json.dumps(unit.get("meta") or {}),
             unit.get("order_index", 0), unit.get("topo_level", 0), unit.get("scc_group"),
             unit.get("status", "blocked"), now,
+            unit.get("kind", "source_file"), unit.get("component_name"),
+            unit.get("target_project"), unit.get("target_namespace"),
+            unit.get("output_dir"),
+            unit.get("est_input_tokens", 0), unit.get("est_output_tokens", 0),
+            float(unit.get("est_cost_usd") or 0.0), unit.get("risk"),
         ))
     conn = get_connection()
     conn.executemany(
@@ -330,8 +729,9 @@ def insert_units(run_id: str, units: List[Dict[str, Any]]) -> int:
         "(id, run_id, parent_unit_id, path, language, module_type, classification_source, "
         " classification_confidence, loc, source_hash, source_text, depends_on_json, "
         " dependents_json, exports_json, meta_json, order_index, topo_level, scc_group, "
-        " status, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " status, created_at, kind, component_name, target_project, target_namespace, "
+        " output_dir, est_input_tokens, est_output_tokens, est_cost_usd, risk) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.commit()
@@ -356,18 +756,19 @@ def _decode_unit(row: sqlite3.Row) -> Dict[str, Any]:
     return unit
 
 
-def list_units(run_id: str, status: str = "", include_source: bool = False) -> List[Dict[str, Any]]:
-    conn = get_connection()
+def list_units(run_id: str, status: str = "", include_source: bool = False,
+               kind: str = "") -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_units WHERE run_id = ?"
+    params: List[Any] = [run_id]
     if status:
-        rows = conn.execute(
-            "SELECT * FROM modernization_units WHERE run_id = ? AND status = ? "
-            "ORDER BY topo_level, order_index", (run_id, status),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM modernization_units WHERE run_id = ? ORDER BY topo_level, order_index",
-            (run_id,),
-        ).fetchall()
+        sql += " AND status = ?"
+        params.append(status)
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    sql += " ORDER BY topo_level, order_index"
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     units = [_decode_unit(r) for r in rows]
     if not include_source:
@@ -384,12 +785,22 @@ def get_unit(unit_id: str) -> Optional[Dict[str, Any]]:
     return _decode_unit(row) if row else None
 
 
-def unit_status_counts(run_id: str) -> Dict[str, int]:
+def unit_status_counts(run_id: str, kind: str = "source_file") -> Dict[str, int]:
+    """Status tally for one kind of unit.
+
+    Defaults to `source_file` because that is what a customer reads: "417 of 523 files".
+    Progress, the plan gate and the export report all mean *files*, and they must go on
+    meaning files now that a run also contains comprehension probes and components. Pass
+    `kind=""` for every row regardless of kind.
+    """
+    sql = "SELECT status, COUNT(*) AS n FROM modernization_units WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    sql += " GROUP BY status"
     conn = get_connection()
-    rows = conn.execute(
-        "SELECT status, COUNT(*) AS n FROM modernization_units WHERE run_id = ? GROUP BY status",
-        (run_id,),
-    ).fetchall()
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
     counts = {state: 0 for state in UNIT_STATES}
     for row in rows:
@@ -398,54 +809,151 @@ def unit_status_counts(run_id: str) -> Dict[str, int]:
     return counts
 
 
-def mark_roots_ready(run_id: str) -> int:
+def stage_units_exist(run_id: str, kind: str) -> bool:
+    """Has this stage already been planned? The check that makes `plan()` idempotent."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM modernization_units WHERE run_id = ? AND kind = ? LIMIT 1",
+        (run_id, kind),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def stage_outstanding(run_id: str, kind: str) -> int:
+    """Rows of this kind that are neither done nor abandoned — i.e. the stage is not over."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_units WHERE run_id = ? AND kind = ? "
+        "AND status IN ('blocked', 'ready', 'in_progress')",
+        (run_id, kind),
+    ).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def mark_roots_ready(run_id: str, kind: str = "") -> int:
     """Open the run: every unit with no unconverted dependency becomes claimable.
 
-    Called once when conversion starts. After that, readiness is granted incrementally by
-    `complete_unit`, which is cheaper and — more importantly — happens inside the same
-    transaction that recorded the completion, so a crash can never leave a dependent
-    permanently blocked behind a dependency that is already done.
+    Called once when conversion starts, so the full scan is the right shape here. After
+    that, readiness is granted incrementally by `complete_unit`, which passes only the
+    completed unit's dependents as candidates — and happens inside the same transaction
+    that recorded the completion, so a crash can never leave a dependent permanently
+    blocked behind a dependency that is already done.
     """
     conn = get_connection()
     cursor = conn.cursor()
-    n = _promote_ready(cursor, run_id)
+    n = _promote_ready(cursor, run_id, kind=kind)
     conn.commit()
     conn.close()
     return n
 
 
-def _promote_ready(cursor: sqlite3.Cursor, run_id: str) -> int:
-    """Move `blocked` units whose dependencies are all resolved to `ready`.
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds. Every `IN (...)` here
+# is built from run data whose size we do not control, so they all chunk.
+_SQL_VARS = 900
 
-    "Resolved" includes `skipped` and `failed`, not only `converted`. A run where one
+
+def _chunks(items: List[str], size: int = _SQL_VARS):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _resolved_paths(cursor: sqlite3.Cursor, run_id: str,
+                    among: Optional[Set[str]] = None) -> Set[str]:
+    """Which of these paths no longer block anything.
+
+    `converted`, `skipped` and `failed` all count, and so does `rolled_up` — a source file
+    absorbed into a component is not work anybody is still waiting on. A run where one
     unresolvable file permanently blocks half the codebase is worse than one that converts
-    the rest and reports the gap — the dependent is flagged `needs_human_review` by the
+    the rest and reports the gap; the dependent is flagged `needs_human_review` by the
     runner when a dependency it needed did not convert.
     """
-    resolved = {
-        row["path"] for row in cursor.execute(
-            "SELECT path FROM modernization_units WHERE run_id = ? "
-            "AND status IN ('converted', 'skipped', 'failed')", (run_id,),
+    states = "('converted', 'skipped', 'failed', 'rolled_up')"
+    if among is None:
+        return {
+            row["path"] for row in cursor.execute(
+                f"SELECT path FROM modernization_units WHERE run_id = ? AND status IN {states}",
+                (run_id,),
+            )
+        }
+    if not among:
+        return set()
+    found: Set[str] = set()
+    for chunk in _chunks(sorted(among)):
+        placeholders = ",".join("?" * len(chunk))
+        found.update(
+            row["path"] for row in cursor.execute(
+                f"SELECT path FROM modernization_units WHERE run_id = ? "
+                f"AND status IN {states} AND path IN ({placeholders})",
+                [run_id] + chunk,
+            )
         )
-    }
-    promoted = []
-    for row in cursor.execute(
-        "SELECT id, depends_on_json FROM modernization_units WHERE run_id = ? AND status = 'blocked'",
-        (run_id,),
-    ):
+    return found
+
+
+def _promote_ready(cursor: sqlite3.Cursor, run_id: str,
+                   candidates: Optional[List[str]] = None,
+                   kind: str = "") -> int:
+    """Move `blocked` units whose dependencies are all resolved to `ready`.
+
+    `candidates` is the optimisation that keeps a run linear rather than quadratic. Only a
+    unit that depends on the one just completed can possibly have become ready, and
+    `complete_unit` already knows exactly who those are — it is holding `dependents_json`.
+    Passing them turns a full scan of every blocked row (times every completion) into a
+    lookup over a handful of paths. `None` means "check everything", which is what
+    `mark_roots_ready` wants and what a failure path falls back to.
+    """
+    rows: List[sqlite3.Row] = []
+    if candidates is None:
+        sql = ("SELECT id, depends_on_json FROM modernization_units "
+               "WHERE run_id = ? AND status = 'blocked'")
+        params: List[Any] = [run_id]
+        if kind:
+            sql += " AND kind = ?"
+            params.append(kind)
+        rows = list(cursor.execute(sql, params))
+    else:
+        if not candidates:
+            return 0
+        for chunk in _chunks(candidates):
+            placeholders = ",".join("?" * len(chunk))
+            sql = (f"SELECT id, depends_on_json FROM modernization_units "
+                   f"WHERE run_id = ? AND status = 'blocked' AND path IN ({placeholders})")
+            params = [run_id] + chunk
+            if kind:
+                sql += " AND kind = ?"
+                params.append(kind)
+            rows.extend(cursor.execute(sql, params))
+    if not rows:
+        return 0
+
+    parsed: List[tuple] = []
+    needed: Set[str] = set()
+    for row in rows:
         try:
             deps = json.loads(row["depends_on_json"] or "[]")
         except (TypeError, ValueError):
             deps = []
-        if all(dep in resolved for dep in deps):
-            promoted.append(row["id"])
+        parsed.append((row["id"], deps))
+        needed.update(deps)
+
+    # When we were given candidates, only their own dependencies need resolving — which is
+    # a small set. Without them, one full scan is cheaper than many targeted lookups.
+    resolved = _resolved_paths(cursor, run_id, None if candidates is None else needed)
+
+    promoted = [unit_id for unit_id, deps in parsed if all(dep in resolved for dep in deps)]
     for unit_id in promoted:
-        cursor.execute("UPDATE modernization_units SET status = 'ready' WHERE id = ? AND status = 'blocked'",
-                       (unit_id,))
+        cursor.execute(
+            "UPDATE modernization_units SET status = 'ready' WHERE id = ? AND status = 'blocked'",
+            (unit_id,),
+        )
     return len(promoted)
 
 
-def claim_next_unit(run_id: str, owner: str, lease_seconds: int = LEASE_SECONDS) -> Optional[Dict[str, Any]]:
+def claim_next_unit(run_id: str, owner: str, lease_seconds: int = LEASE_SECONDS,
+                    kind: str = "") -> Optional[Dict[str, Any]]:
     """Atomically take the next ready unit, or return None if there isn't one.
 
     One UPDATE with `AND status='ready'` in the WHERE clause is the whole locking story.
@@ -458,31 +966,94 @@ def claim_next_unit(run_id: str, owner: str, lease_seconds: int = LEASE_SECONDS)
     """
     expires = (datetime.utcnow() + timedelta(seconds=lease_seconds)).isoformat()
     now = _now()
+    kind_filter = " AND kind = ?" if kind else ""
+    inner_params: List[Any] = [run_id] + ([kind] if kind else [])
     conn = get_connection()
     cursor = conn.cursor()
+    # Pick the row first, then claim *that id*. Selecting the winner up front is what lets
+    # the read-back below be exact: re-selecting by (run_id, lease_owner) after the UPDATE
+    # could return a different row, because `worker_id()` is hostname:pid:thread and the
+    # job threadpool recycles thread ids across runs in one process.
+    candidate = cursor.execute(
+        f"SELECT id FROM modernization_units WHERE run_id=? AND status='ready'{kind_filter} "
+        f"ORDER BY topo_level, order_index LIMIT 1",
+        inner_params,
+    ).fetchone()
+    if candidate is None:
+        conn.commit()
+        conn.close()
+        return None
+    unit_id = candidate["id"]
     cursor.execute(
         "UPDATE modernization_units "
         "   SET status='in_progress', lease_owner=?, lease_expires_at=?, "
         "       attempts=attempts+1, started_at=COALESCE(started_at, ?) "
-        " WHERE id = (SELECT id FROM modernization_units "
-        "              WHERE run_id=? AND status='ready' "
-        "              ORDER BY topo_level, order_index LIMIT 1) "
-        "   AND status='ready'",
-        (owner, expires, now, run_id),
+        " WHERE id = ? AND status='ready'",
+        (owner, expires, now, unit_id),
     )
     if cursor.rowcount == 0:
+        # Another worker took it between the SELECT and the UPDATE. SQLite serialises
+        # writers, so exactly one of us can satisfy `status='ready'`; the loser just asks
+        # again rather than holding a lock.
         conn.commit()
         conn.close()
         return None
     row = cursor.execute(
-        "SELECT * FROM modernization_units WHERE run_id = ? AND lease_owner = ? "
-        "AND status = 'in_progress' ORDER BY lease_expires_at DESC LIMIT 1",
-        (run_id, owner),
+        "SELECT * FROM modernization_units WHERE id = ?", (unit_id,),
     ).fetchone()
     conn.commit()
     conn.close()
     return _decode_unit(row) if row else None
 
+
+def record_rejected_artifacts(
+    unit_id: str,
+    run_id: str,
+    artifacts: List[Dict[str, Any]],
+    reason: str = "",
+) -> int:
+    """Keep output a Tier-0 check refused, as a **non-current** version. -> rows written.
+
+    A rejection used to persist only its `validation_issues` — the reasons, for the retry
+    prompt — and throw the content itself away. So a component that failed three times left
+    three reasons and nothing to read them against, and there was no way to tell a check that
+    caught real broken output from a check that was wrong about good output. Everywhere else
+    in this pipeline that is the failure mode the sanity layer exists to prevent: a verdict
+    with nothing behind it cannot be disbelieved.
+
+    Written with `is_current = 0` and without touching any other row's flag, so this is
+    invisible to the export, to reconciliation and to `symbol_names` — everything reads
+    `is_current = 1`. It is evidence for a human, not a candidate for shipping. No symbols
+    are registered either: a type declared by a file that was refused does not exist.
+    """
+    if not artifacts:
+        return 0
+    now = _now()
+    conn = get_connection()
+    cursor = conn.cursor()
+    written = 0
+    try:
+        for artifact in artifacts:
+            path = artifact.get("path") or ""
+            prev = cursor.execute(
+                "SELECT MAX(version) AS v FROM modernization_artifacts "
+                "WHERE run_id = ? AND path = ?", (run_id, path),
+            ).fetchone()
+            cursor.execute(
+                "INSERT INTO modernization_artifacts "
+                "(id, run_id, unit_id, path, version, content, purpose, validation_json, "
+                " is_current, created_at) VALUES (?,?,?,?,?,?,?,?,0,?)",
+                (str(uuid.uuid4()), run_id, unit_id, path, (prev["v"] or 0) + 1,
+                 artifact.get("content", ""),
+                 ("REJECTED: " + reason)[:400] if reason else "REJECTED",
+                 json.dumps(artifact.get("validation")) if artifact.get("validation") else None,
+                 now),
+            )
+            written += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return written
 
 def complete_unit(
     unit_id: str,
@@ -492,6 +1063,7 @@ def complete_unit(
     validation: Optional[Dict[str, Any]] = None,
     needs_human_review: bool = False,
     event_detail: str = "",
+    cost_usd: float = 0.0,
 ) -> Dict[str, int]:
     """Record one converted unit. **This single transaction is the checkpoint.**
 
@@ -507,6 +1079,7 @@ def complete_unit(
     try:
         # Version rather than overwrite: a re-conversion (retry, or a human asking for
         # another pass) must not destroy what a reviewer may already have read.
+        overwritten: List[str] = []
         for artifact in artifacts:
             path = artifact.get("path") or ""
             prev = cursor.execute(
@@ -514,6 +1087,22 @@ def complete_unit(
                 (run_id, path),
             ).fetchone()
             version = (prev["v"] or 0) + 1
+            # Versioning is right for the *same* unit converting again. For a **different**
+            # unit it means one component has taken over another's file, and the loser simply
+            # stops being current: it vanishes from the export and from reconciliation with no
+            # row anywhere saying so. `architecture` keeps `output_dir` unique precisely to
+            # make this impossible, so reaching here means that guarantee has been defeated —
+            # by a converter returning an absolute-ish path, or by two components legitimately
+            # sharing a directory. Silence was the wrong answer either way: this is the same
+            # class as two units emitting one symbol, which has warned since it was found.
+            if version > 1:
+                owner = cursor.execute(
+                    "SELECT unit_id FROM modernization_artifacts "
+                    "WHERE run_id = ? AND path = ? AND version = ?",
+                    (run_id, path, version - 1),
+                ).fetchone()
+                if owner and owner["unit_id"] and owner["unit_id"] != unit_id:
+                    overwritten.append(path)
             cursor.execute(
                 "UPDATE modernization_artifacts SET is_current = 0 WHERE run_id = ? AND path = ?",
                 (run_id, path),
@@ -528,26 +1117,88 @@ def complete_unit(
                  now),
             )
 
+        # The namespace every symbol in this batch lands in. Taken from the unit rather than
+        # from the symbol dict: the unit's `target_namespace` was assigned deterministically at
+        # design time and is what the file actually declares, whereas anything the model said
+        # about its own namespace is a claim. One read, reused for the whole batch.
+        unit_row = cursor.execute(
+            "SELECT target_namespace FROM modernization_units WHERE id = ?", (unit_id,),
+        ).fetchone()
+        unit_namespace = (unit_row["target_namespace"] if unit_row else "") or ""
+
+        conflicts = []
         for symbol in symbols:
-            # INSERT OR REPLACE, not INSERT: a re-conversion re-declares the same symbols,
-            # and the UNIQUE(run_id, name, kind) constraint would otherwise abort the whole
-            # checkpoint transaction over a duplicate that is entirely expected.
+            name, kind = symbol.get("name", ""), symbol.get("kind", "")
+            # A name already claimed by a *different* unit is a real defect — two components
+            # both emitting `OrderService` means whichever converts second silently wins,
+            # and `symbols_for_paths` then points every dependent at the wrong `target_path`.
+            # INSERT OR REPLACE is still correct (a re-conversion re-declares its own
+            # symbols, and aborting the checkpoint over that would be absurd), so the
+            # collision is recorded rather than prevented — reconciliation reports it.
+            prior = cursor.execute(
+                "SELECT unit_id, target_path FROM modernization_symbols "
+                "WHERE run_id = ? AND name = ? AND kind = ?", (run_id, name, kind),
+            ).fetchone()
+            if prior and prior["unit_id"] and prior["unit_id"] != unit_id:
+                conflicts.append((name, kind, prior["target_path"] or ""))
             cursor.execute(
                 "INSERT OR REPLACE INTO modernization_symbols "
-                "(id, run_id, unit_id, name, kind, signature, target_path, source_symbol, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), run_id, unit_id, symbol.get("name", ""),
-                 symbol.get("kind", ""), symbol.get("signature", ""),
-                 symbol.get("target_path", ""), symbol.get("source_symbol", ""), now),
+                "(id, run_id, unit_id, name, kind, signature, target_path, source_symbol, "
+                " namespace, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), run_id, unit_id, name, kind,
+                 symbol.get("signature", ""),
+                 symbol.get("target_path", ""), symbol.get("source_symbol", ""),
+                 # A symbol may name its own namespace, and some do: the deterministic
+                 # scaffold knows exactly where it put `PhpCompat`, while the unit that
+                 # emitted it is a scaffold row with no `target_namespace` to inherit. The
+                 # unit is the fallback, not the authority.
+                 symbol.get("namespace") or unit_namespace, now),
+            )
+        for name, kind, prior_path in conflicts[:20]:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, unit_id, level, event, detail, created_at) "
+                "VALUES (?, ?, 'warning', 'symbol_conflict', ?, ?)",
+                (run_id, unit_id,
+                 f"{kind} `{name}` was already declared by another unit"
+                 + (f" in {prior_path}" if prior_path else "")
+                 + ". The later declaration wins; both are reported by reconciliation.", now),
+            )
+        for path in overwritten[:20]:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, unit_id, level, event, detail, created_at) "
+                "VALUES (?, ?, 'warning', 'artifact_overwritten', ?, ?)",
+                (run_id, unit_id,
+                 f"{path} was already produced by a different unit. This unit's version is now "
+                 f"the current one and the earlier file is no longer in the export — two "
+                 f"components have claimed the same output path.", now),
             )
 
         cursor.execute(
             "UPDATE modernization_units SET status='converted', lease_owner=NULL, "
-            "lease_expires_at=NULL, needs_human_review=?, error_json=NULL, finished_at=? "
-            "WHERE id = ?",
-            (1 if needs_human_review else 0, now, unit_id),
+            "lease_expires_at=NULL, needs_human_review=?, error_json=NULL, finished_at=?, "
+            "actual_cost_usd=? WHERE id = ?",
+            (1 if needs_human_review else 0, now, float(cost_usd or 0.0), unit_id),
         )
-        promoted = _promote_ready(cursor, run_id)
+
+        # A component's members were parked at `rolled_up` when the plan was approved. They
+        # become `converted` here, in the same transaction as the component itself, so file
+        # counts move at exactly the instant the work actually happened.
+        cursor.execute(
+            "UPDATE modernization_units SET status='converted', finished_at=? "
+            "WHERE run_id = ? AND parent_unit_id = ? AND status = 'rolled_up'",
+            (now, run_id, unit_id),
+        )
+        members = cursor.rowcount
+
+        row = cursor.execute(
+            "SELECT dependents_json, kind FROM modernization_units WHERE id = ?", (unit_id,),
+        ).fetchone()
+        try:
+            dependents = json.loads((row["dependents_json"] if row else None) or "[]")
+        except (TypeError, ValueError):
+            dependents = []
+        promoted = _promote_ready(cursor, run_id, candidates=dependents,
+                                  kind=(row["kind"] if row else "") or "")
         cursor.execute(
             "INSERT INTO modernization_events (run_id, unit_id, level, event, detail, created_at) "
             "VALUES (?, ?, 'info', 'unit_converted', ?, ?)",
@@ -563,7 +1214,9 @@ def complete_unit(
         conn.close()
     if validation:
         logger.debug("Unit %s validation: %s", unit_id, validation)
-    return {"artifacts": len(artifacts), "symbols": len(symbols), "unblocked": promoted}
+    return {"artifacts": len(artifacts), "symbols": len(symbols), "unblocked": promoted,
+            "members_converted": members, "symbol_conflicts": len(conflicts),
+            "overwritten_paths": list(overwritten)}
 
 
 def fail_unit(unit_id: str, run_id: str, error: str, terminal: bool = False,
@@ -598,6 +1251,59 @@ def fail_unit(unit_id: str, run_id: str, error: str, terminal: bool = False,
     conn.commit()
     conn.close()
     return status
+
+
+def set_unit_placement(unit_id: str, target_project: str = "", target_namespace: str = "",
+                       output_dir: str = "") -> None:
+    """Move a component to a different project, namespace and/or directory. One UPDATE.
+
+    Written for the plan-repair path, where a merge moves components between projects after
+    the gate and before the scaffold. Only the arguments given are written, so a caller
+    changing the project without the directory cannot blank the directory by omission — but
+    it should almost never want to: `_place_artifacts` joins every emitted file onto
+    `output_dir`, and an SDK-style `.csproj` globs `**/*.cs` *beneath itself only*. A merge
+    that renames the project and leaves the directory alone moves the label and leaves the
+    code where MSBuild never looks for it.
+    """
+    sets, values = [], []
+    for column, value in (("target_project", target_project),
+                          ("target_namespace", target_namespace),
+                          ("output_dir", output_dir)):
+        if value:
+            sets.append(f"{column} = ?")
+            values.append(value)
+    if not sets:
+        return
+    conn = get_connection()
+    try:
+        conn.execute(f"UPDATE modernization_units SET {', '.join(sets)} WHERE id = ?",
+                     (*values, unit_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_unit_meta(unit_id: str, updates: Dict[str, Any]) -> None:
+    """Merge keys into a unit's `meta_json`. Read-modify-write in one connection.
+
+    Merge rather than replace: `meta` already carries what the graph knows (`in_cycle_with`,
+    `external_requires`) and what ingest found (`redactions`), and a stage writing its own
+    findings must not silently drop either.
+    """
+    conn = get_connection()
+    row = conn.execute("SELECT meta_json FROM modernization_units WHERE id = ?",
+                       (unit_id,)).fetchone()
+    try:
+        meta = json.loads((row["meta_json"] if row else None) or "{}")
+    except (TypeError, ValueError):
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.update(updates)
+    conn.execute("UPDATE modernization_units SET meta_json = ? WHERE id = ?",
+                 (json.dumps(meta), unit_id))
+    conn.commit()
+    conn.close()
 
 
 def set_unit_status(unit_id: str, status: str, detail: str = "") -> None:
@@ -638,17 +1344,19 @@ def recover_expired_leases(run_id: Optional[str] = None) -> Dict[str, int]:
     units = cursor.rowcount
     # A run left mid-conversion is paused, not failed: everything it has done is on disk
     # and a resume continues from exactly where it stopped.
+    active = ", ".join(f"'{s}'" for s in ACTIVE_RUN_STATES)
+    reason = "The worker process stopped. Resume to continue from the last converted file."
     if run_id:
         cursor.execute(
-            "UPDATE modernization_runs SET status='paused', paused_reason=?, updated_at=? "
-            "WHERE id = ? AND status IN ('converting', 'scanning', 'analyzing')",
-            ("The worker process stopped. Resume to continue from the last converted file.", now, run_id),
+            f"UPDATE modernization_runs SET status='paused', paused_reason=?, updated_at=? "
+            f"WHERE id = ? AND status IN ({active})",
+            (reason, now, run_id),
         )
     else:
         cursor.execute(
-            "UPDATE modernization_runs SET status='paused', paused_reason=?, updated_at=? "
-            "WHERE status IN ('converting', 'scanning', 'analyzing')",
-            ("The worker process stopped. Resume to continue from the last converted file.", now),
+            f"UPDATE modernization_runs SET status='paused', paused_reason=?, updated_at=? "
+            f"WHERE status IN ({active})",
+            (reason, now),
         )
     runs = cursor.rowcount
     conn.commit()
@@ -663,6 +1371,8 @@ def recover_expired_leases(run_id: Optional[str] = None) -> Dict[str, int]:
 # ── Symbols, artifacts, checkpoints, events ────────────────────────────────
 
 def list_symbols(run_id: str, limit: int = 2000) -> List[Dict[str, Any]]:
+    """A page of the registry, for display. Never use this to build a validation set —
+    see `symbol_names`."""
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM modernization_symbols WHERE run_id = ? ORDER BY name LIMIT ?",
@@ -670,6 +1380,840 @@ def list_symbols(run_id: str, limit: int = 2000) -> List[Dict[str, Any]]:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def symbol_names(run_id: str) -> Set[str]:
+    """Every symbol name in the run. Unlimited, and one column.
+
+    `list_symbols` has a 2000-row default limit and an `ORDER BY name`, so using it to build
+    the "what exists" set for `validation.check_symbols` meant that past 2000 symbols the
+    set was an *alphabetical prefix* of reality. Every symbol after that point read as
+    unresolved, which is a `warn`, which sets `needs_human_review` on the unit — so the
+    review flag became noise on essentially every remaining unit at exactly the codebase
+    size where it starts to matter.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT name FROM modernization_symbols WHERE run_id = ?", (run_id,),
+    ).fetchall()
+    conn.close()
+    return {row["name"] for row in rows if row["name"]}
+
+
+def flag_converted_for_review(run_id: str, reason: str) -> int:
+    """Mark every already-converted unit as needing a human, and say why.
+
+    `charter.py` promises this: changing the charter mid-run means the files converted
+    before the change were converted against different rules than the ones after it, which
+    is the precise inconsistency the charter exists to prevent. Refusing the edit outright
+    would be worse — a charter you cannot correct after seeing the first ten files is a
+    charter you have to get right blind.
+    """
+    now = _now()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE modernization_units SET needs_human_review = 1 "
+        "WHERE run_id = ? AND status = 'converted'", (run_id,),
+    )
+    flagged = cursor.rowcount
+    if flagged:
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, 'warning', 'charter_changed', ?, ?)",
+            (run_id, f"{flagged} already-converted unit(s) flagged for review: {reason}"[:2000], now),
+        )
+    conn.commit()
+    conn.close()
+    return flagged
+
+
+def set_parent(run_id: str, member_paths: List[str], parent_unit_id: str,
+               status: str = "rolled_up") -> int:
+    """Absorb source files into a component. Returns how many moved."""
+    if not member_paths:
+        return 0
+    conn = get_connection()
+    cursor = conn.cursor()
+    moved = 0
+    for chunk in _chunks(list(member_paths)):
+        placeholders = ",".join("?" * len(chunk))
+        cursor.execute(
+            f"UPDATE modernization_units SET parent_unit_id = ?, status = ? "
+            f"WHERE run_id = ? AND kind = 'source_file' AND path IN ({placeholders})",
+            [parent_unit_id, status, run_id] + chunk,
+        )
+        moved += cursor.rowcount
+    conn.commit()
+    conn.close()
+    return moved
+
+
+# ── Evidence ───────────────────────────────────────────────────────────────
+
+def insert_evidence(run_id: str, rows: List[Dict[str, Any]]) -> int:
+    """Bulk-write observed facts. Deterministic input, so this is idempotent per ingest."""
+    if not rows:
+        return 0
+    now = _now()
+    payload = [
+        (run_id, r.get("unit_id"), r.get("path", ""), r.get("kind", ""),
+         str(r.get("value", ""))[:500], int(r.get("line") or 0),
+         (r.get("snippet") or "")[:200], float(r.get("confidence", 1.0)),
+         r.get("source", "parser"), (r.get("value_default") or "")[:200], now)
+        for r in rows
+    ]
+    conn = get_connection()
+    conn.executemany(
+        "INSERT INTO modernization_evidence "
+        "(run_id, unit_id, path, kind, value, line, snippet, confidence, source, "
+        " value_default, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        payload,
+    )
+    conn.commit()
+    conn.close()
+    return len(payload)
+
+
+def list_evidence(run_id: str, kind: str = "", path: str = "",
+                  limit: int = 5000) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_evidence WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if kind:
+        sql += " AND kind = ?"
+        params.append(kind)
+    if path:
+        sql += " AND path = ?"
+        params.append(path)
+    sql += " ORDER BY kind, path, line LIMIT ?"
+    params.append(limit)
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def evidence_counts(run_id: str) -> Dict[str, int]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT kind, COUNT(*) AS n FROM modernization_evidence WHERE run_id = ? GROUP BY kind",
+        (run_id,),
+    ).fetchall()
+    conn.close()
+    return {row["kind"]: row["n"] for row in rows}
+
+
+# ── Business rules (comprehension) ─────────────────────────────────────────
+
+def insert_rules(run_id: str, rules: List[Dict[str, Any]]) -> int:
+    """Bulk-insert proposed rules. Verification flips them to `confirmed` afterwards."""
+    if not rules:
+        return 0
+    now = _now()
+    conn = get_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO modernization_rules "
+            "(id, run_id, unit_id, statement, category, path, line, quote, status, "
+            " reject_reason, confidence, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(str(uuid.uuid4()), run_id, r.get("unit_id"), r.get("statement", ""),
+              r.get("category", ""), r.get("path", ""), int(r.get("line") or 0),
+              r.get("quote", ""), r.get("status", "proposed"), r.get("reject_reason", ""),
+              float(r.get("confidence") or 0.0), now) for r in rules],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rules)
+
+
+def list_rules(run_id: str, status: str = "", limit: int = 500) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_rules WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY category, path, line LIMIT ?"
+    params.append(limit)
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_rule_status(rule_id: str, status: str, reject_reason: str = "") -> None:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE modernization_rules SET status = ?, reject_reason = ? WHERE id = ?",
+        (status, reject_reason, rule_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def rule_counts(run_id: str) -> Dict[str, int]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT status, COUNT(*) AS n FROM modernization_rules WHERE run_id = ? GROUP BY status",
+        (run_id,),
+    ).fetchall()
+    conn.close()
+    return {row["status"]: row["n"] for row in rows}
+
+
+# ── Builds and diagnostics ─────────────────────────────────────────────────
+
+def units_for_artifact_paths(run_id: str, paths: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Map an emitted file path back to the unit that produced it.
+
+    Current versions only: a diagnostic is about the code that was built, and a superseded
+    artifact is not that code. Chunked because a failing build can name more paths than
+    SQLite will bind in one statement.
+    """
+    if not paths:
+        return {}
+    found: Dict[str, Dict[str, Any]] = {}
+    conn = get_connection()
+    try:
+        for chunk in _chunks(list(dict.fromkeys(paths))):
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT a.path, a.unit_id, u.status, u.kind, u.rework_attempts "
+                f"FROM modernization_artifacts a "
+                f"LEFT JOIN modernization_units u ON u.id = a.unit_id "
+                f"WHERE a.run_id = ? AND a.is_current = 1 AND a.path IN ({placeholders})",
+                [run_id] + list(chunk),
+            ).fetchall()
+            for row in rows:
+                found[row["path"]] = {"unit_id": row["unit_id"], "status": row["status"],
+                                      "kind": row["kind"],
+                                      "rework_attempts": row["rework_attempts"] or 0}
+    finally:
+        conn.close()
+    return found
+
+
+def record_build(run_id: str, diagnostics: List[Dict[str, Any]], *, source: str = "external",
+                 branch: str = "", commit_sha: str = "", command: str = "",
+                 status: str = "reported", fingerprint: str = "",
+                 summary: str = "") -> Dict[str, Any]:
+    """Persist one build attempt and its messages. Does **not** reopen anything.
+
+    Recording and reopening are separate transactions on purpose: a build that is merely
+    informational (a warning-only run, a build the operator wants to look at before acting)
+    must be recordable without moving a single unit. `reopen_units` is the deliberate act.
+    """
+    now = _now()
+    build_id = str(uuid.uuid4())
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        prev = cursor.execute(
+            "SELECT COALESCE(MAX(round), 0) AS r FROM modernization_builds WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        round_no = (prev["r"] or 0) + 1
+        errors = sum(1 for d in diagnostics if (d.get("severity") or "error") == "error")
+        warnings = sum(1 for d in diagnostics if (d.get("severity") or "") == "warning")
+        unmapped = sum(1 for d in diagnostics if not d.get("unit_id"))
+        cursor.execute(
+            "INSERT INTO modernization_builds "
+            "(id, run_id, round, source, status, branch, commit_sha, command, error_count, "
+            " warning_count, unmapped_count, reopened_count, fingerprint, summary, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)",
+            (build_id, run_id, round_no, source, status, branch, commit_sha, command,
+             errors, warnings, unmapped, fingerprint, summary, now),
+        )
+        cursor.executemany(
+            "INSERT INTO modernization_diagnostics "
+            "(build_id, run_id, unit_id, artifact_path, file, line, col, severity, code, "
+            " message, project, routed_by, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(build_id, run_id, d.get("unit_id"), d.get("artifact_path", ""),
+              d.get("file", ""), int(d.get("line") or 0), int(d.get("col") or 0),
+              d.get("severity") or "error", d.get("code", ""), d.get("message", ""),
+              d.get("project", ""), d.get("routed_by", ""), now)
+             for d in diagnostics],
+        )
+        cursor.execute(
+            "UPDATE modernization_runs SET build_round = ?, build_fingerprint = ?, updated_at = ? "
+            "WHERE id = ?", (round_no, fingerprint, now, run_id),
+        )
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, ?, 'build_reported', ?, ?)",
+            (run_id, "warning" if errors else "info",
+             f"build round {round_no} from {source}: {errors} error(s), {warnings} warning(s)"
+             + (f", {unmapped} in file(s) no unit owns" if unmapped else ""), now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"build_id": build_id, "round": round_no, "errors": errors,
+            "warnings": warnings, "unmapped": unmapped}
+
+
+def reopen_units(run_id: str, unit_ids: List[str], reason: str,
+                 max_rework: int = 3) -> Dict[str, Any]:
+    """Send failing units back through the conversion loop.
+
+    No new persistence is needed for a rework pass: a unit goes `converted` -> `ready`, the
+    existing claim loop picks it up, and `complete_unit` versions the new artifact over the
+    old one. What this adds is the guard — a unit that has already been reworked
+    `max_rework` times is left alone and named, because the alternative is a loop that
+    spends the budget rewriting the same file.
+    """
+    if not unit_ids:
+        return {"reopened": 0, "units": [], "exhausted": [], "deferred": [],
+                "unreworkable": [], "skipped": 0}
+    now = _now()
+    conn = get_connection()
+    cursor = conn.cursor()
+    reopened, exhausted, deferred, unreworkable, skipped = [], [], [], [], 0
+    try:
+        for unit_id in dict.fromkeys(unit_ids):
+            row = cursor.execute(
+                "SELECT id, path, status, rework_attempts FROM modernization_units "
+                "WHERE id = ? AND run_id = ?",
+                (unit_id, run_id),
+            ).fetchone()
+            if not row:
+                skipped += 1
+                continue
+            # A unit a worker holds right now must not be reopened. Clearing its lease here
+            # does not stop that worker: it finishes, and `complete_unit` writes the
+            # *pre-rework* output as the new current artifact and sets the unit back to
+            # `converted` — so the reopen is silently lost while `rework_attempts` has still
+            # been spent. Three of those retire a unit as exhausted without one rework
+            # having run, and the next build then reports a `build_stuck` that is really a
+            # race. Deferring costs nothing: the unit is being converted as we speak, and if
+            # that output is still wrong the next build report reopens it for real.
+            if row["status"] == "in_progress":
+                deferred.append({"unit_id": unit_id, "path": row["path"]})
+                continue
+            if (row["rework_attempts"] or 0) >= max_rework:
+                exhausted.append({"unit_id": unit_id, "path": row["path"],
+                                  "attempts": row["rework_attempts"] or 0})
+                continue
+            # The UPDATE below carried no status predicate at all, so it flipped *any* row to
+            # `ready`. Four of those are actively corrupting and are refused here:
+            #
+            #   `failed`/`skipped` — resurrecting a terminally failed unit on a diagnostic that
+            #       cannot have come from it (it produced no current artifact to complain about),
+            #       and giving it a rework attempt it never used.
+            #   `rolled_up`        — a component *member*. Making it claimable converts one
+            #       source file twice, in two units, which is the two-of-everything export
+            #       `ownership` exists to prevent.
+            #   `blocked`          — its dependencies have not converted, so the ordering the
+            #       whole graph exists to enforce would be skipped for it.
+            #
+            # `ready` is deliberately still reopenable: it is a no-op on the status and the
+            # rework counter advancing is what bounds a loop that has gone round again.
+            if row["status"] in ("failed", "skipped", "rolled_up", "blocked"):
+                unreworkable.append({"unit_id": unit_id, "path": row["path"],
+                                     "status": row["status"]})
+                continue
+            # `attempts` is the *conversion* retry counter that `fail_unit` compares against
+            # max_attempts; resetting it is what makes a reopened unit a fresh piece of work
+            # rather than one that is already two-thirds of the way to terminal failure.
+            cursor.execute(
+                "UPDATE modernization_units SET status='ready', attempts=0, "
+                "rework_attempts = COALESCE(rework_attempts, 0) + 1, lease_owner=NULL, "
+                "lease_expires_at=NULL, finished_at=NULL, error_json=NULL "
+                "WHERE id = ? AND run_id = ?",
+                (unit_id, run_id),
+            )
+            # Members were flipped to `converted` alongside the component; they go back to
+            # `rolled_up` so the file count stops claiming work that is being redone.
+            cursor.execute(
+                "UPDATE modernization_units SET status='rolled_up', finished_at=NULL "
+                "WHERE run_id = ? AND parent_unit_id = ? AND status = 'converted'",
+                (run_id, unit_id),
+            )
+            reopened.append({"unit_id": unit_id, "path": row["path"]})
+        if reopened:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+                "VALUES (?, 'info', 'units_reopened', ?, ?)",
+                (run_id, f"{len(reopened)} unit(s) reopened for rework: {reason}", now),
+            )
+        if exhausted:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+                "VALUES (?, 'warning', 'rework_exhausted', ?, ?)",
+                (run_id, f"{len(exhausted)} unit(s) hit the rework limit and were left as-is: "
+                         + ", ".join(e["path"] for e in exhausted[:10]), now),
+            )
+        if deferred:
+            cursor.execute(
+                "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+                "VALUES (?, 'info', 'rework_deferred', ?, ?)",
+                (run_id, f"{len(deferred)} unit(s) were being converted when this build was "
+                         f"reported, so they were left alone: "
+                         + ", ".join(d["path"] for d in deferred[:10]), now),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"reopened": len(reopened), "units": reopened, "exhausted": exhausted,
+            "deferred": deferred, "unreworkable": unreworkable, "skipped": skipped}
+
+
+def units_by_path(run_id: str, paths: List[str], include_source: bool = True
+                  ) -> List[Dict[str, Any]]:
+    """Just these units, with their source. The alternative — loading the whole inventory
+    and indexing it — costs one full read of the codebase per caller, and the callers here
+    run once per probe."""
+    if not paths:
+        return []
+    columns = "*" if include_source else \
+        "id, run_id, parent_unit_id, path, language, module_type, status, kind, meta_json"
+    out: List[Dict[str, Any]] = []
+    conn = get_connection()
+    try:
+        for chunk in _chunks(list(dict.fromkeys(paths))):
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                f"SELECT {columns} FROM modernization_units "
+                f"WHERE run_id = ? AND path IN ({placeholders})",
+                [run_id] + list(chunk),
+            ).fetchall()
+            out.extend(_decode_unit(r) for r in rows)
+    finally:
+        conn.close()
+    return out
+
+
+def record_runtime(run_id: str, checks: List[Dict[str, Any]], *, status: str,
+                   started: bool, skipped_reason: str = "", base_url: str = "",
+                   command: str = "", source: str = "external", log_tail: str = "",
+                   actor: str = "") -> str:
+    """Store one startup attempt and its probed URLs. -> the report id.
+
+    One transaction, like `record_build`: a report and its checks are either both on the record
+    or neither is. The round is `MAX(round)+1` over this run's own reports and is independent of
+    `build_round` — a startup check is not a build round, and counting them together would make
+    the build loop's round cap and its convergence fingerprint mean something else.
+    """
+    now = _now()
+    report_id = str(uuid.uuid4())
+    failing = sum(1 for c in checks
+                  if (c.get("status") or 0) >= 500
+                  or (c.get("error") and not c.get("status")))
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        row = cursor.execute(
+            "SELECT MAX(round) AS r FROM modernization_runtime_reports WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()
+        round_no = int((row["r"] if row and row["r"] else 0)) + 1
+        cursor.execute(
+            "INSERT INTO modernization_runtime_reports "
+            "(id, run_id, round, source, status, started, skipped_reason, base_url, command, "
+            " check_count, failing_count, log_tail, actor, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (report_id, run_id, round_no, source, status, 1 if started else 0, skipped_reason,
+             base_url, command, len(checks), failing, log_tail, actor, now),
+        )
+        cursor.executemany(
+            "INSERT INTO modernization_runtime_checks "
+            "(report_id, run_id, method, path, status, error, ms, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [(report_id, run_id, c.get("method") or "GET", c.get("path") or "",
+              int(c.get("status") or 0), c.get("error") or "", int(c.get("ms") or 0), now)
+             for c in checks],
+        )
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, ?, 'runtime_reported', ?, ?)",
+            (run_id, "warning" if status == "failed" else "info",
+             f"startup round {round_no} from {source}: {status}, {len(checks)} URL(s) probed, "
+             f"{failing} failing", now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return report_id
+
+
+def latest_runtime(run_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM modernization_runtime_reports WHERE run_id = ? "
+        "ORDER BY round DESC LIMIT 1", (run_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def runtime_checks(run_id: str, report_id: str = "") -> List[Dict[str, Any]]:
+    conn = get_connection()
+    if report_id:
+        rows = conn.execute(
+            "SELECT * FROM modernization_runtime_checks WHERE run_id = ? AND report_id = ? "
+            "ORDER BY id", (run_id, report_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM modernization_runtime_checks WHERE run_id = ? ORDER BY id",
+            (run_id,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def artifacts_changed_since(run_id: str, since: str) -> int:
+    """How many current artifacts were written after `since`.
+
+    What the build gate needs to tell two different sentences apart. "Round 3 reported four
+    errors and nothing has changed since" means the export in hand is the one that failed —
+    a known quantity. "Round 3 reported four errors and eleven files have been rewritten
+    since" means the current export has never been compiled at all, and that error count is
+    about files that no longer exist in that form. Reporting the second as the first is the
+    absence-looks-like-evidence failure this subsystem keeps closing.
+
+    An empty `since` counts nothing rather than everything: no timestamp means no build to
+    compare against, and the caller already has a separate state for that.
+    """
+    if not since:
+        return 0
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_artifacts "
+        "WHERE run_id = ? AND is_current = 1 AND created_at > ?", (run_id, since),
+    ).fetchone()
+    conn.close()
+    return int(row["n"] if row else 0)
+
+
+def pending_unit_count(run_id: str) -> int:
+    """Units still waiting to be converted or in flight, across every kind.
+
+    Read by the stuck-loop guard: "two builds reported the same errors" only means the model
+    cannot fix them if a rework pass actually ran in between. After a failed build the run is
+    left *paused* with units sitting in `ready`, so two identical reports with nothing
+    between them is the ordinary state — and the workflow offers `workflow_dispatch`, so an
+    operator clicking re-run produces byte-identical output by construction.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_units "
+        "WHERE run_id = ? AND status IN ('ready', 'in_progress')", (run_id,),
+    ).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def set_build_outcome(build_id: str, status: str, reopened_count: int = 0) -> None:
+    conn = get_connection()
+    conn.execute("UPDATE modernization_builds SET status = ?, reopened_count = ? WHERE id = ?",
+                 (status, reopened_count, build_id))
+    conn.commit()
+    conn.close()
+
+
+def list_builds(run_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM modernization_builds WHERE run_id = ? ORDER BY round DESC LIMIT ?",
+        (run_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def latest_build(run_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM modernization_builds WHERE run_id = ? ORDER BY round DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_diagnostics(run_id: str, build_id: str = "", severity: str = "",
+                     unit_id: str = "", limit: int = 1000) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_diagnostics WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if build_id:
+        sql += " AND build_id = ?"
+        params.append(build_id)
+    if severity:
+        sql += " AND severity = ?"
+        params.append(severity)
+    if unit_id:
+        sql += " AND unit_id = ?"
+        params.append(unit_id)
+    sql += " ORDER BY severity, file, line LIMIT ?"
+    params.append(limit)
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def diagnostics_for_unit(run_id: str, unit_id: str, build_id: str = "",
+                         limit: int = 60) -> List[Dict[str, Any]]:
+    """What the compiler said about this unit's output, for the rework prompt."""
+    return list_diagnostics(run_id, build_id=build_id, unit_id=unit_id, limit=limit)
+
+
+# ── Behavioural parity ─────────────────────────────────────────────────────
+#
+# Golden cases and their verdicts. Deliberately shaped like the build tables above, because
+# the constraint is the same one: the platform stores and adjudicates, something else runs
+# (D-05). Nothing here executes an HTTP request, a PHP interpreter or a .NET host.
+
+# JSON-encoded columns, and the plain key each decodes to. One tuple so that reading and
+# writing cannot drift — the failure mode otherwise is a column written as JSON and read as
+# text, which yields a case whose `extract` rules are the *string* "[]" and silently match
+# nothing.
+_PARITY_CASE_JSON = (
+    ("request_headers_json", "request_headers"),
+    ("cookies_json", "cookies"),
+    ("expected_headers_json", "expected_headers"),
+    ("expected_values_json", "expected_values"),
+    ("extract_json", "extract"),
+    ("ignore_json", "ignore"),
+)
+
+_PARITY_CASE_COLUMNS = (
+    "name", "group_name", "seq", "source_path", "rule_id", "method", "path", "query",
+    "request_headers_json", "cookies_json", "request_body", "request_content_type",
+    "expected_status", "expected_location", "expected_content_type",
+    "expected_headers_json", "expected_body", "expected_values_json", "extract_json",
+    "ignore_json", "body_match", "status", "source", "notes",
+)
+
+
+def _decode_parity_case(row: sqlite3.Row) -> Dict[str, Any]:
+    case = dict(row)
+    for column, key in _PARITY_CASE_JSON:
+        raw = case.pop(column, None)
+        try:
+            case[key] = json.loads(raw) if raw else None
+        except (TypeError, ValueError):
+            case[key] = None
+    return case
+
+
+def upsert_parity_cases(run_id: str, cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Store recorded golden cases, keyed by `name` within the run.
+
+    An existing case is **updated in place** rather than replaced, so its id survives — a
+    re-recording of "employee list after adding Ann" is the same case as before, and its
+    history in `modernization_parity_results` has to stay attached to it. `INSERT OR REPLACE`
+    would mint a new id and orphan every verdict ever reached about that behaviour, which is
+    exactly the record you want when arguing about whether a conversion regressed.
+    """
+    if not cases:
+        return {"inserted": 0, "updated": 0, "ids": {}}
+    now = _now()
+    inserted = updated = 0
+    ids: Dict[str, str] = {}
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        for case in cases:
+            values = [case.get(column) for column in _PARITY_CASE_COLUMNS]
+            existing = cursor.execute(
+                "SELECT id FROM modernization_parity_cases WHERE run_id = ? AND name = ?",
+                (run_id, case.get("name")),
+            ).fetchone()
+            if existing:
+                assignments = ", ".join(f"{c} = ?" for c in _PARITY_CASE_COLUMNS)
+                cursor.execute(
+                    f"UPDATE modernization_parity_cases SET {assignments}, updated_at = ? "
+                    f"WHERE id = ?", values + [now, existing["id"]])
+                ids[case["name"]] = existing["id"]
+                updated += 1
+            else:
+                case_id = str(uuid.uuid4())
+                placeholders = ",".join("?" * (len(_PARITY_CASE_COLUMNS) + 3))
+                cursor.execute(
+                    f"INSERT INTO modernization_parity_cases "
+                    f"(id, run_id, {', '.join(_PARITY_CASE_COLUMNS)}, created_at) "
+                    f"VALUES ({placeholders})",
+                    [case_id, run_id] + values + [now])
+                ids[case["name"]] = case_id
+                inserted += 1
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, 'info', 'parity_cases_recorded', ?, ?)",
+            (run_id, f"{inserted} new and {updated} updated golden case(s)", now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"inserted": inserted, "updated": updated, "ids": ids}
+
+
+def list_parity_cases(run_id: str, status: str = "active",
+                      include_bodies: bool = False) -> List[Dict[str, Any]]:
+    """The corpus, in replay order. `include_bodies` off by default — a recorded page is
+    the largest thing in this schema and a case list is rendered as a table."""
+    # `request_body` is in the lean list and `expected_body` is not, and the asymmetry is the
+    # point: the request is *input a runner must send* — without it every recorded POST
+    # replays as an empty form and diverges for a reason that has nothing to do with the
+    # conversion — while the expected response is the thing a runner must never see, because
+    # a runner holding it would be one edit away from deciding pass/fail itself.
+    columns = "*" if include_bodies else (
+        "id, run_id, name, group_name, seq, source_path, rule_id, method, path, query, "
+        "request_body, "
+        "cookies_json, request_content_type, expected_status, expected_location, "
+        "expected_content_type, expected_headers_json, expected_values_json, extract_json, "
+        "ignore_json, body_match, status, source, notes, created_at, updated_at, "
+        "request_headers_json, LENGTH(expected_body) AS expected_body_chars")
+    sql = f"SELECT {columns} FROM modernization_parity_cases WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY group_name, seq, name"
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return [_decode_parity_case(row) for row in rows]
+
+
+def parity_case_count(run_id: str, status: str = "active") -> int:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_parity_cases "
+        "WHERE run_id = ? AND status = ?", (run_id, status),
+    ).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def record_parity_report(run_id: str, results: List[Dict[str, Any]], *,
+                         source: str = "external", base_url: str = "", commit_sha: str = "",
+                         status: str = "reported", fingerprint: str = "",
+                         summary: str = "") -> Dict[str, Any]:
+    """Persist one adjudicated replay. Changes no unit and no run state.
+
+    Split from acting on it for the same reason `record_build` is: a parity report that is
+    merely informational — a first replay against a half-deployed environment, say — has to
+    be recordable without moving anything.
+    """
+    now = _now()
+    report_id = str(uuid.uuid4())
+    tally = {v: sum(1 for r in results if r.get("verdict") == v)
+             for v in ("pass", "fail", "error", "missing")}
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        prev = cursor.execute(
+            "SELECT COALESCE(MAX(round), 0) AS r FROM modernization_parity_reports "
+            "WHERE run_id = ?", (run_id,),
+        ).fetchone()
+        round_no = (prev["r"] or 0) + 1
+        cursor.execute(
+            "INSERT INTO modernization_parity_reports "
+            "(id, run_id, round, source, status, base_url, commit_sha, total, passed, "
+            " failed, errored, missing, fingerprint, summary, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (report_id, run_id, round_no, source, status, base_url, commit_sha,
+             len(results), tally["pass"], tally["fail"], tally["error"], tally["missing"],
+             fingerprint, summary, now),
+        )
+        cursor.executemany(
+            "INSERT INTO modernization_parity_results "
+            "(report_id, run_id, case_id, case_name, verdict, actual_status, "
+            " actual_location, differences_json, unit_id, error, duration_ms, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(report_id, run_id, r.get("case_id") or "", r.get("case_name") or "",
+              r.get("verdict") or "fail", int(r.get("actual_status") or 0),
+              r.get("actual_location") or "",
+              json.dumps(r.get("differences") or []), r.get("unit_id") or None,
+              (r.get("error") or "")[:2000], int(r.get("duration_ms") or 0), now)
+             for r in results],
+        )
+        cursor.execute(
+            "INSERT INTO modernization_events (run_id, level, event, detail, created_at) "
+            "VALUES (?, ?, 'parity_reported', ?, ?)",
+            (run_id, "warning" if tally["fail"] or tally["error"] or tally["missing"] else "info",
+             f"parity round {round_no} from {source}: {tally['pass']} passed, "
+             f"{tally['fail']} diverged, {tally['error']} errored, {tally['missing']} missing",
+             now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"report_id": report_id, "round": round_no, **tally}
+
+
+def set_parity_outcome(report_id: str, status: str, summary: str = "") -> None:
+    conn = get_connection()
+    conn.execute("UPDATE modernization_parity_reports SET status = ?, summary = ? WHERE id = ?",
+                 (status, summary, report_id))
+    conn.commit()
+    conn.close()
+
+
+def list_parity_reports(run_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM modernization_parity_reports WHERE run_id = ? "
+        "ORDER BY round DESC LIMIT ?", (run_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def latest_parity_report(run_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM modernization_parity_reports WHERE run_id = ? "
+        "ORDER BY round DESC LIMIT 1", (run_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_parity_results(run_id: str, report_id: str = "", verdict: str = "",
+                        limit: int = 1000) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM modernization_parity_results WHERE run_id = ?"
+    params: List[Any] = [run_id]
+    if report_id:
+        sql += " AND report_id = ?"
+        params.append(report_id)
+    if verdict:
+        sql += " AND verdict = ?"
+        params.append(verdict)
+    # Failures first, then errors, then the passes: a parity report is read for what broke.
+    sql += (" ORDER BY CASE verdict WHEN 'fail' THEN 0 WHEN 'error' THEN 1 "
+            "WHEN 'missing' THEN 2 ELSE 3 END, case_name LIMIT ?")
+    params.append(limit)
+    conn = get_connection()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    out = []
+    for row in rows:
+        result = dict(row)
+        raw = result.pop("differences_json", None)
+        try:
+            result["differences"] = json.loads(raw) if raw else []
+        except (TypeError, ValueError):
+            result["differences"] = []
+        out.append(result)
+    return out
 
 
 def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, Any]]:
@@ -683,8 +2227,12 @@ def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, An
         return []
     conn = get_connection()
     placeholders = ",".join("?" * len(source_paths))
+    # `u.target_namespace` as a fallback for `s.namespace`: rows written before the column
+    # existed have NULL, and a run resumed across the upgrade would otherwise render half its
+    # dependency signatures without the namespace the model needs to import them.
     rows = conn.execute(
-        f"SELECT s.* FROM modernization_symbols s "
+        f"SELECT s.*, COALESCE(NULLIF(s.namespace, ''), u.target_namespace) AS namespace "
+        f"FROM modernization_symbols s "
         f"JOIN modernization_units u ON u.id = s.unit_id "
         f"WHERE s.run_id = ? AND u.path IN ({placeholders}) ORDER BY s.name",
         [run_id] + list(source_paths),
@@ -693,10 +2241,70 @@ def symbols_for_paths(run_id: str, source_paths: List[str]) -> List[Dict[str, An
     return [dict(r) for r in rows]
 
 
+# Symbol kinds that name a *type*. The registry also records methods, constants, properties
+# and — when a converter emits a project file — a pseudo-symbol for the project itself, and
+# none of those is something another file can reference by name.
+TYPE_SYMBOL_KINDS = frozenset({
+    "class", "interface", "struct", "enum", "record", "type", "delegate",
+})
+
+
+def symbol_namespaces(run_id: str) -> Dict[str, str]:
+    """Every generated **type** in the run -> the namespace it lives in.
+
+    The whole map, unlimited and in one query, because the using-resolver has to scan an
+    artifact against *all* of them: a file may reference a type from any component, not only
+    from the ones its unit declared a dependency on. Same reasoning as `symbol_names`, which
+    is the equivalent for the unresolved-symbol check.
+
+    **Types only, which this did not do despite saying so.** On a real 45-file run, 116 of the
+    161 registered symbols were not types: 110 methods (`EmployeeService.CreateAsync`), four
+    constants, and one `Acme.Ems.Web (project)` a converter registered for its own `.csproj`.
+    Both consumers scan artifacts for these names, so a repository that happened to define its
+    own `CreateAsync` was recorded as referencing the Application layer, and every file at all
+    was recorded as referencing the web host. `wireup` turned that into `Domain -> Web` in the
+    project graph and MSBuild refused to restore the solution.
+
+    A member also arrives dotted (`Foo.Bar`) and so is indistinguishable by shape from a
+    namespace-qualified type (`Shop.Domain.Cart`) — so a dotted name whose first segment is
+    itself a registered symbol is dropped as a member, which is the one signal that separates
+    them.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT s.name AS name, s.kind AS kind, "
+        "       COALESCE(NULLIF(s.namespace, ''), u.target_namespace) AS namespace "
+        "FROM modernization_symbols s "
+        "LEFT JOIN modernization_units u ON u.id = s.unit_id "
+        "WHERE s.run_id = ?", (run_id,),
+    ).fetchall()
+    conn.close()
+
+    declared = {r["name"] for r in rows if r["name"]}
+    out: Dict[str, str] = {}
+    for row in rows:
+        name, namespace = row["name"], row["namespace"]
+        if not name or not namespace:
+            continue
+        if (row["kind"] or "").strip().lower() not in TYPE_SYMBOL_KINDS:
+            continue
+        if "." in name and name.split(".", 1)[0] in declared:
+            continue
+        out[name] = namespace
+    return out
+
+
 def list_artifacts(run_id: str, current_only: bool = True,
                    include_content: bool = False) -> List[Dict[str, Any]]:
     conn = get_connection()
-    sql = "SELECT * FROM modernization_artifacts WHERE run_id = ?"
+    # `SELECT *` only when the caller wants the content. Selecting it and popping it
+    # afterwards materialises the whole converted codebase in memory to answer questions
+    # like "which paths exist" — which is what mapping a build's diagnostics does, on a
+    # request that may name hundreds of files.
+    columns = "*" if include_content else \
+        "id, run_id, unit_id, path, version, purpose, validation_json, is_current, " \
+        "created_at, LENGTH(content) AS size_chars"
+    sql = f"SELECT {columns} FROM modernization_artifacts WHERE run_id = ?"
     if current_only:
         sql += " AND is_current = 1"
     sql += " ORDER BY path, version"
@@ -706,7 +2314,7 @@ def list_artifacts(run_id: str, current_only: bool = True,
     for row in rows:
         artifact = dict(row)
         if not include_content:
-            artifact["size_chars"] = len(artifact.get("content") or "")
+            artifact["size_chars"] = int(artifact.get("size_chars") or 0)
             artifact.pop("content", None)
         out.append(artifact)
     return out
@@ -714,15 +2322,25 @@ def list_artifacts(run_id: str, current_only: bool = True,
 
 def create_checkpoint(run_id: str, kind: str, title: str, detail: str = "",
                       unit_id: Optional[str] = None, options: Optional[List[str]] = None,
-                      blocking: bool = True) -> str:
+                      blocking: bool = True,
+                      payload: Optional[Dict[str, Any]] = None) -> str:
+    """Raise a decision for a human.
+
+    `payload` carries structure the UI renders — a per-component cost table, a list of
+    conflicts — as opposed to `options`, which is a list of answers. A gate whose entire body
+    is prose can only ever be approved or not; one carrying a table can be *read* first,
+    which is the difference between a gate and a speed bump.
+    """
     checkpoint_id = str(uuid.uuid4())
     conn = get_connection()
     conn.execute(
         "INSERT INTO modernization_checkpoints "
-        "(id, run_id, unit_id, kind, title, detail, options_json, status, blocking, created_at) "
-        "VALUES (?,?,?,?,?,?,?,'open',?,?)",
+        "(id, run_id, unit_id, kind, title, detail, options_json, status, blocking, "
+        " created_at, payload_json) "
+        "VALUES (?,?,?,?,?,?,?,'open',?,?,?)",
         (checkpoint_id, run_id, unit_id, kind, title, detail,
-         json.dumps(options or []), 1 if blocking else 0, _now()),
+         json.dumps(options or []), 1 if blocking else 0, _now(),
+         json.dumps(payload) if payload else None),
     )
     conn.commit()
     conn.close()
@@ -746,7 +2364,8 @@ def list_checkpoints(run_id: str, status: str = "") -> List[Dict[str, Any]]:
     out = []
     for row in rows:
         cp = dict(row)
-        for field, target in (("options_json", "options"), ("answer_json", "answer")):
+        for field, target in (("options_json", "options"), ("answer_json", "answer"),
+                              ("payload_json", "payload")):
             raw = cp.pop(field, None)
             try:
                 cp[target] = json.loads(raw) if raw else None

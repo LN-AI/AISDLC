@@ -25,4 +25,12 @@ Modules
 - `graph`      — Kahn ordering, SCC (cycle) detection.
 - `validation` — Tier-0, in-process, zero execution (D-05).
 - `runner`     — the worker loop that ties them together.
+
+Two modules break the "everything happens in one process" shape, and break it the same way.
+`build_results` and `parity` both answer a question this host is forbidden to answer itself —
+does the converted code compile, and does it still behave the same — so both are built as
+*contracts* rather than as runners: the platform stores the inputs and adjudicates the
+outputs, and the execution happens on the customer's CI, a developer's laptop or an opt-in
+sandbox worker, which POST their results back. Neither module contains anything that starts a
+process, and neither should.
 """

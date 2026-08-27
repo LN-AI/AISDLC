@@ -186,6 +186,145 @@ class GitHubService:
             "content_sha": data.get("content", {}).get("sha", ""),
         }
 
+    # GitHub rejects a very large `POST /git/trees` payload, and its own guidance for a big
+    # tree is to build it in stages. A 500-file conversion is exactly that shape, so entries
+    # go up in batches of this size, each batch passing the previous result as its
+    # `base_tree` — the final tree still contains every file.
+    TREE_ENTRY_BATCH = 500
+    # One client serves every blob POST in a conversion, and a generated source file is a
+    # larger body than any other write in this file, so the usual 30s is tight.
+    GIT_DATA_TIMEOUT = 60
+
+    def _tree_path(self, raw: str) -> str:
+        """Normalize one repo-relative path, or raise if it isn't safe to commit.
+
+        Rejected rather than repaired, matching the rule at the other end of the pipeline
+        (`modernization.repo_ingest.safe_relpath`): no absolute path, no drive letter, and
+        no `..` segment even when it would normalize back inside the tree. These paths are
+        machine-generated, and a name we had to fix is a name whose intent we can't vouch for.
+        """
+        path = (raw or "").replace("\\", "/").strip()
+        # A drive letter survives the backslash swap as `C:/…`; git has no such path.
+        drive_letter = len(path) > 1 and path[1] == ":"
+        # Empty segments cover a leading `/` and a doubled `//`; `.`/`..` cover traversal.
+        bad_segment = any(seg in ("", ".", "..") for seg in path.split("/"))
+        if not path or drive_letter or bad_segment:
+            raise ValueError(f"Refusing to commit an unsafe path: {raw!r}")
+        return path
+
+    def commit_tree(self, owner: str, repo: str, branch: str, files: Dict[str, str],
+                    message: str, base_branch: str = "") -> Dict[str, Any]:
+        """Commit many files as ONE commit, via the Git Data API.
+
+        `commit_file` is one GET plus one PUT per file and moves the branch each time, so a
+        500-file conversion is 1,000 sequential requests and 500 commits — slow enough to be
+        unusable and enough traffic to trip GitHub's secondary rate limits. This is one blob
+        POST per file, then a single tree, commit and ref update, so the branch ends up with
+        the whole conversion or with none of it.
+
+        `base_branch` empty means: build on `branch` if that ref already exists (so a second
+        build/fix round stacks onto the first instead of orphaning it), otherwise on the
+        repository's default branch. The one it resolved to comes back as `base_branch`,
+        because the caller opening the PR needs to name it and only this method knows it.
+
+        Never force-pushes. A branch that has diverged from its base raises rather than
+        discarding whatever moved it.
+        """
+        if not self.token:
+            raise ValueError("GITHUB_TOKEN is not configured")
+        if not files:
+            raise ValueError("commit_tree was given no files")
+        import base64
+
+        # Validate every path before a single request goes out — a partially committed tree
+        # is not something we can take back.
+        items = [(self._tree_path(path), content or "") for path, content in files.items()]
+
+        with httpx.Client(headers=self.headers, timeout=self.GIT_DATA_TIMEOUT) as client:
+            base = base_branch or branch
+            ref_resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/git/ref/heads/{base}")
+            if ref_resp.status_code == 404 and not base_branch:
+                repo_resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}")
+                repo_resp.raise_for_status()
+                base = repo_resp.json().get("default_branch") or "main"
+                ref_resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/git/ref/heads/{base}")
+            ref_resp.raise_for_status()
+            base_commit_sha = ref_resp.json()["object"]["sha"]
+
+            commit_resp = client.get(
+                f"{self.BASE_URL}/repos/{owner}/{repo}/git/commits/{base_commit_sha}"
+            )
+            commit_resp.raise_for_status()
+            base_tree_sha = commit_resp.json()["tree"]["sha"]
+
+            entries = []
+            for path, content in items:
+                # Always base64, never `utf-8`: generated source can legitimately contain
+                # anything, and the utf-8 encoding rejects content GitHub can't round-trip.
+                blob_resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/git/blobs",
+                    json={
+                        "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                        "encoding": "base64",
+                    },
+                )
+                blob_resp.raise_for_status()
+                entries.append({"path": path, "mode": "100644", "type": "blob",
+                                "sha": blob_resp.json()["sha"]})
+
+            tree_sha = base_tree_sha
+            for start in range(0, len(entries), self.TREE_ENTRY_BATCH):
+                tree_resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/git/trees",
+                    json={"base_tree": tree_sha,
+                          "tree": entries[start:start + self.TREE_ENTRY_BATCH]},
+                )
+                tree_resp.raise_for_status()
+                tree_sha = tree_resp.json()["sha"]
+
+            new_commit_resp = client.post(
+                f"{self.BASE_URL}/repos/{owner}/{repo}/git/commits",
+                json={"message": message, "tree": tree_sha, "parents": [base_commit_sha]},
+            )
+            new_commit_resp.raise_for_status()
+            new_commit = new_commit_resp.json()
+            commit_sha = new_commit["sha"]
+
+            update_resp = client.patch(
+                f"{self.BASE_URL}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+                json={"sha": commit_sha, "force": False},
+            )
+            if update_resp.status_code in (404, 422):
+                create_resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/git/refs",
+                    json={"ref": f"refs/heads/{branch}", "sha": commit_sha},
+                )
+                if create_resp.status_code == 422 and "already exists" in create_resp.text:
+                    # The PATCH was refused and the ref is there, so it isn't missing — it
+                    # has moved off the base we built on. Saying so beats "Reference already
+                    # exists", which reads like a race and hides the real answer (pass the
+                    # branch as `base_branch`, or delete it).
+                    raise ValueError(
+                        f"{owner}/{repo}:{branch} exists but has diverged from '{base}', and "
+                        f"commit_tree never force-pushes. Re-run with base_branch='{branch}'."
+                    )
+                create_resp.raise_for_status()
+            else:
+                update_resp.raise_for_status()
+
+        # File count only. The contents are customer source and converted output; neither
+        # belongs in a log line.
+        logger.info("Committed %d file(s) to %s/%s:%s as %s (base %s)",
+                    len(entries), owner, repo, branch, commit_sha[:7], base)
+        return {
+            "commit_sha": commit_sha,
+            "tree_sha": tree_sha,
+            "branch": branch,
+            "base_branch": base,
+            "files": len(entries),
+            "html_url": new_commit.get("html_url", ""),
+        }
+
     def create_pull_request(self, owner: str, repo: str, title: str, body: str, head: str, base: str) -> Dict[str, Any]:
         """Open a PR from head -> base. Returns its number and URL."""
         if not self.token:

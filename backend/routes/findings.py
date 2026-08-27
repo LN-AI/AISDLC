@@ -11,10 +11,10 @@ Scoped per project: a waiver is a decision one team made about their own code
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from backend import database
+from backend import database, scope
 from backend.routes.v1_agents import get_caller
 from backend.services.finding_pipeline import WAIVED_STATUSES
 
@@ -39,6 +39,44 @@ class FindingStatusRequest(BaseModel):
     comment: str = Field("", description="Why. Recorded on the finding and in the audit trail.")
 
 
+@router.get(
+    "",
+    summary="List findings across a project's reviews",
+)
+def list_findings(
+    caller: dict = Depends(get_caller),
+    status: Optional[str] = Query(None, description="Filter by lifecycle status, e.g. 'open'."),
+    min_severity: int = Query(0, ge=0, le=5, description="1 Info … 4 High, 5 Critical."),
+    review_id: Optional[str] = Query(None, description="Only this review's findings."),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Every finding this caller may see, newest review first.
+
+    The counterpart the lifecycle never had: `PATCH /{finding_id}` could waive a finding
+    from the first day the column existed, but the only way to *find* one was to open the
+    review that produced it, so "what is still open in this project" was unanswerable.
+
+    `counts` describes the whole status-filtered set rather than the page, so a caller can
+    show "12 open, 3 critical" without paging through everything.
+    """
+    visible = scope.visible_from_caller(caller)
+    findings = database.list_findings(
+        project_ids=visible, status=status, min_severity=min_severity,
+        review_id=review_id, limit=limit, offset=offset,
+    )
+    counts = database.count_findings(
+        project_ids=visible, status=status, min_severity=min_severity, review_id=review_id)
+    return {
+        "findings": findings,
+        "count": len(findings),
+        "total": counts["total"],
+        "counts": counts,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @router.patch(
     "/{finding_id}",
     summary="Set a finding's status (waive, dismiss, resolve, reopen)",
@@ -48,6 +86,16 @@ def set_status(finding_id: str, req: FindingStatusRequest, caller: dict = Depend
         raise HTTPException(
             400, f"Unknown status '{req.status}'. Expected one of: {', '.join(_ALLOWED_STATUSES)}."
         )
+    # A waiver suppresses the finding from every future review of its project, so who may
+    # issue one has to be checked. This route took a bare id and changed it — a finding id
+    # from any project would do — which was survivable only while ids were unguessable and
+    # unlistable. The list endpoint above makes them listable.
+    existing = database.get_finding(finding_id)
+    if not existing:
+        raise HTTPException(404, f"No finding with id '{finding_id}'.")
+    visible = scope.visible_from_caller(caller)
+    if visible is not None and existing.get("project_id") not in visible:
+        raise HTTPException(404, f"No finding with id '{finding_id}'.")
     # A waiver is a governance decision, so the audit row has to name a person or a key,
     # not "system".
     actor = caller.get("username") or caller.get("team") or "unknown"

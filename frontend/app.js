@@ -345,6 +345,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'agent-hub') { loadAgentHub(); loadSwarmPolicies(); }
     if (page === 'gate') loadReviewPicker();
     if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
+    if (page === 'findings') loadFindings(0);
     if (page === 'inventory') loadInventory();
     if (page === 'sensitive') { /* page ready, no auto-load */ }
     if (page === 'ai-provenance') { /* page ready, no auto-load */ }
@@ -2128,6 +2129,73 @@ function renderFinding(f) {
   `;
 }
 
+// ── Findings ──────────────────────────────────────────────────────────────
+//
+// A finding could be waived from the day the API existed, but only from inside the
+// review-detail modal of the review that produced it — so "what is still open in this
+// project" had no answer on any screen. This page is the read side of that lifecycle:
+// `GET /api/v1/findings`, project-scoped server-side like every other governance surface.
+
+const FINDINGS_PAGE_SIZE = 25;
+let _findingsOffset = 0;
+
+async function loadFindings(offset) {
+  _findingsOffset = Math.max(0, offset || 0);
+  const wrap = document.getElementById('findings-list');
+  const pager = document.getElementById('findings-pager');
+  if (!wrap) return;
+  wrap.innerHTML = '<div class="empty-state">Loading…</div>';
+
+  const status = document.getElementById('findings-status').value;
+  const minSeverity = document.getElementById('findings-severity').value;
+  const params = new URLSearchParams({
+    limit: FINDINGS_PAGE_SIZE, offset: _findingsOffset, min_severity: minSeverity,
+  });
+  if (status) params.set('status', status);
+
+  try {
+    const data = await apiFetch(`/api/v1/findings?${params}`);
+    const findings = data.findings || [];
+    const counts = data.counts || {};
+    document.getElementById('findings-counts').innerHTML =
+      `<strong>${data.total || 0}</strong> matching · ${counts.critical || 0} critical · ${counts.high || 0} high`;
+
+    if (!findings.length) {
+      wrap.innerHTML = `<div class="empty-state">No findings match this filter.
+        ${status === 'open' ? 'Nothing is open — either nothing was found, or everything found has been waived or resolved.' : ''}</div>`;
+      pager.classList.add('hidden');
+      return;
+    }
+
+    // A finding is meaningless without the review it came from, so each card is prefixed
+    // with its origin — this is the one screen where findings from different reviews and
+    // different agents sit next to each other.
+    wrap.innerHTML = findings.map(f => `
+      <div class="finding-origin">
+        <span class="tag tag-${esc(f.review_type || '')}">${esc((f.review_type || 'review').replace(/_/g, ' '))}</span>
+        <span>${esc(f.project_name || '')}</span>
+        <span>${esc((f.review_created_at || '').slice(0, 16).replace('T', ' '))}</span>
+        <button class="btn btn-link" onclick="viewReview('${esc(f.review_id)}')">Open review</button>
+      </div>
+      ${renderFinding(f)}
+    `).join('');
+
+    const first = _findingsOffset + 1;
+    const last = _findingsOffset + findings.length;
+    document.getElementById('findings-range').textContent = `Showing ${first}–${last} of ${data.total}`;
+    document.getElementById('findings-prev').disabled = _findingsOffset === 0;
+    document.getElementById('findings-next').disabled = last >= data.total;
+    pager.classList.toggle('hidden', (data.total || 0) <= FINDINGS_PAGE_SIZE);
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load findings: ${esc(e.message)}</div>`;
+    pager.classList.add('hidden');
+  }
+}
+
+function pageFindings(direction) {
+  loadFindings(_findingsOffset + direction * FINDINGS_PAGE_SIZE);
+}
+
 // ── Waiving a finding ─────────────────────────────────────────────────────
 //
 // The `findings` table has always had status/resolved_by/resolved_at and the API to write
@@ -2174,6 +2242,20 @@ async function waiveFinding(findingId, forcedStatus) {
     if (card) {
       const holder = card.querySelector('.finding-actions, .finding-waived');
       if (holder) holder.outerHTML = renderWaiveControl({ ...updated, id: findingId });
+    }
+    // The Findings page counts "how many are still open", which this just changed. The
+    // card is updated in place rather than removed — pulling a row out from under the
+    // cursor mid-review is worse than a list that is one row stale.
+    const active = document.querySelector('.page.active');
+    if (active && active.id === 'page-findings') {
+      apiFetch('/api/v1/findings?limit=1&status=open', { _silent: true })
+        .then(d => {
+          const el = document.getElementById('findings-counts');
+          const c = (d && d.counts) || {};
+          if (el) el.innerHTML =
+            `<strong>${d.total || 0}</strong> open · ${c.critical || 0} critical · ${c.high || 0} high`;
+        })
+        .catch(() => {});
     }
   } catch (e) {
     alert('Could not update the finding: ' + (e.message || e));
@@ -5550,8 +5632,68 @@ loadDashboard();
 // died, which shows as `paused` with a Resume button rather than a spinner that never ends.
 
 let _modRunId = null;
+// Names only, and never values: what the corpus needs supplied before it can be
+// replayed at all. Set by the parity badge, read by its help dialog.
+let _modParitySecrets = [];
 let _modPollTimer = null;
 let _modCharterFields = null;
+// Last run object handed back by a successful refresh, so a skipped repaint (see
+// `_charterIsDirty`) can still answer the poll loop's "is it still working?" question.
+let _modLastRun = null;
+
+// True when the charter form is on screen holding text the server has not been given yet.
+// Compared against what the form was rendered with, not against emptiness — a user editing
+// a pre-filled suggestion is exactly the case the poll used to silently revert.
+function _charterIsDirty() {
+  const boxes = document.querySelectorAll('#mod-detail textarea[id^="charter-"]');
+  if (!boxes.length) return false;
+  return Array.from(boxes).some(el => el.value !== (el.dataset.rendered ?? ''));
+}
+// Per-run, deliberately not cached across runs: these answers are derived from one specific
+// codebase's evidence. `runId` is the cache key; a mismatch triggers a fetch.
+let _modCharterSuggestions = { runId: null, fields: [], loading: false, prefilled: false };
+
+// ── On-demand panels ───────────────────────────────────────────────────────
+//
+// Six of this product's read endpoints had no caller in the browser at all, so the screen
+// showed a progress bar over work whose substance — the parser findings, the redactions, the
+// symbol registry, the run log, the architect's reasoning, the converted text of one file —
+// was reachable only through curl. They are loaded on demand rather than on the poll: a run
+// manifest is four small queries, and hanging six more off a 4s timer would turn a read-only
+// screen into a load generator.
+//
+// `_modPanelCache` is what makes that safe. The poll repaints `#mod-detail` wholesale, which
+// blows every panel away; restoring them from the cached response means an open panel costs
+// a re-render and not a re-fetch. Both are dropped when the selected run changes — showing
+// one run's evidence under another run's heading is worse than showing none.
+let _modPanelCache = {};
+// `name|containerId` pairs, because the same panel is shown in two places: the evidence panel
+// has a button of its own *and* is loaded unasked into the discovery gate, where the money is
+// actually approved.
+let _modOpenPanels = new Set();
+let _modUnitCache = {};
+let _modUnitId = null;
+let _modUnitSource = false;
+// The graph is drawn from `units`/`components`, which the poll already fetches — so it needs
+// no request of its own and survives a repaint by being part of the repaint.
+let _modShowGraph = false;
+let _modGraphMode = 'files';
+let _modLastUnits = [];
+let _modLastComponents = [];
+
+// `store.get_run` decodes charter/stats/redactions/error but **not** `plan_json` /
+// `estimate_json`, so `run.plan` and `run.estimate` are never populated and
+// `GET /runs/{id}/plan` answers 404 for every run that has a plan. The run view still carries
+// the raw columns, so parse them here: the estimate line in the header has been dead for the
+// same reason. The endpoint is still tried first, so this stops mattering the day the decode
+// is added server-side.
+function _modJson(value) {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  try { return JSON.parse(value); } catch (e) { return null; }
+}
+function _modRunPlan(run) { return _modJson(run && (run.plan || run.plan_json)); }
+function _modRunEstimate(run) { return _modJson(run && (run.estimate || run.estimate_json)); }
 
 async function loadModernizationRuns() {
   const box = document.getElementById('mod-runs');
@@ -5562,8 +5704,11 @@ async function loadModernizationRuns() {
       box.innerHTML = '<div class="empty-state">No runs yet. Upload a zip above to build an inventory — nothing is billed until you approve a plan.</div>';
       return;
     }
+    // `selected` matters more than it looks: the detail panel is a single element below this
+    // list, so clicking a second run swaps its contents in place. With two runs at the same
+    // status the swap is invisible, and clicking reads as a dead control.
     box.innerHTML = data.runs.map(r => `
-      <div class="mod-run-card" onclick="openModernizationRun('${esc(r.id)}')">
+      <div class="mod-run-card ${r.id === _modRunId ? 'selected' : ''}" onclick="openModernizationRun('${esc(r.id)}')">
         <div class="mod-run-head">
           <span class="mod-run-name">${esc(r.name || 'Untitled run')}</span>
           <span class="mod-status ${esc(r.status)}">${esc(r.status)}</span>
@@ -5607,26 +5752,76 @@ async function createModernizationRun() {
 }
 
 async function openModernizationRun(runId) {
+  const switching = _modRunId !== runId;
   _modRunId = runId;
+  if (switching) {
+    // Panel contents belong to one run. Carrying them across would render the previous run's
+    // evidence, symbols and converted files under this run's heading — the kind of wrong that
+    // reads as correct.
+    _modPanelCache = {};
+    _modUnitCache = {};
+    _modOpenPanels = new Set();
+    _modUnitId = null;
+    _modUnitSource = false;
+    _modShowGraph = false;
+    _modGraphMode = 'files';
+    _modLastUnits = [];
+    _modLastComponents = [];
+  }
   await refreshModernizationRun();
+  if (switching) {
+    // Re-render the list so the newly selected card is highlighted, and bring the panel into
+    // view — it sits below the run list, so on a page with several runs the update happens
+    // off-screen and the click appears to have done nothing.
+    loadModernizationRuns();
+    const panel = document.getElementById('mod-detail');
+    if (panel && panel.scrollIntoView) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
   // Poll only while there is something to watch. A completed or cancelled run never
   // changes again, and a paused one only changes when someone acts on this page.
   clearInterval(_modPollTimer);
   _modPollTimer = setInterval(async () => {
     const run = await refreshModernizationRun();
-    if (!run || run.status !== 'converting') clearInterval(_modPollTimer);
+    // A run is "working" in several states now, not only `converting` — stopping the poll at
+    // the first non-converting tick would freeze the screen the moment it started thinking.
+    if (!run || !['converting', 'comprehending', 'analyzing', 'reconciling', 'scanning'].includes(run.status)) {
+      clearInterval(_modPollTimer);
+    }
   }, 4000);
 }
 
 async function refreshModernizationRun() {
   if (!_modRunId) return null;
+  // Re-rendering #mod-detail rebuilds the charter form from the server's suggestions, which
+  // throws away anything typed but not yet saved. The damage is invisible for fields that
+  // have a suggestion — they are refilled with the same text — so it only ever destroyed the
+  // answers a human had to write themselves, and the run then rejected those as missing.
+  // Skipping the repaint while the form is dirty is safe: `awaiting_charter` only changes in
+  // response to this page, so there is nothing to miss.
+  if (_charterIsDirty()) return _modLastRun;
   const box = document.getElementById('mod-detail');
   try {
-    const run = await apiFetch(`/api/v1/modernization/runs/${_modRunId}`, { _silent: true });
-    const checkpoints = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/checkpoints?status=open`, { _silent: true });
-    const units = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/units`, { _silent: true });
+    const base = `/api/v1/modernization/runs/${_modRunId}`;
+    const run = await apiFetch(base, { _silent: true });
+    const checkpoints = await apiFetch(`${base}/checkpoints?status=open`, { _silent: true });
+    const units = await apiFetch(`${base}/units`, { _silent: true });
+    // Components only exist once the architecture has been designed; a 404 or an empty list
+    // is the normal state for most of a run's life, not an error worth showing.
+    let components = [];
+    try {
+      components = (await apiFetch(`${base}/components`, { _silent: true })).components || [];
+    } catch (e) { /* not designed yet */ }
     box.classList.remove('hidden');
-    box.innerHTML = renderModernizationRun(run, checkpoints.checkpoints || [], units.units || []);
+    // Kept so the graph and the panel toggles can repaint themselves without a second fetch —
+    // everything they draw is already in this response.
+    _modLastUnits = units.units || [];
+    _modLastComponents = components;
+    _modLastRun = run;
+    box.innerHTML = renderModernizationRun(run, checkpoints.checkpoints || [],
+                                           _modLastUnits, components);
+    // The repaint above destroyed every on-demand panel. Restore them from the cache rather
+    // than re-requesting: the poll must stay four queries a tick however many panels are open.
+    _modRestorePanels(checkpoints.checkpoints || []);
     return run;
   } catch (e) {
     box.classList.remove('hidden');
@@ -5635,14 +5830,16 @@ async function refreshModernizationRun() {
   }
 }
 
-function renderModernizationRun(run, checkpoints, units) {
+function renderModernizationRun(run, checkpoints, units, components) {
   const u = run.units || {};
-  const blocking = checkpoints.filter(c => c.blocking);
+  const c = run.components || {};
+  const blocking = checkpoints.filter(x => x.blocking);
   const needsCharter = run.status === 'awaiting_charter';
   const canStart = run.status === 'awaiting_approval' && blocking.length === 0;
   const canResume = run.status === 'paused';
-  const running = run.status === 'converting';
+  const working = ['converting', 'comprehending', 'analyzing', 'reconciling'].includes(run.status);
   const terminal = ['completed', 'cancelled', 'failed'].includes(run.status);
+  const est = _modRunEstimate(run) || {};
 
   return `
     <div class="mod-panel">
@@ -5651,41 +5848,1095 @@ function renderModernizationRun(run, checkpoints, units) {
         <span class="mod-status ${esc(run.status)}">${esc(run.status)}</span>
         <span class="compliance-chip">${esc(run.target_stack || '')}</span>
       </div>
+      ${renderModernizationStages(run)}
       <div class="mod-bar"><span style="width:${run.progress_pct || 0}%"></span></div>
       <div class="mod-meta">
-        ${u.converted || 0} of ${u.total || 0} converted
+        ${u.converted || 0} of ${u.total || 0} files converted
+        ${c.total ? ` · ${c.converted || 0} of ${c.total} components` : ''}
         ${u.failed ? ` · ${u.failed} failed` : ''}
-        ${u.blocked ? ` · ${u.blocked} waiting on dependencies` : ''}
+        ${c.blocked ? ` · ${c.blocked} waiting on dependencies` : ''}
         · $${Number(run.spent_usd || 0).toFixed(2)} spent${run.budget_cap_usd ? ' of $' + Number(run.budget_cap_usd).toFixed(2) + ' cap' : ''}
+        ${est.expected_usd !== undefined ? ` · est. $${Number(est.expected_usd).toFixed(2)}, ceiling $${Number(est.ceiling_usd || 0).toFixed(2)}` : ''}
         ${run.redaction_count ? ` · ${run.redaction_count} secret(s) redacted at ingest` : ''}
       </div>
       ${run.paused_reason ? `<div class="mod-alert">${esc(run.paused_reason)}</div>` : ''}
       <div class="form-actions" style="margin-top:12px">
-        ${canStart ? '<button class="btn btn-primary" onclick="startModernizationRun()">Start conversion</button>' : ''}
+        ${canStart ? '<button class="btn btn-primary" onclick="startModernizationRun()">Start</button>' : ''}
         ${canResume ? '<button class="btn btn-primary" onclick="resumeModernizationRun()">Resume</button>' : ''}
-        ${running ? '<button class="btn btn-secondary" onclick="pauseModernizationRun()">Pause</button>' : ''}
+        ${working ? '<button class="btn btn-secondary" onclick="pauseModernizationRun()">Pause</button>' : ''}
         ${u.converted ? '<button class="btn btn-secondary" onclick="exportModernizationRun()">Download converted code</button>' : ''}
+        ${(c.converted || terminal) ? '<button class="btn btn-secondary" onclick="showModernizationReconciliation()">Consistency report</button>' : ''}
+        ${run.build_round ? '<button class="btn btn-secondary" onclick="showModernizationBuilds()">Build results</button>' : ''}
+        ${run.rules_confirmed ? '<button class="btn btn-secondary" onclick="showModernizationRules()">Business rules</button>' : ''}
         ${terminal ? '' : '<button class="btn btn-link" onclick="cancelModernizationRun()">Cancel run</button>'}
       </div>
+      ${renderModernizationBuildBadge(run)}
+      ${renderModernizationParityBadge(run)}
+      <div class="mod-inspect" id="mod-inspect">${renderModernizationInspect(run, units)}</div>
     </div>
 
     ${needsCharter ? renderCharterForm(run) : ''}
     ${checkpoints.length ? renderModernizationCheckpoints(checkpoints) : ''}
+    <div id="mod-graph">${_modShowGraph ? renderModernizationGraph(units, components, _modGraphMode) : ''}</div>
+    <div id="mod-unit"></div>
+    <div id="mod-plan"></div>
+    <div id="mod-evidence"></div>
+    <div id="mod-redactions"></div>
+    <div id="mod-symbols"></div>
+    <div id="mod-events"></div>
+    <div id="mod-reconciliation"></div>
+    <div id="mod-builds"></div>
+    <div id="mod-rules"></div>
+    ${renderModernizationComponents(components)}
     ${renderModernizationUnits(units)}
   `;
 }
 
+// The read-only half of the screen, kept apart from the action row on purpose: nothing here
+// changes the run or spends anything, and mixing "look at the evidence" in beside "Cancel run"
+// made both harder to find. Returns the chips only — the container is rendered by the caller
+// so a toggle can repaint the strip in place without touching the rest of the panel.
+function renderModernizationInspect(run, units) {
+  const u = run.units || {};
+  const c = run.components || {};
+  const converted = (u.converted || 0) + (c.converted || 0);
+  const chip = (name, label, on) => `<button type="button" class="mod-choice ${on ? 'selected' : ''}"
+      onclick="toggleModernizationPanel('${name}')">${esc(label)}</button>`;
+  return `<span class="mod-inspect-label">Look inside</span>
+    ${(units || []).length ? `<button type="button" class="mod-choice ${_modShowGraph ? 'selected' : ''}"
+        onclick="toggleModernizationGraph()">Dependency graph</button>` : ''}
+    ${chip('evidence', 'Evidence', _modOpenPanels.has('evidence|mod-evidence'))}
+    ${_modRunPlan(run) ? chip('plan', 'The plan', _modOpenPanels.has('plan|mod-plan')) : ''}
+    ${run.redaction_count ? chip('redactions', `Redactions (${run.redaction_count})`,
+                                 _modOpenPanels.has('redactions|mod-redactions')) : ''}
+    ${converted ? chip('symbols', 'Symbols produced', _modOpenPanels.has('symbols|mod-symbols')) : ''}
+    ${chip('events', 'Run timeline', _modOpenPanels.has('events|mod-events'))}`;
+}
+
+// The chips read their state out of `_modOpenPanels`, so a toggle has to repaint them or the
+// button stays lit on a run whose poll has already stopped.
+function _modPaintInspect() {
+  const box = document.getElementById('mod-inspect');
+  if (box && _modLastRun) box.innerHTML = renderModernizationInspect(_modLastRun, _modLastUnits);
+}
+
+function renderModernizationBuildBadge(run) {
+  // A run that has been through a build round is in a different conversation with the user
+  // than one that never compiled: the question is no longer "did it convert" but "does it
+  // build". Surfacing the round on the header is what makes the loop visible at all.
+  //
+  // "Never compiled" is now one of the things it says. It used to render nothing at all,
+  // which reads as an absence of problems rather than an absence of evidence — and a real
+  // run shipped 45 converted files whose solution could not `dotnet restore`, with every
+  // offline check green. The line only appears once there is something to compile.
+  if (!run.build_round) {
+    const converted = (run.units || {}).converted || 0;
+    if (!converted) return '';
+    return `<div class="mod-meta" style="margin-top:8px">
+      Never compiled — every check that ran reads the code; none of them runs a compiler.
+      <span class="mod-drill" onclick="showModernizationBuildHelp()">How to check it builds</span>
+    </div>`;
+  }
+  const b = run.last_build || {};
+  const clean = b.error_count === 0;
+  return `<div class="mod-meta" style="margin-top:8px">
+    Build round ${run.build_round}${b.source ? ' from ' + esc(b.source) : ''} ·
+    ${clean ? 'compiled with no errors' : `${b.error_count || 0} error(s)`}
+    ${b.warning_count ? ` · ${b.warning_count} warning(s)` : ''}
+    ${b.reopened_count ? ` · ${b.reopened_count} unit(s) sent back for rework` : ''}
+  </div>`;
+}
+
+// The other question no check above can answer: does it still *do* the same thing. The run
+// manifest has carried `parity` since parity was written and nothing on this screen read it,
+// so a run that verified its behaviour and one that never looked rendered identically — which
+// is the exact failure the summary's own comment says must not happen.
+function renderModernizationParityBadge(run) {
+  const p = run.parity;
+  const converted = (run.units || {}).converted || 0;
+  if (!p) {
+    if (!converted) return '';
+    return `<div class="mod-meta" style="margin-top:4px">
+      No recorded behaviour — nothing checked that the converted application does what the
+      legacy one did.
+      <span class="mod-drill" onclick="showModernizationParityHelp()">How to record it</span>
+    </div>`;
+  }
+  const label = {
+    never_run: `${p.cases} recorded behaviour(s), never replayed`,
+    passed: `${p.cases} recorded behaviour(s) — all matched on round ${p.round}`,
+  }[p.status] || `${p.cases} recorded behaviour(s) — ${p.failed || 0} differed, ` +
+                 `${p.passed || 0} matched, ${p.errored || 0} errored on round ${p.round}`;
+  // A corpus recorded through a login cannot be replayed until somebody supplies the
+  // credential that was masked out of it before it was stored. A reader who is not told
+  // that reads unrunnable cases as things the conversion broke — which is exactly what
+  // happened: one dead sign-in reported as 19 behavioural divergences.
+  _modParitySecrets = p.secrets_required || [];
+  const needs = _modParitySecrets.length
+    ? `<div class="mod-meta">Needs ${_modParitySecrets.map(esc).join(', ')} supplied at
+       replay time — the recording was stored without it.
+       <span class="mod-drill" onclick="showModernizationParityHelp()">How to supply it</span>
+       </div>`
+    : '';
+  return `<div class="mod-meta" style="margin-top:4px">Behaviour: ${esc(label)}</div>${needs}`;
+}
+
+function showModernizationParityHelp() {
+  const id = _modRunId || '<run id>';
+  alert(
+    'A conversion can compile, pass every consistency check, and still behave differently. '
+    + "`(int)$_POST['salary']` became `int.TryParse`, so a stored 61234 became 0 — valid C# "
+    + 'that no check here can see.\n\n'
+    + 'The only thing that catches it is a recording of the legacy application, replayed '
+    + 'against the converted one:\n\n'
+    + `    curl ${location.origin}/api/v1/modernization/runs/${id}/parity-tools\n\n`
+    + 'Two single-file Python programs, no dependencies. Run the recorder next to the legacy '
+    + 'app and use it for a few minutes — including the journeys that fail. The replayer runs '
+    + 'the same requests against the converted app and reports back here:\n\n'
+    + '    python replay_parity.py --base-url <the converted app> --token <api key>'
+    + (_modParitySecrets.length
+        ? ' ' + _modParitySecrets.map(n => '--secret ' + n + '=…').join(' ') : '')
+    + '\n\n'
+    + (_modParitySecrets.length
+        ? 'Those credentials were masked out of the recording before it was stored, so this '
+          + 'platform does not have them and cannot give them back. The replayer takes them '
+          + 'from your machine and sends them only to your application — what it reports '
+          + 'back here is which ones it filled, never what they were. Run it without them '
+          + 'and it names the ones it wants.\n\n'
+        : '')
+    + 'Record it while the legacy system still exists. Once it is gone, so is the only source '
+    + 'of truth about what it did.');
+}
+
+// The command, not advice about the command. "Run a build" is something a reader agrees with
+// and does not do; a line they can paste is an action. Nothing here compiles anything — the
+// platform cannot (D-05), so what it can do is make the question easy to answer.
+function showModernizationBuildHelp() {
+  const id = _modRunId || '<run id>';
+  alert(
+    'Nothing here can compile this export — building code generated from your source is '
+    + 'arbitrary code execution, so it happens where your own CI does.\n\n'
+    + 'On a machine with the .NET SDK:\n\n'
+    + `    python scripts/build_run.py --run ${id} --api ${location.origin} \\\n`
+    + '        --user <you> --password <yours>\n\n'
+    + 'It downloads the export, runs `dotnet build`, and posts the compiler output back to '
+    + 'this run. Units that failed go back into the queue with those errors in their prompt, '
+    + 'so a build is not only a verdict — it is the input to the next attempt.\n\n'
+    + 'Or open a PR against a repository you own, which carries a workflow that does the '
+    + 'same thing from GitHub Actions and reports back here.');
+}
+
+function renderModernizationStages(run) {
+  // The stage strip is the answer to "what is it doing" — a status of `analyzing` for ten
+  // minutes is otherwise indistinguishable from a stuck run.
+  const s = run.stage;
+  if (!s) return '';
+  // One entry per stage in backend/services/modernization/stages.py, in the same order —
+  // the server sends an index into that list, so a missing name shifts every later stage.
+  const names = ['Understand', 'Portrait', 'Design', 'Cost', 'Scaffold', 'Convert', 'Wire up', 'Reconcile'];
+  return `<div class="mod-stages">
+    ${names.map((n, i) => `<span class="mod-stage ${i < s.index ? 'done' : (i === s.index ? 'active' : '')}">${esc(n)}</span>`).join('')}
+    <span class="mod-stage-label">${esc(s.label)}</span>
+  </div>`;
+}
+
+// A blocking checkpoint whose answer means "carry on **without** the evidence I am asking for".
+// These are not approvals of anything and must never be labelled or styled as one: the button
+// on `parity_required` used to read "Approve", in primary blue, on a gate whose own text says
+// "answer this to finish the run without that evidence". Faced with one prominent button
+// called Approve and no other action, everybody clicks Approve — and then the check that
+// exists to catch a conversion which compiles, runs and does something else is a check nobody
+// has ever run. That is the same failure this whole layer is about, arriving through the UI.
+const MOD_WAIVER_CHECKPOINTS = {
+  parity_required:   { label: 'Finish without checking behaviour', help: 'showModernizationParityHelp' },
+  parity_divergence: { label: 'Finish with the differences unresolved', help: 'showModernizationParityHelp' },
+  parity_incomplete: { label: 'Finish with the replay incomplete', help: 'showModernizationParityHelp' },
+  build_required:    { label: 'Finish without compiling', help: 'showModernizationBuildHelp' },
+  build_errors_outstanding:
+                     { label: 'Finish with the build failing', help: 'showModernizationBuildHelp' },
+  build_not_repairable:
+                     { label: 'Finish with these errors unfixed', help: 'showModernizationBuildHelp' },
+  wireup_ambiguous:  { label: 'Finish with it unregistered', help: 'showModernizationBuildHelp' },
+  runtime_required:  { label: 'Finish without starting it', help: 'showModernizationBuildHelp' },
+  runtime_failed:    { label: 'Finish with it failing to serve', help: 'showModernizationBuildHelp' },
+};
+
 function renderModernizationCheckpoints(checkpoints) {
   return `<div class="mod-panel">
     <div class="section-title" style="margin-top:0">Waiting on you (${checkpoints.length})</div>
-    ${checkpoints.map(c => `
+    ${checkpoints.map(c => {
+      const waiver = MOD_WAIVER_CHECKPOINTS[c.kind];
+      return `
       <div class="mod-alert">
-        <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks conversion' : ' — informational'}
-        <div style="margin-top:6px">${esc(c.detail || '')}</div>
-        <button class="btn btn-secondary btn-sm" style="margin-top:8px"
-                onclick="answerModernizationCheckpoint('${esc(c.id)}')">Acknowledge</button>
-      </div>`).join('')}
+        <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks the run' : ' — informational'}
+        <div style="margin-top:6px;white-space:pre-wrap">${esc(c.detail || '')}</div>
+        ${renderCheckpointPayload(c)}
+        ${waiver ? `<button class="btn btn-primary btn-sm" style="margin-top:8px"
+                onclick="${waiver.help}()">Show me how to do it</button>` : ''}
+        <button class="btn ${waiver || !c.blocking ? 'btn-secondary' : 'btn-primary'} btn-sm" style="margin-top:8px"
+                onclick="answerModernizationCheckpoint('${esc(c.id)}')">${
+                  waiver ? esc(waiver.label) : (c.blocking ? 'Approve' : 'Acknowledge')}</button>
+      </div>`;
+    }).join('')}
   </div>`;
+}
+
+function renderCheckpointPayload(c) {
+  // A gate whose entire body is prose can only be approved or not. One carrying a table can
+  // be read first, which is the difference between a gate and a speed bump.
+  //
+  // Both gates ask for money, so both now carry their own working. Gate A gets the parser
+  // findings — every one a line in the user's own source, produced for free before any model
+  // ran — loaded into `#mod-gate-evidence` by `_modRestorePanels` without being asked for.
+  // Gate B gets the architect's summary, projects and stated risks, which were already in the
+  // payload and were being thrown away in favour of a table of prices.
+  const p = c.payload;
+  if (!p) return '';
+  if (p.estimate && !p.components) {
+    const e = p.estimate;
+    const found = p.evidence || {};
+    const kinds = Object.keys(found).filter(k => found[k]).sort();
+    return `<div class="mod-meta" style="margin-top:8px">
+      ${e.calls} model call(s) · estimated $${Number(e.expected_usd || 0).toFixed(2)} ·
+      ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}${e.price_is_estimated ? ' (indicative rates)' : ''}
+      ${p.files ? ` · over ${p.files} ingested file(s)` : ''}
+    </div>
+    ${renderAnalysisContradictions(p.contradictions)}
+    ${renderAnalysisDenominators(p.signals)}
+    ${kinds.length ? `<div class="chip-row">${kinds.map(k =>
+      `<span class="compliance-chip">${esc(k.replace(/_/g, ' '))} · ${found[k]}</span>`).join('')}</div>` : ''}
+    <div class="mod-meta">Everything below was read out of your source by a parser, not proposed
+      by a model — it is what the assessment is being priced against.</div>
+    <div id="mod-gate-evidence"></div>`;
+  }
+  if (!p.components || !p.components.length) return '';
+  return `<div style="margin-top:10px">${renderModernizationPlanBody(p)}</div>`;
+}
+
+// Where the analysis disagrees with itself. Above the evidence table on purpose: the evidence
+// panel answers "what did we find", and this answers the question that has to be asked first —
+// "is what we found the whole story". Every row names the two numbers that disagree, because a
+// warning a reader cannot check against their own source in a minute is a warning they learn to
+// scroll past. Non-blocking by design; the gate is still approvable with these standing.
+function renderAnalysisContradictions(rows) {
+  if (!rows || !rows.length) return '';
+  return `<div class="mod-alert" style="margin-top:10px">
+    <strong>${rows.length} thing(s) in this analysis contradict something else in it</strong>
+    <div class="mod-meta" style="margin-top:4px">These do not block the run. They are pairs of
+      numbers this pipeline computed from your source by two different routes, which should
+      agree and do not — so at least one of them is wrong, and a number that is wrong here is
+      wrong in every prompt after it.</div>
+    <div class="mod-scroll" style="margin-top:8px">
+      <table class="mod-unit-table">
+        <thead><tr><th>What looks wrong</th><th>One signal says</th><th>The other says</th></tr></thead>
+        <tbody>${rows.map(r => `<tr>
+          <td><strong>${esc(r.title || r.code || '')}</strong>
+            <div class="mod-meta" style="white-space:normal">${esc(r.detail || '')}</div></td>
+          <td class="mod-unit-path">${esc(r.left || '')}</td>
+          <td class="mod-unit-path">${esc(r.right || '')}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// The denominators. "1 route" and "we could not read this codebase" are the same sentence
+// without the population the count was drawn from; with it, the reader can disbelieve a number.
+function renderAnalysisDenominators(s) {
+  if (!s || !s.files_analysed) return '';
+  const read = s.read_by || {};
+  const langs = Object.keys(s.languages || {}).sort((a, b) => s.languages[b] - s.languages[a]);
+  const n = v => (Array.isArray(v) ? v.length : (v || 0));
+  const rows = [
+    ['URL(s) this application answers on', n(s.routes)],
+    ['table(s) named in its SQL', n(s.tables)],
+    ['place(s) in the code that reach the database', n(s.db_sites)],
+    ['file(s) nothing else in the codebase depends on', n(s.entrypoints)],
+    ['setting(s) that must be supplied to run it', n(s.config_keys)],
+  ];
+  const blocked = s.blocked || [];
+  return `<div class="mod-panel" style="margin-top:10px">
+    <div class="section-title" style="margin-top:0">What was read, and how well</div>
+    <div class="mod-meta">${s.files_ingested || 0} file(s) ingested${s.files_skipped
+      ? `, ${s.files_skipped} skipped by extension` : ''}${langs.length
+      ? ' — ' + langs.map(l => `${s.languages[l]} ${esc(l)}`).join(', ') : ''}.
+      Of those, <strong>${read.parser || 0}</strong> were read by a real parser,
+      <strong>${read.heuristic || 0}</strong> by a pattern fallback, and
+      <strong>${read.default || 0}</strong> could not be read at all.</div>
+    <div class="chip-row" style="margin-top:8px">${rows.map(([label, count]) =>
+      `<span class="compliance-chip">${count} ${esc(label)}</span>`).join('')}</div>
+    ${blocked.length ? `<div class="mod-meta" style="margin-top:8px">
+      ${blocked.length} file(s) carry something that must be flagged for a human rather than
+      translated — ${esc(blocked[0].path || '')}${blocked[0].dependents
+        ? `, which ${blocked[0].dependents} other file(s) depend on` : ''}${blocked.length > 1
+        ? ` (and ${blocked.length - 1} more)` : ''}.</div>` : ''}
+  </div>`;
+}
+
+function renderModernizationComponents(components) {
+  if (!components || !components.length) return '';
+  // The view a per-file inventory cannot give: which source files were converted together,
+  // and where the result landed.
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Target architecture (${components.length} components)</div>
+    <p class="subtitle" style="margin-top:-6px">Decided once, before any file was converted. Every converted file lands under its component's directory and declares its namespace — the drift that used to be possible across a long run is now not expressible. Click a component to read the files it produced.</p>
+    <div style="max-height:420px;overflow:auto">
+      <table class="mod-unit-table">
+        <thead><tr><th>Level</th><th>Component</th><th>Project</th><th>Directory</th><th>Files</th><th>Risk</th><th>Status</th></tr></thead>
+        <tbody>${components.map(c => `<tr>
+          <td>${c.topo_level}</td>
+          <td class="mod-unit-path">${c.id
+            ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(c.id)}')">${esc(c.name)}</span>`
+            : esc(c.name)}</td>
+          <td>${esc(c.project || '')}</td>
+          <td class="mod-unit-path">${esc(c.output_dir || '')}</td>
+          <td title="${esc((c.members || []).join(', '))}">${(c.members || []).length}</td>
+          <td><span class="compliance-chip">${esc(c.risk || '')}</span></td>
+          <td><span class="mod-status ${esc(c.status)}">${esc(c.status)}</span>${c.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+async function showModernizationReconciliation() {
+  const box = document.getElementById('mod-reconciliation');
+  if (!box) return;
+  box.innerHTML = '<div class="mod-panel">Checking the converted codebase…</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/reconciliation`, { _silent: true });
+    const counts = r.counts || {};
+    box.innerHTML = `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Cross-file consistency</div>
+      <p class="subtitle" style="margin-top:-6px">Nothing here was compiled. These are the inconsistencies visible across the whole output — the ones no single-file check can see.</p>
+      <div class="mod-meta">${counts.fail || 0} failure(s) · ${counts.warn || 0} warning(s) · ${counts.artifacts || 0} file(s) checked</div>
+      ${(r.issues || []).length
+        ? `<div style="max-height:360px;overflow:auto;margin-top:10px">${r.issues.map(i => `
+            <div class="mod-alert" style="margin-bottom:6px">
+              <span class="compliance-chip">${esc(i.kind.replace(/_/g, ' '))}</span>
+              ${esc(i.detail)}
+            </div>`).join('')}</div>`
+        : '<div class="mod-meta" style="margin-top:10px">No cross-file inconsistencies were found.</div>'}
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="mod-panel">Could not run the consistency check: ${esc(e.message)}</div>`;
+  }
+}
+
+async function showModernizationBuilds() {
+  const box = document.getElementById('mod-builds');
+  if (!box) return;
+  box.innerHTML = '<div class="mod-panel">Loading build results…</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/builds`, { _silent: true });
+    const builds = r.builds || [];
+    const diags = r.diagnostics || [];
+    box.innerHTML = `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Build results</div>
+      <p class="subtitle" style="margin-top:-6px">What a real compiler said about the converted code. Units whose output failed to compile go back through conversion automatically, carrying these messages — which is the only check here that can prove the output is buildable rather than merely plausible.</p>
+      <div style="overflow:auto">
+        <table class="mod-unit-table">
+          <thead><tr><th>Round</th><th>Source</th><th>Errors</th><th>Warnings</th><th>Reopened</th><th>Outcome</th><th>When</th></tr></thead>
+          <tbody>${builds.map(b => `<tr>
+            <td>${b.round}</td>
+            <td>${esc(b.source || '')}</td>
+            <td>${b.error_count || 0}</td>
+            <td>${b.warning_count || 0}</td>
+            <td>${b.reopened_count || 0}</td>
+            <td><span class="mod-status ${esc(b.status)}">${esc((b.status || '').replace(/_/g, ' '))}</span></td>
+            <td class="mod-meta">${esc((b.created_at || '').replace('T', ' ').slice(0, 16))}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>
+      ${diags.length ? `<div class="section-title">Messages (${diags.length})</div>
+        <div style="max-height:360px;overflow:auto">
+          <table class="mod-unit-table">
+            <thead><tr><th>Severity</th><th>Code</th><th>File</th><th>Line</th><th>Message</th></tr></thead>
+            <tbody>${diags.map(d => `<tr>
+              <td><span class="compliance-chip">${esc(d.severity)}</span></td>
+              <td>${esc(d.code || '')}</td>
+              <td class="mod-unit-path" title="${esc(d.file)}">${esc(d.artifact_path || d.file)}${d.unit_id ? '' : ' <span class="compliance-chip">unowned</span>'}</td>
+              <td>${d.line || ''}</td>
+              <td>${esc(d.message || '')}</td>
+            </tr>`).join('')}</tbody>
+          </table>
+        </div>` : '<div class="mod-meta" style="margin-top:10px">The last build reported no messages.</div>'}
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="mod-panel">Could not load build results: ${esc(e.message)}</div>`;
+  }
+}
+
+async function showModernizationRules() {
+  // Its own container, not the builds panel: these answer different questions and an
+  // operator comparing a compiler error against the rule it broke needs both on screen.
+  const box = document.getElementById('mod-rules');
+  if (!box) return;
+  box.innerHTML = '<div class="mod-panel">Loading business rules…</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/rules`, { _silent: true });
+    const rules = r.rules || [];
+    const counts = r.counts || {};
+    const byCategory = {};
+    rules.forEach(x => { (byCategory[x.category || 'other'] = byCategory[x.category || 'other'] || []).push(x); });
+    box.innerHTML = `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Business rules found in the source</div>
+      <p class="subtitle" style="margin-top:-6px">What the application does, not how it is built. Every rule below was checked against the file it cites — a claim whose quote could not be found in the source was rejected rather than shown, which is why the count of rejects is worth reading too.</p>
+      <div class="mod-meta">${counts.confirmed || 0} confirmed · ${counts.rejected || 0} rejected as unverifiable · ${counts.proposed || 0} awaiting verification</div>
+      ${rules.length ? Object.keys(byCategory).sort().map(cat => `
+        <div class="section-title">${esc(cat.replace(/_/g, ' '))} (${byCategory[cat].length})</div>
+        <div style="max-height:300px;overflow:auto">
+          ${byCategory[cat].map(x => `<div class="mod-alert" style="margin-bottom:6px">
+            ${esc(x.statement)}
+            <div class="mod-meta" style="margin-top:4px">${esc(x.path)}:${x.line}${x.reject_reason ? ' — rejected: ' + esc(x.reject_reason.replace(/_/g, ' ')) : ''}</div>
+            ${x.quote ? `<pre class="mod-unit-path" style="margin:6px 0 0;white-space:pre-wrap">${esc(x.quote)}</pre>` : ''}
+          </div>`).join('')}
+        </div>`).join('')
+        : '<div class="mod-meta" style="margin-top:10px">No rules at this status.</div>'}
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="mod-panel">Could not load business rules: ${esc(e.message)}</div>`;
+  }
+}
+
+// ── The panels that were never wired up ────────────────────────────────────
+//
+// One table drives all five. Each entry is: which container it paints, what it asks for, and
+// the pure function that turns the response into HTML — the renderers below take a response
+// and return a string, so the smoke suite can exercise them without a fetch.
+const MOD_PANELS = {
+  plan: {
+    box: 'mod-plan', path: '/plan', label: 'Loading the conversion plan…',
+    render: renderModernizationPlan,
+    // `GET /plan` 404s for every run today (see `_modJson`), so the plan is read out of the
+    // run row instead. Tried second, not first, so the endpoint wins once it works.
+    fallback: () => ({ plan: _modRunPlan(_modLastRun), estimate: _modRunEstimate(_modLastRun) }),
+  },
+  evidence: {
+    box: 'mod-evidence', path: '/evidence', label: 'Loading what the parsers found…',
+    render: renderModernizationEvidence,
+  },
+  redactions: {
+    box: 'mod-redactions', path: '/redactions', label: 'Loading redactions…',
+    render: renderModernizationRedactions,
+  },
+  symbols: {
+    box: 'mod-symbols', path: '/symbols', label: 'Loading the symbol registry…',
+    render: renderModernizationSymbols,
+  },
+  events: {
+    box: 'mod-events', path: '/events?limit=200', label: 'Loading the run log…',
+    render: renderModernizationEvents,
+  },
+};
+
+async function showModernizationPanel(name, boxId) {
+  const spec = MOD_PANELS[name];
+  if (!spec || !_modRunId) return;
+  const target = boxId || spec.box;
+  const box = document.getElementById(target);
+  if (!box) return;
+  _modOpenPanels.add(`${name}|${target}`);
+  if (_modPanelCache[name]) { box.innerHTML = spec.render(_modPanelCache[name]); return; }
+  box.innerHTML = `<div class="mod-panel">${esc(spec.label)}</div>`;
+  let data = null;
+  try {
+    data = await apiFetch(`/api/v1/modernization/runs/${_modRunId}${spec.path}`, { _silent: true });
+  } catch (e) {
+    data = spec.fallback ? spec.fallback() : null;
+    if (!data || (name === 'plan' && !data.plan)) {
+      const dead = document.getElementById(target);
+      if (dead) dead.innerHTML = `<div class="mod-panel">Could not load this: ${esc(e.message)}</div>`;
+      return;
+    }
+  }
+  _modPanelCache[name] = data;
+  // Re-read the container: a poll tick may have repainted `#mod-detail` while this was in
+  // flight, which replaces the element the closure is holding with a different one.
+  const live = document.getElementById(target);
+  if (live) live.innerHTML = spec.render(data);
+}
+
+function toggleModernizationPanel(name) {
+  const spec = MOD_PANELS[name];
+  if (!spec) return;
+  const key = `${name}|${spec.box}`;
+  if (_modOpenPanels.has(key)) {
+    _modOpenPanels.delete(key);
+    const box = document.getElementById(spec.box);
+    if (box) box.innerHTML = '';
+    _modPaintInspect();
+    return;
+  }
+  showModernizationPanel(name, spec.box);
+  _modPaintInspect();
+}
+
+function _modRestorePanels(checkpoints) {
+  _modOpenPanels.forEach(key => {
+    const cut = key.indexOf('|');
+    const name = key.slice(0, cut);
+    const spec = MOD_PANELS[name];
+    const box = document.getElementById(key.slice(cut + 1));
+    if (spec && box && _modPanelCache[name]) box.innerHTML = spec.render(_modPanelCache[name]);
+  });
+  // The assessment gate is the first place money is approved, and its whole body used to be
+  // one sentence. Load the findings behind it without being asked — a cached response after
+  // the first tick, so this costs one request per run, not one per poll.
+  const atGate = (checkpoints || []).some(
+    x => x.kind === 'discovery_approval' && (x.status || 'open') === 'open');
+  if (atGate) showModernizationPanel('evidence', 'mod-gate-evidence');
+  if (_modUnitId) showModernizationUnit(_modUnitId);
+}
+
+// ── Evidence ───────────────────────────────────────────────────────────────
+
+function renderModernizationEvidence(data) {
+  const rows = (data && data.evidence) || [];
+  const counts = (data && data.counts_by_kind) || {};
+  const byKind = {};
+  rows.forEach(r => { (byKind[r.kind || 'other'] = byKind[r.kind || 'other'] || []).push(r); });
+  const kinds = Object.keys(counts).sort();
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">What the parsers observed (${(data && data.count) || rows.length})</div>
+    <p class="subtitle" style="margin-top:-6px">Deterministic and free: every row is a citation into your own source, produced before any model was called. Nothing here is a model's claim — that is a different list, under Business rules.</p>
+    ${kinds.length ? `<div class="chip-row">${kinds.map(k =>
+      `<span class="compliance-chip">${esc(k.replace(/_/g, ' '))} · ${counts[k]}</span>`).join('')}</div>` : ''}
+    ${rows.length ? Object.keys(byKind).sort().map(kind => `
+      <div class="section-title">${esc(kind.replace(/_/g, ' '))} (${byKind[kind].length})</div>
+      <div class="mod-scroll">
+        <table class="mod-unit-table">
+          <thead><tr><th>File</th><th>Line</th><th>What</th><th>In the source</th><th>Found by</th></tr></thead>
+          <tbody>${byKind[kind].map(e => `<tr>
+            <td class="mod-unit-path">${e.unit_id
+                ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(e.unit_id)}')">${esc(e.path)}</span>`
+                : esc(e.path)}</td>
+            <td>${e.line || ''}</td>
+            <td>${esc(e.value || '')}</td>
+            <td>${e.snippet ? `<code class="mod-snippet">${esc(e.snippet)}</code>` : ''}</td>
+            <td class="mod-meta">${esc(e.source || '')}${(e.confidence !== null && e.confidence !== undefined && e.confidence < 1)
+                ? ` · ${Math.round(e.confidence * 100)}% sure` : ''}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>`).join('')
+      : '<div class="mod-meta" style="margin-top:10px">The parsers recorded nothing for this codebase. That is itself worth knowing before approving an assessment: no entry point, route or data access was recognised, so the architect will be working from the file inventory alone.</div>'}
+  </div>`;
+}
+
+// ── Redactions ─────────────────────────────────────────────────────────────
+
+function renderModernizationRedactions(data) {
+  const rows = (data && data.redactions) || [];
+  const byCategory = (data && data.by_category) || {};
+  const cats = Object.keys(byCategory).sort();
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Secrets masked at ingest (${(data && data.count) || rows.length})</div>
+    <p class="subtitle" style="margin-top:-6px">Removed from the source <em>before</em> any model saw it, so the value never entered this system and is not stored here either. Each row is a configuration key somebody has to supply in the converted application — the same list ships inside the export.</p>
+    ${cats.length ? `<div class="chip-row">${cats.map(k =>
+      `<span class="compliance-chip">${esc(k.replace(/_/g, ' '))} · ${byCategory[k]}</span>`).join('')}</div>` : ''}
+    ${rows.length ? `<div class="mod-scroll">
+      <table class="mod-unit-table">
+        <thead><tr><th>File</th><th>Line</th><th>Category</th></tr></thead>
+        <tbody>${rows.map(r => `<tr>
+          <td class="mod-unit-path">${esc(r.path)}</td>
+          <td>${r.line || ''}</td>
+          <td><span class="compliance-chip">${esc((r.category || 'unknown').replace(/_/g, ' '))}</span></td>
+        </tr>`).join('')}</tbody>
+      </table></div>`
+      : '<div class="mod-meta" style="margin-top:10px">Nothing was masked — the scanner found no credential literals in this codebase.</div>'}
+  </div>`;
+}
+
+// ── Symbol registry ────────────────────────────────────────────────────────
+
+function renderModernizationSymbols(data) {
+  const rows = (data && data.symbols) || [];
+  const byNamespace = {};
+  rows.forEach(s => {
+    const ns = s.namespace || '(no namespace)';
+    (byNamespace[ns] = byNamespace[ns] || []).push(s);
+  });
+  const namespaces = Object.keys(byNamespace).sort();
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Types the conversion has produced (${rows.length})</div>
+    <p class="subtitle" style="margin-top:-6px">This registry is what lets file 200 be consistent with file 40: each conversion call is told the name, signature and namespace of everything its dependencies already exported. Reading it is how you tell a type that exists from one a later file merely assumed.</p>
+    ${rows.length ? namespaces.map(ns => `
+      <div class="section-title">${esc(ns)} (${byNamespace[ns].length})</div>
+      <div class="mod-scroll">
+        <table class="mod-unit-table">
+          <thead><tr><th>Name</th><th>Kind</th><th>Signature</th><th>Lands in</th><th>From</th></tr></thead>
+          <tbody>${byNamespace[ns].map(s => `<tr>
+            <td class="mod-unit-path">${s.unit_id
+                ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(s.unit_id)}')">${esc(s.name)}</span>`
+                : esc(s.name)}</td>
+            <td>${esc(s.kind || '')}</td>
+            <td class="mod-unit-path">${esc(s.signature || '')}</td>
+            <td class="mod-unit-path">${esc(s.target_path || '')}</td>
+            <td class="mod-meta mod-unit-path">${esc(s.source_symbol || '')}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>`).join('')
+      : '<div class="mod-meta" style="margin-top:10px">Nothing has been registered yet — the registry fills as components convert.</div>'}
+  </div>`;
+}
+
+// ── Run timeline ───────────────────────────────────────────────────────────
+
+function renderModernizationEvents(data) {
+  // Newest first, exactly as the server returns it. This is the append-only log the run row
+  // is a summary of — "paused, budget cap" on the header, and here the tick that caused it.
+  const rows = (data && data.events) || [];
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Run timeline (${rows.length})</div>
+    <p class="subtitle" style="margin-top:-6px">Append-only, newest first. A status is a single word for a run that has been going for hours; this is what actually happened, including everything that was retried, reopened or refused.</p>
+    <div class="form-actions" style="margin-top:0">
+      <button class="btn btn-secondary btn-sm" onclick="reloadModernizationEvents()">Refresh</button>
+    </div>
+    ${rows.length ? `<div class="mod-scroll mod-timeline">
+      ${rows.map(e => `<div class="mod-event mod-event-${esc(e.level || 'info')}">
+        <span class="mod-event-when">${esc((e.created_at || '').replace('T', ' ').slice(0, 19))}</span>
+        <span class="mod-event-name">${esc((e.event || '').replace(/_/g, ' '))}</span>
+        <span class="mod-event-detail">${esc(e.detail || '')}</span>
+      </div>`).join('')}</div>`
+      : '<div class="mod-meta" style="margin-top:10px">No events recorded yet.</div>'}
+  </div>`;
+}
+
+function reloadModernizationEvents() {
+  // The only panel worth re-fetching by hand: everything else is settled once the stage that
+  // produced it has finished.
+  delete _modPanelCache.events;
+  showModernizationPanel('events', 'mod-events');
+}
+
+// ── The plan ───────────────────────────────────────────────────────────────
+
+function renderModernizationPlan(data) {
+  const plan = (data && data.plan) || null;
+  if (!plan) return '<div class="mod-panel">This run has no plan yet — it is raised once the target architecture has been designed.</div>';
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">The conversion plan</div>
+    <p class="subtitle" style="margin-top:-6px">Decided once, before any file was converted, and approved by a human at the second gate. Everything below binds every conversion call that followed.</p>
+    ${renderModernizationPlanBody(plan, data && data.estimate)}
+  </div>`;
+}
+
+// Shared by the plan panel and the plan gate, because they are the same document: the gate's
+// payload *is* the plan. Rendering them from two code paths is how a gate and the record of
+// what was approved start disagreeing.
+function renderModernizationPlanBody(plan, estimate) {
+  if (!plan) return '';
+  const totals = plan.totals || estimate || {};
+  const rows = plan.components || [];
+  const projects = plan.projects || [];
+  const risks = plan.risks || [];
+  const corrections = plan.corrections || [];
+  const byRisk = plan.by_risk || {};
+  const line = x => (typeof x === 'string' ? x : (x && (x.detail || x.message || x.name)) || JSON.stringify(x));
+  return `
+    ${plan.summary ? `<div class="summary-box" style="margin-top:8px">${esc(plan.summary)}</div>` : ''}
+    <div class="mod-meta">${rows.length} component(s) ·
+      estimated $${Number(totals.expected_usd || 0).toFixed(2)} ·
+      ceiling $${Number(totals.ceiling_usd || 0).toFixed(2)}${totals.price_is_estimated ? ' (indicative rates)' : ''}
+      ${(byRisk.high || byRisk.medium || byRisk.low)
+        ? ` · risk ${byRisk.high || 0} high / ${byRisk.medium || 0} medium / ${byRisk.low || 0} low` : ''}</div>
+    ${projects.length ? `<div class="section-title">Projects (${projects.length})</div>
+      <div class="mod-scroll"><table class="mod-unit-table">
+        <thead><tr><th>Project</th><th>Why it exists</th><th>References</th></tr></thead>
+        <tbody>${projects.map(p => (typeof p === 'string'
+          ? `<tr><td class="mod-unit-path">${esc(p)}</td><td></td><td></td></tr>`
+          : `<tr>
+              <td class="mod-unit-path">${esc(p.name || '')}</td>
+              <td>${esc(p.purpose || '')}</td>
+              <td class="mod-meta mod-unit-path">${esc((p.depends_on || []).join(', '))}</td>
+            </tr>`)).join('')}</tbody>
+      </table></div>` : ''}
+    ${risks.length ? `<div class="section-title">Risks the architect stated (${risks.length})</div>
+      ${risks.map(r => `<div class="mod-alert" style="margin-bottom:6px">${esc(line(r))}</div>`).join('')}` : ''}
+    ${corrections.length ? `<div class="section-title">Corrections applied to the proposed layout (${corrections.length})</div>
+      <p class="subtitle" style="margin-top:-6px">The architect's answer was not taken as given. These are the places it was overruled deterministically.</p>
+      <ul class="mod-list">${corrections.map(x => `<li>${esc(line(x))}</li>`).join('')}</ul>` : ''}
+    ${rows.length ? `<div class="section-title">Components (${rows.length})</div>
+      <div class="mod-scroll"><table class="mod-unit-table">
+        <thead><tr><th>Level</th><th>Component</th><th>Project</th><th>Namespace</th><th>Directory</th><th>Files</th><th>LOC</th><th>Risk</th><th>Est.</th></tr></thead>
+        <tbody>${rows.map(r => `<tr>
+          <td>${r.level === undefined || r.level === null ? '' : r.level}</td>
+          <td class="mod-unit-path">${esc(r.component)}</td>
+          <td>${esc(r.project || '')}</td>
+          <td class="mod-unit-path">${esc(r.namespace || '')}</td>
+          <td class="mod-unit-path">${esc(r.output_dir || '')}</td>
+          <td>${r.files || 0}</td>
+          <td>${r.loc || 0}</td>
+          <td><span class="compliance-chip">${esc(r.risk || '')}</span></td>
+          <td>$${Number(r.est_cost_usd || 0).toFixed(3)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>` : ''}`;
+}
+
+// ── One unit, and what it became ───────────────────────────────────────────
+
+async function showModernizationUnit(unitId, withSource) {
+  if (!unitId || !_modRunId) return;
+  const box = document.getElementById('mod-unit');
+  if (!box) return;
+  if (withSource !== undefined) _modUnitSource = !!withSource;
+  const fresh = _modUnitId !== unitId;
+  _modUnitId = unitId;
+  const key = `${unitId}|${_modUnitSource ? 1 : 0}`;
+  if (_modUnitCache[key]) {
+    box.innerHTML = renderModernizationUnit(_modUnitCache[key], _modUnitSource);
+    if (fresh && box.scrollIntoView) box.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+  box.innerHTML = '<div class="mod-panel">Loading this unit…</div>';
+  try {
+    const data = await apiFetch(
+      `/api/v1/modernization/runs/${_modRunId}/units/${unitId}?include_source=${_modUnitSource}`,
+      { _silent: true });
+    _modUnitCache[key] = data;
+    const live = document.getElementById('mod-unit');
+    if (!live) return;
+    live.innerHTML = renderModernizationUnit(data, _modUnitSource);
+    if (fresh && live.scrollIntoView) live.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    const live = document.getElementById('mod-unit');
+    if (live) live.innerHTML = `<div class="mod-panel">Could not load that file: ${esc(e.message)}</div>`;
+  }
+}
+
+function toggleModernizationUnitSource() {
+  if (_modUnitId) showModernizationUnit(_modUnitId, !_modUnitSource);
+}
+
+function closeModernizationUnit() {
+  _modUnitId = null;
+  _modUnitSource = false;
+  const box = document.getElementById('mod-unit');
+  if (box) box.innerHTML = '';
+}
+
+// Source and converted output are both whole files. Clipped rather than paged: the point of
+// this panel is "does the output look like the input", which the first few hundred lines
+// answer, and holding a 500-file codebase in the DOM answers nothing at all.
+const MOD_TEXT_CLIP = 20000;
+function _modClip(text) {
+  const s = String(text || '');
+  return s.length > MOD_TEXT_CLIP
+    ? `${s.slice(0, MOD_TEXT_CLIP)}\n\n… clipped: ${s.length - MOD_TEXT_CLIP} more character(s). Download the export for the whole file.`
+    : s;
+}
+
+function renderModernizationUnit(data, withSource) {
+  const u = (data && data.unit) || {};
+  const artifacts = (data && data.artifacts) || [];
+  const meta = u.meta || {};
+  const members = meta.members || [];
+  const expected = meta.expected_files || [];
+  const pathList = (label, list) => (list && list.length
+    ? `<div class="mod-meta">${esc(label)} (${list.length}): ${list.map(
+        x => `<code class="mod-unit-path">${esc(x)}</code>`).join(' ')}</div>`
+    : '');
+  return `<div class="mod-panel mod-unit-panel">
+    <div class="mod-run-head">
+      <div class="section-title" style="margin:0">${esc(u.component_name || u.path || 'Unit')}</div>
+      <span class="mod-status ${esc(u.status || '')}">${esc(modUnitStatusLabel(u.status))}</span>
+      ${u.kind ? `<span class="compliance-chip">${esc(u.kind.replace(/_/g, ' '))}</span>` : ''}
+      ${u.needs_human_review ? '<span class="compliance-chip">review</span>' : ''}
+      <button class="btn btn-link btn-sm" onclick="closeModernizationUnit()">Close</button>
+    </div>
+    <div class="mod-meta mod-unit-path">${esc(u.path || '')}</div>
+    <div class="mod-meta">level ${u.topo_level === undefined || u.topo_level === null ? '—' : u.topo_level}
+      ${u.language ? ` · ${esc(u.language)}` : ''}${u.module_type ? ` · ${esc(u.module_type)}` : ''}
+      ${u.loc ? ` · ${u.loc} LOC` : ''}${u.risk ? ` · ${esc(u.risk)} risk` : ''}
+      ${u.attempts ? ` · ${u.attempts} attempt(s)` : ''}
+      ${u.rework_attempts ? ` · ${u.rework_attempts} rework attempt(s)` : ''}
+      ${u.target_namespace ? ` · ${esc(u.target_namespace)}` : ''}
+      ${u.actual_cost_usd ? ` · $${Number(u.actual_cost_usd).toFixed(4)} spent`
+        : (u.est_cost_usd ? ` · est. $${Number(u.est_cost_usd).toFixed(4)}` : '')}</div>
+    ${meta.rationale ? `<div class="mod-meta">${esc(meta.rationale)}</div>` : ''}
+    ${u.error ? `<div class="mod-alert" style="margin-top:10px">${esc(u.error.error || u.error.message || JSON.stringify(u.error))}</div>` : ''}
+    ${pathList('Source files rolled up into this component', members)}
+    ${pathList('Depends on', u.depends_on)}
+    ${pathList('Needed by', u.dependents)}
+    ${pathList('Output files promised by the plan', expected)}
+    <div class="form-actions" style="margin-top:10px">
+      <button class="btn btn-secondary btn-sm" onclick="toggleModernizationUnitSource()">${withSource ? 'Hide' : 'Show'} original source</button>
+    </div>
+    ${withSource ? (u.source_text
+      ? `<div class="section-title">Original source</div>
+         <pre class="mod-source">${esc(_modClip(u.source_text))}</pre>`
+      : '<div class="mod-meta" style="margin-top:8px">No source is stored against this row — components and stage rows carry their members’ source, not their own.</div>') : ''}
+    ${artifacts.length ? `<div class="section-title">Converted output (${artifacts.length} file(s))</div>
+      ${artifacts.map(a => `<details class="mod-artifact">
+        <summary><span class="mod-unit-path">${esc(a.path)}</span>
+          <span class="mod-meta">v${a.version || 1}${a.purpose ? ` · ${esc(a.purpose)}` : ''}${a.is_current ? '' : ' · superseded'}</span></summary>
+        <pre class="mod-source">${esc(_modClip(a.content))}</pre>
+      </details>`).join('')}`
+      : '<div class="mod-meta" style="margin-top:10px">Nothing has been written for this unit yet.</div>'}
+  </div>`;
+}
+
+// ── Dependency graph ───────────────────────────────────────────────────────
+//
+// The single most explanatory thing the pipeline produces, and it was invisible: the tables
+// carry `topo_level` and a dependency *count*, which proves an order exists without ever
+// showing it. Drawn as inline SVG, laid out by level — there is no build step and no CDN here,
+// so a layout library is not an option, and none is needed: a topological level IS an x
+// coordinate. That is the whole layout.
+//
+// Component mode projects the *file* edges through each component's `members` rather than
+// reading the component rows' own `depends_on`. Those name synthetic `#component/NNNN-slug`
+// paths which `GET /components` does not return (it returns `name`), so matching them in the
+// browser would mean re-implementing the server's slugify and silently dropping every edge it
+// got wrong. Projecting cannot be wrong: it is the same operation `architecture.py` performs.
+const MOD_GRAPH_MAX_NODES = 160;
+const MOD_GRAPH_MAX_EDGES = 600;
+const MOD_GRAPH_NODE_W = 210;
+const MOD_GRAPH_NODE_H = 26;
+const MOD_GRAPH_V_GAP = 10;
+const MOD_GRAPH_COL_GAP = 74;
+const MOD_GRAPH_PAD = 22;
+const MOD_GRAPH_HEAD = 18;
+
+function modBaseName(path) { return String(path || '').split('/').pop() || String(path || ''); }
+
+// Capped so the name and the role beside it cannot overlap inside a 210px box — the full
+// value is on the node's <title>, which is where a hover reads it.
+function modClipLabel(text, max) {
+  const s = String(text || '');
+  const cap = max || 20;
+  return s.length > cap ? `${s.slice(0, cap - 1)}…` : s;
+}
+
+function modGraphModel(units, components, mode) {
+  const rows = units || [];
+  const comps = components || [];
+  if (mode === 'components' && comps.length) {
+    const compOf = {};
+    comps.forEach(c => (c.members || []).forEach(m => { compOf[m] = c.id; }));
+    const nodes = comps.map(c => ({
+      key: c.id, id: c.id, label: c.name || c.id,
+      title: `${c.name || ''} — ${(c.members || []).length} file(s) → ${c.output_dir || ''}`,
+      sub: c.project || '', level: c.topo_level || 0, status: c.status || '',
+    }));
+    const known = new Set(nodes.map(n => n.key));
+    const seen = new Set();
+    const edges = [];
+    rows.forEach(u => (u.depends_on || []).forEach(dep => {
+      const from = compOf[dep];
+      const to = compOf[u.path];
+      if (!from || !to || from === to || !known.has(from) || !known.has(to)) return;
+      const k = `${from}\u0000${to}`;
+      if (seen.has(k)) return;
+      seen.add(k);
+      edges.push({ from, to });
+    }));
+    return { nodes, edges, mode: 'components' };
+  }
+  // A cycle is invisible in the drawing by construction: `graph.build` drops the intra-SCC
+  // edges, because nothing in a cycle could ever become `ready` otherwise (D-21). So the
+  // members are marked instead — otherwise the picture quietly claims an acyclic codebase.
+  const nodes = rows.map(u => ({
+    key: u.path, id: u.id, label: modBaseName(u.path),
+    title: u.path + ((u.scc_group !== null && u.scc_group !== undefined)
+      ? ` — in circular group ${u.scc_group}; the edges inside it were dropped so the run can order at all`
+      : ''),
+    sub: u.module_type || '', level: u.topo_level || 0, status: u.status || '',
+    cycle: u.scc_group !== null && u.scc_group !== undefined,
+  }));
+  const known = new Set(nodes.map(n => n.key));
+  const edges = [];
+  rows.forEach(u => (u.depends_on || []).forEach(dep => {
+    if (known.has(dep) && dep !== u.path) edges.push({ from: dep, to: u.path });
+  }));
+  return { nodes, edges, mode: 'files' };
+}
+
+function modGraphLayout(model) {
+  const levels = Array.from(new Set(model.nodes.map(n => n.level))).sort((a, b) => a - b);
+  const byLevel = {};
+  levels.forEach(l => { byLevel[l] = model.nodes.filter(n => n.level === l); });
+  const incoming = {};
+  model.edges.forEach(e => { (incoming[e.to] = incoming[e.to] || []).push(e.from); });
+
+  // One barycentre pass: order each column by the mean row of what it depends on in the
+  // columns already placed. Not crossing-minimal and not claiming to be — it is the cheapest
+  // thing that stops a 40-node graph looking like a ball of wool.
+  const rowOf = {};
+  const pos = {};
+  levels.forEach((lvl, col) => {
+    const column = byLevel[lvl];
+    column.forEach(n => {
+      const parents = (incoming[n.key] || []).map(k => rowOf[k]).filter(v => v !== undefined);
+      n.bary = parents.length ? parents.reduce((a, b) => a + b, 0) / parents.length : -1;
+    });
+    column.sort((a, b) => (a.bary - b.bary) || String(a.label).localeCompare(String(b.label)));
+    column.forEach((n, row) => {
+      rowOf[n.key] = row;
+      pos[n.key] = {
+        x: MOD_GRAPH_PAD + col * (MOD_GRAPH_NODE_W + MOD_GRAPH_COL_GAP),
+        y: MOD_GRAPH_PAD + MOD_GRAPH_HEAD + row * (MOD_GRAPH_NODE_H + MOD_GRAPH_V_GAP),
+      };
+    });
+  });
+  const cols = levels.length;
+  let maxRows = 1;
+  levels.forEach(l => { maxRows = Math.max(maxRows, byLevel[l].length); });
+  return {
+    levels, byLevel, pos,
+    width: MOD_GRAPH_PAD * 2 + cols * MOD_GRAPH_NODE_W + Math.max(0, cols - 1) * MOD_GRAPH_COL_GAP,
+    height: MOD_GRAPH_PAD * 2 + MOD_GRAPH_HEAD + maxRows * (MOD_GRAPH_NODE_H + MOD_GRAPH_V_GAP),
+  };
+}
+
+function renderModernizationGraph(units, components, mode) {
+  const comps = components || [];
+  const model = modGraphModel(units, comps, comps.length ? mode : 'files');
+  const head = `
+    <div class="section-title" style="margin-top:0">Dependency graph</div>
+    <p class="subtitle" style="margin-top:-6px">Left to right is conversion order. Everything in one column is independent of everything else in that column — that is what a topological level means, and it is the claim the whole run rests on. An arrow points from a dependency to the thing that needed it.</p>
+    <div class="chip-row">
+      <button type="button" class="mod-choice ${model.mode === 'files' ? 'selected' : ''}"
+              onclick="setModernizationGraphMode('files')">Files (${(units || []).length})</button>
+      ${comps.length ? `<button type="button" class="mod-choice ${model.mode === 'components' ? 'selected' : ''}"
+              onclick="setModernizationGraphMode('components')">Components (${comps.length})</button>` : ''}
+    </div>
+    <div class="mod-meta">${model.nodes.length} node(s) · ${model.edges.length} edge(s) ·
+      ${Array.from(new Set(model.nodes.map(n => n.level))).length} level(s)</div>`;
+
+  if (!model.nodes.length) {
+    return `<div class="mod-panel">${head}
+      <div class="mod-meta" style="margin-top:10px">Nothing to draw yet.</div></div>`;
+  }
+  if (model.nodes.length > MOD_GRAPH_MAX_NODES || model.edges.length > MOD_GRAPH_MAX_EDGES) {
+    return `<div class="mod-panel">${head}${modGraphSummary(model)}</div>`;
+  }
+
+  const L = modGraphLayout(model);
+  const edges = model.edges.map(e => {
+    const a = L.pos[e.from];
+    const b = L.pos[e.to];
+    if (!a || !b) return '';
+    const x1 = a.x + MOD_GRAPH_NODE_W;
+    const y1 = a.y + MOD_GRAPH_NODE_H / 2;
+    const x2 = b.x;
+    const y2 = b.y + MOD_GRAPH_NODE_H / 2;
+    const dx = Math.max(24, (x2 - x1) / 2);
+    return `<path class="mod-edge" d="M${x1} ${y1} C${x1 + dx} ${y1} ${x2 - dx} ${y2} ${x2} ${y2}"
+                  marker-end="url(#mod-arrow)" />`;
+  }).join('');
+  const heads = L.levels.map((lvl, col) => `<text class="mod-graph-level"
+      x="${MOD_GRAPH_PAD + col * (MOD_GRAPH_NODE_W + MOD_GRAPH_COL_GAP)}"
+      y="${MOD_GRAPH_PAD}">Level ${lvl} · ${L.byLevel[lvl].length}</text>`).join('');
+  const nodes = model.nodes.map(n => {
+    const p = L.pos[n.key];
+    return `<g class="mod-node-g"${n.id ? ` onclick="showModernizationUnit('${esc(n.id)}')"` : ''}>
+      <title>${esc(n.title)}</title>
+      <rect class="mod-node ${esc(n.status)}${n.cycle ? ' in-cycle' : ''}" x="${p.x}" y="${p.y}"
+            width="${MOD_GRAPH_NODE_W}" height="${MOD_GRAPH_NODE_H}" rx="4" />
+      <text class="mod-node-label" x="${p.x + 8}" y="${p.y + 17}">${esc(modClipLabel(n.label))}</text>
+      ${n.sub ? `<text class="mod-node-sub" x="${p.x + MOD_GRAPH_NODE_W - 8}" y="${p.y + 17}"
+            text-anchor="end">${esc(modClipLabel(n.sub, 9))}</text>` : ''}
+    </g>`;
+  }).join('');
+
+  return `<div class="mod-panel">${head}
+    <div class="mod-graph-wrap">
+      <svg class="mod-graph" width="${L.width}" height="${L.height}"
+           viewBox="0 0 ${L.width} ${L.height}" role="img" aria-label="Dependency graph">
+        <defs>
+          <marker id="mod-arrow" viewBox="0 0 8 8" refX="7" refY="4"
+                  markerWidth="7" markerHeight="7" orient="auto">
+            <path class="mod-edge-arrow" d="M0 0 L8 4 L0 8 z" />
+          </marker>
+        </defs>
+        ${heads}${edges}${nodes}
+      </svg>
+    </div>
+    <div class="mod-graph-legend">
+      <span><i class="mod-graph-swatch swatch-converted"></i>converted</span>
+      <span><i class="mod-graph-swatch swatch-in_progress"></i>converting</span>
+      <span><i class="mod-graph-swatch swatch-needs_human"></i>needs review</span>
+      <span><i class="mod-graph-swatch swatch-failed"></i>failed</span>
+      <span><i class="mod-graph-swatch swatch-blocked"></i>waiting on a dependency</span>
+      <span><i class="mod-graph-swatch swatch-cycle"></i>in a circular group — its edges inside that group were dropped</span>
+      <span>Click any node to read what it became.</span>
+    </div>
+  </div>`;
+}
+
+function modGraphSummary(model) {
+  // Past a couple of hundred nodes a drawn graph is a picture of a ball of wool: it stops
+  // answering the question it exists for. Summarise instead — the levels are still the useful
+  // fact, and so is which nodes everything else is waiting on.
+  const levels = Array.from(new Set(model.nodes.map(n => n.level))).sort((a, b) => a - b);
+  const neededBy = {};
+  const dependsOn = {};
+  model.edges.forEach(e => {
+    neededBy[e.from] = (neededBy[e.from] || 0) + 1;
+    dependsOn[e.to] = (dependsOn[e.to] || 0) + 1;
+  });
+  const label = {};
+  model.nodes.forEach(n => { label[n.key] = n.label; });
+  const hubs = Object.keys(neededBy).sort((a, b) => neededBy[b] - neededBy[a]).slice(0, 15);
+  return `
+    <div class="mod-alert" style="margin-top:10px">Too large to draw legibly
+      (${model.nodes.length} nodes, ${model.edges.length} edges), so here is what it says
+      instead. Everything in a level converts without waiting on anything else in that level.</div>
+    <div class="mod-scroll"><table class="mod-unit-table">
+      <thead><tr><th>Level</th><th>Nodes</th><th>Some of them</th></tr></thead>
+      <tbody>${levels.map(l => {
+        const inLevel = model.nodes.filter(n => n.level === l);
+        return `<tr><td>${l}</td><td>${inLevel.length}</td>
+          <td class="mod-meta mod-unit-path">${esc(inLevel.slice(0, 6).map(n => n.label).join(', '))}${
+            inLevel.length > 6 ? ` …and ${inLevel.length - 6} more` : ''}</td></tr>`;
+      }).join('')}</tbody>
+    </table></div>
+    ${hubs.length ? `<div class="section-title">Everything is waiting on these</div>
+      <div class="mod-scroll"><table class="mod-unit-table">
+        <thead><tr><th>Node</th><th>Needed by</th><th>Depends on</th></tr></thead>
+        <tbody>${hubs.map(k => `<tr>
+          <td class="mod-unit-path">${esc(label[k] || k)}</td>
+          <td>${neededBy[k] || 0}</td><td>${dependsOn[k] || 0}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>` : ''}`;
+}
+
+function toggleModernizationGraph() {
+  _modShowGraph = !_modShowGraph;
+  _modPaintGraph();
+  _modPaintInspect();
+}
+
+function setModernizationGraphMode(mode) {
+  _modGraphMode = mode;
+  _modShowGraph = true;
+  _modPaintGraph();
+  _modPaintInspect();
+}
+
+function _modPaintGraph() {
+  const box = document.getElementById('mod-graph');
+  if (!box) return;
+  box.innerHTML = _modShowGraph
+    ? renderModernizationGraph(_modLastUnits, _modLastComponents, _modGraphMode) : '';
+}
+
+// `blocked` is the *default* state of every unit — a unit becomes `ready` only once everything
+// it depends on is converted, which is what makes the topological order real rather than
+// advisory. Rendering the internal name meant a run that had not started yet showed every file
+// as BLOCKED, which reads as an error and sent at least one person looking for the fault.
+// `rolled_up` has the same problem in reverse: it sounds like nothing happened, when it means
+// the file was absorbed into a component that is doing the work.
+const MOD_UNIT_STATUS_LABELS = {
+  blocked: 'waiting',
+  in_progress: 'converting',
+  needs_human: 'needs review',
+  rolled_up: 'in a component',
+};
+
+function modUnitStatusLabel(status) {
+  return MOD_UNIT_STATUS_LABELS[status] || status || '';
 }
 
 function renderModernizationUnits(units) {
@@ -5695,6 +6946,7 @@ function renderModernizationUnits(units) {
   // can convert without waiting for anything else at that level.
   return `<div class="mod-panel">
     <div class="section-title" style="margin-top:0">Files (${units.length}), in conversion order</div>
+    <p class="subtitle" style="margin-top:-6px">Click any path to read the original source beside what it was converted into.</p>
     <div style="max-height:460px;overflow:auto">
       <table class="mod-unit-table">
         <thead><tr><th>#</th><th>Level</th><th>File</th><th>Role</th><th>Deps</th><th>Status</th></tr></thead>
@@ -5702,10 +6954,12 @@ function renderModernizationUnits(units) {
         ${units.map(x => `<tr>
           <td>${x.order_index}</td>
           <td>${x.topo_level}</td>
-          <td class="mod-unit-path">${esc(x.path)}${(x.scc_group !== null && x.scc_group !== undefined) ? ' <span class="compliance-chip">cycle</span>' : ''}</td>
+          <td class="mod-unit-path">${x.id
+            ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(x.id)}')">${esc(x.path)}</span>`
+            : esc(x.path)}${(x.scc_group !== null && x.scc_group !== undefined) ? ' <span class="compliance-chip">cycle</span>' : ''}</td>
           <td>${esc(x.module_type || '')}</td>
           <td>${(x.depends_on || []).length}</td>
-          <td><span class="mod-status ${esc(x.status)}">${esc(x.status)}</span>${x.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
+          <td><span class="mod-status ${esc(x.status)}">${esc(modUnitStatusLabel(x.status))}</span>${x.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
         </tr>`).join('')}
         </tbody>
       </table>
@@ -5714,29 +6968,110 @@ function renderModernizationUnits(units) {
 }
 
 function renderCharterForm(run) {
-  // Field definitions come from the server so this form cannot drift from what
-  // `charter.validate()` actually enforces — a screen missing a required field would
-  // produce runs rejected at submit for no visible reason.
-  if (!_modCharterFields) {
-    apiFetch('/api/v1/modernization/charter-fields', { _silent: true })
-      .then(d => { _modCharterFields = d.fields; refreshModernizationRun(); })
-      .catch(() => {});
-    return '<div class="mod-panel">Loading the charter form…</div>';
+  // The per-run suggestions carry the field definitions too, and those come from the server so
+  // the form cannot drift from what `charter.validate()` enforces — a screen missing a required
+  // field would produce runs rejected at submit for no visible reason.
+  //
+  // Suggestions are per run and are NOT cached across runs: they are derived from one specific
+  // codebase's evidence, and serving one run's answers on another run's form would be worse
+  // than serving none.
+  if (_modCharterSuggestions.runId !== run.id) {
+    if (!_modCharterSuggestions.loading) {
+      _modCharterSuggestions.loading = true;
+      apiFetch(`/api/v1/modernization/runs/${run.id}/charter-suggestions`, { _silent: true })
+        .then(d => {
+          _modCharterSuggestions = { runId: run.id, fields: d.fields || [], loading: false,
+                                    prefilled: false };
+          refreshModernizationRun();
+        })
+        .catch(() => {
+          // Falling back to the plain schema is the right failure: an empty form the user can
+          // still fill in beats a screen that only says something went wrong.
+          apiFetch('/api/v1/modernization/charter-fields', { _silent: true })
+            .then(d => {
+              _modCharterSuggestions = {
+                runId: run.id, loading: false, prefilled: true,
+                fields: (d.fields || []).map(f => ({ ...f, emphasis: f.required ? 'required' : 'optional', options: [] })),
+              };
+              refreshModernizationRun();
+            })
+            .catch(() => { _modCharterSuggestions.loading = false; });
+        });
+    }
+    return '<div class="mod-panel">Reading the codebase to suggest answers…</div>';
   }
+
+  const fields = _modCharterSuggestions.fields;
+  _modCharterFields = fields;          // what saveModernizationCharter() iterates
+  const groups = [
+    ['required', 'Required', 'Every file is converted against these. A run cannot start without them.'],
+    ['recommended', 'Recommended for this codebase', 'Optional in general — but the parsers found the thing each one is about, so leaving it blank means the model decides per file.'],
+    ['optional', 'Optional', 'Sensible defaults apply if you leave these alone.'],
+  ];
+
   return `<div class="mod-panel">
     <div class="section-title" style="margin-top:0">Conversion charter</div>
-    <p class="subtitle" style="margin-top:-6px">Decided once, applied to every file. This is what stops file 1 using EF Core and file 90 using raw ADO.NET — the inconsistency nothing could detect before, because nothing compared them.</p>
-    <div class="mod-charter-grid">
-      ${_modCharterFields.map(f => `
-        <div class="form-group">
-          <label>${esc(f.label)}${f.required ? ' <span class="required">*</span>' : ''}</label>
-          <textarea id="charter-${esc(f.key)}" rows="2" placeholder="${esc(f.help)}">${esc(f.key === 'target_stack' ? (run.target_stack || '') : '')}</textarea>
-        </div>`).join('')}
-    </div>
+    <p class="subtitle" style="margin-top:-6px">Decided once, applied to every file. This is what stops file 1 using EF Core and file 90 using raw ADO.NET — the inconsistency nothing could detect before, because nothing compared them. The answers below were derived from your codebase, not from a template: each one shows what it was derived from. Change any of them.</p>
+    ${groups.map(([key, title, blurb]) => {
+      const inGroup = fields.filter(f => (f.emphasis || 'optional') === key);
+      if (!inGroup.length) return '';
+      return `
+        <details class="mod-charter-group" ${key === 'optional' ? '' : 'open'}>
+          <summary><strong>${esc(title)}</strong> <span class="mod-meta">${inGroup.length} — ${esc(blurb)}</span></summary>
+          <div class="mod-charter-grid">
+            ${inGroup.map(f => renderCharterField(f)).join('')}
+          </div>
+        </details>`;
+    }).join('')}
     <div class="form-actions">
       <button class="btn btn-primary" onclick="saveModernizationCharter()">Save charter and review the plan</button>
+      <button class="btn btn-secondary" onclick="resetCharterToSuggested()">Reset to suggested</button>
     </div>
+    <div class="field-hint">Nothing has been billed yet. Saving this raises an approval showing what the assessment will cost, before it runs.</div>
   </div>`;
+}
+
+function renderCharterField(f) {
+  const options = f.options || [];
+  // options[0] is the recommended one when there is one — the server sorts it first, which the
+  // smoke suite asserts, so pre-filling never has to search for it.
+  const initial = (options[0] && options[0].recommended) ? options[0].value : '';
+  return `
+    <div class="form-group">
+      <label>${esc(f.label)}${f.required ? ' <span class="required">*</span>' : ''}</label>
+      <div class="field-hint" style="margin-top:-4px">${esc(f.help || '')}</div>
+      ${options.length ? `<div class="chip-row">
+        ${options.map((o, i) => `<button type="button" class="mod-choice ${i === 0 && o.recommended ? 'selected' : ''}"
+            data-charter-key="${esc(f.key)}" data-charter-index="${i}"
+            onclick="pickCharterOption('${esc(f.key)}', ${i})"
+            title="${esc(o.why || '')}">${esc(o.label)}${o.recommended ? ' ★' : ''}</button>`).join('')}
+      </div>` : ''}
+      <textarea id="charter-${esc(f.key)}" rows="3"
+                data-rendered="${esc(initial)}">${esc(initial)}</textarea>
+      ${options.length ? `<div class="field-hint mod-choice-why" id="why-${esc(f.key)}">${esc(options[0].why || '')}</div>` : ''}
+    </div>`;
+}
+
+// Which option each field's chips came from, so a click can find its value and its `why`
+// without a second fetch or a lookup by text.
+function pickCharterOption(key, index) {
+  const field = (_modCharterSuggestions.fields || []).find(f => f.key === key);
+  const option = field && (field.options || [])[index];
+  if (!option) return;
+  const box = document.getElementById('charter-' + key);
+  if (box) box.value = option.value;
+  const why = document.getElementById('why-' + key);
+  if (why) why.textContent = option.why || '';
+  document.querySelectorAll(`[data-charter-key="${key}"]`).forEach(el => {
+    el.classList.toggle('selected', el.dataset.charterIndex === String(index));
+  });
+}
+
+function resetCharterToSuggested() {
+  (_modCharterSuggestions.fields || []).forEach(f => {
+    const options = f.options || [];
+    if (options[0] && options[0].recommended) pickCharterOption(f.key, 0);
+  });
 }
 
 async function saveModernizationCharter() {
@@ -5750,6 +7085,14 @@ async function saveModernizationCharter() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ charter }),
+    });
+    // The server now holds exactly what these boxes contain, so the form is no longer
+    // "unsaved" — re-baseline `data-rendered` before refreshing. Without this the dirty
+    // guard that protects unsaved edits (C-54) never releases: the repaint after a
+    // successful save is skipped, the charter form stays on screen as though nothing
+    // happened, and the only way forward is a manual reload.
+    document.querySelectorAll('#mod-detail textarea[id^="charter-"]').forEach(el => {
+      el.dataset.rendered = el.value;
     });
     await refreshModernizationRun();
   } catch (e) {

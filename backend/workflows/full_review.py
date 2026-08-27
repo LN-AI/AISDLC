@@ -29,6 +29,11 @@ from backend.workflows.shared import calculate_overall_risk
 
 WORKFLOW_ID = "full"
 
+# How many earlier findings to carry forward into the next stage's context, highest
+# severity first. Enough for a later reviewer to notice a pattern; small enough that it
+# stays a hint rather than a second artifact competing with the one under review.
+_CARRY_FORWARD_LIMIT = 12
+
 # Every step this workflow can ever run, in order. `plan_steps` decides which of them will
 # for a given request; the result reports the rest as "not run" so a caller can tell a
 # clean review from an unasked question.
@@ -111,18 +116,61 @@ def run(
         review_results.append(result)
         all_findings.extend(result.get("findings", []))
 
+    def _stage_context() -> str:
+        """The caller's context, plus what earlier stages of *this* review already found.
+
+        Until this existed, every stage got the same caller-typed string and its own
+        artifact, and no stage ever saw another's output — the eight agents met for the
+        first time at the release gate. That makes `full` a batch of independent reviews
+        wearing one name: the requirement reviewer's finding that an acceptance criterion
+        is untestable never reached the code reviewer, who could have looked for it.
+
+        A digest, not the findings themselves: the later stage is still reviewing its own
+        artifact, and a full finding list would compete with it for attention (and for
+        input budget on a large run). Highest severity first, capped, and explicitly
+        labelled as another agent's output so a reviewer weighs it as a lead rather than
+        as a fact about the code in front of it.
+
+        Safe for the prompt cache: context travels in the user message, after the cache
+        breakpoint, which sits on the system block only (D-06).
+        """
+        ranked = sorted(
+            (
+                (r.get("source", "?"), f)
+                for r in review_results
+                for f in r.get("findings", [])
+            ),
+            key=lambda pair: pair[1].get("severity", 0),
+            reverse=True,
+        )[:_CARRY_FORWARD_LIMIT]
+        if not ranked:
+            return context
+        lines = "\n".join(
+            f"- [{source}] severity {f.get('severity', '?')}: {f.get('title', '')}".rstrip()
+            for source, f in ranked
+        )
+        return (
+            f"{context}\n\n"
+            "EARLIER STAGES OF THIS SAME REVIEW REPORTED THE FOLLOWING. They concern other "
+            "artifacts of the same system and are another agent's conclusions, not verified "
+            "fact. Use them as leads — say so if what you are reviewing confirms, "
+            "contradicts, or is unaffected by them. Do not restate them as your own "
+            "findings.\n"
+            f"{lines}"
+        ).strip()
+
     # Each stage is gated on `will_run`, not on its own re-derived condition, so the plan
     # reported to the progress bar and the budget reservation cannot disagree with what
     # actually executes.
     if "Requirement Review" in will_run:
         progress.step("Requirement Review")
-        _collect(orch.req_agent.review_requirement(requirement, context), "requirement")
+        _collect(orch.req_agent.review_requirement(requirement, _stage_context()), "requirement")
 
     if "Compliance Mapping" in will_run:
         progress.step("Compliance Mapping")
         # The only sub-step that does its own KB lookup — compliance findings lean
         # heavily on org-specific framework mappings.
-        compliance_context = orch._kb("compliance", context, compliance_artifact, project_name)
+        compliance_context = orch._kb("compliance", _stage_context(), compliance_artifact, project_name)
         _collect(
             orch.compliance_agent.map_compliance(compliance_artifact, context=compliance_context),
             "compliance",
@@ -131,29 +179,29 @@ def run(
     if "Architecture Review" in will_run:
         progress.step("Architecture Review")
         _collect(
-            orch.arch_agent.run_architecture_review(architecture, context, project_name=project_name),
+            orch.arch_agent.run_architecture_review(architecture, _stage_context(), project_name=project_name),
             "architecture",
         )
 
     if "Security Review (STRIDE)" in will_run:
         progress.step("Security Review (STRIDE)")
         _collect(
-            orch.security_agent.run_security_review(architecture, context=context),
+            orch.security_agent.run_security_review(architecture, context=_stage_context()),
             "security",
         )
 
     if "Code Review" in will_run:
         progress.step("Code Review")
-        _collect(orch.code_agent.review_code(code, context=context), "code")
+        _collect(orch.code_agent.review_code(code, context=_stage_context()), "code")
 
     if "VAPT Assessment" in will_run:
         progress.step("VAPT Assessment")
-        _collect(orch.vapt_agent.run_vapt(code, context=context), "vapt")
+        _collect(orch.vapt_agent.run_vapt(code, context=_stage_context()), "vapt")
 
     if "Sensitive Data Scan" in will_run:
         progress.step("Sensitive Data Scan")
         _collect(
-            orch.sensitive_agent.scan(code, context=context, project_name=project_name),
+            orch.sensitive_agent.scan(code, context=_stage_context(), project_name=project_name),
             "sensitive_data",
         )
 
@@ -165,7 +213,7 @@ def run(
                 user_prompt=prompt_config.get("user_prompt", ""),
                 tool_definitions=prompt_config.get("tool_definitions", ""),
                 rag_config=prompt_config.get("rag_config", ""),
-                context=context,
+                context=_stage_context(),
             ),
             "prompt",
         )
@@ -225,11 +273,17 @@ def run(
         },
     )
 
+    # A Red gate or a Critical finding has already put this review in the approval queue
+    # (`save_review`). Name it, so the caller can link the decision to the sign-off.
+    approval = database.get_pending_approval_for_review(review_id)
+
     return {
         "review_id": review_id,
         "report_id": report_id,
         "project_name": project_name,
         "gate_status": final_gate,
+        "approval_required": approval is not None,
+        "approval_id": (approval or {}).get("id"),
         "overall_risk_score": overall_risk,
         "total_findings": len(all_findings),
         "critical_count": sum(1 for f in all_findings if f.get("severity") == 5),
