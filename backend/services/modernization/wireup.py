@@ -1020,7 +1020,40 @@ FRAMEWORK_PROVIDED_PACKAGES = frozenset({
     "Microsoft.AspNetCore.Session",
     "Microsoft.AspNetCore.StaticFiles",
     "Microsoft.AspNetCore.WebUtilities",
+    # Added after a second live run hit the identical NU1102 on a name the first list did not
+    # carry (`Rewrite`). The list is curated, so it is necessarily incomplete — see the note
+    # below — and each of these is here because it has no 3.0+ release on nuget.org.
+    "Microsoft.AspNetCore.CookiePolicy",
+    "Microsoft.AspNetCore.HttpOverrides",
+    "Microsoft.AspNetCore.Localization",
+    "Microsoft.AspNetCore.Localization.Routing",
+    "Microsoft.AspNetCore.MiddlewareAnalysis",
+    "Microsoft.AspNetCore.Mvc.ApiExplorer",
+    "Microsoft.AspNetCore.Mvc.Cors",
+    "Microsoft.AspNetCore.Mvc.DataAnnotations",
+    "Microsoft.AspNetCore.Mvc.Formatters.Json",
+    "Microsoft.AspNetCore.Mvc.Formatters.Xml",
+    "Microsoft.AspNetCore.Mvc.Localization",
+    "Microsoft.AspNetCore.Owin",
+    "Microsoft.AspNetCore.ResponseCaching.Abstractions",
+    "Microsoft.AspNetCore.Rewrite",
+    "Microsoft.AspNetCore.Server.HttpSys",
+    "Microsoft.AspNetCore.Server.Kestrel.Https",
+    "Microsoft.AspNetCore.Server.Kestrel.Transport.Sockets",
+    "Microsoft.AspNetCore.WebSockets",
 })
+
+# **This list cannot be complete, and that is a known limitation rather than an oversight.**
+# It is memory about someone else's package feed, and the first two live runs each found a name
+# it did not carry — one build round each, and a `build_stuck` that reads as non-convergence
+# rather than as a missing entry. The durable fix is to stop remembering and start reading: a
+# build reports `NU1102: Unable to find package X with version (>= 8.0.0)` together with
+# `Nearest version: 2.3.12`, and a `Microsoft.AspNetCore.*` package whose newest release is 2.x
+# is, definitionally, one the shared framework absorbed. That is dispositive evidence and it
+# cannot be wrong about a package that does exist — but acting on it means threading the build's
+# own diagnostics into `apply_to_csproj`, which today takes none, and classifying `NU1102` as
+# actionable in `build_results._PROJECT_FILE_CODES`, where it is deliberately not. Until then,
+# a name missing here costs exactly one build round.
 
 
 def framework_provided(name: str) -> bool:

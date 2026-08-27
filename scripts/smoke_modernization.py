@@ -9696,14 +9696,26 @@ check("while a real package asked for is still added",
 # packages a net8.0 project must reference, and stripping one would trade a restore failure
 # for a compile failure — the same trade in the wrong direction.
 for _real in ("Microsoft.AspNetCore.Authentication.JwtBearer",
+              "Microsoft.AspNetCore.Authentication.Google",
+              "Microsoft.AspNetCore.SignalR.Client",
+              "Microsoft.AspNetCore.Mvc.Testing",
+              "Microsoft.AspNetCore.OpenApi",
+              "Microsoft.AspNetCore.SpaServices.Extensions",
               "Microsoft.AspNetCore.Authentication.OpenIdConnect",
               "Microsoft.AspNetCore.Identity.EntityFrameworkCore",
               "Microsoft.AspNetCore.Mvc.NewtonsoftJson",
               "Microsoft.AspNetCore.Diagnostics.EntityFrameworkCore"):
     check(f"{_real.rsplit('.', 1)[-1]} is a real package and is left alone",
           not wireup.framework_provided(_real))
+# `Rewrite` was not on the first version of this list, and a second live run hit the identical
+# NU1102 on it — one build round, and a `build_stuck` that reads as non-convergence rather
+# than as a missing entry. The list is memory about somebody else's package feed and cannot be
+# complete; the durable fix is to read the build's own "Nearest version: 2.3.12" instead, which
+# is noted beside the list.
 for _framework in ("Microsoft.AspNetCore.Authentication.Cookies", "Microsoft.AspNetCore.Mvc",
-                   "Microsoft.AspNetCore.Session", "Microsoft.AspNetCore.StaticFiles"):
+                   "Microsoft.AspNetCore.Session", "Microsoft.AspNetCore.StaticFiles",
+                   "Microsoft.AspNetCore.Rewrite", "Microsoft.AspNetCore.HttpOverrides",
+                   "Microsoft.AspNetCore.WebSockets", "Microsoft.AspNetCore.CookiePolicy"):
     check(f"{_framework.rsplit('.', 1)[-1]} comes from the framework and is stripped",
           wireup.framework_provided(_framework))
 
