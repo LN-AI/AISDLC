@@ -2,6 +2,37 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## How to explain your work
+
+Every answer, every proposal and every finding needs four things. Not as headings to fill in —
+as things the reader must not have to ask for.
+
+**1. Plain language first.** Lead with what happened and what it means for the user, in words
+that assume no knowledge of this codebase, of .NET, of PHP, or of the platform's own
+vocabulary. "The converted app compiles but crashes the moment you start it" before
+`AmbiguousMatchException`. Domain terms are fine *after* the plain sentence, never instead of
+it. If a term is unavoidable, define it once in passing.
+
+**2. The reasoning, not just the conclusion.** Say why this and not the alternative you
+considered. A recommendation with no visible reasoning cannot be disagreed with, which makes
+the user a rubber stamp rather than a decision maker — and they are the one who knows things
+you do not.
+
+**3. What could go wrong.** State the weaknesses of your own suggestion: what it does not
+cover, what it assumes, what evidence it rests on and how thin that evidence is (`n=1` is worth
+saying out loud). If you are choosing where to intervene in a chain of causes, say why that
+point and not one further upstream. A proposal presented without its downsides is a sales
+pitch.
+
+**4. How you intend to build it, briefly.** A few sentences of mechanism — which files, what
+shape, what the new thing does when it fails — before writing code. Enough that the user can
+stop you if the approach is wrong, and not so much that it is the code written twice.
+
+The same applies to explaining *findings*, not only proposals: lead with the consequence, then
+cite `file.py:line`. And never use the platform's own conventions as though they were common
+knowledge — a checkpoint, a gate, a unit, a seam and a component all mean something specific
+here and nothing anywhere else.
+
 ## Read `DECISIONS.md` first
 
 `DECISIONS.md` (repo root) is the durable memory across sessions: architectural decisions and

@@ -95,6 +95,34 @@ def feasible_repairs(point):
                                           r["id"]))
 
 
+def pick_layout(options, wanted):
+    """The layout option `--layout TEXT` asked for. `None` when TEXT matches nothing.
+
+    **How many projects the output has is decided at the charter and nowhere else.** The
+    advisor offers both a single-unit layout and a layered one on every run and marks one
+    recommended; for the PHP -> .NET pair that recommendation flips to layered above 40 source
+    files. This driver took option one for every field, so the 45-file run whose two unbuildable
+    crossings cost two conversions had its architecture chosen by a five-file margin, in
+    silence, and nothing in the transcript said so.
+
+    Matched against the option's *label* rather than a fixed vocabulary, because the options
+    come from the stack's own advisor and this driver has no business knowing what a .NET
+    project is called.
+
+    `None` rather than falling back to the default: converting into a layout somebody explicitly
+    asked not to have, without saying so, is the same class of silence as everything else this
+    driver has had to stop doing.
+    """
+    if not options:
+        return None
+    if not wanted:
+        return options[0]
+    for option in options:
+        if str(wanted).lower() in str(option.get("label") or "").lower():
+            return option
+    return None
+
+
 class Client:
     """Talks to the platform as whatever credential it was given.
 
@@ -196,6 +224,13 @@ def main():
                         help="Carry on past consistency findings that say the converted code "
                              "cannot work. Off by default: they are the difference between a "
                              "build that succeeds and an application that starts.")
+    parser.add_argument("--layout", default="", metavar="TEXT",
+                        help="Pick the charter's project layout by matching TEXT against the "
+                             "offered option labels, e.g. 'single' or 'layer'. Fewer projects "
+                             "means fewer boundaries a dependency can cross illegally, so this "
+                             "is the first thing to try when a run stalls on layout conflicts. "
+                             "Default: whichever option the advisor recommends, which for the "
+                             "PHP -> .NET pair is layered above 40 source files.")
     parser.add_argument("--repair", default="stop",
                         help="What to do when the plan gate offers layout repairs: 'stop' "
                              "(default — print them and let a human choose), 'best' (take the "
@@ -243,10 +278,28 @@ def main():
         # Deterministic suggestions, first option per field — what a user accepting the
         # defaults would send. Free: no model call happens behind this endpoint.
         _s, suggestions = client.call(f"{base}/charter-suggestions")
-        charter = {field["key"]: field["options"][0]["value"]
-                   for field in suggestions.get("fields", []) if field.get("options")}
+        charter, layout_label = {}, ""
+        for field in suggestions.get("fields", []):
+            options = field.get("options") or []
+            if not options:
+                continue
+            pick = options[0]
+            if field.get("key") == "project_layout":
+                pick = pick_layout(options, args.layout)
+                if pick is None:
+                    say(f"  !! --layout {args.layout!r} matches none of the offered layouts: "
+                        + "; ".join(str(o.get("label")) for o in options), log)
+                    return 2
+                layout_label = str(pick.get("label") or "")
+            charter[field["key"]] = pick["value"]
         status, _ = client.call(f"{base}/charter", "POST", {"charter": charter})
-        say(f"charter set ({status}) — {len(charter)} field(s)", log)
+        # Said out loud whether it was chosen or defaulted. How many projects the output has is
+        # decided here and nowhere else, the default flips to layered above 40 source files, and
+        # the 45-file run that produced two unbuildable crossings took that default without
+        # anybody seeing it happen — a five-file margin deciding the architecture in silence.
+        say(f"charter set ({status}) — {len(charter)} field(s); project layout: "
+            f"{layout_label or 'not offered'}"
+            + ("" if args.layout else " (the recommended one — pass --layout to change it)"), log)
 
     last, seen_event = None, 0
     deadline = time.time() + args.hours * 3600

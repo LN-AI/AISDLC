@@ -121,7 +121,9 @@ def _project_layout(observed: Dict[str, Any]) -> List[Option]:
               "holds its controller, its view models and its views together.",
         label="Single project, folder-per-feature",
         why=f"{count} source file(s). At this size layered projects add build ceremony without "
-            f"buying separation the codebase needs.",
+            f"buying separation the codebase needs. One project also cannot have a dependency "
+            f"pointing the wrong way, so the layering conflicts that stop a run at the plan "
+            f"gate cannot arise at all.",
         recommended=small,
     )
     layered = Option(
@@ -129,7 +131,11 @@ def _project_layout(observed: Dict[str, Any]) -> List[Option]:
               "inward only, with the Web project holding no data access.",
         label="Project per layer",
         why=f"{count} source file(s). Enforces a dependency direction at compile time, which is "
-            f"worth the extra projects once a codebase is large enough to drift.",
+            f"worth the extra projects once a codebase is large enough to drift. The cost, "
+            f"which is real: any dependency the source already has that points the wrong way "
+            f"through these layers has no legal expression and needs an interface seam. The "
+            f"plan gate names those before conversion and the run stops until each one is "
+            f"closed or accepted.",
         recommended=not small,
     )
     return [feature, layered] if small else [layered, feature]

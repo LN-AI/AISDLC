@@ -10732,6 +10732,72 @@ finally:
 
 
 
+section("74. How many projects, decided where a human can see it")
+
+# ── The question section 73 could not answer ───────────────────────────────
+#
+# Section 73 stops a run whose layout cannot be built. It does not ask the prior question: why
+# was that layout chosen? The answer is the charter, and only the charter — `project_layout` is
+# a required field, the advisor offers a single-unit option and a layered one on every run, and
+# `architect_agent` is told to follow whichever was picked exactly.
+#
+# For the PHP -> .NET pair the recommendation flips to layered above 40 source files. The
+# 45-file run whose two unbuildable crossings cost two conversions was five files over that
+# line, and nothing in its transcript said which layout had been taken or that there had been a
+# choice. A single project cannot have a dependency pointing the wrong way, so "try fewer
+# projects" is the cheapest possible answer to a run that stalls on layering — and it was
+# reachable only by knowing to look.
+
+_small = {o.label: o for o in advice.suggest(
+    ".NET 8", {"file_count": 12, "routes": ["/"]})["project_layout"]}
+_large = {o.label: o for o in advice.suggest(
+    ".NET 8", {"file_count": 45, "routes": ["/"]})["project_layout"]}
+
+check("both layouts are offered on a small codebase, not just the recommended one",
+      len(_small) == 2, str(sorted(_small)))
+check("and on a large one, so fewer projects is always available to pick",
+      len(_large) == 2, str(sorted(_large)))
+check("a small codebase is recommended the single project",
+      any(o.recommended and "Single" in label for label, o in _small.items()),
+      str([(l, o.recommended) for l, o in _small.items()]))
+check("a large one is recommended the layered split",
+      any(o.recommended and "layer" in label for label, o in _large.items()),
+      str([(l, o.recommended) for l, o in _large.items()]))
+check("the recommendation is the only thing that moves — the same two options are offered",
+      sorted(_small) == sorted(_large), str((sorted(_small), sorted(_large))))
+
+# A recommendation that states only its benefit is an argument, not a choice. Layering buys an
+# enforced dependency direction and costs an interface seam for every dependency already
+# pointing the other way — which is the thing that stopped both live runs, and was nowhere in
+# the text the person choosing had in front of them.
+_layered = next(o for label, o in _large.items() if "layer" in label)
+_single = next(o for label, o in _large.items() if "Single" in label)
+check("the layered option says what it costs, not only what it buys",
+      "seam" in _layered.why and "plan gate" in _layered.why, _layered.why)
+check("and the single-project option says why the problem cannot arise there",
+      "cannot" in _single.why and "wrong way" in _single.why, _single.why)
+
+# ── The driver can express the choice, and never makes it silently ─────────
+_opts = [{"label": "Project per layer", "value": "L"},
+         {"label": "Single project, folder-per-feature", "value": "S"}]
+check("with no --layout the recommended option is taken, exactly as before",
+      _driver.pick_layout(_opts, "")["value"] == "L")
+check("--layout single picks the single project even when it is not recommended",
+      _driver.pick_layout(_opts, "single")["value"] == "S")
+check("matching is case-insensitive and partial, so 'layer' is enough",
+      _driver.pick_layout(_opts, "LAYER")["value"] == "L")
+check("a --layout nobody offers returns nothing, so the driver stops rather than "
+      "converting into a layout somebody asked not to have",
+      _driver.pick_layout(_opts, "microservices") is None)
+check("and no options at all is not a crash",
+      _driver.pick_layout([], "single") is None and _driver.pick_layout([], "") is None)
+check("the driver's help says fewer projects is the first thing to try",
+      "Fewer projects" in (io.open(os.path.join(os.path.dirname(os.path.dirname(
+          os.path.abspath(__file__))), "scripts", "drive_modernization.py"),
+          encoding="utf-8").read()))
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

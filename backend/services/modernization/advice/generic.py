@@ -65,7 +65,9 @@ def _project_layout(observed: Dict[str, Any]) -> List[Option]:
         value="A single deployable unit, divided into one folder per feature. Each feature owns "
               "its entry points, its logic and its data access.",
         label="Single unit, folder-per-feature",
-        why=("Keeps related code together, which is how the source is already organised. "
+        why=("Keeps related code together, which is how the source is already organised, and "
+             "one unit cannot have a dependency pointing the wrong way — the layering "
+             "conflicts that stop a run at the plan gate cannot arise. "
              + _cite(observed, "file_count")).strip(),
         recommended=small,
     )
@@ -74,7 +76,10 @@ def _project_layout(observed: Dict[str, Any]) -> List[Option]:
               "infrastructure — with dependencies pointing inward only.",
         label="One module per layer",
         why="Enforces a dependency direction the source almost certainly does not have. Worth "
-            "the extra structure on a large codebase; overhead on a small one.",
+            "the extra structure on a large codebase; overhead on a small one. The cost is "
+            "that every dependency the source has which points the wrong way needs an "
+            "interface seam, and the plan gate stops the run until each one is closed or "
+            "accepted.",
         recommended=not small,
     )
     return [feature, layered] if small else [layered, feature]
