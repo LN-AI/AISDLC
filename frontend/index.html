@@ -1025,7 +1025,19 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
         </div>
 
         <div class="section-title">Runs</div>
-        <div id="mod-runs" class="result-area"></div>
+        <!--
+          Paged and height-capped. The list used to render every run this project had ever
+          created at full height, and the detail panel below it is the thing a reader came
+          for — so on a project with a history, opening a run scrolled the answer off screen.
+        -->
+        <div id="mod-runs" class="result-area mod-runs-scroll"></div>
+        <div id="mod-runs-pager" class="table-pager hidden">
+          <span id="mod-runs-range" class="pager-range"></span>
+          <div class="pager-buttons">
+            <button class="btn btn-secondary btn-sm" id="mod-runs-prev" onclick="pageModernizationRuns(-1)">← Newer</button>
+            <button class="btn btn-secondary btn-sm" id="mod-runs-next" onclick="pageModernizationRuns(1)">Older →</button>
+          </div>
+        </div>
 
         <div id="mod-detail" class="hidden"></div>
       </div>

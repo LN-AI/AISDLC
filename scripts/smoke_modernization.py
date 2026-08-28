@@ -10798,6 +10798,134 @@ check("the driver's help says fewer projects is the first thing to try",
 
 
 
+
+
+section("75. The dashboard can page the runs, and read what the run produced")
+
+# ── Paging ────────────────────────────────────────────────────────────────
+# The run list used to ask for every run the server would give it and render them all at full
+# height *above* the detail panel, so on a project with a history, opening a run scrolled its
+# own answer off screen. `total` is what makes a pager honest: without it a caller cannot tell
+# a last page from a page that happens to be short.
+# Bound to this project on purpose: `total` is scoped, so a run with no project is invisible
+# to this caller and would not be counted — which is the correct behaviour and makes for a
+# fixture that proves nothing.
+_page_runs = [store.create_run("page run %d" % i, ".NET 8", "files", created_by="smoke")
+              for i in range(7)]
+for _pr in _page_runs:
+    store.update_run(_pr, project_id=PROJECT_ID)
+_p1 = client.get("/api/v1/modernization/runs?limit=3&offset=0", headers=HDR).json()
+_p2 = client.get("/api/v1/modernization/runs?limit=3&offset=3", headers=HDR).json()
+check("the list reports a total, not only the rows it returned",
+      isinstance(_p1.get("total"), int) and _p1["total"] >= 7, str(_p1.get("total")))
+check("a page is the size it was asked for", len(_p1["runs"]) == 3, str(len(_p1["runs"])))
+check("the two pages carry the same total", _p1["total"] == _p2["total"])
+check("offset moves the window rather than repeating it",
+      not (set(r["id"] for r in _p1["runs"]) & set(r["id"] for r in _p2["runs"])))
+check("the echo says which window this is", _p2["limit"] == 3 and _p2["offset"] == 3, str(_p2))
+# Paging must not shuffle: a reader on page two who reloads has to see page two, not a
+# different three runs.
+_p2_again = client.get("/api/v1/modernization/runs?limit=3&offset=3", headers=HDR).json()
+check("paging is stable, so a reload does not move the reader",
+      [r["id"] for r in _p2_again["runs"]] == [r["id"] for r in _p2["runs"]])
+check("an offset past the end is an empty page, not an error",
+      client.get("/api/v1/modernization/runs?limit=3&offset=%d" % (_p1["total"] + 50),
+                 headers=HDR).json()["runs"] == [])
+# The scope contract is the subtle half: `None` is unrestricted, `[]` is "may see nothing", and
+# collapsing the two would hand every run to a caller entitled to none.
+check("count_runs honours the same scope rules as list_runs",
+      store.count_runs([]) == 0 and store.count_runs(None) >= 7,
+      "%s / %s" % (store.count_runs([]), store.count_runs(None)))
+check("a total never counts runs the caller may not see",
+      client.get("/api/v1/modernization/runs", headers=other_hdr).json()["total"] < _p1["total"],
+      "another team's total included this team's runs")
+
+# ── The artifact index ────────────────────────────────────────────────────
+# "Where do I see the converted code" took four steps and a guess, because the only ways to the
+# output were one unit at a time or downloading the zip. This is the listing that was missing,
+# and it deliberately carries no content: selecting it would materialise the whole converted
+# codebase to answer "which files exist".
+_art_run = store.create_run("artifact index", ".NET 8", "files", created_by="smoke")
+store.update_run(_art_run, project_id=PROJECT_ID)
+store.insert_units(_art_run, [{"path": "a.php", "depends_on": [], "order_index": 0,
+                               "topo_level": 0, "source_text": "<?php echo 1;"}])
+_art_unit = store.list_units(_art_run)[0]["id"]
+store.complete_unit(_art_unit, _art_run,
+                    artifacts=[{"path": "Shop.Web/Program.cs", "content": "var app = 1;",
+                                "purpose": "host"},
+                               {"path": "Shop.Data/Repo.cs", "content": "class Repo {}",
+                                "purpose": "repository"}],
+                    symbols=[])
+_idx = client.get("/api/v1/modernization/runs/%s/artifacts" % _art_run, headers=HDR).json()
+check("every file the run wrote is listed", _idx["count"] == 2, str(_idx["count"]))
+check("with the path and version a reader needs",
+      all(a.get("path") and a.get("version") for a in _idx["artifacts"]), str(_idx["artifacts"]))
+check("and a size, so a listing can say how big a file is without carrying it",
+      all(isinstance(a.get("size_chars"), int) and a["size_chars"] > 0
+          for a in _idx["artifacts"]), str(_idx["artifacts"]))
+check("the listing never carries the file content",
+      not any("content" in a for a in _idx["artifacts"]))
+check("it links back to the unit that wrote each file, which is how a row opens",
+      all(a.get("unit_id") == _art_unit for a in _idx["artifacts"]))
+check("the index is scoped like every other read",
+      client.get("/api/v1/modernization/runs/%s/artifacts" % _art_run,
+                 headers=other_hdr).status_code == 404)
+
+# ── The run report ────────────────────────────────────────────────────────
+# `_export_report` builds a real markdown document — headings, bold, pipe tables, bullet lists
+# — and it existed only inside the downloaded zip, so the one artifact that states plainly what
+# was skipped and what failed was the hardest thing here to read.
+_rep = client.get("/api/v1/modernization/runs/%s/report" % _art_run, headers=HDR).json()
+check("the report is served as markdown, not only inside the zip",
+      _rep["markdown"].startswith("# ") and _rep["filename"] == "MODERNIZATION_REPORT.md",
+      _rep["markdown"][:60])
+check("it carries the warning that nothing was compiled",
+      "not compiled" in _rep["markdown"])
+check("it is markdown a renderer can act on, not a flat wall of text",
+      "## " in _rep["markdown"] and "**" in _rep["markdown"])
+check("the report is scoped too",
+      client.get("/api/v1/modernization/runs/%s/report" % _art_run,
+                 headers=other_hdr).status_code == 404)
+
+# ── The reads that had no caller in the browser ───────────────────────────
+# Each of these was computed, stored and served, and reachable only through curl. Asserted as a
+# set because the defect was an omission from a list, not one wrong endpoint.
+for _path, _key in (("runtime", "summary"), ("startup-plan", "urls"),
+                    ("parity", "reports"), ("checkpoints", "checkpoints"),
+                    ("artifacts", "artifacts"), ("report", "markdown"),
+                    ("builds", "builds"), ("rules", "rules")):
+    _resp = client.get("/api/v1/modernization/runs/%s/%s" % (_art_run, _path), headers=HDR)
+    check("GET /%s answers, so the screen has something to render" % _path,
+          _resp.status_code == 200 and _key in _resp.json(),
+          "%s: %s" % (_resp.status_code, _resp.text[:120]))
+
+# `never_run` has to be sayable out loud: a run nobody started and a run that starts and serves
+# must never render the same, which they did for as long as nothing read this.
+_rt = client.get("/api/v1/modernization/runs/%s/runtime" % _art_run, headers=HDR).json()
+check("a run nobody started reports never_run rather than nothing",
+      _rt["summary"]["status"] == "never_run" and _rt["summary"]["started"] is False,
+      str(_rt["summary"]))
+check("and the manifest carries the same answer, which is what the badge reads",
+      client.get("/api/v1/modernization/runs/%s" % _art_run,
+                 headers=HDR).json()["runtime"]["status"] == "never_run")
+
+# The decision record: the browser only ever asked for `?status=open`, so every approval and
+# every waiver was stored and shown nowhere.
+_cp_id = store.create_checkpoint(_art_run, "build_required", "Nobody compiled this",
+                                 detail="Finish without compiling?")
+store.answer_checkpoint(_cp_id, {"decision": "shipping anyway"}, "smoke-actor")
+_cps = client.get("/api/v1/modernization/runs/%s/checkpoints" % _art_run, headers=HDR).json()
+check("an answered decision is still listed, with who answered it and why",
+      any(c["id"] == _cp_id and c["status"] == "answered"
+          and c["answered_by"] == "smoke-actor"
+          and (c.get("answer") or {}).get("decision") == "shipping anyway"
+          for c in _cps["checkpoints"]), str(_cps["checkpoints"]))
+check("while the open-only view still filters it out, as every caller relied on",
+      not any(c["id"] == _cp_id for c in client.get(
+          "/api/v1/modernization/runs/%s/checkpoints?status=open" % _art_run,
+          headers=HDR).json()["checkpoints"]))
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

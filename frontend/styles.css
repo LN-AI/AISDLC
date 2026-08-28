@@ -1685,18 +1685,93 @@ button.not-entitled::after {
   box-shadow: inset 3px 0 0 var(--accent);
 }
 
-/* ── Looking inside a run ──────────────────────────────────────────────────
-   Read-only panels, deliberately a row of chips rather than more buttons: none of these
-   changes the run or spends anything, and they sat beside "Cancel run" badly. */
-.mod-inspect {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+/* ── Sections of a run ─────────────────────────────────────────────────────
+   One tab is on screen at a time, and its label is the answer to "what am I looking at". The
+   bar wraps rather than scrolling sideways: a horizontally scrolling tab strip hides tabs, and
+   a tab nobody can see is a section nobody knows exists. */
+.mod-tabs {
+  display: flex; flex-wrap: wrap; gap: 4px;
+  margin: 0 0 16px; padding-bottom: 0; border-bottom: 1px solid var(--border);
+}
+.mod-tab {
+  font-size: 12px; padding: 8px 13px; cursor: pointer;
+  border: 1px solid transparent; border-bottom: none;
+  border-radius: 6px 6px 0 0; background: transparent; color: var(--text-muted);
+  margin-bottom: -1px; transition: color .15s, background .15s;
+}
+.mod-tab:hover { color: var(--text); background: var(--surface2); }
+.mod-tab.selected {
+  color: var(--text); font-weight: 600;
+  background: var(--surface); border-color: var(--border); border-bottom: 1px solid var(--surface);
+}
+/* How much is behind a tab, so the reader can decide before clicking. */
+.mod-tab-count {
+  font-size: 10px; padding: 1px 5px; margin-left: 3px; border-radius: 8px;
+  background: var(--surface2); color: var(--text-muted); font-weight: 400;
+}
+.mod-tab.selected .mod-tab-count {
+  background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--text);
+}
+
+/* ── The three verdicts ────────────────────────────────────────────────────
+   Grouped rather than left as three loose lines, because the *set* is the point: "compiles"
+   on its own reads as a verdict on the conversion, and it is not one. A missing answer is
+   styled as loudly as a bad one — absence of evidence must not read as absence of problems. */
+.mod-verdicts {
   margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+  display: grid; gap: 6px;
 }
-.mod-inspect-label {
-  font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
-  color: var(--text-muted); margin-right: 4px;
+.mod-verdict { display: flex; gap: 10px; align-items: baseline; font-size: 13px; }
+.mod-verdict-q {
+  flex: none; width: 190px; color: var(--text-muted); font-size: 12px; font-weight: 600;
 }
+.mod-verdict-a { flex: 1; }
+.mod-verdict-a .mod-meta { display: inline; margin: 0; }
+.mod-verdict-ok { color: var(--green); }
+.mod-verdict-bad { color: var(--red); }
+.mod-verdict-unknown { color: var(--amber); }
+@media (max-width: 700px) {
+  .mod-verdict { flex-direction: column; gap: 2px; }
+  .mod-verdict-q { width: auto; }
+}
+
+/* A collapsible section inside a tab. One item per accordion — a build round, a converted
+   directory, a diverged case — and its open/closed state survives the 4s poll by key. */
+.mod-acc { margin: 10px 0 0; border-top: 1px solid var(--border); padding-top: 8px; }
+.mod-acc > summary {
+  cursor: pointer; list-style: none; padding: 2px 0;
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline;
+}
+.mod-acc > summary::-webkit-details-marker { display: none; }
+.mod-acc > summary::before { content: '▸'; color: var(--text-muted); font-size: 11px; }
+.mod-acc[open] > summary::before { content: '▾'; }
+.mod-acc > summary:hover { color: var(--accent); }
+.mod-acc .mod-meta { display: inline; margin: 0; }
+
+/* Why a component exists, under its name in the architecture table. Constrained because a
+   rationale is a sentence and the column it sits in is not a prose column. */
+.mod-rationale { white-space: normal; max-width: 460px; margin-top: 3px; }
+.mod-chip-waiver { border-color: var(--red); color: var(--red); }
+.mod-row-selected > td { background: var(--surface2); }
+
+/* The run list. Capped and paged: it used to render every run a project had ever created at
+   full height, above the detail panel — so opening a run scrolled the answer off screen. */
+.mod-runs-scroll { max-height: 44vh; overflow-y: auto; }
 .mod-scroll { max-height: 360px; overflow: auto; margin-top: 8px; }
+/* The inventories are read *down* — 45 files, 18 components — so they get more room. */
+.mod-scroll-tall { max-height: 460px; overflow: auto; margin-top: 8px; }
+
+/* Pin the header of anything that scrolls. Without this, "Level / Role / Deps / Status" leaves
+   the screen a few rows in and the rest of the table is unlabelled columns of short strings —
+   which is exactly the case where you cannot guess which is which. Same treatment the dashboard's
+   review table already had; these tables never got it. */
+.mod-scroll .mod-unit-table th,
+.mod-scroll-tall .mod-unit-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--surface);
+}
 .mod-list { margin: 8px 0 0 18px; font-size: 13px; }
 .mod-list li { margin-bottom: 4px; }
 
@@ -1908,3 +1983,54 @@ button.not-entitled::after {
 .llm-pill.ok { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
 .llm-pill.untested { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber); }
 .llm-pill.failed { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
+
+
+/* ── Rendered markdown ─────────────────────────────────────────────────────
+   Model-written prose used to arrive on screen as its own punctuation: `## Heading`, `**bold**`
+   and rows of pipes. `mdToHtml` turns it into these elements, so the spacing is defined once
+   here rather than per panel.
+
+   Headings are deliberately modest. A model's `#` is shifted to an `h2` by the renderer, and
+   even then it must not outrank the `.section-title` of the panel it is sitting inside. */
+.md-body { font-size: 13px; line-height: 1.6; }
+.md-body > *:first-child { margin-top: 0; }
+.md-body > *:last-child { margin-bottom: 0; }
+.md-body p { margin: 0 0 9px; }
+.md-body h2, .md-body h3, .md-body h4, .md-body h5, .md-body h6 {
+  margin: 16px 0 7px; line-height: 1.35; font-weight: 600;
+}
+.md-body h2 { font-size: 15px; }
+.md-body h3 { font-size: 13.5px; }
+.md-body h4, .md-body h5, .md-body h6 { font-size: 13px; color: var(--text-muted); }
+.md-body ul, .md-body ol { margin: 0 0 9px 20px; }
+.md-body li { margin-bottom: 3px; }
+.md-body strong { font-weight: 650; }
+.md-body hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+.md-body blockquote {
+  margin: 0 0 9px; padding: 6px 12px; border-left: 3px solid var(--border);
+  color: var(--text-muted);
+}
+.md-body a { color: var(--accent); }
+.md-body a:hover { color: var(--accent-hover); }
+.md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px; background: var(--surface2); border-radius: 3px; padding: 1px 5px;
+}
+/* A fenced block is usually a command somebody is meant to paste, so it never wraps —
+   a wrapped command line is a command that does something else. */
+.md-body pre.md-code {
+  margin: 0 0 10px; padding: 10px 12px; overflow-x: auto;
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 4px;
+  white-space: pre; font-size: 11px;
+}
+.md-body pre.md-code code { background: none; padding: 0; font-size: 11px; }
+/* Tables get their own scroller so a wide one cannot widen the page it is inside. */
+.md-body .md-table-wrap { overflow-x: auto; margin: 0 0 10px; }
+.md-body table.md-table { border-collapse: collapse; font-size: 12px; width: 100%; }
+.md-body table.md-table th, .md-body table.md-table td {
+  text-align: left; padding: 5px 9px; border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.md-body table.md-table th { color: var(--text-muted); font-weight: 600; white-space: nowrap; }
+/* The run report is a whole document rather than a paragraph, so it gets room and a ceiling. */
+.md-body.md-report { max-height: 60vh; overflow-y: auto; padding-right: 6px; }

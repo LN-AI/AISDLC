@@ -605,17 +605,25 @@ def get_run(run_id: str) -> Optional[Dict[str, Any]]:
     return run
 
 
-def list_runs(project_ids: Optional[List[str]] = None, limit: int = 50) -> List[Dict[str, Any]]:
+def list_runs(project_ids: Optional[List[str]] = None, limit: int = 50,
+              offset: int = 0) -> List[Dict[str, Any]]:
     """Newest first, scoped to what the caller may see.
 
     `project_ids=None` means unrestricted (a super admin, or an unbound session), matching
     how `database.list_reviews` reads scope. An empty list means "may see nothing", which
     is not the same thing and must not silently widen to everything.
+
+    `offset` pages it. The dashboard used to render every row this returned at full height,
+    which pushed the run *detail* panel — the thing a reader came for — below however many
+    runs the project had accumulated. Paired with `count_runs` so a pager can say how many
+    there are rather than only "here is a page".
     """
     conn = get_connection()
+    offset = max(0, int(offset or 0))
     if project_ids is None:
         rows = conn.execute(
-            "SELECT * FROM modernization_runs ORDER BY created_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM modernization_runs ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
     elif not project_ids:
         rows = []
@@ -623,8 +631,8 @@ def list_runs(project_ids: Optional[List[str]] = None, limit: int = 50) -> List[
         placeholders = ",".join("?" * len(project_ids))
         rows = conn.execute(
             f"SELECT * FROM modernization_runs WHERE project_id IN ({placeholders}) "
-            f"ORDER BY created_at DESC LIMIT ?",
-            list(project_ids) + [limit],
+            f"ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            list(project_ids) + [limit, offset],
         ).fetchall()
     conn.close()
     out = []
@@ -634,6 +642,31 @@ def list_runs(project_ids: Optional[List[str]] = None, limit: int = 50) -> List[
             run.pop(field, None)
         out.append(run)
     return out
+
+
+def count_runs(project_ids: Optional[List[str]] = None) -> int:
+    """How many runs `list_runs` would page through, under the same scope rules.
+
+    Deliberately a separate function rather than a second value out of `list_runs`: the
+    scope contract is the subtle part (`None` is unrestricted, `[]` is nothing, and the two
+    must never collapse into each other), so it is written once here and asserted once by the
+    smoke suite instead of being reimplemented inside a count branch.
+    """
+    conn = get_connection()
+    if project_ids is None:
+        row = conn.execute("SELECT COUNT(*) AS n FROM modernization_runs").fetchone()
+    elif not project_ids:
+        conn.close()
+        return 0
+    else:
+        placeholders = ",".join("?" * len(project_ids))
+        row = conn.execute(
+            f"SELECT COUNT(*) AS n FROM modernization_runs "
+            f"WHERE project_id IN ({placeholders})",
+            list(project_ids),
+        ).fetchone()
+    conn.close()
+    return int((row or {"n": 0})["n"] or 0)
 
 
 def update_run(run_id: str, **fields: Any) -> None:
