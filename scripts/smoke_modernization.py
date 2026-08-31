@@ -11720,12 +11720,62 @@ check("a run with no project does not print an empty --project",
           if c["kind"] == "build_required") if [c for c in store.list_checkpoints(_rc)
                                                 if c["kind"] == "build_required"] else True)
 
+_br = io.open(os.path.join(_ROOT, "scripts", "build_run.py"), encoding="utf-8").read()
+_driver_build_answers = _driver._LOOP_ANSWERS if hasattr(_driver, "_LOOP_ANSWERS") else (
+    tuple(x.strip().strip('"\'') for x in
+          _br.split("_LOOP_ANSWERS = (")[1].split(")")[0].split(",") if x.strip()))
+
+# ── A package reference is not something a converter can write ─────────────
+#
+# The 45-file run ended stuck on exactly two errors, both `CS0103: The name 'BCrypt' does not
+# exist`, after the converter had written `BCrypt.Net.BCrypt.Verify(...)` correctly, fully
+# qualified, with a comment naming the package it needed. There was no rule to act on it, so
+# the error routed to the *converter*, which rewrote an already-correct file three times and
+# was then retired as failed. That is the D-65 trap in a new place: an error whose fix belongs
+# to a deterministic stage, handed to a model.
+#
+# Not incidental to that codebase either. PHP's `password_hash`/`password_verify` **are**
+# bcrypt, so every converted PHP application with a login reaches this.
+
+check("code calling BCrypt asks for the package that supplies it",
+      ("BCrypt.Net-Next", "4.0.3") in wireup.packages_for_code(
+          "if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash)) { return null; }"),
+      str(sorted(wireup.packages_for_code("BCrypt.Net.BCrypt.Verify(a, b);"))))
+check("a comment naming the package adds no dependency",
+      not wireup.packages_for_code(
+          "// BCrypt.Net-Next is the .NET equivalent of PHP's PASSWORD_DEFAULT (bcrypt)."))
+check("and an unrelated file gains nothing",
+      not wireup.packages_for_code("public class Employee { public int Id { get; set; } }"))
+
+
+# ── The list of checkpoints the loop may clear, actually cleared ───────────
+#
+# `_LOOP_ANSWERS` names the blocking checkpoints this program is entitled to answer — and it
+# was used only as an *exclusion* list, in the test asking whether anything blocking is open
+# that is **not** on it. Nothing ever answered the ones that are. So once the loop had changed
+# any file the run raised `build_errors_outstanding`, `POST /resume` answered 409 while it was
+# open, and the loop stopped one line after deciding it was allowed to continue. The third
+# instance in one afternoon of a named capability that is declared and never wired.
+
+check("the loop knows which build checkpoints are its own to answer",
+      set(_br_answers := _driver_build_answers) >= {"build_required",
+                                                    "build_errors_outstanding"},
+      str(_br_answers))
+check("and it answers them before resuming, rather than only checking for them",
+      "_clear_loop_checkpoints(api, key, run_id, token, project_id)" in _br
+      and _br.index("def _clear_loop_checkpoints") < _br.index(
+          "_clear_loop_checkpoints(api, key, run_id, token, project_id)"),
+      "the loop still resumes without clearing what it is responsible for")
+check("it answers only its own kinds, never a decision the product asked a human for",
+      '"decision": "compiled by build_run.py"' in _br
+      and 'point.get("kind") not in _LOOP_ANSWERS' in _br)
+
+
 # ── "Resume me" is not "give up" ───────────────────────────────────────────
 #
 # The loop built, reopened three units, built again without resuming, saw the same six errors
 # and stopped — while the fix sat in the queue untouched and the platform's own summary said
 # "resume the run" in those words.
-_br = io.open(os.path.join(_ROOT, "scripts", "build_run.py"), encoding="utf-8").read()
 check("awaiting_rework is not a terminal status",
       "awaiting_rework" not in _br.split("_TERMINAL_BUILD_STATUSES = ")[1].split(")")[0],
       _br.split("_TERMINAL_BUILD_STATUSES = ")[1].split(")")[0])

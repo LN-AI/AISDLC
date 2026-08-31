@@ -412,6 +412,40 @@ def _blocking_kinds(api: str, key: str, run_id: str, token: str, project_id: str
             if c.get("blocking") and c.get("status") == "open"]
 
 
+def _clear_loop_checkpoints(api: str, key: str, run_id: str, token: str,
+                            project_id: str) -> int:
+    """Answer the blocking checkpoints this loop is entitled to answer. -> how many.
+
+    `_LOOP_ANSWERS` names them, and until now it was used only as an *exclusion* list — the
+    test above asks whether anything blocking is open that is not on it, and nothing ever
+    cleared the ones that are. So a run that raised `build_errors_outstanding`, which is exactly
+    what happens once the loop has changed any file, could not be resumed by the loop that
+    changed it: `POST /resume` answers 409 while a blocking checkpoint is open, and the loop
+    stopped one line after deciding it was allowed to continue.
+
+    Answering these is not a judgement. `build_required` and `build_errors_outstanding` both
+    say "somebody has to compile this" — and compiling it is the thing this program is doing.
+    """
+    status, body = _http(f"{api}/api/v1/modernization/runs/{run_id}/checkpoints", key,
+                         token=token, project_id=project_id)
+    if status != 200:
+        return 0
+    rows = json.loads(body)
+    rows = rows.get("checkpoints", rows) if isinstance(rows, dict) else rows
+    cleared = 0
+    for point in rows:
+        if not (point.get("blocking") and point.get("status") == "open"):
+            continue
+        if point.get("kind") not in _LOOP_ANSWERS:
+            continue
+        code, _ = _http(f"{api}/api/v1/modernization/checkpoints/{point['id']}/answer", key,
+                        "POST", {"decision": "compiled by build_run.py"},
+                        token=token, project_id=project_id)
+        if code == 200:
+            cleared += 1
+    return cleared
+
+
 def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
          project_id: str = "", max_rounds: int = 5, deadline_hours: float = 3.0,
          serve: bool = False, connection: str = "") -> int:
@@ -480,6 +514,13 @@ def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
             print("Stopping: nothing was reopened, so another build would report the same "
                   "errors. Nothing here can move it forward.")
             return 1
+
+        # Clear what this program is entitled to clear, or the resume below is refused with a
+        # 409 for a checkpoint that says "somebody has to compile this" — which is the thing
+        # this program has just done.
+        cleared = _clear_loop_checkpoints(api, key, run_id, token, project_id)
+        if cleared:
+            print(f"  answered {cleared} build checkpoint(s) this loop is responsible for")
 
         status_code, body = _http(f"{api}/api/v1/modernization/runs/{run_id}/resume", key,
                                   "POST", {}, token=token, project_id=project_id)

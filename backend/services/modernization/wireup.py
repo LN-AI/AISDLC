@@ -73,6 +73,15 @@ _PACKAGE_TYPES: Tuple[Tuple[str, str, str], ...] = (
      "Microsoft.Extensions.DependencyInjection.Abstractions", "8.0.2"),
     (r"\bILogger<", "Microsoft.Extensions.Logging.Abstractions", "8.0.2"),
     (r"\bIOptions<|\bIOptionsMonitor<", "Microsoft.Extensions.Options", "8.0.2"),
+    # Password hashing, which for this language pair is not an edge case: PHP's
+    # `password_hash`/`password_verify` are bcrypt, so every converted application with a login
+    # reaches for this. The 45-file live run ended stuck on exactly two errors, both
+    # `CS0103: The name 'BCrypt' does not exist`, after the converter had written
+    # `BCrypt.Net.BCrypt.Verify(...)` correctly, fully qualified, with a comment naming the
+    # package. The information was there; there was no rule to act on it, so the unit was
+    # reopened three times to rewrite a file that was already right and then retired as failed.
+    # A missing package reference is not something a converter can fix by writing better code.
+    (r"\bBCrypt\.Net\b", "BCrypt.Net-Next", "4.0.3"),
     (r"\bMySqlConnection\b", "MySqlConnector", "2.3.7"),
     (r"\bSqlConnection\b", "Microsoft.Data.SqlClient", "5.2.2"),
     (r"\bNpgsqlConnection\b", "Npgsql", "8.0.5"),
