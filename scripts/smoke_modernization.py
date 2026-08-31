@@ -850,11 +850,13 @@ try:
                             + call_log.count("submit_extraction_audit"))
     check("the extraction audit runs exactly once per run",
           call_log.count("submit_extraction_audit") == 1, str(call_log))
-    # Against the constant, not against 3: the panel's size is a tuning decision, and a test
-    # that hardcoded it would fail on a deliberate change while still not asserting the thing
-    # that matters — that every call in the log belongs to a stage entitled to make one.
-    _design_calls = max(1, min(runner.DESIGN_CANDIDATES, len(architect_agent.STANCES)))
-    check("the design stage asks once per candidate decomposition",
+    # Against the function, not against a literal or a re-derived formula: the panel's size is
+    # a tuning decision, and this now covers two groups of calls — the candidates within the
+    # charter's layout, and the ones designed under the other layout it offered. A test that
+    # recomputed the sum would drift from the thing the assessment gate quotes, which is the
+    # one property that matters here (a stage may not make a call that gate did not price).
+    _design_calls = runner._design_call_count()
+    check("the design stage asks once per candidate decomposition, both layouts counted",
           call_log.count("submit_target_architecture") == _design_calls, str(call_log))
     check("the scaffold cost no model call",
           call_log.count("submit_unit_conversion") == 6
@@ -8362,10 +8364,12 @@ finally:
 _panel_gate_detail = next(
     c["detail"] for c in store.list_checkpoints(e2e)
     if c["kind"] == "discovery_approval")
-check("the assessment gate prices one design call per candidate",
-      runner._discovery_estimate(e2e)["design_calls"]
-      == max(1, min(runner.DESIGN_CANDIDATES, len(architect_agent.STANCES))),
+check("the assessment gate prices every design call the run will make",
+      runner._discovery_estimate(e2e)["design_calls"] == runner._design_call_count(),
       str(runner._discovery_estimate(e2e)))
+check("including the ones spent on the layout the charter did not choose",
+      runner._design_call_count() > runner.DESIGN_CANDIDATES,
+      str(runner._design_call_count()))
 
 
 
@@ -10785,10 +10789,67 @@ check("the recommendation is the only thing that moves — the same two options 
 # the text the person choosing had in front of them.
 _layered = next(o for label, o in _large.items() if "layer" in label)
 _single = next(o for label, o in _large.items() if "Single" in label)
-check("the layered option says what it costs, not only what it buys",
-      "seam" in _layered.why and "plan gate" in _layered.why, _layered.why)
-check("and the single-project option says why the problem cannot arise there",
+check("with no dependency graph to look at, no cost is claimed either way",
+      "interface bridge" not in _layered.why, _layered.why)
+check("but the single-project option still says why the problem cannot arise there",
       "cannot" in _single.why and "wrong way" in _single.why, _single.why)
+
+# ── The signal the file count was standing in for ──────────────────────────
+#
+# The file count was the *only* thing this recommendation had, and on both real codebases it
+# pointed the wrong way: seven files whose dependencies would tolerate layers, and forty-five
+# whose dependencies fight them 15% of the way through the graph. The second produced two
+# failed conversions. The graph and the evidence are both in hand when the charter is answered.
+
+_FRICTIONLESS = {"file_count": 45, "routes": ["/"],
+                 "layer_friction": {"wrong_way": 0, "edges": 104, "percent": 0,
+                                    "examples": [], "in_cycle": 0, "depth": 7}}
+_FRICTION = {"file_count": 45, "routes": ["/"],
+             "layer_friction": {"wrong_way": 15, "edges": 104, "percent": 14,
+                                "examples": ["src/Core/Database.php -> config/database.php"],
+                                "in_cycle": 0, "depth": 7}}
+_clean = {o.label: o for o in advice.suggest(".NET 8", _FRICTIONLESS)["project_layout"]}
+_rough = {o.label: o for o in advice.suggest(".NET 8", _FRICTION)["project_layout"]}
+
+check("45 files whose dependencies tolerate layers are still recommended layers",
+      any(o.recommended and "layer" in label for label, o in _clean.items()),
+      str([(l, o.recommended) for l, o in _clean.items()]))
+check("45 files whose dependencies fight them are recommended one project instead",
+      any(o.recommended and "Single" in label for label, o in _rough.items()),
+      str([(l, o.recommended) for l, o in _rough.items()]))
+check("and the same file count produces opposite advice, which is the whole point",
+      [l for l, o in _clean.items() if o.recommended]
+      != [l for l, o in _rough.items() if o.recommended])
+# By substring, because which advisor answers depends on the stack pair and the two
+# spell the label differently ("Project per layer" / "One module per layer").
+_rough_layered = next(o for label, o in _rough.items() if "layer" in label)
+check("the reason is quoted with its denominator, not asserted",
+      "15 of the 104" in _rough_layered.why, _rough_layered.why)
+check("with an example a reader can go and look at in their own source",
+      "src/Core/Database.php" in _rough_layered.why)
+check("and it says out loud that the count is a tendency, not a forecast",
+      "tendency rather than a forecast" in _rough_layered.why)
+check("both layouts are still offered either way — this moves advice, not availability",
+      len(_clean) == 2 and len(_rough) == 2, str((sorted(_clean), sorted(_rough))))
+
+# The measurement itself, over a graph small enough to check by eye.
+_units = [
+    {"path": "page.php", "depends_on": ["db.php"], "topo_level": 0},
+    {"path": "db.php", "depends_on": ["config.php"], "topo_level": 1},
+    {"path": "config.php", "depends_on": [], "topo_level": 2},
+]
+_rows = [{"path": "page.php", "kind": "route"}, {"path": "db.php", "kind": "datastore"}]
+_measured = advice.layer_friction(_units, _rows)
+check("a page depending on the database is with the grain and is not counted",
+      _measured["edges"] == 2 and _measured["wrong_way"] == 0, str(_measured))
+_rows_up = _rows + [{"path": "config.php", "kind": "route"}]
+check("the database depending on something that answers a URL is against it, and is",
+      advice.layer_friction(_units, _rows_up)["wrong_way"] == 1,
+      str(advice.layer_friction(_units, _rows_up)))
+check("a codebase with no dependencies at all measures zero rather than dividing by it",
+      advice.layer_friction([{"path": "a.php", "depends_on": []}], [])["percent"] == 0)
+check("and no units at all is not a crash",
+      advice.layer_friction([], [])["edges"] == 0)
 
 # ── The driver can express the choice, and never makes it silently ─────────
 _opts = [{"label": "Project per layer", "value": "L"},
@@ -11269,9 +11330,16 @@ finally:
 llm_gateway.call_tool = _clean_call_tool
 try:
     _nc, _nc_gate = _to_two_gap_plan("layout-no-conflict")
-    check("a layout with no conflicts never triggers the extra design calls",
-          "layout_alternative_started" not in
-          [e.get("event") for e in store.list_events(_nc, limit=900)])
+    check("both layouts are designed even when the chosen one is clean, and both scored",
+          "layout_alternative_scored" in
+          [e.get("event") for e in store.list_events(_nc, limit=900)],
+          str([e.get("event") for e in store.list_events(_nc, limit=900)][-10:]))
+    check("and the run is told the alternative closes nothing, rather than it vanishing",
+          any(e.get("event") == "layout_alternative_scored"
+              and "closes nothing" in (e.get("detail") or "")
+              for e in store.list_events(_nc, limit=900)),
+          str([e.get("detail") for e in store.list_events(_nc, limit=900)
+               if e.get("event") == "layout_alternative_scored"]))
     check("and the gate offers no layout swap, because there is nothing to compare against",
           not [r for r in ((_nc_gate.get("payload") or {}).get("repairs") or [])
                if r.get("kind") == "swap_layout"])

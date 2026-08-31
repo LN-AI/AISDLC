@@ -16,7 +16,8 @@ what `Option` fields mean.
 """
 from typing import Any, Dict, List
 
-from backend.services.modernization.advice import Advisor, Option, blocking_hazards, register
+from backend.services.modernization.advice import (LAYER_FRICTION_PERCENT, Advisor, Option,
+                                                 blocking_hazards, register)
 from backend.services.modernization.playbooks import DOTNET_ALIASES
 
 # Which .NET data provider a source database implies. Keys are matched against the analyzer's
@@ -113,29 +114,59 @@ def _target_language(observed: Dict[str, Any]) -> List[Option]:
     ]
 
 
+def _layers_are_cheap(observed):
+    """Whether this codebase's own dependencies would tolerate a layered split.
+
+    Two conditions, and both have to hold: big enough to want walls — the file count, which is
+    what this used to decide on alone — **and** a dependency graph that does not fight them.
+    The second is what was missing. On the two real codebases this product has converted the
+    file count pointed the wrong way both times, and the one it sent to layers produced two
+    failed runs.
+    """
+    friction = observed.get("layer_friction") or {}
+    return ((observed.get("file_count") or 0) > 40
+            and int(friction.get("percent") or 0) <= LAYER_FRICTION_PERCENT)
+
+
+def _friction_note(observed):
+    """The evidence behind the recommendation, in one sentence. "" when there is none."""
+    friction = observed.get("layer_friction") or {}
+    wrong, edges = int(friction.get("wrong_way") or 0), int(friction.get("edges") or 0)
+    if not edges:
+        return ""
+    if not wrong:
+        return (f"None of the {edges} dependencies between these files points the wrong way for "
+                f"a layered split, so the walls would cost nothing to put up.")
+    example = (friction.get("examples") or [""])[0]
+    return (f"{wrong} of the {edges} dependencies between these files "
+            f"({friction.get('percent')}%) point the wrong way for a layered split"
+            + (f" — for example `{example}`" if example else "")
+            + ". Each one needs an interface bridge, and the plan gate stops the run until "
+              "every one is closed or accepted. This is a tendency rather than a forecast: the "
+              "count moves with how the layers are guessed, and the plan gate measures both "
+              "layouts properly before anything is converted.")
+
+
 def _project_layout(observed: Dict[str, Any]) -> List[Option]:
     count = observed.get("file_count") or 0
-    small = count <= 40
+    small = not _layers_are_cheap(observed)
+    note = _friction_note(observed)
     feature = Option(
         value="A single ASP.NET Core project, organised folder-per-feature: each feature folder "
               "holds its controller, its view models and its views together.",
         label="Single project, folder-per-feature",
-        why=f"{count} source file(s). At this size layered projects add build ceremony without "
-            f"buying separation the codebase needs. One project also cannot have a dependency "
-            f"pointing the wrong way, so the layering conflicts that stop a run at the plan "
-            f"gate cannot arise at all.",
+        why=(f"{count} source file(s). {note} One project cannot have a dependency pointing "
+             f"the wrong way at all, so the layering conflicts that stop a run at the plan "
+             f"gate cannot arise.").replace("  ", " "),
         recommended=small,
     )
     layered = Option(
         value="One project per layer — Web, Application, Domain, Infrastructure — referencing "
               "inward only, with the Web project holding no data access.",
         label="Project per layer",
-        why=f"{count} source file(s). Enforces a dependency direction at compile time, which is "
-            f"worth the extra projects once a codebase is large enough to drift. The cost, "
-            f"which is real: any dependency the source already has that points the wrong way "
-            f"through these layers has no legal expression and needs an interface seam. The "
-            f"plan gate names those before conversion and the run stops until each one is "
-            f"closed or accepted.",
+        why=(f"{count} source file(s). Enforces a dependency direction at compile time, which "
+             f"is worth the extra projects once a codebase is large enough to drift. "
+             f"{note}").replace("  ", " "),
         recommended=not small,
     )
     return [feature, layered] if small else [layered, feature]

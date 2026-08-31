@@ -320,10 +320,12 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
     projected_output = 400 + 60 * max(len(units), 1)
     expected_output = min(projected_output, _ARCHITECT_MAX_TOKENS)
     numbers = estimate.band(input_tokens, expected_output, _ARCHITECT_MAX_TOKENS)
-    # One call per candidate decomposition. Priced here rather than discovered later because
-    # this gate's whole claim is that the call count is a fact, not a forecast — `STANCES` is
-    # a constant, so the run will make exactly this many.
-    calls = max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))
+    # One call per candidate decomposition, plus the candidates designed under the *other*
+    # project layout the charter offered. Priced here rather than discovered later because this
+    # gate's whole claim is that the call count is a fact, not a forecast — both constants are
+    # constants, so the run will make exactly this many. Leaving the second group out would
+    # have been the one thing a stage may not do: make a call this gate did not price.
+    calls = _design_call_count()
     # Each candidate may also spend read-only turns before it answers. Only the *ceiling*
     # carries that multiplier: a candidate that needs no lookup makes one call, so charging
     # the expectation for turns nobody has been measured taking would overstate the quote in
@@ -387,7 +389,7 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
             "ceiling_usd": round(ceiling, 4), "model": numbers["model"],
             "price_is_estimated": bool(estimated),
             "comprehension_calls": len(bundles) + (1 if len(bundles) > 1 else 0),
-            "design_calls": max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES))),
+            "design_calls": _design_call_count(),
             "design_output_tokens": projected_output,
             "design_output_cap": _ARCHITECT_MAX_TOKENS,
             "design_file_ceiling": _DESIGN_FILE_CEILING}
@@ -1428,6 +1430,13 @@ def _design_alternative_layout(run_id: str, charter: Dict[str, Any], caller: dic
                                beat: int) -> Dict[str, Any]:
     """Design the same codebase under a layout the charter did not choose. -> {} or the best.
 
+    Run on **every** design, not only on one that already failed. The charter's recommendation
+    is a guess made before anything can be measured, and it was a bad one: it had only a file
+    count to reason from and pointed the wrong way on both real codebases this product has
+    converted. `advice.layer_friction` makes that guess better; this makes it not have to be
+    right, because the plan gate then carries two measured numbers instead of one recommendation.
+    Two extra architect calls per run is what that costs.
+
     **The panel cannot reach this on its own, by design.** All three of its stances are
     emphases *within* the charter's project layout, never an override of it, because the layout
     was decided by the team that owns the codebase. That is the right default and it has a
@@ -1464,17 +1473,21 @@ def _design_alternative_layout(run_id: str, charter: Dict[str, Any], caller: dic
     if not scored:
         return {}
     best = scored[0]
-    if int(best["score"].get("gaps") or 0) >= beat:
-        # No better on the one number this exists to improve. Offering it anyway would ask a
-        # human to choose between two plans on a difference that is not there.
-        store.append_event(
-            run_id, "layout_alternative_rejected",
-            f"\"{layout['label']}\" scored {best['score'].get('gaps')} gap(s) against "
-            f"{beat}, so it is not offered.")
-        return {}
-    return {"label": layout["label"], "value": layout["value"],
-            "stance": best["stance"], "score": best["score"], "proposal": best["proposal"],
-            "cost": sum(c["cost"] for c in scored)}
+    better = int(best["score"].get("gaps") or 0) < beat
+    store.append_event(
+        run_id, "layout_alternative_scored",
+        f"\"{layout['label']}\": {architecture.describe_score(best['score'])}. The chosen "
+        f"layout leaves {beat} gap(s)."
+        + ("" if better else " It is not offered, because it closes nothing the chosen layout "
+                            "leaves open."))
+    result = {"label": layout["label"], "value": layout["value"], "stance": best["stance"],
+              "score": best["score"], "cost": sum(c["cost"] for c in scored)}
+    if better:
+        # The proposal is kept only when it could still be built. Otherwise the comparison is
+        # worth reporting and the plan is dead weight — a large blob carried into a checkpoint
+        # payload for an option nobody will be offered.
+        result["proposal"] = best["proposal"]
+    return result
 
 
 def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
@@ -1514,14 +1527,14 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
 
     # The panel is three emphases *within* the charter's layout, so when the layout itself is
     # what cannot be built, all three carry the same conflicts — which is exactly what happened
-    # on the 45-file run. Only then is it worth designing under the other layout the charter
-    # offered, and the result is offered rather than taken.
-    alternative = {}
-    if int(winner["score"].get("gaps") or 0) > 0:
-        alternative = _design_alternative_layout(
-            run_id, charter, caller, llm_override, project_name, inventory, digest,
-            cycles, source_edges, source_units, beat=int(winner["score"]["gaps"]))
-        cost += float(alternative.get("cost") or 0.0)
+    # on the 45-file run. The other layout the charter offered is therefore designed too, and
+    # measured, so the gate carries two numbers rather than one recommendation. Always, because
+    # the recommendation is a guess made before anything can be measured and it pointed the
+    # wrong way on both real codebases; offered as a choice only when it closes something.
+    alternative = _design_alternative_layout(
+        run_id, charter, caller, llm_override, project_name, inventory, digest,
+        cycles, source_edges, source_units, beat=int(winner["score"].get("gaps") or 0))
+    cost += float(alternative.get("cost") or 0.0)
     if runners_up:
         # Reported, never silent. Which decomposition a run was built on is the single most
         # consequential decision in it, and "we generated three and picked one" is not
@@ -2122,6 +2135,17 @@ def _layout_option(run_id: str, design_meta: Dict[str, Any]) -> List[Dict[str, A
         return []
 
 
+def _design_call_count() -> int:
+    """Model calls the design stage makes. One reader, because two gates quote it.
+
+    The assessment gate prices it and `stages.py`'s second invariant depends on that price
+    being a fact — so a change to either constant has to move the quote, and it can only do
+    that if there is one place that computes it.
+    """
+    return (max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))
+            + min(LAYOUT_ALTERNATIVE_CANDIDATES, len(architect_agent.STANCES)))
+
+
 def _plan_repair_options(run_id: str, gaps: List[Dict[str, Any]],
                          projects: List[Dict[str, Any]],
                          seams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2606,6 +2630,17 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     # already fixed, and this is something it cannot fix. Reported rather than fatal — the
     # architect may have a reason, a parsed edge may not survive translation, and refusing a
     # plan on a guess is worse than naming the risk in front of the person paying for it.
+    alternative = design_meta.get("alternative_layout") or {}
+    if alternative.get("score"):
+        _alt_score = alternative["score"]
+        detail += (
+            f"\n\n**Both project layouts the charter offered were designed and measured.** "
+            f"This plan follows the one you chose. The other — \"{alternative.get('label')}\" "
+            f"— came out as {_alt_score.get('projects')} project(s) and "
+            f"{_alt_score.get('components')} component(s) with {_alt_score.get('gaps')} "
+            f"dependency direction(s) that have no legal way to be written, against "
+            f"{len(design_meta.get('layering_gaps') or [])} here.")
+
     gaps = design_meta.get("layering_gaps") or []
     if gaps:
         detail += (
