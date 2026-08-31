@@ -284,11 +284,20 @@ MARKER = "// Registrations for converted services are added here as components a
 # working home page. That is the right way round for a conversion, where "starts and is subtly
 # wrong" is the expensive outcome and a precise message is a single fix rather than an
 # afternoon of clicking.
+# The escape hatch is deliberate and deliberately awkward to reach. Strict is the default and
+# is what the pipeline tests; `ValidateServices=false` in the environment starts a broken
+# application anyway so a developer can look around it. Two behaviours is a real cost — what
+# you tested is then not what you shipped — and it is worth it only because the alternative,
+# on the day a conversion has one gap left, is a person with nothing on the screen and no way
+# to see how close it came.
 VALIDATION_LINES = (
+    "// Every registration is checked while the application starts, not on the first request",
+    "// that needs it. Set ValidateServices=false in the environment to start it anyway.",
+    "var validateServices = builder.Configuration[\"ValidateServices\"] != \"false\";",
     "builder.Host.UseDefaultServiceProvider(options =>",
     "{",
-    "    options.ValidateOnBuild = true;",
-    "    options.ValidateScopes = true;",
+    "    options.ValidateOnBuild = validateServices;",
+    "    options.ValidateScopes = validateServices;",
     "});",
 )
 
@@ -719,7 +728,8 @@ def unregistered_dependencies(artifacts: List[Dict[str, Any]],
 
 
 def host_plan(artifacts: List[Dict[str, Any]], entry_project: str,
-              charter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+              charter: Optional[Dict[str, Any]] = None,
+              required: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """What `Program.cs` is missing, read off the converted code. Pure — no I/O.
 
     Returns `services` (registration lines), `view_formats` (Razor search paths for a layout
@@ -826,6 +836,18 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str,
     # asking a human to choose. Caught by the check that has asserted "two implementations
     # register neither" since this stage was written.
     wanted = _container_constructed(constructors, seeds) - seeds
+    # Types the *running* application proved it needs and this closure did not reach. Supplied
+    # by `runtime.route` after a start-up failure, and it is the only new fact in a rework of
+    # this stage: reopened and told nothing, a deterministic generator re-runs over unchanged
+    # inputs and emits byte-identical output (D-65). Everything below still applies to them —
+    # an unconstructible type or one whose name is claimed by two namespaces is not registered
+    # merely because something asked for it.
+    #
+    # Deliberately narrow. An *interface* is skipped here, as it always was: the pass above
+    # registers one with exactly one implementation, and one with none or two is not something
+    # this stage may decide. A start-up failure naming such an interface is a conversion defect,
+    # and it reaches the converter through the unit `runtime.route` reopened, not through here.
+    wanted |= {str(name).rsplit(".", 1)[-1] for name in (required or ()) if name}
     for name in sorted(wanted):
         if name in registered_names or name in _FRAMEWORK_INJECTED or name in interfaces:
             continue

@@ -11048,7 +11048,10 @@ check("a comment says what was removed and why, rather than it vanishing (D-90/D
 # that reports all of them at once, at start-up, naming the type and what wanted it.
 
 check("the wired host validates its container",
-      "ValidateOnBuild = true" in _WIRED and "ValidateScopes = true" in _WIRED, _WIRED)
+      "ValidateOnBuild = validateServices" in _WIRED
+      and "ValidateScopes = validateServices" in _WIRED, _WIRED)
+check("strict is the default — the hatch has to be reached for on purpose",
+      'builder.Configuration["ValidateServices"] != "false"' in _WIRED, _WIRED)
 check("it is configured on the builder, before anything is registered on it",
       _WIRED.index("ValidateOnBuild") < _WIRED.index("AddControllersWithViews"), _WIRED)
 check("running the stage again changes nothing — the build loop re-runs it",
@@ -11310,6 +11313,194 @@ except ValueError as _exc:
 check("the refusal is all-or-nothing — nothing was deleted on the way to raising",
       len(store.list_units(_cp, kind="component")) == 1,
       str([c.get("component_name") for c in store.list_units(_cp, kind="component")]))
+
+
+
+section("77. Reading the failure instead of storing it")
+
+# ── The dead end this removes ──────────────────────────────────────────────
+#
+# The launcher already captured the process output, the platform already stored it, and the
+# checkpoint already showed it. Nothing read it — so a host that refused to start was where
+# build errors were before `build_results`: a human opening a checkpoint and decoding twenty
+# lines of .NET. With start-up validation on, that output is now the most valuable text in the
+# run, because it names *every* unresolvable service at once instead of the first request's.
+#
+# The answer is the one build errors got. Parse what is parseable, route it to the unit that can
+# fix it, and hand what is left to the converter with the log in front of it. **The parser does
+# not have to be complete**, which is what makes it safe to ship: a shape it knows produces an
+# exact deterministic fix, a shape it does not produces a type name harvested from the message
+# and routed by whoever declared it, and only a message naming nothing this run produced stays
+# a checkpoint for a human — which is where all of them were.
+
+_STARTUP_LOG = (
+    "Unhandled exception. System.AggregateException: Some services are not able to be "
+    "constructed\n"
+    " ---> System.InvalidOperationException: Error while validating the service descriptor "
+    "'ServiceType: Acme.Web.Controllers.EmployeeController': Unable to resolve service for "
+    "type 'Acme.Application.IEmployeeService' while attempting to activate "
+    "'Acme.Web.Controllers.EmployeeController'.\n"
+    " ---> System.InvalidOperationException: Unable to resolve service for type "
+    "'Acme.Application.IEmployeeService' while attempting to activate "
+    "'Acme.Web.Controllers.ReportController'.\n"
+    " ---> System.InvalidOperationException: Cannot consume scoped service "
+    "'Acme.Infrastructure.EmsDbContext' from singleton 'Acme.Application.CacheService'.\n"
+    "   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor()\n")
+
+_found = runtime.diagnostics(_STARTUP_LOG)
+_kinds = [d["kind"] for d in _found]
+check("an unresolvable service is read out of the log, not left as prose",
+      "missing_service" in _kinds, str(_kinds))
+check("with the type that is missing and the type that wanted it",
+      any(d["missing"].endswith("IEmployeeService")
+          and d["wanted_by"].endswith("EmployeeController") for d in _found), str(_found))
+check("a singleton holding a scoped service is read too — stale data, not a crash",
+      "scope_mismatch" in _kinds, str(_kinds))
+check("the same service wanted by two controllers is two findings, not one",
+      len([d for d in _found if d["kind"] == "missing_service"]) == 2, str(_kinds))
+check("but the same finding repeated verbatim is deduplicated",
+      len(runtime.diagnostics(_STARTUP_LOG + _STARTUP_LOG)) == len(_found))
+check("an empty log produces nothing rather than a finding about nothing",
+      runtime.diagnostics("") == [] and runtime.diagnostics("   ") == [])
+
+check("a view emitted under another name is read",
+      [d["missing"] for d in runtime.diagnostics(
+          "InvalidOperationException: The view 'Index' was not found. The following locations "
+          "were searched:\n/Views/Employee/Index.cshtml")] == ["Index"])
+check("and two actions claiming one URL",
+      [d["kind"] for d in runtime.diagnostics(
+          "AmbiguousMatchException: The request matched multiple endpoints.")]
+      == ["ambiguous_route"])
+
+# The fallback, which is the reason an incomplete parser is acceptable. A message this parser
+# does not know still yields the type names in it, and a type this run declared is a route.
+_unknown = runtime.diagnostics(
+    "Unhandled exception. System.IO.FileNotFoundException: Could not load file or assembly "
+    "'Acme.Infrastructure'. \n   at Acme.Web.Program.<Main>$(String[] args)")
+check("a message the parser does not know still yields the types it names",
+      [d["missing"] for d in _unknown] and all(d["kind"] == "unclassified" for d in _unknown),
+      str([d["missing"] for d in _unknown]))
+check("and carries what actually happened, not that something did",
+      _unknown and "FileNotFoundException" in _unknown[0]["detail"], str(_unknown[:1]))
+
+# ── Routing: by who declared the type, because there is no file and no line ─
+#
+# A start-up message has no file position at all, so the `build_results` path — resolve the file,
+# find its owner — is unavailable, and a reader who reused it would get `unmapped` for every row.
+# The one anchor a start-up message offers is a type name.
+
+_rt = store.create_run("startup-route", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rt, [
+    {"path": "#component/web", "kind": "component", "component_name": "web", "status": "ready"},
+    {"path": "#component/app", "kind": "component", "component_name": "app", "status": "ready"}])
+_units = {u["component_name"]: u for u in store.list_units(_rt, kind="component")}
+store.complete_unit(_units["web"]["id"], _rt,
+                    [{"path": "Web/EmployeeController.cs", "content": "public class C { }"}],
+                    [{"name": "Acme.Web.Controllers.EmployeeController",
+                      "signature": "class EmployeeController"}], event_detail="ok")
+store.complete_unit(_units["app"]["id"], _rt,
+                    [{"path": "App/EmployeeService.cs", "content": "public class S { }"}],
+                    [{"name": "Acme.Application.EmployeeService",
+                      "signature": "class EmployeeService"}], event_detail="ok")
+
+_routed = runtime.route(_rt, _found)
+check("a finding goes to the unit that declared the type which asked for the missing one",
+      _units["web"]["id"] in _routed["by_unit"], str(sorted(_routed["by_unit"])))
+check("a finding naming nothing this run declared is not routed to a guess",
+      _routed["unrouted"], str(_routed["unrouted"]))
+check("nothing is routed for a run that declared none of these types",
+      not runtime.route(store.create_run("startup-empty", ".NET 8", "files",
+                                         created_by="smoke"), _found)["by_unit"])
+
+# ── The prompt half, which is where an unrecognised message still helps ────
+_prompt = runtime.summarize_for_prompt(_found, _STARTUP_LOG)
+check("the converter is told the solution compiled and the process stopped",
+      "would not start" in _prompt and "No compiler can see any of this" in _prompt)
+check("it lists what was read out of the output",
+      "missing service" in _prompt and "IEmployeeService" in _prompt, _prompt[:400])
+check("and it carries the output itself, rather than only our reading of it",
+      "Unable to resolve service" in _prompt)
+check("nothing to say produces no section at all",
+      runtime.summarize_for_prompt([], "") == "")
+
+# ── End to end: a failed launch puts work back into the loop ───────────────
+_report = runtime.ingest(_rt, {"checks": [], "started": False, "log_tail": _STARTUP_LOG},
+                         actor="smoke")
+check("the report is recorded as a failure", _report["status"] == "failed", str(_report))
+check("units were sent back to be converted again", _report.get("reopened", 0) or
+      any(e.get("event") == "startup_reopened" for e in store.list_events(_rt, limit=400)),
+      str([e.get("event") for e in store.list_events(_rt, limit=400)][-8:]))
+_point = [c for c in store.list_checkpoints(_rt) if c["kind"] == "runtime_failed"][-1]
+check("the checkpoint does not block, because the run needs resuming and not deciding",
+      not _point["blocking"],
+      "a blocking gate here would stop the very repair it just queued")
+check("it says how many units went back, in the reader's words",
+      "sent back to be converted again" in (_point.get("detail") or ""),
+      (_point.get("detail") or "")[-300:])
+check("the findings ride on the checkpoint too, so a screen can render them",
+      ((_point.get("payload") or {}).get("diagnostics") or []), str(_point.get("payload")))
+check("the reopened unit carries the findings and the log, which is how they reach the prompt",
+      ((store.get_unit(_units['web']['id']) or {}).get("meta") or {}).get("startup_issues"),
+      str(((store.get_unit(_units['web']['id']) or {}).get("meta") or {}).keys()))
+check("the run is rewound to a stage that will claim them, never onto a gate",
+      (store.get_run(_rt) or {}).get("phase") not in ("completed", "", None)
+      and not (stages.get((store.get_run(_rt) or {}).get("phase") or "") or
+               stages.STAGES[0]).gate,
+      str((store.get_run(_rt) or {}).get("phase")))
+
+# The round cap. Each round here costs a whole build and a launch, not a compile, so it is a
+# smaller number than the build loop's and it has to stop rather than spend.
+for _ in range(runtime.MAX_STARTUP_ROUNDS + 2):
+    runtime.ingest(_rt, {"checks": [], "started": False, "log_tail": _STARTUP_LOG},
+                   actor="smoke")
+_last = [c for c in store.list_checkpoints(_rt) if c["kind"] == "runtime_failed"][-1]
+check("past the round cap it stops and asks, rather than spending against a loop",
+      _last["blocking"] and "used all" in (_last.get("detail") or ""),
+      (_last.get("detail") or "")[-300:])
+
+# A failure naming nothing this run produced has to stay a human's problem.
+_nr = store.create_run("startup-unroutable", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_nr, {"checks": [], "started": False,
+                     "log_tail": "Unhandled exception. System.Exception: boom"}, actor="smoke")
+_nr_point = [c for c in store.list_checkpoints(_nr) if c["kind"] == "runtime_failed"][-1]
+check("nothing routable means a blocking checkpoint, as it always did",
+      _nr_point["blocking"])
+
+# ── The deterministic half: registering what the run proved it needs ───────
+#
+# Reopened and told nothing, a generator re-runs over unchanged inputs and emits byte-identical
+# output — the D-65 trap, one stage over. The list of types the container could not resolve is
+# exactly the fact the wire-up pass did not have.
+
+_svc = [{"path": "App/Clock.cs",
+         "content": "namespace App;\npublic class Clock { public Clock() { } }"},
+        {"path": "Web/Program.cs", "content": "var builder = WebApplication.CreateBuilder(args);"
+                                              "\n\nvar app = builder.Build();\napp.Run();\n"}]
+check("a class nothing appeared to need is not registered on its own",
+      not any("Clock" in line for line in wireup.host_plan(_svc, "Web")["services"]),
+      str(wireup.host_plan(_svc, "Web")["services"]))
+check("but one the running application proved it needs is",
+      any("Clock" in line for line in
+          wireup.host_plan(_svc, "Web", required=["App.Clock"])["services"]),
+      str(wireup.host_plan(_svc, "Web", required=["App.Clock"])["services"]))
+check("a type this run never declared is not registered merely because something asked",
+      not any("Nowhere" in line for line in
+              wireup.host_plan(_svc, "Web", required=["Some.Nowhere"])["services"]))
+
+# ── The escape hatch: strict by default, reachable on purpose ──────────────
+#
+# Two behaviours is a real cost — what the pipeline tested is then not what shipped — and it is
+# worth it only because the alternative, on the day a conversion has one gap left, is a person
+# with nothing on the screen and no way to see how close it came.
+_hatch = dotnet_scaffold._program_cs(
+    {"name": "Acme.Web", "purpose": "host"},
+    {"target_stack": ".NET 8 / ASP.NET Core MVC with Razor views"})
+check("the scaffold defaults to strict",
+      'builder.Configuration["ValidateServices"] != "false"' in _hatch, _hatch[:300])
+check("and says how to start a broken application anyway, in the file itself",
+      "Set ValidateServices=false in the environment" in _hatch)
+check("the hatch is off by default, not on — an absent variable validates",
+      '!= "false"' in _hatch and '== "true"' not in _hatch)
 
 
 

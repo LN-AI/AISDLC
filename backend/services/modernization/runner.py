@@ -1780,7 +1780,8 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
     # database" and its solution referenced the provider nowhere, registered the DbContext
     # nowhere, and would have thrown on its first query.
     host_plan = wireup.host_plan(artifacts, entry_project,
-                                 (store.get_run(run_id) or {}).get("charter"))
+                                 (store.get_run(run_id) or {}).get("charter"),
+                                 required=(unit.get("meta") or {}).get("required_services"))
     program_path = f"{entry_project}/Program.cs" if entry_project else ""
     program = by_path.get(program_path)
     if program is not None:
@@ -2884,6 +2885,12 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         semantics.summarize_for_prompt(meta.get("semantic_issues") or []),
         validation.summarize_for_prompt(meta.get("validation_issues") or []),
         layering.summarize_for_prompt(meta.get("layering_issues") or []),
+        # The failure no static check can produce: the solution compiled, the process started,
+        # and it stopped. Written onto this unit by `runtime.route`, and carried with the log
+        # the process actually printed — a parser that recognised the message can say what to
+        # do, and one that did not has nothing better to offer than what happened.
+        runtime.summarize_for_prompt(meta.get("startup_issues") or [],
+                                     meta.get("startup_log") or ""),
         ownership.summarize_for_prompt(meta.get("ownership_issues") or []),
         _followups_for_prompt(meta.get("followups") or []),
     ) if block)

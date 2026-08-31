@@ -158,10 +158,14 @@ def _program_cs(entry: Dict[str, Any], charter: Dict[str, Any]) -> str:
         # it, every one of them is reported at once, naming the type and what wanted it. The
         # cost is that the application refuses to start instead of starting half-broken, which
         # is the right way round when the thing being judged is a conversion.
+        "// Every registration is checked while the application starts, not on the first "
+        "request",
+        "// that needs it. Set ValidateServices=false in the environment to start it anyway.",
+        "var validateServices = builder.Configuration[\"ValidateServices\"] != \"false\";",
         "builder.Host.UseDefaultServiceProvider(options =>",
         "{",
-        "    options.ValidateOnBuild = true;",
-        "    options.ValidateScopes = true;",
+        "    options.ValidateOnBuild = validateServices;",
+        "    options.ValidateScopes = validateServices;",
         "});",
         "",
         "builder.Services.AddControllersWithViews();",

@@ -1936,6 +1936,21 @@ def latest_runtime(run_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def runtime_attempts(run_id: str) -> int:
+    """How many times this run has been launched. The round counter for start-up repair.
+
+    Counted from the reports themselves rather than held on the run row, for the same reason
+    `build_results` counts build rounds that way: the reports are the durable record, and a
+    counter that could disagree with them is a counter that eventually does.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM modernization_runtime_reports WHERE run_id = ?",
+        (run_id,)).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
 def runtime_checks(run_id: str, report_id: str = "") -> List[Dict[str, Any]]:
     conn = get_connection()
     if report_id:
