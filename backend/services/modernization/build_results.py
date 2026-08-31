@@ -1058,6 +1058,9 @@ def gate(run_id: str) -> Dict[str, Any]:
         "runs a compiler, and a conversion can pass all of them and still not build.",
         level="warning")
     if not any(c["kind"] == "build_required" for c in store.list_checkpoints(run_id)):
+        # Read here rather than threaded in: the instruction below is only correct for
+        # a deployment that binds calls to a project when it names the project.
+        project_id = (store.get_run(run_id) or {}).get("project_id") or ""
         store.create_checkpoint(
             run_id, "build_required",
             "This export has never been compiled",
@@ -1068,8 +1071,15 @@ def gate(run_id: str) -> Dict[str, Any]:
                 "nothing here can — building code generated from a customer's source is "
                 "arbitrary code execution, so it happens where the customer's own CI does.\n\n"
                 "The shortest path is a machine with the .NET SDK on it:\n\n"
-                f"    python scripts/build_run.py --run {run_id} \\n"
-                "        --api <this deployment> --user <you> --password <yours>\n\n"
+                # `\\n` in a Python string is a backslash and the letter n, so this printed
+                # the shell continuation and the line break as literal `\\n` in the middle of
+                # the command — the one piece of text whose entire job is being copied and
+                # pasted. `--project` is included when the run has one, because a deployment
+                # that binds every call to a project refuses the resume step without it, and
+                # the loop then dies half way with `project_binding_denied`.
+                f"    python scripts/build_run.py --run {run_id} \\\n"
+                + (f"        --project {project_id} \\\n" if project_id else "")
+                + "        --api <this deployment> --user <you> --password <yours>\n\n"
                 "It downloads the export, runs `dotnet build`, and posts the compiler's own "
                 "output back to this run. Failing units go back into the queue with those "
                 "errors in their prompt, so a build is not only a verdict — it is the input "

@@ -936,6 +936,13 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
                 f"{len(report['issues'])} consistency issue(s) across the converted codebase",
                 detail=reconcile.describe(report)[:4000],
                 blocking=False,
+                # The findings themselves, not only the prose. `drive_modernization`'s
+                # `will_not_work` reads `payload["issues"]` and stops on any `fail` — and this
+                # call never populated it, so that guard has never once fired against the real
+                # product. It was written after a live run sent seven fatal findings past
+                # unread, tested against a payload the smoke suite built by hand, and shipped
+                # reading a field nothing wrote. A second live run then sent two more past.
+                payload={"issues": report["issues"], "counts": report["counts"]},
             )
         # Two questions the platform cannot answer itself, asked here because this is the
         # last moment anyone is looking. Both follow the same shape (D-05): nothing is

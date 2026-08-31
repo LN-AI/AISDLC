@@ -468,7 +468,15 @@ def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
             print(f"Stopping: {', '.join(sorted(set(held)))} needs a human. "
                   f"That is a decision the product asked for, not a build failure.")
             return 2
-        if not result.get("reopened"):
+        if status == "awaiting_rework":
+            # Not a dead end, and reading it as one stopped a run whose repair was already
+            # queued: the loop built, reopened three units, built *again* without resuming,
+            # saw the same six errors, and gave up while the fix sat in the queue untouched.
+            # The platform's own summary says "resume the run" in those words. Falling through
+            # to the resume below is doing what it asked.
+            print("  the previous round's rework has not been converted yet — resuming "
+                  "rather than rebuilding into the same errors")
+        elif not result.get("reopened"):
             print("Stopping: nothing was reopened, so another build would report the same "
                   "errors. Nothing here can move it forward.")
             return 1

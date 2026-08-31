@@ -416,7 +416,23 @@ def _reflected_types(artifacts: List[Dict[str, Any]],
         path = artifact.get("path") or ""
         if not path.lower().endswith(".cs"):
             continue
-        for literal in _QUALIFIED_LITERAL.findall(artifact.get("content") or ""):
+        # Comments first, and this is the whole difference between a finding and a false
+        # one. A doc comment cross-referencing a type —
+        #
+        #     ///   'auth'  -> <see cref="Acme.Ems.Web.Infrastructure.AuthMiddleware"/>
+        #
+        # — is documentation, not a lookup, and on the second live 45-file run two of those
+        # were the only two `fail` findings the whole conversion produced. Both named a class
+        # that *had* been converted and idiomatically renamed (`AuthMiddleware` ->
+        # `AuthPolicy`), so the check reported a crash that could not happen, on a run that
+        # was otherwise clean. Exactly the mistake the char-literal rule had already made one
+        # module over (D-177), repeated here because this scanned raw text.
+        #
+        # `strip_comments`, not `strip_non_code`: the string literal *is* the evidence here,
+        # so blanking strings would silence the check on the defect it exists for. Reaching
+        # for the wrong sibling did exactly that on the first attempt at this fix.
+        for literal in _QUALIFIED_LITERAL.findall(
+                usings.strip_comments(artifact.get("content") or "")):
             root = literal.split(".")[0]
             if root not in roots:
                 continue
@@ -710,14 +726,25 @@ def describe(report: Dict[str, Any]) -> str:
         f"compiled — these are the inconsistencies visible without building.",
         "",
     ]
-    by_kind: Dict[str, List[str]] = defaultdict(list)
-    for issue in issues:
-        by_kind[issue["kind"]].append(issue["detail"])
-    for kind in sorted(by_kind):
-        lines.append(f"**{kind.replace('_', ' ')}** ({len(by_kind[kind])})")
-        for detail in by_kind[kind][:10]:
-            lines.append(f"- {detail}")
-        if len(by_kind[kind]) > 10:
-            lines.append(f"- … and {len(by_kind[kind]) - 10} more")
+    # Failures first, every time. Grouping by kind and sorting the kinds alphabetically put
+    # `manual_followup` (93 of them) ahead of `reflected_type_missing` (2) on a live run — and
+    # the caller truncates this at 4,000 characters, so the only two findings that said "this
+    # will not work" were cut out of the text a human reads. Severity is the axis that decides
+    # whether somebody acts; the kind is only how the acting is organised.
+    for severity, heading in (("fail", "Will not work"), ("warn", "Worth a look")):
+        of_severity = [i for i in issues if i.get("severity") == severity]
+        if not of_severity:
+            continue
+        lines.append(f"### {heading} ({len(of_severity)})")
         lines.append("")
+        by_kind: Dict[str, List[str]] = defaultdict(list)
+        for issue in of_severity:
+            by_kind[issue["kind"]].append(issue["detail"])
+        for kind in sorted(by_kind):
+            lines.append(f"**{kind.replace('_', ' ')}** ({len(by_kind[kind])})")
+            for detail in by_kind[kind][:10]:
+                lines.append(f"- {detail}")
+            if len(by_kind[kind]) > 10:
+                lines.append(f"- … and {len(by_kind[kind]) - 10} more")
+            lines.append("")
     return "\n".join(lines)

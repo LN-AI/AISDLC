@@ -87,6 +87,40 @@ def strip_non_code(content: str) -> str:
     return _NON_CODE.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), content or "")
 
 
+# Strings and comments in one alternation, matched left to right so neither can swallow the
+# other: a `//` inside a string literal is not a comment, and a `"` inside a comment does not
+# open one. The order within the alternation is the verbatim form first, because `@"a""b"`
+# would otherwise end at the doubled quote.
+_STRING_OR_COMMENT = re.compile(
+    r'@"(?:[^"]|"")*"'          # @"verbatim, where "" is an escaped quote"
+    r'|"(?:\\.|[^"\\\n])*"'     # "ordinary"
+    r"|'(?:\\.|[^'\\\n])*'"     # 'c'
+    r"|//[^\n]*"                # // line
+    r"|/\*.*?\*/",              # /* block */
+    re.DOTALL)
+
+
+def strip_comments(content: str) -> str:
+    """Blank the comments, keep the strings, preserve every offset.
+
+    The sibling of `strip_non_code`, and the difference between them is the whole point. That
+    one blanks strings *and* comments, which is right when the question is "what does this code
+    do" — a type named in a string is not a reference. It is wrong when the question is "what
+    does this code name at run time", because then the string literal is the evidence and the
+    comment is the noise.
+
+    Getting that backwards cost two false `fail` findings on a live 45-file run: a check for
+    types reached by name scanned raw text, so a doc comment reading
+    `/// <see cref="Acme.Ems.Web.Infrastructure.AuthMiddleware"/>` was read as a reflective
+    lookup of a class that had merely been renamed. Reaching for `strip_non_code` to fix it
+    then blanked the real lookups too, and the check went silent on the defect it exists for.
+    """
+    return _STRING_OR_COMMENT.sub(
+        lambda m: (re.sub(r"[^\n]", " ", m.group(0))
+                   if m.group(0)[:2] in ("//", "/*") else m.group(0)),
+        content or "")
+
+
 def declared_namespace(content: str) -> str:
     """The namespace this file declares, block or file-scoped. "" when it declares none."""
     match = _NAMESPACE_DECL.search(content or "")

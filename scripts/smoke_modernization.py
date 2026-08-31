@@ -11572,6 +11572,168 @@ check("the hatch is off by default, not on — an absent variable validates",
 
 
 
+section("78. Four checks that were shipped reading a field nothing wrote")
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# ── What a live run found that 1,937 offline checks did not ────────────────
+#
+# The second 45-file conversion produced 45 converted files, 0 failed units and 6 compiler
+# errors — an ordinary, recoverable result. It then stalled, and every reason was in the
+# machinery around the conversion rather than in the conversion:
+#
+#   * the driver's fatal-finding guard read `payload["issues"]` and the producer never wrote it,
+#   * the build loop read "resume me" as "give up",
+#   * the instruction the product prints for a human contained a literal `\n` and omitted the
+#     one flag this deployment refuses the call without,
+#   * and the two `fail` findings that guard would have stopped on were both false.
+#
+# Each is one line. Each survived a suite that tests every one of these behaviours — because
+# every one of those tests built its own input instead of taking the product's.
+
+# ── The gate carries its findings, not only its prose ──────────────────────
+#
+# `will_not_work` filters `payload["issues"]` for severity `fail`. It was written after a live
+# run sent seven fatal findings past unread, tested against a payload the suite built by hand,
+# and shipped against a `create_checkpoint` call with no `payload=` at all. A second live run
+# then sent two more past. This asserts on a checkpoint **the runner made**, which is the only
+# version of this check that could have failed.
+
+_rc = store.create_run("reconcile-payload", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rc, [
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "ready", "target_project": "W", "output_dir": "W", "target_namespace": "W"}])
+_rc_unit = store.list_units(_rc, kind="component")[0]
+store.complete_unit(_rc_unit["id"], _rc, [
+    {"path": "W/Reflect.cs",
+     "content": 'namespace W;\npublic class R { const string T = "W.Missing.Thing"; }'}],
+    [{"name": "W.R", "signature": "class R"}], event_detail="ok")
+_report = reconcile.run(_rc)
+check("the run's own reconciliation finds the fatal case",
+      _report["counts"]["fail"] >= 1, str(_report["counts"]))
+
+# Raised the way the runner raises it, through the same call.
+store.create_checkpoint(
+    _rc, "reconciliation",
+    f"{len(_report['issues'])} consistency issue(s) across the converted codebase",
+    detail=reconcile.describe(_report)[:4000], blocking=False,
+    payload={"issues": _report["issues"], "counts": _report["counts"]})
+_point = [c for c in store.list_checkpoints(_rc) if c["kind"] == "reconciliation"][-1]
+check("the reconciliation gate carries the findings themselves",
+      ((_point.get("payload") or {}).get("issues") or []), str(_point.get("payload"))[:120])
+check("so the driver's fatal-finding guard actually sees them",
+      _driver.will_not_work(_point), str(_point.get("payload"))[:120])
+check("and a run with nothing fatal still reads as nothing fatal",
+      not _driver.will_not_work({"payload": {"issues": [
+          {"severity": "warn", "kind": "namespace_drift", "detail": "x"}]}}))
+
+# The producer is what this is really about: a `create_checkpoint` for reconciliation with no
+# payload passes every other check in this file and makes the guard above permanently blind.
+check("the runner passes the findings when it raises this gate",
+      "payload={\"issues\": report[\"issues\"], \"counts\": report[\"counts\"]}"
+      in io.open(os.path.join(_ROOT, "backend", "services", "modernization", "runner.py"),
+                 encoding="utf-8").read(),
+      "runner.py raises reconciliation without a payload again")
+
+# ── Failures lead, because the text is truncated ───────────────────────────
+#
+# Grouping by kind and sorting alphabetically put `manual_followup` (93 of them) ahead of
+# `reflected_type_missing` (2), and the caller cuts this at 4,000 characters — so on a live run
+# the only two findings that said "this will not work" were cut out of what a human reads.
+
+_mixed = {"issues": [{"kind": "zzz_manual_followup", "severity": "warn", "detail": "a note"}] * 40
+                    + [{"kind": "aaa_broken", "severity": "fail", "detail": "this cannot work"}],
+          "counts": {"fail": 1, "warn": 40, "artifacts": 10}}
+_text = reconcile.describe(_mixed)
+check("a failure appears before the warnings, whatever the kinds are called",
+      _text.index("this cannot work") < _text.index("a note"), _text[:200])
+check("and it survives the 4,000-character cut the caller applies",
+      "this cannot work" in _text[:4000])
+check("both severities are still labelled in the reader's words",
+      "Will not work" in _text and "Worth a look" in _text)
+
+# ── A doc comment is not a reflective lookup ───────────────────────────────
+#
+# Both `fail` findings on the live run were `/// <see cref="...AuthMiddleware"/>` in a
+# documentation file, naming a class that had been converted and idiomatically renamed to
+# `AuthPolicy`. The check scanned raw text. Reaching for `strip_non_code` to fix it then blanked
+# the real string literals too and the check went silent on the defect it exists for — so the
+# distinction it needs is comments-out, strings-in.
+
+check("a comment mentioning a type is not a lookup",
+      not reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            '/// <see cref="W.Infra.AuthMiddleware"/>\nnamespace W;\npublic class A { }'}],
+          set(), {"W"}))
+check("a block comment is not either",
+      not reconcile._reflected_types(
+          [{"path": "A.cs", "content": '/* see "W.Infra.AuthMiddleware" */\npublic class A { }'}],
+          set(), {"W"}))
+check("but a real string literal still is, which is the whole point of the check",
+      reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            'public class A { const string T = "W.Infra.Missing"; }'}],
+          set(), {"W"}))
+check("a `//` inside a string does not turn the rest of the line into a comment",
+      reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            'public class A { string u = "http://x"; const string T = "W.Infra.Missing"; }'}],
+          set(), {"W"}))
+check("and a quote inside a comment does not open a string",
+      not reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            '// the " character, then "W.Infra.Missing"\npublic class A { }'}],
+          set(), {"W"}))
+check("offsets survive the blanking, so line numbers stay honest",
+      len(usings.strip_comments('a\n// x\nb')) == len('a\n// x\nb'))
+check("a verbatim string keeps its doubled quotes rather than ending early",
+      usings.strip_comments('var p = @"C:\\a""b"; // note').startswith('var p = @"C:\\a""b";'))
+
+# ── An instruction a human can paste ──────────────────────────────────────
+#
+# Asserted on the **rendered** text rather than on the source that produces it, which is this
+# section's own lesson. `\\n` in a Python string is a backslash and the letter n, so the gate
+# printed the shell continuation and the line break as a literal `\\n` in the middle of the one
+# piece of text whose entire job is being copied and pasted. A test reading the source for the
+# escape sequence would have to get the same escaping right to catch it.
+_pb = store.create_run("build-instruction", ".NET 8", "files", created_by="smoke",
+                       project_id="proj-42", project_name="demo")
+store.insert_units(_pb, [
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "ready", "target_project": "W", "output_dir": "W"}])
+_pb_unit = store.list_units(_pb, kind="component")[0]
+store.complete_unit(_pb_unit["id"], _pb,
+                    [{"path": "W/A.cs", "content": "public class A { }"}], [],
+                    event_detail="ok")
+build_results.gate(_pb)
+_instruction = next((c.get("detail") or "") for c in store.list_checkpoints(_pb)
+                    if c["kind"] == "build_required")
+check("the printed build command breaks its lines, rather than printing a literal backslash-n",
+      " \\\n" in _instruction and "\\n " not in _instruction.replace(" \\\n", ""),
+      _instruction[_instruction.find("python scripts"):][:160])
+check("and names the project, without which a project-bound deployment refuses the resume",
+      "--project proj-42" in _instruction,
+      _instruction[_instruction.find("python scripts"):][:160])
+check("a run with no project does not print an empty --project",
+      "--project" not in next(
+          (c.get("detail") or "") for c in store.list_checkpoints(_rc)
+          if c["kind"] == "build_required") if [c for c in store.list_checkpoints(_rc)
+                                                if c["kind"] == "build_required"] else True)
+
+# ── "Resume me" is not "give up" ───────────────────────────────────────────
+#
+# The loop built, reopened three units, built again without resuming, saw the same six errors
+# and stopped — while the fix sat in the queue untouched and the platform's own summary said
+# "resume the run" in those words.
+_br = io.open(os.path.join(_ROOT, "scripts", "build_run.py"), encoding="utf-8").read()
+check("awaiting_rework is not a terminal status",
+      "awaiting_rework" not in _br.split("_TERMINAL_BUILD_STATUSES = ")[1].split(")")[0],
+      _br.split("_TERMINAL_BUILD_STATUSES = ")[1].split(")")[0])
+check("and the loop resumes on it rather than stopping",
+      'if status == "awaiting_rework":' in _br and "resuming" in _br)
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:
