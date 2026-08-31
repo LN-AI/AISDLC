@@ -1482,6 +1482,54 @@ def set_parent(run_id: str, member_paths: List[str], parent_unit_id: str,
     return moved
 
 
+def clear_plan(run_id: str) -> Dict[str, Any]:
+    """Undo `architecture.materialize`: drop the component rows, release their members.
+
+    -> `{"components": n, "released": n}`, or raises `ValueError` if it is no longer safe.
+
+    There is exactly one window in which this is safe, and the guard below is what keeps it to
+    that window: **before the scaffold**, when a component is a row and nothing else. After
+    conversion begins a component owns emitted artifacts and registered symbols, and deleting
+    the row would strand both — so a component that has produced anything, or that is anything
+    other than freshly planned, refuses the whole operation rather than half-doing it.
+
+    Members go back to `blocked`, which is the status `graph.build` gives them and therefore
+    the state they were in before they were absorbed. They are re-absorbed immediately by the
+    materialize that follows; the intermediate value matters only if that one fails, and
+    `blocked` is the honest answer then — the files exist and belong to no component.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        rows = cursor.execute(
+            "SELECT id, status FROM modernization_units WHERE run_id = ? AND kind = 'component'",
+            (run_id,)).fetchall()
+        unsafe = [r["id"] for r in rows if (r["status"] or "") not in ("blocked", "ready")]
+        if unsafe:
+            raise ValueError(
+                f"{len(unsafe)} component(s) of this run have already started converting, so "
+                f"the plan can no longer be replaced.")
+        produced = cursor.execute(
+            "SELECT COUNT(*) AS n FROM modernization_artifacts a "
+            "JOIN modernization_units u ON u.id = a.unit_id "
+            "WHERE a.run_id = ? AND u.kind = 'component'", (run_id,)).fetchone()
+        if produced and produced["n"]:
+            raise ValueError(
+                f"{produced['n']} file(s) have already been converted, so the plan can no "
+                f"longer be replaced.")
+
+        released = cursor.execute(
+            "UPDATE modernization_units SET parent_unit_id = NULL, status = 'blocked' "
+            "WHERE run_id = ? AND kind = 'source_file'", (run_id,)).rowcount
+        removed = cursor.execute(
+            "DELETE FROM modernization_units WHERE run_id = ? AND kind = 'component'",
+            (run_id,)).rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return {"components": removed, "released": released}
+
+
 # ── Evidence ───────────────────────────────────────────────────────────────
 
 def insert_evidence(run_id: str, rows: List[Dict[str, Any]]) -> int:

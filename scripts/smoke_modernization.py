@@ -11093,6 +11093,226 @@ check("and a file that is not C# is never judged by it",
 
 
 
+section("76. Offering the layout the panel was never allowed to try")
+
+# ── Why the panel could not have saved run 4 ───────────────────────────────
+#
+# Three decompositions are designed and scored deterministically, and the best is applied. All
+# three are emphases *within* the charter's project layout, never an override of it, because the
+# layout was decided by the team that owns the codebase. That is the right default — and it has
+# a consequence nobody had drawn: when the layout **itself** is what cannot be built, every
+# candidate carries the same conflicts. On the 45-file live run all three did.
+#
+# So when the chosen layout leaves crossings with no legal expression, the same source is
+# designed again under the other layout the charter advisor offered, scored the same way, and
+# **offered** — never taken. A customer who asked for four projects and receives one, silently,
+# is the correction D-90 and D-98 argue against. Fewer projects means fewer boundaries a
+# dependency can cross illegally, and one project cannot have the problem at all.
+#
+# Only when the chosen layout produced conflicts, which is the user's call: a run that is
+# already fine pays nothing, at the price of one extra round-trip on a run that is not.
+
+_LAYERED = [
+    {"name": "Acme.Web", "purpose": "host", "depends_on": ["Acme.Application"]},
+    {"name": "Acme.Application", "purpose": "logic", "depends_on": []},
+    {"name": "Acme.Infrastructure", "purpose": "data", "depends_on": []},
+]
+
+
+def _layout_call_tool(system_prompt, user_content, schema, llm_override=None,
+                      max_tokens=None, **kw):
+    """Two decompositions of one codebase, keyed on the layout the charter asked for.
+
+    Keyed on the prompt because that is how the real thing works: `_design_alternative_layout`
+    re-runs the architect with `project_layout` replaced, and nothing else about the call
+    changes. A fixture that keyed on anything else would not be exercising the mechanism.
+    """
+    if schema.get("name") != "submit_target_architecture":
+        return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+    # The charter is rendered into the **system** block, not the user message — which is
+    # what makes it byte-stable for the prompt cache (D-06). Keying on `user_content`
+    # here silently tested nothing.
+    if "single deployable unit" in (system_prompt or "").lower():
+        return {
+            "projects": [{"name": "Acme.App", "purpose": "everything", "depends_on": []}],
+            "components": [
+                {"name": "config", "project": "Acme.App", "namespace": "Acme.App.Config",
+                 "output_dir": "Acme.App/Config", "members": ["cfg.py"], "role": "config",
+                 "rationale": "settings", "expected_files": ["Cfg.cs"]},
+                {"name": "everything-else", "project": "Acme.App",
+                 "namespace": "Acme.App.Features", "output_dir": "Acme.App/Features",
+                 "members": ["svc.py", "repo.py"], "role": "business",
+                 "rationale": "one feature", "expected_files": ["Svc.cs", "Repo.cs"]},
+            ],
+            "seams": [], "shared_conventions": "Types are PascalCase.",
+            "risks": [], "summary": "One project. No boundary to cross.",
+        }
+    return {
+        "projects": _LAYERED,
+        "components": [
+            {"name": "config", "project": "Acme.Web", "namespace": "Acme.Web.Config",
+             "output_dir": "Acme.Web/Config", "members": ["cfg.py"], "role": "config",
+             "rationale": "settings", "expected_files": ["Cfg.cs"]},
+            {"name": "service", "project": "Acme.Application",
+             "namespace": "Acme.Application.Services", "output_dir": "Acme.Application/Services",
+             "members": ["svc.py"], "role": "business", "rationale": "the service",
+             "expected_files": ["Svc.cs"]},
+            {"name": "repository", "project": "Acme.Infrastructure",
+             "namespace": "Acme.Infrastructure.Data", "output_dir": "Acme.Infrastructure/Data",
+             "members": ["repo.py"], "role": "data", "rationale": "the repository",
+             "expected_files": ["Repo.cs"]},
+        ],
+        "seams": [], "shared_conventions": "Types are PascalCase.",
+        "risks": [], "summary": "Three layers, two illegal dependencies.",
+    }
+
+
+llm_gateway.call_tool = _layout_call_tool
+try:
+    _ly, _ly_gate = _to_two_gap_plan("layout-choice")
+    check("the plan gate is reached", _ly_gate is not None)
+
+    _events = [e.get("event") for e in store.list_events(_ly, limit=900)]
+    check("the alternative was designed, because the chosen layout could not be built",
+          "layout_alternative_started" in _events, str(_events[-14:]))
+    check("and it was designed by re-running the architect, not by rearranging the old answer",
+          "layout_alternative_candidate" in _events, str(_events[-14:]))
+
+    _meta = (store.list_units(_ly, kind="design")[0].get("meta")) or {}
+    _alt = _meta.get("alternative_layout") or {}
+    check("the alternative is kept whole, because unlike the panel it may still be built",
+          bool((_alt.get("proposal") or {}).get("components")), str(sorted(_alt)))
+    check("it scores zero unbuildable crossings where the chosen layout scores two",
+          (_alt.get("score") or {}).get("gaps") == 0
+          and len(_meta.get("layering_gaps") or []) == 2,
+          str(((_alt.get("score") or {}).get("gaps"), len(_meta.get("layering_gaps") or []))))
+
+    _offered = {r["id"]: r for r in ((_ly_gate.get("payload") or {}).get("repairs") or [])}
+    _swap = next((r for r in _offered.values() if r["kind"] == "swap_layout"), None)
+    check("the plan gate offers it beside the interface-seam and merge options",
+          _swap is not None, str(sorted(_offered)))
+    check("it says how many crossings it measurably closes, like every other option",
+          _swap and len(_swap["closes"]) == 2 and not _swap["opens"], str(_swap))
+    check("it is first, because closing two beats closing one",
+          list(_offered)[0] == _swap["id"], str(list(_offered)))
+    check("the text names both plans' project counts, so the choice is legible",
+          _swap and "1 project(s)" in _swap["detail"] and "3 and 3" in _swap["detail"],
+          _swap["detail"] if _swap else "")
+    check("and warns that this one re-costs the run, unlike every other option",
+          _swap and "the quote changes with it" in _swap["detail"],
+          _swap["detail"] if _swap else "")
+    check("a human may still keep the layout they asked for",
+          "none" in (_ly_gate.get("options") or []), str(_ly_gate.get("options")))
+
+    # Applying it. Nothing is converted yet, so a component is a row and nothing else — the one
+    # window in which the decomposition can be replaced rather than edited.
+    _before = {(c.get("component_name"), c.get("target_project"))
+               for c in store.list_units(_ly, kind="component")}
+    store.answer_checkpoint(_ly_gate["id"], {"decision": "approved", "repair": _swap["id"]},
+                            "smoke")
+    store.update_run(_ly, status="converting", paused_reason=None)
+    runner.convert_run(_ly, CALLER)
+
+    _after = store.list_units(_ly, kind="component")
+    check("the whole decomposition is replaced, not relabelled",
+          {(c.get("component_name"), c.get("target_project")) for c in _after} != _before,
+          str(sorted((c.get("component_name"), c.get("target_project")) for c in _after)))
+    check("every component now lives in the single project",
+          {c.get("target_project") for c in _after} == {"Acme.App"},
+          str({c.get("target_project") for c in _after}))
+    check("no source file is left belonging to a component that was deleted",
+          all(u.get("parent_unit_id") in {c["id"] for c in _after}
+              for u in store.list_units(_ly, kind="source_file")),
+          str([(u["path"], u.get("status")) for u in store.list_units(_ly, kind="source_file")]))
+    check("nothing is left that has no legal way to be written",
+          not ((store.list_units(_ly, kind="design")[0].get("meta") or {})
+               .get("layering_gaps")),
+          str((store.list_units(_ly, kind="design")[0].get("meta") or {}).get("layering_gaps")))
+    check("so the conflict gate does not stop the run",
+          not [c for c in store.list_checkpoints(_ly, "open")
+               if c["kind"] == "plan_conflicts"])
+    check("the run converts",
+          store.list_artifacts(_ly, current_only=False),
+          str((store.get_run(_ly) or {}).get("paused_reason")))
+    check("the frozen plan is re-quoted from the components that now exist, not the old ones",
+          len((((store.get_run(_ly) or {}).get("plan") or {}).get("components")) or [])
+          == len(_after),
+          str(len((((store.get_run(_ly) or {}).get("plan") or {}).get("components")) or [])))
+    check("and the alternative is cleared, so it is not offered against the layout it became",
+          not ((store.list_units(_ly, kind="design")[0].get("meta") or {})
+               .get("alternative_layout")))
+
+    # Keeping the chosen layout has to behave exactly as it did before any of this.
+    _keep, _keep_gate = _to_two_gap_plan("layout-keep")
+    store.answer_checkpoint(_keep_gate["id"], {"decision": "approved"}, "smoke")
+    store.update_run(_keep, status="converting", paused_reason=None)
+    runner.convert_run(_keep, CALLER)
+    check("approving without picking it leaves the layered plan in place",
+          {c.get("target_project") for c in store.list_units(_keep, kind="component")}
+          == {"Acme.Web", "Acme.Application", "Acme.Infrastructure"},
+          str({c.get("target_project")
+               for c in store.list_units(_keep, kind="component")}))
+    check("and the conflict gate still stops it, because the crossings are still there",
+          [c for c in store.list_checkpoints(_keep, "open")
+           if c["kind"] == "plan_conflicts"])
+except Exception:
+    traceback.print_exc()
+    check("the layout-choice runs raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+# ── A plan that is fine pays nothing, and one being built cannot be replaced ─
+
+llm_gateway.call_tool = _clean_call_tool
+try:
+    _nc, _nc_gate = _to_two_gap_plan("layout-no-conflict")
+    check("a layout with no conflicts never triggers the extra design calls",
+          "layout_alternative_started" not in
+          [e.get("event") for e in store.list_events(_nc, limit=900)])
+    check("and the gate offers no layout swap, because there is nothing to compare against",
+          not [r for r in ((_nc_gate.get("payload") or {}).get("repairs") or [])
+               if r.get("kind") == "swap_layout"])
+except Exception:
+    traceback.print_exc()
+    check("the no-conflict layout run raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+# `clear_plan` is the only destructive operation in this package, and the guard is what makes
+# it acceptable. Before the scaffold a component is a row; after conversion begins it owns
+# emitted files and registered symbols that deleting the row would strand.
+_cp = store.create_run("clear-plan-guard", ".NET 8", "files", created_by="smoke")
+store.insert_units(_cp, [
+    {"path": "a.py", "kind": "source_file", "status": "blocked", "source_text": "x = 1\n"},
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "blocked", "target_project": "P"}])
+_comp = store.list_units(_cp, kind="component")[0]
+store.set_parent(_cp, ["a.py"], _comp["id"])
+check("a plan nothing has started converting can be replaced",
+      store.clear_plan(_cp)["components"] == 1)
+check("and its members go back to belonging to nothing, rather than to a row that is gone",
+      all(u.get("parent_unit_id") in (None, "")
+          for u in store.list_units(_cp, kind="source_file")),
+      str([(u["path"], u.get("parent_unit_id"), u.get("status"))
+           for u in store.list_units(_cp, kind="source_file")]))
+
+store.insert_units(_cp, [{"path": "#component/two", "kind": "component",
+                          "component_name": "two", "status": "converting",
+                          "target_project": "P"}])
+try:
+    store.clear_plan(_cp)
+    check("a plan that has started converting refuses to be replaced", False,
+          "clear_plan deleted a component that was already being converted")
+except ValueError as _exc:
+    check("a plan that has started converting refuses to be replaced", True)
+    check("and says why, in a sentence naming what is in the way",
+          "already started converting" in str(_exc), str(_exc))
+check("the refusal is all-or-nothing — nothing was deleted on the way to raising",
+      len(store.list_units(_cp, kind="component")) == 1,
+      str([c.get("component_name") for c in store.list_units(_cp, kind="component")]))
+
+
+
 # ── Summary ────────────────────────────────────────────────────────────────
 print(f"\n{'=' * 60}")
 if _failures:

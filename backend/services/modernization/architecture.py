@@ -466,6 +466,11 @@ def score_proposal(proposal: Dict[str, Any], units: List[Dict[str, Any]],
         "problems": len(problems) + len(project_notes),
         "size_spread": spread,
         "gap_detail": [g.get("detail", "") for g in gaps[:6]],
+        # *Which* crossings, not only how many. Two layouts with one gap each are not the same
+        # layout, and comparing them by count would let an option claim to close a crossing it
+        # merely swapped for a different one.
+        "gap_keys": sorted({f"{g.get('consumer')}->{g.get('provider')}" for g in gaps
+                            if g.get("consumer")}),
     }
 
 
@@ -676,6 +681,49 @@ def apply_repair(run_id: str, option: Dict[str, Any]) -> Dict[str, Any]:
         return {"applied": False, "reason": "this run has no design unit"}
     design = design_units[0]
     meta = design.get("meta") or {}
+
+    # ── A different decomposition entirely ────────────────────────────────
+    #
+    # Every other repair here edits the plan in place: an edge added, a seam declared,
+    # components moved between projects. This one replaces it, because the alternative was
+    # designed under a *different project layout* and therefore groups the files differently —
+    # it is not the same components wearing different labels.
+    #
+    # Safe only here, and `store.clear_plan` enforces that rather than trusting the caller: a
+    # component is a row until the scaffold runs, and after conversion begins it owns emitted
+    # files and registered symbols that deleting the row would strand.
+    if kind == "swap_layout":
+        proposal = option.get("proposal") or {}
+        if not proposal.get("components"):
+            return {"applied": False, "reason": "the option carries no alternative plan"}
+        try:
+            cleared = store.clear_plan(run_id)
+        except ValueError as exc:
+            return {"applied": False, "reason": str(exc)}
+        outcome = materialize(run_id, proposal)
+        store.set_unit_meta(design["id"], {
+            "summary": proposal.get("summary") or meta.get("summary") or "",
+            "shared_conventions": (proposal.get("shared_conventions")
+                                   or meta.get("shared_conventions") or ""),
+            "risks": [r for r in (proposal.get("risks") or []) if isinstance(r, str)][:20],
+            "projects": outcome.get("project_list") or proposal.get("projects") or [],
+            "seams": [s for s in (proposal.get("seams") or []) if isinstance(s, dict)][:60],
+            "problems": outcome["problems"],
+            "estimate": outcome["estimate"],
+            # The alternative has been taken, so it is no longer an alternative. Left in place
+            # it would be offered again at the next gate, against the layout it just became.
+            "alternative_layout": {},
+            "layout_applied": option.get("layout") or "",
+            "repair_applied": {"id": option.get("id"), "kind": kind,
+                               "moved": [f"{cleared['components']} component(s) replaced by "
+                                         f"{outcome['components']}"], "problems": []},
+        })
+        return {"applied": True, "kind": kind,
+                "moved": [f"{cleared['components']} component(s) replaced by "
+                          f"{outcome['components']}, in "
+                          f"{len(outcome['projects'])} project(s)"],
+                "problems": outcome["problems"]}
+
     components = store.list_units(run_id, kind="component")
     moved: List[str] = []
 

@@ -86,7 +86,12 @@ def feasible_repairs(point):
 
     A merge is sometimes genuinely right. It should not win by accident.
     """
-    rank = {"seam": 0, "allow": 1, "merge": 2}
+    #   * `layout` — design the whole codebase again under the other layout the charter
+    #     offered. Last, because it is the largest thing that can be done to somebody's
+    #     architecture: not a boundary relaxed but every boundary redrawn. It still wins
+    #     whenever it closes more crossings than the others, which is the common case and the
+    #     right outcome — this rank only decides ties.
+    rank = {"seam": 0, "allow": 1, "merge": 2, "layout": 3}
     repairs = [r for r in ((point.get("payload") or {}).get("repairs") or [])
                if r.get("feasible") and r.get("id")]
     return sorted(repairs, key=lambda r: (-len(r.get("closes") or []),
@@ -355,7 +360,20 @@ def main():
                 elif repairs and args.repair not in ("none", "stop"):
                     chosen = args.repair
                 if chosen:
-                    say(f"  applying layout repair {chosen}", log)
+                    _picked = next((r for r in repairs if r["id"] == chosen), {})
+                    if _picked.get("kind") == "swap_layout":
+                        # Said loudly and separately. Every other repair edits the plan the
+                        # customer approved; this one replaces their decomposition, and an
+                        # unattended run doing that inside a one-line "applying repair" would
+                        # be the silence this driver keeps having to stop doing.
+                        say(f"  !! REPLACING THE LAYOUT: {_picked.get('title')}", log)
+                        say(f"     this is not an edit to the approved plan — the codebase is "
+                            f"decomposed again and the run is re-costed", log)
+                        for _line in (_picked.get("detail") or "").splitlines():
+                            if _line.strip():
+                                say(f"     {_line.strip()[:200]}", log)
+                    else:
+                        say(f"  applying layout repair {chosen}", log)
                 client.call(f"/api/v1/modernization/checkpoints/{point['id']}/answer",
                             "POST", {"decision": "approve",
                                      "answer": {"repair": chosen} if chosen else {}})

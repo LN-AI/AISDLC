@@ -38,7 +38,7 @@ from backend.services import agent_guard, guardrail_service, llm_gateway
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import contracts
 from backend.services.modernization import (
-    analyzers, architecture, build_results, comprehension, estimate, evidence,
+    advice, analyzers, architecture, build_results, comprehension, estimate, evidence,
     extraction_audit, graph, layering, lookup, ownership, parity, playbooks, reconcile,
     repo_ingest, rules, runtime, sanity, scaffold, semantics, stages, store, usings,
     validation, wireup,
@@ -70,6 +70,12 @@ _ARCHITECT_MAX_TOKENS = architect_agent.ARCHITECTURE_MAX_TOKENS
 # to generate several is that they can be *measured*. Set to 1 to restore the single-call
 # behaviour exactly — `STANCES[0]` is the empty stance.
 DESIGN_CANDIDATES = 3
+
+# Candidates designed under a project layout the charter did **not** choose, and only when the
+# one it did choose produced dependencies with no legal way to be written. Zero cost on a run
+# that is already fine; on one that is not, it buys the only comparison nobody could otherwise
+# make, because all three panel stances are emphases *within* the charter's layout.
+LAYOUT_ALTERNATIVE_CANDIDATES = 2
 
 # How many read-only turns each design candidate may spend before it answers. The architect
 # decides placement from a table of rows, and the one thing a table cannot settle is what an
@@ -1332,7 +1338,9 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
                        llm_override: Optional[dict], project_name: str,
                        inventory: str, digest: str, cycles: List[Dict[str, Any]],
                        source_edges: List[Tuple[str, str]],
-                       source_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                       source_units: List[Dict[str, Any]],
+                       stances: Optional[Tuple[Tuple[str, str], ...]] = None,
+                       label: str = "design_candidate") -> List[Dict[str, Any]]:
     """Ask for several decompositions, score each deterministically, return them ranked.
 
     **Degrades rather than fails.** Candidates are asked for one at a time and a candidate
@@ -1346,7 +1354,8 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
     tools = lookup.DESIGN_TOOL_SCHEMAS if DESIGN_LOOKUP_TURNS > 0 else None
     dispatch = lookup.dispatcher(run_id, lookup.DESIGN_TOOL_NAMES) \
         if DESIGN_LOOKUP_TURNS > 0 else None
-    for index, (stance_id, stance) in enumerate(architect_agent.STANCES[:DESIGN_CANDIDATES]):
+    for index, (stance_id, stance) in enumerate(
+            stances if stances is not None else architect_agent.STANCES[:DESIGN_CANDIDATES]):
         try:
             # The turns happen *inside* one guarded call, so the reservation has to be told —
             # the same mechanism agentic conversion uses, and for the same reason (D-25).
@@ -1381,7 +1390,7 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
         # for a tier it does not use, and one that always exhausts its turns needs a bigger one.
         looked_up = (proposal or {}).get("_agentic_lookups") or []
         store.append_event(
-            run_id, "design_candidate",
+            run_id, label,
             f"{stance_id}: {architecture.describe_score(score)}"
             + (f"; read {len(looked_up)} thing(s) first" if looked_up else ""))
 
@@ -1389,6 +1398,83 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
     # winner reproducible rather than dependent on which call happened to come back first.
     scored.sort(key=lambda c: architecture.rank_key(c["score"]) + (c["index"],))
     return scored
+
+
+def _other_layouts(run_id: str, charter: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Project layouts the charter advisor offered and this run did not take. Never raises.
+
+    Read back from the advisor rather than hard-coded, so this works for any language pair whose
+    advice module offers more than one — it knows nothing about what a .NET project is called.
+    """
+    try:
+        run = store.get_run(run_id) or {}
+        observed = advice.observe(store.list_units(run_id, kind="source_file"),
+                                  store.list_evidence(run_id), run.get("redactions") or [])
+        offered = advice.suggest(run.get("target_stack") or "",
+                                 observed).get("project_layout") or []
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not read the layout options for run %s (continuing)", run_id)
+        return []
+    taken = " ".join(str(charter.get("project_layout") or "").lower().split())
+    return [{"label": option.label, "value": option.value} for option in offered
+            if " ".join(option.value.lower().split()) != taken]
+
+
+def _design_alternative_layout(run_id: str, charter: Dict[str, Any], caller: dict,
+                               llm_override: Optional[dict], project_name: str,
+                               inventory: str, digest: str, cycles: List[Dict[str, Any]],
+                               source_edges: List[Tuple[str, str]],
+                               source_units: List[Dict[str, Any]],
+                               beat: int) -> Dict[str, Any]:
+    """Design the same codebase under a layout the charter did not choose. -> {} or the best.
+
+    **The panel cannot reach this on its own, by design.** All three of its stances are
+    emphases *within* the charter's project layout, never an override of it, because the layout
+    was decided by the team that owns the codebase. That is the right default and it has a
+    consequence: when the layout *itself* is what cannot be built, every candidate carries the
+    same conflicts. On the 45-file live run all three did, and the panel could not have helped.
+
+    Run only when the chosen layout has produced crossings with no legal expression, so a run
+    that is already fine pays nothing. Never applied — the result becomes an option on a gate,
+    because a customer who asked for four projects and receives one, silently, is the
+    correction D-90 and D-98 argue against.
+
+    Never raises: a comparison that could fail the run it was meant to improve is worse than no
+    comparison (D-101).
+    """
+    try:
+        alternatives = _other_layouts(run_id, charter)
+        if not alternatives:
+            return {}
+        layout = alternatives[0]
+        stances = architect_agent.STANCES[:LAYOUT_ALTERNATIVE_CANDIDATES]
+        store.append_event(
+            run_id, "layout_alternative_started",
+            f"The chosen layout leaves {beat} dependency direction(s) with no legal "
+            f"expression. Designing {len(stances)} candidate(s) under "
+            f"\"{layout['label']}\" so the two can be compared.")
+        scored = _design_candidates(
+            run_id, dict(charter, project_layout=layout["value"]), caller, llm_override,
+            project_name, inventory, digest, cycles, source_edges, source_units,
+            stances=stances, label="layout_alternative_candidate")
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not design an alternative layout for run %s (continuing)",
+                         run_id)
+        return {}
+    if not scored:
+        return {}
+    best = scored[0]
+    if int(best["score"].get("gaps") or 0) >= beat:
+        # No better on the one number this exists to improve. Offering it anyway would ask a
+        # human to choose between two plans on a difference that is not there.
+        store.append_event(
+            run_id, "layout_alternative_rejected",
+            f"\"{layout['label']}\" scored {best['score'].get('gaps')} gap(s) against "
+            f"{beat}, so it is not offered.")
+        return {}
+    return {"label": layout["label"], "value": layout["value"],
+            "stance": best["stance"], "score": best["score"], "proposal": best["proposal"],
+            "cost": sum(c["cost"] for c in scored)}
 
 
 def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
@@ -1425,6 +1511,17 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     # Every candidate, not just the one that won. A run that generated three and charged for
     # one would understate the design stage on the very screen its cost is read from.
     cost = sum(c["cost"] for c in candidates)
+
+    # The panel is three emphases *within* the charter's layout, so when the layout itself is
+    # what cannot be built, all three carry the same conflicts — which is exactly what happened
+    # on the 45-file run. Only then is it worth designing under the other layout the charter
+    # offered, and the result is offered rather than taken.
+    alternative = {}
+    if int(winner["score"].get("gaps") or 0) > 0:
+        alternative = _design_alternative_layout(
+            run_id, charter, caller, llm_override, project_name, inventory, digest,
+            cycles, source_edges, source_units, beat=int(winner["score"]["gaps"]))
+        cost += float(alternative.get("cost") or 0.0)
     if runners_up:
         # Reported, never silent. Which decomposition a run was built on is the single most
         # consequential decision in it, and "we generated three and picked one" is not
@@ -1468,6 +1565,9 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # built, and the scores are what makes the choice reviewable.
         "design_panel": [{"stance": c["stance"], "score": c["score"],
                           "chosen": c is winner} for c in candidates],
+        # The whole proposal, unlike the panel above, because this one may still be built. It
+        # is the only thing here that is kept in order to be *applied* rather than reviewed.
+        "alternative_layout": {k: v for k, v in alternative.items() if k != "cost"},
         "estimate": outcome["estimate"],
     })
     store.complete_unit(
@@ -1964,6 +2064,63 @@ def _plan_layering_gaps(run_id: str, projects: List[Dict[str, Any]],
         return []
 
 
+def _layout_option(run_id: str, design_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """"Use the other layout instead", shaped like a repair. `[]` when there is none.
+
+    Shaped like a repair on purpose: both gates already render options with what each
+    measurably closes and opens, `_apply_plan_repair` already applies the one a human picked
+    just before the scaffold, and that path already handles resume and idempotency. A second
+    mechanism for the same conversation would be a second thing to get wrong.
+
+    It differs from every other option in one way that has to be said out loud, and is: the
+    others edit this plan, and this one *replaces* it. The files are grouped differently, so
+    the component count changes and the quote changes with it — which is why the detail below
+    names both numbers rather than leaving a reader to discover it after approving.
+
+    Never raises.
+    """
+    try:
+        alternative = design_meta.get("alternative_layout") or {}
+        proposal = alternative.get("proposal") or {}
+        if not proposal.get("components"):
+            return []
+        chosen_keys = {f"{g.get('consumer')}->{g.get('provider')}"
+                       for g in (design_meta.get("layering_gaps") or []) if g.get("consumer")}
+        alt_keys = set((alternative.get("score") or {}).get("gap_keys") or [])
+        closes, opens = sorted(chosen_keys - alt_keys), sorted(alt_keys - chosen_keys)
+        if not closes:
+            return []
+        score = alternative.get("score") or {}
+        here = store.list_units(run_id, kind="component")
+        return [{
+            "id": f"layout:{alternative.get('label') or 'alternative'}",
+            "kind": "swap_layout",
+            "layout": alternative.get("label") or "",
+            "title": f"Use the \"{alternative.get('label')}\" layout instead",
+            "detail": (
+                f"The same source, decomposed again under the other layout the charter "
+                f"offered — **{score.get('projects')} project(s) and "
+                f"{score.get('components')} component(s)**, against "
+                f"{len(design_meta.get('projects') or [])} and {len(here)} in the plan above. "
+                f"It leaves {len(alt_keys)} dependency direction(s) with no legal expression "
+                f"where this plan leaves {len(chosen_keys)}"
+                + (", and fewer projects means fewer boundaries a dependency can cross "
+                   "illegally at all."
+                   if int(score.get("projects") or 0) < len(design_meta.get("projects") or [])
+                   else ".")
+                + f"\n\nThis is the one option here that replaces the plan rather than "
+                  f"editing it, so **the quote changes with it** — the numbers above were "
+                  f"costed for the layout you chose, and the run is re-costed if you take "
+                  f"this. Nothing has been converted, so nothing is lost either way."),
+            "closes": closes, "opens": opens, "feasible": True, "why_not": "",
+            "proposal": proposal,
+        }]
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not offer the alternative layout for run %s (continuing)",
+                         run_id)
+        return []
+
+
 def _plan_repair_options(run_id: str, gaps: List[Dict[str, Any]],
                          projects: List[Dict[str, Any]],
                          seams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2157,9 +2314,12 @@ def _apply_one_repair(run_id: str, checkpoint: Dict[str, Any], chosen: str,
     design_meta = (store.list_units(run_id, kind="design")[0].get("meta")) or {}
 
     run = store.get_run(run_id) or {}
+    # The design unit's estimate, when it has one, because a `swap_layout` re-materialised the
+    # components and wrote a new total there. `run["estimate"]` is the one quoted at the gate,
+    # which for that repair is a number about a plan that no longer exists.
     _freeze_plan(run_id, run, design_meta,
                  store.list_units(run_id, kind="component"),
-                 (run.get("estimate") or {}))
+                 design_meta.get("estimate") or (run.get("estimate") or {}))
     store.append_event(
         run_id, "plan_repair_applied",
         f"{option.get('title')}. "
@@ -2274,7 +2434,8 @@ def _hold_for_plan_conflicts(run_id: str) -> bool:
 
         applied = list(meta.get("repairs_applied") or [])
         repairs = ([] if len(applied) >= MAX_PLAN_REPAIRS else
-                   [r for r in _plan_repair_options(run_id, gaps, projects, seams)
+                   [r for r in (_layout_option(run_id, meta)
+                                + _plan_repair_options(run_id, gaps, projects, seams))
                     if r.get("feasible")])
 
         detail = (
@@ -2461,8 +2622,9 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     # human picks one. Not a bare block (there is a decision here, and the architect may be
     # right), and not a silent auto-fix (a customer who approved four projects and receives
     # three, with nothing saying so, is the correction D-90 and D-98 argue against).
-    repairs = _plan_repair_options(run_id, gaps, design_meta.get("projects") or [],
-                                   design_meta.get("seams") or [])
+    repairs = (_layout_option(run_id, design_meta)
+               + _plan_repair_options(run_id, gaps, design_meta.get("projects") or [],
+                                      design_meta.get("seams") or []))
     if repairs:
         plan["repairs"] = repairs
         detail += (
@@ -2490,9 +2652,14 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
             f"so read the ceiling, not the estimate.")
     # One gate, not two. `start` refuses to begin while *any* blocking checkpoint is open, so a
     # separate repair gate raised in the same breath would give an operator who answered one a
-    # Resume button that silently did nothing. Safe to fold in because no repair changes the
-    # quote: component count and source characters are identical under all of them, so the
-    # number approved here stays true whichever is picked.
+    # Resume button that silently did nothing.
+    #
+    # Folding in was safe while every option merely edited the plan — component count and
+    # source characters were identical under all of them, so the number approved here stayed
+    # true whichever was picked. `swap_layout` breaks that: it replaces the decomposition, so
+    # the component count and the quote both move. It is still folded in, because a second gate
+    # would not help, and the option's own text names both numbers and says the run is
+    # re-costed. `_freeze_plan` then re-quotes from the new rows.
     store.create_checkpoint(
         run_id, "plan_approval", "Approve the conversion plan", detail=detail,
         blocking=True, payload=plan,
