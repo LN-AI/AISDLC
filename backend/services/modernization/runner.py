@@ -1718,6 +1718,16 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
     # A DbContext taking `DbContextOptions` cannot be registered without a provider, and a
     # provider is never guessed (a wrong one restores, builds, and cannot open a connection).
     # Say what is missing instead of registering nothing in silence.
+    # A registration the converter wrote that cannot work. Reported here as well as removed,
+    # because the removal makes the application start*able* and does not make it *work* — the
+    # real fix is the context getting the constructor the container can call, and that is the
+    # converter's job. `reconcile` raises it as a fatal finding for exactly that reason.
+    for problem in host_plan.get("bad_registrations") or []:
+        store.append_event(
+            run_id, "registration_removed",
+            f"{problem['context']}: {problem['detail']}"[:900],
+            unit_id=unit["id"], level="warning")
+
     if host_plan.get("db_note"):
         store.create_checkpoint(
             run_id, "database_provider_unknown",

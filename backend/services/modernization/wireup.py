@@ -266,6 +266,193 @@ def _container_constructed(constructors: Dict[str, List[str]], seeds: Set[str],
 # it will sometimes register a type that does not exist.
 MARKER = "// Registrations for converted services are added here as components are converted."
 
+# ── Making a whole class of failure visible at start-up ────────────────────
+#
+# A missing registration is invisible to the compiler, invisible at start-up, and throws on the
+# first request that needs it. So a converted app "runs" — the home page loads — and is broken
+# on the pages nobody clicked yet, which is found one page and one debug cycle at a time. Five
+# separate checks in this package exist because five separate runs failed that way, each added
+# after the fact.
+#
+# These two switches make the container walk every registration while the app is starting.
+# Anything it cannot construct is reported then, all of it at once, naming the exact type and
+# the thing that wanted it. `ValidateScopes` catches the other half: a long-lived object holding
+# a short-lived one, which produces stale data rather than an error.
+#
+# The trade is deliberate and it is not free — the app now **refuses to start** instead of
+# starting half-broken, so a missing registration means nothing on the screen rather than a
+# working home page. That is the right way round for a conversion, where "starts and is subtly
+# wrong" is the expensive outcome and a precise message is a single fix rather than an
+# afternoon of clicking.
+VALIDATION_LINES = (
+    "builder.Host.UseDefaultServiceProvider(options =>",
+    "{",
+    "    options.ValidateOnBuild = true;",
+    "    options.ValidateScopes = true;",
+    "});",
+)
+
+_CREATE_BUILDER = re.compile(r"^([ \t]*)var\s+builder\s*=\s*WebApplication\.CreateBuilder\b[^;]*;",
+                             re.MULTILINE)
+
+
+def ensure_validation(content: str) -> str:
+    """Make the container check every registration at start-up. Idempotent.
+
+    Placed immediately after the builder is created, because it configures the builder and has
+    to run before anything is registered on it. Silent when there is no builder to configure —
+    a `Program.cs` this pipeline did not recognise is not one to rewrite on a guess.
+    """
+    text = content or ""
+    if not text.strip() or "ValidateOnBuild" in text:
+        return text
+    match = _CREATE_BUILDER.search(text)
+    if not match:
+        return text
+    indent = match.group(1)
+    block = "\n".join(indent + line if line else line for line in VALIDATION_LINES)
+    return text[:match.end()] + "\n\n" + block + text[match.end():]
+
+
+# `AddDbContextFactory` is included: it constructs the context the same way and fails the same
+# way. `AddDbContextPool` additionally *requires* the options constructor, so a pooled context
+# with anything else is doubly wrong.
+_ADD_DBCONTEXT = re.compile(
+    r"\bAdd(?:DbContextPool|DbContextFactory|DbContext)\s*<\s*(?P<type>[\w.]+)\s*>")
+
+
+def _statement_span(text: str, start: int):
+    """(begin, end) of the whole statement containing `start`, to its terminating `;`.
+
+    A registration is not always one line — `AddDbContext<T>(options => ...)` wraps as a matter
+    of course. Deleting "the line" would leave the tail of a statement behind, turning a
+    start-up failure into a compile error, which is a worse trade than the one being made.
+    """
+    begin = text.rfind("\n", 0, start) + 1
+    depth, index = 0, start
+    while index < len(text):
+        char = text[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == ";" and depth <= 0:
+            end = text.find("\n", index)
+            return begin, (len(text) if end == -1 else end + 1)
+        index += 1
+    return begin, len(text)
+
+
+def bad_registrations(program_content: str,
+                      artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Registrations already in `Program.cs` that are guaranteed to fail at start-up.
+
+    -> `[{span, context, detail}]`, where `span` indexes the **original** text.
+
+    A span rather than the statement's text, because `usings.strip_non_code` blanks strings and
+    comments *in place* — the offsets are identical, the characters are not. Carrying the text
+    meant a registration containing a string literal, which is nearly all of them, could not be
+    found again in the file it came from, and the removal below silently did nothing.
+
+    `db_plan` refuses to *write* a registration for a context the container cannot construct,
+    and says nothing about one that is already there. On the 45-file run the converter had
+    written that line into `Program.cs` itself, so the context read as already registered, this
+    stage had nothing to add, and the export built with zero errors and threw on start-up.
+    Checking only what we are about to add is checking the half of the file we wrote.
+
+    Comments are stripped before matching, for the reason `registrations_in` documents: a
+    commented-out suggestion is not a registration, and counting one is how a check that exists
+    to catch a false negative produces its own.
+    """
+    text = program_content or ""
+    if not text.strip():
+        return []
+    code = usings.strip_non_code(text)
+    declared: Dict[str, str] = {}
+    for artifact in artifacts or ():
+        path = str(artifact.get("path") or "")
+        if not path.lower().endswith(".cs"):
+            continue
+        body = artifact.get("content") or ""
+        found = _DBCONTEXT_CLASS.search(usings.strip_non_code(body))
+        if found:
+            declared[found.group(1)] = body
+
+    problems: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for match in _ADD_DBCONTEXT.finditer(code):
+        name = match.group("type").rsplit(".", 1)[-1]
+        body = declared.get(name)
+        if body is None:
+            # Not declared in this run. The compiler will say so, loudly and with a line
+            # number, and guessing here would only pre-empt a better message.
+            continue
+        if name in seen:
+            problems.append({
+                "span": _statement_span(code, match.start()),
+                "context": name,
+                "detail": (f"`{name}` is registered more than once. The last registration "
+                           f"wins silently, so the provider and options the application "
+                           f"actually uses are whichever line happens to come last."),
+            })
+            continue
+        seen.add(name)
+        if dbcontext_is_constructible(usings.strip_non_code(body), name):
+            continue
+        problems.append({
+            "span": _statement_span(code, match.start()),
+            "context": name,
+            "detail": (f"`{name}` declares no constructor that takes only its "
+                       f"`DbContextOptions`, so the container cannot construct it. This "
+                       f"registration compiles and throws while the application is starting: "
+                       f"\"Unable to resolve service for type 'System.String'\". Removing it "
+                       f"is not the fix — the context needs the standard constructor — but "
+                       f"leaving it guarantees the application never starts."),
+        })
+    return problems
+
+
+def strip_registrations(content: str, problems: List[Dict[str, Any]]) -> str:
+    """Remove registrations that cannot work, leaving a comment where each one was.
+
+    A comment rather than nothing, because a silent deletion is the correction D-90 and D-98
+    argue against — somebody reading `Program.cs` afterwards has to be able to see that a
+    registration was taken out and why.
+    """
+    text = content or ""
+    # Last first, so removing one cannot shift the offsets of the next.
+    for problem in sorted(problems or (), key=lambda p: p.get("span") or (0, 0), reverse=True):
+        span = problem.get("span")
+        if not span:
+            continue
+        begin, end = span
+        if not (0 <= begin < end <= len(text)):
+            continue
+        original = [line.strip() for line in text[begin:end].strip().splitlines()]
+        note = ("// Removed by the wire-up pass — this registration cannot succeed:"
+                + "".join(f"\n//   {line}"
+                          for line in _wrap(problem.get("detail") or "", 88))
+                + "\n// The line was:"
+                + "".join(f"\n//   {line}" for line in original[:4]) + "\n")
+        text = text[:begin] + note + text[end:]
+    return text
+
+
+def _wrap(sentence: str, width: int) -> List[str]:
+    """One sentence broken across comment lines. `textwrap` would do this; a comment block is
+    not worth an import nothing else in this module needs."""
+    lines: List[str] = []
+    current = ""
+    for word in str(sentence or "").split():
+        if current and len(current) + 1 + len(word) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = f"{current} {word}".strip()
+    if current:
+        lines.append(current)
+    return lines
+
 _NAMESPACE = re.compile(r"^\s*namespace\s+([\w.]+)\s*[;{]", re.MULTILINE)
 _INTERFACE = re.compile(r"\b(?:public|internal)\s+(?:partial\s+)?interface\s+(I\w+)")
 # `abstract` is excluded deliberately: registering an abstract type as an implementation is a
@@ -350,8 +537,19 @@ FRAMEWORK_REGISTRATIONS = {
 # argument — its `DbContextOptions<T>` — so a context asking for anything else cannot be built
 # that way, and the container throws while validating: "Unable to resolve service for type
 # 'System.String'". It compiles perfectly; it fails before the first request.
+# The base call is **optional**, and requiring it was the defect that let the 45-file run
+# through. A context that configures itself in `OnConfiguring` has no reason to call
+# `: base(...)` —
+#
+#     public AcmeEmsDbContext(string databasePath) { _databasePath = databasePath; }
+#
+# — so this pattern matched nothing, "no constructor declared" was read as "the framework
+# supplies one", and the function returned True about the one shape it exists to catch. The
+# export built with zero errors and threw the moment it started. A check that cannot see its
+# own subject is worse than no check, because it is also reassuring.
 _DBCONTEXT_CTOR = re.compile(
-    r"public\s+(?P<name>[A-Za-z_]\w*)\s*\((?P<args>[^)]*)\)\s*:\s*base\s*\(")
+    r"public\s+(?P<name>[A-Za-z_]\w*)\s*\((?P<args>[^)]*)\)\s*"
+    r"(?::\s*(?:base|this)\s*\([^)]*\)\s*)?[\{=]")
 
 
 def dbcontext_is_constructible(content: str, context_name: str) -> bool:
@@ -675,6 +873,13 @@ def host_plan(artifacts: List[Dict[str, Any]], entry_project: str,
         "chosen": chosen_notes,
         "db_context": db.get("context") or "",
         "db_note": db.get("note") or "",
+        # What is already in the file, not only what we would add. `Program.cs` is one of the
+        # artifacts, so this needs nothing the caller does not already hold.
+        "bad_registrations": bad_registrations(
+            next((a.get("content") or "" for a in artifacts or ()
+                  if str(a.get("path") or "").replace("\\", "/")
+                  == f"{entry_project}/Program.cs"), ""),
+            artifacts),
         "view_formats": _view_formats(view_paths, controllers, entry_project),
         "needs_session": needs_session,
         "needs_http_context": needs_http_context,
@@ -723,10 +928,25 @@ def _registers_pair(text: str, lhs: str, rhs: str) -> bool:
 
 
 def apply_to_program_cs(content: str, plan: Dict[str, Any]) -> str:
-    """Insert the registrations. Idempotent, and never removes what is already there."""
+    """Wire the host: validate the container, drop what cannot work, add what is missing.
+
+    Idempotent — the build loop re-runs this stage over its own output.
+
+    It used to only ever add, and "never removes what is already there" was the stated
+    contract. That contract is what let a registration the converter wrote, for a context the
+    container cannot construct, sit in `Program.cs` untouched while this stage reported the
+    context as already registered. The export built with zero errors and threw on start-up.
+    A registration that is guaranteed to fail is not code to preserve.
+    """
     text = content or ""
     if not text.strip():
         return text
+
+    # Order matters. Remove first, so a bad registration is not counted as "already present"
+    # by the additions below; validate second, so the switch survives into the output of every
+    # later round.
+    text = strip_registrations(text, plan.get("bad_registrations") or [])
+    text = ensure_validation(text)
     additions: List[str] = []
 
     # Match the *call*, not one spelling of it. A converter that writes the configured form,

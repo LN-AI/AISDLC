@@ -151,6 +151,19 @@ def _program_cs(entry: Dict[str, Any], charter: Dict[str, Any]) -> str:
     lines = [
         "var builder = WebApplication.CreateBuilder(args);",
         "",
+        # Every registration is checked while the application starts, rather than when the
+        # first request needs it. A missing registration is invisible to the compiler and
+        # invisible at start-up without this, so a converted app loads its home page and 500s
+        # on the pages nobody clicked yet — found one page and one debug cycle at a time. With
+        # it, every one of them is reported at once, naming the type and what wanted it. The
+        # cost is that the application refuses to start instead of starting half-broken, which
+        # is the right way round when the thing being judged is a conversion.
+        "builder.Host.UseDefaultServiceProvider(options =>",
+        "{",
+        "    options.ValidateOnBuild = true;",
+        "    options.ValidateScopes = true;",
+        "});",
+        "",
         "builder.Services.AddControllersWithViews();",
     ]
     # Every charter value, not a hand-picked three. The old list was `config_strategy`,

@@ -1449,6 +1449,7 @@ check("a hazard with a real target equivalent does not demand a marker",
 # ── 17. Charter advice ─────────────────────────────────────────────────────
 section("17. Charter advice — the form arrives answered, for free")
 
+from backend.services.modernization.scaffold import dotnet as dotnet_scaffold  # noqa: E402
 from backend.services.modernization import advice                        # noqa: E402
 
 # The observations every suggestion is derived from. Same inputs the real endpoint uses.
@@ -2464,8 +2465,20 @@ check("a Program.cs with no placeholder still gets its registrations",
       "AddScoped<" in wireup.apply_to_program_cs(_program.replace(wireup.MARKER, ""), _hp))
 check("a Program.cs with nowhere to put them is left untouched rather than corrupted",
       wireup.apply_to_program_cs("// not a host", _hp) == "// not a host")
-check("nothing to wire leaves the file alone",
-      wireup.apply_to_program_cs(_program, wireup.host_plan([], "Shop.Web")) == _program)
+# The contract this check used to assert — "nothing to wire leaves the file alone" — is
+# deliberately no longer the one this stage keeps. Start-up validation is not a registration:
+# it is what makes a *missing* registration visible while the application starts instead of on
+# the first request that needs it, so it belongs on every host, including one with nothing to
+# register. What must stay true is that no registration is invented and the pass is idempotent.
+_nothing = wireup.apply_to_program_cs(_program, wireup.host_plan([], "Shop.Web"))
+_dense = "".join(_nothing.split())
+check("nothing to wire adds no registration",
+      "AddScoped<" not in _nothing and "AddDbContext" not in _nothing, _nothing)
+check("the only change is that the container is now checked at start-up",
+      _dense.replace("".join("".join(wireup.VALIDATION_LINES).split()), "", 1)
+      == "".join(_program.split()), _nothing)
+check("and wiring it a second time changes nothing",
+      wireup.apply_to_program_cs(_nothing, wireup.host_plan([], "Shop.Web")) == _nothing)
 
 # A converter that wrote its own host is the normal case once the architect gives Program.cs
 # to a component. Re-registering on top of it produced a duplicated `AddSession` beside the
@@ -10924,6 +10937,160 @@ check("while the open-only view still filters it out, as every caller relied on"
       not any(c["id"] == _cp_id for c in client.get(
           "/api/v1/modernization/runs/%s/checkpoints?status=open" % _art_run,
           headers=HDR).json()["checkpoints"]))
+
+
+section("75. Failing at start-up, loudly, instead of on the page nobody clicked")
+
+# ── The guard that could not see its own subject ───────────────────────────
+#
+# `AddDbContext<T>()` builds `T` by handing it exactly one argument, its options. A context
+# asking for anything else cannot be built that way: the solution compiles with zero errors and
+# the host throws while starting, with a message about `System.String` rather than about the
+# class. `dbcontext_is_constructible` exists to catch precisely that.
+#
+# It required the constructor to call `: base(...)`. A context that configures itself in
+# `OnConfiguring` has no reason to — it holds the path and uses it later — so the pattern
+# matched nothing, "no constructor declared" was read as "the framework supplies one", and the
+# function returned True about the one shape it was written for. The 45-file run's export built
+# clean and would not start, on the line the guard was supposed to have stopped.
+
+_SELF_CONFIGURING = ("namespace A;\npublic class EmsDbContext : DbContext\n{\n"
+                     "    private readonly string _path;\n"
+                     "    public EmsDbContext(string databasePath) { _path = databasePath; }\n"
+                     "    protected override void OnConfiguring(DbContextOptionsBuilder o)\n"
+                     "        => o.UseSqlite($\"Data Source={_path}\");\n}\n")
+_STANDARD = ("namespace A;\npublic class OkDbContext : DbContext\n{\n"
+             "    public OkDbContext(DbContextOptions<OkDbContext> o) : base(o) { }\n}\n")
+
+check("a context taking a path, with no base call, is NOT constructible by the container",
+      not wireup.dbcontext_is_constructible(_SELF_CONFIGURING, "EmsDbContext"),
+      "this is the exact shape that shipped an export which would not start")
+check("the standard options constructor still is",
+      wireup.dbcontext_is_constructible(_STANDARD, "OkDbContext"))
+check("a context declaring no constructor at all still is — the framework supplies one",
+      wireup.dbcontext_is_constructible("public class C : DbContext { }", "C"))
+check("and one offering both is, because AddDbContext picks the one it can use",
+      wireup.dbcontext_is_constructible(
+          "public class C : DbContext {\n"
+          "  public C(string p) { }\n"
+          "  public C(DbContextOptions<C> o) : base(o) { }\n}", "C"))
+check("an expression-bodied constructor is read too, not only a braced one",
+      not wireup.dbcontext_is_constructible(
+          "public class C : DbContext { public C(string p) => _p = p; }", "C"))
+
+# ── Checking the half of Program.cs we did not write ───────────────────────
+#
+# `db_plan` refuses to *write* a registration for a context the container cannot construct, and
+# said nothing about one already there. On the live run the converter had written that line
+# itself, so the context read as registered, this stage had nothing to add, and the export built
+# with zero errors and threw. Checking only what we are about to add is checking our own half.
+
+_CTX_ART = {"path": "Infra/EmsDbContext.cs", "content": _SELF_CONFIGURING}
+_OK_ART = {"path": "Infra/OkDbContext.cs", "content": _STANDARD}
+
+
+def _program(*lines):
+    return ("var builder = WebApplication.CreateBuilder(args);\n\n"
+            "builder.Services.AddControllersWithViews();\n"
+            + "".join(line + "\n" for line in lines)
+            + "\nvar app = builder.Build();\napp.Run();\n")
+
+
+_MODEL_WROTE = _program(
+    "builder.Services.AddDbContext<A.EmsDbContext>(options =>",
+    "    options.UseSqlite(builder.Configuration.GetConnectionString(\"Default\")));")
+
+check("a registration the converter wrote for an unbuildable context is found",
+      [b["context"] for b in wireup.bad_registrations(_MODEL_WROTE, [_CTX_ART])]
+      == ["EmsDbContext"],
+      str(wireup.bad_registrations(_MODEL_WROTE, [_CTX_ART])))
+check("a registration for a context that can be built is left alone",
+      not wireup.bad_registrations(
+          _program("builder.Services.AddDbContext<A.OkDbContext>(o => o.UseSqlite(\"x\"));"),
+          [_OK_ART]))
+check("the same context registered twice is reported — the last line silently wins",
+      any("more than once" in b["detail"] for b in wireup.bad_registrations(
+          _program("builder.Services.AddDbContext<A.OkDbContext>(o => o.UseSqlite(\"x\"));",
+                   "builder.Services.AddDbContext<A.OkDbContext>(o => o.UseNpgsql(\"y\"));"),
+          [_OK_ART])))
+check("a commented-out registration is not a registration",
+      not wireup.bad_registrations(
+          _program("// builder.Services.AddDbContext<A.EmsDbContext>(o => o.UseSqlite(\"x\"));"),
+          [_CTX_ART]))
+check("a context this run never declared is left to the compiler, which has a line number",
+      not wireup.bad_registrations(
+          _program("builder.Services.AddDbContext<Some.Other.Context>(o => { });"), [_CTX_ART]))
+check("AddDbContextFactory is judged the same way — it constructs the same type",
+      wireup.bad_registrations(
+          _program("builder.Services.AddDbContextFactory<A.EmsDbContext>(o => { });"),
+          [_CTX_ART]))
+
+# The removal has to take the *whole statement*. These wrap as a matter of course, and deleting
+# one line of a two-line statement turns a start-up failure into a compile error — a worse trade
+# than the one being made.
+_WIRED = wireup.apply_to_program_cs(
+    _MODEL_WROTE, wireup.host_plan([_CTX_ART, {"path": "Web/Program.cs",
+                                               "content": _MODEL_WROTE}], "Web"))
+check("the whole statement goes, not the first line of it",
+      "AddDbContext<A.EmsDbContext>" not in usings.strip_non_code(_WIRED)
+      and "UseSqlite" not in usings.strip_non_code(_WIRED), _WIRED)
+check("and what is left still parses as C#",
+      not csharp_syntax.faults(_WIRED, "Program.cs"),
+      str(csharp_syntax.faults(_WIRED, "Program.cs")))
+check("a comment says what was removed and why, rather than it vanishing (D-90/D-98)",
+      "Removed by the wire-up pass" in _WIRED and "EmsDbContext" in _WIRED)
+
+# ── Every registration checked while the app starts ────────────────────────
+#
+# A missing registration is invisible to the compiler and invisible at start-up. The app loads
+# its home page and 500s on the pages nobody clicked — found one page and one debug cycle at a
+# time. Five checks in this package exist because five runs failed that way. This is the switch
+# that reports all of them at once, at start-up, naming the type and what wanted it.
+
+check("the wired host validates its container",
+      "ValidateOnBuild = true" in _WIRED and "ValidateScopes = true" in _WIRED, _WIRED)
+check("it is configured on the builder, before anything is registered on it",
+      _WIRED.index("ValidateOnBuild") < _WIRED.index("AddControllersWithViews"), _WIRED)
+check("running the stage again changes nothing — the build loop re-runs it",
+      wireup.apply_to_program_cs(_WIRED, wireup.host_plan(
+          [_CTX_ART, {"path": "Web/Program.cs", "content": _WIRED}], "Web")) == _WIRED)
+check("a Program.cs with no builder to configure is left alone, not guessed at",
+      wireup.ensure_validation("Console.WriteLine(\"hi\");")
+      == "Console.WriteLine(\"hi\");")
+check("and an empty one is not a crash", wireup.ensure_validation("") == "")
+
+_SCAFFOLDED = dotnet_scaffold._program_cs(
+    {"name": "Acme.Web", "purpose": "host"},
+    {"target_stack": ".NET 8 / ASP.NET Core MVC with Razor views"})
+check("the scaffold writes the switch into the first Program.cs, so it is never absent",
+      "ValidateOnBuild" in _SCAFFOLDED, _SCAFFOLDED[:200])
+check("and that Program.cs parses",
+      not csharp_syntax.faults(_SCAFFOLDED, "Program.cs"),
+      str(csharp_syntax.faults(_SCAFFOLDED, "Program.cs")))
+
+# ── Removing it is not the fix, so the converter has to hear about it ──────
+#
+# Stripping the registration makes the application start*able*; it does not make it work.
+# Anything needing the context still cannot be built, and with validation on the host now says
+# so and stops. The real fix is a constructor the container can call, and only the converter can
+# write one — which is why this is a `fail`, carried by the reconciliation gate, which the
+# driver stops on.
+
+check("a context the container cannot build is a FATAL reconciliation finding",
+      [(i["kind"], i["severity"]) for i in reconcile._unbuildable_contexts([_CTX_ART])]
+      == [("unbuildable_dbcontext", "fail")],
+      str(reconcile._unbuildable_contexts([_CTX_ART])))
+check("the finding names the file, the class and the constructor to write",
+      all(bit in reconcile._unbuildable_contexts([_CTX_ART])[0]["detail"]
+          for bit in ("Infra/EmsDbContext.cs", "EmsDbContext",
+                      "DbContextOptions<EmsDbContext> options")),
+      reconcile._unbuildable_contexts([_CTX_ART])[0]["detail"])
+check("a context that can be built produces no finding at all",
+      not reconcile._unbuildable_contexts([_OK_ART]))
+check("and a file that is not C# is never judged by it",
+      not reconcile._unbuildable_contexts(
+          [{"path": "a.php", "content": "class EmsDbContext extends DbContext {}"}]))
+
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

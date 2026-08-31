@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Set
 
-from backend.services.modernization import graph, layering, store, wireup
+from backend.services.modernization import graph, layering, store, usings, wireup
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,48 @@ def _controller_reachable(artifacts: List[Dict[str, Any]]) -> Set[str]:
             continue
         names.update(_CTOR_PARAM.findall(content))
     return names
+
+
+def _unbuildable_contexts(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Database contexts the container has no way to construct. Fatal.
+
+    Fatal, not advisory, and that is the whole point of it being here. `wireup` refuses to
+    register such a context and strips a registration the converter wrote for one, which makes
+    the application *start* and does not make it *work* — anything that needs the context still
+    cannot be built, and with start-up validation on, the host now says so and stops.
+
+    The real fix is a constructor the container can call, and only the converter can write it.
+    A `fail` finding is how that reaches the converter: the reconciliation gate carries it, the
+    driver stops on it, and a rework can act on it. Reported as a warning it would ship, which
+    is exactly what happened — the 45-file run's export compiled, and threw on the line the
+    guard was supposed to have caught.
+
+    Deliberately narrow. It says nothing about a context that takes options and is registered
+    without a provider (`db_note` covers that, and it is a charter question), nothing about a
+    context nobody uses, and nothing about whether the schema is right.
+    """
+    issues: List[Dict[str, Any]] = []
+    for artifact in artifacts or ():
+        path = str(artifact.get("path") or "")
+        if not path.lower().endswith(".cs"):
+            continue
+        content = artifact.get("content") or ""
+        found = wireup._DBCONTEXT_CLASS.search(usings.strip_non_code(content))
+        if not found:
+            continue
+        name = found.group(1)
+        if wireup.dbcontext_is_constructible(usings.strip_non_code(content), name):
+            continue
+        issues.append(_issue(
+            "unbuildable_dbcontext", "fail",
+            f"`{path}` declares `{name}`, whose every constructor asks for something other "
+            f"than its `DbContextOptions` — so neither `AddDbContext<{name}>()` nor the "
+            f"container can create one. This compiles. The application throws while it is "
+            f"starting, with a message about `System.String` rather than about this class. "
+            f"Give `{name}` the standard `{name}(DbContextOptions<{name}> options) : "
+            f"base(options)` constructor and move what the other parameters supplied into "
+            f"the options, or into a value read from configuration inside `OnConfiguring`."))
+    return issues
 
 
 def _unresolved_views(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -602,6 +644,8 @@ def run(run_id: str) -> Dict[str, Any]:
         for issue in wireup.unregistered_dependencies(artifacts, _registrations):
             issues.append(_issue(issue["kind"], issue["severity"], issue["detail"]))
 
+    for issue in _unbuildable_contexts(artifacts):
+        issues.append(issue)
     for issue in _unresolved_views(artifacts):
         issues.append(issue)
     for issue in _double_encoded_views(artifacts):
