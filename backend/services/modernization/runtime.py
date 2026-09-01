@@ -149,6 +149,21 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
     )
 
     failing = [c for c in checks if c["status"] >= 500 or (c["error"] and not c["status"])]
+    if status == "passed":
+        # Withdrawn on the report rather than at the next `gate` call, for the reason
+        # `build_results.ingest` documents: `_stop_reason` pauses at the top of every stage for
+        # any open blocking checkpoint, and `gate` runs at the end of reconcile — so a run
+        # holding an open `runtime_required` cannot reach the only code that would take it
+        # down. php-crud-v2 was in that state after a clean build and a passed startup check.
+        cleared = store.withdraw_checkpoints(
+            run_id, ("runtime_required",),
+            f"Withdrawn automatically: the application started and answered {len(checks)} "
+            f"probe(s) with {len(failing)} failing, which is the evidence this gate was "
+            f"asking for.")
+        if cleared:
+            store.append_event(
+                run_id, "gate_withdrawn",
+                f"{cleared} startup gate(s) withdrawn — this report answered them", level="info")
     if status == "failed":
         # Read the output and send what it names back through the loop, rather than storing a
         # log for a human to decode. Only a host that never started has output worth parsing;

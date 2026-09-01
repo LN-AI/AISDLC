@@ -11901,6 +11901,10 @@ check("an export nobody has compiled raises the build gate",
 # Reported through the real entry point, so the test cannot pass against a producer that
 # writes nothing — the mistake D-202 records.
 build_results.ingest(_gw, {"source": "local_dotnet", "diagnostics": []}, "smoke")
+check("the build report itself takes it back down, without waiting for the next gate",
+      not any(c["kind"] == "build_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)),
+      "the gate that blocks the resume is only cleared by code the resume cannot reach")
 build_results.gate(_gw)
 check("a clean build takes it back down",
       not any(c["kind"] == "build_required" and c["status"] == "open"
@@ -11926,6 +11930,9 @@ check("an export nobody has started raises the runtime gate",
           for c in store.list_checkpoints(_gw)))
 runtime.ingest(_gw, {"started": True, "base_url": "http://127.0.0.1:1",
                      "checks": [{"method": "GET", "path": "/", "status": 200}]}, "smoke")
+check("and a passed startup report clears its own gate the same way",
+      not any(c["kind"] == "runtime_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)))
 runtime.gate(_gw)
 check("a passed startup takes that one down too",
       not any(c["kind"] == "runtime_required" and c["status"] == "open"

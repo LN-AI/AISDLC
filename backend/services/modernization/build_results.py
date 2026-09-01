@@ -701,6 +701,21 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
         status = "passed"
         summary = (f"Build round {round_no} reported no errors "
                    f"({warning_count} warning(s)); nothing was sent back for rework.")
+        # Withdrawn on the *report*, not on the next gate evaluation, and the difference is
+        # whether a run can get out of the state at all. `_stop_reason` pauses at the top of
+        # every stage for any open blocking checkpoint, and `build_results.gate` runs at the
+        # end of reconcile — so a run holding an open `build_errors_outstanding` can never
+        # reach the code that would take it down. Run 8a9612e0 was in exactly that trap:
+        # compiled clean, and unable to resume, because the only thing that could retire the
+        # objection sat behind the objection. Doing it here means the evidence retires the
+        # question the moment the evidence exists.
+        cleared = store.withdraw_checkpoints(
+            run_id, ("build_required", "build_errors_outstanding"),
+            f"Withdrawn automatically: build round {round_no} compiled with 0 error(s), "
+            f"which is the evidence this gate was asking for.",
+            older_than_round=round_no)
+        if cleared:
+            notes.append(f"{cleared} build gate(s) withdrawn — this build answered them")
     elif not error_units:
         # Checked before non-convergence and before the round cap, because when nothing maps
         # nothing can ever be reopened — so the *next* build is identical by construction and
