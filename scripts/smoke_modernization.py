@@ -11783,6 +11783,38 @@ check("awaiting_rework is not a terminal status",
 check("and the loop resumes on it rather than stopping",
       'if status == "awaiting_rework":' in _br and "resuming" in _br)
 
+# ── A clean build is not the end of the run ────────────────────────────────
+#
+# The loop resumed a run only to drive *rework*: the `passed` branch returned straight out of
+# the function. So a run whose last obstacle was the build sat `paused` at `reconcile` with no
+# blocking checkpoint and nothing to push it over the line — the platform holding every piece
+# of evidence it had been asking for and still unable to say the conversion had finished.
+# Watched happen on run 8a9612e0: build round 9 clean, 8 URLs probed with 0 failing, and the
+# run reached `completed` only because a person made one more call by hand.
+#
+# Asserted on the source for the same reason the other `build_run.py` checks are: this program
+# talks HTTP to a running deployment, and the suite has neither. The live run below is what
+# actually verifies it.
+
+check("a clean build hands off to the code that finishes the run",
+      "_finish_run(api, key, run_id, token, project_id, started, deadline_hours)" in _br
+      and _br.index("def _finish_run") < _br.index('if status == "passed":'),
+      "the passed branch still returns without letting the run finish")
+check("and it does that after the startup check, not before",
+      _br.index("served = serve_export(") < _br.index(
+          "return _finish_run(api, key, run_id, token, project_id, started, deadline_hours)"),
+      "resuming before the app has been started re-raises the startup gate and pauses again")
+check("a failing startup check is left to the rework path rather than resumed into",
+      "if served != 0:" in _br and _br.index("if served != 0:") < _br.index(
+          "return _finish_run(api, key, run_id, token, project_id, started, deadline_hours)"))
+check("finishing still refuses to answer a checkpoint that is not this program's to answer",
+      _br.count('if k not in _LOOP_ANSWERS') == 2,
+      f"{_br.count('if k not in _LOOP_ANSWERS')} of the two paths filter what they may answer")
+check("and it says what a run is still waiting on rather than exiting quietly",
+      "still waiting on:" in _br and "paused_reason" in _br)
+
+
+
 
 
 
