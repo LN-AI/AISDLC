@@ -1075,6 +1075,16 @@ def apply_to_appsettings(content: str, name: str = CONNECTION_NAME) -> str:
     return json.dumps(merged, indent=2) + "\n"
 
 
+def catalogue_ids() -> Set[str]:
+    """Every package id this platform has an opinion about, for `packages.resolve`.
+
+    Public because the runner has to know which ids are already settled before it asks
+    nuget.org about them — reaching into `_PACKAGE_TYPES` from another module would make the
+    table's shape part of its interface.
+    """
+    return {package for _, package, _ in _PACKAGE_TYPES}
+
+
 def packages_for_code(content: str) -> Set[Tuple[str, str]]:
     """Packages the code in `content` proves it needs. Comments and strings are stripped
     first — a `// TODO: use Dapper here` must not add a dependency."""
@@ -1247,11 +1257,18 @@ def resolve_reference_cycles(existing: Dict[str, Set[str]], needed: Dict[str, Se
 
 
 def plan(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
-         namespace_to_project: Dict[str, str], entry_project: str = "") -> Dict[str, Any]:
+         namespace_to_project: Dict[str, str], entry_project: str = "",
+         extra_packages: Optional[Dict[str, Set[Tuple[str, str]]]] = None) -> Dict[str, Any]:
     """Work out what each project file is missing. Pure — no database, no I/O.
 
     `namespace_to_project` maps a component's namespace to the project it lives in, which is
     how a cross-namespace type reference becomes a `ProjectReference` edge.
+
+    `extra_packages` is per project, and holds ids that reached here by a route the pattern
+    table cannot cover: a converter asked for one in a project file, it was refused as a build
+    file, and the id was then confirmed against nuget.org or approved by a person. The table
+    stays the default and the only thing consulted for code — this is the escape hatch for the
+    long tail, and everything in it has already been verified by something outside this module.
     """
     projects = sorted({p for p in namespace_to_project.values() if p})
     needed_packages: Dict[str, Set[Tuple[str, str]]] = {p: set() for p in projects}
@@ -1280,6 +1297,13 @@ def plan(artifacts: List[Dict[str, Any]], symbol_namespaces: Dict[str, str],
             if target and target != owner:
                 needed_projects[owner].add(target)
                 carried.setdefault((owner, target), set()).add(path)
+
+    for owner, extras in (extra_packages or {}).items():
+        # A project with no converted `.cs` file of its own still gets its approved packages:
+        # `needed_packages` is keyed on every project in the namespace map, and an id confirmed
+        # against the registry is not conditional on which file happened to mention it.
+        needed_packages.setdefault(owner, set())
+        needed_packages[owner] |= {(str(n), str(v)) for n, v in extras if n and v}
 
     removed, problems = resolve_reference_cycles(
         existing_references(artifacts), needed_projects, entry_project,

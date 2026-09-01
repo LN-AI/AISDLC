@@ -6477,6 +6477,12 @@ const MOD_WAIVER_CHECKPOINTS = {
   // it "Approve" would put the one prominent blue button in the dashboard on the outcome the
   // gate exists to prevent.
   plan_conflicts:    { label: 'Convert this layout anyway', answer: { repair: 'proceed' } },
+  // Adding a package reference is a decision per id, not per checkpoint, so the buttons that
+  // actually add anything are rendered by `renderPackageChoices`. This one is the other
+  // answer, and it is deliberately the plain-looking one: leaving an unverifiable dependency
+  // out costs a compiler error naming a type, while adding a bad id costs `NU1102`, which
+  // stops the restore before there is any file or line to route the failure back to.
+  package_approval:  { label: 'Leave them out' },
 };
 
 function renderModernizationCheckpoints(checkpoints) {
@@ -6490,6 +6496,7 @@ function renderModernizationCheckpoints(checkpoints) {
         <div style="margin-top:6px">${md(c.detail) || `<span style="white-space:pre-wrap">${esc(c.detail || '')}</span>`}</div>
         ${renderCheckpointPayload(c)}
         ${renderCheckpointRepairs(c)}
+        ${renderPackageChoices(c)}
         ${waiver && waiver.help ? `<button class="btn btn-primary btn-sm" style="margin-top:8px"
                 onclick="${waiver.help}()">Show me how to do it</button>` : ''}
         <button class="btn ${waiver || !c.blocking ? 'btn-secondary' : 'btn-primary'} btn-sm" style="margin-top:8px"
@@ -6498,6 +6505,25 @@ function renderModernizationCheckpoints(checkpoints) {
                   waiver ? esc(waiver.label) : (c.blocking ? 'Approve' : 'Acknowledge')}</button>
       </div>`;
     }).join('')}
+  </div>`;
+}
+
+// Packages the converter asked for that this platform could not confirm — nuget.org has no
+// such id, or could not be reached. One button per id and an "add all", because a person may
+// recognise one name and not the other, and a single Approve would make that impossible to
+// express. Nothing here is a waiver: the ids that *were* confirmed never reach this screen,
+// they are already in the project file.
+function renderPackageChoices(c) {
+  if (c.kind !== 'package_approval') return '';
+  const rows = ((c.payload || {}).candidates || []).filter(r => r && r.name);
+  if (!rows.length) return '';
+  return `<div style="margin-top:8px">
+    ${rows.map(r => `<button class="btn btn-secondary btn-sm" style="margin:2px"
+        onclick="approveModernizationPackages('${esc(c.id)}', ['${jsArg(r.name)}'])"
+        >Add ${esc(r.name)} ${esc(r.version || r.requested || '')}</button>`).join('')}
+    ${rows.length > 1 ? `<button class="btn btn-primary btn-sm" style="margin:2px"
+        onclick="approveModernizationPackages('${esc(c.id)}', [])"
+        >Add all ${rows.length}</button>` : ''}
   </div>`;
 }
 
@@ -6650,7 +6676,7 @@ function renderModernizationComponents(components) {
           <td class="mod-unit-path">${esc(c.output_dir || '')}</td>
           <td title="${esc((c.members || []).join(', '))}">${(c.members || []).length}</td>
           <td><span class="compliance-chip">${esc(c.risk || '')}</span></td>
-          <td><span class="mod-status ${esc(c.status)}">${esc(c.status)}</span>${c.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
+          <td><span class="mod-status ${esc(c.status)}">${esc(modUnitStatusLabel(c.status))}</span>${c.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
         </tr>`).join('')}</tbody>
       </table>
     </div>
@@ -7951,6 +7977,10 @@ const MOD_UNIT_STATUS_LABELS = {
   in_progress: 'converting',
   needs_human: 'needs review',
   rolled_up: 'in a component',
+  // Not 'failed'. This unit converted, its output is in the export and shipping; what failed
+  // was a later repair, which was rejected and never replaced it. Showing it in the same red
+  // as a unit that produced nothing is the exact confusion the status split exists to end.
+  repair_failed: 'converted · repair failed',
 };
 
 function modUnitStatusLabel(status) {
@@ -8140,6 +8170,26 @@ function cancelModernizationRun() {
   // Terminal, and it stops a run someone may be paying for — worth one confirmation.
   if (!confirm('Cancel this run? Converted files are kept and stay downloadable, but conversion stops for good.')) return;
   _modAction('cancel', { reason: 'Cancelled from the dashboard' });
+}
+
+// An empty `names` means every candidate on the checkpoint, which is what "Add all" sends
+// and what the backend reads an empty list as. The decision word matters: `_approved_packages`
+// only acts on an explicit approval, so the free-text decision a person types on the generic
+// button can never add a dependency by accident.
+async function approveModernizationPackages(checkpointId, names) {
+  const what = names.length ? names.join(', ') : 'every package listed';
+  if (!confirm(`Add ${what} to the project file? They will be restored from your package `
+             + `feed when this export is built.`)) return;
+  try {
+    await apiFetch(`/api/v1/modernization/checkpoints/${checkpointId}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved', answer: { packages: names } }),
+    });
+    await refreshModernizationRun();
+  } catch (e) {
+    alert(e.message);
+  }
 }
 
 async function answerModernizationCheckpoint(checkpointId, repair) {

@@ -46,7 +46,8 @@ from backend.services.modernization import (  # noqa: E402
     contracts, csharp_syntax,
     evidence, extraction_audit, graph, layering, lookup, ownership, parity, parity_tools,
     reconcile,
-    repo_ingest, runner, rules as rules_module, runtime, sanity, scaffold, stages, store,
+    packages, repo_ingest, runner, rules as rules_module, runtime, sanity, scaffold,
+    stages, store,
     usings,
     validation, wireup,
 )
@@ -11782,6 +11783,326 @@ check("awaiting_rework is not a terminal status",
 check("and the loop resumes on it rather than stopping",
       'if status == "awaiting_rework":' in _br and "resuming" in _br)
 
+
+
+
+# ── "Produced nothing" and "produced good work, then a repair failed" ──────
+#
+# `failed` carried both meanings and the code had to tell them apart. Run 8a9612e0's auth
+# component converted cleanly on attempt 1, was reopened over a package reference it was never
+# permitted to add, had three rewrites rejected for withdrawing `AuthController.Logout`, and
+# retired `failed`. `_finalize` then set the run to `failed` with "1 of 14 component(s) did not
+# convert, so 3 source file(s) have no output" — about three files whose output was in the
+# export, compiled, and served requests. The artifact rows had it right the whole time: v1
+# `is_current=1`, v2-v4 REJECTED.
+#
+# The functional half matters more than the label. `reopen_units` refuses `failed` on the
+# stated grounds that such a unit "produced no current artifact to complain about" — so the one
+# component the build most wanted fixed was the one component the rework loop could never touch
+# again.
+section("A failed repair is not a failed conversion")
+
+_rf = store.create_run("repair-vs-failure", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rf, [
+    {"path": "#component/shipped", "kind": "component", "component_name": "shipped",
+     "status": "ready", "target_project": "W", "output_dir": "W",
+     "meta": {"members": ["a.php", "b.php"]}},
+    {"path": "#component/empty", "kind": "component", "component_name": "empty",
+     "status": "ready", "target_project": "W", "output_dir": "W",
+     "meta": {"members": ["c.php"]}},
+])
+_rf_shipped, _rf_empty = (store.list_units(_rf, kind="component")[0],
+                          store.list_units(_rf, kind="component")[1])
+if _rf_shipped["component_name"] != "shipped":
+    _rf_shipped, _rf_empty = _rf_empty, _rf_shipped
+
+# The real producer, not a hand-written artifact row: this is the call the convert stage makes.
+store.complete_unit(_rf_shipped["id"], _rf,
+                    [{"path": "W/Auth.cs", "content": "public class Auth { }"}], [],
+                    event_detail="converted")
+
+_rf_a = store.fail_unit(_rf_shipped["id"], _rf, "rewrite withdrew Auth.Logout", terminal=True)
+_rf_b = store.fail_unit(_rf_empty["id"], _rf, "returned no files", terminal=True)
+check("a unit whose output is still shipping retires as repair_failed",
+      _rf_a == "repair_failed", _rf_a)
+check("a unit that produced nothing still retires as failed", _rf_b == "failed", _rf_b)
+check("both are terminal, so neither is claimable again",
+      set(store.TERMINAL_UNIT_STATES) >= {"failed", "repair_failed"}
+      and store.claim_next_unit(_rf, "smoke", kind="component") is None)
+
+# The half that is not cosmetic.
+check("a repair_failed unit can be reopened, because a diagnostic can have come from it",
+      store.reopen_units(_rf, [_rf_shipped["id"]], "build error in Auth.cs")["reopened"] == 1)
+check("and a genuinely failed one still cannot",
+      store.reopen_units(_rf, [_rf_empty["id"]], "build error")["reopened"] == 0
+      and (store.get_unit(_rf_empty["id"]) or {})["status"] == "failed")
+
+# Put it back, and check what a human is told about each.
+store.fail_unit(_rf_shipped["id"], _rf, "rewrite withdrew Auth.Logout", terminal=True)
+_rf_report = reconcile.run(_rf)
+_rf_kinds = {i["kind"]: i for i in _rf_report["issues"]}
+check("reconciliation reports the failed component as a fatal missing-output finding",
+      _rf_kinds.get("component_failed", {}).get("severity") == "fail"
+      and "c.php" in _rf_kinds.get("component_failed", {}).get("detail", ""))
+check("and the repair_failed one as a warning, not as missing output",
+      _rf_kinds.get("component_repair_failed", {}).get("severity") == "warn",
+      str(sorted(_rf_kinds)))
+check("naming its files without claiming they produced nothing",
+      "a.php" in _rf_kinds.get("component_repair_failed", {}).get("detail", "")
+      and "a.php" not in _rf_kinds.get("component_failed", {}).get("detail", ""))
+check("the status tally counts them apart",
+      store.unit_status_counts(_rf, kind="component")["failed"] == 1
+      and store.unit_status_counts(_rf, kind="component")["repair_failed"] == 1)
+
+# Runs converted before this state existed stored *both* kinds of failure as `failed`, and the
+# fact underneath — current artifacts — is identical in an old row and a new one. So the two
+# places that decide whether an export is partial ask the artifacts, not the status word;
+# otherwise the fix would only ever reach runs converted after it shipped, and run 8a9612e0,
+# the one that produced it, would still be reported as having lost three files.
+store.set_unit_status(_rf_shipped["id"], "failed", "recorded before repair_failed existed")
+check("a component labelled failed by an older run is not counted as missing output",
+      [c["component_name"] for c in runner._components_without_output(_rf)] == ["empty"],
+      str([c["component_name"] for c in runner._components_without_output(_rf)]))
+_rf_old = {i["kind"] for i in reconcile.run(_rf)["issues"]}
+check("and it is still reported, as the warning rather than the fatal finding",
+      "component_repair_failed" in _rf_old,
+      str(sorted(_rf_old)))
+check("while the one that really produced nothing keeps its fatal finding",
+      "component_failed" in _rf_old)
+store.set_unit_status(_rf_shipped["id"], "repair_failed", "back to the current state")
+
+
+# ── A gate that evidence has answered comes back down ──────────────────────
+#
+# Every gate in this subsystem ratcheted one way. `build_results.gate` raises "this export has
+# never been compiled", somebody compiles it clean, and the clean branch returns without ever
+# looking at the question it asked last time. `_finalize` will not complete a run while a
+# blocking checkpoint is open, so run 8a9612e0 compiled with 0 errors at 14:55:37 and stayed
+# parked on a checkpoint raised at 14:55:11 saying it had never been compiled — and php-crud-v2
+# sat on `build_required` *and* `runtime_required` after a clean build and a passed startup.
+# Neither run could ever report success. `_withdraw_end_of_run_gates` was the opposite
+# direction, and only that half existed.
+section("Gates come back down when the evidence arrives")
+
+_gw = store.create_run("gate-withdrawal", ".NET 8", "files", created_by="smoke")
+store.insert_units(_gw, [
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "ready", "target_project": "W", "output_dir": "W"}])
+_gw_unit = store.list_units(_gw, kind="component")[0]
+store.complete_unit(_gw_unit["id"], _gw,
+                    [{"path": "W/A.cs", "content": "public class A { }"}], [],
+                    event_detail="ok")
+
+build_results.gate(_gw)
+check("an export nobody has compiled raises the build gate",
+      any(c["kind"] == "build_required" and c["status"] == "open"
+          for c in store.list_checkpoints(_gw)))
+
+# Reported through the real entry point, so the test cannot pass against a producer that
+# writes nothing — the mistake D-202 records.
+build_results.ingest(_gw, {"source": "local_dotnet", "diagnostics": []}, "smoke")
+build_results.gate(_gw)
+check("a clean build takes it back down",
+      not any(c["kind"] == "build_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)),
+      str([(c["kind"], c["status"]) for c in store.list_checkpoints(_gw)]))
+check("withdrawn, not answered by a person — the history must not claim a decision nobody made",
+      any(c["kind"] == "build_required"
+          and (c.get("answer") or {}).get("decision") == "withdrawn"
+          and c.get("answered_by") == "system"
+          for c in store.list_checkpoints(_gw)))
+
+# The guard that keeps this from being the evidence loss the gates exist to prevent.
+store.create_checkpoint(_gw, "build_errors_outstanding", "a later round failed",
+                        blocking=True, payload={"round": 99})
+build_results.gate(_gw)
+check("a gate raised about a later round than the one that passed is left alone",
+      any(c["kind"] == "build_errors_outstanding" and c["status"] == "open"
+          for c in store.list_checkpoints(_gw)))
+
+runtime.gate(_gw)
+check("an export nobody has started raises the runtime gate",
+      any(c["kind"] == "runtime_required" and c["status"] == "open"
+          for c in store.list_checkpoints(_gw)))
+runtime.ingest(_gw, {"started": True, "base_url": "http://127.0.0.1:1",
+                     "checks": [{"method": "GET", "path": "/", "status": 200}]}, "smoke")
+runtime.gate(_gw)
+check("a passed startup takes that one down too",
+      not any(c["kind"] == "runtime_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)),
+      str([(c["kind"], c["status"]) for c in store.list_checkpoints(_gw)]))
+
+
+# ── The same rejection twice is not worth a third attempt ──────────────────
+#
+# The retry limit counted attempts and never compared *why* they failed, so three identical
+# refusals looked no different from three different ones. The auth component was rewritten
+# three times and rejected each time with the same sentence, two and a half minutes and a
+# conversion call apiece, over an objection no rewrite could have satisfied.
+section("An identical rejection stops the loop")
+
+_rr = store.create_run("repeat-rejection", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rr, [
+    {"path": "#component/x", "kind": "component", "component_name": "x", "status": "ready"},
+    {"path": "#component/y", "kind": "component", "component_name": "y", "status": "ready"},
+    {"path": "#component/z", "kind": "component", "component_name": "z", "status": "ready"},
+])
+_rr_x, _rr_y, _rr_z = sorted(store.list_units(_rr, kind="component"),
+                             key=lambda u: u["component_name"])
+
+_same = "`AuthController.Logout` is no longer declared, and _Layout.cshtml still calls it."
+check("the first rejection is retryable",
+      store.fail_unit(_rr_x["id"], _rr, _same, max_attempts=3, stop_if_repeated=True) == "ready")
+check("the same rejection a second time is terminal, without spending the third attempt",
+      store.fail_unit(_rr_x["id"], _rr, _same, max_attempts=3, stop_if_repeated=True) == "failed",
+      str((store.get_unit(_rr_x["id"]) or {}).get("attempts")))
+check("and the record says it stopped because the reason repeated",
+      ((store.get_unit(_rr_x["id"]) or {}).get("error") or {}).get("repeated") is True)
+
+check("a different rejection is still retryable",
+      store.fail_unit(_rr_y["id"], _rr, _same, max_attempts=3, stop_if_repeated=True) == "ready"
+      and store.fail_unit(_rr_y["id"], _rr, "something else entirely", max_attempts=3,
+                          stop_if_repeated=True) == "ready")
+check("whitespace is not a difference",
+      store.fail_unit(_rr_y["id"], _rr, "something   else\nentirely", max_attempts=3,
+                      stop_if_repeated=True) == "failed")
+
+# The safety property, and the reason this is opt-in rather than automatic: a transient
+# failure repeating identically is the strongest possible argument for trying again.
+check("a repeated *transient* failure is never cut short",
+      [store.fail_unit(_rr_z["id"], _rr, "LLMTimeout: read timed out", max_attempts=3)
+       for _ in range(2)] == ["ready", "ready"])
+
+
+# ── A package the converter asked for is checked, not guessed and not binned ─
+#
+# The conversion stage may not write project files: the first two live runs had components
+# inventing `Microsoft.AspNetCore.Authentication.Cookies` and `Microsoft.AspNetCore.Rewrite` at
+# 8.0.0, ids absorbed into the shared framework in 3.0, and `NU1102` stops the *restore* — so
+# there is no file and no line to route the failure back to, and the run reads as a conversion
+# that will not converge. That refusal stays.
+#
+# Throwing the refused file away was the mistake. Run 8a9612e0 spent three build rounds and
+# three conversion calls on `CS0103: The name 'BCrypt' does not exist` while the converter had
+# twice submitted a project file naming `BCrypt.Net-Next` 4.0.3 — real, and exactly right. The
+# authority that separates the two cases is neither this codebase nor a model: it is the
+# registry. Stubbed here, because this suite runs with no network.
+section("Package requests are verified against the registry")
+
+_versions = {"bcrypt.net-next": ["4.0.0", "4.0.3"],
+             "serilog": ["3.1.1", "4.4.0", "5.0.0-dev"],
+             "contoso.invented": []}
+_real_lookup = packages.nuget_versions
+packages.nuget_versions = lambda name, timeout=0: (
+    None if name.lower() == "unreachable.pkg" else _versions.get(name.lower(), []))
+try:
+    _csproj = ('<Project Sdk="Microsoft.NET.Sdk.Web"><ItemGroup>\n'
+               '  <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />\n'
+               '  <PackageReference Version="8.0.0" Include="Microsoft.AspNetCore.Rewrite" />\n'
+               '  <PackageReference Include="Serilog" Version="99.99.99" />\n'
+               '  <PackageReference Include="Contoso.Invented" Version="1.0.0" />\n'
+               '  <PackageReference Include="Unreachable.Pkg" Version="1.0.0" />\n'
+               '</ItemGroup></Project>')
+    check("both attribute orders are read, and a version-less reference is not lost",
+          packages.parse_requests(_csproj)[:3] == [
+              ("BCrypt.Net-Next", "4.0.3"), ("Microsoft.AspNetCore.Rewrite", "8.0.0"),
+              ("Serilog", "99.99.99")],
+          str(packages.parse_requests(_csproj)))
+
+    _pk_rows = packages.resolve(packages.parse_requests(_csproj),
+                                known_ids=sorted(wireup.catalogue_ids()),
+                                framework_ids=sorted(wireup.FRAMEWORK_PROVIDED_PACKAGES))
+    _pk = {r["name"]: r for r in _pk_rows}
+    check("an id the shared framework provides is refused without asking the registry",
+          _pk["Microsoft.AspNetCore.Rewrite"]["verdict"] == "framework")
+    check("an id this platform's own catalogue covers is left to the catalogue",
+          _pk["BCrypt.Net-Next"]["verdict"] == "known")
+    check("an id the registry has, at a version it does not, moves to the newest stable one",
+          _pk["Serilog"]["verdict"] == "substituted" and _pk["Serilog"]["version"] == "4.4.0",
+          str(_pk["Serilog"]))
+    check("a prerelease is never what a converted application is pinned to",
+          "5.0.0-dev" not in str(_pk["Serilog"]["version"]))
+    check("an id the registry answered about and does not have needs a person",
+          _pk["Contoso.Invented"]["verdict"] == "missing")
+    check("and an id the registry could not be asked about needs one too, for a different reason",
+          _pk["Unreachable.Pkg"]["verdict"] == "unreachable")
+    check("only registry-confirmed ids are added without asking",
+          packages.approved(_pk_rows) == [("Serilog", "4.4.0")],
+          str(packages.approved(_pk_rows)))
+    check("and exactly the two unverifiable ones are put to a human",
+          sorted(r["name"] for r in packages.unresolved(_pk_rows))
+          == ["Contoso.Invented", "Unreachable.Pkg"])
+
+    # Producer side. A test that hands `resolve` its own list proves nothing about whether the
+    # refusal path ever produces one — the failure D-202 records, in the module that caused it.
+    _pq = store.create_run("package-capture", ".NET 8", "files", created_by="smoke")
+    store.insert_units(_pq, [
+        {"path": "#component/auth", "kind": "component", "component_name": "auth",
+         "status": "ready", "target_project": "W", "output_dir": "W"}])
+    _pq_unit = store.list_units(_pq, kind="component")[0]
+    _pq_rejected, _pq_asked = [], []
+    _pq_placed = runner._place_artifacts(
+        _pq, _pq_unit,
+        [{"filename": "W.csproj", "content": _csproj},
+         {"filename": "AuthService.cs", "content": "public class AuthService { }"}],
+        _pq_rejected, _pq_asked)
+    check("the project file is still refused",
+          [a["path"] for a in _pq_placed] == ["W/AuthService.cs"],
+          str([a["path"] for a in _pq_placed]))
+    check("but the package ids it named survive the refusal",
+          ("BCrypt.Net-Next", "4.0.3") in _pq_asked and len(_pq_asked) == 5,
+          str(_pq_asked))
+    check("and the reason a human reads says they were kept, not that they were derived",
+          any("being checked against nuget.org" in r for r in _pq_rejected),
+          "; ".join(_pq_rejected))
+
+    runner._resolve_packages(_pq, _pq_unit, _pq_asked)
+    check("a confirmed id is recorded against the component with no checkpoint raised for it",
+          [list(p) for p in ((store.get_unit(_pq_unit["id"]) or {}).get("meta") or {}).get(
+              "approved_packages") or []] == [["Serilog", "4.4.0"]],
+          str((store.get_unit(_pq_unit["id"]) or {}).get("meta", {}).get("approved_packages")))
+    _pq_gate = [c for c in store.list_checkpoints(_pq) if c["kind"] == "package_approval"]
+    check("the unverifiable ones raise one blocking checkpoint between them",
+          len(_pq_gate) == 1 and _pq_gate[0]["blocking"]
+          and len((_pq_gate[0].get("payload") or {}).get("candidates") or []) == 2)
+    check("and the checkpoint names what was settled without a person, so it reads as a whole",
+          "Serilog" in (_pq_gate[0].get("detail") or ""))
+
+    # What the run does with the answer, read where it is used.
+    check("before anyone answers, only the confirmed id reaches wireup",
+          runner._approved_packages(_pq, store.list_units(_pq, kind="component"))
+          == {"W": {("Serilog", "4.4.0")}})
+    store.answer_checkpoint(_pq_gate[0]["id"],
+                            {"decision": "approved", "packages": ["Contoso.Invented"]}, "smoke")
+    _pq_after = runner._approved_packages(_pq, store.list_units(_pq, kind="component"))
+    check("an approval adds the one id that was named and not the other",
+          _pq_after == {"W": {("Serilog", "4.4.0"), ("Contoso.Invented", "1.0.0")}},
+          str(_pq_after))
+
+    _pq_plan = wireup.plan(
+        [{"path": "W/AuthService.cs", "content": "public class AuthService { }"}],
+        {}, {"Acme.W": "W"}, "W", extra_packages=_pq_after)
+    check("and wireup puts it in that project's package list",
+          ("Contoso.Invented", "1.0.0") in (_pq_plan["packages"].get("W") or []),
+          str(_pq_plan["packages"]))
+
+    # The safe direction, and the one that must never be reached by accident.
+    _pq2 = store.create_run("package-declined", ".NET 8", "files", created_by="smoke")
+    store.insert_units(_pq2, [
+        {"path": "#component/auth", "kind": "component", "component_name": "auth",
+         "status": "ready", "target_project": "W", "output_dir": "W"}])
+    _pq2_unit = store.list_units(_pq2, kind="component")[0]
+    runner._resolve_packages(_pq2, _pq2_unit, [("Contoso.Invented", "1.0.0")])
+    _pq2_gate = [c for c in store.list_checkpoints(_pq2) if c["kind"] == "package_approval"][0]
+    store.answer_checkpoint(_pq2_gate["id"], {"decision": "Reviewed and approved"}, "smoke")
+    check("the free text a person types on the generic button never adds a dependency",
+          runner._approved_packages(_pq2, store.list_units(_pq2, kind="component")) == {},
+          "an unverified package id was added by a decision that did not approve it")
+finally:
+    packages.nuget_versions = _real_lookup
+
+check("the registry lookup is restored for anything after this section",
+      packages.nuget_versions is _real_lookup)
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

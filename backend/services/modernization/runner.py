@@ -27,7 +27,7 @@ import logging
 import os
 import socket
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.agents.modernization_intelligence import architect_agent, unit_converter
 from backend.agents.modernization_intelligence import comprehension_agent as _comprehension
@@ -39,7 +39,8 @@ from backend.services.modernization import charter as charter_module
 from backend.services.modernization import contracts
 from backend.services.modernization import (
     advice, analyzers, architecture, build_results, comprehension, estimate, evidence,
-    extraction_audit, graph, layering, lookup, ownership, parity, playbooks, reconcile,
+    extraction_audit, graph, layering, lookup, ownership, packages as package_registry,
+    parity, playbooks, reconcile,
     repo_ingest, rules, runtime, sanity, scaffold, semantics, stages, store, usings,
     validation, wireup,
 )
@@ -1724,7 +1725,7 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
         next((c.get("target_project") for c in components if c.get("target_project")), "")
 
     needed = wireup.plan(artifacts, store.symbol_namespaces(run_id), namespace_to_project,
-                         entry_project)
+                         entry_project, _approved_packages(run_id, components))
     by_path = {a["path"]: a for a in artifacts}
     rewritten: List[Dict[str, Any]] = []
     notes: List[str] = []
@@ -1988,7 +1989,9 @@ def _unit_source(run_id: str, unit: Dict[str, Any],
 
 def _place_artifacts(run_id: str, unit: Dict[str, Any],
                      files: List[Dict[str, Any]],
-                     rejected: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                     rejected: Optional[List[str]] = None,
+                     package_requests: Optional[List[Tuple[str, str]]] = None
+                     ) -> List[Dict[str, Any]]:
     """Join each returned file name onto the directory this run already chose for it.
 
     The model gives a bare `filename` and at most a `subdir`; the component's `output_dir`
@@ -2048,10 +2051,22 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
                   if raw else "a returned file carried no filename at all")
             continue
         if build_files and raw.lower().endswith(build_files):
+            # Refused, but no longer discarded. The sentence below used to end "…is derived
+            # from the code instead", and run 8a9612e0 is the counter-example: the code said
+            # `BCrypt.Net.BCrypt.Verify`, nothing in the catalogue derived a package from it,
+            # and the answer was sitting in the very file being thrown away. Keeping the ids
+            # concedes nothing — they are checked against nuget.org before anything is added,
+            # which is the authority neither this codebase nor the model can be.
+            asked = package_registry.parse_requests(entry.get("content") or "")
+            if package_requests is not None:
+                package_requests.extend(asked)
             _drop(f"{raw} is a build file, and those are written by the scaffold and wireup "
                   f"stages from a catalogue of packages known to exist at this target "
-                  f"framework — not by a conversion. Anything this file needed to say about "
-                  f"dependencies is derived from the code instead.")
+                  f"framework — not by a conversion."
+                  + (f" The {len(asked)} package reference(s) it named were kept and are "
+                     f"being checked against nuget.org."
+                     if asked else
+                     " It named no package references, so there was nothing to keep."))
             continue
         subdir = (entry.get("subdir") or "").strip().strip("/")
         if subdir and (".." in subdir.split("/") or subdir.startswith("/")):
@@ -2175,6 +2190,188 @@ def _plan_repair_options(run_id: str, gaps: List[Dict[str, Any]],
         # repairs the gate reads exactly as it did before they existed.
         logger.exception("Could not compute plan repairs for run %s (continuing)", run_id)
         return []
+
+
+def _components_without_output(run_id: str) -> List[Dict[str, Any]]:
+    """Components that produced nothing at all — the only ones that make an export partial.
+
+    Decided on the artifacts rather than on the status word, for two reasons. A run converted
+    before `repair_failed` existed recorded both kinds of failure as `failed`, and the fact
+    underneath is identical in old rows and new ones — so asking `is_current` repairs those
+    runs without rewriting a single stored status. And it removes the possibility of the two
+    ever disagreeing: `_finalize` used to declare a run partial from a status tally while the
+    export it was describing contained every file it said was missing (run 8a9612e0: "3 source
+    file(s) have no output" about three files that compiled and served requests).
+    """
+    return [c for c in store.list_units(run_id, kind="component")
+            if c.get("status") in ("failed", "needs_human")
+            and not store.has_current_artifacts(c["id"])]
+
+
+def _approved_packages(run_id: str,
+                       components: List[Dict[str, Any]]) -> Dict[str, Set[Tuple[str, str]]]:
+    """Every package id cleared for this run, keyed by the project that needs it.
+
+    Two sources, both read at the point of use rather than written into a shared place when
+    they happen: what `_resolve_packages` confirmed against nuget.org during conversion, and
+    what a person approved on a `package_approval` checkpoint. Reading the checkpoint here is
+    what makes the human answer take effect — the answer endpoint is generic and has no
+    per-kind hooks, and giving it one would put this decision two modules away from the only
+    code that consumes it.
+
+    A checkpoint that was declined, or answered with anything other than an approval, adds
+    nothing. That is the safe direction: the build then reports the missing type, which is
+    exactly what happens today and is a diagnosis rather than a restore failure.
+    """
+    by_unit = {c["id"]: c for c in components}
+    approved: Dict[str, Set[Tuple[str, str]]] = {}
+
+    def _add(project: str, pairs) -> None:
+        if not project:
+            return
+        for pair in pairs:
+            if len(pair) == 2 and all(pair):
+                approved.setdefault(project, set()).add((str(pair[0]), str(pair[1])))
+
+    for component in components:
+        _add(component.get("target_project") or "",
+             ((component.get("meta") or {}).get("approved_packages") or []))
+
+    for checkpoint in store.list_checkpoints(run_id):
+        if checkpoint["kind"] != "package_approval" or checkpoint["status"] == "open":
+            continue
+        answer = checkpoint.get("answer") or {}
+        decision = str(answer.get("decision") or "").strip().lower()
+        if decision not in ("approve", "approved", "yes", "add", "accept"):
+            continue
+        owner = by_unit.get(checkpoint.get("unit_id") or "", {}).get("target_project") or ""
+        candidates = (checkpoint.get("payload") or {}).get("candidates") or []
+        # A person may approve some of what was asked and not all of it, by naming ids in the
+        # answer. Naming none means "all of them", which is what a plain Approve button sends.
+        chosen = {str(n).lower() for n in (answer.get("packages") or [])}
+        _add(owner, [(row.get("name"), row.get("version") or row.get("requested"))
+                     for row in candidates
+                     if not chosen or str(row.get("name") or "").lower() in chosen])
+
+    if approved:
+        store.append_event(
+            run_id, "packages_approved",
+            "; ".join(f"{project}: " + ", ".join(f"{n} {v}" for n, v in sorted(pairs))
+                      for project, pairs in sorted(approved.items()))[:500],
+            level="info")
+    return approved
+
+
+def _resolve_packages(run_id: str, unit: Dict[str, Any],
+                      requests: List[Tuple[str, str]]) -> None:
+    """Check the package ids a refused project file asked for, and act on the verdicts.
+
+    Three outcomes, and which one applies is decided by nuget.org rather than here:
+
+      * the registry has the id (at that version, or at a newer stable one) — added to this
+        component's meta, which `_wireup_one` unions into the project file. No human, because
+        there is nothing left to decide: a published id at a published version is a fact.
+      * our own catalogue or the shared framework already covers it — nothing to do, and in
+        the framework case adding it is the specific error that produced `NU1102` on two
+        earlier runs, so it is refused with the reason on the record.
+      * the registry says no such id, or could not be reached — a blocking checkpoint, because
+        this is precisely the guess that must not be made silently.
+
+    Blocking is a real cost and worth naming: the run stops here rather than at the build,
+    with the rest of the conversion unspent. That is the trade deliberately — the alternative
+    is paying for the remaining components to arrive at a restore failure we could already
+    see, and a paused run is cheap to resume by construction (D-03). One checkpoint per
+    unknown id, and the common case (a real package, e.g. `BCrypt.Net-Next` 4.0.3) raises none.
+
+    Never raises. A registry that is down must not be able to fail a conversion that was
+    otherwise fine — the argument D-101 makes about nets that can break what they watch.
+    """
+    try:
+        rows = package_registry.resolve(requests,
+                                        known_ids=sorted(wireup.catalogue_ids()),
+                                        framework_ids=sorted(wireup.FRAMEWORK_PROVIDED_PACKAGES))
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not resolve package requests for run %s (continuing)", run_id)
+        return
+
+    store.append_event(run_id, "packages_requested",
+                       (f"{len(requests)} package reference(s) from a refused project "
+                        f"file:\n" + package_registry.describe(rows))[:500],
+                       unit_id=unit["id"], level="info")
+
+    approved = package_registry.approved(rows)
+    if approved:
+        # Re-read rather than trusting the `unit` dict in hand: it was loaded when the unit was
+        # claimed, and a component reopened twice would otherwise drop the ids the first pass
+        # confirmed.
+        fresh = store.get_unit(unit["id"]) or {}
+        held = {tuple(p) for p in ((fresh.get("meta") or {}).get("approved_packages") or [])}
+        store.set_unit_meta(unit["id"], {
+            "approved_packages": sorted([list(p) for p in held | set(approved)])})
+
+    pending = package_registry.unresolved(rows)
+    if pending:
+        names = ", ".join(f"{r['name']} {r.get('requested') or ''}".strip() for r in pending)
+        store.create_checkpoint(
+            run_id, "package_approval",
+            f"{len(pending)} package(s) the converter asked for could not be verified",
+            detail=(
+                f"Converting `{unit.get('component_name') or unit['path']}` produced code that "
+                f"needs package(s) this platform does not know, and nuget.org did not confirm "
+                f"them:\n\n{package_registry.describe(pending)}\n\n"
+                f"Approving adds them to the project file exactly as named. Declining leaves "
+                f"the project file alone, and the build will report the missing type — which "
+                f"is what happens today.\n\n"
+                f"A package id that cannot restore is worse than a missing one: `NU1102` stops "
+                f"the restore before anything compiles, so there is no file and no line to "
+                f"route the failure back to. Approve an id you recognise, or one your own "
+                f"package feed carries.\n\n"
+                f"Everything else the same file asked for has already been settled without "
+                f"you:\n\n{package_registry.describe([r for r in rows if r not in pending])}"
+            )[:4000],
+            unit_id=unit["id"], blocking=True,
+            payload={"candidates": pending, "resolved": rows},
+        )
+
+
+def _stopped_repeating(run_id: str, unit: Dict[str, Any], status: str,
+                       kind: str, detail: str) -> None:
+    """Say so when a unit retired on a rejection, and say *why it stopped when it did*.
+
+    The contract branch was the one terminal path in `_convert_one` that raised no checkpoint
+    at all: it failed the unit, logged an event, and returned. So the auth component of run
+    8a9612e0 exhausted three attempts against an identical objection and the only trace a
+    human could find was three `contract_broken` lines in the event stream — nothing on the
+    checkpoints screen, nothing blocking, nothing asking to be read.
+
+    Non-blocking. Nothing is missing from the export in the `repair_failed` case (the previous
+    output is still current and still shipping), and in the `failed` case reconciliation
+    already raises the component as a fatal finding. This is the record of *this* decision.
+    """
+    if status not in store.TERMINAL_UNIT_STATES:
+        return
+    repeated = bool(((store.get_unit(unit["id"]) or {}).get("error") or {}).get("repeated"))
+    name = unit.get("component_name") or unit["path"]
+    store.create_checkpoint(
+        run_id, kind,
+        (f"{name} was rewritten twice with the same objection, so it stopped there"
+         if repeated else
+         f"{name} could not be rewritten without breaking something else"),
+        detail=(
+            ("Two attempts in a row were rejected for exactly the same reason, so the "
+             "remaining attempts would have argued with the same answer and were not "
+             "spent.\n\n"
+             if repeated else
+             "Every attempt at this component was rejected.\n\n")
+            + ("Its converted output from before the rework is unchanged and is what "
+               "the export contains — nothing here is missing, but nothing the rework "
+               "was trying to fix was fixed either.\n\n"
+               if status == "repair_failed" else
+               "This component produced no output, so its source files have none.\n\n")
+            + detail
+        )[:4000],
+        unit_id=unit["id"], blocking=False,
+    )
 
 
 def _design_projects(run_id: str) -> List[Dict[str, Any]]:
@@ -3055,7 +3252,11 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         store.add_run_spend(run_id, float(cost))
 
     rejected: List[str] = []
-    artifacts = _place_artifacts(run_id, unit, result.get("files") or [], rejected)
+    package_requests: List[Tuple[str, str]] = []
+    artifacts = _place_artifacts(run_id, unit, result.get("files") or [], rejected,
+                                 package_requests)
+    if package_requests:
+        _resolve_packages(run_id, unit, package_requests)
     if not artifacts:
         detail = ("The converter returned no files for this unit."
                   if not rejected else
@@ -3164,8 +3365,9 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # out — is what produced a 3 -> 22 error round on a live run, where one rewrite put one
         # detail wrong in twenty-two dependent places and nothing noticed until the compiler
         # counted them.
-        store.fail_unit(unit["id"], run_id, detail[:400], terminal=False,
-                        max_attempts=MAX_UNIT_ATTEMPTS)
+        status = store.fail_unit(unit["id"], run_id, detail[:400], terminal=False,
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        _stopped_repeating(run_id, unit, status, "contract_broken", detail)
         return "failed"
 
     if report["status"] == "fail":
@@ -3190,9 +3392,10 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # a transient, and committing it anywhere is the failure `autofix_pr` refuses too.
         terminal = "secret" in report["failed_checks"]
         status = store.fail_unit(unit["id"], run_id, f"Validation failed: {detail}",
-                                 terminal=terminal, max_attempts=MAX_UNIT_ATTEMPTS)
+                                 terminal=terminal, max_attempts=MAX_UNIT_ATTEMPTS,
+                                 stop_if_repeated=True)
         store.append_event(run_id, "validation_failed", detail, unit_id=unit["id"], level="error")
-        if status == "failed":
+        if status in store.TERMINAL_UNIT_STATES:
             store.create_checkpoint(
                 run_id, "validation", f"{path} could not be converted cleanly",
                 detail=detail, unit_id=unit["id"], blocking=False,
@@ -3224,8 +3427,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                            unit_id=unit["id"], level="error")
         status = store.fail_unit(unit["id"], run_id,
                                  f"Behaviour differs from the source: {detail}"[:500],
-                                 max_attempts=MAX_UNIT_ATTEMPTS)
-        if status == "failed":
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        if status in store.TERMINAL_UNIT_STATES:
             # Blocking, unlike a validation failure. A structurally broken file announces
             # itself the moment anyone opens it; this one compiles and ships, and the only
             # symptom is a number that is wrong in production.
@@ -3262,8 +3465,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                            unit_id=unit["id"], level="error")
         status = store.fail_unit(unit["id"], run_id,
                                  f"Broke the project boundaries: {detail}"[:500],
-                                 max_attempts=MAX_UNIT_ATTEMPTS)
-        if status == "failed":
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        if status in store.TERMINAL_UNIT_STATES:
             # Blocking, for the same reason a semantic drift is: this one does not merely
             # produce a worse file, it produces a solution MSBuild refuses to build at all,
             # and no later stage can repair it by adding a reference.
@@ -3300,8 +3503,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                            unit_id=unit["id"], level="error")
         status = store.fail_unit(unit["id"], run_id,
                                  f"Converted files it does not own: {detail}"[:500],
-                                 max_attempts=MAX_UNIT_ATTEMPTS)
-        if status == "failed":
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        if status in store.TERMINAL_UNIT_STATES:
             store.create_checkpoint(
                 run_id, "foreign_declaration",
                 f"{unit.get('component_name') or path} declared types another component owns",
@@ -3517,7 +3720,7 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
                     f"Everything converted, but {store.open_blocking_checkpoints(run_id)} "
                     f"blocking checkpoint(s) are unanswered. The run is not finished until "
                     f"they are."))
-        elif outstanding == 0 and not stages_left and components["failed"]:
+        elif outstanding == 0 and not stages_left and _components_without_output(run_id):
             # A component that exhausted its attempts is `failed`, which `outstanding` does
             # not count — so a run could lose half its components and still land in the
             # branch below. The message made it worse: `counts` is over *source files*, and
@@ -3530,20 +3733,18 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
             # finds nothing claimable and would land here again. The status is the only
             # honest signal that the export is partial; `reconcile` already names each
             # missing component and the source files stranded with it.
-            stranded = sum(
-                len(((c.get("meta") or {}).get("members")) or [])
-                for c in store.list_units(run_id, kind="component")
-                if c.get("status") in ("failed", "needs_human"))
+            empty = _components_without_output(run_id)
+            stranded = sum(len(((c.get("meta") or {}).get("members")) or []) for c in empty)
             store.update_run(
                 run_id, status="failed", phase=run.get("phase") or "convert",
                 paused_reason=(
-                    f"{components['failed']} of {components['total']} component(s) did not "
+                    f"{len(empty)} of {components['total']} component(s) did not "
                     f"convert, so {stranded} source file(s) have no output. The export is "
                     f"partial."))
             store.append_event(
                 run_id, "run_incomplete",
                 f"{components['converted']} of {components['total']} component(s) converted; "
-                f"{components['failed']} failed, stranding {stranded} source file(s). The "
+                f"{len(empty)} produced nothing, stranding {stranded} source file(s). The "
                 f"export is missing their output entirely — it is not a finished conversion.",
                 level="error",
             )
@@ -3566,11 +3767,22 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
                     f"Everything converted, but the last build reported "
                     f"{state.get('errors', 0)} error(s)."))
         elif outstanding == 0 and not stages_left:
+            # `repair_failed` components do not stop a run completing — their output is in the
+            # export and compiled — but they are not allowed to vanish either. Named here and
+            # reported by `reconcile` at `warn`, so "completed" never quietly covers a rewrite
+            # that was rejected and never replaced.
+            repaired_badly = sum(
+                1 for c in store.list_units(run_id, kind="component")
+                if c.get("status") in ("repair_failed", "failed", "needs_human")
+                and store.has_current_artifacts(c["id"]))
             store.update_run(run_id, status="completed", phase="completed")
             store.append_event(
                 run_id, "run_completed",
                 f"{counts['converted']} file(s) converted, {counts['failed']} failed, "
-                f"{components['converted']} component(s)",
+                f"{components['converted']} component(s)"
+                + (f"; {repaired_badly} component(s) converted but had a later repair "
+                   f"rejected — their output is in the export unchanged"
+                   if repaired_badly else ""),
             )
         elif outstanding:
             # Nothing claimable but work remains: every remaining unit is blocked behind

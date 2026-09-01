@@ -20,12 +20,13 @@ Every one of them answers a question the run has to survive a restart to answer:
 `approvals` is deliberately not reused for checkpoints: its `review_id` FK ties it to a
 *completed* review, while a checkpoint has to block a *running* one.
 """
+import hashlib
 import json
 import logging
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from backend.database import get_connection
 
@@ -66,8 +67,29 @@ ACTIVE_RUN_STATES = ("converting", "scanning", "analyzing", "comprehending", "re
 # `converted` in the same transaction that records the component.
 UNIT_STATES = (
     "blocked", "ready", "in_progress", "converted", "failed", "skipped", "needs_human",
-    "rolled_up",
+    "rolled_up", "repair_failed",
 )
+
+# `failed` was carrying two meanings that a reader cannot tell apart and that the code must:
+#
+#   "this produced nothing"            -> the export is missing its output. Genuinely partial.
+#   "this produced good output, and a
+#    later *repair* was rejected"      -> the export has the good output; only the repair died.
+#
+# Observed on run 8a9612e0, where the auth component converted cleanly on its first attempt,
+# was then reopened over a missing package reference it was never permitted to add (see the
+# build-file refusal in `runner._place_artifacts`), had three rewrites rejected for withdrawing
+# `AuthController.Logout`, and was retired `failed`. The run then reported "1 of 14 components
+# did not convert, so 3 source files have no output" about three files whose output was in the
+# export, compiled, and served requests. The artifact layer had it right the whole time — v1
+# `is_current=1`, v2-v4 REJECTED — and only the unit's status column disagreed.
+#
+# Terminal like `failed` (not claimable, dependents unblocked), but *reopenable*, which is the
+# functional half of the split rather than the cosmetic one: `reopen_units` refuses `failed` on
+# the stated grounds that such a unit "produced no current artifact to complain about", and for
+# this state that reasoning is simply false. Leaving it as `failed` makes the one component the
+# build most wants to fix the one component the rework loop can never touch again.
+TERMINAL_UNIT_STATES = ("failed", "repair_failed", "skipped")
 
 # What a unit is. `source_file` is every row written before this column existed, which is
 # why it is the DEFAULT — see `_migrate`. Each kind is claimed and drained separately, and
@@ -1039,6 +1061,28 @@ def claim_next_unit(run_id: str, owner: str, lease_seconds: int = LEASE_SECONDS,
     return _decode_unit(row) if row else None
 
 
+def _has_current_artifacts(cursor: sqlite3.Cursor, unit_id: str) -> bool:
+    """Does this unit own output that the export would actually ship?
+
+    `is_current` is the single fact that separates the two failures above, and it is already
+    the field the export, reconciliation and the symbol registry all read — so this asks the
+    same question they do rather than inventing a second notion of "has output".
+    """
+    return cursor.execute(
+        "SELECT 1 FROM modernization_artifacts WHERE unit_id = ? AND is_current = 1 LIMIT 1",
+        (unit_id,),
+    ).fetchone() is not None
+
+
+def has_current_artifacts(unit_id: str) -> bool:
+    """`_has_current_artifacts` for callers that are not already holding a connection."""
+    conn = get_connection()
+    try:
+        return _has_current_artifacts(conn.cursor(), unit_id)
+    finally:
+        conn.close()
+
+
 def record_rejected_artifacts(
     unit_id: str,
     run_id: str,
@@ -1253,32 +1297,74 @@ def complete_unit(
 
 
 def fail_unit(unit_id: str, run_id: str, error: str, terminal: bool = False,
-              max_attempts: int = 3) -> str:
+              max_attempts: int = 3, stop_if_repeated: bool = False) -> str:
     """Release a unit after a failed conversion. Returns its new status.
 
     A transient failure puts it back to `ready` so another pass picks it up. Past
     `max_attempts` — or on a failure the runner knows is not worth retrying — it becomes
     `failed`, and its dependents are unblocked anyway so one bad file does not strand the
     rest of the codebase. Their reviewers are told, via `needs_human_review`.
+
+    `stop_if_repeated` is for the branches that reject *output* rather than report a failed
+    call: if this attempt was rejected for a byte-identical reason to the last one, it goes
+    terminal now instead of spending the rest of the budget. The auth component of run
+    8a9612e0 was reopened over a package reference it was not permitted to add, and its three
+    rewrites were each rejected with the same sentence — `AuthController.Logout` withdrawn —
+    two and a half minutes and a conversion call apiece. Repeating an identical action that
+    produced an identical rejection is not persistence, and this is the unit-level form of the
+    argument `build_stuck` already makes one level up about identical build fingerprints.
+
+    Deliberately strict: byte-identical after whitespace, not similar. A looser comparison
+    would retire units whose second attempt failed differently in a way that spelled the same,
+    and the cost of one wasted attempt is far below the cost of abandoning work that was one
+    try from succeeding. Callers reporting a *transient* failure — a timeout, a rate limit —
+    must leave this off, because there an identical error is the strongest possible argument
+    for trying again.
+
+    Terminal splits two ways, and the unit's own artifacts decide which (see `UNIT_STATES`):
+    a unit with nothing current in the export is `failed`, and one whose good output is still
+    live and shipping is `repair_failed`. Decided here rather than at each of the eleven
+    `fail_unit` call sites because none of them knows the difference — the validation branch,
+    the contract branch and the guardrail branch all say "this attempt was no good", which is
+    a statement about the attempt and not about whether anything survives it.
     """
     now = _now()
     conn = get_connection()
     cursor = conn.cursor()
-    row = cursor.execute("SELECT attempts FROM modernization_units WHERE id = ?", (unit_id,)).fetchone()
+    row = cursor.execute(
+        "SELECT attempts, error_json FROM modernization_units WHERE id = ?",
+        (unit_id,)).fetchone()
     attempts = row["attempts"] if row else max_attempts
-    status = "failed" if (terminal or attempts >= max_attempts) else "ready"
+    reason_key = hashlib.sha1(" ".join((error or "").split()).encode("utf-8")).hexdigest()[:16]
+    previous_key = ""
+    if row and row["error_json"]:
+        try:
+            previous_key = str((json.loads(row["error_json"]) or {}).get("reason_key") or "")
+        except (ValueError, TypeError):
+            previous_key = ""
+    repeated = bool(stop_if_repeated and previous_key and previous_key == reason_key)
+    status = "failed" if (terminal or repeated or attempts >= max_attempts) else "ready"
+    if status == "failed" and _has_current_artifacts(cursor, unit_id):
+        status = "repair_failed"
     cursor.execute(
         "UPDATE modernization_units SET status=?, lease_owner=NULL, lease_expires_at=NULL, "
         "error_json=?, finished_at=? WHERE id = ?",
-        (status, json.dumps({"error": error, "attempts": attempts}),
-         now if status == "failed" else None, unit_id),
+        (status, json.dumps({"error": error, "attempts": attempts,
+                             "reason_key": reason_key, "repeated": repeated}),
+         now if status in TERMINAL_UNIT_STATES else None, unit_id),
     )
-    if status == "failed":
+    if status in TERMINAL_UNIT_STATES:
         _promote_ready(cursor, run_id)
     cursor.execute(
         "INSERT INTO modernization_events (run_id, unit_id, level, event, detail, created_at) "
-        "VALUES (?, ?, 'error', ?, ?, ?)",
-        (run_id, unit_id, "unit_failed" if status == "failed" else "unit_retry",
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, unit_id,
+         # A repair that failed over output which is still shipping is a warning, not an error.
+         # Logged at `error` it reads in the run history exactly like a unit that produced
+         # nothing, which is the confusion this whole split exists to end.
+         "warning" if status == "repair_failed" else "error",
+         {"failed": "unit_failed", "repair_failed": "unit_repair_failed"}.get(
+             status, "unit_retry"),
          error[:500], now),
     )
     conn.commit()
@@ -1783,7 +1869,10 @@ def reopen_units(run_id: str, unit_ids: List[str], reason: str,
             #
             #   `failed`/`skipped` — resurrecting a terminally failed unit on a diagnostic that
             #       cannot have come from it (it produced no current artifact to complain about),
-            #       and giving it a rework attempt it never used.
+            #       and giving it a rework attempt it never used. `repair_failed` is deliberately
+            #       *not* in this list: it is terminal for the same reasons, but its output is
+            #       current and shipping, so a diagnostic can have come from it and refusing the
+            #       rework would leave the compiler pointing at a file nothing may ever fix.
             #   `rolled_up`        — a component *member*. Making it claimable converts one
             #       source file twice, in two units, which is the two-of-everything export
             #       `ownership` exists to prevent.
@@ -2488,6 +2577,41 @@ def answer_checkpoint(checkpoint_id: str, answer: Dict[str, Any], actor: str) ->
     append_event(row["run_id"], "checkpoint_answered", f"{row['title']} — by {actor}",
                  unit_id=row["unit_id"])
     return dict(row)
+
+
+def withdraw_checkpoints(run_id: str, kinds: Sequence[str], note: str,
+                         older_than_round: Optional[int] = None) -> int:
+    """Retire open checkpoints of these kinds because later evidence has answered them. -> how many.
+
+    Gates in this subsystem only ever ratcheted one way. `build_results.gate` raises "this
+    export has never been compiled", somebody compiles it clean, and the gate's own clean
+    branch returns without ever looking at the question it asked last time; `runtime.gate` does
+    the same with "nobody has started this application". `_withdraw_end_of_run_gates` handles
+    the opposite direction — a build round reopening work puts the gates back — so the machinery
+    existed and only this half was missing.
+
+    The consequence is not cosmetic: `_finalize` refuses to complete a run while any blocking
+    checkpoint is open, so a run that compiled clean and served every route was parked in
+    `paused` with no exit. Both runs on record were in that state.
+
+    `older_than_round` is the guard that keeps this from being the evidence-loss the gates
+    exist to prevent: only a question about a build *earlier* than the one that just answered
+    it is retired. A gate raised about the current round is left alone.
+
+    Recorded as an answer with `decision="withdrawn"` by "system", the same idiom
+    `_withdraw_end_of_run_gates` settled on, so the history says what happened and by whom.
+    """
+    withdrawn = 0
+    for checkpoint in list_checkpoints(run_id, "open"):
+        if checkpoint["kind"] not in kinds:
+            continue
+        if older_than_round is not None:
+            raised_for = int((checkpoint.get("payload") or {}).get("round") or 0)
+            if raised_for > older_than_round:
+                continue
+        answer_checkpoint(checkpoint["id"], {"decision": "withdrawn", "note": note}, "system")
+        withdrawn += 1
+    return withdrawn
 
 
 def open_blocking_checkpoints(run_id: str) -> int:

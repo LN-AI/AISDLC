@@ -499,6 +499,17 @@ def gate(run_id: str) -> Dict[str, Any]:
     state = summary_for_run(run_id)
     if state["status"] in ("passed", "failed"):
         # `failed` already raised its own blocking checkpoint at ingest, with the diagnosis.
+        if state["status"] == "passed":
+            # Somebody started it and it answered, which is exactly what this gate asked for.
+            # Left open it parks the run in `paused` forever — the state php-crud-v2 sat in
+            # after a clean build and a passed startup check, with nothing left to do and no
+            # way to finish. Same half-a-ratchet as the build gate above.
+            store.withdraw_checkpoints(
+                run_id, ("runtime_required",),
+                f"Withdrawn automatically: the application started and answered "
+                f"{state.get('checks') or 0} probe(s) with "
+                f"{state.get('failing') or 0} failing, which is the evidence this gate was "
+                f"asking for.")
         return state
     if not any(c["kind"] == "runtime_required" for c in store.list_checkpoints(run_id)):
         store.create_checkpoint(

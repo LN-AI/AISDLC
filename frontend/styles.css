@@ -1610,6 +1610,8 @@ button.not-entitled::after {
 .mod-status.paused     { border-color: #d97706; color: #d97706; }
 .mod-status.failed,
 .mod-status.cancelled  { border-color: #dc2626; color: #dc2626; }
+/* Amber, with `paused`: something wants a look, but nothing is missing from the export. */
+.mod-status.repair_failed { border-color: #d97706; color: #d97706; }
 
 /* The stage strip. A run spends minutes in `analyzing` and the status alone cannot tell a
    thinking run from a stuck one. */

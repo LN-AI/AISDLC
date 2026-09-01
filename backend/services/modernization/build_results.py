@@ -663,6 +663,10 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
     # run. Units left `ready` mean it has not, and that is what separates "the model cannot
     # fix this" from "nobody has resumed the run yet".
     pending_before = store.pending_unit_count(run_id)
+    # And the status of the round before this one, for the same reason: `awaiting_rework`
+    # twice running means the queue did not move between two builds, which is a different
+    # situation from a queue that was filled a moment ago.
+    previous_status = (store.latest_build(run_id) or {}).get("status") or ""
 
     current_fingerprint = fingerprint(diagnostics)
     errors = [d for d in diagnostics if d["severity"] == "error"]
@@ -764,6 +768,31 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
             f"round {round_no}: {pending_before} unit(s) still queued from the previous round",
             level="info",
         )
+        # Twice in a row is not "wait a moment", it is a queue nobody is draining. Rounds 5
+        # and 6 of run 8a9612e0 were byte-identical rebuilds of an unfixed tree while the fix
+        # sat `ready` and unclaimed, because the only message on offer said "resume the run"
+        # in a summary line and nothing was reading it. Non-blocking deliberately: `resume`
+        # refuses to start while a blocking checkpoint is open, so a blocking gate here would
+        # forbid the exact action the gate is asking for.
+        if previous_status == "awaiting_rework":
+            store.create_checkpoint(
+                run_id, "build_not_resumed",
+                f"Two builds in a row have found the same {len(errors)} error(s) with the fix "
+                f"still queued",
+                detail=(
+                    f"Rounds {round_no - 1} and {round_no} compiled the same tree and reported "
+                    f"the same errors, because {pending_before} unit(s) reopened for rework "
+                    f"have not been converted yet. Building it a third time will report them "
+                    f"again — nothing changes until the run itself is resumed:\n\n"
+                    f"    POST /api/v1/modernization/runs/{run_id}/resume\n\n"
+                    f"`scripts/build_run.py --loop` does this for you between rounds. The "
+                    f"errors it is waiting to fix:\n\n"
+                    + _bullets(errors, CHECKPOINT_DIAGNOSTICS)
+                )[:4000],
+                blocking=False,
+                payload={**payload_base, "pending": pending_before,
+                         "diagnostics": _for_payload(errors, CHECKPOINT_DIAGNOSTICS)},
+            )
     elif round_no > MAX_BUILD_ROUNDS:
         status = "round_limit"
         summary = (f"Build round {round_no} still reports {len(errors)} error(s), but the run "
@@ -1009,6 +1038,19 @@ def gate(run_id: str) -> Dict[str, Any]:
         latest = store.latest_build(run_id) or {}
         errors = latest.get("error_count") or 0
         if not errors:
+            # A clean build is the answer to "has anybody compiled this", so retire the
+            # question. Without this the gate raised in an earlier round stays open forever:
+            # `_finalize` will not complete a run with a blocking checkpoint outstanding, so
+            # run 8a9612e0 compiled with zero errors at 14:55:37 and stayed parked on a
+            # checkpoint raised at 14:55:11 saying it had never been compiled. Retiring it is
+            # not a judgement about the code — the compiler made that judgement 26 seconds
+            # later, and this only stops the record contradicting it.
+            round_no = int(run.get("build_round") or 0)
+            store.withdraw_checkpoints(
+                run_id, ("build_required", "build_errors_outstanding"),
+                f"Withdrawn automatically: build round {round_no} compiled with 0 error(s), "
+                f"which is the evidence this gate was asking for.",
+                older_than_round=round_no)
             return {"status": "clean", "round": run.get("build_round"), "errors": 0}
 
         # Errors outstanding. Two honest states, and they need different sentences: nothing has

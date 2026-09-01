@@ -606,9 +606,15 @@ def run(run_id: str) -> Dict[str, Any]:
     #    Those members are still `rolled_up` — not `converted`, not `failed` — so a per-file
     #    tally reports zero failures while a seventh of the codebase has no output at all.
     #    This is the check that stops a run looking complete because the *files* look fine.
+    #    Which components those are is decided by whether they *have output*, not by the word
+    #    in the status column. A run converted before `repair_failed` existed stored the other
+    #    kind of failure as `failed` too, and the fact underneath — current artifacts — is the
+    #    same one either way. Asking the artifacts fixes those runs without rewriting them.
     stranded = 0
     for component in components:
         if component.get("status") not in ("failed", "needs_human"):
+            continue
+        if store.has_current_artifacts(component["id"]):
             continue
         members = (component.get("meta") or {}).get("members") or []
         stranded += len(members)
@@ -616,6 +622,29 @@ def run(run_id: str) -> Dict[str, Any]:
             "component_failed", "fail",
             f"Component `{component.get('component_name') or component['path']}` did not "
             f"convert, so {len(members)} source file(s) produced no output: "
+            + ", ".join(f"`{m}`" for m in members[:8])
+            + (" …" if len(members) > 8 else ""),
+            unit_id=component["id"]))
+
+    # 7b. Components whose output is shipping but whose last *repair* was rejected. Distinct
+    #     from 7 above and deliberately `warn`: nothing is missing from the export, so calling
+    #     it a failure would say the opposite of what is true. What a reader needs to know is
+    #     narrower — this component's files are the ones a rejected rewrite was arguing about,
+    #     so if anything downstream looks wrong, start here.
+    for component in components:
+        if component.get("status") not in ("repair_failed", "failed", "needs_human"):
+            continue
+        if not store.has_current_artifacts(component["id"]):
+            continue
+        members = (component.get("meta") or {}).get("members") or []
+        reason = str(((component.get("error") or {}).get("error") or "")).strip()
+        issues.append(_issue(
+            "component_repair_failed", "warn",
+            f"Component `{component.get('component_name') or component['path']}` converted, "
+            f"and its output is in the export, but a later repair attempt was rejected "
+            f"{('(' + reason[:160] + ')') if reason else ''} — so it still carries whatever "
+            f"the repair was trying to fix. "
+            f"{len(members)} source file(s): "
             + ", ".join(f"`{m}`" for m in members[:8])
             + (" …" if len(members) > 8 else ""),
             unit_id=component["id"]))
