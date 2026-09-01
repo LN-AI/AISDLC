@@ -414,8 +414,12 @@ await checkAsync('required and recommended groups are open; optional starts coll
   const { html } = await renderCharter(CHARTER_SUGGESTIONS);
   // Three <details>; exactly the two non-optional ones carry `open`.
   assert((html.match(/<details/g) || []).length === 3, 'expected three groups');
-  assert((html.match(/<details class="mod-charter-group" open>/g) || []).length === 2,
+  assert((html.match(/<details[^>]*\sopen(?:\s|>)/g) || []).length === 2,
          'expected exactly two open groups');
+  // Each group carries a stable key, which is what stops the 4s poll closing it under a
+  // reader mid-edit. Without the key the accordion state has nothing to be restored against.
+  assert((html.match(/data-acc="charter-group-/g) || []).length === 3,
+         'every charter group needs an accordion key');
 });
 
 // The textarea carries a `data-rendered` copy of what it was filled with, so the poll can
@@ -691,12 +695,16 @@ function modGraphChecks() {
     assert(html.includes('200 node(s)'), 'the summary should still state the size');
   });
 
-  check('the graph costs the 4s poll nothing until it is asked for', () => {
-    // It is rendered inline from data the poll already has, so an unopened graph is an empty
-    // div rather than a second request.
-    const html = sandbox.renderModernizationRun(MOD_RUN, [], MOD_UNITS, MOD_COMPONENTS);
-    assert(html.includes('<div id="mod-graph"></div>'), 'the graph should start empty');
-    assert(html.includes('Dependency graph'), 'no way to open it');
+  check('the graph costs the 4s poll nothing until its section is opened', () => {
+    // Drawn inline from data the poll already has, so it never costs a request — and it is not
+    // in the document at all until the reader is on the section that holds it.
+    const overview = sandbox.renderModernizationRun(MOD_RUN, [], MOD_UNITS, MOD_COMPONENTS);
+    assert(!overview.includes('id="mod-graph"'), 'the graph should not be on the overview');
+    sandbox.setModernizationTab('architecture');
+    const arch = sandbox.renderModernizationRun(MOD_RUN, [], MOD_UNITS, MOD_COMPONENTS);
+    assert(arch.includes('id="mod-graph"'), 'the graph is unreachable from Architecture');
+    assert(arch.includes('<svg'), 'the graph section should draw it');
+    sandbox.setModernizationTab('overview');
   });
 }
 
@@ -840,6 +848,91 @@ function modPlanChecks() {
     assert(!html.includes('What was read'), 'it invented a denominator block from nothing');
   });
 
+  // ── The layout repairs, which were unreachable from here until now ──────
+  //
+  // `layering.repair_options` has been computing these, measuring what each closes, and
+  // writing them into the gate payload since D-176 — and the dashboard's only button sent a
+  // decision string with no answer. So every human answering a plan gate here selected "none"
+  // whether they meant to or not, and the one thing the UI could approve was a layout the
+  // pipeline had already proved would not build.
+
+  const MOD_REPAIRS = [
+    { id: 'merge:Acme.Infrastructure->Acme.Application', kind: 'merge_projects', feasible: true,
+      title: 'Merge Acme.Infrastructure into Acme.Application', closes: ['a->b'], opens: [],
+      detail: 'Always buildable, and a coarser architecture than the one on this plan.' },
+    { id: 'seam:Acme.Application->Acme.Infrastructure', kind: 'declare_seam', feasible: true,
+      title: 'Declare IInfrastructureGateway in Acme.Application', closes: ['a->b'], opens: [],
+      detail: 'The layering rule survives intact.' },
+    { id: 'allow:Acme.Application->Acme.Infrastructure', kind: 'allow_reference', feasible: false,
+      title: 'Let Acme.Application reference Acme.Infrastructure', closes: [], opens: [],
+      why_not: 'It would close a reference cycle and MSBuild refuses to build one.' },
+  ];
+  const MOD_CONFLICT_GATE = {
+    id: 'cp-1', kind: 'plan_conflicts', blocking: true,
+    title: '1 dependency direction(s) in this layout cannot be built',
+    detail: 'The source has dependencies that cross a project boundary the plan forbids.',
+    payload: { gaps: [{ consumer: 'A', provider: 'B', count: 3 }], repairs: MOD_REPAIRS },
+  };
+
+  check('a gate carrying repairs offers each one as something a human can pick', () => {
+    const html = sandbox.renderCheckpointRepairs(MOD_CONFLICT_GATE);
+    assert(html.includes('Merge Acme.Infrastructure into Acme.Application'), 'the merge is missing');
+    assert(html.includes('IInfrastructureGateway'), 'the seam is missing');
+    // `-&gt;` rather than `->`: the id goes through `esc` on its way into the attribute and the
+    // browser decodes it before the handler ever sees it. Asserting on the raw arrow would be
+    // asserting that the escaping is absent.
+    assert(html.includes("answerModernizationCheckpoint('cp-1', 'seam:Acme.Application-&gt;Acme.Infrastructure')"),
+           'the repair id never reaches the handler, which is how this was broken before');
+    assert(html.includes('closes 1'), 'the measured number is missing');
+  });
+
+  check('a repair that cannot be applied is not offered as a button', () => {
+    // It stays in the payload — "you cannot do this, and here is why" is what stops somebody
+    // proposing it again — but a button that closes nothing is a trap.
+    const html = sandbox.renderCheckpointRepairs(MOD_CONFLICT_GATE);
+    assert(!html.includes("'allow:Acme.Application->Acme.Infrastructure'"),
+           'an infeasible repair is being offered as a choice');
+  });
+
+  check('a merge never wins the ordering by accident', () => {
+    // On a live 45-file run all four feasible repairs scored identically at "closes 1, opens
+    // 0", the ordering fell through to the id, and `merge:` beat `seam:` alphabetically — so a
+    // boundary between two projects was dissolved because of a letter. The seam is listed
+    // first here for the same reason `drive_modernization.feasible_repairs` ranks it first.
+    const html = sandbox.renderCheckpointRepairs(MOD_CONFLICT_GATE);
+    assert(html.indexOf('IInfrastructureGateway') < html.indexOf('Merge Acme.Infrastructure'),
+           'a merge is being offered above a seam that closes just as much');
+  });
+
+  check('a gate with no repairs renders nothing extra', () => {
+    assert(sandbox.renderCheckpointRepairs({ id: 'x', payload: {} }) === '');
+    assert(sandbox.renderCheckpointRepairs({ id: 'x' }) === '');
+  });
+
+  check('the button on a conflict gate says what it does, not "Approve"', () => {
+    // The same argument as the parity and build waivers above it. This gate's own text says the
+    // layout has dependencies with no legal way to be written; putting the dashboard's single
+    // prominent blue "Approve" button on it would make the outcome the gate exists to prevent
+    // the easiest thing in the room to click.
+    const html = sandbox.renderModernizationCheckpoints([MOD_CONFLICT_GATE]);
+    assert(html.includes('Convert this layout anyway'), 'the plain button still reads as approval');
+    assert(!html.includes('>Approve<'), 'an Approve button survived on a gate that approves nothing');
+    assert(html.includes("answerModernizationCheckpoint('cp-1', 'proceed')"),
+           'the override sends no answer, so the run would re-ask the same question forever');
+  });
+
+  check('a repair id carrying a quote cannot break out of the handler', () => {
+    // Repair ids are built from project names the architect chose, so this is model-controlled
+    // text on its way into an onclick. `esc` escapes `"` and deliberately leaves `'` alone —
+    // which is exactly the character that ends the JS string it is being placed in.
+    const html = sandbox.renderCheckpointRepairs({
+      id: 'cp-2',
+      payload: { repairs: [{ id: "merge:O'Brien->X", feasible: true, title: 'T',
+                             closes: ['a'], opens: [], detail: 'd' }] } });
+    assert(html.includes("\\'Brien"), 'the quote is unescaped and ends the argument early');
+    assert(!html.includes("'merge:O'Brien"), 'the handler argument is broken');
+  });
+
   check('a run nobody compiled says so, instead of rendering nothing', () => {
     // It used to render nothing at all when `build_round` was 0, which reads as an absence of
     // problems rather than an absence of evidence. A real run shipped 45 converted files whose
@@ -893,13 +986,18 @@ function modPlanChecks() {
     assert(html.includes('3 differed') && html.includes('9 matched'), html);
   });
 
-  check('the plan is offered from the run row, because GET /plan answers 404', () => {
-    // `store.get_run` decodes charter/stats/redactions/error and not plan_json/estimate_json,
-    // so `run.plan` is never populated. Reading the raw column is what makes the chip appear
-    // and the header estimate line render at all.
+  check('the plan is offered from the run row even when GET /plan answers 404', () => {
+    // Older builds of `store.get_run` decoded charter/stats/redactions/error and not
+    // plan_json/estimate_json, so `run.plan` was never populated. Reading the raw column is
+    // what keeps the plan panel and the header estimate line alive against such a server.
     const html = sandbox.renderModernizationRun(MOD_RUN, [], MOD_UNITS, MOD_COMPONENTS);
-    assert(html.includes('>The plan</button>'), 'the plan chip is missing');
-    assert(html.includes('est. $0.14'), 'the header estimate is still dead');
+    assert(html.includes('est. $0.14'), 'the header estimate is dead');
+    // What the plan panel's fallback is built on. `MOD_PANELS` is a `const` and so invisible
+    // from here; these two are the functions it calls.
+    const plan = sandbox._modRunPlan(MOD_RUN);
+    const estimate = sandbox._modRunEstimate(MOD_RUN);
+    assert(plan && plan.summary, 'the plan is not read out of the raw column');
+    assert(estimate && estimate.expected_usd === 0.14, 'the estimate is not read out of the raw column');
   });
 }
 
@@ -963,7 +1061,408 @@ function modUnitChecks() {
   });
 }
 
+// ── Markdown ───────────────────────────────────────────────────────────────
+//
+// Nothing in this frontend rendered markdown, so every model-written field arrived on screen as
+// its own punctuation. The safety half of these checks matters more than the formatting half:
+// `mdToHtml` escapes first and transforms second, and if that order is ever reversed every
+// model response on this site becomes executable. Four vectors are asserted for that reason.
+function markdownChecks() {
+  console.log('\nMarkdown rendering');
+
+  check('a heading, bold text and a bullet list come out as elements', () => {
+    const html = sandbox.mdToHtml('## Read this first\n\nIt was **not compiled**.\n\n- `db.php`\n- `auth.php`');
+    // Shifted down one level: a panel's own titles are h2/h3, so a model `#` must not outrank
+    // the box it is rendered inside.
+    assert(html.includes('<h3>Read this first</h3>'), `heading: ${html}`);
+    assert(html.includes('<strong>not compiled</strong>'), `bold: ${html}`);
+    assert((html.match(/<li>/g) || []).length === 2, `list: ${html}`);
+    assert(html.includes('<code>db.php</code>'), `code span: ${html}`);
+  });
+
+  check('a pipe table becomes a table, and a stray pipe does not', () => {
+    const table = sandbox.mdToHtml('| component | risk |\n|---|---|\n| Web | high |');
+    assert(table.includes('<th>component</th>') && table.includes('<td>high</td>'), table);
+    // Without the divider check, any sentence containing a pipe became a one-row table.
+    const prose = sandbox.mdToHtml('Either the parser or the fallback | not both.');
+    assert(!prose.includes('<table'), prose);
+  });
+
+  check('a fenced block is left verbatim and never wrapped', () => {
+    const html = sandbox.mdToHtml('Run:\n\n```bash\ndotnet build --no-restore\n```');
+    assert(html.includes('<pre class="md-code"><code>dotnet build --no-restore</code></pre>'), html);
+  });
+
+  check('XSS: markup in a model response is inert, not executed', () => {
+    const script = sandbox.mdToHtml('<script>alert(1)</script>');
+    assert(!script.includes('<script'), `a live script tag survived: ${script}`);
+    assert(script.includes('&lt;script&gt;'), `the text was lost instead of escaped: ${script}`);
+    const img = sandbox.mdToHtml('<img src=x onerror=alert(1)>');
+    assert(!img.includes('<img'), `a live img tag survived: ${img}`);
+  });
+
+  check('XSS: a javascript: link is rendered as text, not as a link', () => {
+    const bad = sandbox.mdToHtml('[click me](javascript:alert(1))');
+    assert(!bad.includes('<a '), `an unsafe scheme became a link: ${bad}`);
+    const data = sandbox.mdToHtml('[x](data:text/html;base64,PHNjcmlwdD4=)');
+    assert(!data.includes('<a '), `a data: URL became a link: ${data}`);
+    // The two shapes that are allowed, so the check above is not passing by rejecting everything.
+    assert(sandbox.mdToHtml('[docs](https://example.com/a)').includes('<a href="https://example.com/a"'));
+    assert(sandbox.mdToHtml('[api](/api/v1/x)').includes('<a href="/api/v1/x"'));
+    assert(sandbox.mdToHtml('[docs](https://example.com/a)').includes('rel="noopener noreferrer"'),
+           'an external link needs noopener');
+  });
+
+  check('text that is not markdown survives unmangled', () => {
+    // The reason `md()` is applied to named prose fields and not swept across every string on
+    // the site: a machine-composed message is full of characters markdown wants.
+    assert(!sandbox.mdToHtml('budget cap $5.00 * 3 exceeded').includes('<em>'),
+           'a lone asterisk was eaten as emphasis');
+    assert(!sandbox.mdToHtml('columns snake_case_name and other_field').includes('<em>'),
+           'snake_case was eaten as emphasis');
+    // ...while real emphasis still works, or the check above passes by doing nothing.
+    assert(sandbox.mdToHtml('a *real* emphasis').includes('<em>real</em>'));
+    // `**` inside a code span is a literal, because code spans are lifted out first.
+    const span = sandbox.mdToHtml('a `**literal**` span');
+    assert(span.includes('<code>**literal**</code>') && !span.includes('<strong>'), span);
+  });
+
+  check('empty input renders nothing at all, so a panel has no empty box in it', () => {
+    assert(sandbox.mdToHtml('') === '' && sandbox.mdToHtml(null) === ''
+           && sandbox.mdToHtml(undefined) === '', 'empty input produced markup');
+    assert(sandbox.md('') === '' && sandbox.md(null) === '', 'md() wrapped nothing in a div');
+    assert(sandbox.md('hi').includes('class="md-body'), 'md() lost its wrapper');
+  });
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+//
+// The detail panel was twelve stacked containers with nothing naming them, and three buttons in
+// the action row painted into containers thousands of pixels below the fold. These checks pin
+// the two properties that fixes it: one section is on screen at a time, and each section's
+// renderer is pure enough to be exercised without a fetch.
+function modTabChecks() {
+  console.log('\nModernization sections (tabs)');
+
+  const CTX = { run: MOD_RUN, units: MOD_UNITS, components: MOD_COMPONENTS, checkpoints: [] };
+
+  check('the bar names every section and marks exactly one selected', () => {
+    const bar = sandbox.renderModernizationTabBar(CTX);
+    ['Overview', 'Architecture', 'Files', 'Converted code', 'Checks', 'Evidence', 'History']
+      .forEach(label => assert(bar.includes(`>${label}`), `the ${label} section is missing`));
+    assert((bar.match(/class="mod-tab selected"/g) || []).length === 1,
+           'exactly one tab must read as selected');
+  });
+
+  check('a tab says how much is behind it before it is clicked', () => {
+    const bar = sandbox.renderModernizationTabBar(CTX);
+    assert(bar.includes(`<span class="mod-tab-count">${MOD_UNITS.length}</span>`),
+           `the file count is missing from the bar: ${bar}`);
+  });
+
+  check('every section renders on its own, without a fetch', () => {
+    // The old single renderer could only be exercised whole. Each of these is a pure function
+    // of the poll's context, which is what makes a section testable at all.
+    ['renderModOverviewTab', 'renderModArchitectureTab', 'renderModFilesTab', 'renderModCodeTab',
+     'renderModChecksTab', 'renderModEvidenceTab', 'renderModHistoryTab'].forEach(fn => {
+      const html = sandbox[fn](CTX);
+      assert(typeof html === 'string' && html.length, `${fn} rendered nothing`);
+    });
+  });
+
+  check('an unknown section id is refused rather than stored', () => {
+    // `_modTabSpec` falls back to Overview so no render can explode on a stale id — which means
+    // a setter that trusted it would store the bad id, render Overview, and highlight nothing.
+    sandbox.setModernizationTab('not-a-tab');
+    const bar = sandbox.renderModernizationTabBar(CTX);
+    assert((bar.match(/class="mod-tab selected"/g) || []).length === 1,
+           'an unknown id left the bar with nothing selected');
+  });
+
+  check('only the selected section is in the document', () => {
+    const html = sandbox.renderModernizationRun(MOD_RUN, [], MOD_UNITS, MOD_COMPONENTS);
+    // Overview is the default. The inventory and the evidence table are real sections that must
+    // not also be sitting below it — that stacking is the thing being removed.
+    assert(html.includes('id="mod-tabbody"'), 'no section container');
+    assert(!html.includes('id="mod-evidence"'), 'the evidence section leaked onto Overview');
+    assert(!html.includes('id="mod-builds"'), 'the build section leaked onto Overview');
+  });
+
+  check('a blocking decision and the charter form stay outside the tabs', () => {
+    // Both are the only way the run moves forward. Filed behind a tab, a run looks stalled for
+    // no visible reason.
+    const gate = { id: 'cp-1', kind: 'plan_approval', title: 'Approve the plan',
+                   detail: 'It will cost **$6.43**.', blocking: true, status: 'open' };
+    const html = sandbox.renderModernizationRun(MOD_RUN, [gate], MOD_UNITS, MOD_COMPONENTS);
+    const gateAt = html.indexOf('Approve the plan');
+    const barAt = html.indexOf('id="mod-tabbar"');
+    assert(gateAt !== -1, 'the open gate vanished');
+    assert(gateAt < barAt, 'the gate was filed behind the tab bar');
+    // ...and its prose is markdown now, which it was not.
+    assert(html.includes('<strong>$6.43</strong>'), 'the gate detail is not rendered as markdown');
+  });
+}
+
+// ── The poll's repaint discipline ──────────────────────────────────────────
+//
+// The bug this closes was invisible as a bug: `refreshModernizationRun` rewrote the whole panel
+// every four seconds, so an expanded converted file re-collapsed every four seconds and reading
+// the output during a live run was effectively impossible.
+function modRepaintChecks() {
+  console.log('\nModernization repaint discipline');
+
+  check('the fingerprint moves when the run does, and not otherwise', () => {
+    const a = { status: 'converting', progress_pct: 12, units: { total: 10, converted: 1 },
+                components: {}, stage: { index: 5 } };
+    const same = { status: 'converting', progress_pct: 12, units: { total: 10, converted: 1 },
+                   components: {}, stage: { index: 5 } };
+    assert(sandbox._modFingerprint(a, []) === sandbox._modFingerprint(same, []),
+           'an unchanged run must not repaint the body');
+    const moved = { ...a, units: { total: 10, converted: 2 } };
+    assert(sandbox._modFingerprint(a, []) !== sandbox._modFingerprint(moved, []),
+           'a converted file must reach the screen');
+    // Spend moves on every model call and appears only in the header. If it were in the
+    // fingerprint the body would repaint every few seconds and the accordions would collapse
+    // again — which is the whole defect.
+    const spent = { ...a, spent_usd: 9.99 };
+    assert(sandbox._modFingerprint(a, []) === sandbox._modFingerprint(spent, []),
+           'spend must not repaint the body');
+    // A new decision to answer must.
+    assert(sandbox._modFingerprint(a, []) !== sandbox._modFingerprint(a, [{ id: 'x' }]),
+           'a new checkpoint must reach the screen');
+  });
+
+  check('an accordion the reader opened is still open after a repaint', () => {
+    const key = 'artifact-Web/HomeController.cs';
+    // First render decides the default; `_modAcc` is what emits it.
+    const shut = sandbox._modAcc(key, false);
+    assert(!/\bopen\b/.test(shut), `it should start closed: ${shut}`);
+    // The reader opens it. That is a DOM toggle, so it arrives through the same handler the
+    // markup wires up.
+    sandbox._modRememberAccordion({ open: true, dataset: { acc: key } });
+    const after = sandbox._modAcc(key, false);
+    assert(/\bopen\b/.test(after), `the poll closed it again: ${after}`);
+    sandbox._modRememberAccordion({ open: false, dataset: { acc: key } });
+    assert(!/\bopen\b/.test(sandbox._modAcc(key, false)), 'closing it did not stick');
+  });
+
+  check('a default-open section does not spring back open once closed', () => {
+    const key = 'build-round-test';
+    assert(/\bopen\b/.test(sandbox._modAcc(key, true)), 'the first round should start open');
+    sandbox._modRememberAccordion({ open: false, dataset: { acc: key } });
+    // The default applies once per key. Re-applying it on every render is the same bug from
+    // the other direction.
+    assert(!/\bopen\b/.test(sandbox._modAcc(key, true)), 'the default overrode the reader');
+  });
+}
+
+// ── What the run knew and never showed ────────────────────────────────────
+function modMissingDataChecks() {
+  console.log('\nModernization: data that never reached the browser');
+
+  check('a run nobody started says so, and does not read as a pass', () => {
+    // `run.runtime` has ridden every poll since it was written and nothing read it, so a run
+    // whose app had never been started rendered identically to one that starts and serves.
+    const html = sandbox.renderModernizationRuntimeBadge(
+      { units: { converted: 45 }, runtime: { status: 'never_run', checks: 0 } });
+    assert(html.includes('Nobody has started it'), html);
+    assert(html.includes('mod-verdict-unknown'), 'absence must not be styled as success');
+  });
+
+  check('a runtime failure reports how many URLs failed, and links to which', () => {
+    const html = sandbox.renderModernizationRuntimeBadge(
+      { units: { converted: 45 },
+        runtime: { status: 'failed', started: true, checks: 12, failing: 12, round: 1 } });
+    assert(html.includes('12 of 12'), html);
+    assert(html.includes('mod-verdict-bad'), html);
+    assert(html.includes("setModernizationTab('checks')"), 'no way to see which URLs failed');
+  });
+
+  check('a skipped runtime check is its own state, not a pass', () => {
+    const html = sandbox.renderModernizationRuntimeBadge(
+      { units: { converted: 4 },
+        runtime: { status: 'skipped', skipped_reason: 'no MySQL on this runner' } });
+    assert(html.includes('no MySQL on this runner') && html.includes('not a pass'), html);
+  });
+
+  check('all three verdicts are asked together, so "it compiles" is not read as the answer', () => {
+    const html = sandbox.renderModernizationVerdicts({
+      units: { converted: 45 }, build_round: 3, last_build: { error_count: 0 },
+      runtime: { status: 'never_run' },
+      parity: { cases: 40, status: 'failed', round: 1, passed: 21, failed: 19, errored: 0 },
+    });
+    assert(html.includes('Does it compile?'), html);
+    assert(html.includes('Does it start?'), 'the runtime question is missing');
+    assert(html.includes('Does it behave the same?'), 'the parity question is missing');
+  });
+
+  check('every URL the runtime check asked for is listed, failures first', () => {
+    const html = sandbox.renderModernizationRuntime({
+      summary: { status: 'failed', checks: 3, failing: 1 },
+      report: { round: 1, source: 'local_dotnet', started: true, base_url: 'http://localhost:5000',
+                log_tail: 'Unhandled exception. System.InvalidOperationException' },
+      checks: [{ method: 'GET', path: '/health', status: 200, ms: 8 },
+               { method: 'GET', path: '/employees', status: 500, ms: 40, error: '' },
+               { method: 'GET', path: '/missing', status: 404, ms: 3 }],
+    });
+    assert(html.includes('/employees'), 'the failing URL is missing');
+    assert(html.indexOf('/employees') < html.indexOf('/health'), 'failures should sort first');
+    assert(html.includes('3 URL(s) probed, 1 failing'), html);
+    assert(html.includes('1 answering 404'), 'a 404 is a warning worth stating');
+    assert(html.includes('InvalidOperationException'), 'the process log is the diagnosis');
+  });
+
+  check('which behaviours differed, and the file that implements each', () => {
+    const html = sandbox.renderModernizationParity({
+      cases: 40, selected_report_id: 'pr-1',
+      reports: [{ id: 'pr-1', round: 1, source: 'replay', passed: 21, failed: 1, errored: 0,
+                  missing: 0, created_at: '2026-08-27T10:00:00' }],
+      results: [{ case_id: 'c-9', case_name: 'POST /salary', verdict: 'fail', actual_status: 200,
+                  unit_id: 'u-salary',
+                  differences: [{ kind: 'body_value', name: 'salary', expected: '61234',
+                                  actual: '0', detail: 'a cast became a parse' }] }],
+    });
+    assert(html.includes('POST /salary'), 'the diverged case is missing');
+    assert(html.includes('61234') && html.includes('a cast became a parse'),
+           'the difference itself is missing');
+    assert(html.includes("showModernizationUnit('u-salary')"),
+           'no link from a wrong behaviour to the file that implements it');
+  });
+
+  check('a corpus nobody recorded is stated as a gap, not left blank', () => {
+    const html = sandbox.renderModernizationParity({ cases: 0, reports: [], results: [] });
+    assert(html.includes('No recorded behaviour'), html);
+    assert(html.includes('while the legacy system still exists'), 'no reason to act now');
+  });
+
+  check('the decisions taken are readable, including who waived what', () => {
+    // The browser only ever asked for `?status=open`, so every approval and waiver was stored
+    // and shown nowhere. In a governance product that record is the point.
+    const html = sandbox.renderModernizationDecisions({ checkpoints: [
+      { id: 'cp-1', kind: 'plan_conflicts', title: 'The layout has impossible dependencies',
+        status: 'answered', blocking: true, answered_by: 'lm', answered_at: '2026-08-27T09:00:00',
+        answer: { decision: 'Merging would dissolve a boundary the customer asked for.',
+                  repair: 'seam:IEmployeeRepository' } },
+      { id: 'cp-2', kind: 'parity_required', title: 'Nobody checked the behaviour',
+        status: 'answered', blocking: true, answered_by: 'lm', answered_at: '2026-08-27T11:00:00',
+        answer: { decision: 'Shipping without it.' } },
+      { id: 'cp-3', kind: 'build_required', title: 'Nobody compiled this', status: 'open',
+        blocking: true, answer: null },
+    ] });
+    assert(html.includes('Decisions taken (2 of 3)'), html);
+    assert(html.includes('dissolve a boundary'), 'the recorded reason is missing');
+    assert(html.includes('applied seam:IEmployeeRepository'), 'the chosen repair is missing');
+    // A waiver is not an approval and must never read as one.
+    assert(html.includes('finished without this evidence'), 'a waiver is not marked as one');
+    assert(html.includes('still open'), 'an unanswered decision should say so');
+  });
+
+  check('the saved charter is readable after the form is gone', () => {
+    // The form only renders while `status === awaiting_charter`, and `run.charter` had no reader
+    // at all — so the document binding every conversion call vanished the moment it was saved.
+    const html = sandbox.renderModernizationCharterView(
+      { charter: { data_access: 'EF Core with Pomelo', composition: '', logging: 'Serilog' } });
+    assert(html.includes('EF Core with Pomelo'), 'the charter answer is missing');
+    assert(html.includes('Serilog'), 'a second answer is missing');
+    // A field left blank is not an answer and must not be listed as one.
+    assert(!html.includes('composition'), 'an empty field was listed as a decision');
+    assert(sandbox.renderModernizationCharterView({ charter: null }) === '',
+           'a run with no charter should render nothing');
+  });
+
+  check('the converted files are an index, grouped, filterable and clickable', () => {
+    const data = { count: 3, artifacts: [
+      { path: 'Shop.Web/Controllers/HomeController.cs', unit_id: 'u-web', version: 1,
+        is_current: 1, purpose: 'controller', size_chars: 2048 },
+      { path: 'Shop.Web/Program.cs', unit_id: 'u-web', version: 2, is_current: 1,
+        purpose: 'host', size_chars: 900 },
+      { path: 'Shop.Data/EmployeeRepository.cs', unit_id: 'u-data', version: 1, is_current: 1,
+        purpose: 'repository', size_chars: 4096 },
+    ] };
+    const html = sandbox.renderModernizationArtifacts(data);
+    assert(html.includes('3 file(s) written'), html);
+    assert(html.includes('>Shop.Web<') && html.includes('>Shop.Data<'), 'not grouped by project');
+    assert(html.includes("showModernizationUnit('u-web')"), 'a file must open its content');
+    assert(html.includes('2.0 KB'), 'the size is missing');
+    assert(sandbox.renderModernizationArtifacts({ artifacts: [] }).includes('Nothing has been written yet'),
+           'an empty output should say so rather than render a blank panel');
+  });
+
+  check('the run report is rendered as markdown, not as its own punctuation', () => {
+    // `_export_report` builds headings, bold, pipe tables and bullet lists, and it existed only
+    // inside the downloaded zip. This is the strongest markdown case in the product.
+    const html = sandbox.renderModernizationReport({ markdown:
+      '# payroll — modernization report\n\n- **Status**: completed\n\n'
+      + '## Read this before trusting the output\n\nIt was **not compiled**.' });
+    assert(html.includes('<h2>payroll — modernization report</h2>'), html);
+    assert(html.includes('<strong>Status</strong>'), 'bold list items are still raw');
+    assert(html.includes('<h3>Read this before trusting the output</h3>'), 'a section is still raw');
+  });
+
+  check('build rounds are one section each, with their messages inside', () => {
+    const html = sandbox.renderModernizationBuilds({
+      selected_build_id: 'b-3',
+      builds: [{ id: 'b-3', round: 3, source: 'github_actions', error_count: 0, warning_count: 4,
+                 created_at: '2026-08-27T12:00:00' },
+               { id: 'b-2', round: 2, source: 'github_actions', error_count: 12,
+                 reopened_count: 6, created_at: '2026-08-27T11:00:00' }],
+      diagnostics: [{ build_id: 'b-3', severity: 'warning', code: 'CS0168', file: 'x.cs',
+                      artifact_path: 'Shop.Web/x.cs', line: 14, message: 'unused variable',
+                      unit_id: 'u-web' }],
+    });
+    assert((html.match(/data-acc="build-/g) || []).length === 2, 'one section per round');
+    assert(html.includes('no errors') && html.includes('12 error(s)'), html);
+    assert(html.includes('6 unit(s) sent back for rework'), 'the rework count is missing');
+    assert(html.includes("showModernizationUnit('u-web')"), 'a diagnostic should open its file');
+  });
+
+  check('a run nobody compiled says so in the build section too', () => {
+    const html = sandbox.renderModernizationBuilds({ builds: [], diagnostics: [] });
+    assert(html.includes('never been compiled'), html);
+    assert(html.includes('no compiler has looked'), 'absence must be stated as absence');
+  });
+
+  check('the rejected business rules are reachable, not only the confirmed ones', () => {
+    const html = sandbox.renderModernizationRules({
+      counts: { confirmed: 12, rejected: 3, proposed: 0 },
+      rules: [{ category: 'validation', statement: 'Salary must be **positive**.',
+                path: 'lib/pay.php', line: 42, quote: 'if ($s <= 0) die();' }],
+    });
+    assert(html.includes('12 confirmed') && html.includes('3 rejected'), html);
+    assert(html.includes("setModernizationRulesStatus('rejected')"),
+           'the rejects were unreachable and still are');
+    assert(html.includes('<strong>positive</strong>'), 'a rule statement is still raw markdown');
+    assert(html.includes('lib/pay.php:42'), 'the citation is missing');
+  });
+
+  check('a component says why it exists and what it promised to produce', () => {
+    // Both were on the wire from GET /components and both were dropped on the floor.
+    const html = sandbox.renderModernizationComponents([
+      { id: 'c-data', name: 'DataAccess', project: 'Shop.Data', output_dir: 'Shop.Data',
+        topo_level: 0, risk: 'low', status: 'converted', members: ['lib/db.php'],
+        rationale: 'All **data access** in one place.',
+        expected_files: ['Employee.cs', 'IEmployeeRepository.cs'] },
+    ]);
+    assert(html.includes('<strong>data access</strong>'), `the rationale is missing: ${html}`);
+    assert(html.includes('Employee.cs') && html.includes('IEmployeeRepository.cs'),
+           'the promised output files are missing');
+  });
+
+  check('the inventory can be asked for the scaffold, not only the source files', () => {
+    // `kind` was always a query parameter and the browser always took the default, so the
+    // generated solution and project files were invisible.
+    const html = sandbox.renderModFilesTab(
+      { run: MOD_RUN, units: MOD_UNITS, components: MOD_COMPONENTS, checkpoints: [] });
+    assert(html.includes("setModernizationFilesKind('scaffold')"), 'the scaffold is unreachable');
+    assert(html.includes("setModernizationFilesKind('all')"), 'no way to see every row');
+  });
+}
+
 async function runModernizationChecks() {
+  markdownChecks();
+  modTabChecks();
+  modRepaintChecks();
+  modMissingDataChecks();
   modGraphChecks();
   modPanelChecks();
   modPlanChecks();

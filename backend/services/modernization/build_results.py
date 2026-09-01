@@ -663,6 +663,10 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
     # run. Units left `ready` mean it has not, and that is what separates "the model cannot
     # fix this" from "nobody has resumed the run yet".
     pending_before = store.pending_unit_count(run_id)
+    # And the status of the round before this one, for the same reason: `awaiting_rework`
+    # twice running means the queue did not move between two builds, which is a different
+    # situation from a queue that was filled a moment ago.
+    previous_status = (store.latest_build(run_id) or {}).get("status") or ""
 
     current_fingerprint = fingerprint(diagnostics)
     errors = [d for d in diagnostics if d["severity"] == "error"]
@@ -697,6 +701,21 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
         status = "passed"
         summary = (f"Build round {round_no} reported no errors "
                    f"({warning_count} warning(s)); nothing was sent back for rework.")
+        # Withdrawn on the *report*, not on the next gate evaluation, and the difference is
+        # whether a run can get out of the state at all. `_stop_reason` pauses at the top of
+        # every stage for any open blocking checkpoint, and `build_results.gate` runs at the
+        # end of reconcile — so a run holding an open `build_errors_outstanding` can never
+        # reach the code that would take it down. Run 8a9612e0 was in exactly that trap:
+        # compiled clean, and unable to resume, because the only thing that could retire the
+        # objection sat behind the objection. Doing it here means the evidence retires the
+        # question the moment the evidence exists.
+        cleared = store.withdraw_checkpoints(
+            run_id, ("build_required", "build_errors_outstanding"),
+            f"Withdrawn automatically: build round {round_no} compiled with 0 error(s), "
+            f"which is the evidence this gate was asking for.",
+            older_than_round=round_no)
+        if cleared:
+            notes.append(f"{cleared} build gate(s) withdrawn — this build answered them")
     elif not error_units:
         # Checked before non-convergence and before the round cap, because when nothing maps
         # nothing can ever be reopened — so the *next* build is identical by construction and
@@ -764,6 +783,31 @@ def ingest(run_id: str, payload: Dict[str, Any], actor: str = "") -> Dict[str, A
             f"round {round_no}: {pending_before} unit(s) still queued from the previous round",
             level="info",
         )
+        # Twice in a row is not "wait a moment", it is a queue nobody is draining. Rounds 5
+        # and 6 of run 8a9612e0 were byte-identical rebuilds of an unfixed tree while the fix
+        # sat `ready` and unclaimed, because the only message on offer said "resume the run"
+        # in a summary line and nothing was reading it. Non-blocking deliberately: `resume`
+        # refuses to start while a blocking checkpoint is open, so a blocking gate here would
+        # forbid the exact action the gate is asking for.
+        if previous_status == "awaiting_rework":
+            store.create_checkpoint(
+                run_id, "build_not_resumed",
+                f"Two builds in a row have found the same {len(errors)} error(s) with the fix "
+                f"still queued",
+                detail=(
+                    f"Rounds {round_no - 1} and {round_no} compiled the same tree and reported "
+                    f"the same errors, because {pending_before} unit(s) reopened for rework "
+                    f"have not been converted yet. Building it a third time will report them "
+                    f"again — nothing changes until the run itself is resumed:\n\n"
+                    f"    POST /api/v1/modernization/runs/{run_id}/resume\n\n"
+                    f"`scripts/build_run.py --loop` does this for you between rounds. The "
+                    f"errors it is waiting to fix:\n\n"
+                    + _bullets(errors, CHECKPOINT_DIAGNOSTICS)
+                )[:4000],
+                blocking=False,
+                payload={**payload_base, "pending": pending_before,
+                         "diagnostics": _for_payload(errors, CHECKPOINT_DIAGNOSTICS)},
+            )
     elif round_no > MAX_BUILD_ROUNDS:
         status = "round_limit"
         summary = (f"Build round {round_no} still reports {len(errors)} error(s), but the run "
@@ -1009,6 +1053,19 @@ def gate(run_id: str) -> Dict[str, Any]:
         latest = store.latest_build(run_id) or {}
         errors = latest.get("error_count") or 0
         if not errors:
+            # A clean build is the answer to "has anybody compiled this", so retire the
+            # question. Without this the gate raised in an earlier round stays open forever:
+            # `_finalize` will not complete a run with a blocking checkpoint outstanding, so
+            # run 8a9612e0 compiled with zero errors at 14:55:37 and stayed parked on a
+            # checkpoint raised at 14:55:11 saying it had never been compiled. Retiring it is
+            # not a judgement about the code — the compiler made that judgement 26 seconds
+            # later, and this only stops the record contradicting it.
+            round_no = int(run.get("build_round") or 0)
+            store.withdraw_checkpoints(
+                run_id, ("build_required", "build_errors_outstanding"),
+                f"Withdrawn automatically: build round {round_no} compiled with 0 error(s), "
+                f"which is the evidence this gate was asking for.",
+                older_than_round=round_no)
             return {"status": "clean", "round": run.get("build_round"), "errors": 0}
 
         # Errors outstanding. Two honest states, and they need different sentences: nothing has
@@ -1058,6 +1115,9 @@ def gate(run_id: str) -> Dict[str, Any]:
         "runs a compiler, and a conversion can pass all of them and still not build.",
         level="warning")
     if not any(c["kind"] == "build_required" for c in store.list_checkpoints(run_id)):
+        # Read here rather than threaded in: the instruction below is only correct for
+        # a deployment that binds calls to a project when it names the project.
+        project_id = (store.get_run(run_id) or {}).get("project_id") or ""
         store.create_checkpoint(
             run_id, "build_required",
             "This export has never been compiled",
@@ -1068,8 +1128,15 @@ def gate(run_id: str) -> Dict[str, Any]:
                 "nothing here can — building code generated from a customer's source is "
                 "arbitrary code execution, so it happens where the customer's own CI does.\n\n"
                 "The shortest path is a machine with the .NET SDK on it:\n\n"
-                f"    python scripts/build_run.py --run {run_id} \\n"
-                "        --api <this deployment> --user <you> --password <yours>\n\n"
+                # `\\n` in a Python string is a backslash and the letter n, so this printed
+                # the shell continuation and the line break as literal `\\n` in the middle of
+                # the command — the one piece of text whose entire job is being copied and
+                # pasted. `--project` is included when the run has one, because a deployment
+                # that binds every call to a project refuses the resume step without it, and
+                # the loop then dies half way with `project_binding_denied`.
+                f"    python scripts/build_run.py --run {run_id} \\\n"
+                + (f"        --project {project_id} \\\n" if project_id else "")
+                + "        --api <this deployment> --user <you> --password <yours>\n\n"
                 "It downloads the export, runs `dotnet build`, and posts the compiler's own "
                 "output back to this run. Failing units go back into the queue with those "
                 "errors in their prompt, so a build is not only a verdict — it is the input "

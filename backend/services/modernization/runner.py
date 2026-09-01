@@ -27,7 +27,7 @@ import logging
 import os
 import socket
 import threading
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.agents.modernization_intelligence import architect_agent, unit_converter
 from backend.agents.modernization_intelligence import comprehension_agent as _comprehension
@@ -38,8 +38,9 @@ from backend.services import agent_guard, guardrail_service, llm_gateway
 from backend.services.modernization import charter as charter_module
 from backend.services.modernization import contracts
 from backend.services.modernization import (
-    analyzers, architecture, build_results, comprehension, estimate, evidence,
-    extraction_audit, graph, layering, lookup, ownership, parity, playbooks, reconcile,
+    advice, analyzers, architecture, build_results, comprehension, estimate, evidence,
+    extraction_audit, graph, layering, lookup, ownership, packages as package_registry,
+    parity, playbooks, reconcile,
     repo_ingest, rules, runtime, sanity, scaffold, semantics, stages, store, usings,
     validation, wireup,
 )
@@ -70,6 +71,12 @@ _ARCHITECT_MAX_TOKENS = architect_agent.ARCHITECTURE_MAX_TOKENS
 # to generate several is that they can be *measured*. Set to 1 to restore the single-call
 # behaviour exactly — `STANCES[0]` is the empty stance.
 DESIGN_CANDIDATES = 3
+
+# Candidates designed under a project layout the charter did **not** choose, and only when the
+# one it did choose produced dependencies with no legal way to be written. Zero cost on a run
+# that is already fine; on one that is not, it buys the only comparison nobody could otherwise
+# make, because all three panel stances are emphases *within* the charter's layout.
+LAYOUT_ALTERNATIVE_CANDIDATES = 2
 
 # How many read-only turns each design candidate may spend before it answers. The architect
 # decides placement from a table of rows, and the one thing a table cannot settle is what an
@@ -314,10 +321,12 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
     projected_output = 400 + 60 * max(len(units), 1)
     expected_output = min(projected_output, _ARCHITECT_MAX_TOKENS)
     numbers = estimate.band(input_tokens, expected_output, _ARCHITECT_MAX_TOKENS)
-    # One call per candidate decomposition. Priced here rather than discovered later because
-    # this gate's whole claim is that the call count is a fact, not a forecast — `STANCES` is
-    # a constant, so the run will make exactly this many.
-    calls = max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))
+    # One call per candidate decomposition, plus the candidates designed under the *other*
+    # project layout the charter offered. Priced here rather than discovered later because this
+    # gate's whole claim is that the call count is a fact, not a forecast — both constants are
+    # constants, so the run will make exactly this many. Leaving the second group out would
+    # have been the one thing a stage may not do: make a call this gate did not price.
+    calls = _design_call_count()
     # Each candidate may also spend read-only turns before it answers. Only the *ceiling*
     # carries that multiplier: a candidate that needs no lookup makes one call, so charging
     # the expectation for turns nobody has been measured taking would overstate the quote in
@@ -381,7 +390,7 @@ def _discovery_estimate(run_id: str) -> Dict[str, Any]:
             "ceiling_usd": round(ceiling, 4), "model": numbers["model"],
             "price_is_estimated": bool(estimated),
             "comprehension_calls": len(bundles) + (1 if len(bundles) > 1 else 0),
-            "design_calls": max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES))),
+            "design_calls": _design_call_count(),
             "design_output_tokens": projected_output,
             "design_output_cap": _ARCHITECT_MAX_TOKENS,
             "design_file_ceiling": _DESIGN_FILE_CEILING}
@@ -644,6 +653,12 @@ def convert_run(
         # the scaffold's rows are derived from the project list this may change.
         if stage.id == "scaffold":
             _apply_plan_repair(run_id)
+            if _hold_for_plan_conflicts(run_id):
+                # Back to the top of the loop rather than straight to a break: `_stop_reason`
+                # is the single place that decides what a halted run says about itself, and it
+                # already knows what an open blocking checkpoint means. Terminates because the
+                # checkpoint it just raised is blocking, so the next pass pauses and breaks.
+                continue
             run = store.get_run(run_id) or run
 
         # `plan` is idempotent by construction: `insert_units` is one transaction, so a
@@ -922,6 +937,13 @@ def _finish_stage(run_id: str, stage, caller: dict, llm_override: Optional[dict]
                 f"{len(report['issues'])} consistency issue(s) across the converted codebase",
                 detail=reconcile.describe(report)[:4000],
                 blocking=False,
+                # The findings themselves, not only the prose. `drive_modernization`'s
+                # `will_not_work` reads `payload["issues"]` and stops on any `fail` — and this
+                # call never populated it, so that guard has never once fired against the real
+                # product. It was written after a live run sent seven fatal findings past
+                # unread, tested against a payload the smoke suite built by hand, and shipped
+                # reading a field nothing wrote. A second live run then sent two more past.
+                payload={"issues": report["issues"], "counts": report["counts"]},
             )
         # Two questions the platform cannot answer itself, asked here because this is the
         # last moment anyone is looking. Both follow the same shape (D-05): nothing is
@@ -1326,7 +1348,9 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
                        llm_override: Optional[dict], project_name: str,
                        inventory: str, digest: str, cycles: List[Dict[str, Any]],
                        source_edges: List[Tuple[str, str]],
-                       source_units: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                       source_units: List[Dict[str, Any]],
+                       stances: Optional[Tuple[Tuple[str, str], ...]] = None,
+                       label: str = "design_candidate") -> List[Dict[str, Any]]:
     """Ask for several decompositions, score each deterministically, return them ranked.
 
     **Degrades rather than fails.** Candidates are asked for one at a time and a candidate
@@ -1340,7 +1364,8 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
     tools = lookup.DESIGN_TOOL_SCHEMAS if DESIGN_LOOKUP_TURNS > 0 else None
     dispatch = lookup.dispatcher(run_id, lookup.DESIGN_TOOL_NAMES) \
         if DESIGN_LOOKUP_TURNS > 0 else None
-    for index, (stance_id, stance) in enumerate(architect_agent.STANCES[:DESIGN_CANDIDATES]):
+    for index, (stance_id, stance) in enumerate(
+            stances if stances is not None else architect_agent.STANCES[:DESIGN_CANDIDATES]):
         try:
             # The turns happen *inside* one guarded call, so the reservation has to be told —
             # the same mechanism agentic conversion uses, and for the same reason (D-25).
@@ -1375,7 +1400,7 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
         # for a tier it does not use, and one that always exhausts its turns needs a bigger one.
         looked_up = (proposal or {}).get("_agentic_lookups") or []
         store.append_event(
-            run_id, "design_candidate",
+            run_id, label,
             f"{stance_id}: {architecture.describe_score(score)}"
             + (f"; read {len(looked_up)} thing(s) first" if looked_up else ""))
 
@@ -1383,6 +1408,94 @@ def _design_candidates(run_id: str, charter: Dict[str, Any], caller: dict,
     # winner reproducible rather than dependent on which call happened to come back first.
     scored.sort(key=lambda c: architecture.rank_key(c["score"]) + (c["index"],))
     return scored
+
+
+def _other_layouts(run_id: str, charter: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Project layouts the charter advisor offered and this run did not take. Never raises.
+
+    Read back from the advisor rather than hard-coded, so this works for any language pair whose
+    advice module offers more than one — it knows nothing about what a .NET project is called.
+    """
+    try:
+        run = store.get_run(run_id) or {}
+        observed = advice.observe(store.list_units(run_id, kind="source_file"),
+                                  store.list_evidence(run_id), run.get("redactions") or [])
+        offered = advice.suggest(run.get("target_stack") or "",
+                                 observed).get("project_layout") or []
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not read the layout options for run %s (continuing)", run_id)
+        return []
+    taken = " ".join(str(charter.get("project_layout") or "").lower().split())
+    return [{"label": option.label, "value": option.value} for option in offered
+            if " ".join(option.value.lower().split()) != taken]
+
+
+def _design_alternative_layout(run_id: str, charter: Dict[str, Any], caller: dict,
+                               llm_override: Optional[dict], project_name: str,
+                               inventory: str, digest: str, cycles: List[Dict[str, Any]],
+                               source_edges: List[Tuple[str, str]],
+                               source_units: List[Dict[str, Any]],
+                               beat: int) -> Dict[str, Any]:
+    """Design the same codebase under a layout the charter did not choose. -> {} or the best.
+
+    Run on **every** design, not only on one that already failed. The charter's recommendation
+    is a guess made before anything can be measured, and it was a bad one: it had only a file
+    count to reason from and pointed the wrong way on both real codebases this product has
+    converted. `advice.layer_friction` makes that guess better; this makes it not have to be
+    right, because the plan gate then carries two measured numbers instead of one recommendation.
+    Two extra architect calls per run is what that costs.
+
+    **The panel cannot reach this on its own, by design.** All three of its stances are
+    emphases *within* the charter's project layout, never an override of it, because the layout
+    was decided by the team that owns the codebase. That is the right default and it has a
+    consequence: when the layout *itself* is what cannot be built, every candidate carries the
+    same conflicts. On the 45-file live run all three did, and the panel could not have helped.
+
+    Run only when the chosen layout has produced crossings with no legal expression, so a run
+    that is already fine pays nothing. Never applied — the result becomes an option on a gate,
+    because a customer who asked for four projects and receives one, silently, is the
+    correction D-90 and D-98 argue against.
+
+    Never raises: a comparison that could fail the run it was meant to improve is worse than no
+    comparison (D-101).
+    """
+    try:
+        alternatives = _other_layouts(run_id, charter)
+        if not alternatives:
+            return {}
+        layout = alternatives[0]
+        stances = architect_agent.STANCES[:LAYOUT_ALTERNATIVE_CANDIDATES]
+        store.append_event(
+            run_id, "layout_alternative_started",
+            f"The chosen layout leaves {beat} dependency direction(s) with no legal "
+            f"expression. Designing {len(stances)} candidate(s) under "
+            f"\"{layout['label']}\" so the two can be compared.")
+        scored = _design_candidates(
+            run_id, dict(charter, project_layout=layout["value"]), caller, llm_override,
+            project_name, inventory, digest, cycles, source_edges, source_units,
+            stances=stances, label="layout_alternative_candidate")
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not design an alternative layout for run %s (continuing)",
+                         run_id)
+        return {}
+    if not scored:
+        return {}
+    best = scored[0]
+    better = int(best["score"].get("gaps") or 0) < beat
+    store.append_event(
+        run_id, "layout_alternative_scored",
+        f"\"{layout['label']}\": {architecture.describe_score(best['score'])}. The chosen "
+        f"layout leaves {beat} gap(s)."
+        + ("" if better else " It is not offered, because it closes nothing the chosen layout "
+                            "leaves open."))
+    result = {"label": layout["label"], "value": layout["value"], "stance": best["stance"],
+              "score": best["score"], "cost": sum(c["cost"] for c in scored)}
+    if better:
+        # The proposal is kept only when it could still be built. Otherwise the comparison is
+        # worth reporting and the plan is dead weight — a large blob carried into a checkpoint
+        # payload for an option nobody will be offered.
+        result["proposal"] = best["proposal"]
+    return result
 
 
 def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
@@ -1419,6 +1532,17 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
     # Every candidate, not just the one that won. A run that generated three and charged for
     # one would understate the design stage on the very screen its cost is read from.
     cost = sum(c["cost"] for c in candidates)
+
+    # The panel is three emphases *within* the charter's layout, so when the layout itself is
+    # what cannot be built, all three carry the same conflicts — which is exactly what happened
+    # on the 45-file run. The other layout the charter offered is therefore designed too, and
+    # measured, so the gate carries two numbers rather than one recommendation. Always, because
+    # the recommendation is a guess made before anything can be measured and it pointed the
+    # wrong way on both real codebases; offered as a choice only when it closes something.
+    alternative = _design_alternative_layout(
+        run_id, charter, caller, llm_override, project_name, inventory, digest,
+        cycles, source_edges, source_units, beat=int(winner["score"].get("gaps") or 0))
+    cost += float(alternative.get("cost") or 0.0)
     if runners_up:
         # Reported, never silent. Which decomposition a run was built on is the single most
         # consequential decision in it, and "we generated three and picked one" is not
@@ -1462,6 +1586,9 @@ def _design_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # built, and the scores are what makes the choice reviewable.
         "design_panel": [{"stance": c["stance"], "score": c["score"],
                           "chosen": c is winner} for c in candidates],
+        # The whole proposal, unlike the panel above, because this one may still be built. It
+        # is the only thing here that is kept in order to be *applied* rather than reviewed.
+        "alternative_layout": {k: v for k, v in alternative.items() if k != "cost"},
         "estimate": outcome["estimate"],
     })
     store.complete_unit(
@@ -1598,7 +1725,7 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
         next((c.get("target_project") for c in components if c.get("target_project")), "")
 
     needed = wireup.plan(artifacts, store.symbol_namespaces(run_id), namespace_to_project,
-                         entry_project)
+                         entry_project, _approved_packages(run_id, components))
     by_path = {a["path"]: a for a in artifacts}
     rewritten: List[Dict[str, Any]] = []
     notes: List[str] = []
@@ -1674,7 +1801,8 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
     # database" and its solution referenced the provider nowhere, registered the DbContext
     # nowhere, and would have thrown on its first query.
     host_plan = wireup.host_plan(artifacts, entry_project,
-                                 (store.get_run(run_id) or {}).get("charter"))
+                                 (store.get_run(run_id) or {}).get("charter"),
+                                 required=(unit.get("meta") or {}).get("required_services"))
     program_path = f"{entry_project}/Program.cs" if entry_project else ""
     program = by_path.get(program_path)
     if program is not None:
@@ -1712,6 +1840,16 @@ def _wireup_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any]) -> s
     # A DbContext taking `DbContextOptions` cannot be registered without a provider, and a
     # provider is never guessed (a wrong one restores, builds, and cannot open a connection).
     # Say what is missing instead of registering nothing in silence.
+    # A registration the converter wrote that cannot work. Reported here as well as removed,
+    # because the removal makes the application start*able* and does not make it *work* — the
+    # real fix is the context getting the constructor the container can call, and that is the
+    # converter's job. `reconcile` raises it as a fatal finding for exactly that reason.
+    for problem in host_plan.get("bad_registrations") or []:
+        store.append_event(
+            run_id, "registration_removed",
+            f"{problem['context']}: {problem['detail']}"[:900],
+            unit_id=unit["id"], level="warning")
+
     if host_plan.get("db_note"):
         store.create_checkpoint(
             run_id, "database_provider_unknown",
@@ -1851,7 +1989,9 @@ def _unit_source(run_id: str, unit: Dict[str, Any],
 
 def _place_artifacts(run_id: str, unit: Dict[str, Any],
                      files: List[Dict[str, Any]],
-                     rejected: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                     rejected: Optional[List[str]] = None,
+                     package_requests: Optional[List[Tuple[str, str]]] = None
+                     ) -> List[Dict[str, Any]]:
     """Join each returned file name onto the directory this run already chose for it.
 
     The model gives a bare `filename` and at most a `subdir`; the component's `output_dir`
@@ -1911,10 +2051,22 @@ def _place_artifacts(run_id: str, unit: Dict[str, Any],
                   if raw else "a returned file carried no filename at all")
             continue
         if build_files and raw.lower().endswith(build_files):
+            # Refused, but no longer discarded. The sentence below used to end "…is derived
+            # from the code instead", and run 8a9612e0 is the counter-example: the code said
+            # `BCrypt.Net.BCrypt.Verify`, nothing in the catalogue derived a package from it,
+            # and the answer was sitting in the very file being thrown away. Keeping the ids
+            # concedes nothing — they are checked against nuget.org before anything is added,
+            # which is the authority neither this codebase nor the model can be.
+            asked = package_registry.parse_requests(entry.get("content") or "")
+            if package_requests is not None:
+                package_requests.extend(asked)
             _drop(f"{raw} is a build file, and those are written by the scaffold and wireup "
                   f"stages from a catalogue of packages known to exist at this target "
-                  f"framework — not by a conversion. Anything this file needed to say about "
-                  f"dependencies is derived from the code instead.")
+                  f"framework — not by a conversion."
+                  + (f" The {len(asked)} package reference(s) it named were kept and are "
+                     f"being checked against nuget.org."
+                     if asked else
+                     " It named no package references, so there was nothing to keep."))
             continue
         subdir = (entry.get("subdir") or "").strip().strip("/")
         if subdir and (".." in subdir.split("/") or subdir.startswith("/")):
@@ -1946,6 +2098,280 @@ def _plan_layering_gaps(run_id: str, projects: List[Dict[str, Any]],
     except Exception:  # noqa: BLE001
         logger.exception("Could not check the plan's layering for run %s (continuing)", run_id)
         return []
+
+
+def _layout_option(run_id: str, design_meta: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """"Use the other layout instead", shaped like a repair. `[]` when there is none.
+
+    Shaped like a repair on purpose: both gates already render options with what each
+    measurably closes and opens, `_apply_plan_repair` already applies the one a human picked
+    just before the scaffold, and that path already handles resume and idempotency. A second
+    mechanism for the same conversation would be a second thing to get wrong.
+
+    It differs from every other option in one way that has to be said out loud, and is: the
+    others edit this plan, and this one *replaces* it. The files are grouped differently, so
+    the component count changes and the quote changes with it — which is why the detail below
+    names both numbers rather than leaving a reader to discover it after approving.
+
+    Never raises.
+    """
+    try:
+        alternative = design_meta.get("alternative_layout") or {}
+        proposal = alternative.get("proposal") or {}
+        if not proposal.get("components"):
+            return []
+        chosen_keys = {f"{g.get('consumer')}->{g.get('provider')}"
+                       for g in (design_meta.get("layering_gaps") or []) if g.get("consumer")}
+        alt_keys = set((alternative.get("score") or {}).get("gap_keys") or [])
+        closes, opens = sorted(chosen_keys - alt_keys), sorted(alt_keys - chosen_keys)
+        if not closes:
+            return []
+        score = alternative.get("score") or {}
+        here = store.list_units(run_id, kind="component")
+        return [{
+            "id": f"layout:{alternative.get('label') or 'alternative'}",
+            "kind": "swap_layout",
+            "layout": alternative.get("label") or "",
+            "title": f"Use the \"{alternative.get('label')}\" layout instead",
+            "detail": (
+                f"The same source, decomposed again under the other layout the charter "
+                f"offered — **{score.get('projects')} project(s) and "
+                f"{score.get('components')} component(s)**, against "
+                f"{len(design_meta.get('projects') or [])} and {len(here)} in the plan above. "
+                f"It leaves {len(alt_keys)} dependency direction(s) with no legal expression "
+                f"where this plan leaves {len(chosen_keys)}"
+                + (", and fewer projects means fewer boundaries a dependency can cross "
+                   "illegally at all."
+                   if int(score.get("projects") or 0) < len(design_meta.get("projects") or [])
+                   else ".")
+                + f"\n\nThis is the one option here that replaces the plan rather than "
+                  f"editing it, so **the quote changes with it** — the numbers above were "
+                  f"costed for the layout you chose, and the run is re-costed if you take "
+                  f"this. Nothing has been converted, so nothing is lost either way."),
+            "closes": closes, "opens": opens, "feasible": True, "why_not": "",
+            "proposal": proposal,
+        }]
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not offer the alternative layout for run %s (continuing)",
+                         run_id)
+        return []
+
+
+def _design_call_count() -> int:
+    """Model calls the design stage makes. One reader, because two gates quote it.
+
+    The assessment gate prices it and `stages.py`'s second invariant depends on that price
+    being a fact — so a change to either constant has to move the quote, and it can only do
+    that if there is one place that computes it.
+    """
+    return (max(1, min(DESIGN_CANDIDATES, len(architect_agent.STANCES)))
+            + min(LAYOUT_ALTERNATIVE_CANDIDATES, len(architect_agent.STANCES)))
+
+
+def _plan_repair_options(run_id: str, gaps: List[Dict[str, Any]],
+                         projects: List[Dict[str, Any]],
+                         seams: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """`layering.repair_options` over this run's real source graph. Never raises.
+
+    One reader, because two gates now offer repairs — the plan gate, before any conversion
+    spend, and the conflict gate that holds the run if a crossing survives it. Two places
+    computing the same options eventually compute different ones, and the symptom here would be
+    the second gate re-offering a repair the first had already applied.
+    """
+    if not gaps:
+        return []
+    try:
+        return layering.repair_options(
+            gaps, store.list_units(run_id, kind="component"), projects, seams,
+            [(unit["path"], dep) for unit in store.list_units(run_id, kind="source_file")
+             for dep in (unit.get("depends_on") or [])])
+    except Exception:  # noqa: BLE001
+        # A net that can fail the thing it watches is worse than no net (D-101). Without
+        # repairs the gate reads exactly as it did before they existed.
+        logger.exception("Could not compute plan repairs for run %s (continuing)", run_id)
+        return []
+
+
+def _components_without_output(run_id: str) -> List[Dict[str, Any]]:
+    """Components that produced nothing at all — the only ones that make an export partial.
+
+    Decided on the artifacts rather than on the status word, for two reasons. A run converted
+    before `repair_failed` existed recorded both kinds of failure as `failed`, and the fact
+    underneath is identical in old rows and new ones — so asking `is_current` repairs those
+    runs without rewriting a single stored status. And it removes the possibility of the two
+    ever disagreeing: `_finalize` used to declare a run partial from a status tally while the
+    export it was describing contained every file it said was missing (run 8a9612e0: "3 source
+    file(s) have no output" about three files that compiled and served requests).
+    """
+    return [c for c in store.list_units(run_id, kind="component")
+            if c.get("status") in ("failed", "needs_human")
+            and not store.has_current_artifacts(c["id"])]
+
+
+def _approved_packages(run_id: str,
+                       components: List[Dict[str, Any]]) -> Dict[str, Set[Tuple[str, str]]]:
+    """Every package id cleared for this run, keyed by the project that needs it.
+
+    Two sources, both read at the point of use rather than written into a shared place when
+    they happen: what `_resolve_packages` confirmed against nuget.org during conversion, and
+    what a person approved on a `package_approval` checkpoint. Reading the checkpoint here is
+    what makes the human answer take effect — the answer endpoint is generic and has no
+    per-kind hooks, and giving it one would put this decision two modules away from the only
+    code that consumes it.
+
+    A checkpoint that was declined, or answered with anything other than an approval, adds
+    nothing. That is the safe direction: the build then reports the missing type, which is
+    exactly what happens today and is a diagnosis rather than a restore failure.
+    """
+    by_unit = {c["id"]: c for c in components}
+    approved: Dict[str, Set[Tuple[str, str]]] = {}
+
+    def _add(project: str, pairs) -> None:
+        if not project:
+            return
+        for pair in pairs:
+            if len(pair) == 2 and all(pair):
+                approved.setdefault(project, set()).add((str(pair[0]), str(pair[1])))
+
+    for component in components:
+        _add(component.get("target_project") or "",
+             ((component.get("meta") or {}).get("approved_packages") or []))
+
+    for checkpoint in store.list_checkpoints(run_id):
+        if checkpoint["kind"] != "package_approval" or checkpoint["status"] == "open":
+            continue
+        answer = checkpoint.get("answer") or {}
+        decision = str(answer.get("decision") or "").strip().lower()
+        if decision not in ("approve", "approved", "yes", "add", "accept"):
+            continue
+        owner = by_unit.get(checkpoint.get("unit_id") or "", {}).get("target_project") or ""
+        candidates = (checkpoint.get("payload") or {}).get("candidates") or []
+        # A person may approve some of what was asked and not all of it, by naming ids in the
+        # answer. Naming none means "all of them", which is what a plain Approve button sends.
+        chosen = {str(n).lower() for n in (answer.get("packages") or [])}
+        _add(owner, [(row.get("name"), row.get("version") or row.get("requested"))
+                     for row in candidates
+                     if not chosen or str(row.get("name") or "").lower() in chosen])
+
+    if approved:
+        store.append_event(
+            run_id, "packages_approved",
+            "; ".join(f"{project}: " + ", ".join(f"{n} {v}" for n, v in sorted(pairs))
+                      for project, pairs in sorted(approved.items()))[:500],
+            level="info")
+    return approved
+
+
+def _resolve_packages(run_id: str, unit: Dict[str, Any],
+                      requests: List[Tuple[str, str]]) -> None:
+    """Check the package ids a refused project file asked for, and act on the verdicts.
+
+    Three outcomes, and which one applies is decided by nuget.org rather than here:
+
+      * the registry has the id (at that version, or at a newer stable one) — added to this
+        component's meta, which `_wireup_one` unions into the project file. No human, because
+        there is nothing left to decide: a published id at a published version is a fact.
+      * our own catalogue or the shared framework already covers it — nothing to do, and in
+        the framework case adding it is the specific error that produced `NU1102` on two
+        earlier runs, so it is refused with the reason on the record.
+      * the registry says no such id, or could not be reached — a blocking checkpoint, because
+        this is precisely the guess that must not be made silently.
+
+    Blocking is a real cost and worth naming: the run stops here rather than at the build,
+    with the rest of the conversion unspent. That is the trade deliberately — the alternative
+    is paying for the remaining components to arrive at a restore failure we could already
+    see, and a paused run is cheap to resume by construction (D-03). One checkpoint per
+    unknown id, and the common case (a real package, e.g. `BCrypt.Net-Next` 4.0.3) raises none.
+
+    Never raises. A registry that is down must not be able to fail a conversion that was
+    otherwise fine — the argument D-101 makes about nets that can break what they watch.
+    """
+    try:
+        rows = package_registry.resolve(requests,
+                                        known_ids=sorted(wireup.catalogue_ids()),
+                                        framework_ids=sorted(wireup.FRAMEWORK_PROVIDED_PACKAGES))
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not resolve package requests for run %s (continuing)", run_id)
+        return
+
+    store.append_event(run_id, "packages_requested",
+                       (f"{len(requests)} package reference(s) from a refused project "
+                        f"file:\n" + package_registry.describe(rows))[:500],
+                       unit_id=unit["id"], level="info")
+
+    approved = package_registry.approved(rows)
+    if approved:
+        # Re-read rather than trusting the `unit` dict in hand: it was loaded when the unit was
+        # claimed, and a component reopened twice would otherwise drop the ids the first pass
+        # confirmed.
+        fresh = store.get_unit(unit["id"]) or {}
+        held = {tuple(p) for p in ((fresh.get("meta") or {}).get("approved_packages") or [])}
+        store.set_unit_meta(unit["id"], {
+            "approved_packages": sorted([list(p) for p in held | set(approved)])})
+
+    pending = package_registry.unresolved(rows)
+    if pending:
+        names = ", ".join(f"{r['name']} {r.get('requested') or ''}".strip() for r in pending)
+        store.create_checkpoint(
+            run_id, "package_approval",
+            f"{len(pending)} package(s) the converter asked for could not be verified",
+            detail=(
+                f"Converting `{unit.get('component_name') or unit['path']}` produced code that "
+                f"needs package(s) this platform does not know, and nuget.org did not confirm "
+                f"them:\n\n{package_registry.describe(pending)}\n\n"
+                f"Approving adds them to the project file exactly as named. Declining leaves "
+                f"the project file alone, and the build will report the missing type — which "
+                f"is what happens today.\n\n"
+                f"A package id that cannot restore is worse than a missing one: `NU1102` stops "
+                f"the restore before anything compiles, so there is no file and no line to "
+                f"route the failure back to. Approve an id you recognise, or one your own "
+                f"package feed carries.\n\n"
+                f"Everything else the same file asked for has already been settled without "
+                f"you:\n\n{package_registry.describe([r for r in rows if r not in pending])}"
+            )[:4000],
+            unit_id=unit["id"], blocking=True,
+            payload={"candidates": pending, "resolved": rows},
+        )
+
+
+def _stopped_repeating(run_id: str, unit: Dict[str, Any], status: str,
+                       kind: str, detail: str) -> None:
+    """Say so when a unit retired on a rejection, and say *why it stopped when it did*.
+
+    The contract branch was the one terminal path in `_convert_one` that raised no checkpoint
+    at all: it failed the unit, logged an event, and returned. So the auth component of run
+    8a9612e0 exhausted three attempts against an identical objection and the only trace a
+    human could find was three `contract_broken` lines in the event stream — nothing on the
+    checkpoints screen, nothing blocking, nothing asking to be read.
+
+    Non-blocking. Nothing is missing from the export in the `repair_failed` case (the previous
+    output is still current and still shipping), and in the `failed` case reconciliation
+    already raises the component as a fatal finding. This is the record of *this* decision.
+    """
+    if status not in store.TERMINAL_UNIT_STATES:
+        return
+    repeated = bool(((store.get_unit(unit["id"]) or {}).get("error") or {}).get("repeated"))
+    name = unit.get("component_name") or unit["path"]
+    store.create_checkpoint(
+        run_id, kind,
+        (f"{name} was rewritten twice with the same objection, so it stopped there"
+         if repeated else
+         f"{name} could not be rewritten without breaking something else"),
+        detail=(
+            ("Two attempts in a row were rejected for exactly the same reason, so the "
+             "remaining attempts would have argued with the same answer and were not "
+             "spent.\n\n"
+             if repeated else
+             "Every attempt at this component was rejected.\n\n")
+            + ("Its converted output from before the rework is unchanged and is what "
+               "the export contains — nothing here is missing, but nothing the rework "
+               "was trying to fix was fixed either.\n\n"
+               if status == "repair_failed" else
+               "This component produced no output, so its source files have none.\n\n")
+            + detail
+        )[:4000],
+        unit_id=unit["id"], blocking=False,
+    )
 
 
 def _design_projects(run_id: str) -> List[Dict[str, Any]]:
@@ -2024,6 +2450,11 @@ def _freeze_plan(run_id: str, run: Dict[str, Any], design_meta: Dict[str, Any],
     }
     if design_meta.get("repair_applied"):
         plan["repair_applied"] = design_meta["repair_applied"]
+    if design_meta.get("repairs_applied"):
+        # The sequence, because a run can now apply more than one and each was measured
+        # against the layout the previous one left behind. `repair_applied` above is the last
+        # of them and stays for readers that only ever expected one.
+        plan["repairs_applied"] = list(design_meta["repairs_applied"])
     store.update_run(run_id, plan=plan, estimate=totals)
 
     # Freeze the system addendum now, at the gate, and never re-derive it per unit. Two
@@ -2038,89 +2469,260 @@ def _freeze_plan(run_id: str, run: Dict[str, Any], design_meta: Dict[str, Any],
     return plan
 
 
+# How many layout repairs one run applies before it stops offering more. Each is a human
+# answer to a blocking gate and each recomputes the plan against the real dependency graph, so
+# a run that has taken this many and still has crossings left is not converging on them. The
+# remaining question is whether to convert anyway, and after this that is the only thing asked.
+MAX_PLAN_REPAIRS = 4
+
+# The gates that can carry a layout repair in their answer. Both, because the conflict gate is
+# a continuation of the plan gate rather than a different conversation: it asks the same
+# question about what is left after the previous answer was applied.
+_REPAIR_GATES = ("plan_approval", "plan_conflicts")
+
+
+def _gap_signature(gaps: List[Dict[str, Any]]) -> str:
+    """What the conflict gate is *about*, as one comparable string.
+
+    This is what makes the gate terminate. "Has a human answered?" is the wrong question — an
+    answer that picks a repair should lead to another question about what the repair left
+    behind, and an answer that picks nothing must not. "Has a human been shown **this** set of
+    crossings?" is the right one, and it is decidable: two runs of the same unclosed pairs are
+    the same question no matter what was clicked, and a set that changed is a new one.
+
+    The consequence is deliberate. A gate answered with something meaningless proceeds rather
+    than re-asking forever, because the property worth protecting is that somebody was shown
+    the proof and made a decision — not that they typed a particular word.
+    """
+    return "|".join(sorted(f"{g.get('consumer')}->{g.get('provider')}" for g in gaps))
+
+
+def _apply_one_repair(run_id: str, checkpoint: Dict[str, Any], chosen: str,
+                      applied: List[str]) -> None:
+    """Apply one picked repair to the settled plan, then measure what is left.
+
+    The option is looked up in **the checkpoint's own payload**, never recomputed. The source
+    graph has not changed, so a recomputation would almost always agree — but "almost always"
+    is not a property to build a spend gate on, and what a human approved is what must happen.
+    """
+    option = next((r for r in ((checkpoint.get("payload") or {}).get("repairs") or [])
+                   if r.get("id") == chosen), None)
+    if option is None:
+        store.append_event(run_id, "plan_repair_missing",
+                           f"The plan gate was answered with repair {chosen!r}, which is not "
+                           f"one of the options that gate offered. Nothing was changed.",
+                           level="warning")
+        return
+    if not option.get("feasible", True):
+        store.append_event(run_id, "plan_repair_refused",
+                           f"{option.get('title')} was marked not possible on the gate that "
+                           f"offered it: {option.get('why_not')}. Nothing was changed.",
+                           level="warning")
+        return
+
+    outcome = architecture.apply_repair(run_id, option)
+    if not outcome.get("applied"):
+        store.append_event(run_id, "plan_repair_failed",
+                           f"{option.get('title')} could not be applied: "
+                           f"{outcome.get('reason')}", level="warning")
+        return
+
+    # The residual, from the new layout over the same real source graph. Recomputed rather
+    # than taken from the option's own `closes`, because that was measured against the plan
+    # as it stood at the gate and this is measured against what is now on the rows.
+    design_units = store.list_units(run_id, kind="design")
+    design_meta = (design_units[0].get("meta") if design_units else None) or {}
+    store.set_unit_meta(design_units[0]["id"], {
+        "layering_gaps": _plan_layering_gaps(
+            run_id, design_meta.get("projects") or [], design_meta.get("seams") or []),
+        # The list is the idempotency key, and it has to be a list rather than the single
+        # `repair_applied` this used to keep: a run can now apply more than one, and a set of
+        # one cannot say which of two answered gates has already been honoured.
+        "repairs_applied": applied + [chosen],
+    })
+    design_meta = (store.list_units(run_id, kind="design")[0].get("meta")) or {}
+
+    run = store.get_run(run_id) or {}
+    # The design unit's estimate, when it has one, because a `swap_layout` re-materialised the
+    # components and wrote a new total there. `run["estimate"]` is the one quoted at the gate,
+    # which for that repair is a number about a plan that no longer exists.
+    _freeze_plan(run_id, run, design_meta,
+                 store.list_units(run_id, kind="component"),
+                 design_meta.get("estimate") or (run.get("estimate") or {}))
+    store.append_event(
+        run_id, "plan_repair_applied",
+        f"{option.get('title')}. "
+        + (f"{len(outcome.get('moved') or [])} component(s) moved: "
+           + "; ".join((outcome.get("moved") or [])[:8])
+           if outcome.get("moved") else "The project reference graph was updated.")
+        + f" {len(design_meta.get('layering_gaps') or [])} dependency direction(s) remain "
+          f"without a legal expression.",
+    )
+
+
 def _apply_plan_repair(run_id: str) -> None:
-    """Apply the plan repair a human picked at the gate, if they picked one. Never raises.
+    """Apply every layout repair a human has picked and this run has not applied yet.
 
     Runs once, immediately before the scaffold stage — the last moment a project's existence is
     still a row rather than a `.csproj` on disk.
 
-    The option applied is looked up in **the checkpoint's own payload**, never recomputed. The
-    source graph has not changed, so a recomputation would almost always agree — but "almost
-    always" is not a property to build a spend gate on, and what a human approved is what must
-    happen.
+    Plural, and applied one at a time in the order they were answered, because applying a
+    repair changes the plan the next one was measured against. The 45-file live run had **two**
+    unbuildable crossings and was offered four repairs that each closed one; a single answer was
+    taken, so one crossing survived into conversion, the converter improvised around it, and the
+    export compiled and would not start. Recomputing between repairs is what makes a second
+    answer mean anything — which is why this is a loop over answered gates rather than a list
+    applied in one pass, and why the options a later gate offers are computed after the earlier
+    one has landed on the rows.
 
-    An unanswered gate, an answer with no repair, or `"none"` all return immediately, so every
-    existing run and every fixture behaves exactly as it did.
+    An unanswered gate, an answer with no repair, `"none"` or `"proceed"` all skip that gate, so
+    every run that predates this and every fixture behaves exactly as it did.
+
+    Never raises: a run whose repair could not be applied converts into the layout that was
+    approved, which is the behaviour every run had before any of this existed.
     """
     try:
-        answered = [c for c in store.list_checkpoints(run_id)
-                    if c["kind"] == "plan_approval" and c["status"] != "open"]
-        if not answered:
-            return
-        checkpoint = answered[-1]
-        chosen = str(((checkpoint.get("answer") or {}).get("repair") or "")).strip()
-        if not chosen or chosen == "none":
-            return
-
-        design_units = store.list_units(run_id, kind="design")
-        design_meta = (design_units[0].get("meta") if design_units else None) or {}
-        already = (design_meta.get("repair_applied") or {}).get("id")
-        if already:
-            # Idempotent: `convert_run` re-enters this stage after a crash or a resume, and a
-            # merge applied twice would look for a project that no longer exists.
-            return
-
-        option = next((r for r in ((checkpoint.get("payload") or {}).get("repairs") or [])
-                       if r.get("id") == chosen), None)
-        if option is None:
-            store.append_event(run_id, "plan_repair_missing",
-                               f"The plan gate was answered with repair {chosen!r}, which is not "
-                               f"one of the options that gate offered. Nothing was changed.",
-                               level="warning")
-            return
-        if not option.get("feasible", True):
-            store.append_event(run_id, "plan_repair_refused",
-                               f"{option.get('title')} was marked not possible on the gate that "
-                               f"offered it: {option.get('why_not')}. Nothing was changed.",
-                               level="warning")
-            return
-
-        outcome = architecture.apply_repair(run_id, option)
-        if not outcome.get("applied"):
-            store.append_event(run_id, "plan_repair_failed",
-                               f"{option.get('title')} could not be applied: "
-                               f"{outcome.get('reason')}", level="warning")
-            return
-
-        # The residual, from the new layout over the same real source graph. Recomputed rather
-        # than taken from the option's own `closes`, because that was measured against the plan
-        # as it stood at the gate and this is measured against what is now on the rows.
-        design_units = store.list_units(run_id, kind="design")
-        design_meta = (design_units[0].get("meta") if design_units else None) or {}
-        store.set_unit_meta(design_units[0]["id"], {
-            "layering_gaps": _plan_layering_gaps(
-                run_id, design_meta.get("projects") or [], design_meta.get("seams") or []),
-        })
-        design_meta = (store.list_units(run_id, kind="design")[0].get("meta")) or {}
-
-        run = store.get_run(run_id) or {}
-        _freeze_plan(run_id, run, design_meta,
-                     store.list_units(run_id, kind="component"),
-                     (run.get("estimate") or {}))
-        store.append_event(
-            run_id, "plan_repair_applied",
-            f"{option.get('title')}. "
-            + (f"{len(outcome.get('moved') or [])} component(s) moved: "
-               + "; ".join((outcome.get("moved") or [])[:8])
-               if outcome.get("moved") else "The project reference graph was updated.")
-            + f" {len(design_meta.get('layering_gaps') or [])} dependency direction(s) remain "
-              f"without a legal expression.",
-        )
+        for checkpoint in store.list_checkpoints(run_id):
+            if checkpoint["kind"] not in _REPAIR_GATES or checkpoint["status"] == "open":
+                continue
+            chosen = str(((checkpoint.get("answer") or {}).get("repair") or "")).strip()
+            if not chosen or chosen in ("none", "proceed"):
+                continue
+            design_units = store.list_units(run_id, kind="design")
+            if not design_units:
+                return
+            applied = list((design_units[0].get("meta") or {}).get("repairs_applied") or [])
+            if chosen in applied:
+                # Idempotent: `convert_run` re-enters this stage after a crash or a resume,
+                # and a merge applied twice would look for a project that no longer exists.
+                continue
+            _apply_one_repair(run_id, checkpoint, chosen, applied)
     except Exception:  # noqa: BLE001
-        # A net that can fail the thing it watches is worse than no net (D-101). A run whose
-        # repair could not be applied converts into the layout that was approved, which is the
-        # behaviour every run had before this existed.
         logger.exception("Could not apply the plan repair for run %s (continuing)", run_id)
+
+
+def _hold_for_plan_conflicts(run_id: str) -> bool:
+    """Stop the run while the settled layout still has a crossing that cannot be written.
+
+    True means hold. This is the invariant the whole layering check was missing: **the pipeline
+    does not convert into a plan it has already proved cannot be built.** Until now it printed
+    the proof on the gate, applied at most one of the repairs it offered, and walked past the
+    rest.
+
+    That proof has been right twice. On run 9c8cf4fe `plan_gaps` named all twelve eventual build
+    errors while $0.67 had been spent instead of $6.43. On the 45-file run it named two
+    crossings; one was repaired, the survivor was left, and the converter did what a converter
+    forbidden from writing the obvious thing does — it routed around the boundary, which
+    compiles and then fails when the application starts. That failure mode is the expensive one
+    precisely because no compiler can see it, and it has had exactly one cause both times it
+    appeared: the model was told to do something and forbidden from the only legal way to do it.
+    Removing the reason to improvise is worth more than another check for the shape of a
+    particular improvisation, because there is always another shape.
+
+    Not a refusal — this asks. The architect may be right, a parsed edge may not survive
+    translation, and a customer is entitled to convert a layout we merely disapprove of. What
+    they are not entitled to is doing it *by accident*, which is exactly what an unanswered
+    warning on a gate somebody clicked through is. `proceed` is a word someone has to choose;
+    the empty answer that approves a gate no longer selects it.
+
+    Never raises (D-101): a gate that can fail the run it guards is worse than no gate, so
+    anything unexpected here lets the run continue exactly as it did before.
+    """
+    try:
+        design_units = store.list_units(run_id, kind="design")
+        if not design_units:
+            return False
+        design = design_units[0]
+        meta = design.get("meta") or {}
+        projects, seams = meta.get("projects") or [], meta.get("seams") or []
+        gaps = _plan_layering_gaps(run_id, projects, seams)
+        # Written back even when empty, so the row says "checked, and clean" rather than
+        # leaving a stale value that reads identically to never having looked.
+        store.set_unit_meta(design["id"], {"layering_gaps": gaps})
+        if not gaps:
+            return False
+
+        signature = _gap_signature(gaps)
+        for point in store.list_checkpoints(run_id):
+            if point["kind"] != "plan_conflicts":
+                continue
+            if point["status"] == "open":
+                return True          # already asked, still waiting
+            if (point.get("payload") or {}).get("signature") == signature:
+                # Answered, and these are the same crossings that gate was about — so either
+                # the override was chosen, or a repair was chosen and did not change the
+                # situation. Both mean the decision has been made and asking again would only
+                # stall a run whose operator has already seen the proof.
+                answer = str(((point.get("answer") or {}).get("repair") or "")).strip()
+                store.append_event(
+                    run_id, "plan_conflicts_accepted",
+                    f"Converting with {len(gaps)} unbuildable crossing(s), answered "
+                    f"{answer or 'without choosing a repair'}. Expect code that compiles and "
+                    f"does not start.", level="warning")
+                return False
+
+        applied = list(meta.get("repairs_applied") or [])
+        repairs = ([] if len(applied) >= MAX_PLAN_REPAIRS else
+                   [r for r in (_layout_option(run_id, meta)
+                                + _plan_repair_options(run_id, gaps, projects, seams))
+                    if r.get("feasible")])
+
+        detail = (
+            f"**{len(gaps)} dependency direction(s) in this layout have no legal way to be "
+            f"written"
+            + (f"**, after {len(applied)} repair(s) were applied. "
+               if applied else "**. ")
+            + f"The source has dependencies that cross a project boundary the plan forbids, "
+              f"and no interface seam covers them.\n\nThis is not a guess about the model. It "
+              f"is arithmetic over the dependency graph the parsers produced (D-04): the "
+              f"converter will be asked to write something the architecture forbids, and it "
+              f"has two ways out. It can name a type it may not name, and MSBuild refuses to "
+              f"build the solution at all. Or it can route around the boundary, which compiles "
+              f"cleanly and fails when the application starts — the expensive one, because no "
+              f"compiler can see it.\n\n"
+            + "\n\n".join(g["detail"] for g in gaps[:6])
+            + (f"\n\n… and {len(gaps) - 6} more." if len(gaps) > 6 else ""))
+        if repairs:
+            detail += (
+                f"\n\n**{len(repairs)} way(s) to close what is left.** Each is measured "
+                f"against the layout as it stands now, including any repair already applied. "
+                f"Pick one; if a crossing survives it, the run re-checks and asks again.\n\n"
+                + "\n\n".join(
+                    f"- **{r['title']}** — closes {len(r['closes'])} of {len(gaps)}"
+                    + (f", opens {len(r['opens'])} new" if r["opens"] else "")
+                    + f". {r['detail']}" for r in repairs[:8]))
+        elif len(applied) >= MAX_PLAN_REPAIRS:
+            detail += (
+                f"\n\n**No further repairs are offered.** {len(applied)} have already been "
+                f"applied to this plan and crossings remain, which says the decomposition wants "
+                f"rethinking rather than patching. Cancel and re-run with a different layout, "
+                f"or convert this one as it stands.")
+        else:
+            detail += (
+                "\n\n**Nothing deterministic closes these.** Every repair that would close one "
+                "either closes a project reference cycle, which MSBuild refuses outright "
+                "(D-93/D-99), or opens a crossing somewhere else.")
+        detail += (
+            "\n\nAnswer **proceed** to convert this layout anyway — that is a real option and "
+            "sometimes the right one. Nothing is charged for asking, and everything converted "
+            "so far is kept either way.")
+
+        store.create_checkpoint(
+            run_id, "plan_conflicts",
+            f"{len(gaps)} dependency direction(s) in this layout cannot be built",
+            detail=detail, blocking=True,
+            payload={"gaps": gaps, "repairs": repairs, "repairs_applied": applied,
+                     "projects": projects, "signature": signature},
+            options=[r["id"] for r in repairs] + ["proceed"])
+        store.append_event(
+            run_id, "plan_conflicts_held",
+            f"{len(gaps)} unbuildable crossing(s) remain after {len(applied)} repair(s); "
+            f"{len(repairs)} further repair(s) offered. The run will not convert until this is "
+            f"answered.", level="warning")
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not check the settled plan for run %s (continuing)", run_id)
+        return False
 
 
 def _coverage_note(run_id: str) -> str:
@@ -2232,6 +2834,17 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     # already fixed, and this is something it cannot fix. Reported rather than fatal — the
     # architect may have a reason, a parsed edge may not survive translation, and refusing a
     # plan on a guess is worse than naming the risk in front of the person paying for it.
+    alternative = design_meta.get("alternative_layout") or {}
+    if alternative.get("score"):
+        _alt_score = alternative["score"]
+        detail += (
+            f"\n\n**Both project layouts the charter offered were designed and measured.** "
+            f"This plan follows the one you chose. The other — \"{alternative.get('label')}\" "
+            f"— came out as {_alt_score.get('projects')} project(s) and "
+            f"{_alt_score.get('components')} component(s) with {_alt_score.get('gaps')} "
+            f"dependency direction(s) that have no legal way to be written, against "
+            f"{len(design_meta.get('layering_gaps') or [])} here.")
+
     gaps = design_meta.get("layering_gaps") or []
     if gaps:
         detail += (
@@ -2249,31 +2862,23 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
     # human picks one. Not a bare block (there is a decision here, and the architect may be
     # right), and not a silent auto-fix (a customer who approved four projects and receives
     # three, with nothing saying so, is the correction D-90 and D-98 argue against).
-    repairs: List[Dict[str, Any]] = []
-    if gaps:
-        try:
-            repairs = layering.repair_options(
-                gaps, store.list_units(run_id, kind="component"),
-                design_meta.get("projects") or [], design_meta.get("seams") or [],
-                [(unit["path"], dep) for unit in store.list_units(run_id, kind="source_file")
-                 for dep in (unit.get("depends_on") or [])])
-        except Exception:  # noqa: BLE001
-            # A net that can fail the thing it watches is worse than no net (D-101). Without
-            # repairs the gate reads exactly as it did before.
-            logger.exception("Could not compute plan repairs for run %s (continuing)", run_id)
-        if repairs:
-            plan["repairs"] = repairs
-            detail += (
-                f"\n\n**{len(repairs)} way(s) to make this layout buildable, before anything "
-                f"is converted.** Pick one to have it applied to the plan, or approve as it "
-                f"stands and the run converts into the layout above.\n\n"
-                + "\n\n".join(
-                    f"- **{r['title']}**"
-                    + (f" — closes {len(r['closes'])} of {len(gaps)}"
-                       + (f", opens {len(r['opens'])} new" if r["opens"] else "")
-                       + f". {r['detail']}" if r["feasible"] else
-                       f" — **not possible here.** {r['why_not']}")
-                    for r in repairs[:8]))
+    repairs = (_layout_option(run_id, design_meta)
+               + _plan_repair_options(run_id, gaps, design_meta.get("projects") or [],
+                                      design_meta.get("seams") or []))
+    if repairs:
+        plan["repairs"] = repairs
+        detail += (
+            f"\n\n**{len(repairs)} way(s) to make this layout buildable, before anything "
+            f"is converted.** Pick one to have it applied to the plan. If any crossing "
+            f"survives the one you pick, the run stops again and asks — it will not "
+            f"convert into a layout it has already proved cannot be written.\n\n"
+            + "\n\n".join(
+                f"- **{r['title']}**"
+                + (f" — closes {len(r['closes'])} of {len(gaps)}"
+                   + (f", opens {len(r['opens'])} new" if r["opens"] else "")
+                   + f". {r['detail']}" if r["feasible"] else
+                   f" — **not possible here.** {r['why_not']}")
+                for r in repairs[:8]))
     if agentic:
         # Said plainly, because the expectation is the half that is not yet measured. The
         # ceiling above already carries the multiplier; the estimate does not, and quoting a
@@ -2287,9 +2892,14 @@ def _build_task_plan(run_id: str) -> Dict[str, Any]:
             f"so read the ceiling, not the estimate.")
     # One gate, not two. `start` refuses to begin while *any* blocking checkpoint is open, so a
     # separate repair gate raised in the same breath would give an operator who answered one a
-    # Resume button that silently did nothing. Safe to fold in because no repair changes the
-    # quote: component count and source characters are identical under all of them, so the
-    # number approved here stays true whichever is picked.
+    # Resume button that silently did nothing.
+    #
+    # Folding in was safe while every option merely edited the plan — component count and
+    # source characters were identical under all of them, so the number approved here stayed
+    # true whichever was picked. `swap_layout` breaks that: it replaces the decomposition, so
+    # the component count and the quote both move. It is still folded in, because a second gate
+    # would not help, and the option's own text names both numbers and says the run is
+    # re-costed. `_freeze_plan` then re-quotes from the new rows.
     store.create_checkpoint(
         run_id, "plan_approval", "Approve the conversion plan", detail=detail,
         blocking=True, payload=plan,
@@ -2514,6 +3124,12 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         semantics.summarize_for_prompt(meta.get("semantic_issues") or []),
         validation.summarize_for_prompt(meta.get("validation_issues") or []),
         layering.summarize_for_prompt(meta.get("layering_issues") or []),
+        # The failure no static check can produce: the solution compiled, the process started,
+        # and it stopped. Written onto this unit by `runtime.route`, and carried with the log
+        # the process actually printed — a parser that recognised the message can say what to
+        # do, and one that did not has nothing better to offer than what happened.
+        runtime.summarize_for_prompt(meta.get("startup_issues") or [],
+                                     meta.get("startup_log") or ""),
         ownership.summarize_for_prompt(meta.get("ownership_issues") or []),
         _followups_for_prompt(meta.get("followups") or []),
     ) if block)
@@ -2636,7 +3252,11 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         store.add_run_spend(run_id, float(cost))
 
     rejected: List[str] = []
-    artifacts = _place_artifacts(run_id, unit, result.get("files") or [], rejected)
+    package_requests: List[Tuple[str, str]] = []
+    artifacts = _place_artifacts(run_id, unit, result.get("files") or [], rejected,
+                                 package_requests)
+    if package_requests:
+        _resolve_packages(run_id, unit, package_requests)
     if not artifacts:
         detail = ("The converter returned no files for this unit."
                   if not rejected else
@@ -2745,8 +3365,9 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # out — is what produced a 3 -> 22 error round on a live run, where one rewrite put one
         # detail wrong in twenty-two dependent places and nothing noticed until the compiler
         # counted them.
-        store.fail_unit(unit["id"], run_id, detail[:400], terminal=False,
-                        max_attempts=MAX_UNIT_ATTEMPTS)
+        status = store.fail_unit(unit["id"], run_id, detail[:400], terminal=False,
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        _stopped_repeating(run_id, unit, status, "contract_broken", detail)
         return "failed"
 
     if report["status"] == "fail":
@@ -2771,9 +3392,10 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
         # a transient, and committing it anywhere is the failure `autofix_pr` refuses too.
         terminal = "secret" in report["failed_checks"]
         status = store.fail_unit(unit["id"], run_id, f"Validation failed: {detail}",
-                                 terminal=terminal, max_attempts=MAX_UNIT_ATTEMPTS)
+                                 terminal=terminal, max_attempts=MAX_UNIT_ATTEMPTS,
+                                 stop_if_repeated=True)
         store.append_event(run_id, "validation_failed", detail, unit_id=unit["id"], level="error")
-        if status == "failed":
+        if status in store.TERMINAL_UNIT_STATES:
             store.create_checkpoint(
                 run_id, "validation", f"{path} could not be converted cleanly",
                 detail=detail, unit_id=unit["id"], blocking=False,
@@ -2805,8 +3427,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                            unit_id=unit["id"], level="error")
         status = store.fail_unit(unit["id"], run_id,
                                  f"Behaviour differs from the source: {detail}"[:500],
-                                 max_attempts=MAX_UNIT_ATTEMPTS)
-        if status == "failed":
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        if status in store.TERMINAL_UNIT_STATES:
             # Blocking, unlike a validation failure. A structurally broken file announces
             # itself the moment anyone opens it; this one compiles and ships, and the only
             # symptom is a number that is wrong in production.
@@ -2843,8 +3465,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                            unit_id=unit["id"], level="error")
         status = store.fail_unit(unit["id"], run_id,
                                  f"Broke the project boundaries: {detail}"[:500],
-                                 max_attempts=MAX_UNIT_ATTEMPTS)
-        if status == "failed":
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        if status in store.TERMINAL_UNIT_STATES:
             # Blocking, for the same reason a semantic drift is: this one does not merely
             # produce a worse file, it produces a solution MSBuild refuses to build at all,
             # and no later stage can repair it by adding a reference.
@@ -2881,8 +3503,8 @@ def _convert_one(run_id: str, unit: Dict[str, Any], charter: Dict[str, Any],
                            unit_id=unit["id"], level="error")
         status = store.fail_unit(unit["id"], run_id,
                                  f"Converted files it does not own: {detail}"[:500],
-                                 max_attempts=MAX_UNIT_ATTEMPTS)
-        if status == "failed":
+                                 max_attempts=MAX_UNIT_ATTEMPTS, stop_if_repeated=True)
+        if status in store.TERMINAL_UNIT_STATES:
             store.create_checkpoint(
                 run_id, "foreign_declaration",
                 f"{unit.get('component_name') or path} declared types another component owns",
@@ -3098,7 +3720,7 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
                     f"Everything converted, but {store.open_blocking_checkpoints(run_id)} "
                     f"blocking checkpoint(s) are unanswered. The run is not finished until "
                     f"they are."))
-        elif outstanding == 0 and not stages_left and components["failed"]:
+        elif outstanding == 0 and not stages_left and _components_without_output(run_id):
             # A component that exhausted its attempts is `failed`, which `outstanding` does
             # not count — so a run could lose half its components and still land in the
             # branch below. The message made it worse: `counts` is over *source files*, and
@@ -3111,20 +3733,18 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
             # finds nothing claimable and would land here again. The status is the only
             # honest signal that the export is partial; `reconcile` already names each
             # missing component and the source files stranded with it.
-            stranded = sum(
-                len(((c.get("meta") or {}).get("members")) or [])
-                for c in store.list_units(run_id, kind="component")
-                if c.get("status") in ("failed", "needs_human"))
+            empty = _components_without_output(run_id)
+            stranded = sum(len(((c.get("meta") or {}).get("members")) or []) for c in empty)
             store.update_run(
                 run_id, status="failed", phase=run.get("phase") or "convert",
                 paused_reason=(
-                    f"{components['failed']} of {components['total']} component(s) did not "
+                    f"{len(empty)} of {components['total']} component(s) did not "
                     f"convert, so {stranded} source file(s) have no output. The export is "
                     f"partial."))
             store.append_event(
                 run_id, "run_incomplete",
                 f"{components['converted']} of {components['total']} component(s) converted; "
-                f"{components['failed']} failed, stranding {stranded} source file(s). The "
+                f"{len(empty)} produced nothing, stranding {stranded} source file(s). The "
                 f"export is missing their output entirely — it is not a finished conversion.",
                 level="error",
             )
@@ -3147,11 +3767,22 @@ def _finalize(run_id: str, converted: int, failed: int) -> Dict[str, Any]:
                     f"Everything converted, but the last build reported "
                     f"{state.get('errors', 0)} error(s)."))
         elif outstanding == 0 and not stages_left:
+            # `repair_failed` components do not stop a run completing — their output is in the
+            # export and compiled — but they are not allowed to vanish either. Named here and
+            # reported by `reconcile` at `warn`, so "completed" never quietly covers a rewrite
+            # that was rejected and never replaced.
+            repaired_badly = sum(
+                1 for c in store.list_units(run_id, kind="component")
+                if c.get("status") in ("repair_failed", "failed", "needs_human")
+                and store.has_current_artifacts(c["id"]))
             store.update_run(run_id, status="completed", phase="completed")
             store.append_event(
                 run_id, "run_completed",
                 f"{counts['converted']} file(s) converted, {counts['failed']} failed, "
-                f"{components['converted']} component(s)",
+                f"{components['converted']} component(s)"
+                + (f"; {repaired_badly} component(s) converted but had a later repair "
+                   f"rejected — their output is in the export unchanged"
+                   if repaired_badly else ""),
             )
         elif outstanding:
             # Nothing claimable but work remains: every remaining unit is blocked behind

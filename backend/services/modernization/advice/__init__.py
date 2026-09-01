@@ -90,6 +90,92 @@ def find(source_language: str, target_stack: str) -> Optional[Advisor]:
 
 # ── Observation ────────────────────────────────────────────────────────────
 
+# Evidence that puts a file at one end of a layered stack. Nothing here is language-specific:
+# "answers a URL" and "talks to a datastore" are facts every analyzer in this package produces.
+_TOP_EVIDENCE = {"route", "entrypoint", "output"}
+_BOTTOM_EVIDENCE = {"datastore", "table"}
+
+# Web -> Application -> Domain, with Infrastructure below Application. A dependency from a
+# lower rank to a higher one is the one a layered split forbids.
+_LAYER_RANK = {"web": 0, "application": 1, "infrastructure": 2, "domain": 3}
+
+# Above this share of the dependency graph, a layered split is buying an interface bridge for
+# every wrong-way edge and the recommendation flips. Calibrated on two real codebases — 0% and
+# 15% — so the threshold is a floor between two measurements rather than a considered value,
+# and it is chosen low on purpose: the plan gate now compares both layouts on *measured* gap
+# counts, so this only has to pick a sensible starting point rather than be right.
+LAYER_FRICTION_PERCENT = 5
+
+
+def layer_friction(units: Sequence[Dict[str, Any]],
+                   evidence_rows: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
+    """How hard this codebase's own dependencies fight a layered split. Never raises.
+
+    -> `{wrong_way, edges, percent, examples, in_cycle, depth}`.
+
+    The file count was the only signal the layout recommendation had, and on the two real
+    codebases this product has converted it pointed the **wrong way both times**: seven files
+    with nothing resisting layers, and forty-five with 15% of the dependency graph resisting
+    them. The second produced two failed conversions.
+
+    Everything here is already in hand when the charter is answered: the dependency graph came
+    from the analyzers at ingest, and the evidence rows say which files answer URLs and which
+    touch a datastore. Presume a layer from the evidence, project the real graph onto it, and
+    count the edges pointing the wrong way — each is a dependency a layered split has no legal
+    way to express, needing an interface bridge.
+
+    **It is a propensity, not a prediction**, and the count is soft: the architect may assign
+    files differently, a page-script that is markup and a query at once belongs to two layers,
+    and the number moved from 24 to 16 on one codebase merely by presuming a domain layer for
+    leaf types. What survives that is the comparison — 0% against 15% — which is what this is
+    used for.
+    """
+    try:
+        by_path = {u.get("path"): u for u in units or [] if u.get("path")}
+        if not by_path:
+            return {"wrong_way": 0, "edges": 0, "percent": 0, "examples": [],
+                    "in_cycle": 0, "depth": 0}
+        kinds: Dict[str, set] = {}
+        for row in evidence_rows or ():
+            path = row.get("path")
+            if path in by_path:
+                kinds.setdefault(path, set()).add(row.get("kind") or "")
+
+        layers: Dict[str, str] = {}
+        for path, unit in by_path.items():
+            seen = kinds.get(path) or set()
+            if seen & _TOP_EVIDENCE:
+                layers[path] = "web"
+            elif seen & _BOTTOM_EVIDENCE:
+                layers[path] = "infrastructure"
+            elif not (unit.get("depends_on") or []):
+                # Depends on nothing and shows no evidence at either end: a plain type. Plain
+                # types are what everything else is built on, so they sit at the bottom rather
+                # than in the middle, and presuming otherwise inflated the count by half.
+                layers[path] = "domain"
+            else:
+                layers[path] = "application"
+
+        edges = [(path, dep) for path, unit in by_path.items()
+                 for dep in (unit.get("depends_on") or []) if dep in by_path]
+        wrong = [(a, b) for a, b in edges
+                 if _LAYER_RANK[layers[b]] < _LAYER_RANK[layers[a]]]
+        return {
+            "wrong_way": len(wrong),
+            "edges": len(edges),
+            "percent": (100 * len(wrong) // len(edges)) if edges else 0,
+            "examples": [f"{a} -> {b}" for a, b in sorted(wrong)[:6]],
+            "in_cycle": sum(1 for u in by_path.values() if u.get("scc_group") is not None),
+            "depth": max((int(u.get("topo_level") or 0) for u in by_path.values()), default=0) + 1,
+        }
+    except Exception:  # noqa: BLE001
+        # A signal that can fail the charter it advises is worse than no signal (D-101). An
+        # empty measurement leaves every rule below reading exactly as it did before.
+        logger.exception("Could not measure layer friction (continuing without it)")
+        return {"wrong_way": 0, "edges": 0, "percent": 0, "examples": [],
+                "in_cycle": 0, "depth": 0}
+
+
 def observe(units: Sequence[Dict[str, Any]],
             evidence_rows: Sequence[Dict[str, Any]] = (),
             redactions: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
@@ -108,6 +194,9 @@ def observe(units: Sequence[Dict[str, Any]],
         "languages": facts.get("languages") or [],
         "dominant_language": dominant,
         "file_count": len(units or []),
+        # How much this codebase's own dependency graph resists being cut into layers. The
+        # file count alone pointed the wrong way on both real codebases converted so far.
+        "layer_friction": layer_friction(units or [], evidence_rows or []),
         # Language facts (currently populated by the PHP analyzer; empty elsewhere, which the
         # rules all tolerate).
         "db_apis": facts.get("db_apis") or [],

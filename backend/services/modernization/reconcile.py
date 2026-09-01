@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Set
 
-from backend.services.modernization import graph, layering, store, wireup
+from backend.services.modernization import graph, layering, store, usings, wireup
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,48 @@ def _controller_reachable(artifacts: List[Dict[str, Any]]) -> Set[str]:
             continue
         names.update(_CTOR_PARAM.findall(content))
     return names
+
+
+def _unbuildable_contexts(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Database contexts the container has no way to construct. Fatal.
+
+    Fatal, not advisory, and that is the whole point of it being here. `wireup` refuses to
+    register such a context and strips a registration the converter wrote for one, which makes
+    the application *start* and does not make it *work* — anything that needs the context still
+    cannot be built, and with start-up validation on, the host now says so and stops.
+
+    The real fix is a constructor the container can call, and only the converter can write it.
+    A `fail` finding is how that reaches the converter: the reconciliation gate carries it, the
+    driver stops on it, and a rework can act on it. Reported as a warning it would ship, which
+    is exactly what happened — the 45-file run's export compiled, and threw on the line the
+    guard was supposed to have caught.
+
+    Deliberately narrow. It says nothing about a context that takes options and is registered
+    without a provider (`db_note` covers that, and it is a charter question), nothing about a
+    context nobody uses, and nothing about whether the schema is right.
+    """
+    issues: List[Dict[str, Any]] = []
+    for artifact in artifacts or ():
+        path = str(artifact.get("path") or "")
+        if not path.lower().endswith(".cs"):
+            continue
+        content = artifact.get("content") or ""
+        found = wireup._DBCONTEXT_CLASS.search(usings.strip_non_code(content))
+        if not found:
+            continue
+        name = found.group(1)
+        if wireup.dbcontext_is_constructible(usings.strip_non_code(content), name):
+            continue
+        issues.append(_issue(
+            "unbuildable_dbcontext", "fail",
+            f"`{path}` declares `{name}`, whose every constructor asks for something other "
+            f"than its `DbContextOptions` — so neither `AddDbContext<{name}>()` nor the "
+            f"container can create one. This compiles. The application throws while it is "
+            f"starting, with a message about `System.String` rather than about this class. "
+            f"Give `{name}` the standard `{name}(DbContextOptions<{name}> options) : "
+            f"base(options)` constructor and move what the other parameters supplied into "
+            f"the options, or into a value read from configuration inside `OnConfiguring`."))
+    return issues
 
 
 def _unresolved_views(artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -374,7 +416,23 @@ def _reflected_types(artifacts: List[Dict[str, Any]],
         path = artifact.get("path") or ""
         if not path.lower().endswith(".cs"):
             continue
-        for literal in _QUALIFIED_LITERAL.findall(artifact.get("content") or ""):
+        # Comments first, and this is the whole difference between a finding and a false
+        # one. A doc comment cross-referencing a type —
+        #
+        #     ///   'auth'  -> <see cref="Acme.Ems.Web.Infrastructure.AuthMiddleware"/>
+        #
+        # — is documentation, not a lookup, and on the second live 45-file run two of those
+        # were the only two `fail` findings the whole conversion produced. Both named a class
+        # that *had* been converted and idiomatically renamed (`AuthMiddleware` ->
+        # `AuthPolicy`), so the check reported a crash that could not happen, on a run that
+        # was otherwise clean. Exactly the mistake the char-literal rule had already made one
+        # module over (D-177), repeated here because this scanned raw text.
+        #
+        # `strip_comments`, not `strip_non_code`: the string literal *is* the evidence here,
+        # so blanking strings would silence the check on the defect it exists for. Reaching
+        # for the wrong sibling did exactly that on the first attempt at this fix.
+        for literal in _QUALIFIED_LITERAL.findall(
+                usings.strip_comments(artifact.get("content") or "")):
             root = literal.split(".")[0]
             if root not in roots:
                 continue
@@ -548,9 +606,15 @@ def run(run_id: str) -> Dict[str, Any]:
     #    Those members are still `rolled_up` — not `converted`, not `failed` — so a per-file
     #    tally reports zero failures while a seventh of the codebase has no output at all.
     #    This is the check that stops a run looking complete because the *files* look fine.
+    #    Which components those are is decided by whether they *have output*, not by the word
+    #    in the status column. A run converted before `repair_failed` existed stored the other
+    #    kind of failure as `failed` too, and the fact underneath — current artifacts — is the
+    #    same one either way. Asking the artifacts fixes those runs without rewriting them.
     stranded = 0
     for component in components:
         if component.get("status") not in ("failed", "needs_human"):
+            continue
+        if store.has_current_artifacts(component["id"]):
             continue
         members = (component.get("meta") or {}).get("members") or []
         stranded += len(members)
@@ -558,6 +622,29 @@ def run(run_id: str) -> Dict[str, Any]:
             "component_failed", "fail",
             f"Component `{component.get('component_name') or component['path']}` did not "
             f"convert, so {len(members)} source file(s) produced no output: "
+            + ", ".join(f"`{m}`" for m in members[:8])
+            + (" …" if len(members) > 8 else ""),
+            unit_id=component["id"]))
+
+    # 7b. Components whose output is shipping but whose last *repair* was rejected. Distinct
+    #     from 7 above and deliberately `warn`: nothing is missing from the export, so calling
+    #     it a failure would say the opposite of what is true. What a reader needs to know is
+    #     narrower — this component's files are the ones a rejected rewrite was arguing about,
+    #     so if anything downstream looks wrong, start here.
+    for component in components:
+        if component.get("status") not in ("repair_failed", "failed", "needs_human"):
+            continue
+        if not store.has_current_artifacts(component["id"]):
+            continue
+        members = (component.get("meta") or {}).get("members") or []
+        reason = str(((component.get("error") or {}).get("error") or "")).strip()
+        issues.append(_issue(
+            "component_repair_failed", "warn",
+            f"Component `{component.get('component_name') or component['path']}` converted, "
+            f"and its output is in the export, but a later repair attempt was rejected "
+            f"{('(' + reason[:160] + ')') if reason else ''} — so it still carries whatever "
+            f"the repair was trying to fix. "
+            f"{len(members)} source file(s): "
             + ", ".join(f"`{m}`" for m in members[:8])
             + (" …" if len(members) > 8 else ""),
             unit_id=component["id"]))
@@ -602,6 +689,8 @@ def run(run_id: str) -> Dict[str, Any]:
         for issue in wireup.unregistered_dependencies(artifacts, _registrations):
             issues.append(_issue(issue["kind"], issue["severity"], issue["detail"]))
 
+    for issue in _unbuildable_contexts(artifacts):
+        issues.append(issue)
     for issue in _unresolved_views(artifacts):
         issues.append(issue)
     for issue in _double_encoded_views(artifacts):
@@ -666,14 +755,25 @@ def describe(report: Dict[str, Any]) -> str:
         f"compiled — these are the inconsistencies visible without building.",
         "",
     ]
-    by_kind: Dict[str, List[str]] = defaultdict(list)
-    for issue in issues:
-        by_kind[issue["kind"]].append(issue["detail"])
-    for kind in sorted(by_kind):
-        lines.append(f"**{kind.replace('_', ' ')}** ({len(by_kind[kind])})")
-        for detail in by_kind[kind][:10]:
-            lines.append(f"- {detail}")
-        if len(by_kind[kind]) > 10:
-            lines.append(f"- … and {len(by_kind[kind]) - 10} more")
+    # Failures first, every time. Grouping by kind and sorting the kinds alphabetically put
+    # `manual_followup` (93 of them) ahead of `reflected_type_missing` (2) on a live run — and
+    # the caller truncates this at 4,000 characters, so the only two findings that said "this
+    # will not work" were cut out of the text a human reads. Severity is the axis that decides
+    # whether somebody acts; the kind is only how the acting is organised.
+    for severity, heading in (("fail", "Will not work"), ("warn", "Worth a look")):
+        of_severity = [i for i in issues if i.get("severity") == severity]
+        if not of_severity:
+            continue
+        lines.append(f"### {heading} ({len(of_severity)})")
         lines.append("")
+        by_kind: Dict[str, List[str]] = defaultdict(list)
+        for issue in of_severity:
+            by_kind[issue["kind"]].append(issue["detail"])
+        for kind in sorted(by_kind):
+            lines.append(f"**{kind.replace('_', ' ')}** ({len(by_kind[kind])})")
+            for detail in by_kind[kind][:10]:
+                lines.append(f"- {detail}")
+            if len(by_kind[kind]) > 10:
+                lines.append(f"- … and {len(by_kind[kind]) - 10} more")
+            lines.append("")
     return "\n".join(lines)

@@ -383,8 +383,19 @@ def _fetch_github_repo(repo_url: str) -> List[Dict[str, str]]:
 # ── Read ───────────────────────────────────────────────────────────────────
 
 @router.get("/runs", summary="List modernization runs")
-def list_runs(limit: int = 50, caller: dict = Depends(get_caller)):
-    return {"runs": store.list_runs(scope.visible_from_caller(caller), limit=limit)}
+def list_runs(limit: int = 50, offset: int = 0, caller: dict = Depends(get_caller)):
+    """Newest first, paged.
+
+    `total` is what makes a pager honest: without it a caller cannot tell a last page from a
+    page that happens to be short, and the dashboard could only ever say "here are some runs".
+    Counted under the same scope as the rows, so the number never describes runs the caller
+    may not see.
+    """
+    visible = scope.visible_from_caller(caller)
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    return {"runs": store.list_runs(visible, limit=limit, offset=offset),
+            "total": store.count_runs(visible), "limit": limit, "offset": offset}
 
 
 @router.get("/runs/{run_id}", summary="Run manifest — status, progress, open checkpoints")
@@ -777,6 +788,47 @@ def get_unit(run_id: str, unit_id: str, include_source: bool = False,
     artifacts = [a for a in store.list_artifacts(run_id, include_content=True)
                  if a["unit_id"] == unit_id]
     return {"unit": unit, "artifacts": artifacts}
+
+
+@router.get("/runs/{run_id}/artifacts", summary="Every file this run has written")
+def list_run_artifacts(run_id: str, current_only: bool = True,
+                       caller: dict = Depends(get_caller)):
+    """The index of the converted codebase: what was produced, where it landed, how big it is.
+
+    Without this the only ways to see the output were one unit at a time or by downloading the
+    zip, so "show me the converted code" was a question the screen could not answer directly.
+    Content is deliberately **not** included — this is a listing, and selecting the text would
+    materialise the whole converted codebase in memory to answer "which files exist".
+    `GET /units/{unit_id}` carries the content for one unit, which is the granularity anybody
+    actually reads at.
+
+    `current_only=false` includes superseded versions, which is how a reader sees that a file
+    was rewritten by a build round rather than written once.
+    """
+    _require_run(run_id, caller)
+    rows = store.list_artifacts(run_id, current_only=current_only, include_content=False)
+    return {"count": len(rows),
+            "total_chars": sum(int(r.get("size_chars") or 0) for r in rows),
+            "artifacts": rows}
+
+
+@router.get("/runs/{run_id}/report", summary="The run report, as markdown")
+def get_run_report(run_id: str, caller: dict = Depends(get_caller)):
+    """The same document the export zip carries as `MODERNIZATION_REPORT.md`.
+
+    It was readable only by downloading the archive and opening a file inside it — so the one
+    artifact that states plainly what was skipped, what failed and which configuration keys the
+    redactions left somebody to supply was the hardest thing here to read.
+
+    Not cheap: `_export_report` runs reconciliation over the whole output, so this is an
+    on-demand read and must never be put on a poll. Handed the *listing* rather than
+    content-bearing artifacts, which is safe because the report only counts them.
+    """
+    run = _require_run(run_id, caller)
+    counts = store.unit_status_counts(run_id)
+    artifacts = store.list_artifacts(run_id, current_only=True, include_content=False)
+    return {"markdown": _export_report(run, counts, artifacts),
+            "filename": "MODERNIZATION_REPORT.md"}
 
 
 @router.get("/runs/{run_id}/symbols", summary="The run's symbol registry")

@@ -18,7 +18,8 @@ target-agnostic ones (`has_ui`, `tables`, `routes`, `config_keys`).
 """
 from typing import Any, Dict, List
 
-from backend.services.modernization.advice import Advisor, Option, blocking_hazards
+from backend.services.modernization.advice import (LAYER_FRICTION_PERCENT, Advisor, Option,
+                                                 blocking_hazards)
 
 
 def _cite(observed: Dict[str, Any], *keys: str) -> str:
@@ -59,22 +60,59 @@ def _target_stack(observed: Dict[str, Any]) -> List[Option]:
     return [Option(value=stated, label=f"As stated: {stated}", why=why, recommended=True)]
 
 
+def _layers_are_cheap(observed):
+    """Whether this codebase's own dependencies would tolerate a layered split.
+
+    Two conditions, and both have to hold: big enough to want walls — the file count, which is
+    what this used to decide on alone — **and** a dependency graph that does not fight them.
+    The second is what was missing. On the two real codebases this product has converted the
+    file count pointed the wrong way both times, and the one it sent to layers produced two
+    failed runs.
+    """
+    friction = observed.get("layer_friction") or {}
+    return ((observed.get("file_count") or 0) > 40
+            and int(friction.get("percent") or 0) <= LAYER_FRICTION_PERCENT)
+
+
+def _friction_note(observed):
+    """The evidence behind the recommendation, in one sentence. "" when there is none."""
+    friction = observed.get("layer_friction") or {}
+    wrong, edges = int(friction.get("wrong_way") or 0), int(friction.get("edges") or 0)
+    if not edges:
+        return ""
+    if not wrong:
+        return (f"None of the {edges} dependencies between these files points the wrong way for "
+                f"a layered split, so the walls would cost nothing to put up.")
+    example = (friction.get("examples") or [""])[0]
+    return (f"{wrong} of the {edges} dependencies between these files "
+            f"({friction.get('percent')}%) point the wrong way for a layered split"
+            + (f" — for example `{example}`" if example else "")
+            + ". Each one needs an interface bridge, and the plan gate stops the run until "
+              "every one is closed or accepted. This is a tendency rather than a forecast: the "
+              "count moves with how the layers are guessed, and the plan gate measures both "
+              "layouts properly before anything is converted.")
+
+
 def _project_layout(observed: Dict[str, Any]) -> List[Option]:
-    small = (observed.get("file_count") or 0) <= 40
+    small = not _layers_are_cheap(observed)
+    note = _friction_note(observed)
     feature = Option(
         value="A single deployable unit, divided into one folder per feature. Each feature owns "
               "its entry points, its logic and its data access.",
         label="Single unit, folder-per-feature",
-        why=("Keeps related code together, which is how the source is already organised. "
-             + _cite(observed, "file_count")).strip(),
+        why=("Keeps related code together, which is how the source is already organised, and "
+             "one unit cannot have a dependency pointing the wrong way — the layering "
+             "conflicts that stop a run at the plan gate cannot arise. " + note + " "
+             + _cite(observed, "file_count")).replace("  ", " ").strip(),
         recommended=small,
     )
     layered = Option(
         value="One module per layer — entry points, application logic, domain model, "
               "infrastructure — with dependencies pointing inward only.",
         label="One module per layer",
-        why="Enforces a dependency direction the source almost certainly does not have. Worth "
-            "the extra structure on a large codebase; overhead on a small one.",
+        why=("Enforces a dependency direction the source almost certainly does not have. Worth "
+             "the extra structure on a large codebase; overhead on a small one. "
+             + note).replace("  ", " ").strip(),
         recommended=not small,
     )
     return [feature, layered] if small else [layered, feature]

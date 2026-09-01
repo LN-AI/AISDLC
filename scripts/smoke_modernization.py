@@ -46,7 +46,8 @@ from backend.services.modernization import (  # noqa: E402
     contracts, csharp_syntax,
     evidence, extraction_audit, graph, layering, lookup, ownership, parity, parity_tools,
     reconcile,
-    repo_ingest, runner, rules as rules_module, runtime, sanity, scaffold, stages, store,
+    packages, repo_ingest, runner, rules as rules_module, runtime, sanity, scaffold,
+    stages, store,
     usings,
     validation, wireup,
 )
@@ -850,11 +851,13 @@ try:
                             + call_log.count("submit_extraction_audit"))
     check("the extraction audit runs exactly once per run",
           call_log.count("submit_extraction_audit") == 1, str(call_log))
-    # Against the constant, not against 3: the panel's size is a tuning decision, and a test
-    # that hardcoded it would fail on a deliberate change while still not asserting the thing
-    # that matters — that every call in the log belongs to a stage entitled to make one.
-    _design_calls = max(1, min(runner.DESIGN_CANDIDATES, len(architect_agent.STANCES)))
-    check("the design stage asks once per candidate decomposition",
+    # Against the function, not against a literal or a re-derived formula: the panel's size is
+    # a tuning decision, and this now covers two groups of calls — the candidates within the
+    # charter's layout, and the ones designed under the other layout it offered. A test that
+    # recomputed the sum would drift from the thing the assessment gate quotes, which is the
+    # one property that matters here (a stage may not make a call that gate did not price).
+    _design_calls = runner._design_call_count()
+    check("the design stage asks once per candidate decomposition, both layouts counted",
           call_log.count("submit_target_architecture") == _design_calls, str(call_log))
     check("the scaffold cost no model call",
           call_log.count("submit_unit_conversion") == 6
@@ -1449,6 +1452,7 @@ check("a hazard with a real target equivalent does not demand a marker",
 # ── 17. Charter advice ─────────────────────────────────────────────────────
 section("17. Charter advice — the form arrives answered, for free")
 
+from backend.services.modernization.scaffold import dotnet as dotnet_scaffold  # noqa: E402
 from backend.services.modernization import advice                        # noqa: E402
 
 # The observations every suggestion is derived from. Same inputs the real endpoint uses.
@@ -2464,8 +2468,20 @@ check("a Program.cs with no placeholder still gets its registrations",
       "AddScoped<" in wireup.apply_to_program_cs(_program.replace(wireup.MARKER, ""), _hp))
 check("a Program.cs with nowhere to put them is left untouched rather than corrupted",
       wireup.apply_to_program_cs("// not a host", _hp) == "// not a host")
-check("nothing to wire leaves the file alone",
-      wireup.apply_to_program_cs(_program, wireup.host_plan([], "Shop.Web")) == _program)
+# The contract this check used to assert — "nothing to wire leaves the file alone" — is
+# deliberately no longer the one this stage keeps. Start-up validation is not a registration:
+# it is what makes a *missing* registration visible while the application starts instead of on
+# the first request that needs it, so it belongs on every host, including one with nothing to
+# register. What must stay true is that no registration is invented and the pass is idempotent.
+_nothing = wireup.apply_to_program_cs(_program, wireup.host_plan([], "Shop.Web"))
+_dense = "".join(_nothing.split())
+check("nothing to wire adds no registration",
+      "AddScoped<" not in _nothing and "AddDbContext" not in _nothing, _nothing)
+check("the only change is that the container is now checked at start-up",
+      _dense.replace("".join("".join(wireup.VALIDATION_LINES).split()), "", 1)
+      == "".join(_program.split()), _nothing)
+check("and wiring it a second time changes nothing",
+      wireup.apply_to_program_cs(_nothing, wireup.host_plan([], "Shop.Web")) == _nothing)
 
 # A converter that wrote its own host is the normal case once the architect gives Program.cs
 # to a component. Re-registering on top of it produced a duplicated `AddSession` beside the
@@ -8349,10 +8365,12 @@ finally:
 _panel_gate_detail = next(
     c["detail"] for c in store.list_checkpoints(e2e)
     if c["kind"] == "discovery_approval")
-check("the assessment gate prices one design call per candidate",
-      runner._discovery_estimate(e2e)["design_calls"]
-      == max(1, min(runner.DESIGN_CANDIDATES, len(architect_agent.STANCES))),
+check("the assessment gate prices every design call the run will make",
+      runner._discovery_estimate(e2e)["design_calls"] == runner._design_call_count(),
       str(runner._discovery_estimate(e2e)))
+check("including the ones spent on the layout the charter did not choose",
+      runner._design_call_count() > runner.DESIGN_CANDIDATES,
+      str(runner._design_call_count()))
 
 
 
@@ -10450,6 +10468,1680 @@ check("and the sentence names them, so the log says which rewrite was dangerous"
 check("nothing exposed produces no sentence",
       contracts.describe_risk({"symbols": 0, "files": 0, "paths": []}) == "")
 
+
+
+section("73. The pipeline does not convert into a plan it has proved cannot be built")
+
+# ── What this is actually for ──────────────────────────────────────────────
+#
+# `plan_gaps` has been right every time it has spoken. On run 9c8cf4fe it named all twelve
+# eventual build errors while $0.67 had been spent instead of $6.43. On the 45-file run it named
+# two unbuildable crossings; one repair was applied, the survivor was left standing, and the
+# converter did what a converter forbidden from writing the obvious thing does — it routed
+# around the boundary. That compiles. It fails when the application starts, which is the
+# expensive failure precisely because no compiler can see it.
+#
+# So the proof was produced, printed, and walked past. Section 48 made the gate *offer* the
+# repairs; this makes the run *stop* until the crossings are gone or somebody says convert
+# anyway. Every improvisation check in this suite catches a shape — a name looked up at run
+# time, a service nobody registered, a context registered twice — and there is always another
+# shape. This removes the reason to improvise, which is the only intervention here that is not
+# a special case.
+#
+# Two gaps, because one was never the hard part. The gate takes one answer, and applying a
+# repair changes the plan the next one was measured against — so the second question can only
+# be asked after the first answer has landed on the rows.
+
+_TWO_GAP_PROJECTS = [
+    {"name": "Acme.Web", "purpose": "host", "depends_on": ["Acme.Application"]},
+    {"name": "Acme.Application", "purpose": "logic", "depends_on": ["Acme.Domain"]},
+    {"name": "Acme.Infrastructure", "purpose": "data", "depends_on": ["Acme.Domain"]},
+    {"name": "Acme.Domain", "purpose": "types", "depends_on": []},
+]
+
+_TWO_GAP_SOURCE = [
+    {"path": "cfg.py", "content": "SETTING = 'x'\n"},
+    {"path": "repo.py", "content": "from cfg import SETTING\n\ndef load():\n    return SETTING\n"},
+    {"path": "svc.py", "content": "from repo import load\n\ndef run():\n    return load()\n"},
+]
+
+
+def _two_gap_call_tool(system_prompt, user_content, schema, llm_override=None,
+                       max_tokens=None, **kw):
+    """svc(Application) -> repo(Infrastructure) and repo(Infrastructure) -> cfg(Web). Neither
+    direction is in the project graph and no seam covers either."""
+    if schema.get("name") == "submit_target_architecture":
+        return {
+            "projects": _TWO_GAP_PROJECTS,
+            "components": [
+                {"name": "config", "project": "Acme.Web",
+                 "namespace": "Acme.Web.Config", "output_dir": "Acme.Web/Config",
+                 "members": ["cfg.py"], "role": "config", "rationale": "settings",
+                 "expected_files": ["Cfg.cs"]},
+                {"name": "service", "project": "Acme.Application",
+                 "namespace": "Acme.Application.Services", "output_dir": "Acme.Application/Services",
+                 "members": ["svc.py"], "role": "business", "rationale": "the service",
+                 "expected_files": ["Svc.cs"]},
+                {"name": "repository", "project": "Acme.Infrastructure",
+                 "namespace": "Acme.Infrastructure.Data", "output_dir": "Acme.Infrastructure/Data",
+                 "members": ["repo.py"], "role": "data", "rationale": "the repository",
+                 "expected_files": ["Repo.cs"]},
+            ],
+            "seams": [],
+            "shared_conventions": "Types are PascalCase.",
+            "risks": [], "summary": "Three layers, two illegal dependencies.",
+        }
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+def _to_two_gap_plan(name, source=None, tool=None):
+    """Drive a run to its open `plan_approval`, answering everything before it."""
+    run_id = store.create_run(name, ".NET 8", "files", created_by="smoke")
+    runner.ingest_and_analyze(run_id, list(source or _TWO_GAP_SOURCE))
+    runner.set_charter(run_id, VALID_CHARTER, "smoke")
+    for _ in range(8):
+        runner.convert_run(run_id, CALLER)
+        gate = [c for c in store.list_checkpoints(run_id, "open")
+                if c["kind"] == "plan_approval"]
+        if gate:
+            return run_id, gate[0]
+        for cp in store.list_checkpoints(run_id, "open"):
+            if cp["blocking"]:
+                store.answer_checkpoint(cp["id"], {"decision": "approved"}, "smoke")
+        store.update_run(run_id, status="converting", paused_reason=None)
+    return run_id, None
+
+
+def _open_conflict_gate(run_id):
+    points = [c for c in store.list_checkpoints(run_id, "open")
+              if c["kind"] == "plan_conflicts"]
+    return points[-1] if points else None
+
+
+def _answer_and_run(run_id, point, answer):
+    store.answer_checkpoint(point["id"], answer, "smoke")
+    store.update_run(run_id, status="converting", paused_reason=None)
+    runner.convert_run(run_id, CALLER)
+
+
+llm_gateway.call_tool = _two_gap_call_tool
+try:
+    _tg, _plan_gate = _to_two_gap_plan("two-gap-repair")
+    check("the plan gate is reached", _plan_gate is not None)
+    _predicted = ((_plan_gate.get("payload") or {}).get("layering_gaps") or []) if _plan_gate else []
+    check("both unbuildable crossings are predicted before a penny of conversion spend",
+          len(_predicted) == 2,
+          str([(g.get("consumer"), g.get("provider")) for g in _predicted]))
+
+    # One answer, two problems — the shape of the live failure. The gate is entitled to take
+    # one; what it is not entitled to do is convert with the other still standing.
+    _first = [r for r in ((_plan_gate.get("payload") or {}).get("repairs") or [])
+              if r.get("feasible") and r["id"].startswith("seam:")][0]
+    _answer_and_run(_tg, _plan_gate, {"decision": "approved", "repair": _first["id"]})
+
+    check("the run stops instead of converting, because a crossing survived the repair",
+          (store.get_run(_tg) or {}).get("status") == "paused",
+          str((store.get_run(_tg) or {}).get("status")))
+    check("and nothing was converted while it was stopped — this costs nothing to ask",
+          not store.list_artifacts(_tg, current_only=False),
+          str(len(store.list_artifacts(_tg, current_only=False))))
+
+    _hold = _open_conflict_gate(_tg)
+    check("a blocking gate names what is left", _hold is not None and _hold["blocking"])
+    check("it says how many crossings remain, not that the plan is fine",
+          len(((_hold.get("payload") or {}).get("gaps") or [])) == 1,
+          str((_hold.get("payload") or {}).get("gaps")))
+    check("it says what has already been tried, so the reader is not answering blind",
+          ((_hold.get("payload") or {}).get("repairs_applied") or []) == [_first["id"]],
+          str((_hold.get("payload") or {}).get("repairs_applied")))
+    check("the detail explains the consequence rather than only naming the rule",
+          "compiles cleanly" in (_hold.get("detail") or "")
+          and "fails when the application starts" in (_hold.get("detail") or ""),
+          (_hold.get("detail") or "")[:200])
+    check("and 'convert anyway' is offered, because sometimes it is the right answer",
+          "proceed" in (_hold.get("options") or []), str(_hold.get("options")))
+
+    # The whole reason this is a second gate rather than a list of repairs applied in one pass.
+    # The first repair let Acme.Infrastructure reference Acme.Application; the *second* gap's
+    # cheapest fix would have Acme.Infrastructure referenced from Acme.Web — and MSBuild refuses
+    # a cycle, so an option that was feasible when measured against the original plan is not
+    # feasible now. Measured against a stale layout, this gate would offer a repair that cannot
+    # be applied.
+    _second_options = (_hold.get("payload") or {}).get("repairs") or []
+    check("the second gate's repairs are measured against the repaired layout, not the "
+          "original one",
+          {r["id"] for r in _second_options}
+          != {r["id"] for r in ((_plan_gate.get("payload") or {}).get("repairs") or [])},
+          str([r["id"] for r in _second_options]))
+    check("every repair it offers is one that can actually be applied now",
+          all(r.get("feasible") for r in _second_options),
+          str([(r["id"], r.get("feasible")) for r in _second_options]))
+    check("and each still states what it measurably closes",
+          _second_options and all(r["closes"] for r in _second_options),
+          str([(r["id"], r["closes"]) for r in _second_options]))
+
+    _second = _second_options[0]
+    _answer_and_run(_tg, _hold, {"decision": "approved", "repair": _second["id"]})
+
+    _design_meta = (store.list_units(_tg, kind="design")[0].get("meta")) or {}
+    check("both repairs are on the record, in the order they were answered",
+          (_design_meta.get("repairs_applied") or []) == [_first["id"], _second["id"]],
+          str(_design_meta.get("repairs_applied")))
+    check("nothing is left that has no legal way to be written",
+          not (_design_meta.get("layering_gaps") or []),
+          str(_design_meta.get("layering_gaps")))
+    check("the run carries on past the gate once the layout can be built",
+          (store.get_run(_tg) or {}).get("status") != "paused"
+          or "checkpoint" not in ((store.get_run(_tg) or {}).get("paused_reason") or "")
+          or not _open_conflict_gate(_tg),
+          str((store.get_run(_tg) or {}).get("paused_reason")))
+    check("and the frozen plan carries the whole sequence, not just the last one",
+          (((store.get_run(_tg) or {}).get("plan") or {}).get("repairs_applied") or [])
+          == [_first["id"], _second["id"]],
+          str(((store.get_run(_tg) or {}).get("plan") or {}).get("repairs_applied")))
+
+    # ── The override is real, and it is a word somebody has to choose ──────
+    #
+    # A customer is entitled to convert a layout we merely disapprove of. What they are not
+    # entitled to is doing it by accident, which is what an unanswered warning on a gate
+    # somebody clicked through is.
+    _ov, _ov_gate = _to_two_gap_plan("two-gap-override")
+    _answer_and_run(_ov, _ov_gate, {"decision": "approved"})
+    _ov_hold = _open_conflict_gate(_ov)
+    check("approving the plan without picking a repair stops too — 'none' is not 'proceed'",
+          _ov_hold is not None and not store.list_artifacts(_ov, current_only=False))
+    check("the gate that stopped it names both crossings",
+          len(((_ov_hold.get("payload") or {}).get("gaps") or [])) == 2,
+          str((_ov_hold.get("payload") or {}).get("gaps")))
+    _answer_and_run(_ov, _ov_hold, {"decision": "approved", "repair": "proceed"})
+    check("answering proceed converts the layout as it stands",
+          store.list_artifacts(_ov, current_only=False),
+          str((store.get_run(_ov) or {}).get("paused_reason")))
+    check("and the run log says what was accepted, at warning level, in the reader's words",
+          any(e.get("event") == "plan_conflicts_accepted" and e.get("level") == "warning"
+              and "compiles and does not start" in (e.get("detail") or "")
+              for e in store.list_events(_ov, limit=800)),
+          str([e.get("event") for e in store.list_events(_ov, limit=800)][-12:]))
+    check("proceeding does not raise the same gate again",
+          len([c for c in store.list_checkpoints(_ov) if c["kind"] == "plan_conflicts"]) == 1,
+          str([c["kind"] for c in store.list_checkpoints(_ov)]))
+
+    # ── Termination, which is the property that makes this safe to ship ────
+    #
+    # "Has a human answered?" is the wrong question — an answer that picks a repair should lead
+    # to another question, and an answer that picks nothing must not. "Has a human been shown
+    # *this* set of crossings?" is the right one, and it is decidable. An answer that changes
+    # nothing therefore proceeds rather than re-asking forever, because the property worth
+    # protecting is that somebody saw the proof and decided, not that they typed a word.
+    _tm, _tm_gate = _to_two_gap_plan("two-gap-terminates")
+    _answer_and_run(_tm, _tm_gate, {"decision": "approved"})
+    _tm_hold = _open_conflict_gate(_tm)
+    check("the run is held", _tm_hold is not None)
+    _answer_and_run(_tm, _tm_hold, {"decision": "looked at it"})
+    check("an answer that names no repair at all does not re-ask the same question forever",
+          not _open_conflict_gate(_tm)
+          and len([c for c in store.list_checkpoints(_tm)
+                   if c["kind"] == "plan_conflicts"]) == 1,
+          str([(c["kind"], c["status"]) for c in store.list_checkpoints(_tm)]))
+    check("and it still converts, with the acceptance on the record",
+          store.list_artifacts(_tm, current_only=False)
+          and any(e.get("event") == "plan_conflicts_accepted"
+                  for e in store.list_events(_tm, limit=800)))
+
+    # A repair the gate never offered is refused rather than guessed at, and refusing it must
+    # not strand the run: the crossings are unchanged, so the question has been asked and
+    # answered and the operator is not made to answer it twice.
+    _bg, _bg_gate = _to_two_gap_plan("two-gap-bogus")
+    _answer_and_run(_bg, _bg_gate, {"decision": "approved"})
+    _bg_hold = _open_conflict_gate(_bg)
+    _answer_and_run(_bg, _bg_hold, {"decision": "approved", "repair": "merge:Nope->Nope"})
+    check("a repair the gate did not offer is refused and said so",
+          any(e.get("event") == "plan_repair_missing"
+              for e in store.list_events(_bg, limit=800)))
+    check("and the refusal does not strand the run at a gate it cannot get past",
+          not _open_conflict_gate(_bg), str((store.get_run(_bg) or {}).get("paused_reason")))
+except Exception:
+    traceback.print_exc()
+    check("the plan-conflict runs raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+# ── A layout with nothing wrong with it is untouched by all of this ────────
+#
+# The check that keeps the gate honest. Every existing run, every fixture and every clean
+# conversion must behave exactly as it did — a gate that fires on a plan that is fine is a gate
+# people learn to click through, which is the failure this whole layer exists to prevent.
+
+
+def _clean_call_tool(system_prompt, user_content, schema, llm_override=None,
+                     max_tokens=None, **kw):
+    if schema.get("name") == "submit_target_architecture":
+        return {
+            "projects": [{"name": "Acme.Web", "purpose": "host", "depends_on": []}],
+            "components": [
+                {"name": "everything", "project": "Acme.Web", "namespace": "Acme.Web",
+                 "output_dir": "Acme.Web", "members": ["cfg.py", "repo.py", "svc.py"],
+                 "role": "business", "rationale": "one project", "expected_files": ["All.cs"]},
+            ],
+            "seams": [], "shared_conventions": "Types are PascalCase.",
+            "risks": [], "summary": "One project, so no boundary to cross.",
+        }
+    return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+
+
+llm_gateway.call_tool = _clean_call_tool
+try:
+    _cl, _cl_gate = _to_two_gap_plan("no-gaps")
+    check("a layout with no illegal crossing predicts none",
+          not ((_cl_gate.get("payload") or {}).get("layering_gaps") or []),
+          str((_cl_gate.get("payload") or {}).get("layering_gaps")))
+    _answer_and_run(_cl, _cl_gate, {"decision": "approved"})
+    check("so approving it raises no conflict gate at all",
+          not [c for c in store.list_checkpoints(_cl) if c["kind"] == "plan_conflicts"],
+          str([c["kind"] for c in store.list_checkpoints(_cl)]))
+    check("and the run converts, exactly as it did before any of this existed",
+          store.list_artifacts(_cl, current_only=False),
+          str((store.get_run(_cl) or {}).get("paused_reason")))
+except Exception:
+    traceback.print_exc()
+    check("the clean-layout run raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+
+
+section("74. How many projects, decided where a human can see it")
+
+# ── The question section 73 could not answer ───────────────────────────────
+#
+# Section 73 stops a run whose layout cannot be built. It does not ask the prior question: why
+# was that layout chosen? The answer is the charter, and only the charter — `project_layout` is
+# a required field, the advisor offers a single-unit option and a layered one on every run, and
+# `architect_agent` is told to follow whichever was picked exactly.
+#
+# For the PHP -> .NET pair the recommendation flips to layered above 40 source files. The
+# 45-file run whose two unbuildable crossings cost two conversions was five files over that
+# line, and nothing in its transcript said which layout had been taken or that there had been a
+# choice. A single project cannot have a dependency pointing the wrong way, so "try fewer
+# projects" is the cheapest possible answer to a run that stalls on layering — and it was
+# reachable only by knowing to look.
+
+_small = {o.label: o for o in advice.suggest(
+    ".NET 8", {"file_count": 12, "routes": ["/"]})["project_layout"]}
+_large = {o.label: o for o in advice.suggest(
+    ".NET 8", {"file_count": 45, "routes": ["/"]})["project_layout"]}
+
+check("both layouts are offered on a small codebase, not just the recommended one",
+      len(_small) == 2, str(sorted(_small)))
+check("and on a large one, so fewer projects is always available to pick",
+      len(_large) == 2, str(sorted(_large)))
+check("a small codebase is recommended the single project",
+      any(o.recommended and "Single" in label for label, o in _small.items()),
+      str([(l, o.recommended) for l, o in _small.items()]))
+check("a large one is recommended the layered split",
+      any(o.recommended and "layer" in label for label, o in _large.items()),
+      str([(l, o.recommended) for l, o in _large.items()]))
+check("the recommendation is the only thing that moves — the same two options are offered",
+      sorted(_small) == sorted(_large), str((sorted(_small), sorted(_large))))
+
+# A recommendation that states only its benefit is an argument, not a choice. Layering buys an
+# enforced dependency direction and costs an interface seam for every dependency already
+# pointing the other way — which is the thing that stopped both live runs, and was nowhere in
+# the text the person choosing had in front of them.
+_layered = next(o for label, o in _large.items() if "layer" in label)
+_single = next(o for label, o in _large.items() if "Single" in label)
+check("with no dependency graph to look at, no cost is claimed either way",
+      "interface bridge" not in _layered.why, _layered.why)
+check("but the single-project option still says why the problem cannot arise there",
+      "cannot" in _single.why and "wrong way" in _single.why, _single.why)
+
+# ── The signal the file count was standing in for ──────────────────────────
+#
+# The file count was the *only* thing this recommendation had, and on both real codebases it
+# pointed the wrong way: seven files whose dependencies would tolerate layers, and forty-five
+# whose dependencies fight them 15% of the way through the graph. The second produced two
+# failed conversions. The graph and the evidence are both in hand when the charter is answered.
+
+_FRICTIONLESS = {"file_count": 45, "routes": ["/"],
+                 "layer_friction": {"wrong_way": 0, "edges": 104, "percent": 0,
+                                    "examples": [], "in_cycle": 0, "depth": 7}}
+_FRICTION = {"file_count": 45, "routes": ["/"],
+             "layer_friction": {"wrong_way": 15, "edges": 104, "percent": 14,
+                                "examples": ["src/Core/Database.php -> config/database.php"],
+                                "in_cycle": 0, "depth": 7}}
+_clean = {o.label: o for o in advice.suggest(".NET 8", _FRICTIONLESS)["project_layout"]}
+_rough = {o.label: o for o in advice.suggest(".NET 8", _FRICTION)["project_layout"]}
+
+check("45 files whose dependencies tolerate layers are still recommended layers",
+      any(o.recommended and "layer" in label for label, o in _clean.items()),
+      str([(l, o.recommended) for l, o in _clean.items()]))
+check("45 files whose dependencies fight them are recommended one project instead",
+      any(o.recommended and "Single" in label for label, o in _rough.items()),
+      str([(l, o.recommended) for l, o in _rough.items()]))
+check("and the same file count produces opposite advice, which is the whole point",
+      [l for l, o in _clean.items() if o.recommended]
+      != [l for l, o in _rough.items() if o.recommended])
+# By substring, because which advisor answers depends on the stack pair and the two
+# spell the label differently ("Project per layer" / "One module per layer").
+_rough_layered = next(o for label, o in _rough.items() if "layer" in label)
+check("the reason is quoted with its denominator, not asserted",
+      "15 of the 104" in _rough_layered.why, _rough_layered.why)
+check("with an example a reader can go and look at in their own source",
+      "src/Core/Database.php" in _rough_layered.why)
+check("and it says out loud that the count is a tendency, not a forecast",
+      "tendency rather than a forecast" in _rough_layered.why)
+check("both layouts are still offered either way — this moves advice, not availability",
+      len(_clean) == 2 and len(_rough) == 2, str((sorted(_clean), sorted(_rough))))
+
+# The measurement itself, over a graph small enough to check by eye.
+_units = [
+    {"path": "page.php", "depends_on": ["db.php"], "topo_level": 0},
+    {"path": "db.php", "depends_on": ["config.php"], "topo_level": 1},
+    {"path": "config.php", "depends_on": [], "topo_level": 2},
+]
+_rows = [{"path": "page.php", "kind": "route"}, {"path": "db.php", "kind": "datastore"}]
+_measured = advice.layer_friction(_units, _rows)
+check("a page depending on the database is with the grain and is not counted",
+      _measured["edges"] == 2 and _measured["wrong_way"] == 0, str(_measured))
+_rows_up = _rows + [{"path": "config.php", "kind": "route"}]
+check("the database depending on something that answers a URL is against it, and is",
+      advice.layer_friction(_units, _rows_up)["wrong_way"] == 1,
+      str(advice.layer_friction(_units, _rows_up)))
+check("a codebase with no dependencies at all measures zero rather than dividing by it",
+      advice.layer_friction([{"path": "a.php", "depends_on": []}], [])["percent"] == 0)
+check("and no units at all is not a crash",
+      advice.layer_friction([], [])["edges"] == 0)
+
+# ── The driver can express the choice, and never makes it silently ─────────
+_opts = [{"label": "Project per layer", "value": "L"},
+         {"label": "Single project, folder-per-feature", "value": "S"}]
+check("with no --layout the recommended option is taken, exactly as before",
+      _driver.pick_layout(_opts, "")["value"] == "L")
+check("--layout single picks the single project even when it is not recommended",
+      _driver.pick_layout(_opts, "single")["value"] == "S")
+check("matching is case-insensitive and partial, so 'layer' is enough",
+      _driver.pick_layout(_opts, "LAYER")["value"] == "L")
+check("a --layout nobody offers returns nothing, so the driver stops rather than "
+      "converting into a layout somebody asked not to have",
+      _driver.pick_layout(_opts, "microservices") is None)
+check("and no options at all is not a crash",
+      _driver.pick_layout([], "single") is None and _driver.pick_layout([], "") is None)
+check("the driver's help says fewer projects is the first thing to try",
+      "Fewer projects" in (io.open(os.path.join(os.path.dirname(os.path.dirname(
+          os.path.abspath(__file__))), "scripts", "drive_modernization.py"),
+          encoding="utf-8").read()))
+
+
+
+
+
+section("75. The dashboard can page the runs, and read what the run produced")
+
+# ── Paging ────────────────────────────────────────────────────────────────
+# The run list used to ask for every run the server would give it and render them all at full
+# height *above* the detail panel, so on a project with a history, opening a run scrolled its
+# own answer off screen. `total` is what makes a pager honest: without it a caller cannot tell
+# a last page from a page that happens to be short.
+# Bound to this project on purpose: `total` is scoped, so a run with no project is invisible
+# to this caller and would not be counted — which is the correct behaviour and makes for a
+# fixture that proves nothing.
+_page_runs = [store.create_run("page run %d" % i, ".NET 8", "files", created_by="smoke")
+              for i in range(7)]
+for _pr in _page_runs:
+    store.update_run(_pr, project_id=PROJECT_ID)
+_p1 = client.get("/api/v1/modernization/runs?limit=3&offset=0", headers=HDR).json()
+_p2 = client.get("/api/v1/modernization/runs?limit=3&offset=3", headers=HDR).json()
+check("the list reports a total, not only the rows it returned",
+      isinstance(_p1.get("total"), int) and _p1["total"] >= 7, str(_p1.get("total")))
+check("a page is the size it was asked for", len(_p1["runs"]) == 3, str(len(_p1["runs"])))
+check("the two pages carry the same total", _p1["total"] == _p2["total"])
+check("offset moves the window rather than repeating it",
+      not (set(r["id"] for r in _p1["runs"]) & set(r["id"] for r in _p2["runs"])))
+check("the echo says which window this is", _p2["limit"] == 3 and _p2["offset"] == 3, str(_p2))
+# Paging must not shuffle: a reader on page two who reloads has to see page two, not a
+# different three runs.
+_p2_again = client.get("/api/v1/modernization/runs?limit=3&offset=3", headers=HDR).json()
+check("paging is stable, so a reload does not move the reader",
+      [r["id"] for r in _p2_again["runs"]] == [r["id"] for r in _p2["runs"]])
+check("an offset past the end is an empty page, not an error",
+      client.get("/api/v1/modernization/runs?limit=3&offset=%d" % (_p1["total"] + 50),
+                 headers=HDR).json()["runs"] == [])
+# The scope contract is the subtle half: `None` is unrestricted, `[]` is "may see nothing", and
+# collapsing the two would hand every run to a caller entitled to none.
+check("count_runs honours the same scope rules as list_runs",
+      store.count_runs([]) == 0 and store.count_runs(None) >= 7,
+      "%s / %s" % (store.count_runs([]), store.count_runs(None)))
+check("a total never counts runs the caller may not see",
+      client.get("/api/v1/modernization/runs", headers=other_hdr).json()["total"] < _p1["total"],
+      "another team's total included this team's runs")
+
+# ── The artifact index ────────────────────────────────────────────────────
+# "Where do I see the converted code" took four steps and a guess, because the only ways to the
+# output were one unit at a time or downloading the zip. This is the listing that was missing,
+# and it deliberately carries no content: selecting it would materialise the whole converted
+# codebase to answer "which files exist".
+_art_run = store.create_run("artifact index", ".NET 8", "files", created_by="smoke")
+store.update_run(_art_run, project_id=PROJECT_ID)
+store.insert_units(_art_run, [{"path": "a.php", "depends_on": [], "order_index": 0,
+                               "topo_level": 0, "source_text": "<?php echo 1;"}])
+_art_unit = store.list_units(_art_run)[0]["id"]
+store.complete_unit(_art_unit, _art_run,
+                    artifacts=[{"path": "Shop.Web/Program.cs", "content": "var app = 1;",
+                                "purpose": "host"},
+                               {"path": "Shop.Data/Repo.cs", "content": "class Repo {}",
+                                "purpose": "repository"}],
+                    symbols=[])
+_idx = client.get("/api/v1/modernization/runs/%s/artifacts" % _art_run, headers=HDR).json()
+check("every file the run wrote is listed", _idx["count"] == 2, str(_idx["count"]))
+check("with the path and version a reader needs",
+      all(a.get("path") and a.get("version") for a in _idx["artifacts"]), str(_idx["artifacts"]))
+check("and a size, so a listing can say how big a file is without carrying it",
+      all(isinstance(a.get("size_chars"), int) and a["size_chars"] > 0
+          for a in _idx["artifacts"]), str(_idx["artifacts"]))
+check("the listing never carries the file content",
+      not any("content" in a for a in _idx["artifacts"]))
+check("it links back to the unit that wrote each file, which is how a row opens",
+      all(a.get("unit_id") == _art_unit for a in _idx["artifacts"]))
+check("the index is scoped like every other read",
+      client.get("/api/v1/modernization/runs/%s/artifacts" % _art_run,
+                 headers=other_hdr).status_code == 404)
+
+# ── The run report ────────────────────────────────────────────────────────
+# `_export_report` builds a real markdown document — headings, bold, pipe tables, bullet lists
+# — and it existed only inside the downloaded zip, so the one artifact that states plainly what
+# was skipped and what failed was the hardest thing here to read.
+_rep = client.get("/api/v1/modernization/runs/%s/report" % _art_run, headers=HDR).json()
+check("the report is served as markdown, not only inside the zip",
+      _rep["markdown"].startswith("# ") and _rep["filename"] == "MODERNIZATION_REPORT.md",
+      _rep["markdown"][:60])
+check("it carries the warning that nothing was compiled",
+      "not compiled" in _rep["markdown"])
+check("it is markdown a renderer can act on, not a flat wall of text",
+      "## " in _rep["markdown"] and "**" in _rep["markdown"])
+check("the report is scoped too",
+      client.get("/api/v1/modernization/runs/%s/report" % _art_run,
+                 headers=other_hdr).status_code == 404)
+
+# ── The reads that had no caller in the browser ───────────────────────────
+# Each of these was computed, stored and served, and reachable only through curl. Asserted as a
+# set because the defect was an omission from a list, not one wrong endpoint.
+for _path, _key in (("runtime", "summary"), ("startup-plan", "urls"),
+                    ("parity", "reports"), ("checkpoints", "checkpoints"),
+                    ("artifacts", "artifacts"), ("report", "markdown"),
+                    ("builds", "builds"), ("rules", "rules")):
+    _resp = client.get("/api/v1/modernization/runs/%s/%s" % (_art_run, _path), headers=HDR)
+    check("GET /%s answers, so the screen has something to render" % _path,
+          _resp.status_code == 200 and _key in _resp.json(),
+          "%s: %s" % (_resp.status_code, _resp.text[:120]))
+
+# `never_run` has to be sayable out loud: a run nobody started and a run that starts and serves
+# must never render the same, which they did for as long as nothing read this.
+_rt = client.get("/api/v1/modernization/runs/%s/runtime" % _art_run, headers=HDR).json()
+check("a run nobody started reports never_run rather than nothing",
+      _rt["summary"]["status"] == "never_run" and _rt["summary"]["started"] is False,
+      str(_rt["summary"]))
+check("and the manifest carries the same answer, which is what the badge reads",
+      client.get("/api/v1/modernization/runs/%s" % _art_run,
+                 headers=HDR).json()["runtime"]["status"] == "never_run")
+
+# The decision record: the browser only ever asked for `?status=open`, so every approval and
+# every waiver was stored and shown nowhere.
+_cp_id = store.create_checkpoint(_art_run, "build_required", "Nobody compiled this",
+                                 detail="Finish without compiling?")
+store.answer_checkpoint(_cp_id, {"decision": "shipping anyway"}, "smoke-actor")
+_cps = client.get("/api/v1/modernization/runs/%s/checkpoints" % _art_run, headers=HDR).json()
+check("an answered decision is still listed, with who answered it and why",
+      any(c["id"] == _cp_id and c["status"] == "answered"
+          and c["answered_by"] == "smoke-actor"
+          and (c.get("answer") or {}).get("decision") == "shipping anyway"
+          for c in _cps["checkpoints"]), str(_cps["checkpoints"]))
+check("while the open-only view still filters it out, as every caller relied on",
+      not any(c["id"] == _cp_id for c in client.get(
+          "/api/v1/modernization/runs/%s/checkpoints?status=open" % _art_run,
+          headers=HDR).json()["checkpoints"]))
+
+
+section("75. Failing at start-up, loudly, instead of on the page nobody clicked")
+
+# ── The guard that could not see its own subject ───────────────────────────
+#
+# `AddDbContext<T>()` builds `T` by handing it exactly one argument, its options. A context
+# asking for anything else cannot be built that way: the solution compiles with zero errors and
+# the host throws while starting, with a message about `System.String` rather than about the
+# class. `dbcontext_is_constructible` exists to catch precisely that.
+#
+# It required the constructor to call `: base(...)`. A context that configures itself in
+# `OnConfiguring` has no reason to — it holds the path and uses it later — so the pattern
+# matched nothing, "no constructor declared" was read as "the framework supplies one", and the
+# function returned True about the one shape it was written for. The 45-file run's export built
+# clean and would not start, on the line the guard was supposed to have stopped.
+
+_SELF_CONFIGURING = ("namespace A;\npublic class EmsDbContext : DbContext\n{\n"
+                     "    private readonly string _path;\n"
+                     "    public EmsDbContext(string databasePath) { _path = databasePath; }\n"
+                     "    protected override void OnConfiguring(DbContextOptionsBuilder o)\n"
+                     "        => o.UseSqlite($\"Data Source={_path}\");\n}\n")
+_STANDARD = ("namespace A;\npublic class OkDbContext : DbContext\n{\n"
+             "    public OkDbContext(DbContextOptions<OkDbContext> o) : base(o) { }\n}\n")
+
+check("a context taking a path, with no base call, is NOT constructible by the container",
+      not wireup.dbcontext_is_constructible(_SELF_CONFIGURING, "EmsDbContext"),
+      "this is the exact shape that shipped an export which would not start")
+check("the standard options constructor still is",
+      wireup.dbcontext_is_constructible(_STANDARD, "OkDbContext"))
+check("a context declaring no constructor at all still is — the framework supplies one",
+      wireup.dbcontext_is_constructible("public class C : DbContext { }", "C"))
+check("and one offering both is, because AddDbContext picks the one it can use",
+      wireup.dbcontext_is_constructible(
+          "public class C : DbContext {\n"
+          "  public C(string p) { }\n"
+          "  public C(DbContextOptions<C> o) : base(o) { }\n}", "C"))
+check("an expression-bodied constructor is read too, not only a braced one",
+      not wireup.dbcontext_is_constructible(
+          "public class C : DbContext { public C(string p) => _p = p; }", "C"))
+
+# ── Checking the half of Program.cs we did not write ───────────────────────
+#
+# `db_plan` refuses to *write* a registration for a context the container cannot construct, and
+# said nothing about one already there. On the live run the converter had written that line
+# itself, so the context read as registered, this stage had nothing to add, and the export built
+# with zero errors and threw. Checking only what we are about to add is checking our own half.
+
+_CTX_ART = {"path": "Infra/EmsDbContext.cs", "content": _SELF_CONFIGURING}
+_OK_ART = {"path": "Infra/OkDbContext.cs", "content": _STANDARD}
+
+
+def _program(*lines):
+    return ("var builder = WebApplication.CreateBuilder(args);\n\n"
+            "builder.Services.AddControllersWithViews();\n"
+            + "".join(line + "\n" for line in lines)
+            + "\nvar app = builder.Build();\napp.Run();\n")
+
+
+_MODEL_WROTE = _program(
+    "builder.Services.AddDbContext<A.EmsDbContext>(options =>",
+    "    options.UseSqlite(builder.Configuration.GetConnectionString(\"Default\")));")
+
+check("a registration the converter wrote for an unbuildable context is found",
+      [b["context"] for b in wireup.bad_registrations(_MODEL_WROTE, [_CTX_ART])]
+      == ["EmsDbContext"],
+      str(wireup.bad_registrations(_MODEL_WROTE, [_CTX_ART])))
+check("a registration for a context that can be built is left alone",
+      not wireup.bad_registrations(
+          _program("builder.Services.AddDbContext<A.OkDbContext>(o => o.UseSqlite(\"x\"));"),
+          [_OK_ART]))
+check("the same context registered twice is reported — the last line silently wins",
+      any("more than once" in b["detail"] for b in wireup.bad_registrations(
+          _program("builder.Services.AddDbContext<A.OkDbContext>(o => o.UseSqlite(\"x\"));",
+                   "builder.Services.AddDbContext<A.OkDbContext>(o => o.UseNpgsql(\"y\"));"),
+          [_OK_ART])))
+check("a commented-out registration is not a registration",
+      not wireup.bad_registrations(
+          _program("// builder.Services.AddDbContext<A.EmsDbContext>(o => o.UseSqlite(\"x\"));"),
+          [_CTX_ART]))
+check("a context this run never declared is left to the compiler, which has a line number",
+      not wireup.bad_registrations(
+          _program("builder.Services.AddDbContext<Some.Other.Context>(o => { });"), [_CTX_ART]))
+check("AddDbContextFactory is judged the same way — it constructs the same type",
+      wireup.bad_registrations(
+          _program("builder.Services.AddDbContextFactory<A.EmsDbContext>(o => { });"),
+          [_CTX_ART]))
+
+# The removal has to take the *whole statement*. These wrap as a matter of course, and deleting
+# one line of a two-line statement turns a start-up failure into a compile error — a worse trade
+# than the one being made.
+_WIRED = wireup.apply_to_program_cs(
+    _MODEL_WROTE, wireup.host_plan([_CTX_ART, {"path": "Web/Program.cs",
+                                               "content": _MODEL_WROTE}], "Web"))
+check("the whole statement goes, not the first line of it",
+      "AddDbContext<A.EmsDbContext>" not in usings.strip_non_code(_WIRED)
+      and "UseSqlite" not in usings.strip_non_code(_WIRED), _WIRED)
+check("and what is left still parses as C#",
+      not csharp_syntax.faults(_WIRED, "Program.cs"),
+      str(csharp_syntax.faults(_WIRED, "Program.cs")))
+check("a comment says what was removed and why, rather than it vanishing (D-90/D-98)",
+      "Removed by the wire-up pass" in _WIRED and "EmsDbContext" in _WIRED)
+
+# ── Every registration checked while the app starts ────────────────────────
+#
+# A missing registration is invisible to the compiler and invisible at start-up. The app loads
+# its home page and 500s on the pages nobody clicked — found one page and one debug cycle at a
+# time. Five checks in this package exist because five runs failed that way. This is the switch
+# that reports all of them at once, at start-up, naming the type and what wanted it.
+
+check("the wired host validates its container",
+      "ValidateOnBuild = validateServices" in _WIRED
+      and "ValidateScopes = validateServices" in _WIRED, _WIRED)
+check("strict is the default — the hatch has to be reached for on purpose",
+      'builder.Configuration["ValidateServices"] != "false"' in _WIRED, _WIRED)
+check("it is configured on the builder, before anything is registered on it",
+      _WIRED.index("ValidateOnBuild") < _WIRED.index("AddControllersWithViews"), _WIRED)
+check("running the stage again changes nothing — the build loop re-runs it",
+      wireup.apply_to_program_cs(_WIRED, wireup.host_plan(
+          [_CTX_ART, {"path": "Web/Program.cs", "content": _WIRED}], "Web")) == _WIRED)
+check("a Program.cs with no builder to configure is left alone, not guessed at",
+      wireup.ensure_validation("Console.WriteLine(\"hi\");")
+      == "Console.WriteLine(\"hi\");")
+check("and an empty one is not a crash", wireup.ensure_validation("") == "")
+
+_SCAFFOLDED = dotnet_scaffold._program_cs(
+    {"name": "Acme.Web", "purpose": "host"},
+    {"target_stack": ".NET 8 / ASP.NET Core MVC with Razor views"})
+check("the scaffold writes the switch into the first Program.cs, so it is never absent",
+      "ValidateOnBuild" in _SCAFFOLDED, _SCAFFOLDED[:200])
+check("and that Program.cs parses",
+      not csharp_syntax.faults(_SCAFFOLDED, "Program.cs"),
+      str(csharp_syntax.faults(_SCAFFOLDED, "Program.cs")))
+
+# ── Removing it is not the fix, so the converter has to hear about it ──────
+#
+# Stripping the registration makes the application start*able*; it does not make it work.
+# Anything needing the context still cannot be built, and with validation on the host now says
+# so and stops. The real fix is a constructor the container can call, and only the converter can
+# write one — which is why this is a `fail`, carried by the reconciliation gate, which the
+# driver stops on.
+
+check("a context the container cannot build is a FATAL reconciliation finding",
+      [(i["kind"], i["severity"]) for i in reconcile._unbuildable_contexts([_CTX_ART])]
+      == [("unbuildable_dbcontext", "fail")],
+      str(reconcile._unbuildable_contexts([_CTX_ART])))
+check("the finding names the file, the class and the constructor to write",
+      all(bit in reconcile._unbuildable_contexts([_CTX_ART])[0]["detail"]
+          for bit in ("Infra/EmsDbContext.cs", "EmsDbContext",
+                      "DbContextOptions<EmsDbContext> options")),
+      reconcile._unbuildable_contexts([_CTX_ART])[0]["detail"])
+check("a context that can be built produces no finding at all",
+      not reconcile._unbuildable_contexts([_OK_ART]))
+check("and a file that is not C# is never judged by it",
+      not reconcile._unbuildable_contexts(
+          [{"path": "a.php", "content": "class EmsDbContext extends DbContext {}"}]))
+
+
+
+section("76. Offering the layout the panel was never allowed to try")
+
+# ── Why the panel could not have saved run 4 ───────────────────────────────
+#
+# Three decompositions are designed and scored deterministically, and the best is applied. All
+# three are emphases *within* the charter's project layout, never an override of it, because the
+# layout was decided by the team that owns the codebase. That is the right default — and it has
+# a consequence nobody had drawn: when the layout **itself** is what cannot be built, every
+# candidate carries the same conflicts. On the 45-file live run all three did.
+#
+# So when the chosen layout leaves crossings with no legal expression, the same source is
+# designed again under the other layout the charter advisor offered, scored the same way, and
+# **offered** — never taken. A customer who asked for four projects and receives one, silently,
+# is the correction D-90 and D-98 argue against. Fewer projects means fewer boundaries a
+# dependency can cross illegally, and one project cannot have the problem at all.
+#
+# Only when the chosen layout produced conflicts, which is the user's call: a run that is
+# already fine pays nothing, at the price of one extra round-trip on a run that is not.
+
+_LAYERED = [
+    {"name": "Acme.Web", "purpose": "host", "depends_on": ["Acme.Application"]},
+    {"name": "Acme.Application", "purpose": "logic", "depends_on": []},
+    {"name": "Acme.Infrastructure", "purpose": "data", "depends_on": []},
+]
+
+
+def _layout_call_tool(system_prompt, user_content, schema, llm_override=None,
+                      max_tokens=None, **kw):
+    """Two decompositions of one codebase, keyed on the layout the charter asked for.
+
+    Keyed on the prompt because that is how the real thing works: `_design_alternative_layout`
+    re-runs the architect with `project_layout` replaced, and nothing else about the call
+    changes. A fixture that keyed on anything else would not be exercising the mechanism.
+    """
+    if schema.get("name") != "submit_target_architecture":
+        return fake_call_tool(system_prompt, user_content, schema, llm_override, max_tokens, **kw)
+    # The charter is rendered into the **system** block, not the user message — which is
+    # what makes it byte-stable for the prompt cache (D-06). Keying on `user_content`
+    # here silently tested nothing.
+    if "single deployable unit" in (system_prompt or "").lower():
+        return {
+            "projects": [{"name": "Acme.App", "purpose": "everything", "depends_on": []}],
+            "components": [
+                {"name": "config", "project": "Acme.App", "namespace": "Acme.App.Config",
+                 "output_dir": "Acme.App/Config", "members": ["cfg.py"], "role": "config",
+                 "rationale": "settings", "expected_files": ["Cfg.cs"]},
+                {"name": "everything-else", "project": "Acme.App",
+                 "namespace": "Acme.App.Features", "output_dir": "Acme.App/Features",
+                 "members": ["svc.py", "repo.py"], "role": "business",
+                 "rationale": "one feature", "expected_files": ["Svc.cs", "Repo.cs"]},
+            ],
+            "seams": [], "shared_conventions": "Types are PascalCase.",
+            "risks": [], "summary": "One project. No boundary to cross.",
+        }
+    return {
+        "projects": _LAYERED,
+        "components": [
+            {"name": "config", "project": "Acme.Web", "namespace": "Acme.Web.Config",
+             "output_dir": "Acme.Web/Config", "members": ["cfg.py"], "role": "config",
+             "rationale": "settings", "expected_files": ["Cfg.cs"]},
+            {"name": "service", "project": "Acme.Application",
+             "namespace": "Acme.Application.Services", "output_dir": "Acme.Application/Services",
+             "members": ["svc.py"], "role": "business", "rationale": "the service",
+             "expected_files": ["Svc.cs"]},
+            {"name": "repository", "project": "Acme.Infrastructure",
+             "namespace": "Acme.Infrastructure.Data", "output_dir": "Acme.Infrastructure/Data",
+             "members": ["repo.py"], "role": "data", "rationale": "the repository",
+             "expected_files": ["Repo.cs"]},
+        ],
+        "seams": [], "shared_conventions": "Types are PascalCase.",
+        "risks": [], "summary": "Three layers, two illegal dependencies.",
+    }
+
+
+llm_gateway.call_tool = _layout_call_tool
+try:
+    _ly, _ly_gate = _to_two_gap_plan("layout-choice")
+    check("the plan gate is reached", _ly_gate is not None)
+
+    _events = [e.get("event") for e in store.list_events(_ly, limit=900)]
+    check("the alternative was designed, because the chosen layout could not be built",
+          "layout_alternative_started" in _events, str(_events[-14:]))
+    check("and it was designed by re-running the architect, not by rearranging the old answer",
+          "layout_alternative_candidate" in _events, str(_events[-14:]))
+
+    _meta = (store.list_units(_ly, kind="design")[0].get("meta")) or {}
+    _alt = _meta.get("alternative_layout") or {}
+    check("the alternative is kept whole, because unlike the panel it may still be built",
+          bool((_alt.get("proposal") or {}).get("components")), str(sorted(_alt)))
+    check("it scores zero unbuildable crossings where the chosen layout scores two",
+          (_alt.get("score") or {}).get("gaps") == 0
+          and len(_meta.get("layering_gaps") or []) == 2,
+          str(((_alt.get("score") or {}).get("gaps"), len(_meta.get("layering_gaps") or []))))
+
+    _offered = {r["id"]: r for r in ((_ly_gate.get("payload") or {}).get("repairs") or [])}
+    _swap = next((r for r in _offered.values() if r["kind"] == "swap_layout"), None)
+    check("the plan gate offers it beside the interface-seam and merge options",
+          _swap is not None, str(sorted(_offered)))
+    check("it says how many crossings it measurably closes, like every other option",
+          _swap and len(_swap["closes"]) == 2 and not _swap["opens"], str(_swap))
+    check("it is first, because closing two beats closing one",
+          list(_offered)[0] == _swap["id"], str(list(_offered)))
+    check("the text names both plans' project counts, so the choice is legible",
+          _swap and "1 project(s)" in _swap["detail"] and "3 and 3" in _swap["detail"],
+          _swap["detail"] if _swap else "")
+    check("and warns that this one re-costs the run, unlike every other option",
+          _swap and "the quote changes with it" in _swap["detail"],
+          _swap["detail"] if _swap else "")
+    check("a human may still keep the layout they asked for",
+          "none" in (_ly_gate.get("options") or []), str(_ly_gate.get("options")))
+
+    # Applying it. Nothing is converted yet, so a component is a row and nothing else — the one
+    # window in which the decomposition can be replaced rather than edited.
+    _before = {(c.get("component_name"), c.get("target_project"))
+               for c in store.list_units(_ly, kind="component")}
+    store.answer_checkpoint(_ly_gate["id"], {"decision": "approved", "repair": _swap["id"]},
+                            "smoke")
+    store.update_run(_ly, status="converting", paused_reason=None)
+    runner.convert_run(_ly, CALLER)
+
+    _after = store.list_units(_ly, kind="component")
+    check("the whole decomposition is replaced, not relabelled",
+          {(c.get("component_name"), c.get("target_project")) for c in _after} != _before,
+          str(sorted((c.get("component_name"), c.get("target_project")) for c in _after)))
+    check("every component now lives in the single project",
+          {c.get("target_project") for c in _after} == {"Acme.App"},
+          str({c.get("target_project") for c in _after}))
+    check("no source file is left belonging to a component that was deleted",
+          all(u.get("parent_unit_id") in {c["id"] for c in _after}
+              for u in store.list_units(_ly, kind="source_file")),
+          str([(u["path"], u.get("status")) for u in store.list_units(_ly, kind="source_file")]))
+    check("nothing is left that has no legal way to be written",
+          not ((store.list_units(_ly, kind="design")[0].get("meta") or {})
+               .get("layering_gaps")),
+          str((store.list_units(_ly, kind="design")[0].get("meta") or {}).get("layering_gaps")))
+    check("so the conflict gate does not stop the run",
+          not [c for c in store.list_checkpoints(_ly, "open")
+               if c["kind"] == "plan_conflicts"])
+    check("the run converts",
+          store.list_artifacts(_ly, current_only=False),
+          str((store.get_run(_ly) or {}).get("paused_reason")))
+    check("the frozen plan is re-quoted from the components that now exist, not the old ones",
+          len((((store.get_run(_ly) or {}).get("plan") or {}).get("components")) or [])
+          == len(_after),
+          str(len((((store.get_run(_ly) or {}).get("plan") or {}).get("components")) or [])))
+    check("and the alternative is cleared, so it is not offered against the layout it became",
+          not ((store.list_units(_ly, kind="design")[0].get("meta") or {})
+               .get("alternative_layout")))
+
+    # Keeping the chosen layout has to behave exactly as it did before any of this.
+    _keep, _keep_gate = _to_two_gap_plan("layout-keep")
+    store.answer_checkpoint(_keep_gate["id"], {"decision": "approved"}, "smoke")
+    store.update_run(_keep, status="converting", paused_reason=None)
+    runner.convert_run(_keep, CALLER)
+    check("approving without picking it leaves the layered plan in place",
+          {c.get("target_project") for c in store.list_units(_keep, kind="component")}
+          == {"Acme.Web", "Acme.Application", "Acme.Infrastructure"},
+          str({c.get("target_project")
+               for c in store.list_units(_keep, kind="component")}))
+    check("and the conflict gate still stops it, because the crossings are still there",
+          [c for c in store.list_checkpoints(_keep, "open")
+           if c["kind"] == "plan_conflicts"])
+except Exception:
+    traceback.print_exc()
+    check("the layout-choice runs raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+# ── A plan that is fine pays nothing, and one being built cannot be replaced ─
+
+llm_gateway.call_tool = _clean_call_tool
+try:
+    _nc, _nc_gate = _to_two_gap_plan("layout-no-conflict")
+    check("both layouts are designed even when the chosen one is clean, and both scored",
+          "layout_alternative_scored" in
+          [e.get("event") for e in store.list_events(_nc, limit=900)],
+          str([e.get("event") for e in store.list_events(_nc, limit=900)][-10:]))
+    check("and the run is told the alternative closes nothing, rather than it vanishing",
+          any(e.get("event") == "layout_alternative_scored"
+              and "closes nothing" in (e.get("detail") or "")
+              for e in store.list_events(_nc, limit=900)),
+          str([e.get("detail") for e in store.list_events(_nc, limit=900)
+               if e.get("event") == "layout_alternative_scored"]))
+    check("and the gate offers no layout swap, because there is nothing to compare against",
+          not [r for r in ((_nc_gate.get("payload") or {}).get("repairs") or [])
+               if r.get("kind") == "swap_layout"])
+except Exception:
+    traceback.print_exc()
+    check("the no-conflict layout run raised nothing", False)
+finally:
+    llm_gateway.call_tool = _real_call_tool
+
+# `clear_plan` is the only destructive operation in this package, and the guard is what makes
+# it acceptable. Before the scaffold a component is a row; after conversion begins it owns
+# emitted files and registered symbols that deleting the row would strand.
+_cp = store.create_run("clear-plan-guard", ".NET 8", "files", created_by="smoke")
+store.insert_units(_cp, [
+    {"path": "a.py", "kind": "source_file", "status": "blocked", "source_text": "x = 1\n"},
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "blocked", "target_project": "P"}])
+_comp = store.list_units(_cp, kind="component")[0]
+store.set_parent(_cp, ["a.py"], _comp["id"])
+check("a plan nothing has started converting can be replaced",
+      store.clear_plan(_cp)["components"] == 1)
+check("and its members go back to belonging to nothing, rather than to a row that is gone",
+      all(u.get("parent_unit_id") in (None, "")
+          for u in store.list_units(_cp, kind="source_file")),
+      str([(u["path"], u.get("parent_unit_id"), u.get("status"))
+           for u in store.list_units(_cp, kind="source_file")]))
+
+store.insert_units(_cp, [{"path": "#component/two", "kind": "component",
+                          "component_name": "two", "status": "converting",
+                          "target_project": "P"}])
+try:
+    store.clear_plan(_cp)
+    check("a plan that has started converting refuses to be replaced", False,
+          "clear_plan deleted a component that was already being converted")
+except ValueError as _exc:
+    check("a plan that has started converting refuses to be replaced", True)
+    check("and says why, in a sentence naming what is in the way",
+          "already started converting" in str(_exc), str(_exc))
+check("the refusal is all-or-nothing — nothing was deleted on the way to raising",
+      len(store.list_units(_cp, kind="component")) == 1,
+      str([c.get("component_name") for c in store.list_units(_cp, kind="component")]))
+
+
+
+section("77. Reading the failure instead of storing it")
+
+# ── The dead end this removes ──────────────────────────────────────────────
+#
+# The launcher already captured the process output, the platform already stored it, and the
+# checkpoint already showed it. Nothing read it — so a host that refused to start was where
+# build errors were before `build_results`: a human opening a checkpoint and decoding twenty
+# lines of .NET. With start-up validation on, that output is now the most valuable text in the
+# run, because it names *every* unresolvable service at once instead of the first request's.
+#
+# The answer is the one build errors got. Parse what is parseable, route it to the unit that can
+# fix it, and hand what is left to the converter with the log in front of it. **The parser does
+# not have to be complete**, which is what makes it safe to ship: a shape it knows produces an
+# exact deterministic fix, a shape it does not produces a type name harvested from the message
+# and routed by whoever declared it, and only a message naming nothing this run produced stays
+# a checkpoint for a human — which is where all of them were.
+
+_STARTUP_LOG = (
+    "Unhandled exception. System.AggregateException: Some services are not able to be "
+    "constructed\n"
+    " ---> System.InvalidOperationException: Error while validating the service descriptor "
+    "'ServiceType: Acme.Web.Controllers.EmployeeController': Unable to resolve service for "
+    "type 'Acme.Application.IEmployeeService' while attempting to activate "
+    "'Acme.Web.Controllers.EmployeeController'.\n"
+    " ---> System.InvalidOperationException: Unable to resolve service for type "
+    "'Acme.Application.IEmployeeService' while attempting to activate "
+    "'Acme.Web.Controllers.ReportController'.\n"
+    " ---> System.InvalidOperationException: Cannot consume scoped service "
+    "'Acme.Infrastructure.EmsDbContext' from singleton 'Acme.Application.CacheService'.\n"
+    "   at Microsoft.Extensions.DependencyInjection.ServiceProvider..ctor()\n")
+
+_found = runtime.diagnostics(_STARTUP_LOG)
+_kinds = [d["kind"] for d in _found]
+check("an unresolvable service is read out of the log, not left as prose",
+      "missing_service" in _kinds, str(_kinds))
+check("with the type that is missing and the type that wanted it",
+      any(d["missing"].endswith("IEmployeeService")
+          and d["wanted_by"].endswith("EmployeeController") for d in _found), str(_found))
+check("a singleton holding a scoped service is read too — stale data, not a crash",
+      "scope_mismatch" in _kinds, str(_kinds))
+check("the same service wanted by two controllers is two findings, not one",
+      len([d for d in _found if d["kind"] == "missing_service"]) == 2, str(_kinds))
+check("but the same finding repeated verbatim is deduplicated",
+      len(runtime.diagnostics(_STARTUP_LOG + _STARTUP_LOG)) == len(_found))
+check("an empty log produces nothing rather than a finding about nothing",
+      runtime.diagnostics("") == [] and runtime.diagnostics("   ") == [])
+
+check("a view emitted under another name is read",
+      [d["missing"] for d in runtime.diagnostics(
+          "InvalidOperationException: The view 'Index' was not found. The following locations "
+          "were searched:\n/Views/Employee/Index.cshtml")] == ["Index"])
+check("and two actions claiming one URL",
+      [d["kind"] for d in runtime.diagnostics(
+          "AmbiguousMatchException: The request matched multiple endpoints.")]
+      == ["ambiguous_route"])
+
+# The fallback, which is the reason an incomplete parser is acceptable. A message this parser
+# does not know still yields the type names in it, and a type this run declared is a route.
+_unknown = runtime.diagnostics(
+    "Unhandled exception. System.IO.FileNotFoundException: Could not load file or assembly "
+    "'Acme.Infrastructure'. \n   at Acme.Web.Program.<Main>$(String[] args)")
+check("a message the parser does not know still yields the types it names",
+      [d["missing"] for d in _unknown] and all(d["kind"] == "unclassified" for d in _unknown),
+      str([d["missing"] for d in _unknown]))
+check("and carries what actually happened, not that something did",
+      _unknown and "FileNotFoundException" in _unknown[0]["detail"], str(_unknown[:1]))
+
+# ── Routing: by who declared the type, because there is no file and no line ─
+#
+# A start-up message has no file position at all, so the `build_results` path — resolve the file,
+# find its owner — is unavailable, and a reader who reused it would get `unmapped` for every row.
+# The one anchor a start-up message offers is a type name.
+
+_rt = store.create_run("startup-route", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rt, [
+    {"path": "#component/web", "kind": "component", "component_name": "web", "status": "ready"},
+    {"path": "#component/app", "kind": "component", "component_name": "app", "status": "ready"}])
+_units = {u["component_name"]: u for u in store.list_units(_rt, kind="component")}
+store.complete_unit(_units["web"]["id"], _rt,
+                    [{"path": "Web/EmployeeController.cs", "content": "public class C { }"}],
+                    [{"name": "Acme.Web.Controllers.EmployeeController",
+                      "signature": "class EmployeeController"}], event_detail="ok")
+store.complete_unit(_units["app"]["id"], _rt,
+                    [{"path": "App/EmployeeService.cs", "content": "public class S { }"}],
+                    [{"name": "Acme.Application.EmployeeService",
+                      "signature": "class EmployeeService"}], event_detail="ok")
+
+_routed = runtime.route(_rt, _found)
+check("a finding goes to the unit that declared the type which asked for the missing one",
+      _units["web"]["id"] in _routed["by_unit"], str(sorted(_routed["by_unit"])))
+check("a finding naming nothing this run declared is not routed to a guess",
+      _routed["unrouted"], str(_routed["unrouted"]))
+check("nothing is routed for a run that declared none of these types",
+      not runtime.route(store.create_run("startup-empty", ".NET 8", "files",
+                                         created_by="smoke"), _found)["by_unit"])
+
+# ── The prompt half, which is where an unrecognised message still helps ────
+_prompt = runtime.summarize_for_prompt(_found, _STARTUP_LOG)
+check("the converter is told the solution compiled and the process stopped",
+      "would not start" in _prompt and "No compiler can see any of this" in _prompt)
+check("it lists what was read out of the output",
+      "missing service" in _prompt and "IEmployeeService" in _prompt, _prompt[:400])
+check("and it carries the output itself, rather than only our reading of it",
+      "Unable to resolve service" in _prompt)
+check("nothing to say produces no section at all",
+      runtime.summarize_for_prompt([], "") == "")
+
+# ── End to end: a failed launch puts work back into the loop ───────────────
+_report = runtime.ingest(_rt, {"checks": [], "started": False, "log_tail": _STARTUP_LOG},
+                         actor="smoke")
+check("the report is recorded as a failure", _report["status"] == "failed", str(_report))
+check("units were sent back to be converted again", _report.get("reopened", 0) or
+      any(e.get("event") == "startup_reopened" for e in store.list_events(_rt, limit=400)),
+      str([e.get("event") for e in store.list_events(_rt, limit=400)][-8:]))
+_point = [c for c in store.list_checkpoints(_rt) if c["kind"] == "runtime_failed"][-1]
+check("the checkpoint does not block, because the run needs resuming and not deciding",
+      not _point["blocking"],
+      "a blocking gate here would stop the very repair it just queued")
+check("it says how many units went back, in the reader's words",
+      "sent back to be converted again" in (_point.get("detail") or ""),
+      (_point.get("detail") or "")[-300:])
+check("the findings ride on the checkpoint too, so a screen can render them",
+      ((_point.get("payload") or {}).get("diagnostics") or []), str(_point.get("payload")))
+check("the reopened unit carries the findings and the log, which is how they reach the prompt",
+      ((store.get_unit(_units['web']['id']) or {}).get("meta") or {}).get("startup_issues"),
+      str(((store.get_unit(_units['web']['id']) or {}).get("meta") or {}).keys()))
+check("the run is rewound to a stage that will claim them, never onto a gate",
+      (store.get_run(_rt) or {}).get("phase") not in ("completed", "", None)
+      and not (stages.get((store.get_run(_rt) or {}).get("phase") or "") or
+               stages.STAGES[0]).gate,
+      str((store.get_run(_rt) or {}).get("phase")))
+
+# The round cap. Each round here costs a whole build and a launch, not a compile, so it is a
+# smaller number than the build loop's and it has to stop rather than spend.
+for _ in range(runtime.MAX_STARTUP_ROUNDS + 2):
+    runtime.ingest(_rt, {"checks": [], "started": False, "log_tail": _STARTUP_LOG},
+                   actor="smoke")
+_last = [c for c in store.list_checkpoints(_rt) if c["kind"] == "runtime_failed"][-1]
+check("past the round cap it stops and asks, rather than spending against a loop",
+      _last["blocking"] and "used all" in (_last.get("detail") or ""),
+      (_last.get("detail") or "")[-300:])
+
+# A failure naming nothing this run produced has to stay a human's problem.
+_nr = store.create_run("startup-unroutable", ".NET 8", "files", created_by="smoke")
+runtime.ingest(_nr, {"checks": [], "started": False,
+                     "log_tail": "Unhandled exception. System.Exception: boom"}, actor="smoke")
+_nr_point = [c for c in store.list_checkpoints(_nr) if c["kind"] == "runtime_failed"][-1]
+check("nothing routable means a blocking checkpoint, as it always did",
+      _nr_point["blocking"])
+
+# ── The deterministic half: registering what the run proved it needs ───────
+#
+# Reopened and told nothing, a generator re-runs over unchanged inputs and emits byte-identical
+# output — the D-65 trap, one stage over. The list of types the container could not resolve is
+# exactly the fact the wire-up pass did not have.
+
+_svc = [{"path": "App/Clock.cs",
+         "content": "namespace App;\npublic class Clock { public Clock() { } }"},
+        {"path": "Web/Program.cs", "content": "var builder = WebApplication.CreateBuilder(args);"
+                                              "\n\nvar app = builder.Build();\napp.Run();\n"}]
+check("a class nothing appeared to need is not registered on its own",
+      not any("Clock" in line for line in wireup.host_plan(_svc, "Web")["services"]),
+      str(wireup.host_plan(_svc, "Web")["services"]))
+check("but one the running application proved it needs is",
+      any("Clock" in line for line in
+          wireup.host_plan(_svc, "Web", required=["App.Clock"])["services"]),
+      str(wireup.host_plan(_svc, "Web", required=["App.Clock"])["services"]))
+check("a type this run never declared is not registered merely because something asked",
+      not any("Nowhere" in line for line in
+              wireup.host_plan(_svc, "Web", required=["Some.Nowhere"])["services"]))
+
+# ── The escape hatch: strict by default, reachable on purpose ──────────────
+#
+# Two behaviours is a real cost — what the pipeline tested is then not what shipped — and it is
+# worth it only because the alternative, on the day a conversion has one gap left, is a person
+# with nothing on the screen and no way to see how close it came.
+_hatch = dotnet_scaffold._program_cs(
+    {"name": "Acme.Web", "purpose": "host"},
+    {"target_stack": ".NET 8 / ASP.NET Core MVC with Razor views"})
+check("the scaffold defaults to strict",
+      'builder.Configuration["ValidateServices"] != "false"' in _hatch, _hatch[:300])
+check("and says how to start a broken application anyway, in the file itself",
+      "Set ValidateServices=false in the environment" in _hatch)
+check("the hatch is off by default, not on — an absent variable validates",
+      '!= "false"' in _hatch and '== "true"' not in _hatch)
+
+
+
+section("78. Four checks that were shipped reading a field nothing wrote")
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# ── What a live run found that 1,937 offline checks did not ────────────────
+#
+# The second 45-file conversion produced 45 converted files, 0 failed units and 6 compiler
+# errors — an ordinary, recoverable result. It then stalled, and every reason was in the
+# machinery around the conversion rather than in the conversion:
+#
+#   * the driver's fatal-finding guard read `payload["issues"]` and the producer never wrote it,
+#   * the build loop read "resume me" as "give up",
+#   * the instruction the product prints for a human contained a literal `\n` and omitted the
+#     one flag this deployment refuses the call without,
+#   * and the two `fail` findings that guard would have stopped on were both false.
+#
+# Each is one line. Each survived a suite that tests every one of these behaviours — because
+# every one of those tests built its own input instead of taking the product's.
+
+# ── The gate carries its findings, not only its prose ──────────────────────
+#
+# `will_not_work` filters `payload["issues"]` for severity `fail`. It was written after a live
+# run sent seven fatal findings past unread, tested against a payload the suite built by hand,
+# and shipped against a `create_checkpoint` call with no `payload=` at all. A second live run
+# then sent two more past. This asserts on a checkpoint **the runner made**, which is the only
+# version of this check that could have failed.
+
+_rc = store.create_run("reconcile-payload", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rc, [
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "ready", "target_project": "W", "output_dir": "W", "target_namespace": "W"}])
+_rc_unit = store.list_units(_rc, kind="component")[0]
+store.complete_unit(_rc_unit["id"], _rc, [
+    {"path": "W/Reflect.cs",
+     "content": 'namespace W;\npublic class R { const string T = "W.Missing.Thing"; }'}],
+    [{"name": "W.R", "signature": "class R"}], event_detail="ok")
+_report = reconcile.run(_rc)
+check("the run's own reconciliation finds the fatal case",
+      _report["counts"]["fail"] >= 1, str(_report["counts"]))
+
+# Raised the way the runner raises it, through the same call.
+store.create_checkpoint(
+    _rc, "reconciliation",
+    f"{len(_report['issues'])} consistency issue(s) across the converted codebase",
+    detail=reconcile.describe(_report)[:4000], blocking=False,
+    payload={"issues": _report["issues"], "counts": _report["counts"]})
+_point = [c for c in store.list_checkpoints(_rc) if c["kind"] == "reconciliation"][-1]
+check("the reconciliation gate carries the findings themselves",
+      ((_point.get("payload") or {}).get("issues") or []), str(_point.get("payload"))[:120])
+check("so the driver's fatal-finding guard actually sees them",
+      _driver.will_not_work(_point), str(_point.get("payload"))[:120])
+check("and a run with nothing fatal still reads as nothing fatal",
+      not _driver.will_not_work({"payload": {"issues": [
+          {"severity": "warn", "kind": "namespace_drift", "detail": "x"}]}}))
+
+# The producer is what this is really about: a `create_checkpoint` for reconciliation with no
+# payload passes every other check in this file and makes the guard above permanently blind.
+check("the runner passes the findings when it raises this gate",
+      "payload={\"issues\": report[\"issues\"], \"counts\": report[\"counts\"]}"
+      in io.open(os.path.join(_ROOT, "backend", "services", "modernization", "runner.py"),
+                 encoding="utf-8").read(),
+      "runner.py raises reconciliation without a payload again")
+
+# ── Failures lead, because the text is truncated ───────────────────────────
+#
+# Grouping by kind and sorting alphabetically put `manual_followup` (93 of them) ahead of
+# `reflected_type_missing` (2), and the caller cuts this at 4,000 characters — so on a live run
+# the only two findings that said "this will not work" were cut out of what a human reads.
+
+_mixed = {"issues": [{"kind": "zzz_manual_followup", "severity": "warn", "detail": "a note"}] * 40
+                    + [{"kind": "aaa_broken", "severity": "fail", "detail": "this cannot work"}],
+          "counts": {"fail": 1, "warn": 40, "artifacts": 10}}
+_text = reconcile.describe(_mixed)
+check("a failure appears before the warnings, whatever the kinds are called",
+      _text.index("this cannot work") < _text.index("a note"), _text[:200])
+check("and it survives the 4,000-character cut the caller applies",
+      "this cannot work" in _text[:4000])
+check("both severities are still labelled in the reader's words",
+      "Will not work" in _text and "Worth a look" in _text)
+
+# ── A doc comment is not a reflective lookup ───────────────────────────────
+#
+# Both `fail` findings on the live run were `/// <see cref="...AuthMiddleware"/>` in a
+# documentation file, naming a class that had been converted and idiomatically renamed to
+# `AuthPolicy`. The check scanned raw text. Reaching for `strip_non_code` to fix it then blanked
+# the real string literals too and the check went silent on the defect it exists for — so the
+# distinction it needs is comments-out, strings-in.
+
+check("a comment mentioning a type is not a lookup",
+      not reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            '/// <see cref="W.Infra.AuthMiddleware"/>\nnamespace W;\npublic class A { }'}],
+          set(), {"W"}))
+check("a block comment is not either",
+      not reconcile._reflected_types(
+          [{"path": "A.cs", "content": '/* see "W.Infra.AuthMiddleware" */\npublic class A { }'}],
+          set(), {"W"}))
+check("but a real string literal still is, which is the whole point of the check",
+      reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            'public class A { const string T = "W.Infra.Missing"; }'}],
+          set(), {"W"}))
+check("a `//` inside a string does not turn the rest of the line into a comment",
+      reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            'public class A { string u = "http://x"; const string T = "W.Infra.Missing"; }'}],
+          set(), {"W"}))
+check("and a quote inside a comment does not open a string",
+      not reconcile._reflected_types(
+          [{"path": "A.cs", "content":
+            '// the " character, then "W.Infra.Missing"\npublic class A { }'}],
+          set(), {"W"}))
+check("offsets survive the blanking, so line numbers stay honest",
+      len(usings.strip_comments('a\n// x\nb')) == len('a\n// x\nb'))
+check("a verbatim string keeps its doubled quotes rather than ending early",
+      usings.strip_comments('var p = @"C:\\a""b"; // note').startswith('var p = @"C:\\a""b";'))
+
+# ── An instruction a human can paste ──────────────────────────────────────
+#
+# Asserted on the **rendered** text rather than on the source that produces it, which is this
+# section's own lesson. `\\n` in a Python string is a backslash and the letter n, so the gate
+# printed the shell continuation and the line break as a literal `\\n` in the middle of the one
+# piece of text whose entire job is being copied and pasted. A test reading the source for the
+# escape sequence would have to get the same escaping right to catch it.
+_pb = store.create_run("build-instruction", ".NET 8", "files", created_by="smoke",
+                       project_id="proj-42", project_name="demo")
+store.insert_units(_pb, [
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "ready", "target_project": "W", "output_dir": "W"}])
+_pb_unit = store.list_units(_pb, kind="component")[0]
+store.complete_unit(_pb_unit["id"], _pb,
+                    [{"path": "W/A.cs", "content": "public class A { }"}], [],
+                    event_detail="ok")
+build_results.gate(_pb)
+_instruction = next((c.get("detail") or "") for c in store.list_checkpoints(_pb)
+                    if c["kind"] == "build_required")
+check("the printed build command breaks its lines, rather than printing a literal backslash-n",
+      " \\\n" in _instruction and "\\n " not in _instruction.replace(" \\\n", ""),
+      _instruction[_instruction.find("python scripts"):][:160])
+check("and names the project, without which a project-bound deployment refuses the resume",
+      "--project proj-42" in _instruction,
+      _instruction[_instruction.find("python scripts"):][:160])
+check("a run with no project does not print an empty --project",
+      "--project" not in next(
+          (c.get("detail") or "") for c in store.list_checkpoints(_rc)
+          if c["kind"] == "build_required") if [c for c in store.list_checkpoints(_rc)
+                                                if c["kind"] == "build_required"] else True)
+
+_br = io.open(os.path.join(_ROOT, "scripts", "build_run.py"), encoding="utf-8").read()
+_driver_build_answers = _driver._LOOP_ANSWERS if hasattr(_driver, "_LOOP_ANSWERS") else (
+    tuple(x.strip().strip('"\'') for x in
+          _br.split("_LOOP_ANSWERS = (")[1].split(")")[0].split(",") if x.strip()))
+
+# ── A package reference is not something a converter can write ─────────────
+#
+# The 45-file run ended stuck on exactly two errors, both `CS0103: The name 'BCrypt' does not
+# exist`, after the converter had written `BCrypt.Net.BCrypt.Verify(...)` correctly, fully
+# qualified, with a comment naming the package it needed. There was no rule to act on it, so
+# the error routed to the *converter*, which rewrote an already-correct file three times and
+# was then retired as failed. That is the D-65 trap in a new place: an error whose fix belongs
+# to a deterministic stage, handed to a model.
+#
+# Not incidental to that codebase either. PHP's `password_hash`/`password_verify` **are**
+# bcrypt, so every converted PHP application with a login reaches this.
+
+check("code calling BCrypt asks for the package that supplies it",
+      ("BCrypt.Net-Next", "4.0.3") in wireup.packages_for_code(
+          "if (!BCrypt.Net.BCrypt.Verify(password, user.PasswordHash)) { return null; }"),
+      str(sorted(wireup.packages_for_code("BCrypt.Net.BCrypt.Verify(a, b);"))))
+check("a comment naming the package adds no dependency",
+      not wireup.packages_for_code(
+          "// BCrypt.Net-Next is the .NET equivalent of PHP's PASSWORD_DEFAULT (bcrypt)."))
+check("and an unrelated file gains nothing",
+      not wireup.packages_for_code("public class Employee { public int Id { get; set; } }"))
+
+
+# ── The list of checkpoints the loop may clear, actually cleared ───────────
+#
+# `_LOOP_ANSWERS` names the blocking checkpoints this program is entitled to answer — and it
+# was used only as an *exclusion* list, in the test asking whether anything blocking is open
+# that is **not** on it. Nothing ever answered the ones that are. So once the loop had changed
+# any file the run raised `build_errors_outstanding`, `POST /resume` answered 409 while it was
+# open, and the loop stopped one line after deciding it was allowed to continue. The third
+# instance in one afternoon of a named capability that is declared and never wired.
+
+check("the loop knows which build checkpoints are its own to answer",
+      set(_br_answers := _driver_build_answers) >= {"build_required",
+                                                    "build_errors_outstanding"},
+      str(_br_answers))
+check("and it answers them before resuming, rather than only checking for them",
+      "_clear_loop_checkpoints(api, key, run_id, token, project_id)" in _br
+      and _br.index("def _clear_loop_checkpoints") < _br.index(
+          "_clear_loop_checkpoints(api, key, run_id, token, project_id)"),
+      "the loop still resumes without clearing what it is responsible for")
+check("it answers only its own kinds, never a decision the product asked a human for",
+      '"decision": "compiled by build_run.py"' in _br
+      and 'point.get("kind") not in _LOOP_ANSWERS' in _br)
+
+
+# ── "Resume me" is not "give up" ───────────────────────────────────────────
+#
+# The loop built, reopened three units, built again without resuming, saw the same six errors
+# and stopped — while the fix sat in the queue untouched and the platform's own summary said
+# "resume the run" in those words.
+check("awaiting_rework is not a terminal status",
+      "awaiting_rework" not in _br.split("_TERMINAL_BUILD_STATUSES = ")[1].split(")")[0],
+      _br.split("_TERMINAL_BUILD_STATUSES = ")[1].split(")")[0])
+check("and the loop resumes on it rather than stopping",
+      'if status == "awaiting_rework":' in _br and "resuming" in _br)
+
+# ── A clean build is not the end of the run ────────────────────────────────
+#
+# The loop resumed a run only to drive *rework*: the `passed` branch returned straight out of
+# the function. So a run whose last obstacle was the build sat `paused` at `reconcile` with no
+# blocking checkpoint and nothing to push it over the line — the platform holding every piece
+# of evidence it had been asking for and still unable to say the conversion had finished.
+# Watched happen on run 8a9612e0: build round 9 clean, 8 URLs probed with 0 failing, and the
+# run reached `completed` only because a person made one more call by hand.
+#
+# Asserted on the source for the same reason the other `build_run.py` checks are: this program
+# talks HTTP to a running deployment, and the suite has neither. The live run below is what
+# actually verifies it.
+
+check("a clean build hands off to the code that finishes the run",
+      "_finish_run(api, key, run_id, token, project_id, started, deadline_hours)" in _br
+      and _br.index("def _finish_run") < _br.index('if status == "passed":'),
+      "the passed branch still returns without letting the run finish")
+check("and it does that after the startup check, not before",
+      _br.index("served = serve_export(") < _br.index(
+          "return _finish_run(api, key, run_id, token, project_id, started, deadline_hours)"),
+      "resuming before the app has been started re-raises the startup gate and pauses again")
+check("a failing startup check is left to the rework path rather than resumed into",
+      "if served != 0:" in _br and _br.index("if served != 0:") < _br.index(
+          "return _finish_run(api, key, run_id, token, project_id, started, deadline_hours)"))
+check("finishing still refuses to answer a checkpoint that is not this program's to answer",
+      _br.count('if k not in _LOOP_ANSWERS') == 2,
+      f"{_br.count('if k not in _LOOP_ANSWERS')} of the two paths filter what they may answer")
+check("and it says what a run is still waiting on rather than exiting quietly",
+      "still waiting on:" in _br and "paused_reason" in _br)
+
+
+
+
+
+
+# ── "Produced nothing" and "produced good work, then a repair failed" ──────
+#
+# `failed` carried both meanings and the code had to tell them apart. Run 8a9612e0's auth
+# component converted cleanly on attempt 1, was reopened over a package reference it was never
+# permitted to add, had three rewrites rejected for withdrawing `AuthController.Logout`, and
+# retired `failed`. `_finalize` then set the run to `failed` with "1 of 14 component(s) did not
+# convert, so 3 source file(s) have no output" — about three files whose output was in the
+# export, compiled, and served requests. The artifact rows had it right the whole time: v1
+# `is_current=1`, v2-v4 REJECTED.
+#
+# The functional half matters more than the label. `reopen_units` refuses `failed` on the
+# stated grounds that such a unit "produced no current artifact to complain about" — so the one
+# component the build most wanted fixed was the one component the rework loop could never touch
+# again.
+section("A failed repair is not a failed conversion")
+
+_rf = store.create_run("repair-vs-failure", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rf, [
+    {"path": "#component/shipped", "kind": "component", "component_name": "shipped",
+     "status": "ready", "target_project": "W", "output_dir": "W",
+     "meta": {"members": ["a.php", "b.php"]}},
+    {"path": "#component/empty", "kind": "component", "component_name": "empty",
+     "status": "ready", "target_project": "W", "output_dir": "W",
+     "meta": {"members": ["c.php"]}},
+])
+_rf_shipped, _rf_empty = (store.list_units(_rf, kind="component")[0],
+                          store.list_units(_rf, kind="component")[1])
+if _rf_shipped["component_name"] != "shipped":
+    _rf_shipped, _rf_empty = _rf_empty, _rf_shipped
+
+# The real producer, not a hand-written artifact row: this is the call the convert stage makes.
+store.complete_unit(_rf_shipped["id"], _rf,
+                    [{"path": "W/Auth.cs", "content": "public class Auth { }"}], [],
+                    event_detail="converted")
+
+_rf_a = store.fail_unit(_rf_shipped["id"], _rf, "rewrite withdrew Auth.Logout", terminal=True)
+_rf_b = store.fail_unit(_rf_empty["id"], _rf, "returned no files", terminal=True)
+check("a unit whose output is still shipping retires as repair_failed",
+      _rf_a == "repair_failed", _rf_a)
+check("a unit that produced nothing still retires as failed", _rf_b == "failed", _rf_b)
+check("both are terminal, so neither is claimable again",
+      set(store.TERMINAL_UNIT_STATES) >= {"failed", "repair_failed"}
+      and store.claim_next_unit(_rf, "smoke", kind="component") is None)
+
+# The half that is not cosmetic.
+check("a repair_failed unit can be reopened, because a diagnostic can have come from it",
+      store.reopen_units(_rf, [_rf_shipped["id"]], "build error in Auth.cs")["reopened"] == 1)
+check("and a genuinely failed one still cannot",
+      store.reopen_units(_rf, [_rf_empty["id"]], "build error")["reopened"] == 0
+      and (store.get_unit(_rf_empty["id"]) or {})["status"] == "failed")
+
+# Put it back, and check what a human is told about each.
+store.fail_unit(_rf_shipped["id"], _rf, "rewrite withdrew Auth.Logout", terminal=True)
+_rf_report = reconcile.run(_rf)
+_rf_kinds = {i["kind"]: i for i in _rf_report["issues"]}
+check("reconciliation reports the failed component as a fatal missing-output finding",
+      _rf_kinds.get("component_failed", {}).get("severity") == "fail"
+      and "c.php" in _rf_kinds.get("component_failed", {}).get("detail", ""))
+check("and the repair_failed one as a warning, not as missing output",
+      _rf_kinds.get("component_repair_failed", {}).get("severity") == "warn",
+      str(sorted(_rf_kinds)))
+check("naming its files without claiming they produced nothing",
+      "a.php" in _rf_kinds.get("component_repair_failed", {}).get("detail", "")
+      and "a.php" not in _rf_kinds.get("component_failed", {}).get("detail", ""))
+check("the status tally counts them apart",
+      store.unit_status_counts(_rf, kind="component")["failed"] == 1
+      and store.unit_status_counts(_rf, kind="component")["repair_failed"] == 1)
+
+# Runs converted before this state existed stored *both* kinds of failure as `failed`, and the
+# fact underneath — current artifacts — is identical in an old row and a new one. So the two
+# places that decide whether an export is partial ask the artifacts, not the status word;
+# otherwise the fix would only ever reach runs converted after it shipped, and run 8a9612e0,
+# the one that produced it, would still be reported as having lost three files.
+store.set_unit_status(_rf_shipped["id"], "failed", "recorded before repair_failed existed")
+check("a component labelled failed by an older run is not counted as missing output",
+      [c["component_name"] for c in runner._components_without_output(_rf)] == ["empty"],
+      str([c["component_name"] for c in runner._components_without_output(_rf)]))
+_rf_old = {i["kind"] for i in reconcile.run(_rf)["issues"]}
+check("and it is still reported, as the warning rather than the fatal finding",
+      "component_repair_failed" in _rf_old,
+      str(sorted(_rf_old)))
+check("while the one that really produced nothing keeps its fatal finding",
+      "component_failed" in _rf_old)
+store.set_unit_status(_rf_shipped["id"], "repair_failed", "back to the current state")
+
+
+# ── A gate that evidence has answered comes back down ──────────────────────
+#
+# Every gate in this subsystem ratcheted one way. `build_results.gate` raises "this export has
+# never been compiled", somebody compiles it clean, and the clean branch returns without ever
+# looking at the question it asked last time. `_finalize` will not complete a run while a
+# blocking checkpoint is open, so run 8a9612e0 compiled with 0 errors at 14:55:37 and stayed
+# parked on a checkpoint raised at 14:55:11 saying it had never been compiled — and php-crud-v2
+# sat on `build_required` *and* `runtime_required` after a clean build and a passed startup.
+# Neither run could ever report success. `_withdraw_end_of_run_gates` was the opposite
+# direction, and only that half existed.
+section("Gates come back down when the evidence arrives")
+
+_gw = store.create_run("gate-withdrawal", ".NET 8", "files", created_by="smoke")
+store.insert_units(_gw, [
+    {"path": "#component/one", "kind": "component", "component_name": "one",
+     "status": "ready", "target_project": "W", "output_dir": "W"}])
+_gw_unit = store.list_units(_gw, kind="component")[0]
+store.complete_unit(_gw_unit["id"], _gw,
+                    [{"path": "W/A.cs", "content": "public class A { }"}], [],
+                    event_detail="ok")
+
+build_results.gate(_gw)
+check("an export nobody has compiled raises the build gate",
+      any(c["kind"] == "build_required" and c["status"] == "open"
+          for c in store.list_checkpoints(_gw)))
+
+# Reported through the real entry point, so the test cannot pass against a producer that
+# writes nothing — the mistake D-202 records.
+build_results.ingest(_gw, {"source": "local_dotnet", "diagnostics": []}, "smoke")
+check("the build report itself takes it back down, without waiting for the next gate",
+      not any(c["kind"] == "build_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)),
+      "the gate that blocks the resume is only cleared by code the resume cannot reach")
+build_results.gate(_gw)
+check("a clean build takes it back down",
+      not any(c["kind"] == "build_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)),
+      str([(c["kind"], c["status"]) for c in store.list_checkpoints(_gw)]))
+check("withdrawn, not answered by a person — the history must not claim a decision nobody made",
+      any(c["kind"] == "build_required"
+          and (c.get("answer") or {}).get("decision") == "withdrawn"
+          and c.get("answered_by") == "system"
+          for c in store.list_checkpoints(_gw)))
+
+# The guard that keeps this from being the evidence loss the gates exist to prevent.
+store.create_checkpoint(_gw, "build_errors_outstanding", "a later round failed",
+                        blocking=True, payload={"round": 99})
+build_results.gate(_gw)
+check("a gate raised about a later round than the one that passed is left alone",
+      any(c["kind"] == "build_errors_outstanding" and c["status"] == "open"
+          for c in store.list_checkpoints(_gw)))
+
+runtime.gate(_gw)
+check("an export nobody has started raises the runtime gate",
+      any(c["kind"] == "runtime_required" and c["status"] == "open"
+          for c in store.list_checkpoints(_gw)))
+runtime.ingest(_gw, {"started": True, "base_url": "http://127.0.0.1:1",
+                     "checks": [{"method": "GET", "path": "/", "status": 200}]}, "smoke")
+check("and a passed startup report clears its own gate the same way",
+      not any(c["kind"] == "runtime_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)))
+runtime.gate(_gw)
+check("a passed startup takes that one down too",
+      not any(c["kind"] == "runtime_required" and c["status"] == "open"
+              for c in store.list_checkpoints(_gw)),
+      str([(c["kind"], c["status"]) for c in store.list_checkpoints(_gw)]))
+
+
+# ── The same rejection twice is not worth a third attempt ──────────────────
+#
+# The retry limit counted attempts and never compared *why* they failed, so three identical
+# refusals looked no different from three different ones. The auth component was rewritten
+# three times and rejected each time with the same sentence, two and a half minutes and a
+# conversion call apiece, over an objection no rewrite could have satisfied.
+section("An identical rejection stops the loop")
+
+_rr = store.create_run("repeat-rejection", ".NET 8", "files", created_by="smoke")
+store.insert_units(_rr, [
+    {"path": "#component/x", "kind": "component", "component_name": "x", "status": "ready"},
+    {"path": "#component/y", "kind": "component", "component_name": "y", "status": "ready"},
+    {"path": "#component/z", "kind": "component", "component_name": "z", "status": "ready"},
+])
+_rr_x, _rr_y, _rr_z = sorted(store.list_units(_rr, kind="component"),
+                             key=lambda u: u["component_name"])
+
+_same = "`AuthController.Logout` is no longer declared, and _Layout.cshtml still calls it."
+check("the first rejection is retryable",
+      store.fail_unit(_rr_x["id"], _rr, _same, max_attempts=3, stop_if_repeated=True) == "ready")
+check("the same rejection a second time is terminal, without spending the third attempt",
+      store.fail_unit(_rr_x["id"], _rr, _same, max_attempts=3, stop_if_repeated=True) == "failed",
+      str((store.get_unit(_rr_x["id"]) or {}).get("attempts")))
+check("and the record says it stopped because the reason repeated",
+      ((store.get_unit(_rr_x["id"]) or {}).get("error") or {}).get("repeated") is True)
+
+check("a different rejection is still retryable",
+      store.fail_unit(_rr_y["id"], _rr, _same, max_attempts=3, stop_if_repeated=True) == "ready"
+      and store.fail_unit(_rr_y["id"], _rr, "something else entirely", max_attempts=3,
+                          stop_if_repeated=True) == "ready")
+check("whitespace is not a difference",
+      store.fail_unit(_rr_y["id"], _rr, "something   else\nentirely", max_attempts=3,
+                      stop_if_repeated=True) == "failed")
+
+# The safety property, and the reason this is opt-in rather than automatic: a transient
+# failure repeating identically is the strongest possible argument for trying again.
+check("a repeated *transient* failure is never cut short",
+      [store.fail_unit(_rr_z["id"], _rr, "LLMTimeout: read timed out", max_attempts=3)
+       for _ in range(2)] == ["ready", "ready"])
+
+
+# ── A package the converter asked for is checked, not guessed and not binned ─
+#
+# The conversion stage may not write project files: the first two live runs had components
+# inventing `Microsoft.AspNetCore.Authentication.Cookies` and `Microsoft.AspNetCore.Rewrite` at
+# 8.0.0, ids absorbed into the shared framework in 3.0, and `NU1102` stops the *restore* — so
+# there is no file and no line to route the failure back to, and the run reads as a conversion
+# that will not converge. That refusal stays.
+#
+# Throwing the refused file away was the mistake. Run 8a9612e0 spent three build rounds and
+# three conversion calls on `CS0103: The name 'BCrypt' does not exist` while the converter had
+# twice submitted a project file naming `BCrypt.Net-Next` 4.0.3 — real, and exactly right. The
+# authority that separates the two cases is neither this codebase nor a model: it is the
+# registry. Stubbed here, because this suite runs with no network.
+section("Package requests are verified against the registry")
+
+_versions = {"bcrypt.net-next": ["4.0.0", "4.0.3"],
+             "serilog": ["3.1.1", "4.4.0", "5.0.0-dev"],
+             "contoso.invented": []}
+_real_lookup = packages.nuget_versions
+packages.nuget_versions = lambda name, timeout=0: (
+    None if name.lower() == "unreachable.pkg" else _versions.get(name.lower(), []))
+try:
+    _csproj = ('<Project Sdk="Microsoft.NET.Sdk.Web"><ItemGroup>\n'
+               '  <PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />\n'
+               '  <PackageReference Version="8.0.0" Include="Microsoft.AspNetCore.Rewrite" />\n'
+               '  <PackageReference Include="Serilog" Version="99.99.99" />\n'
+               '  <PackageReference Include="Contoso.Invented" Version="1.0.0" />\n'
+               '  <PackageReference Include="Unreachable.Pkg" Version="1.0.0" />\n'
+               '</ItemGroup></Project>')
+    check("both attribute orders are read, and a version-less reference is not lost",
+          packages.parse_requests(_csproj)[:3] == [
+              ("BCrypt.Net-Next", "4.0.3"), ("Microsoft.AspNetCore.Rewrite", "8.0.0"),
+              ("Serilog", "99.99.99")],
+          str(packages.parse_requests(_csproj)))
+
+    _pk_rows = packages.resolve(packages.parse_requests(_csproj),
+                                known_ids=sorted(wireup.catalogue_ids()),
+                                framework_ids=sorted(wireup.FRAMEWORK_PROVIDED_PACKAGES))
+    _pk = {r["name"]: r for r in _pk_rows}
+    check("an id the shared framework provides is refused without asking the registry",
+          _pk["Microsoft.AspNetCore.Rewrite"]["verdict"] == "framework")
+    check("an id this platform's own catalogue covers is left to the catalogue",
+          _pk["BCrypt.Net-Next"]["verdict"] == "known")
+    check("an id the registry has, at a version it does not, moves to the newest stable one",
+          _pk["Serilog"]["verdict"] == "substituted" and _pk["Serilog"]["version"] == "4.4.0",
+          str(_pk["Serilog"]))
+    check("a prerelease is never what a converted application is pinned to",
+          "5.0.0-dev" not in str(_pk["Serilog"]["version"]))
+    check("an id the registry answered about and does not have needs a person",
+          _pk["Contoso.Invented"]["verdict"] == "missing")
+    check("and an id the registry could not be asked about needs one too, for a different reason",
+          _pk["Unreachable.Pkg"]["verdict"] == "unreachable")
+    check("only registry-confirmed ids are added without asking",
+          packages.approved(_pk_rows) == [("Serilog", "4.4.0")],
+          str(packages.approved(_pk_rows)))
+    check("and exactly the two unverifiable ones are put to a human",
+          sorted(r["name"] for r in packages.unresolved(_pk_rows))
+          == ["Contoso.Invented", "Unreachable.Pkg"])
+
+    # Producer side. A test that hands `resolve` its own list proves nothing about whether the
+    # refusal path ever produces one — the failure D-202 records, in the module that caused it.
+    _pq = store.create_run("package-capture", ".NET 8", "files", created_by="smoke")
+    store.insert_units(_pq, [
+        {"path": "#component/auth", "kind": "component", "component_name": "auth",
+         "status": "ready", "target_project": "W", "output_dir": "W"}])
+    _pq_unit = store.list_units(_pq, kind="component")[0]
+    _pq_rejected, _pq_asked = [], []
+    _pq_placed = runner._place_artifacts(
+        _pq, _pq_unit,
+        [{"filename": "W.csproj", "content": _csproj},
+         {"filename": "AuthService.cs", "content": "public class AuthService { }"}],
+        _pq_rejected, _pq_asked)
+    check("the project file is still refused",
+          [a["path"] for a in _pq_placed] == ["W/AuthService.cs"],
+          str([a["path"] for a in _pq_placed]))
+    check("but the package ids it named survive the refusal",
+          ("BCrypt.Net-Next", "4.0.3") in _pq_asked and len(_pq_asked) == 5,
+          str(_pq_asked))
+    check("and the reason a human reads says they were kept, not that they were derived",
+          any("being checked against nuget.org" in r for r in _pq_rejected),
+          "; ".join(_pq_rejected))
+
+    runner._resolve_packages(_pq, _pq_unit, _pq_asked)
+    check("a confirmed id is recorded against the component with no checkpoint raised for it",
+          [list(p) for p in ((store.get_unit(_pq_unit["id"]) or {}).get("meta") or {}).get(
+              "approved_packages") or []] == [["Serilog", "4.4.0"]],
+          str((store.get_unit(_pq_unit["id"]) or {}).get("meta", {}).get("approved_packages")))
+    _pq_gate = [c for c in store.list_checkpoints(_pq) if c["kind"] == "package_approval"]
+    check("the unverifiable ones raise one blocking checkpoint between them",
+          len(_pq_gate) == 1 and _pq_gate[0]["blocking"]
+          and len((_pq_gate[0].get("payload") or {}).get("candidates") or []) == 2)
+    check("and the checkpoint names what was settled without a person, so it reads as a whole",
+          "Serilog" in (_pq_gate[0].get("detail") or ""))
+
+    # What the run does with the answer, read where it is used.
+    check("before anyone answers, only the confirmed id reaches wireup",
+          runner._approved_packages(_pq, store.list_units(_pq, kind="component"))
+          == {"W": {("Serilog", "4.4.0")}})
+    store.answer_checkpoint(_pq_gate[0]["id"],
+                            {"decision": "approved", "packages": ["Contoso.Invented"]}, "smoke")
+    _pq_after = runner._approved_packages(_pq, store.list_units(_pq, kind="component"))
+    check("an approval adds the one id that was named and not the other",
+          _pq_after == {"W": {("Serilog", "4.4.0"), ("Contoso.Invented", "1.0.0")}},
+          str(_pq_after))
+
+    _pq_plan = wireup.plan(
+        [{"path": "W/AuthService.cs", "content": "public class AuthService { }"}],
+        {}, {"Acme.W": "W"}, "W", extra_packages=_pq_after)
+    check("and wireup puts it in that project's package list",
+          ("Contoso.Invented", "1.0.0") in (_pq_plan["packages"].get("W") or []),
+          str(_pq_plan["packages"]))
+
+    # The safe direction, and the one that must never be reached by accident.
+    _pq2 = store.create_run("package-declined", ".NET 8", "files", created_by="smoke")
+    store.insert_units(_pq2, [
+        {"path": "#component/auth", "kind": "component", "component_name": "auth",
+         "status": "ready", "target_project": "W", "output_dir": "W"}])
+    _pq2_unit = store.list_units(_pq2, kind="component")[0]
+    runner._resolve_packages(_pq2, _pq2_unit, [("Contoso.Invented", "1.0.0")])
+    _pq2_gate = [c for c in store.list_checkpoints(_pq2) if c["kind"] == "package_approval"][0]
+    store.answer_checkpoint(_pq2_gate["id"], {"decision": "Reviewed and approved"}, "smoke")
+    check("the free text a person types on the generic button never adds a dependency",
+          runner._approved_packages(_pq2, store.list_units(_pq2, kind="component")) == {},
+          "an unverified package id was added by a decision that did not approve it")
+finally:
+    packages.nuget_versions = _real_lookup
+
+check("the registry lookup is restored for anything after this section",
+      packages.nuget_versions is _real_lookup)
 
 
 # ── Summary ────────────────────────────────────────────────────────────────

@@ -2,6 +2,37 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## How to explain your work
+
+Every answer, every proposal and every finding needs four things. Not as headings to fill in —
+as things the reader must not have to ask for.
+
+**1. Plain language first.** Lead with what happened and what it means for the user, in words
+that assume no knowledge of this codebase, of .NET, of PHP, or of the platform's own
+vocabulary. "The converted app compiles but crashes the moment you start it" before
+`AmbiguousMatchException`. Domain terms are fine *after* the plain sentence, never instead of
+it. If a term is unavoidable, define it once in passing.
+
+**2. The reasoning, not just the conclusion.** Say why this and not the alternative you
+considered. A recommendation with no visible reasoning cannot be disagreed with, which makes
+the user a rubber stamp rather than a decision maker — and they are the one who knows things
+you do not.
+
+**3. What could go wrong.** State the weaknesses of your own suggestion: what it does not
+cover, what it assumes, what evidence it rests on and how thin that evidence is (`n=1` is worth
+saying out loud). If you are choosing where to intervene in a chain of causes, say why that
+point and not one further upstream. A proposal presented without its downsides is a sales
+pitch.
+
+**4. How you intend to build it, briefly.** A few sentences of mechanism — which files, what
+shape, what the new thing does when it fails — before writing code. Enough that the user can
+stop you if the approach is wrong, and not so much that it is the code written twice.
+
+The same applies to explaining *findings*, not only proposals: lead with the consequence, then
+cite `file.py:line`. And never use the platform's own conventions as though they were common
+knowledge — a checkpoint, a gate, a unit, a seam and a component all mean something specific
+here and nothing anywhere else.
+
 ## Read `DECISIONS.md` first
 
 `DECISIONS.md` (repo root) is the durable memory across sessions: architectural decisions and
@@ -31,17 +62,24 @@ python run.py
 
 ## Tests: smoke scripts, no framework
 
-There is no test framework, linter/formatter config, or CI pipeline. Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework.
+There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These seven scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
 
 ```
 python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
 python scripts/smoke_code_review.py     # chunking, gate floor, evidence verification, waivers
-python scripts/smoke_modernization.py   # run lifecycle, dependency order, crash/resume
+python scripts/smoke_modernization.py   # run lifecycle, dependency order, crash/resume (much the longest)
 python scripts/smoke_governance.py      # Core SDLC Review stages, reports, gate fan-in, swarm
+python scripts/smoke_llm_providers.py   # admin LLM connections: key never returned, resolution order
 node   scripts/smoke_render.js          # frontend result rendering (DOM-stubbed, no deps)
+node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans screen product picker
 ```
 
-The Python ones drive the real app through FastAPI's `TestClient` against a throwaway SQLite file with `llm_gateway.call_tool` stubbed, so they need no server, no API key and no network — they exercise routing, auth, entitlement, quota and persistence, but never the model itself.
+The Python ones drive the real app through FastAPI's `TestClient` against a throwaway SQLite file with `llm_gateway.call_tool` stubbed, so they need no server, no API key and no network — they exercise routing, auth, entitlement, quota and persistence, but never the model itself. Two exceptions worth knowing before you run them:
+
+- `smoke_llm_providers.py` stubs the *provider* functions (`_call_anthropic` / `_call_openai`) rather than `call_tool`, because the resolution logic under test lives inside `call_tool` — stubbing that would stub out the thing being tested.
+- `smoke_plan_picker.js` takes a `products.json` argument (a saved `GET /api/v1/products` response) and **there is no such file in the repo**, so it dies with `ENOENT` until you capture one from a running server. `smoke_render.js` needs no argument — it defaults to `frontend/app.js`.
+
+Everything else under `scripts/` is tooling, not tests; don't run it expecting a free offline check. `eval_code_review.py` measures the agent against a labelled corpus and **spends real money**. `build_run.py` compiles a converted codebase with the local .NET SDK and posts the verdict back — the app itself prints that command into modernization checkpoints and the UI (`build_results.py`, `runtime.py`, `frontend/app.js`), so it has to keep working. `drive_modernization.py` walks a run through the live HTTP API as the browser does; `audit_source_analysis.py` reports what the deterministic layer concludes about a zip before any spend.
 
 ## Architecture
 

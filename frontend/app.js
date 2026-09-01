@@ -2287,6 +2287,16 @@ function showError(targetId, message) {
   `;
 }
 
+// A value going into a single-quoted JS string inside a double-quoted HTML attribute has to
+// survive two parsers, and `esc` handles one: it escapes `"` and deliberately leaves `'` alone,
+// which is the character that ends the JS string. Fine for the UUIDs every existing onclick
+// passes; not fine for a repair id, which is built out of project names the architect chose —
+// model-controlled text on its way into an event handler.
+function jsArg(value) {
+  return esc(String(value === null || value === undefined ? '' : value)
+    .replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
+}
+
 function esc(str) {
   if (!str) return '';
   return String(str)
@@ -2294,6 +2304,170 @@ function esc(str) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+// ── Markdown ───────────────────────────────────────────────────────────────
+//
+// Every prose field on this site is written by a model, and models write markdown. Until now
+// nothing here rendered it, so a report arrived on screen as `## Heading`, `**bold**` and rows
+// of pipes — the formatting was in the response and only ever visible as punctuation.
+//
+// **Escape first, transform second.** This is the whole safety argument and it must not be
+// reversed: `esc()` neutralises every `<`, `>`, `&` and `"` in the model's text, and only then
+// does this function insert tags, all of which it wrote itself. A response containing
+// `<script>` or `onerror=` therefore renders as visible characters rather than executing. The
+// one attribute built from model text is a link's `href`, and it is only emitted when the URL
+// matches `MD_SAFE_HREF` — so `[click](javascript:…)` renders as plain text, not a live link.
+//
+// Hand-rolled because this repo has no build step, no CDN and no npm dependencies (see
+// CLAUDE.md and the header of scripts/smoke_render.js). It is a deliberately small subset:
+// what an agent actually emits, and nothing else.
+const MD_SAFE_HREF = /^(https?:\/\/|\/|#)/i;
+
+// Inline runs on an ALREADY-ESCAPED string. Order matters: code spans are lifted out first and
+// put back last, so `**` inside a code span is never treated as emphasis.
+//
+// The parking slot is `<c0>`, `<c1>`, … — safe by construction rather than by luck: `esc()` has
+// already turned every `<` the model wrote into `&lt;`, so no `<` survives in the input and a
+// placeholder cannot collide with the text it is hiding among. (A control character would work
+// too, and was tried; a raw control byte in source is invisible to every reader and to grep.)
+function mdInline(escaped) {
+  const codes = [];
+  let out = String(escaped === null || escaped === undefined ? '' : escaped)
+    .replace(/`([^`]+)`/g, (_m, code) => `<c${codes.push(code) - 1}>`);
+  out = out
+    // Links: the text is already escaped, and the href is only emitted if it looks like a URL
+    // we are willing to navigate to. Anything else stays as the literal text the model wrote.
+    .replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (m, text, href) =>
+      (MD_SAFE_HREF.test(href)
+        ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${text || href}</a>`
+        : m))
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    // A single `*`/`_` needs a non-space neighbour, or `$5.00 * 3` and `snake_case_name` get
+    // eaten — which is the failure mode that keeps this off machine-composed strings.
+    .replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?![*\w])/g, '$1<em>$2</em>')
+    .replace(/(^|[^_\w])_([^_\s][^_]*?)_(?![_\w])/g, '$1<em>$2</em>')
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  return out.replace(/<c(\d+)>/g, (_m, i) => `<code>${codes[Number(i)]}</code>`);
+}
+
+function mdTableRow(escapedLine) {
+  // A pipe table's leading and trailing pipes are optional, so trim them before splitting or
+  // every row gains an empty first and last cell.
+  return escapedLine.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+}
+
+function mdIsDivider(line) {
+  return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(line);
+}
+
+function mdToHtml(text) {
+  if (text === null || text === undefined || text === '') return '';
+  const lines = esc(String(text)).replace(/\r\n?/g, '\n').split('\n');
+  const html = [];
+  let i = 0;
+  let para = [];
+
+  const flushPara = () => {
+    if (!para.length) return;
+    html.push(`<p>${mdInline(para.join(' '))}</p>`);
+    para = [];
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // Fenced code — taken verbatim, no inline pass. The fence's language is ignored rather than
+    // used for highlighting: there is no highlighter here, and claiming one would be a lie.
+    if (/^\s*```+\s*\S*\s*$/.test(line)) {
+      flushPara();
+      const body = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```+\s*$/.test(lines[i])) { body.push(lines[i]); i += 1; }
+      i += 1;                                     // consume the closing fence, if there is one
+      html.push(`<pre class="md-code"><code>${body.join('\n')}</code></pre>`);
+      continue;
+    }
+
+    if (!line.trim()) { flushPara(); i += 1; continue; }
+
+    if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)) {
+      flushPara(); html.push('<hr />'); i += 1; continue;
+    }
+
+    const heading = line.match(/^\s*(#{1,6})\s+(.*)$/);
+    if (heading) {
+      flushPara();
+      // Shifted down one level: a panel's own section titles are h2/h3, so a model's `#` must
+      // not outrank the heading of the box it is being rendered inside.
+      const level = Math.min(6, heading[1].length + 1);
+      html.push(`<h${level}>${mdInline(heading[2].trim())}</h${level}>`);
+      i += 1;
+      continue;
+    }
+
+    // Pipe table — only when the line after the header is a divider. Without that check any
+    // sentence containing a pipe becomes a one-row table.
+    if (line.indexOf('|') !== -1 && i + 1 < lines.length && mdIsDivider(lines[i + 1])) {
+      flushPara();
+      const head = mdTableRow(line);
+      i += 2;
+      const body = [];
+      while (i < lines.length && lines[i].indexOf('|') !== -1 && lines[i].trim()) {
+        body.push(mdTableRow(lines[i])); i += 1;
+      }
+      html.push('<div class="md-table-wrap"><table class="md-table">'
+        + `<thead><tr>${head.map(c => `<th>${mdInline(c)}</th>`).join('')}</tr></thead>`
+        + `<tbody>${body.map(r =>
+            `<tr>${r.map(c => `<td>${mdInline(c)}</td>`).join('')}</tr>`).join('')}</tbody>`
+        + '</table></div>');
+      continue;
+    }
+
+    if (/^\s*&gt;\s?/.test(line)) {               // `>` survived esc() as `&gt;`
+      flushPara();
+      const body = [];
+      while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) {
+        body.push(lines[i].replace(/^\s*&gt;\s?/, '')); i += 1;
+      }
+      html.push(`<blockquote>${mdInline(body.join(' '))}</blockquote>`);
+      continue;
+    }
+
+    const isBullet = /^\s*[-*+]\s+/.test(line);
+    const isOrdered = /^\s*\d+[.)]\s+/.test(line);
+    if (isBullet || isOrdered) {
+      flushPara();
+      const tag = isBullet ? 'ul' : 'ol';
+      const pattern = isBullet ? /^\s*[-*+]\s+(.*)$/ : /^\s*\d+[.)]\s+(.*)$/;
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(pattern);
+        if (m) { items.push(m[1]); i += 1; continue; }
+        // A wrapped continuation line belongs to the item above it, not to a new paragraph.
+        if (items.length && /^\s{2,}\S/.test(lines[i])) {
+          items[items.length - 1] += ' ' + lines[i].trim(); i += 1; continue;
+        }
+        break;
+      }
+      html.push(`<${tag} class="md-list">`
+        + items.map(x => `<li>${mdInline(x)}</li>`).join('') + `</${tag}>`);
+      continue;
+    }
+
+    para.push(line.trim());
+    i += 1;
+  }
+  flushPara();
+  return html.join('\n');
+}
+
+// The wrapper every call site uses, so block spacing is defined once in styles.css rather than
+// per panel. Returns '' for empty input, so `${md(x)}` collapses instead of leaving an empty box.
+function md(text, className) {
+  const body = mdToHtml(text);
+  return body ? `<div class="md-body ${className || ''}">${body}</div>` : '';
 }
 
 async function apiFetch(url, options = {}) {
@@ -5675,11 +5849,13 @@ let _modUnitCache = {};
 let _modUnitId = null;
 let _modUnitSource = false;
 // The graph is drawn from `units`/`components`, which the poll already fetches — so it needs
-// no request of its own and survives a repaint by being part of the repaint.
-let _modShowGraph = false;
+// no request of its own and survives a repaint by being part of the repaint. Its visibility is
+// now the Architecture tab's accordion; only the files-vs-components choice is state.
 let _modGraphMode = 'files';
 let _modLastUnits = [];
 let _modLastComponents = [];
+// The poll's checkpoint list, kept so a tab repaint has the same context the full render had.
+let _modLastCheckpoints = [];
 
 // `store.get_run` decodes charter/stats/redactions/error but **not** `plan_json` /
 // `estimate_json`, so `run.plan` and `run.estimate` are never populated and
@@ -5695,19 +5871,42 @@ function _modJson(value) {
 function _modRunPlan(run) { return _modJson(run && (run.plan || run.plan_json)); }
 function _modRunEstimate(run) { return _modJson(run && (run.estimate || run.estimate_json)); }
 
+// Ten at a time, with a range readout. The old list asked for every run the server would give
+// it (a default of 50) and rendered them all at full height above the detail panel, so clicking
+// a run scrolled its own answer off screen — which is why `openModernizationRun` still carries a
+// `scrollIntoView` call. Paged and capped, that call is a convenience rather than a repair.
+const MOD_RUNS_PAGE_SIZE = 10;
+let _modRunsOffset = 0;
+
 async function loadModernizationRuns() {
   const box = document.getElementById('mod-runs');
+  const pager = document.getElementById('mod-runs-pager');
   if (!box) return;
   try {
-    const data = await apiFetch('/api/v1/modernization/runs');
-    if (!data.runs.length) {
+    const data = await apiFetch(
+      `/api/v1/modernization/runs?limit=${MOD_RUNS_PAGE_SIZE}&offset=${_modRunsOffset}`);
+    const runs = data.runs || [];
+    // `total` is what makes the pager honest; a server that predates it leaves us describing
+    // only the page we can see, which is still better than claiming a total we do not have.
+    const total = typeof data.total === 'number' ? data.total : runs.length;
+
+    if (!runs.length) {
+      // An empty page past the first means runs were deleted, or the project selector moved,
+      // under us. Fall back to the newest page rather than showing an empty list that looks
+      // like "you have no runs". Same reasoning as `loadRecentReviews`.
+      if (_modRunsOffset > 0) {
+        _modRunsOffset = 0;
+        return loadModernizationRuns();
+      }
       box.innerHTML = '<div class="empty-state">No runs yet. Upload a zip above to build an inventory — nothing is billed until you approve a plan.</div>';
+      if (pager) pager.classList.add('hidden');
       return;
     }
+
     // `selected` matters more than it looks: the detail panel is a single element below this
     // list, so clicking a second run swaps its contents in place. With two runs at the same
     // status the swap is invisible, and clicking reads as a dead control.
-    box.innerHTML = data.runs.map(r => `
+    box.innerHTML = runs.map(r => `
       <div class="mod-run-card ${r.id === _modRunId ? 'selected' : ''}" onclick="openModernizationRun('${esc(r.id)}')">
         <div class="mod-run-head">
           <span class="mod-run-name">${esc(r.name || 'Untitled run')}</span>
@@ -5717,9 +5916,30 @@ async function loadModernizationRuns() {
         <div class="mod-meta">${esc(r.source_kind || '')} · created ${esc((r.created_at || '').slice(0, 16).replace('T', ' '))}
           ${r.spent_usd ? ' · $' + Number(r.spent_usd).toFixed(2) + ' spent' : ''}</div>
       </div>`).join('');
+    box.scrollTop = 0;
+
+    if (pager) {
+      const first = _modRunsOffset + 1;
+      const last = _modRunsOffset + runs.length;
+      const range = document.getElementById('mod-runs-range');
+      const prev = document.getElementById('mod-runs-prev');
+      const next = document.getElementById('mod-runs-next');
+      if (range) range.textContent = `Showing ${first}–${last} of ${total}`;
+      if (prev) prev.disabled = _modRunsOffset === 0;
+      if (next) next.disabled = last >= total;
+      pager.classList.toggle('hidden', total <= MOD_RUNS_PAGE_SIZE);
+    }
   } catch (e) {
     box.innerHTML = `<div class="empty-state">Could not load runs: ${esc(e.message)}</div>`;
+    if (pager) pager.classList.add('hidden');
   }
+}
+
+function pageModernizationRuns(direction) {
+  const next = _modRunsOffset + direction * MOD_RUNS_PAGE_SIZE;
+  if (next < 0) return;
+  _modRunsOffset = next;
+  loadModernizationRuns();
 }
 
 async function createModernizationRun() {
@@ -5759,14 +5979,26 @@ async function openModernizationRun(runId) {
     // evidence, symbols and converted files under this run's heading — the kind of wrong that
     // reads as correct.
     _modPanelCache = {};
+    _modPanelInflight = new Set();
     _modUnitCache = {};
     _modOpenPanels = new Set();
     _modUnitId = null;
     _modUnitSource = false;
-    _modShowGraph = false;
     _modGraphMode = 'files';
     _modLastUnits = [];
     _modLastComponents = [];
+    _modLastCheckpoints = [];
+    // Which section was open, and which accordions inside it, are answers about one run's
+    // shape. Carrying them over would land the reader on a tab that is empty for this run.
+    _modTab = 'overview';
+    _modAccordions = new Set();
+    _modAccSeen = new Set();
+    _modBodyFingerprint = null;
+    _modFilesKind = 'source_file';
+    _modFilesUnits = null;
+    _modRulesStatus = 'confirmed';
+    _modArtifactQuery = '';
+    _modBuildDiags = {};
   }
   await refreshModernizationRun();
   if (switching) {
@@ -5812,16 +6044,35 @@ async function refreshModernizationRun() {
       components = (await apiFetch(`${base}/components`, { _silent: true })).components || [];
     } catch (e) { /* not designed yet */ }
     box.classList.remove('hidden');
-    // Kept so the graph and the panel toggles can repaint themselves without a second fetch —
+    // Kept so the graph and the tab bodies can repaint themselves without a second fetch —
     // everything they draw is already in this response.
     _modLastUnits = units.units || [];
     _modLastComponents = components;
+    _modLastCheckpoints = checkpoints.checkpoints || [];
     _modLastRun = run;
-    box.innerHTML = renderModernizationRun(run, checkpoints.checkpoints || [],
-                                           _modLastUnits, components);
-    // The repaint above destroyed every on-demand panel. Restore them from the cache rather
-    // than re-requesting: the poll must stay four queries a tick however many panels are open.
-    _modRestorePanels(checkpoints.checkpoints || []);
+
+    // The poll's repaint discipline, and the reason for it: this used to rewrite the whole
+    // panel every four seconds, which meant an expanded converted file re-collapsed every four
+    // seconds and reading the output while the run worked was effectively impossible.
+    //
+    // The header carries everything that moves — status, stage, progress, spend — so it is
+    // rewritten every tick. The body is rewritten only when the run's own numbers change, and
+    // whatever the reader had open is restored by key afterwards either way.
+    const fingerprint = _modFingerprint(run, _modLastCheckpoints);
+    const head = document.getElementById('mod-head');
+    const body = document.getElementById('mod-tabbody');
+    if (!head || !body || fingerprint !== _modBodyFingerprint) {
+      _modBodyFingerprint = fingerprint;
+      box.innerHTML = renderModernizationRun(run, _modLastCheckpoints, _modLastUnits, components);
+    } else {
+      head.outerHTML = renderModernizationHead(run);
+    }
+    // The repaint above destroyed every on-demand panel in the active tab. Restore them from
+    // the cache rather than re-requesting: the poll must stay four queries a tick however many
+    // panels are open.
+    _modRestorePanels(_modLastCheckpoints);
+    _modApplyAccordions();
+    _modOpenTabPanels(_modTab);
     return run;
   } catch (e) {
     box.classList.remove('hidden');
@@ -5830,19 +6081,173 @@ async function refreshModernizationRun() {
   }
 }
 
+// ── Tabs, accordions, and what the poll is allowed to repaint ──────────────
+//
+// The detail panel used to be twelve stacked containers with nothing naming them, and three of
+// the buttons that filled them sat in the action row beside Cancel while painting thousands of
+// pixels below the fold — so clicking them read as a dead control. One tab is on screen at a
+// time now, and its label is the answer to "what am I looking at".
+//
+// The second problem was subtler and worse. `refreshModernizationRun` repaints this panel every
+// four seconds, which is why on-demand panels needed a cache and a restore pass at all — and it
+// also meant that **during an active run, an expanded converted file re-collapsed every four
+// seconds**. Reading the output while the run worked was effectively impossible. Two rules fix
+// it: the header repaints on every tick (that is what a poll is for), and the body repaints only
+// when a fingerprint of the run's actual numbers changes. Open accordions are remembered by key
+// across whatever repaints do happen.
+let _modTab = 'overview';
+// Set of `data-acc` keys the reader has open, plus the keys we have already decided a default
+// for — without the second set a section that defaults to open would spring back open every
+// time it is rendered, which is the same bug from the other direction.
+let _modAccordions = new Set();
+let _modAccSeen = new Set();
+let _modBodyFingerprint = null;
+
+function _modRememberAccordion(el) {
+  const key = el && el.dataset && el.dataset.acc;
+  if (!key) return;
+  if (el.open) _modAccordions.add(key); else _modAccordions.delete(key);
+}
+
+// Emitted into every `<details>` this product renders. `defaultOpen` applies once per key, the
+// first time that key is seen — after that the reader's own choice wins.
+function _modAcc(key, defaultOpen) {
+  if (!_modAccSeen.has(key)) {
+    _modAccSeen.add(key);
+    if (defaultOpen) _modAccordions.add(key);
+  }
+  return `data-acc="${esc(key)}" ontoggle="_modRememberAccordion(this)"`
+    + (_modAccordions.has(key) ? ' open' : '');
+}
+
+// Re-applied after a repaint, because `innerHTML =` builds fresh elements whose `open`
+// attribute came from `_modAcc` at string-build time — correct for a first render, and one tick
+// stale for anything the reader toggled since.
+function _modApplyAccordions() {
+  const scope = document.getElementById('mod-detail');
+  if (!scope || !scope.querySelectorAll) return;
+  Array.prototype.forEach.call(scope.querySelectorAll('details[data-acc]'), el => {
+    const want = _modAccordions.has(el.dataset.acc);
+    if (el.open !== want) el.open = want;
+  });
+}
+
+// Only the numbers the *body* draws. Deliberately excludes `spent_usd`, which moves on every
+// model call and appears only in the header: including it would repaint the body every few
+// seconds and put the collapsing accordions straight back.
+function _modFingerprint(run, checkpoints) {
+  const u = (run && run.units) || {};
+  const c = (run && run.components) || {};
+  return [
+    run && run.status, u.total, u.converted, u.failed, u.skipped, u.ready,
+    c.total, c.converted, c.blocked,
+    run && run.build_round, run && run.rules_confirmed, run && run.redaction_count,
+    (checkpoints || []).length,
+    ((run && run.stage) || {}).index,
+    ((run && run.parity) || {}).report_id, ((run && run.parity) || {}).round,
+    ((run && run.runtime) || {}).report_id,
+  ].join('|');
+}
+
+// ── The seven sections ─────────────────────────────────────────────────────
+//
+// A table, not a switch, so moving a section between tabs is a one-line change. `count` is
+// rendered beside the label — a tab that says how much is behind it is a tab a reader can
+// decide about before clicking. `load` names the panels to fetch when the tab first opens;
+// anything expensive to compute is left off it and put behind a button inside the tab instead.
+const MOD_TABS = [
+  { id: 'overview', label: 'Overview', render: renderModOverviewTab },
+  { id: 'architecture', label: 'Architecture', load: ['plan'],
+    count: ctx => (ctx.components || []).length, render: renderModArchitectureTab },
+  { id: 'files', label: 'Files',
+    count: ctx => (ctx.units || []).length, render: renderModFilesTab },
+  { id: 'code', label: 'Converted code', load: ['artifacts'],
+    count: ctx => (((ctx.run || {}).units || {}).converted || 0)
+                  + (((ctx.run || {}).components || {}).converted || 0),
+    render: renderModCodeTab },
+  { id: 'checks', label: 'Checks', load: ['builds', 'runtime', 'parity'],
+    render: renderModChecksTab },
+  { id: 'evidence', label: 'Evidence', load: ['evidence', 'symbols', 'redactions', 'rules'],
+    render: renderModEvidenceTab },
+  { id: 'history', label: 'History', load: ['decisions', 'events'], render: renderModHistoryTab },
+];
+
+// Always returns a spec, so no render path can explode on a stale id. That also makes it
+// useless as an existence check — `_modIsTab` is what a setter must ask.
+function _modTabSpec(id) {
+  return MOD_TABS.filter(t => t.id === id)[0] || MOD_TABS[0];
+}
+
+function _modIsTab(id) {
+  return MOD_TABS.some(t => t.id === id);
+}
+
+function setModernizationTab(id) {
+  if (!_modIsTab(id) || _modTab === id) return;
+  _modTab = id;
+  _modPaintTabBody();
+}
+
+// Repaints the body and the bar together: the bar carries the selected state, so painting one
+// without the other leaves the highlight on the tab the reader just left.
+function _modPaintTabBody() {
+  const ctx = _modTabContext();
+  if (!ctx) return;
+  const bar = document.getElementById('mod-tabbar');
+  const body = document.getElementById('mod-tabbody');
+  if (bar) bar.innerHTML = renderModernizationTabBar(ctx);
+  if (body) body.innerHTML = _modTabSpec(_modTab).render(ctx);
+  _modApplyAccordions();
+  _modOpenTabPanels(_modTab);
+}
+
+function _modTabContext() {
+  if (!_modLastRun) return null;
+  return { run: _modLastRun, units: _modLastUnits, components: _modLastComponents,
+           checkpoints: _modLastCheckpoints };
+}
+
+function renderModernizationTabBar(ctx) {
+  return MOD_TABS.map(t => {
+    const n = t.count ? t.count(ctx) : null;
+    return `<button type="button" class="mod-tab ${t.id === _modTab ? 'selected' : ''}"
+      onclick="setModernizationTab('${t.id}')">${esc(t.label)}${
+      n ? ` <span class="mod-tab-count">${n}</span>` : ''}</button>`;
+  }).join('');
+}
+
 function renderModernizationRun(run, checkpoints, units, components) {
+  const ctx = { run, units: units || [], components: components || [],
+                checkpoints: checkpoints || [] };
+  const needsCharter = run.status === 'awaiting_charter';
+  return `
+    ${renderModernizationHead(run)}
+    ${needsCharter ? renderCharterForm(run) : ''}
+    ${(checkpoints || []).length ? renderModernizationCheckpoints(checkpoints) : ''}
+    <div class="mod-tabs" id="mod-tabbar">${renderModernizationTabBar(ctx)}</div>
+    <div id="mod-tabbody">${_modTabSpec(_modTab).render(ctx)}</div>
+  `;
+}
+
+// Everything the poll owns, and nothing else. Kept in one function so the 4s tick can repaint
+// it alone — see the fingerprint argument above.
+//
+// The charter form and any open checkpoint are rendered *above* the tab bar by the caller
+// rather than inside a tab, and that is deliberate: both are the only way the run moves
+// forward, and a blocking decision filed behind a tab is a run that looks stalled for no
+// visible reason.
+function renderModernizationHead(run) {
   const u = run.units || {};
   const c = run.components || {};
-  const blocking = checkpoints.filter(x => x.blocking);
-  const needsCharter = run.status === 'awaiting_charter';
-  const canStart = run.status === 'awaiting_approval' && blocking.length === 0;
+  const blocking = run.blocking_checkpoints || 0;
+  const canStart = run.status === 'awaiting_approval' && blocking === 0;
   const canResume = run.status === 'paused';
   const working = ['converting', 'comprehending', 'analyzing', 'reconciling'].includes(run.status);
   const terminal = ['completed', 'cancelled', 'failed'].includes(run.status);
   const est = _modRunEstimate(run) || {};
 
   return `
-    <div class="mod-panel">
+    <div class="mod-panel" id="mod-head">
       <div class="mod-run-head">
         <h2 style="margin:0">${esc(run.name || 'Run')}</h2>
         <span class="mod-status ${esc(run.status)}">${esc(run.status)}</span>
@@ -5865,59 +6270,32 @@ function renderModernizationRun(run, checkpoints, units, components) {
         ${canResume ? '<button class="btn btn-primary" onclick="resumeModernizationRun()">Resume</button>' : ''}
         ${working ? '<button class="btn btn-secondary" onclick="pauseModernizationRun()">Pause</button>' : ''}
         ${u.converted ? '<button class="btn btn-secondary" onclick="exportModernizationRun()">Download converted code</button>' : ''}
-        ${(c.converted || terminal) ? '<button class="btn btn-secondary" onclick="showModernizationReconciliation()">Consistency report</button>' : ''}
-        ${run.build_round ? '<button class="btn btn-secondary" onclick="showModernizationBuilds()">Build results</button>' : ''}
-        ${run.rules_confirmed ? '<button class="btn btn-secondary" onclick="showModernizationRules()">Business rules</button>' : ''}
         ${terminal ? '' : '<button class="btn btn-link" onclick="cancelModernizationRun()">Cancel run</button>'}
       </div>
-      ${renderModernizationBuildBadge(run)}
-      ${renderModernizationParityBadge(run)}
-      <div class="mod-inspect" id="mod-inspect">${renderModernizationInspect(run, units)}</div>
-    </div>
-
-    ${needsCharter ? renderCharterForm(run) : ''}
-    ${checkpoints.length ? renderModernizationCheckpoints(checkpoints) : ''}
-    <div id="mod-graph">${_modShowGraph ? renderModernizationGraph(units, components, _modGraphMode) : ''}</div>
-    <div id="mod-unit"></div>
-    <div id="mod-plan"></div>
-    <div id="mod-evidence"></div>
-    <div id="mod-redactions"></div>
-    <div id="mod-symbols"></div>
-    <div id="mod-events"></div>
-    <div id="mod-reconciliation"></div>
-    <div id="mod-builds"></div>
-    <div id="mod-rules"></div>
-    ${renderModernizationComponents(components)}
-    ${renderModernizationUnits(units)}
-  `;
+      ${renderModernizationVerdicts(run)}
+    </div>`;
 }
 
-// The read-only half of the screen, kept apart from the action row on purpose: nothing here
-// changes the run or spends anything, and mixing "look at the evidence" in beside "Cancel run"
-// made both harder to find. Returns the chips only — the container is rendered by the caller
-// so a toggle can repaint the strip in place without touching the rest of the panel.
-function renderModernizationInspect(run, units) {
-  const u = run.units || {};
-  const c = run.components || {};
-  const converted = (u.converted || 0) + (c.converted || 0);
-  const chip = (name, label, on) => `<button type="button" class="mod-choice ${on ? 'selected' : ''}"
-      onclick="toggleModernizationPanel('${name}')">${esc(label)}</button>`;
-  return `<span class="mod-inspect-label">Look inside</span>
-    ${(units || []).length ? `<button type="button" class="mod-choice ${_modShowGraph ? 'selected' : ''}"
-        onclick="toggleModernizationGraph()">Dependency graph</button>` : ''}
-    ${chip('evidence', 'Evidence', _modOpenPanels.has('evidence|mod-evidence'))}
-    ${_modRunPlan(run) ? chip('plan', 'The plan', _modOpenPanels.has('plan|mod-plan')) : ''}
-    ${run.redaction_count ? chip('redactions', `Redactions (${run.redaction_count})`,
-                                 _modOpenPanels.has('redactions|mod-redactions')) : ''}
-    ${converted ? chip('symbols', 'Symbols produced', _modOpenPanels.has('symbols|mod-symbols')) : ''}
-    ${chip('events', 'Run timeline', _modOpenPanels.has('events|mod-events'))}`;
-}
-
-// The chips read their state out of `_modOpenPanels`, so a toggle has to repaint them or the
-// button stays lit on a run whose poll has already stopped.
-function _modPaintInspect() {
-  const box = document.getElementById('mod-inspect');
-  if (box && _modLastRun) box.innerHTML = renderModernizationInspect(_modLastRun, _modLastUnits);
+// The three questions, asked in order of how much they prove, with the weakest first. Each one
+// was already answered somewhere in the run manifest and only two of them were ever rendered —
+// `run.runtime` has ridden every poll since it was written and nothing read it, so a run whose
+// application had never been started looked exactly like one that starts and serves.
+//
+// Grouped rather than left as three loose lines because the *set* is the point: "compiles" on
+// its own reads as a verdict on the conversion, and it is not one.
+function renderModernizationVerdicts(run) {
+  const rows = [
+    ['Does it compile?', renderModernizationBuildBadge(run)],
+    ['Does it start?', renderModernizationRuntimeBadge(run)],
+    ['Does it behave the same?', renderModernizationParityBadge(run)],
+  ].filter(r => r[1]);
+  if (!rows.length) return '';
+  return `<div class="mod-verdicts">
+    ${rows.map(([q, body]) => `<div class="mod-verdict">
+      <span class="mod-verdict-q">${esc(q)}</span>
+      <span class="mod-verdict-a">${body}</span>
+    </div>`).join('')}
+  </div>`;
 }
 
 function renderModernizationBuildBadge(run) {
@@ -5979,6 +6357,40 @@ function renderModernizationParityBadge(run) {
        </div>`
     : '';
   return `<div class="mod-meta" style="margin-top:4px">Behaviour: ${esc(label)}</div>${needs}`;
+}
+
+// The third verdict, and the one that had no renderer at all. `run.runtime` has ridden every
+// poll since runtime.py was written; nothing read it, so a run whose application nobody had ever
+// started rendered identically to one that starts and serves every URL. `never_run` is a state
+// this has to be able to say out loud — absence of evidence read as absence of problems is the
+// exact failure the whole checks layer exists to close.
+function renderModernizationRuntimeBadge(run) {
+  const r = run.runtime || {};
+  const converted = (run.units || {}).converted || 0;
+  if (!converted) return '';
+  const help = '<span class="mod-drill" onclick="showModernizationRuntimeHelp()">How to check it starts</span>';
+  const seeWhich = `<span class="mod-drill" onclick="setModernizationTab('checks')">See which URLs</span>`;
+  if (!r.status || r.status === 'never_run') {
+    return `<span class="mod-verdict-unknown">Nobody has started it — every check above reads the
+      code; none of them runs the application.</span> ${help}`;
+  }
+  if (r.status === 'skipped') {
+    return `<span class="mod-verdict-unknown">Could not be started${
+      r.skipped_reason ? ' — ' + esc(r.skipped_reason) : ''}. A skip is not a pass.</span> ${help}`;
+  }
+  if (r.status === 'passed') {
+    return `<span class="mod-verdict-ok">Started, and answered ${r.checks || 0} of its own
+      URL(s) on round ${r.round || 1}.</span> ${seeWhich}`;
+  }
+  // A process that never came up has no URL counts, and printing "0 of 0 failed" buries the
+  // one thing worth reading — which is in its own output. Seen on a real run whose container
+  // could not construct a service: it compiled with zero errors and threw on startup.
+  if (!r.started) {
+    return `<span class="mod-verdict-bad">It did not start at all on round ${r.round || 1}.</span>
+      <span class="mod-drill" onclick="setModernizationTab('checks')">Read what it printed</span>`;
+  }
+  return `<span class="mod-verdict-bad">Started, but ${r.failing || 0} of ${r.checks || 0}
+    probed URL(s) failed on round ${r.round || 1}.</span> ${seeWhich}`;
 }
 
 function showModernizationParityHelp() {
@@ -6059,6 +6471,18 @@ const MOD_WAIVER_CHECKPOINTS = {
   wireup_ambiguous:  { label: 'Finish with it unregistered', help: 'showModernizationBuildHelp' },
   runtime_required:  { label: 'Finish without starting it', help: 'showModernizationBuildHelp' },
   runtime_failed:    { label: 'Finish with it failing to serve', help: 'showModernizationBuildHelp' },
+  // The same argument, at the other end of the run. This gate's own text says the layout has
+  // dependencies with no legal way to be written, so its plain button is not an approval of
+  // anything — it is a decision to convert code that will compile and fail to start. Labelling
+  // it "Approve" would put the one prominent blue button in the dashboard on the outcome the
+  // gate exists to prevent.
+  plan_conflicts:    { label: 'Convert this layout anyway', answer: { repair: 'proceed' } },
+  // Adding a package reference is a decision per id, not per checkpoint, so the buttons that
+  // actually add anything are rendered by `renderPackageChoices`. This one is the other
+  // answer, and it is deliberately the plain-looking one: leaving an unverifiable dependency
+  // out costs a compiler error naming a type, while adding a bad id costs `NU1102`, which
+  // stops the restore before there is any file or line to route the failure back to.
+  package_approval:  { label: 'Leave them out' },
 };
 
 function renderModernizationCheckpoints(checkpoints) {
@@ -6069,15 +6493,71 @@ function renderModernizationCheckpoints(checkpoints) {
       return `
       <div class="mod-alert">
         <strong>${esc(c.title)}</strong>${c.blocking ? ' — blocks the run' : ' — informational'}
-        <div style="margin-top:6px;white-space:pre-wrap">${esc(c.detail || '')}</div>
+        <div style="margin-top:6px">${md(c.detail) || `<span style="white-space:pre-wrap">${esc(c.detail || '')}</span>`}</div>
         ${renderCheckpointPayload(c)}
-        ${waiver ? `<button class="btn btn-primary btn-sm" style="margin-top:8px"
+        ${renderCheckpointRepairs(c)}
+        ${renderPackageChoices(c)}
+        ${waiver && waiver.help ? `<button class="btn btn-primary btn-sm" style="margin-top:8px"
                 onclick="${waiver.help}()">Show me how to do it</button>` : ''}
         <button class="btn ${waiver || !c.blocking ? 'btn-secondary' : 'btn-primary'} btn-sm" style="margin-top:8px"
-                onclick="answerModernizationCheckpoint('${esc(c.id)}')">${
+                onclick="answerModernizationCheckpoint('${esc(c.id)}'${
+                  waiver && waiver.answer ? `, '${jsArg(waiver.answer.repair)}'` : ''})">${
                   waiver ? esc(waiver.label) : (c.blocking ? 'Approve' : 'Acknowledge')}</button>
       </div>`;
     }).join('')}
+  </div>`;
+}
+
+// Packages the converter asked for that this platform could not confirm — nuget.org has no
+// such id, or could not be reached. One button per id and an "add all", because a person may
+// recognise one name and not the other, and a single Approve would make that impossible to
+// express. Nothing here is a waiver: the ids that *were* confirmed never reach this screen,
+// they are already in the project file.
+function renderPackageChoices(c) {
+  if (c.kind !== 'package_approval') return '';
+  const rows = ((c.payload || {}).candidates || []).filter(r => r && r.name);
+  if (!rows.length) return '';
+  return `<div style="margin-top:8px">
+    ${rows.map(r => `<button class="btn btn-secondary btn-sm" style="margin:2px"
+        onclick="approveModernizationPackages('${esc(c.id)}', ['${jsArg(r.name)}'])"
+        >Add ${esc(r.name)} ${esc(r.version || r.requested || '')}</button>`).join('')}
+    ${rows.length > 1 ? `<button class="btn btn-primary btn-sm" style="margin:2px"
+        onclick="approveModernizationPackages('${esc(c.id)}', [])"
+        >Add all ${rows.length}</button>` : ''}
+  </div>`;
+}
+
+// The layout repairs a gate is offering, one button each. Until this existed the repairs
+// were computed, priced, written into the payload and reachable only from the API — so every
+// dashboard user answered "none" whether they meant to or not, and a plan the pipeline had
+// already proved unbuildable was the only thing the UI could approve.
+//
+// Ordered the way `drive_modernization.feasible_repairs` orders them and for the same reason:
+// closes most, opens least, then cheapest to the architecture. A merge dissolves a boundary
+// the customer asked for and must never win by accident.
+const MOD_REPAIR_RANK = { seam: 0, allow: 1, merge: 2 };
+
+function renderCheckpointRepairs(c) {
+  const repairs = ((c.payload || {}).repairs || []).filter(r => r.feasible && r.id);
+  if (!repairs.length) return '';
+  const ordered = repairs.slice().sort((a, b) =>
+    (b.closes || []).length - (a.closes || []).length ||
+    (a.opens || []).length - (b.opens || []).length ||
+    (MOD_REPAIR_RANK[String(a.id).split(':')[0]] ?? 3) - (MOD_REPAIR_RANK[String(b.id).split(':')[0]] ?? 3) ||
+    String(a.id).localeCompare(String(b.id)));
+  return `<div style="margin-top:10px">
+    <div class="mod-meta">Pick one to have it applied to the plan before anything is converted.
+      Each number below was measured by re-running the check against the repaired layout, not
+      claimed.</div>
+    ${ordered.map(r => `
+      <div class="mod-alert" style="margin-top:6px">
+        <strong>${esc(r.title || r.id)}</strong>
+        <div class="mod-meta">closes ${(r.closes || []).length}${
+          (r.opens || []).length ? ` · opens ${(r.opens || []).length} new` : ''}</div>
+        <div style="margin-top:4px">${esc(r.detail || '')}</div>
+        <button class="btn btn-primary btn-sm" style="margin-top:6px"
+                onclick="answerModernizationCheckpoint('${esc(c.id)}', '${jsArg(r.id)}')">Apply this</button>
+      </div>`).join('')}
   </div>`;
 }
 
@@ -6180,123 +6660,27 @@ function renderModernizationComponents(components) {
   return `<div class="mod-panel">
     <div class="section-title" style="margin-top:0">Target architecture (${components.length} components)</div>
     <p class="subtitle" style="margin-top:-6px">Decided once, before any file was converted. Every converted file lands under its component's directory and declares its namespace — the drift that used to be possible across a long run is now not expressible. Click a component to read the files it produced.</p>
-    <div style="max-height:420px;overflow:auto">
+    <div class="mod-scroll-tall">
       <table class="mod-unit-table">
         <thead><tr><th>Level</th><th>Component</th><th>Project</th><th>Directory</th><th>Files</th><th>Risk</th><th>Status</th></tr></thead>
         <tbody>${components.map(c => `<tr>
           <td>${c.topo_level}</td>
           <td class="mod-unit-path">${c.id
             ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(c.id)}')">${esc(c.name)}</span>`
-            : esc(c.name)}</td>
+            : esc(c.name)}
+            ${c.rationale ? `<div class="mod-meta mod-rationale">${md(c.rationale) || esc(c.rationale)}</div>` : ''}
+            ${(c.expected_files || []).length ? `<div class="mod-meta">Promised: ${
+              c.expected_files.slice(0, 8).map(f => `<code class="mod-unit-path">${esc(f)}</code>`).join(' ')}${
+              c.expected_files.length > 8 ? ` …and ${c.expected_files.length - 8} more` : ''}</div>` : ''}</td>
           <td>${esc(c.project || '')}</td>
           <td class="mod-unit-path">${esc(c.output_dir || '')}</td>
           <td title="${esc((c.members || []).join(', '))}">${(c.members || []).length}</td>
           <td><span class="compliance-chip">${esc(c.risk || '')}</span></td>
-          <td><span class="mod-status ${esc(c.status)}">${esc(c.status)}</span>${c.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
+          <td><span class="mod-status ${esc(c.status)}">${esc(modUnitStatusLabel(c.status))}</span>${c.needs_human_review ? ' <span class="compliance-chip">review</span>' : ''}</td>
         </tr>`).join('')}</tbody>
       </table>
     </div>
   </div>`;
-}
-
-async function showModernizationReconciliation() {
-  const box = document.getElementById('mod-reconciliation');
-  if (!box) return;
-  box.innerHTML = '<div class="mod-panel">Checking the converted codebase…</div>';
-  try {
-    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/reconciliation`, { _silent: true });
-    const counts = r.counts || {};
-    box.innerHTML = `<div class="mod-panel">
-      <div class="section-title" style="margin-top:0">Cross-file consistency</div>
-      <p class="subtitle" style="margin-top:-6px">Nothing here was compiled. These are the inconsistencies visible across the whole output — the ones no single-file check can see.</p>
-      <div class="mod-meta">${counts.fail || 0} failure(s) · ${counts.warn || 0} warning(s) · ${counts.artifacts || 0} file(s) checked</div>
-      ${(r.issues || []).length
-        ? `<div style="max-height:360px;overflow:auto;margin-top:10px">${r.issues.map(i => `
-            <div class="mod-alert" style="margin-bottom:6px">
-              <span class="compliance-chip">${esc(i.kind.replace(/_/g, ' '))}</span>
-              ${esc(i.detail)}
-            </div>`).join('')}</div>`
-        : '<div class="mod-meta" style="margin-top:10px">No cross-file inconsistencies were found.</div>'}
-    </div>`;
-  } catch (e) {
-    box.innerHTML = `<div class="mod-panel">Could not run the consistency check: ${esc(e.message)}</div>`;
-  }
-}
-
-async function showModernizationBuilds() {
-  const box = document.getElementById('mod-builds');
-  if (!box) return;
-  box.innerHTML = '<div class="mod-panel">Loading build results…</div>';
-  try {
-    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/builds`, { _silent: true });
-    const builds = r.builds || [];
-    const diags = r.diagnostics || [];
-    box.innerHTML = `<div class="mod-panel">
-      <div class="section-title" style="margin-top:0">Build results</div>
-      <p class="subtitle" style="margin-top:-6px">What a real compiler said about the converted code. Units whose output failed to compile go back through conversion automatically, carrying these messages — which is the only check here that can prove the output is buildable rather than merely plausible.</p>
-      <div style="overflow:auto">
-        <table class="mod-unit-table">
-          <thead><tr><th>Round</th><th>Source</th><th>Errors</th><th>Warnings</th><th>Reopened</th><th>Outcome</th><th>When</th></tr></thead>
-          <tbody>${builds.map(b => `<tr>
-            <td>${b.round}</td>
-            <td>${esc(b.source || '')}</td>
-            <td>${b.error_count || 0}</td>
-            <td>${b.warning_count || 0}</td>
-            <td>${b.reopened_count || 0}</td>
-            <td><span class="mod-status ${esc(b.status)}">${esc((b.status || '').replace(/_/g, ' '))}</span></td>
-            <td class="mod-meta">${esc((b.created_at || '').replace('T', ' ').slice(0, 16))}</td>
-          </tr>`).join('')}</tbody>
-        </table>
-      </div>
-      ${diags.length ? `<div class="section-title">Messages (${diags.length})</div>
-        <div style="max-height:360px;overflow:auto">
-          <table class="mod-unit-table">
-            <thead><tr><th>Severity</th><th>Code</th><th>File</th><th>Line</th><th>Message</th></tr></thead>
-            <tbody>${diags.map(d => `<tr>
-              <td><span class="compliance-chip">${esc(d.severity)}</span></td>
-              <td>${esc(d.code || '')}</td>
-              <td class="mod-unit-path" title="${esc(d.file)}">${esc(d.artifact_path || d.file)}${d.unit_id ? '' : ' <span class="compliance-chip">unowned</span>'}</td>
-              <td>${d.line || ''}</td>
-              <td>${esc(d.message || '')}</td>
-            </tr>`).join('')}</tbody>
-          </table>
-        </div>` : '<div class="mod-meta" style="margin-top:10px">The last build reported no messages.</div>'}
-    </div>`;
-  } catch (e) {
-    box.innerHTML = `<div class="mod-panel">Could not load build results: ${esc(e.message)}</div>`;
-  }
-}
-
-async function showModernizationRules() {
-  // Its own container, not the builds panel: these answer different questions and an
-  // operator comparing a compiler error against the rule it broke needs both on screen.
-  const box = document.getElementById('mod-rules');
-  if (!box) return;
-  box.innerHTML = '<div class="mod-panel">Loading business rules…</div>';
-  try {
-    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/rules`, { _silent: true });
-    const rules = r.rules || [];
-    const counts = r.counts || {};
-    const byCategory = {};
-    rules.forEach(x => { (byCategory[x.category || 'other'] = byCategory[x.category || 'other'] || []).push(x); });
-    box.innerHTML = `<div class="mod-panel">
-      <div class="section-title" style="margin-top:0">Business rules found in the source</div>
-      <p class="subtitle" style="margin-top:-6px">What the application does, not how it is built. Every rule below was checked against the file it cites — a claim whose quote could not be found in the source was rejected rather than shown, which is why the count of rejects is worth reading too.</p>
-      <div class="mod-meta">${counts.confirmed || 0} confirmed · ${counts.rejected || 0} rejected as unverifiable · ${counts.proposed || 0} awaiting verification</div>
-      ${rules.length ? Object.keys(byCategory).sort().map(cat => `
-        <div class="section-title">${esc(cat.replace(/_/g, ' '))} (${byCategory[cat].length})</div>
-        <div style="max-height:300px;overflow:auto">
-          ${byCategory[cat].map(x => `<div class="mod-alert" style="margin-bottom:6px">
-            ${esc(x.statement)}
-            <div class="mod-meta" style="margin-top:4px">${esc(x.path)}:${x.line}${x.reject_reason ? ' — rejected: ' + esc(x.reject_reason.replace(/_/g, ' ')) : ''}</div>
-            ${x.quote ? `<pre class="mod-unit-path" style="margin:6px 0 0;white-space:pre-wrap">${esc(x.quote)}</pre>` : ''}
-          </div>`).join('')}
-        </div>`).join('')
-        : '<div class="mod-meta" style="margin-top:10px">No rules at this status.</div>'}
-    </div>`;
-  } catch (e) {
-    box.innerHTML = `<div class="mod-panel">Could not load business rules: ${esc(e.message)}</div>`;
-  }
 }
 
 // ── The panels that were never wired up ────────────────────────────────────
@@ -6328,7 +6712,69 @@ const MOD_PANELS = {
     box: 'mod-events', path: '/events?limit=200', label: 'Loading the run log…',
     render: renderModernizationEvents,
   },
+  // ── Endpoints that had no caller in the browser at all ──
+  //
+  // Each of these was computed, stored and served, and reachable only through curl. The three
+  // that used to live on buttons in the action row (builds, rules, reconciliation) are here too:
+  // they are reads, they belong beside the other reads, and being panels means they cache and
+  // survive a repaint like everything else instead of each having its own fetch-and-paint copy.
+  builds: {
+    box: 'mod-builds', path: '/builds', label: 'Loading what the compiler said…',
+    render: renderModernizationBuilds,
+  },
+  runtime: {
+    box: 'mod-runtime', path: '/runtime', label: 'Loading whether it starts…',
+    render: renderModernizationRuntime,
+  },
+  startup: {
+    box: 'mod-startup', path: '/startup-plan', label: 'Working out what to start…',
+    render: renderModernizationStartupPlan,
+  },
+  parity: {
+    box: 'mod-parity', path: '/parity', label: 'Loading what differed…',
+    render: renderModernizationParity,
+  },
+  artifacts: {
+    box: 'mod-artifacts', path: '/artifacts', label: 'Listing what was written…',
+    render: renderModernizationArtifacts,
+  },
+  decisions: {
+    // No status filter: the whole point is the answered ones, which every previous caller
+    // filtered out.
+    box: 'mod-decisions', path: '/checkpoints', label: 'Loading the decisions taken…',
+    render: renderModernizationDecisions,
+  },
+  rules: {
+    box: 'mod-rules', label: 'Loading business rules…',
+    path: () => `/rules?status=${encodeURIComponent(_modRulesStatus)}`,
+    render: renderModernizationRules,
+  },
+  // Both of these compute rather than read — reconciliation re-reads every artifact, and the
+  // report runs reconciliation itself — so neither is in any tab's `load` list. They are
+  // reached by a button inside their section.
+  reconciliation: {
+    box: 'mod-reconciliation', path: '/reconciliation',
+    label: 'Checking the converted codebase…', render: renderModernizationReconciliation,
+  },
+  report: {
+    box: 'mod-report', path: '/report', label: 'Assembling the run report…',
+    render: renderModernizationReport,
+  },
 };
+
+// Panels whose fetch is already in flight. Without this, `_modOpenTabPanels` running after every
+// repaint would fire a second request for anything slower than the poll interval.
+let _modPanelInflight = new Set();
+
+// Called on tab switch and after every repaint. Idempotent: a cached panel renders from cache,
+// an in-flight one is left alone, so the cost of a tab is one request per panel per run.
+function _modOpenTabPanels(tabId) {
+  const spec = _modTabSpec(tabId);
+  (spec.load || []).forEach(name => {
+    const panel = MOD_PANELS[name];
+    if (panel && document.getElementById(panel.box)) showModernizationPanel(name, panel.box);
+  });
+}
 
 async function showModernizationPanel(name, boxId) {
   const spec = MOD_PANELS[name];
@@ -6337,39 +6783,37 @@ async function showModernizationPanel(name, boxId) {
   const box = document.getElementById(target);
   if (!box) return;
   _modOpenPanels.add(`${name}|${target}`);
-  if (_modPanelCache[name]) { box.innerHTML = spec.render(_modPanelCache[name]); return; }
+  if (_modPanelCache[name]) {
+    box.innerHTML = spec.render(_modPanelCache[name]);
+    _modApplyAccordions();
+    return;
+  }
+  if (_modPanelInflight.has(name)) return;
+  _modPanelInflight.add(name);
   box.innerHTML = `<div class="mod-panel">${esc(spec.label)}</div>`;
   let data = null;
   try {
-    data = await apiFetch(`/api/v1/modernization/runs/${_modRunId}${spec.path}`, { _silent: true });
+    // `path` may be a function, for the panels that carry a filter the reader can change.
+    const path = typeof spec.path === 'function' ? spec.path() : spec.path;
+    data = await apiFetch(`/api/v1/modernization/runs/${_modRunId}${path}`, { _silent: true });
   } catch (e) {
     data = spec.fallback ? spec.fallback() : null;
     if (!data || (name === 'plan' && !data.plan)) {
+      _modPanelInflight.delete(name);
       const dead = document.getElementById(target);
       if (dead) dead.innerHTML = `<div class="mod-panel">Could not load this: ${esc(e.message)}</div>`;
       return;
     }
   }
+  _modPanelInflight.delete(name);
   _modPanelCache[name] = data;
   // Re-read the container: a poll tick may have repainted `#mod-detail` while this was in
   // flight, which replaces the element the closure is holding with a different one.
   const live = document.getElementById(target);
-  if (live) live.innerHTML = spec.render(data);
-}
-
-function toggleModernizationPanel(name) {
-  const spec = MOD_PANELS[name];
-  if (!spec) return;
-  const key = `${name}|${spec.box}`;
-  if (_modOpenPanels.has(key)) {
-    _modOpenPanels.delete(key);
-    const box = document.getElementById(spec.box);
-    if (box) box.innerHTML = '';
-    _modPaintInspect();
-    return;
+  if (live) {
+    live.innerHTML = spec.render(data);
+    _modApplyAccordions();
   }
-  showModernizationPanel(name, spec.box);
-  _modPaintInspect();
 }
 
 function _modRestorePanels(checkpoints) {
@@ -6534,7 +6978,7 @@ function renderModernizationPlanBody(plan, estimate) {
   const byRisk = plan.by_risk || {};
   const line = x => (typeof x === 'string' ? x : (x && (x.detail || x.message || x.name)) || JSON.stringify(x));
   return `
-    ${plan.summary ? `<div class="summary-box" style="margin-top:8px">${esc(plan.summary)}</div>` : ''}
+    ${plan.summary ? `<div class="summary-box" style="margin-top:8px">${md(plan.summary) || esc(plan.summary)}</div>` : ''}
     <div class="mod-meta">${rows.length} component(s) ·
       estimated $${Number(totals.expected_usd || 0).toFixed(2)} ·
       ceiling $${Number(totals.ceiling_usd || 0).toFixed(2)}${totals.price_is_estimated ? ' (indicative rates)' : ''}
@@ -6552,10 +6996,10 @@ function renderModernizationPlanBody(plan, estimate) {
             </tr>`)).join('')}</tbody>
       </table></div>` : ''}
     ${risks.length ? `<div class="section-title">Risks the architect stated (${risks.length})</div>
-      ${risks.map(r => `<div class="mod-alert" style="margin-bottom:6px">${esc(line(r))}</div>`).join('')}` : ''}
+      ${risks.map(r => `<div class="mod-alert" style="margin-bottom:6px">${md(line(r)) || esc(line(r))}</div>`).join('')}` : ''}
     ${corrections.length ? `<div class="section-title">Corrections applied to the proposed layout (${corrections.length})</div>
       <p class="subtitle" style="margin-top:-6px">The architect's answer was not taken as given. These are the places it was overruled deterministically.</p>
-      <ul class="mod-list">${corrections.map(x => `<li>${esc(line(x))}</li>`).join('')}</ul>` : ''}
+      <ul class="mod-list">${corrections.map(x => `<li>${mdInline(esc(line(x)))}</li>`).join('')}</ul>` : ''}
     ${rows.length ? `<div class="section-title">Components (${rows.length})</div>
       <div class="mod-scroll"><table class="mod-unit-table">
         <thead><tr><th>Level</th><th>Component</th><th>Project</th><th>Namespace</th><th>Directory</th><th>Files</th><th>LOC</th><th>Risk</th><th>Est.</th></tr></thead>
@@ -6571,6 +7015,615 @@ function renderModernizationPlanBody(plan, estimate) {
           <td>$${Number(r.est_cost_usd || 0).toFixed(3)}</td>
         </tr>`).join('')}</tbody>
       </table></div>` : ''}`;
+}
+
+// ── The tabs ───────────────────────────────────────────────────────────────
+//
+// One function per section. All of them are pure — they take the poll's context and return a
+// string — so the smoke suite exercises each tab without a fetch, which is the property the
+// old single-panel renderer did not have.
+
+// Overview answers "what is this run, and is its output trustworthy". Everything on it is free:
+// the plan, the charter and the analysis denominators are all already in the run row, and two of
+// the three had never been rendered anywhere after the gate that produced them closed.
+function renderModOverviewTab(ctx) {
+  const run = ctx.run;
+  const plan = _modRunPlan(run);
+  const analysis = (run.stats || {}).analysis || {};
+  return `
+    ${plan && plan.summary ? `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">What the architect decided</div>
+      <p class="subtitle" style="margin-top:-6px">Written once, before any file was converted, and approved by a human at the second gate. Everything after it was bound by this.</p>
+      ${md(plan.summary)}
+    </div>` : ''}
+    ${renderModernizationCharterView(run)}
+    ${renderAnalysisContradictions(analysis.contradictions)}
+    ${renderAnalysisDenominators(analysis.signals)}
+    <div class="mod-panel">
+      <div class="section-title" style="margin-top:0">The run report</div>
+      <p class="subtitle" style="margin-top:-6px">The same document the export zip carries as <code>MODERNIZATION_REPORT.md</code> — what was skipped, what failed, and which configuration keys the redactions left somebody to supply. It was previously readable only by downloading the archive and opening a file inside it.</p>
+      <div class="form-actions" style="margin-top:0">
+        <button class="btn btn-secondary btn-sm" onclick="showModernizationPanel('report','mod-report')">Read the run report</button>
+      </div>
+      <div id="mod-report"></div>
+    </div>`;
+}
+
+// The charter is the single most binding document in a run and it was unreadable the moment it
+// was saved: the form is only rendered while `status === 'awaiting_charter'`, and `run.charter`
+// — decoded server-side since it was written — had no reader in the browser at all. So the
+// answer to "why did every file do it *this* way" was in the database and nowhere on screen.
+function renderModernizationCharterView(run) {
+  const charter = run.charter;
+  if (!charter || typeof charter !== 'object') return '';
+  const keys = Object.keys(charter).filter(k => String(charter[k] === null || charter[k] === undefined ? '' : charter[k]).trim());
+  if (!keys.length) return '';
+  // Labels come from the suggestions payload when it is loaded, so this view and the form that
+  // produced it name the same field the same way rather than inventing a second vocabulary.
+  const labels = {};
+  ((_modCharterSuggestions && _modCharterSuggestions.fields) || []).forEach(f => {
+    labels[f.key] = f.label;
+  });
+  const label = k => labels[k] || k.replace(/_/g, ' ');
+  return `<div class="mod-panel">
+    <details class="mod-acc" ${_modAcc('charter-view', false)}>
+      <summary><strong>Conversion charter</strong>
+        <span class="mod-meta">${keys.length} answer(s) — decided once, applied to every file</span></summary>
+      <p class="subtitle">This is what stopped file 1 using one data-access approach and file 90 using another. Every conversion call in this run was given these.</p>
+      <div class="mod-scroll">
+        <table class="mod-unit-table">
+          <thead><tr><th>Decision</th><th>What was chosen</th></tr></thead>
+          <tbody>${keys.sort().map(k => `<tr>
+            <td class="mod-unit-path">${esc(label(k))}</td>
+            <td>${md(String(charter[k]))}</td>
+          </tr>`).join('')}</tbody>
+        </table>
+      </div>
+    </details>
+  </div>`;
+}
+
+function renderModArchitectureTab(ctx) {
+  return `
+    ${renderModernizationComponents(ctx.components)}
+    <div class="mod-panel">
+      <details class="mod-acc" ${_modAcc('graph', true)}>
+        <summary><strong>Dependency graph</strong>
+          <span class="mod-meta">${(ctx.units || []).length} file(s) — left to right is conversion order</span></summary>
+        <div id="mod-graph">${renderModernizationGraph(ctx.units, ctx.components, _modGraphMode)}</div>
+      </details>
+    </div>
+    <div id="mod-plan"></div>
+    <div id="mod-unit"></div>`;
+}
+
+// `kind` was always available on `GET /units` and the browser always took the default, so the
+// scaffold — the solution and project files that make the output a real project rather than
+// loose source — was invisible on a screen whose whole job is showing what the run produced.
+const MOD_UNIT_KINDS = [
+  ['source_file', 'Source files'],
+  ['component', 'Components'],
+  ['scaffold', 'Scaffold'],
+  ['all', 'Everything'],
+];
+let _modFilesKind = 'source_file';
+let _modFilesUnits = null;      // only set when a non-default kind has been fetched
+
+function renderModFilesTab(ctx) {
+  const units = _modFilesKind === 'source_file' ? (ctx.units || []) : (_modFilesUnits || []);
+  return `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">The inventory</div>
+      <p class="subtitle" style="margin-top:-6px">A run holds more than its source files. Components are the groups the architect decided to convert together; the scaffold is what was generated deterministically, without a model.</p>
+      <div class="chip-row">
+        ${MOD_UNIT_KINDS.map(([k, lbl]) => `<button type="button" class="mod-choice ${k === _modFilesKind ? 'selected' : ''}"
+          onclick="setModernizationFilesKind('${k}')">${esc(lbl)}</button>`).join('')}
+      </div>
+    </div>
+    <div id="mod-files-body">${renderModernizationUnits(units)}</div>
+    <div id="mod-unit"></div>`;
+}
+
+async function setModernizationFilesKind(kind) {
+  _modFilesKind = kind;
+  if (kind === 'source_file') { _modFilesUnits = null; _modPaintTabBody(); return; }
+  const box = document.getElementById('mod-files-body');
+  if (box) box.innerHTML = '<div class="mod-panel">Loading the inventory…</div>';
+  try {
+    const d = await apiFetch(
+      `/api/v1/modernization/runs/${_modRunId}/units?kind=${encodeURIComponent(kind)}`,
+      { _silent: true });
+    _modFilesUnits = d.units || [];
+  } catch (e) {
+    _modFilesUnits = [];
+  }
+  _modPaintTabBody();
+}
+
+function renderModCodeTab(ctx) {
+  return `<div id="mod-artifacts"></div><div id="mod-unit"></div>`;
+}
+
+function renderModChecksTab(ctx) {
+  return `
+    <div class="mod-panel">
+      <div class="section-title" style="margin-top:0">What has actually been verified</div>
+      <p class="subtitle" style="margin-top:-6px">Nothing on this platform compiles or runs your converted code — that happens on a machine you control, and the results arrive back here. So each section below is either evidence somebody produced, or a statement that nobody has.</p>
+    </div>
+    <div id="mod-builds"></div>
+    <div id="mod-runtime"></div>
+    <div id="mod-parity"></div>
+    <div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Cross-file consistency</div>
+      <p class="subtitle" style="margin-top:-6px">The inconsistencies visible across the whole output that no single-file check can see. Computed on demand, because it re-reads every artifact.</p>
+      <div class="form-actions" style="margin-top:0">
+        <button class="btn btn-secondary btn-sm" onclick="showModernizationPanel('reconciliation','mod-reconciliation')">Run the consistency check</button>
+      </div>
+      <div id="mod-reconciliation"></div>
+    </div>
+    <div id="mod-unit"></div>`;
+}
+
+function renderModEvidenceTab(ctx) {
+  return `
+    <div id="mod-evidence"></div>
+    <div id="mod-rules"></div>
+    <div id="mod-symbols"></div>
+    <div id="mod-redactions"></div>
+    <div id="mod-unit"></div>`;
+}
+
+function renderModHistoryTab(ctx) {
+  return `<div id="mod-decisions"></div><div id="mod-events"></div>`;
+}
+
+// ── Decisions taken ────────────────────────────────────────────────────────
+//
+// The browser only ever asked for `?status=open`, so the record of every approval and every
+// waiver — who decided, when, and the reason they typed — was stored on every run and shown on
+// none of them. In a governance product that record is arguably the most important thing here:
+// several of these gates exist specifically to be answered "finish without this evidence", and
+// a waiver nobody can find afterwards is not a waiver, it is a silence.
+function renderModernizationDecisions(data) {
+  const rows = (data && data.checkpoints) || [];
+  const answered = rows.filter(c => (c.status || 'open') === 'answered');
+  if (!rows.length) {
+    return `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Decisions taken</div>
+      <div class="mod-meta" style="margin-top:10px">This run has not asked for a decision yet.</div>
+    </div>`;
+  }
+  const waived = answered.filter(c => MOD_WAIVER_CHECKPOINTS[c.kind]);
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Decisions taken (${answered.length} of ${rows.length})</div>
+    <p class="subtitle" style="margin-top:-6px">Who was asked, what they were asked, and what they answered. ${waived.length ? `<strong>${waived.length}</strong> of ${waived.length === 1 ? 'these was a decision' : 'these were decisions'} to finish <em>without</em> a piece of evidence rather than an approval of anything — those rows are marked.` : ''}</p>
+    <div class="mod-scroll">
+      <table class="mod-unit-table">
+        <thead><tr><th>When</th><th>What was asked</th><th>Answered by</th><th>Their reason</th></tr></thead>
+        <tbody>${rows.map(c => {
+          const a = c.answer || {};
+          const waiver = MOD_WAIVER_CHECKPOINTS[c.kind];
+          const open = (c.status || 'open') !== 'answered';
+          return `<tr>
+            <td class="mod-meta">${esc(((c.answered_at || c.created_at) || '').replace('T', ' ').slice(0, 16))}</td>
+            <td><strong>${esc(c.title || c.kind || '')}</strong>
+              ${open ? ' <span class="compliance-chip">still open</span>' : ''}
+              ${waiver && !open ? ' <span class="compliance-chip mod-chip-waiver">finished without this evidence</span>' : ''}
+              ${a.repair ? ` <span class="compliance-chip">applied ${esc(a.repair)}</span>` : ''}
+              <div class="mod-meta" style="white-space:normal">${esc(c.kind || '')}${c.blocking ? ' · blocked the run' : ' · informational'}</div></td>
+            <td>${esc(c.answered_by || (open ? '—' : 'unknown'))}</td>
+            <td>${open ? '<span class="mod-meta">not yet answered</span>' : md(a.decision || '(no reason recorded)')}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// ── Does it start ──────────────────────────────────────────────────────────
+//
+// `run.runtime` has ridden every poll since runtime.py was written and nothing in the browser
+// read it, so a run nobody ever started rendered identically to one that starts and serves. Both
+// defects its module docstring cites — a view that was never emitted, and a missing container
+// registration — compiled with zero errors and 500'd on the first request.
+function renderModernizationRuntime(data) {
+  const s = (data && data.summary) || {};
+  const report = (data && data.report) || null;
+  const checks = (data && data.checks) || [];
+  const failing = checks.filter(c => (c.status || 0) >= 500 || (c.error && !c.status));
+  const notFound = checks.filter(c => (c.status || 0) === 404);
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Does it start, and what answered</div>
+    <p class="subtitle" style="margin-top:-6px">The only check here that runs the application. A conversion can compile cleanly and 500 on every route — a missing registration does exactly that — so "it builds" is not the acceptance bar.</p>
+    ${!report ? `<div class="mod-alert" style="margin-top:10px">Nobody has started this application.
+        <div class="mod-meta" style="margin-top:4px">That is a gap in the evidence, not a pass.</div>
+        <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="showModernizationRuntimeHelp()">Show me how to check it</button>
+      </div>`
+      : `<div class="mod-meta">Round ${report.round || 1}${report.source ? ' from ' + esc(report.source) : ''} ·
+          ${s.status === 'passed' ? 'started and served'
+            : (s.status === 'skipped' ? 'could not be started' : 'failed')} ·
+          ${report.started ? 'the process answered on its port' : 'the process never answered'}
+          ${checks.length
+            ? ` · ${checks.length} URL(s) probed, ${failing.length} failing${
+                notFound.length ? `, ${notFound.length} answering 404` : ''}`
+            : ' · nothing could be probed, so there is no URL result to read'}
+          ${report.base_url ? ` · ${esc(report.base_url)}` : ''}</div>
+        ${!report.started && report.log_tail ? `<div class="mod-alert" style="margin-top:8px">
+          It never came up, so the whole diagnosis is in what the process printed — below.
+        </div>` : ''}
+        ${report.skipped_reason ? `<div class="mod-alert" style="margin-top:8px">Skipped — ${esc(report.skipped_reason)}
+          <div class="mod-meta" style="margin-top:4px">A skip is a state of its own. It is never recorded as a pass.</div></div>` : ''}
+        ${checks.length ? `<details class="mod-acc" ${_modAcc('runtime-checks', failing.length > 0)}>
+          <summary><strong>Every URL that was asked</strong>
+            <span class="mod-meta">${checks.length} probed · failures first</span></summary>
+          <div class="mod-scroll">
+            <table class="mod-unit-table">
+              <thead><tr><th>Method</th><th>URL</th><th>Answered</th><th>ms</th><th>Error</th></tr></thead>
+              <tbody>${checks.slice().sort((a, b) =>
+                ((b.status >= 500 || (b.error && !b.status)) ? 1 : 0) -
+                ((a.status >= 500 || (a.error && !a.status)) ? 1 : 0)).map(c => `<tr>
+                <td>${esc(c.method || 'GET')}</td>
+                <td class="mod-unit-path">${esc(c.path || '')}</td>
+                <td>${c.status ? `<span class="mod-status ${c.status >= 500 ? 'failed' : (c.status >= 400 ? 'needs_human' : 'converted')}">${c.status}</span>`
+                  : '<span class="mod-status failed">nothing answered</span>'}</td>
+                <td>${c.ms || 0}</td>
+                <td class="mod-meta">${esc(c.error || '')}</td>
+              </tr>`).join('')}</tbody>
+            </table>
+          </div>
+        </details>` : ''}
+        ${report.log_tail ? `<details class="mod-acc" ${_modAcc('runtime-log', s.status === 'failed')}>
+          <summary><strong>What the process printed</strong>
+            <span class="mod-meta">for a startup failure this is usually the entire diagnosis</span></summary>
+          <pre class="mod-source">${esc(report.log_tail)}</pre>
+        </details>` : ''}`}
+    <div class="form-actions" style="margin-top:10px">
+      <button class="btn btn-secondary btn-sm" onclick="showModernizationPanel('startup','mod-startup')">What to start, and which URLs to probe</button>
+    </div>
+    <div id="mod-startup"></div>
+  </div>`;
+}
+
+// The runner's own instructions, assembled from the run's route evidence rather than a list
+// somebody maintains beside it. Unprobed URLs come back with the reason, which is the point: a
+// coverage figure without the population it was drawn from cannot be disbelieved.
+function renderModernizationStartupPlan(data) {
+  const d = data || {};
+  const urls = d.urls || [];
+  const unprobed = d.unprobed || [];
+  const keys = d.config_keys || [];
+  return `<div class="mod-panel" style="margin-top:10px">
+    <div class="section-title" style="margin-top:0">Startup plan</div>
+    <div class="mod-meta">Start <code>${esc(d.entry_project || '(no entry project)')}</code>${
+      (d.projects || []).length > 1 ? ` of ${d.projects.length} project(s)` : ''} ·
+      ${d.probe_count || 0} of ${urls.length} known URL(s) worth probing</div>
+    ${keys.length ? `<div class="mod-meta" style="margin-top:6px">${keys.length} setting(s) must be supplied before it will start: ${keys.slice(0, 25).map(k => `<code class="mod-unit-path">${esc(k)}</code>`).join(' ')}${keys.length > 25 ? ` …and ${keys.length - 25} more` : ''}</div>` : ''}
+    ${urls.length ? `<details class="mod-acc" ${_modAcc('startup-urls', false)}>
+      <summary><strong>The URLs</strong> <span class="mod-meta">${urls.length}, from this codebase's own route evidence</span></summary>
+      <div class="mod-scroll"><table class="mod-unit-table">
+        <thead><tr><th>URL</th><th>Probe it?</th><th>Why not</th></tr></thead>
+        <tbody>${urls.map(u => `<tr>
+          <td class="mod-unit-path">${esc(u.path || '')}</td>
+          <td>${u.probe ? 'yes' : 'no'}</td>
+          <td class="mod-meta">${esc(u.reason || '')}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </details>` : `<div class="mod-meta" style="margin-top:8px">No routes were found in the source, so there is no declared URL surface to probe. Starting it at all is still worth doing.</div>`}
+    ${unprobed.length ? `<div class="mod-meta" style="margin-top:6px">${unprobed.length} URL(s) are deliberately not probed — mostly because a request to them would change data.</div>` : ''}
+  </div>`;
+}
+
+function showModernizationRuntimeHelp() {
+  const id = _modRunId || '<run id>';
+  alert(
+    'Nothing here can start your converted application — running code generated from your '
+    + 'source is arbitrary code execution, so it happens where you control the machine.\n\n'
+    + 'Ask this run what to start and what to ask it for:\n\n'
+    + `    curl ${location.origin}/api/v1/modernization/runs/${id}/startup-plan\n\n`
+    + 'Then start the entry project, request those URLs, and post back what answered:\n\n'
+    + `    POST ${location.origin}/api/v1/modernization/runs/${id}/runtime-results\n`
+    + '    { "started": true, "checks": [{"method":"GET","path":"/","status":200,"ms":12}] }\n\n'
+    + 'This is the only check that runs the application. Two defects have shipped from this '
+    + 'product that compiled with zero errors and failed on the first request — a view that was '
+    + 'never emitted, and a missing container registration. Neither was findable any other way.');
+}
+
+// ── Which behaviours differed ──────────────────────────────────────────────
+//
+// The badge could say "19 differed" and there was no way to see which 19: `GET /parity` returns
+// the rounds and the per-case verdicts, failures first, and had no caller in the browser. Each
+// failing case also carries `unit_id` — the component that reimplemented the legacy file the
+// case exercises — which is the forward link from "this behaviour is wrong" to "here is the file".
+function renderModernizationParity(data) {
+  const reports = (data && data.reports) || [];
+  const results = (data && data.results) || [];
+  const cases = (data && data.cases) || 0;
+  if (!cases) {
+    return `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Does it behave the same</div>
+      <p class="subtitle" style="margin-top:-6px">Nothing was recorded from the legacy application, so there is nothing to replay against the converted one.</p>
+      <div class="mod-alert" style="margin-top:10px">No recorded behaviour.
+        <div class="mod-meta" style="margin-top:4px">Record it while the legacy system still exists. Once it is gone, so is the only source of truth about what it did.</div>
+        <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="showModernizationParityHelp()">Show me how to record it</button>
+      </div>
+    </div>`;
+  }
+  const failed = results.filter(r => r.verdict === 'fail');
+  const errored = results.filter(r => r.verdict === 'error');
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Does it behave the same (${cases} recorded case(s))</div>
+    <p class="subtitle" style="margin-top:-6px">A conversion can compile, pass every consistency check, and still do something different — a cast that silently became a parse, and a stored salary became 0. This is the only check that catches that.</p>
+    ${reports.length ? `<div class="mod-scroll">
+      <table class="mod-unit-table">
+        <thead><tr><th>Round</th><th>Source</th><th>Matched</th><th>Differed</th><th>Errored</th><th>Missing</th><th>When</th></tr></thead>
+        <tbody>${reports.map(r => `<tr class="${r.id === (data.selected_report_id || '') ? 'mod-row-selected' : ''}">
+          <td>${r.round || 1}</td>
+          <td>${esc(r.source || '')}</td>
+          <td>${r.passed || 0}</td>
+          <td>${r.failed || 0}</td>
+          <td>${r.errored || 0}</td>
+          <td>${r.missing || 0}</td>
+          <td class="mod-meta">${esc((r.created_at || '').replace('T', ' ').slice(0, 16))}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>`
+      : '<div class="mod-alert" style="margin-top:10px">The corpus has never been replayed, so nothing has been compared yet.</div>'}
+    ${(failed.length || errored.length) ? `
+      <div class="section-title">What differed (${failed.length + errored.length})</div>
+      ${failed.concat(errored).map((r, i) => `<div class="mod-alert" style="margin-bottom:6px">
+        <details class="mod-acc" ${_modAcc(`parity-${r.case_id || i}`, i < 3)}>
+          <summary><strong>${esc(r.case_name || r.case_id || 'case')}</strong>
+            <span class="compliance-chip">${esc(r.verdict || '')}</span>
+            ${r.actual_status ? `<span class="mod-meta">answered ${r.actual_status}</span>` : ''}
+            ${r.unit_id ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(r.unit_id)}')">read the file that implements it</span>` : ''}
+          </summary>
+          ${r.error ? `<div class="mod-meta" style="margin-top:6px">${esc(r.error)}</div>` : ''}
+          ${(r.differences || []).length ? `<div class="mod-scroll" style="margin-top:6px">
+            <table class="mod-unit-table">
+              <thead><tr><th>What</th><th>The legacy app gave</th><th>The converted app gave</th></tr></thead>
+              <tbody>${r.differences.map(d => `<tr>
+                <td><strong>${esc(d.kind || '')}</strong>${d.name ? ' ' + esc(d.name) : ''}
+                  <div class="mod-meta" style="white-space:normal">${esc(d.detail || '')}</div></td>
+                <td class="mod-unit-path">${esc(d.expected === null || d.expected === undefined ? '—' : d.expected)}</td>
+                <td class="mod-unit-path">${esc(d.actual === null || d.actual === undefined ? '—' : d.actual)}</td>
+              </tr>`).join('')}</tbody>
+            </table></div>` : ''}
+        </details>
+      </div>`).join('')}`
+      : (reports.length ? '<div class="mod-meta" style="margin-top:10px">Every recorded behaviour matched on the latest round.</div>' : '')}
+    <div class="form-actions" style="margin-top:10px">
+      <button class="btn btn-secondary btn-sm" onclick="showModernizationParityHelp()">How to record or replay this</button>
+    </div>
+  </div>`;
+}
+
+// ── Every file the run wrote ───────────────────────────────────────────────
+//
+// "Where do I see the converted code" took four steps and a guess: find a source file in the
+// inventory, click it, scroll to the unit panel, then expand one `<details>` per output file.
+// This is the index that was missing — the listing is cheap because it carries no content, and
+// a row opens the file through the unit panel that already knew how to render it.
+let _modArtifactQuery = '';
+
+function renderModernizationArtifacts(data) {
+  const all = (data && data.artifacts) || [];
+  const q = (_modArtifactQuery || '').toLowerCase();
+  const rows = q ? all.filter(a => String(a.path || '').toLowerCase().indexOf(q) !== -1) : all;
+  const groups = {};
+  rows.forEach(a => {
+    const parts = String(a.path || '').split('/');
+    const dir = parts.length > 1 ? parts[0] : '(root)';
+    (groups[dir] = groups[dir] || []).push(a);
+  });
+  const dirs = Object.keys(groups).sort();
+  const kb = n => (n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`);
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Converted code — ${all.length} file(s) written</div>
+    <p class="subtitle" style="margin-top:-6px">Every file this run produced, grouped by project directory. Click a path to read it beside the source it came from. The whole tree is also in the export zip.</p>
+    ${all.length ? `<div class="form-group" style="max-width:420px">
+      <input type="text" id="mod-artifact-filter" placeholder="Filter by path, e.g. Controllers"
+             value="${esc(_modArtifactQuery)}"
+             oninput="filterModernizationArtifacts(this.value, this.selectionStart)" />
+    </div>
+    ${rows.length ? dirs.map(dir => `
+      <details class="mod-acc" ${_modAcc('artifacts-' + dir, dirs.length <= 3)}>
+        <summary><strong>${esc(dir)}</strong>
+          <span class="mod-meta">${groups[dir].length} file(s)</span></summary>
+        <div class="mod-scroll">
+          <table class="mod-unit-table">
+            <thead><tr><th>File</th><th>Why it exists</th><th>Version</th><th>Size</th></tr></thead>
+            <tbody>${groups[dir].map(a => `<tr>
+              <td class="mod-unit-path">${a.unit_id
+                ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(a.unit_id)}')">${esc(a.path)}</span>`
+                : esc(a.path)}</td>
+              <td class="mod-meta">${esc(a.purpose || '')}</td>
+              <td>v${a.version || 1}${a.is_current ? '' : ' <span class="compliance-chip">superseded</span>'}</td>
+              <td class="mod-meta">${kb(Number(a.size_chars || 0))}</td>
+            </tr>`).join('')}</tbody>
+          </table>
+        </div>
+      </details>`).join('')
+      : `<div class="mod-meta" style="margin-top:10px">No file's path contains “${esc(_modArtifactQuery)}”.</div>`}`
+    : '<div class="mod-meta" style="margin-top:10px">Nothing has been written yet. Files appear here as components convert.</div>'}
+  </div>`;
+}
+
+function filterModernizationArtifacts(value, caret) {
+  _modArtifactQuery = value || '';
+  // Re-rendered from the cached response rather than re-fetched: filtering is a question about
+  // data the browser already holds, and a keystroke must not become a request.
+  const box = document.getElementById('mod-artifacts');
+  if (box && _modPanelCache.artifacts) {
+    box.innerHTML = renderModernizationArtifacts(_modPanelCache.artifacts);
+    _modApplyAccordions();
+    // Re-rendering replaced the input the keystroke came from, so focus *and* the caret have to
+    // be put back — with only the focus restored, editing anywhere but the end of the string
+    // jumps the cursor on every character.
+    const input = document.getElementById('mod-artifact-filter');
+    if (input && input.focus) {
+      input.focus();
+      if (input.setSelectionRange) {
+        // Where the caret actually was, handed over by the event — not the end of the string,
+        // which would jump the cursor on every character typed mid-path.
+        const at = (caret === undefined || caret === null)
+          ? (_modArtifactQuery || '').length : caret;
+        try { input.setSelectionRange(at, at); } catch (e) { /* not a text input */ }
+      }
+    }
+  }
+}
+
+// ── The run report ─────────────────────────────────────────────────────────
+
+function renderModernizationReport(data) {
+  const text = (data && data.markdown) || '';
+  if (!text) return '<div class="mod-panel">This run has no report yet.</div>';
+  return `<div class="mod-panel" style="margin-top:10px">
+    ${md(text, 'md-report')}
+  </div>`;
+}
+
+// ── Build results, as one section per round ────────────────────────────────
+//
+// Previously two flat tables in a panel reached from a button beside "Cancel run", which painted
+// off-screen. A round is the unit a reader thinks in — "did round 3 fix what round 2 broke" —
+// so a round is a section, and its messages are inside it.
+// Messages for rounds other than the newest, keyed by build id. Kept out of `_modPanelCache`
+// because it accumulates across several fetches rather than being one response.
+let _modBuildDiags = {};
+
+async function loadModernizationBuildRound(buildId) {
+  if (!buildId || !_modRunId || _modBuildDiags[buildId]) return;
+  try {
+    const d = await apiFetch(
+      `/api/v1/modernization/runs/${_modRunId}/builds?build_id=${encodeURIComponent(buildId)}`,
+      { _silent: true });
+    _modBuildDiags[buildId] = d.diagnostics || [];
+  } catch (e) {
+    _modBuildDiags[buildId] = [];
+  }
+  const box = document.getElementById('mod-builds');
+  if (box && _modPanelCache.builds) {
+    box.innerHTML = renderModernizationBuilds(_modPanelCache.builds);
+    _modApplyAccordions();
+  }
+}
+
+function renderModernizationBuilds(data) {
+  const builds = (data && data.builds) || [];
+  const diags = (data && data.diagnostics) || [];
+  const selected = (data && data.selected_build_id) || '';
+  if (!builds.length) {
+    return `<div class="mod-panel">
+      <div class="section-title" style="margin-top:0">Does it compile</div>
+      <div class="mod-alert" style="margin-top:10px">This export has never been compiled.
+        <div class="mod-meta" style="margin-top:4px">Every check that has run reads the code. None of them runs a compiler, so "no errors found" here means "no compiler has looked".</div>
+        <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="showModernizationBuildHelp()">Show me how to build it</button>
+      </div>
+    </div>`;
+  }
+  // `GET /builds` returns the messages for one round — the newest, unless asked otherwise. So
+  // "a round is a section" was cosmetic for every round but the last: the older ones could only
+  // say that their messages were elsewhere. Each round now fetches its own on demand, which is
+  // the whole point of being able to ask "did round 3 fix what round 2 broke".
+  const byId = {};
+  diags.forEach(d => { (byId[d.build_id || selected] = byId[d.build_id || selected] || []).push(d); });
+  Object.keys(_modBuildDiags).forEach(id => { byId[id] = _modBuildDiags[id]; });
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">Does it compile — ${builds.length} round(s)</div>
+    <p class="subtitle" style="margin-top:-6px">What a real compiler said. Units whose output failed go back through conversion carrying these messages, so a build is not only a verdict — it is the input to the next attempt.</p>
+    ${builds.map((b, i) => {
+      const rows = byId[b.id] || (b.id === selected ? diags : null);
+      const clean = (b.error_count || 0) === 0;
+      return `<details class="mod-acc" ${_modAcc('build-' + b.id, i === 0)}>
+        <summary><strong>Round ${b.round}</strong>
+          <span class="mod-status ${esc(clean ? 'converted' : 'failed')}">${clean ? 'no errors' : `${b.error_count} error(s)`}</span>
+          <span class="mod-meta">${b.warning_count ? `${b.warning_count} warning(s) · ` : ''}${
+            b.reopened_count ? `${b.reopened_count} unit(s) sent back for rework · ` : ''}${
+            esc(b.source || '')} · ${esc((b.created_at || '').replace('T', ' ').slice(0, 16))}</span></summary>
+        ${rows && rows.length ? `<div class="mod-scroll">
+          <table class="mod-unit-table">
+            <thead><tr><th>Severity</th><th>Code</th><th>File</th><th>Line</th><th>Message</th></tr></thead>
+            <tbody>${rows.map(d => `<tr>
+              <td><span class="compliance-chip">${esc(d.severity)}</span></td>
+              <td>${esc(d.code || '')}</td>
+              <td class="mod-unit-path" title="${esc(d.file)}">${d.unit_id
+                ? `<span class="mod-drill" onclick="showModernizationUnit('${esc(d.unit_id)}')">${esc(d.artifact_path || d.file)}</span>`
+                : `${esc(d.artifact_path || d.file)} <span class="compliance-chip">unowned</span>`}</td>
+              <td>${d.line || ''}</td>
+              <td>${esc(d.message || '')}</td>
+            </tr>`).join('')}</tbody>
+          </table></div>`
+          : `<div class="mod-meta" style="margin-top:8px">${(rows || !(
+              (b.error_count || 0) + (b.warning_count || 0)))
+              ? 'This round reported no messages.'
+              : `<button class="btn btn-secondary btn-sm" onclick="loadModernizationBuildRound('${esc(b.id)}')">Load this round's ${
+                  (b.error_count || 0) + (b.warning_count || 0)} message(s)</button>`}</div>`}
+      </details>`;
+    }).join('')}
+  </div>`;
+}
+
+// ── Cross-file consistency ─────────────────────────────────────────────────
+
+function renderModernizationReconciliation(data) {
+  const counts = (data && data.counts) || {};
+  const issues = (data && data.issues) || [];
+  return `<div class="mod-panel" style="margin-top:10px">
+    <div class="mod-meta">${counts.fail || 0} failure(s) · ${counts.warn || 0} warning(s) · ${counts.artifacts || 0} file(s) checked</div>
+    ${issues.length
+      ? `<div class="mod-scroll" style="margin-top:10px">${issues.map(i => `
+          <div class="mod-alert" style="margin-bottom:6px">
+            <span class="compliance-chip">${esc((i.kind || '').replace(/_/g, ' '))}</span>
+            ${esc(i.detail)}
+          </div>`).join('')}</div>`
+      : '<div class="mod-meta" style="margin-top:10px">No cross-file inconsistencies were found. Nothing here was compiled.</div>'}
+  </div>`;
+}
+
+// ── Business rules ─────────────────────────────────────────────────────────
+//
+// `status` was always a query parameter and the browser always took the default, so the rejects
+// — which the route's own docstring calls the more interesting read, because they are the claims
+// whose quote could not be found in the file they cite — were unreachable.
+const MOD_RULE_STATUSES = [['confirmed', 'Confirmed'], ['rejected', 'Rejected as unverifiable'],
+                          ['proposed', 'Awaiting verification']];
+let _modRulesStatus = 'confirmed';
+
+function renderModernizationRules(data) {
+  const rules = (data && data.rules) || [];
+  const counts = (data && data.counts) || {};
+  const byCategory = {};
+  rules.forEach(x => { (byCategory[x.category || 'other'] = byCategory[x.category || 'other'] || []).push(x); });
+  const cats = Object.keys(byCategory).sort();
+  return `<div class="mod-panel">
+    <div class="section-title" style="margin-top:0">What the application does</div>
+    <p class="subtitle" style="margin-top:-6px">Business rules read out of the source, not how it is built. Every rule was checked against the file it cites — a claim whose quote could not be found there was rejected rather than shown, which is why the rejects are worth reading too.</p>
+    <div class="mod-meta">${counts.confirmed || 0} confirmed · ${counts.rejected || 0} rejected as unverifiable · ${counts.proposed || 0} awaiting verification</div>
+    <div class="chip-row">
+      ${MOD_RULE_STATUSES.map(([s, lbl]) => `<button type="button" class="mod-choice ${s === _modRulesStatus ? 'selected' : ''}"
+        onclick="setModernizationRulesStatus('${s}')">${esc(lbl)} (${counts[s] || 0})</button>`).join('')}
+    </div>
+    ${rules.length ? cats.map(cat => `
+      <details class="mod-acc" ${_modAcc('rules-' + cat, cats.length <= 3)}>
+        <summary><strong>${esc(cat.replace(/_/g, ' '))}</strong>
+          <span class="mod-meta">${byCategory[cat].length} rule(s)</span></summary>
+        <div class="mod-scroll">
+          ${byCategory[cat].map(x => `<div class="mod-alert" style="margin-bottom:6px">
+            ${md(x.statement)}
+            <div class="mod-meta" style="margin-top:4px">${esc(x.path)}:${x.line}${x.reject_reason ? ' — rejected: ' + esc(x.reject_reason.replace(/_/g, ' ')) : ''}</div>
+            ${x.quote ? `<pre class="mod-unit-path" style="margin:6px 0 0;white-space:pre-wrap">${esc(x.quote)}</pre>` : ''}
+          </div>`).join('')}
+        </div>
+      </details>`).join('')
+      : '<div class="mod-meta" style="margin-top:10px">No rules at this status.</div>'}
+  </div>`;
+}
+
+function setModernizationRulesStatus(status) {
+  _modRulesStatus = status;
+  // The cache is keyed by panel name, not by filter, so a filter change has to drop it — the
+  // same reason `reloadModernizationEvents` does.
+  delete _modPanelCache.rules;
+  showModernizationPanel('rules', 'mod-rules');
 }
 
 // ── One unit, and what it became ───────────────────────────────────────────
@@ -6653,7 +7706,7 @@ function renderModernizationUnit(data, withSource) {
       ${u.target_namespace ? ` · ${esc(u.target_namespace)}` : ''}
       ${u.actual_cost_usd ? ` · $${Number(u.actual_cost_usd).toFixed(4)} spent`
         : (u.est_cost_usd ? ` · est. $${Number(u.est_cost_usd).toFixed(4)}` : '')}</div>
-    ${meta.rationale ? `<div class="mod-meta">${esc(meta.rationale)}</div>` : ''}
+    ${meta.rationale ? `<div class="mod-meta">${md(meta.rationale) || esc(meta.rationale)}</div>` : ''}
     ${u.error ? `<div class="mod-alert" style="margin-top:10px">${esc(u.error.error || u.error.message || JSON.stringify(u.error))}</div>` : ''}
     ${pathList('Source files rolled up into this component', members)}
     ${pathList('Depends on', u.depends_on)}
@@ -6667,7 +7720,7 @@ function renderModernizationUnit(data, withSource) {
          <pre class="mod-source">${esc(_modClip(u.source_text))}</pre>`
       : '<div class="mod-meta" style="margin-top:8px">No source is stored against this row — components and stage rows carry their members’ source, not their own.</div>') : ''}
     ${artifacts.length ? `<div class="section-title">Converted output (${artifacts.length} file(s))</div>
-      ${artifacts.map(a => `<details class="mod-artifact">
+      ${artifacts.map(a => `<details class="mod-artifact" ${_modAcc('artifact-' + (a.path || ''), artifacts.length === 1)}>
         <summary><span class="mod-unit-path">${esc(a.path)}</span>
           <span class="mod-meta">v${a.version || 1}${a.purpose ? ` · ${esc(a.purpose)}` : ''}${a.is_current ? '' : ' · superseded'}</span></summary>
         <pre class="mod-source">${esc(_modClip(a.content))}</pre>
@@ -6902,24 +7955,15 @@ function modGraphSummary(model) {
       </table></div>` : ''}`;
 }
 
-function toggleModernizationGraph() {
-  _modShowGraph = !_modShowGraph;
-  _modPaintGraph();
-  _modPaintInspect();
-}
-
 function setModernizationGraphMode(mode) {
   _modGraphMode = mode;
-  _modShowGraph = true;
   _modPaintGraph();
-  _modPaintInspect();
 }
 
 function _modPaintGraph() {
   const box = document.getElementById('mod-graph');
   if (!box) return;
-  box.innerHTML = _modShowGraph
-    ? renderModernizationGraph(_modLastUnits, _modLastComponents, _modGraphMode) : '';
+  box.innerHTML = renderModernizationGraph(_modLastUnits, _modLastComponents, _modGraphMode);
 }
 
 // `blocked` is the *default* state of every unit — a unit becomes `ready` only once everything
@@ -6933,6 +7977,10 @@ const MOD_UNIT_STATUS_LABELS = {
   in_progress: 'converting',
   needs_human: 'needs review',
   rolled_up: 'in a component',
+  // Not 'failed'. This unit converted, its output is in the export and shipping; what failed
+  // was a later repair, which was rejected and never replaced it. Showing it in the same red
+  // as a unit that produced nothing is the exact confusion the status split exists to end.
+  repair_failed: 'converted · repair failed',
 };
 
 function modUnitStatusLabel(status) {
@@ -6947,7 +7995,7 @@ function renderModernizationUnits(units) {
   return `<div class="mod-panel">
     <div class="section-title" style="margin-top:0">Files (${units.length}), in conversion order</div>
     <p class="subtitle" style="margin-top:-6px">Click any path to read the original source beside what it was converted into.</p>
-    <div style="max-height:460px;overflow:auto">
+    <div class="mod-scroll-tall">
       <table class="mod-unit-table">
         <thead><tr><th>#</th><th>Level</th><th>File</th><th>Role</th><th>Deps</th><th>Status</th></tr></thead>
         <tbody>
@@ -7016,7 +8064,7 @@ function renderCharterForm(run) {
       const inGroup = fields.filter(f => (f.emphasis || 'optional') === key);
       if (!inGroup.length) return '';
       return `
-        <details class="mod-charter-group" ${key === 'optional' ? '' : 'open'}>
+        <details class="mod-charter-group" ${_modAcc('charter-group-' + key, key !== 'optional')}>
           <summary><strong>${esc(title)}</strong> <span class="mod-meta">${inGroup.length} — ${esc(blurb)}</span></summary>
           <div class="mod-charter-grid">
             ${inGroup.map(f => renderCharterField(f)).join('')}
@@ -7124,14 +8172,37 @@ function cancelModernizationRun() {
   _modAction('cancel', { reason: 'Cancelled from the dashboard' });
 }
 
-async function answerModernizationCheckpoint(checkpointId) {
-  const decision = prompt('Record your decision (kept in the run log):', 'Reviewed and approved');
+// An empty `names` means every candidate on the checkpoint, which is what "Add all" sends
+// and what the backend reads an empty list as. The decision word matters: `_approved_packages`
+// only acts on an explicit approval, so the free-text decision a person types on the generic
+// button can never add a dependency by accident.
+async function approveModernizationPackages(checkpointId, names) {
+  const what = names.length ? names.join(', ') : 'every package listed';
+  if (!confirm(`Add ${what} to the project file? They will be restored from your package `
+             + `feed when this export is built.`)) return;
+  try {
+    await apiFetch(`/api/v1/modernization/checkpoints/${checkpointId}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'approved', answer: { packages: names } }),
+    });
+    await refreshModernizationRun();
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+async function answerModernizationCheckpoint(checkpointId, repair) {
+  const decision = prompt('Record your decision (kept in the run log):',
+    repair ? `Chose ${repair}` : 'Reviewed and approved');
   if (decision === null) return;
   try {
     await apiFetch(`/api/v1/modernization/checkpoints/${checkpointId}/answer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ decision }),
+      // `answer` is what the run reads; `decision` is what the log reads. The repair was
+      // unreachable from here until now because only the second was ever sent.
+      body: JSON.stringify(repair ? { decision, answer: { repair } } : { decision }),
     });
     await refreshModernizationRun();
   } catch (e) {

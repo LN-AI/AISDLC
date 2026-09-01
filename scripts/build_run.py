@@ -412,6 +412,109 @@ def _blocking_kinds(api: str, key: str, run_id: str, token: str, project_id: str
             if c.get("blocking") and c.get("status") == "open"]
 
 
+def _clear_loop_checkpoints(api: str, key: str, run_id: str, token: str,
+                            project_id: str) -> int:
+    """Answer the blocking checkpoints this loop is entitled to answer. -> how many.
+
+    `_LOOP_ANSWERS` names them, and until now it was used only as an *exclusion* list — the
+    test above asks whether anything blocking is open that is not on it, and nothing ever
+    cleared the ones that are. So a run that raised `build_errors_outstanding`, which is exactly
+    what happens once the loop has changed any file, could not be resumed by the loop that
+    changed it: `POST /resume` answers 409 while a blocking checkpoint is open, and the loop
+    stopped one line after deciding it was allowed to continue.
+
+    Answering these is not a judgement. `build_required` and `build_errors_outstanding` both
+    say "somebody has to compile this" — and compiling it is the thing this program is doing.
+    """
+    status, body = _http(f"{api}/api/v1/modernization/runs/{run_id}/checkpoints", key,
+                         token=token, project_id=project_id)
+    if status != 200:
+        return 0
+    rows = json.loads(body)
+    rows = rows.get("checkpoints", rows) if isinstance(rows, dict) else rows
+    cleared = 0
+    for point in rows:
+        if not (point.get("blocking") and point.get("status") == "open"):
+            continue
+        if point.get("kind") not in _LOOP_ANSWERS:
+            continue
+        code, _ = _http(f"{api}/api/v1/modernization/checkpoints/{point['id']}/answer", key,
+                        "POST", {"decision": "compiled by build_run.py"},
+                        token=token, project_id=project_id)
+        if code == 200:
+            cleared += 1
+    return cleared
+
+
+def _finish_run(api: str, key: str, run_id: str, token: str, project_id: str,
+                started: float, deadline_hours: float) -> int:
+    """Resume a run whose evidence is now in, so that it can actually finish. -> exit code.
+
+    The loop resumed a run only to drive *rework*. A clean build returned straight out of the
+    function, so a run whose last obstacle was the build sat `paused` at `reconcile` with
+    nothing blocking it and nobody to push it over the line — the platform had every piece of
+    evidence it had been asking for and still could not say the conversion had finished.
+    Observed on run 8a9612e0: build round 9 reported 0 errors, the startup check probed 8 URLs
+    with 0 failing, and the run only reached `completed` because a person made one more call by
+    hand.
+
+    Ordered after `serve_export` deliberately. The startup gate is raised inside reconcile, so
+    resuming before the application has been started just re-raises it and pauses again; giving
+    the run both pieces of evidence first means one pass finishes it.
+
+    Nothing here is a *decision*. `_clear_loop_checkpoints` still answers only the two build
+    gates this program is entitled to answer, and anything else blocking stops it exactly as it
+    stops the rework path.
+    """
+    run = _manifest(api, key, run_id, token, project_id)
+    if not run:
+        print("The build passed, but the run manifest could not be read to finish it.")
+        return 0
+    if run.get("status") in ("completed", "failed", "cancelled"):
+        print(f"Run is already {run['status']}.")
+        return 1 if run["status"] == "failed" else 0
+
+    held = [k for k in _blocking_kinds(api, key, run_id, token, project_id)
+            if k not in _LOOP_ANSWERS]
+    if held:
+        print(f"Not finishing the run: {', '.join(sorted(set(held)))} needs a human. "
+              f"That is a decision the product asked for, and the build is not what it is "
+              f"waiting on.")
+        return 0
+
+    cleared = _clear_loop_checkpoints(api, key, run_id, token, project_id)
+    if cleared:
+        print(f"  answered {cleared} build checkpoint(s) this loop is responsible for")
+
+    code, body = _http(f"{api}/api/v1/modernization/runs/{run_id}/resume", key, "POST", {},
+                       token=token, project_id=project_id)
+    if code not in (200, 202):
+        print(f"The build passed, but the run could not be resumed to finish it: HTTP {code}"
+              f"\n{body[:300].decode(errors='replace')}")
+        return 0
+
+    while True:
+        if time.time() - started > deadline_hours * 3600:
+            print(f"{deadline_hours}h elapsed while finishing the run.")
+            return 0
+        time.sleep(POLL_SECONDS)
+        run = _manifest(api, key, run_id, token, project_id) or {}
+        if run.get("status") in ("paused", "completed", "failed", "cancelled"):
+            break
+
+    status = run.get("status") or "unknown"
+    if status == "completed":
+        print("Run completed.")
+        return 0
+    # Paused again, or failed. Both are informative rather than silent, which is the whole
+    # point: the reason names either the decision somebody has to make or what is missing.
+    print(f"Run is {status} — {(run.get('paused_reason') or 'no reason recorded').strip()}")
+    remaining = _blocking_kinds(api, key, run_id, token, project_id)
+    if remaining:
+        print(f"  still waiting on: {', '.join(sorted(set(remaining)))}")
+    return 1 if status == "failed" else 0
+
+
 def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
          project_id: str = "", max_rounds: int = 5, deadline_hours: float = 3.0,
          serve: bool = False, connection: str = "") -> int:
@@ -455,8 +558,13 @@ def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
                 # The bar is "compiles and runs", so a clean build is the middle of the check
                 # rather than the end of it. Same workdir: the export was just built there, so
                 # a failure here is provably a runtime failure and not a stale binary.
-                return serve_export(api, key, run_id, workdir, token, project_id, connection)
-            return 0
+                served = serve_export(api, key, run_id, workdir, token, project_id, connection)
+                if served != 0:
+                    # A runtime failure raises its own checkpoint and may queue its own repair.
+                    # Resuming into that is the rework path's job, not this one's, and the
+                    # gates it raises are not on `_LOOP_ANSWERS`.
+                    return served
+            return _finish_run(api, key, run_id, token, project_id, started, deadline_hours)
         if status in _TERMINAL_BUILD_STATUSES:
             print(f"Stopping: the platform reported {status!r}. "
                   f"Read the checkpoint it raised — this is not something another build fixes.")
@@ -468,10 +576,25 @@ def loop(api: str, key: str, run_id: str, keep: str = "", token: str = "",
             print(f"Stopping: {', '.join(sorted(set(held)))} needs a human. "
                   f"That is a decision the product asked for, not a build failure.")
             return 2
-        if not result.get("reopened"):
+        if status == "awaiting_rework":
+            # Not a dead end, and reading it as one stopped a run whose repair was already
+            # queued: the loop built, reopened three units, built *again* without resuming,
+            # saw the same six errors, and gave up while the fix sat in the queue untouched.
+            # The platform's own summary says "resume the run" in those words. Falling through
+            # to the resume below is doing what it asked.
+            print("  the previous round's rework has not been converted yet — resuming "
+                  "rather than rebuilding into the same errors")
+        elif not result.get("reopened"):
             print("Stopping: nothing was reopened, so another build would report the same "
                   "errors. Nothing here can move it forward.")
             return 1
+
+        # Clear what this program is entitled to clear, or the resume below is refused with a
+        # 409 for a checkpoint that says "somebody has to compile this" — which is the thing
+        # this program has just done.
+        cleared = _clear_loop_checkpoints(api, key, run_id, token, project_id)
+        if cleared:
+            print(f"  answered {cleared} build checkpoint(s) this loop is responsible for")
 
         status_code, body = _http(f"{api}/api/v1/modernization/runs/{run_id}/resume", key,
                                   "POST", {}, token=token, project_id=project_id)
