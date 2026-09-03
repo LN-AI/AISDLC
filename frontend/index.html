@@ -524,16 +524,31 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
           <div class="field-hint">Reading the source, filtering it and pricing the work is free — no
             model is called. You are shown the expected cost and a hard ceiling, and asked again
             before anything is spent.</div>
+          <!--
+            Post-back options. Shown only when the source is a GitHub pull request, the same
+            way the token block is: they are meaningless for a paste, and a control that
+            does nothing is worse than no control. This is also the switch that decides
+            which *product* the run is billed against -- see `runReviewFromQuote`.
+          -->
+          <div id="code-gh-options" class="hidden"></div>
           <div id="code-retention-wrap"></div>
           <div id="code-cost-preview" class="hidden"></div>
         </div>
-        <div id="code-result" class="result-area hidden"></div>
-        <div id="code-sources"></div>
+        <!--
+          The run list sits ABOVE the result, height-capped, with its own scrollbar. It was
+          below, and opening a run repainted a long result above it and pushed it off the
+          page -- so switching runs meant leaving the screen and coming back. Modernization
+          hit the same problem from the other direction and its comment says why this is the
+          shape that works: the detail panel is what a reader came for, so the list must not
+          be able to push it away, and the list must not be pushed away either.
+        -->
         <div class="run-history">
           <div class="section-title">Previous runs</div>
-          <p class="subtitle" style="margin-top:-6px">Every review this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran.</p>
-          <div id="code-runs"></div>
+          <p class="subtitle" style="margin-top:-6px">Every review this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="code-runs" class="run-history-scroll"></div>
         </div>
+        <div id="code-result" class="result-area hidden"></div>
+        <div id="code-sources"></div>
       </div>
 
       <!-- Prompt Safety Page -->
@@ -654,59 +669,27 @@ Answer questions about patients based on the provided context."></textarea>
       </div>
 
       <!-- GitHub PR Page -->
+      <!--
+        Retired. This screen reviewed pull requests with its own form, its own handler and
+        its own result renderer -- and without the token field, the cost quote, the progress,
+        the run history, the file inventory or the staged fix that the review screen has.
+        Two implementations of one job is how those gaps appeared, so there is now one, and
+        the nav item lands on it with the source set to GitHub PR.
+      -->
       <div id="page-github" class="page">
         <div class="page-header">
           <h1>GitHub PR Review</h1>
-          <p class="subtitle">Reviews a pull request and reports the result back to GitHub. Findings
-            carry the file and line they are about, so they can be posted as comments on the diff
-            itself. A Red gate can be reported as a commit status, which blocks the merge button under
-            branch protection — the difference between a comment someone may scroll past and a gate.
-            Re-running edits the existing comment rather than adding another.</p>
+          <p class="subtitle">Opening the review screen with a pull request selected…</p>
         </div>
-        <div class="form-card">
-          <div class="section-title" style="margin-top:0">1. The pull request</div>
-          <div class="form-group">
-            <label>GitHub PR URL <span class="required">*</span></label>
-            <input type="url" id="gh-url" placeholder="https://github.com/owner/repo/pull/123" />
-          </div>
-          <div class="form-group">
-            <label>Jira Ticket (optional)</label>
-            <input type="text" id="gh-jira" placeholder="e.g. PROJ-456" />
-          </div>
-
-          <div class="section-title">2. What to post back</div>
-          <div id="gh-options"></div>
-
-          <div class="section-title">3. Run</div>
-          <div class="form-actions">
-            <button class="btn btn-primary" onclick="reviewGithubPR()">
-              <span class="btn-icon">&#128025;</span> Review PR
-            </button>
-            <button class="btn btn-secondary" data-product="auto-fix" onclick="autoFixGithubPR()">
-              <span class="btn-icon">&#128736;</span> Auto-Fix &amp; Open PR
-            </button>
-          </div>
-          <div class="form-group" style="margin-top:12px">
-            <label>Max files to auto-fix (Auto-Fix only)</label>
-            <input type="number" id="gh-max-files" value="5" min="1" max="15" />
-            <div class="field-hint">Auto-Fix works one file per model call and only on findings whose
-              evidence was verified against the source. Files are chosen by where the most severe
-              findings are, not by the order they appear in the diff.</div>
-          </div>
-          <div class="info-box">
-            <strong>What each option needs.</strong> Posting a comment or a review needs
-            <code>GITHUB_TOKEN</code>. Reporting a merge-blocking check needs
-            <code>repo:status</code> on that token. <strong>Auto-Fix additionally needs write
-            access</strong> — it commits to a new <code>lm-autofix/pr-N</code> branch off the PR's head
-            branch and opens a follow-up PR back into it. Every patch is scanned for newly-introduced
-            secrets <em>and</em> re-reviewed before it is committed; a patch that still carries a
-            Critical is refused rather than pushed.
-          </div>
+        <div class="empty-state">
+          Pull request review now lives on the <button class="btn-link"
+            onclick="openPRReview()">Code Review</button> screen, where it gets a cost quote,
+          progress, your project's saved credentials, and the choice of which findings to fix.
+          Everything that posts back to GitHub is still here — it is the
+          <strong>Where the findings go</strong> section of that screen.
         </div>
-        <div id="gh-result" class="result-area hidden"></div>
       </div>
 
-      <!-- Release Gate Page -->
       <div id="page-gate" class="page">
         <div class="page-header">
           <h1>Release Gate</h1>
@@ -1471,13 +1454,21 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div id="vapt-retention-wrap"></div>
           <div id="vapt-cost-preview" class="hidden"></div>
         </div>
-        <div id="vapt-result" class="result-area hidden"></div>
-        <div id="vapt-sources"></div>
+        <!--
+          The run list sits ABOVE the result, height-capped, with its own scrollbar. It was
+          below, and opening a run repainted a long result above it and pushed it off the
+          page -- so switching runs meant leaving the screen and coming back. Modernization
+          hit the same problem from the other direction and its comment says why this is the
+          shape that works: the detail panel is what a reader came for, so the list must not
+          be able to push it away, and the list must not be pushed away either.
+        -->
         <div class="run-history">
           <div class="section-title">Previous runs</div>
-          <p class="subtitle" style="margin-top:-6px">Every assessment this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran.</p>
-          <div id="vapt-runs"></div>
+          <p class="subtitle" style="margin-top:-6px">Every assessment this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="vapt-runs" class="run-history-scroll"></div>
         </div>
+        <div id="vapt-result" class="result-area hidden"></div>
+        <div id="vapt-sources"></div>
       </div>
 
       <!-- Security Review Page -->

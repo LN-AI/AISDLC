@@ -1952,8 +1952,11 @@ check('a group states how many findings it holds', () => {
 section('GitHub post-back');
 
 check('the options offer a way to review without writing to the PR', () => {
-  sandbox.renderGithubOptions();
-  const html = document.getElementById('gh-options').innerHTML;
+  // The block now renders into the review screen's own container -- the separate GitHub PR
+  // screen is retired, because two screens reviewing one artifact is how the token field
+  // and the fix controls ended up on only one of them.
+  sandbox.renderGithubOptions('code-gh-options');
+  const html = document.getElementById('code-gh-options').innerHTML;
   if (!html.includes('value="none"')) throw new Error('no dry-run option');
   if (!html.includes('value="inline"')) throw new Error('no line-comment option');
   if (!html.includes('gh-set-status')) throw new Error('no merge-blocking option');

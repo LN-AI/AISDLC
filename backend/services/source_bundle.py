@@ -320,6 +320,17 @@ def from_github_pr(github, pr_url: str) -> Bundle:
     numbers.
     """
     data = github.get_pr_diff(pr_url)
+    return pr_bundle(data, pr_url)
+
+
+def pr_bundle(data: Dict[str, Any], pr_url: str) -> Bundle:
+    """The same Bundle, from a payload somebody already fetched.
+
+    Split out because `workflows/review_pr.py` and `workflows/autofix_pr.py` call
+    `get_pr_diff` themselves and then need a Bundle to record a source inventory from —
+    fetching the diff a second time to get one would double the request and, on a busy
+    branch, could return a *different* diff than the one being reviewed.
+    """
     diff = data.get("diff") or ""
     if not diff.strip():
         raise SourceError(f"{pr_url} has no reviewable diff — it may be empty or binary-only.")
@@ -345,6 +356,12 @@ def from_github_pr(github, pr_url: str) -> Bundle:
             # than making each caller know which shape it is looking at.
             "commit_sha": data.get("head_sha") or "",
             "repo_url": pr_url.split("/pull/")[0],
+            # What decides whether a fix may be committed into this PR rather than into a
+            # new one. Carried on the bundle so the inventory records it and the choice can
+            # be offered honestly later, without re-fetching the pull request.
+            "head_branch": data.get("head_branch") or "",
+            "from_fork": bool(data.get("from_fork")),
+            "maintainer_can_modify": bool(data.get("maintainer_can_modify")),
         },
     )
 

@@ -161,6 +161,17 @@ def run(orch, pr_url: str, jira_ticket: str = "", max_files: int = 5) -> Dict[st
     code_result["review_id"] = review_id
     base_result["review_id"] = review_id
 
+    # Same reason as in `review_pr.py`: without an inventory the findings this returns carry
+    # fix controls that cannot resolve a file. See that comment for why retention is 0.
+    try:
+        from backend.services import review_source_store, source_bundle
+        review_source_store.record(
+            review_id, source_bundle.pr_bundle(pr_data, pr_url), retention_days=0,
+            findings=code_result.get("findings") or [],
+        )
+    except Exception:
+        logger.exception("Could not record the source inventory for auto-fix %s", review_id)
+
     fix_branch = f"lm-autofix/pr-{pr_number}"
     orch.github.create_branch(owner, repo, fix_branch, pr_data["head_branch"])
 

@@ -606,23 +606,63 @@ def main():
             check("a single uploaded file can be priced for VAPT", ok, text)
             shot(page, "quote-vapt-file")
 
-            # ── 10. GitHub PR screen ──────────────────────────────────────
-            section("10. GitHub PR screen — the post-back choices")
+            # ── 10. One review screen, post-back included ─────────────────
+            #
+            # There were two screens reviewing a pull request, and the only real difference
+            # was whether the result was written back to GitHub -- which is a checkbox. The
+            # rest of the difference was features one had and the other lacked because they
+            # were only ever built once: the token field, the cost quote, progress, the run
+            # history, the staged fix. Both defects a user reported this week were that
+            # divergence showing, so there is now one screen.
+            section("10. The post-back choices live on the review screen")
             goto_page(page, "GitHub PR")
-            check("the GitHub page is showing", page.locator("#page-github").is_visible())
-            opts = page.locator("#gh-options").inner_text()
+            check("the GitHub PR nav item lands on the review screen",
+                  page.locator("#page-code").is_visible(),
+                  "the separate screen is retired; the nav item is an entry point into this one")
+            check("...with the pull-request source already selected",
+                  page.locator("#code-src-pr").is_visible(),
+                  "landing on a paste form after clicking 'GitHub PR' would be a puzzle")
+            check("...and the post-back options revealed",
+                  page.locator("#code-gh-options").is_visible())
+
+            opts = page.locator("#code-gh-options").inner_text()
             check("a summary-comment mode is offered", "summary comment" in opts.lower(), opts)
             check("a line-comment mode is offered", "diff lines" in opts.lower(), opts)
             check("a do-not-post mode is offered", "Do not post" in opts, opts)
             check("merge blocking is offered",
-                  page.locator("#gh-set-status").count() == 1, opts)
+                  page.locator("#code-gh-options #gh-set-status").count() == 1, opts)
             check("...and is on by default", page.is_checked("#gh-set-status"))
             check("requesting changes is offered but off by default",
                   page.locator("#gh-request-changes").count() == 1
                   and not page.is_checked("#gh-request-changes"))
-            check("the screen says what each option needs from the token",
-                  "repo:status" in page.locator("#page-github").inner_text())
-            shot(page, "github-screen")
+            check("it says what the merge check needs from the token",
+                  "repo:status" in opts, opts[:200])
+
+            # The gap that started all this: the PR screen had no token field, because the
+            # fix was only ever applied to the other screen.
+            check("a pull request now offers a token field, like every other GitHub source",
+                  page.locator("#code-gh-token").is_visible(),
+                  "the separate screen never had one and fell through to the environment")
+            check("...and the run is priced first, which the old screen never did",
+                  page.locator("#page-code button:has-text('Estimate cost')").count() >= 1)
+
+            # Writing back is meaningless for a paste, and a control that does nothing is
+            # worse than no control.
+            pick_source(page, "code", "Paste")
+            check("the post-back options are hidden for a paste",
+                  not page.locator("#code-gh-options").is_visible(),
+                  "there is no thread to comment on")
+            pick_source(page, "code", "GitHub repo")
+            check("...and hidden for a repository at a ref, which has no thread either",
+                  not page.locator("#code-gh-options").is_visible())
+            pick_source(page, "code", "GitHub PR")
+            check("...and back when a pull request is selected again",
+                  page.locator("#code-gh-options").is_visible())
+            shot(page, "merged-pr-options")
+
+            check("the retired screen explains where its controls went",
+                  "Code Review" in page.locator("#page-github").inner_text(),
+                  "a screen that vanished with no explanation is worse than one that moved")
 
             # ── 11. Findings screen still works ───────────────────────────
             section("11. The surrounding screens still load")
@@ -697,6 +737,48 @@ def main():
                 check("...with line numbers, so file.py:12 can be found by eye",
                       page.locator("#code-file-view td.ln").count() > 1)
                 shot(page, "file-inventory")
+
+                # ── 13b. The run list stays reachable ─────────────────────
+                #
+                # It was below the result, so opening a run repainted a long result above it
+                # and pushed it off the page -- switching runs meant leaving the screen and
+                # coming back. Modernization hit this from the other direction and its
+                # comment says why the list goes above, capped, with its own scrollbar.
+                section("13b. Opening a run does not hide the other runs")
+                page.wait_for_timeout(400)
+                check("the run list is present with the result open",
+                      page.locator("#code-runs").count() == 1)
+                runs_box = page.locator("#code-runs")
+                check("...and visible, not pushed off the page",
+                      runs_box.is_visible(),
+                      "this is the whole complaint: the list was below a long result")
+                check("...and rendered above the result it describes",
+                      page.evaluate("""() => {
+                          const runs = document.getElementById('code-runs');
+                          const res = document.getElementById('code-result');
+                          if (!runs || !res) return false;
+                          return runs.compareDocumentPosition(res)
+                                 & Node.DOCUMENT_POSITION_FOLLOWING;
+                      }"""),
+                      "below the result is what made it unreachable")
+                check("...and capped so fifty runs cannot bury the result",
+                      page.evaluate("""() => {
+                          const el = document.getElementById('code-runs');
+                          const max = getComputedStyle(el).maxHeight;
+                          return max !== 'none' && parseFloat(max) > 0;
+                      }"""))
+                cards = page.locator("#code-runs .run-card")
+                if cards.count() >= 1:
+                    cards.nth(0).click()
+                    page.wait_for_timeout(900)
+                    check("clicking a run still leaves the list on screen",
+                          page.locator("#code-runs").is_visible()
+                          and page.locator("#code-runs .run-card").count() >= 1,
+                          "so a second run can be opened without leaving the screen")
+                    check("...and marks which one is open",
+                          page.locator("#code-runs .run-card.selected").count() == 1,
+                          "with two runs at the same gate an unmarked swap reads as a dead control")
+                shot(page, "run-list-persists")
 
 
             section("14. The project field is a caption, not a form row")

@@ -2454,7 +2454,11 @@ table.code-view tr:hover td.src { background: rgba(255,255,255,.04); }
    and a selected state -- without which clicking a second run swaps the panel
    below in place and reads as a dead control. */
 .run-history { margin-top: 22px; }
-.run-list { display: grid; gap: 8px; max-height: 420px; overflow-y: auto; }
+/* Capped so a project with fifty runs cannot push the result it is about off the screen,
+   and scrollable so every run stays reachable while one is open. 38vh rather than a pixel
+   height: on a laptop a fixed 420px is most of the viewport. */
+.run-history-scroll { max-height: 38vh; overflow-y: auto; }
+.run-list { display: grid; gap: 8px; }
 .run-card {
   background: var(--surface); border: 1px solid var(--border); border-left: 3px solid transparent;
   border-radius: 6px; padding: 10px 14px; cursor: pointer;
@@ -2519,3 +2523,9 @@ pre.fix-diff {
   margin: 0; padding: 12px 14px; white-space: pre; overflow-x: auto;
   font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px; line-height: 1.5;
 }
+
+/* An option that exists and cannot be used here, with the reason attached. Listing it
+   greyed out beats omitting it: "this option is missing" is a worse answer for a reader
+   than "here is why it does not apply to your pull request". */
+.radio-stack label.radio-off { color: var(--text-muted); cursor: not-allowed; }
+.radio-stack .radio-why { font-style: italic; }

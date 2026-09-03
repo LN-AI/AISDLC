@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # Where a fix can go. `pr` needs a GitHub source and a token with write access; `zip` and
 # `diff` need neither and write nothing anywhere.
-OUTPUTS = ("pr", "branch", "zip", "diff")
+OUTPUTS = ("pr", "same_pr", "branch", "zip", "diff")
 
 # Most files one request may fix. Not a technical limit — each file is an independent call, so
 # fifty files would work and cost fifty calls. It is a guard against a click that spends more
@@ -214,14 +214,38 @@ def _available_outputs(source: Dict[str, Any]) -> List[Dict[str, str]]:
          "note": "A zip of the patched files plus a unified diff. Unbuilt and untested."},
     ]
     if source.get("source_type") in review_source_store.REFETCHABLE and source.get("ref"):
-        out[:0] = [
-            {"id": "pr", "label": "Open a pull request",
+        writes = [
+            {"id": "pr", "label": "Open a new pull request",
              "note": "A branch off the commit this review read, then a pull request against "
                      "the branch it came from. Nothing lands without a human merging it. "
                      "Needs 'Contents: Read and Write' on the token."},
-            {"id": "branch", "label": "Push a branch only",
-             "note": "The branch is created and you open the pull request yourself."},
         ]
+        # Committing into the pull request under review is what most teams want -- one pull
+        # request, fixed, rather than a pull request to fix a pull request. It is offered
+        # second and never chosen for you, because it rewrites a branch somebody else may be
+        # working on. Where it is impossible, it is still listed with the reason: "this
+        # option is missing" is a worse answer than "here is why it cannot be used".
+        if source.get("head_branch"):
+            if source.get("writable"):
+                writes.append({
+                    "id": "same_pr",
+                    "label": f"Commit into this pull request ({source['head_branch']})",
+                    "note": "The fix lands in the pull request being reviewed, so there is "
+                            "one thing to merge instead of two. It rewrites that branch — "
+                            "anyone working on it locally will need to pull before they "
+                            "commit again.",
+                })
+            else:
+                writes.append({
+                    "id": "same_pr", "label": "Commit into this pull request",
+                    "unavailable": source.get("write_blocked") or (
+                        "This pull request's branch cannot be written to."),
+                    "note": source.get("write_blocked") or "",
+                })
+        writes.append(
+            {"id": "branch", "label": "Push a branch only",
+             "note": "The branch is created and you open the pull request yourself."})
+        out[:0] = writes
     return out
 
 
@@ -338,10 +362,17 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
             f"than you meant.")
 
     source = review_source_store.summarize(review_id)
-    if output in ("pr", "branch") and not (source.get("ref") and source.get("commit_sha")):
+    if output in ("pr", "branch", "same_pr") and not (
+            source.get("ref") and source.get("commit_sha")):
         raise FixError(
             "This review's source is not a repository this platform can write to, so a "
             "branch cannot be created. Download the changed files instead.")
+    if output == "same_pr" and not source.get("writable"):
+        # Refused here rather than at the push, so the money is not spent first.
+        raise FixError(
+            source.get("write_blocked")
+            or "This review's source is not a pull request with a branch that can be "
+               "written to. Open a new pull request instead.")
 
     # The files, as the review saw them. Read one at a time so a single unreadable file is a
     # skipped file rather than a failed run.
@@ -442,11 +473,19 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     except Exception:
         logger.warning("Falling back to the shared GitHub client for %s", repo_url)
 
-    # Branched off the commit the review actually read, not off whatever the branch has since
-    # become: a patch computed against last week's file, committed on top of this week's, is
-    # how a fix silently reverts somebody else's change.
-    branch = f"lm-fix/review-{review_id[:8]}"
-    gh.create_branch(owner, repo, branch, source["commit_sha"])
+    if output == "same_pr":
+        # No new branch: the fix is committed onto the pull request's own head branch, which
+        # is the whole point of this option. Nothing is branched off the reviewed commit
+        # here because the target *is* that branch -- if it has moved since the review, the
+        # commit lands on top of the newer tip, which is the correct behaviour for "fix this
+        # pull request" and is why the diff is shown before this is offered.
+        branch = source["head_branch"]
+    else:
+        # Branched off the commit the review actually read, not off whatever the branch has
+        # since become: a patch computed against last week's file, committed on top of this
+        # week's, is how a fix silently reverts somebody else's change.
+        branch = f"lm-fix/review-{review_id[:8]}"
+        gh.create_branch(owner, repo, branch, source["commit_sha"])
     committed = []
     message = result["commit_message"] or f"fix: remediate findings from review {review_id[:8]}"
     for p in safe:
@@ -457,6 +496,15 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     result["branch"] = branch
     result["committed"] = committed
     result["base_commit"] = source["commit_sha"]
+
+    if output == "same_pr":
+        result["note"] = (
+            f"{len(committed)} file(s) committed straight onto `{branch}`, the branch this "
+            f"pull request is built from — so the fix is now part of the pull request being "
+            f"reviewed rather than a second one. Anyone with that branch checked out locally "
+            f"should pull before they commit again.")
+        result["same_pr"] = True
+        return result
 
     if output == "branch":
         result["note"] = (

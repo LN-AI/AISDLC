@@ -76,6 +76,13 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             -- The commit the review actually read. Empty for a zip or a paste. This is what
             -- makes a re-fetch honest; a branch name here would not be.
             commit_sha      TEXT DEFAULT '',
+            -- Where a fix may go. A pull request can sometimes be committed into directly,
+            -- which is what people usually want; whether it can is a property of the pull
+            -- request (fork? maintainer edits allowed?) and is not knowable later without
+            -- re-fetching it, so it is recorded when it is known.
+            head_branch     TEXT DEFAULT '',
+            writable        INTEGER DEFAULT 0,
+            write_blocked   TEXT DEFAULT '',
             files_included  INTEGER DEFAULT 0,
             files_excluded  INTEGER DEFAULT 0,
             total_chars     INTEGER DEFAULT 0,
@@ -113,6 +120,16 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             ON review_sources(expires_at);
         """
     )
+    # `CREATE TABLE IF NOT EXISTS` never revisits a table that exists, so a column added to
+    # the DDL above is missing on every database created before it. Same pattern as
+    # `database.init_db`'s ALTERs, and the same reason.
+    for _col, _type in (("head_branch", "TEXT DEFAULT ''"),
+                        ("writable", "INTEGER DEFAULT 0"),
+                        ("write_blocked", "TEXT DEFAULT ''")):
+        try:
+            cursor.execute(f"ALTER TABLE review_sources ADD COLUMN {_col} {_type}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 def normalize_retention(value: Any) -> int:
@@ -200,6 +217,25 @@ def _language_for(path: str) -> str:
         ".json": "JSON", ".xml": "XML", ".html": "HTML", ".css": "CSS", ".vue": "Vue",
         ".pas": "Pascal", ".dfm": "Delphi form", ".tf": "Terraform", ".md": "Markdown",
     }.get(ext, "")
+
+
+def _write_target(bundle) -> tuple:
+    """`(head_branch, writable, write_blocked)` — whether a fix may go into this PR itself.
+
+    Only a pull request has an answer. A fork's head branch belongs to the contributor and
+    is writable only if they allowed maintainer edits; anything else has no branch of its
+    own to commit into and gets a new one.
+    """
+    meta = bundle.meta or {}
+    branch = meta.get("head_branch") or ""
+    if bundle.source_type != "github_pr" or not branch:
+        return ("", 0, "")
+    if meta.get("from_fork") and not meta.get("maintainer_can_modify"):
+        return (branch, 0, (
+            "This pull request comes from a fork and its author has not allowed edits from "
+            "maintainers, so its branch cannot be written to. A fix has to go into a new "
+            "pull request."))
+    return (branch, 1, "")
 
 
 def record(review_id: str, bundle, retention_days: int,
@@ -314,14 +350,16 @@ def record(review_id: str, bundle, retention_days: int,
         cur = conn.cursor()
         cur.execute(
             """INSERT INTO review_sources
-               (review_id, source_type, label, ref, commit_sha, files_included,
+               (review_id, source_type, label, ref, commit_sha, head_branch, writable,
+                write_blocked, files_included,
                 files_excluded, total_chars, retention_days, expires_at, content_stored,
                 storage_note, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(review_id) DO NOTHING""",
             (review_id, bundle.source_type, bundle.label or "",
              (bundle.meta or {}).get("repo_url") or bundle.ref or "",
              (bundle.meta or {}).get("commit_sha", "") or (bundle.meta or {}).get("head_sha", ""),
+             *_write_target(bundle),
              # The number of files actually inventoried, which for a diff is the files it
              # touches rather than the one pseudo-file the bundle holds.
              sum(1 for r in rows if r["included"]), len(bundle.skipped), bundle.total_chars,

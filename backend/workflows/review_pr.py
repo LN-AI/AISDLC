@@ -31,6 +31,14 @@ WORKFLOW_ID = "github-pr-review"
 POST_MODES = ("summary", "inline", "none")
 
 
+# The stages, in order, so a caller can show a person where a run has got to. Named rather
+# than counted because "3 of 5" says nothing: the interesting information is *which* step,
+# and the slowest one -- re-reading the diff under a model -- is the one that most looks like
+# a hang when it is unlabelled.
+STAGES = ("Fetching the pull request", "Reviewing the diff", "Reporting back to GitHub",
+          "Reporting the merge check")
+
+
 def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
         set_status: bool = True, request_changes: bool = False,
         on_progress=None) -> Dict[str, Any]:
@@ -39,6 +47,20 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
             f"Unknown post_mode '{post_mode}'. Expected one of: {', '.join(POST_MODES)}."
         )
 
+    # `on_progress` from `job_service` takes (step, total, label); the reviewer's fan-out
+    # reports (done, total) about *chunks*. `stage` reports the outer steps and `chunk_stage`
+    # adapts the inner ones onto the same bar, so a person sees "Reviewing the diff -- piece
+    # 3 of 7" rather than either number on its own.
+    def stage(index: int, label: str = "") -> None:
+        if on_progress:
+            on_progress(index, len(STAGES), label or STAGES[index])
+
+    def chunk_stage(done: int, total: int) -> None:
+        if on_progress:
+            on_progress(1, len(STAGES),
+                        f"{STAGES[1]} — piece {done} of {total}")
+
+    stage(0)
     pr_data = orch.github.get_pr_diff(pr_url)
 
     context = f"GitHub PR: {pr_data['title']}\nBranch: {pr_data['head_branch']} → {pr_data['base_branch']}"
@@ -57,6 +79,7 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
     # Chunk-aware budget reservation. Without this a large PR reserved for one call and
     # could spend past a cap that had already been checked — the workflow half of C-17,
     # which `POST /api/v1/agents/code` fixed for itself and the workflows did not.
+    stage(1, f"{STAGES[1]} — {len(changed) or 1} file(s) changed")
     with agent_guard.expect_calls(code_chunker.estimate_chunks(wrapped)):
         code_result = orch.code_agent.review_code(
             code=wrapped,
@@ -70,7 +93,7 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
                 f"The PR diff was truncated to {len(pr_data['diff']):,} of "
                 f"{pr_data.get('diff_full_chars', 0):,} characters; the remainder was not reviewed."
             ),
-            on_progress=on_progress,
+            on_progress=chunk_stage,
         )
 
     review_id = database.save_review(
@@ -84,6 +107,24 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
     # callers unable to link the PR comment back to the stored review.
     code_result["review_id"] = review_id
 
+    # Which files this review looked at, so the result screen can list them and so a person
+    # can select findings and have them fixed. Without it the fix controls on the finding
+    # cards were present and could not work — they route by `file_path`, and nothing had
+    # recorded that this review's paths were the ones the diff touches.
+    #
+    # `retention_days=0`: a diff carries only changed lines, so there is nothing worth
+    # keeping. A whole file is re-read from the repository at `head_sha` when one is needed,
+    # which is both more useful and less to hold.
+    try:
+        from backend.services import review_source_store, source_bundle
+        review_source_store.record(
+            review_id, source_bundle.pr_bundle(pr_data, pr_url), retention_days=0,
+            findings=code_result.get("findings") or [],
+        )
+    except Exception:
+        # Never allowed to fail a review that has already been paid for.
+        logger.exception("Could not record the source inventory for PR review %s", review_id)
+
     result: Dict[str, Any] = {
         "pr_url": pr_url,
         "pr_title": pr_data["title"],
@@ -94,6 +135,7 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
         "post_mode": post_mode,
     }
 
+    stage(2, "Not posting anything to GitHub" if post_mode == "none" else STAGES[2])
     comment = orch.github.format_pr_review_comment(code_result)
     if post_mode == "none":
         # Returned rather than posted, so the caller can show exactly what *would* have been
@@ -113,6 +155,7 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
         result["post_detail"] = posted
 
     if set_status:
+        stage(3)
         # Best-effort and reported, never fatal. A token without `repo:status` should not
         # lose the review that has already been paid for and stored.
         try:
@@ -132,4 +175,5 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
             logger.exception("Could not set the commit status for %s", pr_url)
             result["status_check"] = {"posted": False, "reason": str(exc)[:200]}
 
+    stage(len(STAGES), "Done")
     return result

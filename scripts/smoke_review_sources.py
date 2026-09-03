@@ -1581,6 +1581,136 @@ def main():
         check("...and echoes which product was asked for",
               _route.json().get("product_id") == "code")
 
+        # ── 24. One review surface, two products ──────────────────────────
+        #
+        # The GitHub PR screen and the Code Review screen reviewed the same artifact, and the
+        # only real difference was whether the result was written back. Everything else was a
+        # feature one had and the other lacked because it was built once -- which is how the
+        # missing token field and the non-working fix controls both happened. Merged, with
+        # the *products* deliberately kept apart: a customer entitled to review but not to
+        # writing on their pull requests still has to be refused.
+        section("24. The merged PR surface -- stages, and products kept apart")
+
+        from backend.workflows import review_pr as _rpr
+
+        check("the PR review reports named stages, not a count",
+              len(_rpr.STAGES) >= 4 and all(isinstance(s, str) for s in _rpr.STAGES),
+              str(_rpr.STAGES))
+        check("...including the slow one, which most looks like a hang unlabelled",
+              any("Reviewing" in s for s in _rpr.STAGES), str(_rpr.STAGES))
+        check("an async PR route exists to report them on",
+              "/api/github/pr/async" in client.app.openapi()["paths"]
+              if hasattr(client, "app") else True)
+        from backend.main import app as _app2
+        _p2 = _app2.openapi()["paths"]
+        check("the async route is registered", "/api/github/pr/async" in _p2)
+        check("...and the synchronous one is kept, since it is the documented API",
+              "/api/github/pr" in _p2,
+              "verify_pr_review.py drives it, and an API surface is a promise")
+
+        _async_meta = _p2["/api/github/pr/async"]["post"]
+        check("the async route answers 202, not 200",
+              "202" in _async_meta.get("responses", {}), str(list(
+                  _async_meta.get("responses", {}))))
+
+        # The stage adapter. The reviewer's fan-out reports chunks; the workflow reports
+        # outer steps. Both have to land on one bar or the number is meaningless.
+        _seen = []
+        scripted["code"] = code_response([dict(SQLI)], gate="Red")
+
+        class _StageGitHub(_PRGitHub):
+            pass
+
+        _sg = _StageGitHub()
+        _orig_github = orchestrator_module.SDLCOrchestrator.__init__ if False else None
+        from backend.services.orchestrator import SDLCOrchestrator as _Orch2
+        _orch2 = _Orch2()
+        _orch2.github = _sg
+        _sg.format_pr_review_comment = lambda r: "comment"
+        _sg.upsert_pr_comment = lambda url, body: {"posted": True, "action": "created"}
+        _sg.post_pr_review = lambda *a, **k: {"posted": True}
+        _sg.parse_pr_url = lambda url: ("acme", "portal", 1)
+        _sg.get_pr_head_sha = lambda url: PR_SHA
+        _sg.set_commit_status = lambda *a, **k: {"posted": True}
+
+        _res = _rpr.run(_orch2, "https://github.com/acme/portal/pull/1",
+                        post_mode="summary", set_status=True,
+                        on_progress=lambda i, total, label: _seen.append((i, total, label)))
+        check("every stage is reported as it happens", len(_seen) >= 4, str(_seen))
+        check("...with a label a person can read, not an index",
+              all(lbl for _, _, lbl in _seen), str(_seen))
+        check("...and the chunk progress folds into the reviewing stage",
+              any("piece" in lbl for _, _, lbl in _seen), str([l for _, _, l in _seen]))
+        check("the total never changes mid-run, so the bar cannot go backwards",
+              len({total for _, total, _ in _seen}) == 1,
+              str({total for _, total, _ in _seen}))
+        check("the review still posts back and reports what reached GitHub",
+              _res.get("comment_posted") is True and _res.get("status_check"),
+              str(_res.get("status_check")))
+        check("...and its stored review now has a source inventory",
+              _store.get_inventory(_res["review_id"])["total"] >= 2,
+              "without it the fix controls on its findings could not resolve a file -- "
+              "which is the defect a user hit on this exact screen")
+
+        # ── 25. Where a fix may go ────────────────────────────────────────
+        #
+        # Your call: offer both, default to a new pull request. Committing into the pull
+        # request under review is what most teams want, and it rewrites a branch somebody
+        # else may be working on -- so it is offered, never chosen for you, and where it is
+        # impossible it is still listed with the reason.
+        section("25. Fixing into the pull request itself, or into a new one")
+
+        check("same_pr is an offered delivery", "same_pr" in fix_apply.OUTPUTS,
+              str(fix_apply.OUTPUTS))
+
+        _same_plan = fix_apply.plan(pr_rid, [f["id"] for f in json.loads(
+            database.get_review(pr_rid)["result_json"])["findings"]])
+        _outs = {o["id"]: o for o in _same_plan["outputs"]}
+        check("a new pull request is offered first, so it is the default",
+              _same_plan["outputs"][0]["id"] == "pr",
+              str([o["id"] for o in _same_plan["outputs"]]))
+        check("...and committing into this pull request is offered too",
+              "same_pr" in _outs, str(sorted(_outs)))
+        check("...naming the branch it would write to",
+              "feat/cb-104" in _outs["same_pr"]["label"], _outs["same_pr"]["label"])
+        check("...and warning that it rewrites a branch others may hold",
+              "rewrites" in _outs["same_pr"]["note"], _outs["same_pr"]["note"][:140])
+
+        # A fork PR whose author did not allow maintainer edits cannot be written to, and
+        # discovering that by attempting the push means discovering it after the spend.
+        fork_bundle = source_bundle.pr_bundle(
+            {**_prgh.get_pr_diff("https://github.com/acme/portal/pull/2"),
+             "from_fork": True, "maintainer_can_modify": False},
+            "https://github.com/acme/portal/pull/2")
+        fork_rid = database.save_review("code", "carebrief", "PR #2", "x",
+                                        {"findings": _copy.deepcopy(PR_FINDINGS),
+                                         "gate_status": "Red"})
+        _store.record(fork_rid, fork_bundle, retention_days=0, findings=PR_FINDINGS)
+        fork_src = _store.summarize(fork_rid)
+        check("a fork PR without maintainer edits is recorded as not writable",
+              not fork_src["writable"], str(fork_src.get("writable")))
+        check("...with the reason, so a screen can say why rather than hiding the option",
+              "fork" in fork_src["write_blocked"], fork_src["write_blocked"][:140])
+        fork_outs = {o["id"]: o for o in fix_apply.plan(
+            fork_rid, [f["id"] for f in json.loads(
+                database.get_review(fork_rid)["result_json"])["findings"]])["outputs"]}
+        check("the option is still listed, marked unavailable",
+              fork_outs.get("same_pr", {}).get("unavailable"),
+              "'this option is missing' is a worse answer than 'here is why it cannot be used'")
+        try:
+            fix_apply.apply(None, fork_rid, output="same_pr")
+            check("...and attempting it is refused before anything is spent", False, "no error")
+        except fix_apply.FixError as exc:
+            check("...and attempting it is refused before anything is spent",
+                  "fork" in str(exc) or "cannot be written" in str(exc), str(exc)[:160])
+
+        # A same-repo PR keeps the option live.
+        check("a same-repo pull request is writable",
+              bool(_store.summarize(pr_rid)["writable"]))
+        check("...and its head branch is recorded, which is what a commit needs",
+              _store.summarize(pr_rid)["head_branch"] == "feat/cb-104",
+              _store.summarize(pr_rid)["head_branch"])
+
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")
 

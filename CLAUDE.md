@@ -140,6 +140,13 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   price table. `sarif.py` exports a finished review in the format GitHub code scanning and
   most security dashboards read.
 
+  **One screen reviews everything, including pull requests.** The separate GitHub PR screen
+  is retired (D-267); its nav item opens the review screen with the source pre-set, and the
+  post-back options appear only for a pull-request source. The *products* are still two: a
+  run that will write to GitHub goes to `/api/github/pr/async` (`github-pr-review`), one that
+  will not goes to `/api/review/code/source` (`code`) — merging the screens deliberately did
+  not merge the entitlement, quota or budget.
+
   Two behavioural notes that surprise people: a review over four model calls returns **202 and
   a job id** (`/api/review/jobs/{id}` for progress) rather than blocking; and every screen
   asks for a **cost quote first** — `/preflight` is free, calls no model, and the run button

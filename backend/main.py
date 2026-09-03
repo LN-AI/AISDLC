@@ -1363,6 +1363,73 @@ async def review_github_pr(req: GithubPRRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/github/pr/async", status_code=202)
+async def review_github_pr_async(req: GithubPRRequest, request: Request):
+    """Start a PR review, return a job id, and report which stage it is on.
+
+    The synchronous route above stays: it is the documented API surface and
+    `verify_pr_review.py` drives it. This one exists because the browser needs to say *what*
+    is happening. A PR review fetches a diff, reviews it in n pieces, writes a comment and
+    reports a merge check, and behind one spinner and one static sentence all of that is
+    indistinguishable from a hang — most of all the reviewing step, which is the slow one.
+
+    Guarded before the 202 for the same reason the review jobs are: a refusal has to reach
+    the caller as a 402/403/429 now, not as an accepted job that dies a minute later with
+    nobody watching.
+    """
+    if not req.pr_url:
+        raise HTTPException(status_code=400, detail="PR URL is required")
+    _require_llm()
+
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    # Stashed now: `_run` executes on a background thread with no request headers, and
+    # without this the job would meter against no project at all.
+    caller["_subject"] = subject_service.resolve_subject(caller, request.headers)
+    check_project_rate_limit(caller["_subject"], request.url.path)
+
+    # The real chunk count is not knowable without fetching the diff, which costs a request
+    # and is the first thing the job does anyway. `expect_calls` therefore reserves for the
+    # documented per-product allowance; the fan-out's own reservation inside the workflow
+    # (C-17) is what bounds a large diff.
+    try:
+        with agent_guard.expect_calls(2):
+            agent_guard.preflight(caller["_subject"], "github-pr-review")
+    except Exception as exc:
+        status, detail = format_error_response(exc, agent_name="github-pr-review")
+        raise HTTPException(status, detail)
+
+    def _run(on_progress):
+        return agent_guard.guarded_call(
+            caller, "github-pr-review", None, skip_preflight=True,
+            project_name=req.pr_url,
+            fn=lambda: orchestrator.review_github_pr(
+                pr_url=req.pr_url,
+                jira_ticket=req.jira_ticket or "",
+                include_prompt_review=req.include_prompt_review,
+                post_mode=req.post_mode,
+                set_status=req.set_status,
+                request_changes=req.request_changes,
+                on_progress=on_progress,
+            ),
+        )
+
+    from backend.workflows.review_pr import STAGES as _PR_STAGES
+
+    job_id = job_service.start_job("github-pr-review", total_steps=len(_PR_STAGES),
+                                   run_fn=_run)
+    logger.info("Started PR review job %s for %s (post_mode=%s)",
+                job_id, req.pr_url, req.post_mode)
+    return {
+        "job_id": job_id,
+        "status": "accepted",
+        "agent": "github-pr-review",
+        "stages": list(_PR_STAGES),
+        "poll_url": f"/api/review/jobs/{job_id}",
+    }
+
+
 @app.post("/api/github/pr/auto-fix")
 async def auto_fix_github_pr(req: GithubAutoFixRequest):
     if not req.pr_url:

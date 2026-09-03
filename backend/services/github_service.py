@@ -221,6 +221,17 @@ class GitHubService:
             # branch name cannot do that, because the branch moves.
             "head_sha": pr_data.get("head", {}).get("sha", ""),
             "base_sha": pr_data.get("base", {}).get("sha", ""),
+            # Whether a fix may be committed into this pull request's own branch. Both were
+            # in the response and dropped. A fork's head branch belongs to the contributor,
+            # so pushing to it is refused unless they allowed maintainer edits -- and finding
+            # that out by attempting the push means discovering it after the money is spent.
+            "head_repo": ((pr_data.get("head") or {}).get("repo") or {}).get("full_name", ""),
+            "base_repo": ((pr_data.get("base") or {}).get("repo") or {}).get("full_name", ""),
+            "from_fork": bool(
+                ((pr_data.get("head") or {}).get("repo") or {}).get("full_name")
+                and ((pr_data.get("head") or {}).get("repo") or {}).get("full_name")
+                != ((pr_data.get("base") or {}).get("repo") or {}).get("full_name")),
+            "maintainer_can_modify": bool(pr_data.get("maintainer_can_modify")),
             "diff": diff_text,
             "diff_truncated": diff_truncated,
             "diff_full_chars": diff_full_chars,

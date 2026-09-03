@@ -360,7 +360,10 @@ document.querySelectorAll('.nav-item').forEach(item => {
       // project's runs is worse than no history list.
       loadAgentRuns(page);
     }
-    if (page === 'github') renderGithubOptions();
+    // The GitHub PR screen is retired -- the nav item lands on the review screen with
+    // the source already set, so there is one implementation of reviewing a pull
+    // request rather than two that drift apart.
+    if (page === 'github') openPRReview();
     if (page === 'history') loadHistory();
     if (page === 'knowledge-base') { loadKBCategories(); loadKnowledgeBase(); }
     if (page === 'cost-optimization') loadCostOptimizationPage();
@@ -2314,8 +2317,11 @@ function renderFixPlan(reviewId, d, picked) {
       <div class="form-group">
         <label>Where the fix goes</label>
         <div class="radio-stack">
-          ${outs.map((o, i) => `<label><input type="radio" name="fix-output" value="${esc(o.id)}"${i === 0 ? ' checked' : ''} />
-            <b>${esc(o.label)}</b> — ${esc(o.note)}</label>`).join('')}
+          ${outs.map((o, i) => `<label class="${o.unavailable ? 'radio-off' : ''}">
+            <input type="radio" name="fix-output" value="${esc(o.id)}"${i === 0 ? ' checked' : ''}${o.unavailable ? ' disabled' : ''} />
+            <b>${esc(o.label)}</b>${o.unavailable
+              ? ` — <span class="radio-why">cannot be used: ${esc(o.unavailable)}</span>`
+              : (o.note ? ` — ${esc(o.note)}` : '')}</label>`).join('')}
         </div>
       </div>
       <div class="cost-actions">
@@ -8919,6 +8925,14 @@ function setSourceMode(agent, mode) {
   const authBox = document.getElementById(`${agent}-src-auth`);
   if (authBox) authBox.classList.toggle('hidden', !isGithub);
   if (isGithub) showResolvedCredential(agent);
+  // Writing back only means something for a pull request: a comment goes on a thread, and a
+  // repository at a ref has no thread. Shown by the same rule as the credential block above.
+  const ghOpts = document.getElementById(`${agent}-gh-options`);
+  if (ghOpts) {
+    const isPr = mode === 'pr';
+    ghOpts.classList.toggle('hidden', !isPr);
+    if (isPr) renderGithubOptions(`${agent}-gh-options`);
+  }
   // In compare mode the branch/tag box is meaningless — base and head replace it.
   const refBox = document.getElementById(`${agent}-repo-ref`)?.closest('.form-group');
   if (refBox) refBox.classList.toggle('hidden', mode === 'compare');
@@ -9295,7 +9309,12 @@ function pageAgentRuns(agent, direction) {
 /** Reopen a stored run in the result panel, with its file inventory beneath it. */
 async function openAgentRun(agent, reviewId) {
   _openRunId = reviewId;
-  loadAgentRuns(agent);
+  await loadAgentRuns(agent);
+  // Keep the run you just clicked in view inside its own scroller. Without this, repainting
+  // the list resets its scroll to the top, so opening the eighth run scrolled your place in
+  // the list away at the same moment it answered you.
+  const card = document.querySelector(`#${agent}-runs .run-card.selected`);
+  if (card) card.scrollIntoView({ block: 'nearest' });
   const target = document.getElementById(`${agent}-result`);
   if (!target) return;
   target.classList.remove('hidden');
@@ -9314,6 +9333,9 @@ async function openAgentRun(agent, reviewId) {
       <div class="cost-note">Reopened from ${esc(String(row.created_at || '').slice(0, 16).replace('T', ' '))} UTC.
         No model was called and nothing was billed — this is the stored result. The gate below
         describes the code as it was then.</div>`);
+    // The list is above the result now, so bring the answer up rather than leaving the
+    // reader to guess that something appeared below the fold.
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     target.innerHTML = `<div class="summary-box">Could not open that run — ${esc(e.message)}</div>`;
   }
@@ -9464,6 +9486,58 @@ let _reviewPollTimer = null;
 // than inside it because `_pendingQuote` is cleared the moment the run starts.
 const _approvedQuote = {};
 
+/** Review a pull request and write the result back to it, reporting each stage.
+ *
+ *  Separate from `runReviewAsJob` because the payload and the result shape differ: this one
+ *  posts to the pull-request product and gets back what reached GitHub — the comment, the
+ *  merge check — alongside the review itself.
+ *
+ *  The old screen ran this synchronously behind one static sentence for a job that fetches a
+ *  diff, reviews it in n pieces, writes a comment and reports a check. Naming the stage is
+ *  the difference between waiting and wondering whether it has died.
+ */
+async function runPRReviewAsJob(agent, body, target) {
+  const wrap = document.getElementById(target);
+  wrap.classList.remove('hidden');
+  const opts = githubPostOptions();
+  wrap.innerHTML = renderReviewProgress(
+    { step_label: 'Starting…', current_step: 0, total_steps: 4 }, { unit: 'stage' });
+  try {
+    const started = await apiFetch('/api/github/pr/async', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pr_url: body.github_pr_url,
+        jira_ticket: '',
+        ...opts,
+        ...(body.github_token ? { github_token: body.github_token } : {}),
+      }),
+    });
+    pollReviewJob(agent, started.job_id, target, { unit: 'stage' }, (result) => {
+      // The postback summary goes above the review, because "did it actually reach GitHub"
+      // is the first thing somebody checks and it should not be below a hundred findings.
+      const review = result.review_result || {};
+      wrap.innerHTML = `
+        <div class="gh-result-head">
+          <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title || '')}
+          ${result.files_changed ? `<span class="field-hint">${result.files_changed} file(s) changed</span>` : ''}
+        </div>
+        ${renderGithubPostback(result)}`;
+      const inner = document.createElement('div');
+      inner.id = `${agent}-pr-review-inner`;
+      wrap.appendChild(inner);
+      renderResult(inner.id, review, false);
+      if (review.review_id && document.getElementById(`${agent}-sources`)) {
+        loadReviewSources(agent, review.review_id);
+      }
+      loadAgentRuns(agent);
+      loadDashboard();
+    });
+  } catch (e) {
+    showError(target, e.message);
+  }
+}
+
 /** Run the review the quote was taken for.
  *
  *  A zip upload always takes the synchronous route: the archive travels as FormData and the
@@ -9474,8 +9548,20 @@ async function runReviewFromQuote(agent) {
   const built = _pendingQuote[agent];
   if (!built) { alert('Get an estimate first.'); return; }
   const quotedCalls = _pendingCalls[agent] || 1;
+  const writesToGithub = agent === 'code' && willWriteToGithub(agent);
   clearCostPreview(agent);
   const target = `${agent}-result`;
+
+  // A run that is going to write on somebody's pull request always goes through the
+  // pull-request product, whatever its size — that is what carries the entitlement, the
+  // quota and the postback. It is always the async route, because it has stages worth
+  // naming and the slowest of them looks exactly like a hang when it is unlabelled.
+  if (writesToGithub) {
+    if (!confirm('This will post the review to that pull request on GitHub'
+        + (githubPostOptions().set_status ? ' and report a merge check on the commit' : '')
+        + '. Continue?')) return;
+    return runPRReviewAsJob(agent, built.body, target);
+  }
 
   if (built.kind === 'json' && quotedCalls >= ASYNC_CALL_THRESHOLD) {
     return runReviewAsJob(agent, built, target, quotedCalls);
@@ -9525,7 +9611,14 @@ async function runReviewAsJob(agent, built, target, quotedCalls) {
   }
 }
 
-function pollReviewJob(agent, jobId, target, accepted) {
+/** Poll a review job to completion.
+ *
+ *  `onDone` exists because a pull-request review's result is not just a review: it also
+ *  carries what reached GitHub, which has to be rendered above the findings. Passing a
+ *  finisher keeps one poller — with one set of retry rules and one honest "lost contact"
+ *  message — rather than a second copy that drifts from this one.
+ */
+function pollReviewJob(agent, jobId, target, accepted, onDone) {
   if (_reviewPollTimer) clearInterval(_reviewPollTimer);
   const wrap = document.getElementById(target);
   let misses = 0;
@@ -9538,6 +9631,7 @@ function pollReviewJob(agent, jobId, target, accepted) {
         clearInterval(_reviewPollTimer);
         _reviewPollTimer = null;
         const result = job.result || {};
+        if (onDone) { onDone(result); return; }
         if (agent === 'vapt') renderVAPTResult(target, result);
         else renderResult(target, result);
         loadDashboard();
@@ -9574,7 +9668,7 @@ function renderReviewProgress(job, accepted) {
     <div class="review-progress">
       <div class="review-progress-head">
         <b>Reviewing…</b>
-        <span class="review-progress-count">${done} of ${total} piece(s)</span>
+        <span class="review-progress-count">${done} of ${total} ${esc((accepted && accepted.unit) || 'piece')}(s)</span>
       </div>
       <div class="review-progress-track"><div class="review-progress-bar" style="width:${pct}%"></div></div>
       <div class="review-progress-label">${esc(job.step_label || 'Working…')}</div>
@@ -9790,8 +9884,8 @@ function renderFindingsByFile(findings) {
 // without an audience, and there was no way to make a Red gate actually block anything
 // (C-75). These three controls are the whole difference.
 
-function renderGithubOptions() {
-  const wrap = document.getElementById('gh-options');
+function renderGithubOptions(containerId = 'code-gh-options') {
+  const wrap = document.getElementById(containerId);
   if (!wrap || wrap.dataset.built) return;
   wrap.dataset.built = '1';
   wrap.innerHTML = `
@@ -9824,12 +9918,36 @@ function renderGithubOptions() {
 }
 
 function githubPostOptions() {
+  // The radio group is rendered once, into whichever container is on screen, so reading it
+  // by name rather than by container keeps this working wherever the block is placed.
   const mode = document.querySelector('input[name="gh-post-mode"]:checked')?.value || 'summary';
   return {
     post_mode: mode,
     set_status: !!document.getElementById('gh-set-status')?.checked,
     request_changes: !!document.getElementById('gh-request-changes')?.checked,
   };
+}
+
+/** Whether this run is going to write to the customer's pull request.
+ *
+ *  This is the one question that used to separate two screens, and it decides which product
+ *  the run is billed and entitled against — `github-pr-review` writes, `code` does not. A
+ *  merged screen must not merge that: a customer entitled to review but not to writing on
+ *  their pull requests still has to be refused.
+ */
+function willWriteToGithub(agent) {
+  if (_sourceMode[agent] !== 'pr') return false;
+  const opts = githubPostOptions();
+  return opts.post_mode !== 'none' || opts.set_status;
+}
+
+/** Open the review screen with a pull request selected. The nav's GitHub PR item lands here. */
+function openPRReview() {
+  const nav = document.querySelector('.nav-item[data-page="code"]');
+  if (nav) nav.click();
+  setSourceMode('code', 'pr');
+  const url = document.getElementById('code-pr-url');
+  if (url) url.focus();
 }
 
 
