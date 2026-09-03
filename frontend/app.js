@@ -3138,6 +3138,13 @@ function renderVAPTFinding(f) {
         </div>
         ${f.proof_of_concept ? `<div style="margin-top:10px;"><label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-muted);letter-spacing:.05em;display:block;margin-bottom:4px;">Proof of Concept</label><div class="vapt-poc">${esc(f.proof_of_concept)}</div></div>` : ''}
         ${f.cvss_vector ? `<div style="margin-top:8px;font-size:11px;color:var(--text-muted);font-family:monospace;">${esc(f.cvss_vector)}</div>` : ''}
+        <!-- The screen's own subtitle said "Findings can be waived" and they could not:
+             this renderer is bespoke, and the waiver control lived only inside the shared
+             renderFinding. A VAPT finding could be waived from the Findings screen and
+             nowhere near the assessment that produced it. Added here rather than by routing
+             VAPT through the shared renderer, which would have traded the CVSS vector, the
+             attack scenario and the proof of concept for a button. -->
+        ${f.id ? renderWaiveControl(f) : ''}
       </div>
     </div>`;
 }
@@ -3553,6 +3560,7 @@ function renderSensitiveDataResult(targetId, r) {
         <div class="finding-desc">${esc(f.description||'')}</div>
         ${f.location ? `<div style="font-size:11px;color:var(--text-muted);margin:4px 0">📍 Location: <code>${esc(f.location)}</code></div>` : ''}
         ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+        ${f.id ? renderWaiveControl(f) : ''}
       </div>`;
     }).join('')}` : '<div class="summary-box" style="color:var(--green)">✓ No sensitive data issues detected.</div>'}
     ${r.recommendations?.length ? `<div class="section-title" style="margin-top:20px">Recommendations</div>
@@ -3755,6 +3763,7 @@ function renderCFR21Result(targetId, r) {
         <div class="finding-desc">${esc(f.description||'')}</div>
         ${f.evidence ? `<div style="font-size:11px;color:var(--text-muted);margin:4px 0">📍 Evidence: <code>${esc(f.evidence)}</code></div>` : ''}
         ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+        ${f.id ? renderWaiveControl(f) : ''}
       </div>`).join('')}` : '<div class="summary-box" style="color:var(--green);margin-top:16px">✓ No findings.</div>'}
 
     ${r.recommendations?.length ? `
@@ -3868,6 +3877,7 @@ function renderGxPDocumentResult(targetId, r) {
         <div class="finding-desc">${esc(f.description||'')}</div>
         ${f.evidence ? `<div style="font-size:11px;color:var(--text-muted);margin:4px 0">📍 Evidence: <code>${esc(f.evidence)}</code></div>` : ''}
         ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+        ${f.id ? renderWaiveControl(f) : ''}
       </div>`).join('')}` : '<div class="summary-box" style="color:var(--green);margin-top:16px">✓ No findings.</div>'}
 
     ${r.recommendations?.length ? `

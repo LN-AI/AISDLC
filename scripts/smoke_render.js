@@ -2212,6 +2212,108 @@ await checkAsync('every screen in the table names a renderer that exists', async
   }
 });
 
+section('A finding can be acted on from the screen that reported it');
+
+// `renderWaiveControl` was called from exactly one place -- inside the shared
+// `renderFinding` -- so any screen with its own per-finding markup rendered findings a
+// person could not waive, resolve, accept the risk on, or report as a false positive
+// without going to the separate Findings screen and locating them by hand.
+//
+// VAPT was the worst of these because **its own page subtitle said "Findings can be
+// waived"**. Four renderers were affected: VAPT, Sensitive Data, 21 CFR Part 11 and the
+// GxP Document Check. Everything else already routed through `renderFinding`, including
+// Security and Architecture, whose `renderFindingCard` is a one-line delegation to it.
+//
+// Fixed by calling the control from each bespoke renderer rather than by routing them
+// through the shared one: VAPT's own renderer is the only thing that shows the CVSS vector,
+// the attack scenario and the proof of concept, and trading those for a button would be a
+// bad deal.
+
+const _WAIVABLE = {
+  vapt: {
+    vuln_id: 'VLN-1', title: 'SQLi', severity: 5, cvss_score: 9.8,
+    cvss_vector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H', cwe_id: 'CWE-89',
+    description: 'Concatenated query.', attack_scenario: "' OR 1=1--",
+    proof_of_concept: 'curl -d "x=1"', recommendation: 'Parameterize.',
+    file_path: 'app/auth.py', line_start: 4, evidence: 'q = "S" + u',
+  },
+  sensitive: {
+    title: 'Unmasked SSN', severity: 5, category: 'PII', control_id: 'HIPAA-001',
+    risk_level: 'Critical', description: 'Logged in the clear.', location: 'log.py:22',
+    recommendation: 'Redact it.', regulation_refs: ['HIPAA'],
+  },
+  cfr21: {
+    title: 'No audit trail', severity: 4, control_id: 'CFR-001', cfr_section: '11.10(e)',
+    risk_level: 'High', description: 'No record of who changed what.',
+    evidence: 'update()', recommendation: 'Add an audit table.',
+  },
+  'gxp-docs': {
+    title: 'Missing signature block', severity: 3, control_id: 'GXP-002',
+    gxp_reference: 'Annex 11', risk_level: 'Medium',
+    description: 'No approver.', evidence: 'section 4', recommendation: 'Add one.',
+  },
+};
+
+check('the four screens with bespoke finding markup now offer the waiver controls', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const missing = [];
+  for (const [page, finding] of Object.entries(_WAIVABLE)) {
+    const spec = TABLE[page];
+    assert(spec, `${page} is not in the screen table`);
+    const target = `_waive_${page}`;
+    elements.delete(target);
+    spec.render(target, {
+      review_type: spec.reviewType, review_id: `rv-${page}`, gate_status: 'Red',
+      risk_score: 70, summary: 'One issue.',
+      findings: [{ ...finding, id: `find-${page}` }],
+    });
+    const html = document.getElementById(target).innerHTML;
+    if (!html.includes(`waive-status-find-${page}`)) missing.push(page);
+  }
+  assert(missing.length === 0,
+    `no way to act on a finding from: ${missing.join(', ')} -- it can only be waived from `
+    + `the separate Findings screen, by locating it there by hand`);
+});
+
+check('...and VAPT keeps everything its own renderer shows', () => {
+  // The point of not routing VAPT through the shared renderer. If this fails, the waiver
+  // button was bought with the substance of the assessment.
+  const html = document.getElementById('_waive_vapt').innerHTML;
+  assert(html.includes('CVSS:3.1/AV:N'), 'the CVSS vector was lost');
+  assert(html.includes('curl -d'), 'the proof of concept was lost');
+  assert(html.includes("' OR 1=1--"), 'the attack scenario was lost');
+  assert(html.includes('CWE-89'), 'the CWE reference was lost');
+  assert(html.includes('app/auth.py'), 'the location was lost');
+});
+
+check('...and the regulated screens keep the control ids a report has to cite', () => {
+  assert(document.getElementById('_waive_cfr21').innerHTML.includes('11.10(e)'),
+    'the CFR section was lost');
+  assert(document.getElementById('_waive_gxp-docs').innerHTML.includes('Annex 11'),
+    'the GxP reference was lost');
+  assert(document.getElementById('_waive_sensitive').innerHTML.includes('HIPAA-001'),
+    'the control id was lost');
+});
+
+check('an already-waived finding says so, and offers to reopen it, on those screens too', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  for (const [page, finding] of Object.entries(_WAIVABLE)) {
+    const target = `_waived_${page}`;
+    elements.delete(target);
+    TABLE[page].render(target, {
+      review_type: TABLE[page].reviewType, review_id: `rv-${page}`, gate_status: 'Amber',
+      findings: [{ ...finding, id: `w-${page}`, status: 'accepted_risk',
+                   resolved_by: 'alex', waiver_expires_at: '2026-12-01T00:00:00' }],
+    });
+    const html = document.getElementById(target).innerHTML;
+    assert(html.includes('finding-waived'), `${page}: a waived finding is not marked as one`);
+    assert(html.includes('2026-12-01'),
+      `${page}: the expiry is not shown -- an accepted risk that silently comes back is `
+      + `worse than one that never lapsed`);
+    assert(html.includes('Reopen'), `${page}: no way to undo the waiver`);
+  }
+});
+
 section('What a run cost, carried in headers');
 
 // The synchronous review routes are metered by middleware that runs around the handler, so
