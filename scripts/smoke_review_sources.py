@@ -1760,6 +1760,143 @@ def main():
               _store.summarize(pr_rid)["head_branch"] == "feat/cb-104",
               _store.summarize(pr_rid)["head_branch"])
 
+        # ── 26. Every agent screen declares which agent it is ─────────
+        #
+        # `AGENT_SCREENS` in app.js is a second place product ids and review types live --
+        # the first is `products/registry.py`. That is a real cost, and it buys three things
+        # markup and derivation cannot give: a result container id that follows no
+        # convention, a renderer (which is a function), and a run history that works when
+        # the nav item was not what opened the screen.
+        #
+        # The duplication is only defensible if drift fails here rather than in a browser.
+        # So: every row is checked against the served product contract and against the
+        # `data-product` in the markup, every row's result container and run container must
+        # exist, and a screen with no row at all is a failure unless it is on the explicit
+        # exclusion list. Without this the table would be an apology, not a design.
+        section("26. Every agent screen declares which agent it is")
+
+        import re as _re
+
+        _fe = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "frontend")
+        _html = io.open(os.path.join(_fe, "index.html"), encoding="utf-8").read()
+        _appjs = io.open(os.path.join(_fe, "app.js"), encoding="utf-8").read()
+
+        # Screens that legitimately have no row, each for a stated reason. A screen dropped
+        # in here silently is the failure this list exists to make visible.
+        _NO_ROW = {
+            "modernization": "has its own richer run list (loadModernizationRuns)",
+            "governance-report": "writes a `reports` row, and has its own Previous reports list",
+            "github": "retired; the nav item opens the review screen (D-267)",
+        }
+
+        # ── The table, parsed out of app.js ──────────────────────────────────
+        _tbl_m = _re.search(r"const AGENT_SCREENS = \{(.*?)\n\};", _appjs, _re.S)
+        check("the screen table exists in app.js", _tbl_m is not None)
+        # The trailing newline matters: the table regex consumes the one before `};`, so
+        # without putting it back the *last* row never matches the per-entry pattern and is
+        # reported as a screen with no history. Which is what happened, and is a fair
+        # demonstration that this check can fail.
+        _body = (_tbl_m.group(1) + "\n") if _tbl_m else ""
+        _rows = {}
+        for _m in _re.finditer(r"'?([a-z0-9-]+)'?:\s*\{(.*?)\},\n", _body, _re.S):
+            _fields = _m.group(2)
+            def _s(key, _f=_fields):
+                _g = _re.search(key + r":\s*'([^']*)'", _f)
+                return _g.group(1) if _g else None
+            def _b(key, _f=_fields):
+                _g = _re.search(key + r":\s*(true|false)", _f)
+                return _g.group(1) == "true" if _g else False
+            _rows[_m.group(1)] = {
+                "product": _s("product"), "reviewType": _s("reviewType"),
+                "result": _s("result"), "noun": _s("noun"),
+                "gated": _b("gated"), "inventory": _b("inventory"),
+                "render": (_re.search(r"render:\s*([A-Za-z_$][\w$]*)", _fields) or [None, None])[1],
+            }
+        check("...and parses into rows", len(_rows) >= 15, f"parsed {len(_rows)}")
+
+        # ── The markup's own answer ──────────────────────────────────────────
+        _nav = dict(_re.findall(r'data-page="([a-z0-9-]+)"\s+data-product="([a-z0-9-]+)"',
+                                _html))
+        check("the nav declares a product per agent screen", len(_nav) >= 20, str(len(_nav)))
+
+        # ── The served contract ──────────────────────────────────────────────
+        _prods = {p["id"]: p for p in client.get("/api/v1/products",
+                                                 headers=H).json()["products"]}
+        check("the products endpoint serves review_type",
+              all("review_type" in p for p in _prods.values()),
+              "without it this check would have to re-parse registry.py, which is how a "
+              "check starts agreeing with a bug")
+
+        # ── 1. No agent screen is missing a row ──────────────────────────────
+        _missing = sorted(set(_nav) - set(_rows) - set(_NO_ROW))
+        check("EVERY AGENT SCREEN HAS A ROW OR A STATED REASON NOT TO",
+              not _missing,
+              f"no run history and no exclusion for: {_missing} -- a screen added later "
+              f"without a row ships with an empty history and nobody notices")
+        for _page, _why in _NO_ROW.items():
+            check(f"{_page} is excluded on purpose ({_why[:38]}...)",
+                  _page not in _rows and _page in _nav,
+                  "an excluded screen must still be a real nav item")
+
+        # ── 2. Every row agrees with the markup and the registry ─────────────
+        for _page, _row in sorted(_rows.items()):
+            check(f"{_page}: the product matches the nav item's data-product",
+                  _nav.get(_page) == _row["product"],
+                  f"table says {_row['product']!r}, markup says {_nav.get(_page)!r}")
+            check(f"{_page}: the product is real",
+                  _row["product"] in _prods, str(_row["product"]))
+            _served = (_prods.get(_row["product"]) or {}).get("review_type")
+            check(f"{_page}: the review type matches the registry",
+                  _served == _row["reviewType"],
+                  f"table says {_row['reviewType']!r}, registry writes {_served!r} -- "
+                  f"a mismatch means this screen's history is silently empty")
+            check(f"{_page}: its result container exists in index.html",
+                  f'id="{_row["result"]}"' in _html, str(_row["result"]))
+            check(f"{_page}: its run container exists in index.html",
+                  f'id="{_page}-runs"' in _html,
+                  "loadAgentRuns reads `${agent}-runs` and returns silently without it, "
+                  "which is indistinguishable from a project with no history")
+            check(f"{_page}: its renderer is a real function",
+                  _row["render"] and f'function {_row["render"]}(' in _appjs,
+                  str(_row["render"]))
+            check(f"{_page}: it names what it produces", bool(_row["noun"]),
+                  "the empty state and the card both read this")
+
+        # ── 3. A product that writes no reviews row must not claim one ───────
+        for _page, _row in sorted(_rows.items()):
+            check(f"{_page}: does not point at a product that stores nothing",
+                  bool(_row["reviewType"]),
+                  "report-generate and modernization write elsewhere; a row for either "
+                  "would list runs that can never appear")
+
+        # ── 4. The gate flag is not decoration ───────────────────────────────
+        # `save_review` defaults gate_status to "Green" and findings_count to 0 when the
+        # result carries neither, so a generative agent's row is byte-identical to a clean
+        # security review's. Rendering that as a gate is a claim of safety nobody made.
+        _ungated = {p for p, r in _rows.items() if not r["gated"]}
+        check("the generative agents are marked as having no gate",
+              {"test-scenario", "test-case", "codegen", "gxp-generate"} <= _ungated,
+              f"ungated: {sorted(_ungated)}")
+        _gate_free = database.save_review(
+            "test_cases", "gatecheck", "Test cases — 40 generated", "x",
+            {"test_cases": [{"id": 1}]})
+        _row_tc = database.get_review(_gate_free)
+        check("...because such a run really does store a default Green with no findings",
+              _row_tc["gate_status"] == "Green" and _row_tc["findings_count"] == 0,
+              f"{_row_tc['gate_status']} / {_row_tc['findings_count']} -- this is the row "
+              f"the card must not present as a verdict")
+        check("a findings agent is still marked gated",
+              all(_rows[p]["gated"] for p in ("code", "vapt", "security", "cfr21")
+                  if p in _rows))
+
+        # ── 5. Only the screens that store a source may offer the extras ─────
+        check("only the review screens claim a source inventory",
+              {p for p, r in _rows.items() if r["inventory"]} == {"code", "vapt"},
+              "the fix bar and the retention control are gated on this flag; a screen "
+              "claiming it without a route that calls review_source_store.record would "
+              "render a checkbox guaranteed to fail (D-268)")
+
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")
 

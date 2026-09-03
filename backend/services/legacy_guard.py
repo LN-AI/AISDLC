@@ -269,7 +269,14 @@ async def legacy_product_guard(request, call_next):
     # without it two browser calls starting together both pass the budget check against the
     # same pre-call total and both spend. `bind_project` publishes the project so the
     # review row this produces is attributed to it (see backend/context.py).
-    with context.bind_project(subject.project_id, subject.project_name), \
+    # `product_id` is published for the same reason `agent_guard.guarded_call` publishes it
+    # (D-265): `database.save_review` reads it from the context, and without it every run
+    # served by one of these synchronous routes stored `product_id = NULL`. That is *most*
+    # runs — every agent screen except Code Review and VAPT posts here — so a per-agent run
+    # history had nothing but `review_type` to match on, and the row was labelled "before
+    # agents were recorded" on a screen where the agent was perfectly well known.
+    with context.bind_project(subject.project_id, subject.project_name,
+                              product_id=product_id), \
             agent_guard.hold_budget_reservation(subject), \
             llm_gateway.track_usage():
         response = await call_next(request)

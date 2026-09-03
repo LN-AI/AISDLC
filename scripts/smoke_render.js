@@ -2080,8 +2080,112 @@ check('a VAPT result renders its own fields as well as the shared ones', () => {
 });
 }
 
+
+// ── One screen must not paint into another, and a control must be able to work ──
+//
+// Two defects lived here undetected because neither had a test.
+//
+// The first: `renderResult` inferred the owning screen as "code" for anything that was not
+// VAPT, and `#code-sources` exists on every page load -- so running Requirement Review,
+// Prompt Safety or the Release Gate fetched *that* review's inventory and painted it into
+// the **Code Review screen's** panel. Silent, because the panel being vandalised was on a
+// screen you were not looking at.
+//
+// The second: the Apply Fixes checkbox rendered on every agent's findings, but applying a
+// fix needs the source read back, and only the review pipeline records one. On seventeen
+// screens the checkbox was tickable and guaranteed to fail. Same rule as D-268.
+//
+// The inventory fetch is a `setTimeout(..., 0)`, so these have to await a turn of the event
+// loop -- which is exactly why the defect survived: nothing that could see it ever waited.
+async function runScreenIsolationChecks() {
+section('One screen does not paint into another');
+
+const tick = () => new Promise(r => setTimeout(r, 0));
+
+await checkAsync('a requirement review does not touch the Code Review file panel', async () => {
+  elements.delete('code-sources');
+  elements.delete('req-result');
+  fetchLog.length = 0;
+  sandbox.renderResult('req-result', {
+    review_type: 'requirement', review_id: 'rv-req', gate_status: 'Amber',
+    summary: 'Two ambiguous acceptance criteria.',
+    findings: [{ id: 'q1', title: 'Ambiguous criterion', severity: 3,
+                 file_path: 'reqs/login.md', line_start: 8,
+                 evidence: 'should be fast', evidence_verified: true }],
+  });
+  await tick();
+  const inv = document.getElementById('code-sources').innerHTML;
+  assert(inv === '', `Code Review's file panel was written to by another screen: ${inv.slice(0, 80)}`);
+  const leaked = fetchLog.filter(u => String(u).includes('/sources'));
+  assert(leaked.length === 0,
+    `a requirement review fetched a file inventory it has none of: ${leaked.join(', ')}`);
+});
+
+await checkAsync('...and offers no fix checkbox, because it has no source to patch', async () => {
+  const html = document.getElementById('req-result').innerHTML;
+  assert(!html.includes('fix-check'),
+    'a tickable fix checkbox on a review whose source was never stored -- fix_apply would '
+    + 'refuse it after the round trip');
+  assert(!html.includes('Cannot be fixed'),
+    'not even the disabled box: twenty of those explain a limitation of the screen, not '
+    + 'of the finding, and the waiver controls beside them are the action available here');
+});
+
+await checkAsync('...while the waiver controls it CAN act on are still there', async () => {
+  const html = document.getElementById('req-result').innerHTML;
+  assert(html.includes('setFindingStatus') || html.includes('waive'),
+    'removing the fix affordance must not remove the one that works');
+});
+
+await checkAsync('a code review keeps its fix checkbox and its file panel', async () => {
+  elements.delete('code-sources');
+  elements.delete('code-result');
+  fetchLog.length = 0;
+  sandbox.renderResult('code-result', {
+    review_type: 'code', review_id: 'rv-code', gate_status: 'Red',
+    summary: 'One injection path.',
+    findings: [{ id: 'f1', title: 'SQLi', severity: 5, file_path: 'app/db.py',
+                 line_start: 4, evidence: 'q = "x" + u', evidence_verified: true }],
+  });
+  await tick();
+  const html = document.getElementById('code-result').innerHTML;
+  assert(html.includes('fix-check'), 'Code Review lost the fix checkbox');
+  assert(html.includes('Fix this'), 'the fix affordance is gone from the screen that has it');
+  const asked = fetchLog.filter(u => String(u).includes('/sources'));
+  assert(asked.length === 1,
+    `expected one inventory fetch for the review on screen, got ${asked.length}`);
+  assert(String(asked[0]).includes('rv-code'),
+    `the inventory fetched belongs to another review: ${asked[0]}`);
+});
+
+await checkAsync('a VAPT assessment reopens through the VAPT renderer, not the plain one', async () => {
+  // D-261 claimed a stored run renders through the same function as a fresh one. For VAPT
+  // that was false: `openAgentRun` always called `renderResult`, so reopening an assessment
+  // dropped its CVSS, CWE and proof of concept -- the substance of the assessment.
+  // `const` at a script's top level is a lexical binding, not a property of globalThis,
+  // so it is unreachable as `sandbox.AGENT_SCREENS`. Evaluating in the same context reads
+  // the binding itself.
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const spec = TABLE && TABLE.vapt;
+  assert(spec, 'the screen table has no vapt row');
+  assert(spec.render === sandbox.renderVAPTResult,
+    'the vapt row does not point at renderVAPTResult, so a reopened assessment would '
+    + 'render through the generic renderer and show none of its own fields');
+  const code = TABLE.code;
+  assert(code.render === sandbox.renderResult, 'the code row lost its renderer');
+});
+
+await checkAsync('every screen in the table names a renderer that exists', async () => {
+  for (const [page, s] of Object.entries(vm.runInContext('AGENT_SCREENS', sandbox))) {
+    assert(typeof s.render === 'function', `${page}: render is not a function`);
+    assert(typeof s.result === 'string' && s.result, `${page}: no result container id`);
+    assert(typeof s.noun === 'string' && s.noun, `${page}: nothing to call its runs`);
+  }
+});
+}
+
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
-  .then(runReviewSourceChecks).then(() => {
+  .then(runReviewSourceChecks).then(runScreenIsolationChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

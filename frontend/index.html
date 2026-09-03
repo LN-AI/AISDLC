@@ -316,6 +316,15 @@ Acceptance Criteria:
             </label>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('requirement')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="requirement-runs" class="run-history-scroll"></div>
+        </div>
         <div id="req-result" class="result-area hidden"></div>
       </div>
 
@@ -351,6 +360,15 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
               <span class="btn-icon">🧪</span> Generate Test Scenarios
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('test-scenario')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All generations this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="test-scenario-runs" class="run-history-scroll"></div>
         </div>
         <div id="test-scenario-result" class="result-area hidden"></div>
       </div>
@@ -391,6 +409,15 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
               <span class="btn-icon">📝</span> Generate Test Cases
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('test-case')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All generations this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="test-case-runs" class="run-history-scroll"></div>
         </div>
         <div id="test-case-result" class="result-area hidden"></div>
       </div>
@@ -596,6 +623,15 @@ Answer questions about patients based on the provided context."></textarea>
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('prompt')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="prompt-runs" class="run-history-scroll"></div>
+        </div>
         <div id="prompt-result" class="result-area hidden"></div>
       </div>
 
@@ -664,6 +700,15 @@ Answer questions about patients based on the provided context."></textarea>
               <span class="btn-icon">🚀</span> Run Core SDLC Review
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('full')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="full-runs" class="run-history-scroll"></div>
         </div>
         <div id="full-result" class="result-area hidden"></div>
       </div>
@@ -742,6 +787,15 @@ Answer questions about patients based on the provided context."></textarea>
               <span class="btn-icon">🚦</span> Check Release Gate
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('gate')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All gate decisions this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="gate-runs" class="run-history-scroll"></div>
         </div>
         <div id="gate-result" class="result-area hidden"></div>
       </div>
@@ -928,6 +982,15 @@ e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI feature
             </label>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('architecture')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="architecture-runs" class="run-history-scroll"></div>
+        </div>
         <div id="arch-result" class="result-area hidden"></div>
       </div>
 
@@ -993,6 +1056,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
               <span class="btn-icon">🧭</span> Get Recommendation
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('codegen')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All recommendations this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="codegen-runs" class="run-history-scroll"></div>
         </div>
         <div id="codegen-advisory-result" class="result-area hidden"></div>
 
@@ -1081,6 +1153,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('migration')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All assessments this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="migration-runs" class="run-history-scroll"></div>
+        </div>
         <div id="migration-assessment-result" class="result-area hidden"></div>
 
         <div class="form-card" id="mg-execute-card" style="margin-top:24px">
@@ -1131,6 +1212,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             <div class="form-group flex1">
               <label>Run Name <span class="required">*</span></label>
               <input type="text" id="mod-name" placeholder="e.g. Billing engine → .NET 8" />
+              <!-- The caption only. This was the one agent screen with neither a bound
+                   input nor a caption, so which project a conversion would be charged and
+                   scoped to was invisible here. There is deliberately no hidden
+                   `project-bound` input to go with it: modernization resolves its project
+                   from the X-Project-Id header alone and has no project_name field to
+                   fill, and an input nothing reads is the sort of thing that gets wired up
+                   later by mistake. `_syncProjectInputs` fills every `.project-caption`
+                   regardless of `data-for`, so this needs no other change. -->
+              <div class="project-caption"></div>
             </div>
             <div class="form-group flex1">
               <label>Target Stack <span class="required">*</span></label>
@@ -1273,6 +1363,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
               <span class="btn-icon">🧯</span> Triage Issue
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('issue-triage')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All triages this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="issue-triage-runs" class="run-history-scroll"></div>
         </div>
         <div id="issue-triage-result" class="result-area hidden"></div>
 
@@ -1522,6 +1621,15 @@ Examples:
             </label>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('security')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="security-runs" class="run-history-scroll"></div>
+        </div>
         <div id="security-result" class="result-area hidden"></div>
       </div>
 
@@ -1579,6 +1687,15 @@ Examples:
               Upload File
             </label>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('sensitive')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All scans this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="sensitive-runs" class="run-history-scroll"></div>
         </div>
         <div id="sd-result" class="result-area hidden"></div>
       </div>
@@ -1662,6 +1779,15 @@ Examples:
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('ai-provenance')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All scans this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="ai-provenance-runs" class="run-history-scroll"></div>
+        </div>
         <div id="ap-result" class="result-area hidden"></div>
       </div>
 
@@ -1710,6 +1836,15 @@ Examples:
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('cfr21')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All verifications this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="cfr21-runs" class="run-history-scroll"></div>
+        </div>
         <div id="cfr21-result" class="result-area hidden"></div>
       </div>
 
@@ -1757,6 +1892,15 @@ Examples:
               <span class="btn-icon">📑</span> Check Pasted Document
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('gxp-docs')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All checks this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="gxp-docs-runs" class="run-history-scroll"></div>
         </div>
         <div id="gxp-docs-result" class="result-area hidden"></div>
       </div>
@@ -1807,6 +1951,15 @@ Examples:
               <span class="btn-icon">🧭</span> Plan Validation Package
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('gxp-generate')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All plans this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="gxp-generate-runs" class="run-history-scroll"></div>
         </div>
         <div id="gxg-plan-result" class="result-area hidden"></div>
 
@@ -1872,6 +2025,15 @@ Examples:
               <span class="btn-icon">⚡</span> Run Swarm
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('agent-hub')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All swarm runs this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="agent-hub-runs" class="run-history-scroll"></div>
         </div>
         <div id="swarm-result" class="result-area hidden"></div>
 

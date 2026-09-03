@@ -262,13 +262,26 @@ function _syncProjectInputs() {
   const name = _activeProject ? _activeProject.name : '';
   document.querySelectorAll('input.project-bound').forEach(input => {
     input.value = name;
-    if (input.type !== 'hidden') input.readOnly = !!name;   // the last few text ones, if any
+    // Belt and braces: every one of these is now `type="hidden"`, and `ui_examine` asserts
+    // there are no typed ones left. The Agent Hub built its own in JS and was missed by
+    // D-250 for exactly as long as no test opened that screen.
+    if (input.type !== 'hidden') input.readOnly = !!name;
   });
   document.querySelectorAll('.project-caption').forEach(el => {
+    // The "estimating still works" half is only true where there is something to estimate.
+    // D-250 added it for a real user who got a successful estimate on the review screen and
+    // would have hit a refusal on the run — but on the seventeen screens that have no quote
+    // step it describes a button that is not there. Asked of the DOM rather than declared,
+    // so it becomes true on its own if a screen gains a quote.
+    const quotes = !!(el.closest('.page') || document)
+      .querySelector('[id$="-cost-preview"]');
     el.innerHTML = name
       ? `<b>${esc(name)}</b> <span class="project-caption-note">· set in the sidebar; its Knowledge Base docs are used</span>`
       : `<span class="project-caption-none">No project selected — pick one in the sidebar. `
-        + `Estimating a cost works without one; running a review does not.</span>`;
+        + (quotes
+            ? `Estimating a cost works without one; running a review does not.`
+            : `A run will be refused without one.`)
+        + `</span>`;
   });
 }
 
@@ -355,11 +368,13 @@ document.querySelectorAll('.nav-item').forEach(item => {
     // no-build-step SPA slow to open.
     if (page === 'code' || page === 'vapt') {
       renderSourcePicker(page);
-      // Refreshed on every visit rather than built once: the sidebar project
-      // selector can change between visits, and a history list showing another
-      // project's runs is worse than no history list.
-      loadAgentRuns(page);
     }
+    // Every agent screen loads its own history, scoped to this agent and this project.
+    // Refreshed on every visit rather than built once: the sidebar project selector can
+    // change between visits, and a history list showing another project's runs is worse
+    // than no history list. Screens absent from `AGENT_SCREENS` -- modernization and the
+    // governance report -- keep the richer lists they already had.
+    if (AGENT_SCREENS[page]) loadAgentRuns(page);
     // The GitHub PR screen is retired -- the nav item lands on the review screen with
     // the source already set, so there is one implementation of reviewing a pull
     // request rather than two that drift apart.
@@ -1575,99 +1590,6 @@ async function pollFullReviewJob(jobId) {
   }
 }
 
-// ── GitHub PR Review ──────────────────────────────────────────────────────
-
-async function reviewGithubPR() {
-  const pr_url = document.getElementById('gh-url').value.trim();
-  if (!pr_url) { alert('Please enter a GitHub PR URL.'); return; }
-  const jira_ticket = document.getElementById('gh-jira').value.trim();
-  // `include_prompt_review` is sent as false and always was: the orchestrator has never
-  // implemented it. The checkbox that set it is gone rather than left on the screen doing
-  // nothing — a control with no effect is worse than no control.
-  const include_prompt_review = false;
-
-  const opts = githubPostOptions();
-  showLoading('Fetching the PR and running the review — a large diff is split into pieces…');
-  try {
-    const result = await apiFetch('/api/github/pr', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pr_url, jira_ticket, include_prompt_review, ...opts }),
-    });
-    const wrap = document.getElementById('gh-result');
-    wrap.classList.remove('hidden');
-    const review = result.review_result || {};
-    wrap.innerHTML = `
-      <div class="gh-result-head">
-        <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title)}
-        ${result.files_changed ? `<span class="field-hint">${result.files_changed} file(s) changed</span>` : ''}
-      </div>
-      ${renderGithubPostback(result)}
-    `;
-    const el = document.createElement('div');
-    el.id = '_gh_result_inner';
-    wrap.appendChild(el);
-    renderResult('_gh_result_inner', review, false);
-    loadDashboard();
-  } catch (e) {
-    showError('gh-result', e.message);
-  } finally {
-    hideLoading();
-  }
-}
-
-async function autoFixGithubPR() {
-  const pr_url = document.getElementById('gh-url').value.trim();
-  if (!pr_url) { alert('Please enter a GitHub PR URL.'); return; }
-  const jira_ticket = document.getElementById('gh-jira').value.trim();
-  const max_files = parseInt(document.getElementById('gh-max-files').value, 10) || 5;
-
-  if (!confirm('This will commit fixes to a new branch and open a real pull request on GitHub. Continue?')) return;
-
-  showLoading('Reviewing PR and generating fixes...');
-  try {
-    const result = await apiFetch('/api/github/pr/auto-fix', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pr_url, jira_ticket, max_files }),
-    });
-    const wrap = document.getElementById('gh-result');
-    wrap.classList.remove('hidden');
-
-    if (!result.fix_applied) {
-      wrap.innerHTML = `
-        <div style="margin-bottom:12px">
-          <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title)}
-          <div style="color:var(--text-muted);margin-top:6px">No fix opened — ${esc(result.reason || 'unknown reason')}</div>
-        </div>
-      `;
-    } else {
-      const files = (result.files_patched || [])
-        .map(f => `<li><code>${esc(f.path)}</code> — ${esc(f.explanation || '')}</li>`)
-        .join('');
-      wrap.innerHTML = `
-        <div style="margin-bottom:12px">
-          <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title)}
-          <div style="color:var(--green);margin-top:6px">
-            ✓ Opened <a href="${esc(result.fix_pr_url)}" target="_blank" rel="noopener">fix PR #${result.fix_pr_number}</a>
-            on branch <code>${esc(result.fix_branch)}</code>
-          </div>
-          <ul style="margin-top:8px">${files}</ul>
-        </div>
-      `;
-    }
-    const el = document.createElement('div');
-    el.id = '_gh_result_inner';
-    wrap.appendChild(el);
-    renderResult('_gh_result_inner', result.review_result || {}, false);
-    loadDashboard();
-  } catch (e) {
-    showError('gh-result', e.message);
-  } finally {
-    hideLoading();
-  }
-}
-
 // ── Release Gate ──────────────────────────────────────────────────────────
 //
 // The gate takes review IDs. Those are UUIDs, and the only place one was ever shown is the
@@ -2007,17 +1929,33 @@ function renderResult(targetId, result, clear = true) {
   // The file-by-file record. Fetched after the result paints rather than carried inside it:
   // the inventory of a 1,500-file repository has no business travelling in `result_json`,
   // which every list endpoint also reads (see `database.list_reviews`).
-  const _invAgent = (result.review_type === 'vapt' || result.agent_name === 'VAPT Agent')
-    ? 'vapt' : 'code';
+  // Which screen this result belongs to, asked rather than guessed. The old line inferred
+  // "code" for anything that was not VAPT -- and `#code-sources` always exists -- so
+  // running Requirement Review, Prompt Safety or the Release Gate fetched that review's
+  // (empty) inventory and painted it into the **Code Review screen's** panel. Silent,
+  // because the panel you were vandalising was on a screen you were not looking at.
+  const _owner = screenForReview(result);
+  const _spec = _owner ? AGENT_SCREENS[_owner] : null;
+  const _hasInventory = !!(_spec && _spec.inventory);
+
   // Which review the fix bar acts on. Set here rather than read from the DOM: a stale id
   // would patch the wrong review's files, which is the worst available failure.
+  //
+  // `_fixCapable` is the other half. Applying a fix needs the source read back -- from the
+  // per-run store, or from GitHub at the recorded sha -- and only the review pipeline
+  // records one (`review_source_store.record`, called from `_record_sources`). On every
+  // other agent the checkbox was rendered, tickable, and guaranteed to fail at
+  // `fix_apply.plan`. Same rule as D-268: an affordance that cannot work is worse than no
+  // affordance, because it costs the reader a round trip to learn nothing.
   _fixReviewId = result.review_id || null;
+  _fixCapable = _hasInventory && !!result.review_id;
   const _staleBar = document.getElementById('fix-bar');
   if (_staleBar) _staleBar.remove();
   const _stalePanel = document.getElementById('fix-panel');
   if (_stalePanel) _stalePanel.remove();
-  if (result.review_id && document.getElementById(`${_invAgent}-sources`)) {
-    setTimeout(() => loadReviewSources(_invAgent, result.review_id), 0);
+  if (_hasInventory && result.review_id
+      && document.getElementById(`${_owner}-sources`)) {
+    setTimeout(() => loadReviewSources(_owner, result.review_id), 0);
   }
 
   if (findings.length) {
@@ -2219,7 +2157,11 @@ function fixEligibility(f) {
 }
 
 function renderFixCheckbox(f) {
-  if (!f.id) return '';
+  // Nothing at all -- not even the disabled "cannot be fixed" box -- where this review has
+  // no source to read back. Twenty disabled checkboxes explaining a limitation of the
+  // screen rather than of the finding is noise, and the waiver controls beside them still
+  // work, which is the action actually available here.
+  if (!_fixCapable || !f.id) return '';
   const why = fixEligibility(f);
   if (why) {
     return `<div class="fix-pick fix-pick-off" title="${esc(why)}">
@@ -2240,6 +2182,8 @@ function renderFixCheckbox(f) {
 // call, and a bar that only counted findings would make the quote look wrong.
 
 let _fixReviewId = null;
+// Whether the review on screen has a source the fixer can read back. See `renderResult`.
+let _fixCapable = false;
 
 function refreshFixBar() {
   const picked = [...document.querySelectorAll('.fix-check:checked')];
@@ -4301,9 +4245,17 @@ async function loadAgentHub() {
         <textarea class="hub-ref-input" id="hub-ref-${a.name}" rows="3"
           placeholder="GitHub PR/issue/file/repo URL, Jira ticket ID, or paste content…"></textarea>
         <div class="form-row" style="gap:8px;margin-top:8px">
+          <!-- Hidden input plus a caption, the same shape D-250 gave the twenty-one static
+               screens. This one was missed because it is built here at runtime rather than
+               written into index.html, and no test had ever opened this screen. Its own
+               title attribute said "Set by the project selector in the sidebar", which is
+               an admission that a typed box was the wrong control. It stays a hidden input
+               because the project name is what knowledge_base.get_context slugifies to
+               find project-scoped documents; deleting it would stop those being found
+               with nothing on screen to say so. -->
           <div class="form-group flex1" style="margin:0">
-            <input type="text" id="hub-project-${a.name}" class="project-bound" placeholder="Project name (optional)"
-              title="Set by the project selector in the sidebar" style="width:100%" />
+            <input type="hidden" id="hub-project-${a.name}" class="project-bound" />
+            <div class="project-caption" data-for="hub-project-${a.name}"></div>
           </div>
           <div class="form-group" style="margin:0;display:flex;align-items:center;gap:6px;flex-shrink:0">
             <input type="checkbox" id="hub-postback-${a.name}" />
@@ -9031,6 +8983,11 @@ const RETENTION_DEFAULT = 7;
 function renderRetentionControl(agent) {
   const wrap = document.getElementById(`${agent}-retention-wrap`);
   if (!wrap || wrap.dataset.built) return;
+  // Only where the run actually stores a source. This control promises "kept, encrypted,
+  // for N days, then deleted"; on a screen whose route never calls
+  // `review_source_store.record` that promise is about nothing, and a setting that does
+  // nothing is worse than an absent one because it invites a decision.
+  if (!(AGENT_SCREENS[agent] || {}).inventory) return;
   wrap.dataset.built = '1';
   wrap.innerHTML = `
     <div class="form-group">
@@ -9240,6 +9197,119 @@ async function forgetReviewSources(agent, reviewId) {
   }
 }
 
+// ── Which agent each screen is ────────────────────────────────────────────
+//
+// One row per agent screen, keyed by the `data-page` its nav item carries. This is the
+// only place a screen declares what it is, and everything generic reads it: the run
+// history, which renderer reopens a stored run, whether the fix bar may arm, and whether
+// the retention control is telling the truth.
+//
+// It exists because the three facts a generic helper needs cannot all be derived:
+//
+//   * `product` *could* come from the nav item's `data-product`, and it is checked against
+//     it offline -- but the run history has to work when the nav item was not the thing
+//     that opened the screen.
+//   * `result` cannot be derived from the page id. The container ids are irregular and
+//     predate any convention (`req-result`, `sd-result`, `arch-result`, `gxg-plan-result`),
+//     and renaming twenty-two of them to fit a pattern is a bigger and riskier change than
+//     writing them down once.
+//   * `render` is a function; markup cannot hold one.
+//
+// The obvious objection is that product ids and review types already live in
+// `backend/products/registry.py`, so this is a second copy that can drift. That is true,
+// and the mitigation is the offline check in `smoke_review_sources.py`, which compares
+// every row here against `GET /api/v1/products` and against the `data-product` in
+// `index.html`, and fails on a screen that has no row at all. The check is worth more than
+// the table is; without it this comment would be an apology instead of a design.
+//
+// `gated` says whether a gate verdict from this agent *means* anything. `save_review`
+// defaults `gate_status` to "Green" and `findings_count` to 0 when a result carries neither
+// (`database.py:616-617`), so a test-case generator's stored row is indistinguishable from
+// a clean security review. Rendering that as "Green - 0 finding(s)" is not a summary, it is
+// a claim of safety nobody made. Those screens show what they produced instead.
+//
+// Three agent screens are deliberately absent:
+//   * `modernization` -- has its own run list, and it is richer than this one
+//     (`loadModernizationRuns`). Replacing it would lose the status, stage and spend chips.
+//   * `governance-report` -- writes a `reports` row, not a `reviews` row, and already has
+//     its own "Previous reports" list reading `GET /api/reports`.
+//   * `github` -- retired; its nav item opens the review screen (D-267).
+const AGENT_SCREENS = {
+  requirement:    { product: 'requirement',         reviewType: 'requirement',
+                    result: 'req-result',           render: renderResult,
+                    noun: 'reviews',                gated: true },
+  architecture:   { product: 'architecture',        reviewType: 'architecture',
+                    result: 'arch-result',          render: renderArchitectureResult,
+                    noun: 'reviews',                gated: true },
+  security:       { product: 'security',            reviewType: 'security',
+                    result: 'security-result',      render: renderSecurityResult,
+                    noun: 'reviews',                gated: true },
+  code:           { product: 'code',                reviewType: 'code',
+                    result: 'code-result',          render: renderResult,
+                    noun: 'reviews',                gated: true, inventory: true },
+  codegen:        { product: 'codegen-advisory',    reviewType: 'codegen_advisory',
+                    result: 'codegen-advisory-result', render: renderCodegenAdvisory,
+                    noun: 'recommendations',        gated: false },
+  migration:      { product: 'migration-assessment', reviewType: 'migration_assessment',
+                    result: 'migration-assessment-result', render: renderMigrationAssessment,
+                    noun: 'assessments',            gated: false },
+  'ai-provenance':{ product: 'ai-provenance',       reviewType: 'ai_provenance',
+                    result: 'ap-result',            render: renderAIProvenanceResult,
+                    noun: 'scans',                  gated: false },
+  'test-scenario':{ product: 'test-scenario',       reviewType: 'test_scenarios',
+                    result: 'test-scenario-result', render: renderTestScenarios,
+                    noun: 'generations',            gated: false },
+  'test-case':    { product: 'test-case',           reviewType: 'test_cases',
+                    result: 'test-case-result',     render: renderTestCases,
+                    noun: 'generations',            gated: false },
+  vapt:           { product: 'vapt',                reviewType: 'vapt',
+                    result: 'vapt-result',          render: renderVAPTResult,
+                    noun: 'assessments',            gated: true, inventory: true },
+  sensitive:      { product: 'sensitive-data',      reviewType: 'sensitive_data',
+                    result: 'sd-result',            render: renderSensitiveDataResult,
+                    noun: 'scans',                  gated: true },
+  prompt:         { product: 'prompt',              reviewType: 'prompt',
+                    result: 'prompt-result',        render: renderResult,
+                    noun: 'reviews',                gated: true },
+  cfr21:          { product: 'cfr21-verification',  reviewType: 'cfr21_verification',
+                    result: 'cfr21-result',         render: renderCFR21Result,
+                    noun: 'verifications',          gated: true },
+  'gxp-docs':     { product: 'gxp-document-check',  reviewType: 'gxp_document_check',
+                    result: 'gxp-docs-result',      render: renderGxPDocumentResult,
+                    noun: 'checks',                 gated: true },
+  'gxp-generate': { product: 'gxp-generate-plan',   reviewType: 'gxp_validation_plan',
+                    result: 'gxg-plan-result',      render: renderGxPPlan,
+                    noun: 'plans',                  gated: false },
+  'issue-triage': { product: 'issue-triage',        reviewType: 'issue_triage',
+                    result: 'issue-triage-result',  render: renderIssueTriageReport,
+                    noun: 'triages',                gated: true },
+  full:           { product: 'full',                reviewType: 'full',
+                    result: 'full-result',          render: renderFullResult,
+                    noun: 'reviews',                gated: true },
+  gate:           { product: 'release-gate',        reviewType: 'release_gate',
+                    result: 'gate-result',          render: renderResult,
+                    noun: 'gate decisions',         gated: true },
+  'agent-hub':    { product: 'swarm',               reviewType: 'swarm',
+                    result: 'swarm-result',         render: renderSwarmResult,
+                    noun: 'swarm runs',             gated: true },
+};
+
+/** The screen a stored review belongs to, or null. Used to keep one screen's panels out
+ *  of another's DOM -- see `renderResult`, which used to guess "code" for anything that
+ *  was not VAPT and then paint into the Code Review screen from wherever you were. */
+function screenForReview(result) {
+  if (!result) return null;
+  const type = result.review_type;
+  const product = result.product_id;
+  for (const [page, spec] of Object.entries(AGENT_SCREENS)) {
+    if (product && spec.product === product) return page;
+  }
+  for (const [page, spec] of Object.entries(AGENT_SCREENS)) {
+    if (type && spec.reviewType === type) return page;
+  }
+  return null;
+}
+
 // ── This agent's previous runs ────────────────────────────────────────────
 //
 // The record was already stored and already listed -- on the Dashboard and the History
@@ -9255,19 +9325,27 @@ async function forgetReviewSources(agent, reviewId) {
 // Reopening a run calls no model and costs nothing: the full result is already stored.
 
 const RUNS_PAGE_SIZE = 10;
-const _runsOffset = { code: 0, vapt: 0 };
-let _openRunId = null;
+// One offset per screen, created on demand. This was a two-key literal `{code, vapt}`, and
+// any other screen produced `undefined + 10` = NaN, which reached the server as
+// `offset=NaN` and came back a 422 -- a screen whose history was simply broken rather than
+// empty. Same for `_openRunId`, which was a single global two screens shared: whichever
+// painted last stole the other's highlight.
+const _runsOffset = {};
+const _openRunId = {};
 
 async function loadAgentRuns(agent) {
   const box = document.getElementById(`${agent}-runs`);
-  if (!box) return;
-  // `review_type` alone was wrong here: "code" is written by Code Review, by the GitHub PR
-  // review and by Auto-Fix, so this screen listed all three agents' runs. `product_id` is
-  // the specific one. Both are sent because rows written before product_id existed have
-  // none, and dropping them would make every existing project's history read as empty —
-  // which looks exactly like data loss. Those rows are labelled below instead.
-  const type = agent === 'vapt' ? 'vapt' : 'code';
-  const product = agent === 'vapt' ? 'vapt' : 'code';
+  const spec = AGENT_SCREENS[agent];
+  if (!box || !spec) return;
+  if (_runsOffset[agent] == null) _runsOffset[agent] = 0;
+  // Both axes are sent. `product_id` is the specific agent -- `review_type` alone cannot
+  // answer it, because "code" is written by Code Review, the GitHub PR review and Auto-Fix,
+  // and "issue_triage" by both triage products. `review_type` is sent as well because rows
+  // written before `product_id` was recorded have none, and dropping them would make an
+  // existing project's history read as empty, which looks exactly like data loss. Those
+  // rows are labelled in the card instead.
+  const type = spec.reviewType;
+  const product = spec.product;
   try {
     const d = await apiFetch(
       `/api/reviews?product_id=${product}&review_type=${type}`
@@ -9281,21 +9359,26 @@ async function loadAgentRuns(agent) {
       // under us. Fall back to the newest page rather than showing an empty list that reads
       // as "you have never run this". Same reasoning as `loadRecentReviews`.
       if (_runsOffset[agent] > 0) { _runsOffset[agent] = 0; return loadAgentRuns(agent); }
-      box.innerHTML = `<div class="empty-state">No ${type === 'vapt' ? 'assessments' : 'reviews'}
-        yet for this project. Estimating is free — nothing is billed until you approve a quote.</div>`;
+      // The "estimating is free" reassurance only belongs where there is something to
+      // estimate. Derived from the DOM rather than a flag so it becomes true on its own if
+      // a screen gains a quote later.
+      const quoted = !!document.getElementById(`${agent}-cost-preview`);
+      box.innerHTML = `<div class="empty-state">No ${esc(spec.noun)} yet for this project.${
+        quoted ? ' Estimating is free — nothing is billed until you approve a quote.' : ''}</div>`;
       return;
     }
 
     box.innerHTML = `
       <div class="run-list">${runs.map(r => `
-        <div class="run-card ${r.id === _openRunId ? 'selected' : ''}"
+        <div class="run-card ${r.id === _openRunId[agent] ? 'selected' : ''}"
              onclick="openAgentRun('${agent}', '${esc(r.id)}')">
           <div class="run-card-head">
+            ${spec.gated ? `
             <span class="run-gate ${esc(r.gate_status || 'Green')}">${esc(r.gate_status || '—')}</span>
             <b>${Number(r.findings_count || 0)} finding(s)</b>
             ${r.critical_count ? `<span class="run-gate Red">${r.critical_count} critical</span>` : ''}
-            ${r.high_count ? `<span class="run-gate Amber">${r.high_count} high</span>` : ''}
-            ${!r.product_id ? `<span class="run-gate" title="This run predates the record of which agent produced it, so it is matched on review type alone — it may have come from the GitHub PR review or Auto-Fix rather than this screen">before agents were recorded</span>` : ''}
+            ${r.high_count ? `<span class="run-gate Amber">${r.high_count} high</span>` : ''}` : ''}
+            ${!r.product_id ? `<span class="run-gate" title="This run predates the record of which agent produced it, so it is matched on review type alone — another product writing the same review type could appear here">before agents were recorded</span>` : ''}
             <span class="run-when">${esc(String(r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
           </div>
           <div class="run-card-meta">${esc(r.input_summary || 'No summary')}</div>
@@ -9321,14 +9404,18 @@ function pageAgentRuns(agent, direction) {
 
 /** Reopen a stored run in the result panel, with its file inventory beneath it. */
 async function openAgentRun(agent, reviewId) {
-  _openRunId = reviewId;
+  const spec = AGENT_SCREENS[agent];
+  if (!spec) return;
+  _openRunId[agent] = reviewId;
   await loadAgentRuns(agent);
   // Keep the run you just clicked in view inside its own scroller. Without this, repainting
   // the list resets its scroll to the top, so opening the eighth run scrolled your place in
   // the list away at the same moment it answered you.
   const card = document.querySelector(`#${agent}-runs .run-card.selected`);
   if (card) card.scrollIntoView({ block: 'nearest' });
-  const target = document.getElementById(`${agent}-result`);
+  // `spec.result`, not `${agent}-result` -- the container ids are irregular, so the old
+  // derivation only ever resolved on the two screens that happened to match it.
+  const target = document.getElementById(spec.result);
   if (!target) return;
   target.classList.remove('hidden');
   target.innerHTML = '<div class="mod-panel">Loading that run…</div>';
@@ -9337,11 +9424,17 @@ async function openAgentRun(agent, reviewId) {
     const result = typeof row.result_json === 'string'
       ? JSON.parse(row.result_json || '{}') : (row.result_json || {});
     result.review_id = reviewId;
+    // Carried so `renderResult` can tell which screen owns this result rather than
+    // guessing, and so a reopened run is attributed the same way a fresh one is.
+    if (!result.review_type) result.review_type = row.review_type || spec.reviewType;
+    if (!result.product_id) result.product_id = row.product_id || spec.product;
     // A stored run renders through exactly the same function as a fresh one, so a reader is
-    // never comparing two differently-shaped accounts of the same thing. The banner is the
-    // only difference, and it is there because the gate on a month-old run is a statement
-    // about the code as it was, not as it is.
-    renderResult(`${agent}-result`, result);
+    // never comparing two differently-shaped accounts of the same thing. That claim used to
+    // be false for VAPT: a fresh assessment went through `renderVAPTResult` with its CVSS,
+    // CWE and proof-of-concept detail, and reopening the same run rendered it through the
+    // generic renderer, which shows none of that. The banner is the only difference now,
+    // and it is there because the gate on a month-old run describes the code as it was.
+    spec.render(spec.result, result);
     target.insertAdjacentHTML('afterbegin', `
       <div class="cost-note">Reopened from ${esc(String(row.created_at || '').slice(0, 16).replace('T', ' '))} UTC.
         No model was called and nothing was billed — this is the stored result. The gate below
@@ -9494,7 +9587,8 @@ function renderQuoteFileList(q) {
 // risk a proxy timeout with the spend already incurred.
 const ASYNC_CALL_THRESHOLD = 4;
 
-let _reviewPollTimer = null;
+// One poll interval per result panel, keyed by its element id. See `pollReviewJob`.
+const _reviewPollTimers = {};
 
 // The quote the user pressed the button on, per agent. Lives beside `_pendingQuote` rather
 // than inside it because `_pendingQuote` is cleared the moment the run starts.
@@ -9633,27 +9727,31 @@ async function runReviewAsJob(agent, built, target, quotedCalls) {
  *  message — rather than a second copy that drifts from this one.
  */
 function pollReviewJob(agent, jobId, target, accepted, onDone) {
-  if (_reviewPollTimer) clearInterval(_reviewPollTimer);
+  // One timer per result panel, not one for the whole application. As a single global, a
+  // run started on a second screen cleared the first screen's interval, leaving its panel
+  // stuck on whatever progress it had last painted — a review that looks hung while it is
+  // in fact finishing normally.
+  _stopReviewPoll(target);
   const wrap = document.getElementById(target);
   let misses = 0;
 
-  _reviewPollTimer = setInterval(async () => {
+  _reviewPollTimers[target] = setInterval(async () => {
     try {
       const job = await apiFetch(`/api/review/jobs/${jobId}`, { _silent: true });
       misses = 0;
       if (job.status === 'completed') {
-        clearInterval(_reviewPollTimer);
-        _reviewPollTimer = null;
+        _stopReviewPoll(target);
         const result = job.result || {};
         if (onDone) { onDone(result); return; }
-        if (agent === 'vapt') renderVAPTResult(target, result);
+        const spec = AGENT_SCREENS[agent];
+        if (spec) spec.render(target, result);
         else renderResult(target, result);
         loadDashboard();
+        if (spec) loadAgentRuns(agent);
         return;
       }
       if (job.status === 'failed') {
-        clearInterval(_reviewPollTimer);
-        _reviewPollTimer = null;
+        _stopReviewPoll(target);
         const err = job.error || {};
         showError(target, err.detail || err.message || 'The review failed.');
         return;
@@ -9663,13 +9761,19 @@ function pollReviewJob(agent, jobId, target, accepted, onDone) {
       // One failed poll is a blip; five in a row means the job is unreachable, and saying so
       // beats spinning forever on a review that has already gone.
       if (++misses >= 5) {
-        clearInterval(_reviewPollTimer);
-        _reviewPollTimer = null;
+        _stopReviewPoll(target);
         showError(target,
           `Lost contact with the review — ${e.message}. Its result may still appear in History.`);
       }
     }
   }, 2500);
+}
+
+function _stopReviewPoll(target) {
+  if (_reviewPollTimers[target]) {
+    clearInterval(_reviewPollTimers[target]);
+    delete _reviewPollTimers[target];
+  }
 }
 
 function renderReviewProgress(job, accepted) {
@@ -9735,7 +9839,10 @@ function renderReviewTransparency(r) {
   // and was never shown the bill, and a set of findings never said which model wrote them.
   const spend = r._budget_stats;
   if (spend && (spend.cost_usd != null || spend.calls)) {
-    const approved = _approvedQuote[(r.review_type === 'vapt' ? 'vapt' : 'code')] || {};
+    // The ceiling this run was approved against, if it was approved against one. Keyed by
+    // the screen that owns the result rather than a code/vapt ternary, which silently
+    // compared every other agent's spend against Code Review's last quote.
+    const approved = _approvedQuote[screenForReview(r)] || {};
     const actual = Number(spend.cost_usd || 0);
     const ceiling = Number(approved.ceiling_usd || 0);
     const over = ceiling > 0 && actual > ceiling;

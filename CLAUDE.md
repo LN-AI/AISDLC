@@ -174,6 +174,16 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   *and* on the read path that depends on it: `lapse_expired_waivers` (before every baseline
   lookup) and `review_source_store.sweep_expired` (on every inventory read).
 - `backend/config.py` — env var loading (see below).
+- **`AGENT_SCREENS` in `frontend/app.js` is where an agent screen says what it is.** One row
+  per screen keyed by its nav `data-page`, giving the product id, the `reviews.review_type`
+  it writes, its result container id, its renderer function and what to call its runs. The
+  generic machinery reads it: the per-agent "Previous runs" list, which renderer reopens a
+  stored run, whether the Apply Fixes checkbox may appear, and whether the retention control
+  is telling the truth. **A new agent screen must add a row** — `smoke_review_sources.py`
+  section 26 fails otherwise, and also fails if a row disagrees with `GET /api/v1/products`
+  or with the nav's `data-product`. Three screens are deliberately absent, each for a stated
+  reason in the table's own comment (modernization and the governance report have their own,
+  richer histories; the GitHub PR screen is retired).
 - `docs/` — per-agent reference docs and integration guides (`n8n-workflows/`, `vscode-integration/`).
 
 ## Environment variables

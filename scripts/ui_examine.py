@@ -664,14 +664,106 @@ def main():
                   "Code Review" in page.locator("#page-github").inner_text(),
                   "a screen that vanished with no explanation is worse than one that moved")
 
-            # ── 11. Findings screen still works ───────────────────────────
-            section("11. The surrounding screens still load")
+            # ── 11. Every agent screen, not four of them ─────────────
+            #
+            # This used to assert that four screens "load". That is precisely why nineteen
+            # screens could carry no run history for months: this is the only test that can
+            # see an element id in index.html disagreeing with the one app.js reads, and it
+            # was looking at Code Review.
+            #
+            # The list is read out of the live page (`AGENT_SCREENS`) rather than repeated
+            # here, so a screen added to the table is examined without editing this file --
+            # and a screen added to the nav but not the table is caught by the offline
+            # check in smoke_review_sources.py, which is the other half of the same guard.
+            section("11. Every agent screen has its own history, above its result")
+
+            # Sections remember being collapsed in localStorage; a collapsed one hides its
+            # nav items and every click below would miss.
+            page.evaluate("""() => document.querySelectorAll('.nav-section.collapsed')
+                                    .forEach(s => s.classList.remove('collapsed'))""")
+
+            screens = page.evaluate(
+                "() => (typeof AGENT_SCREENS === 'undefined') ? null "
+                "     : Object.entries(AGENT_SCREENS).map(([p, s]) => "
+                "         ({page: p, result: s.result, noun: s.noun, gated: !!s.gated}))")
+            check("the screen table reached the browser", isinstance(screens, list),
+                  "without it nothing below can run -- a parse error in app.js looks "
+                  "exactly like this")
+            screens = screens or []
+            check("...and covers most of the agent screens", len(screens) >= 19,
+                  f"{len(screens)} screens declared")
+
+            for spec in screens:
+                pg = spec["page"]
+                page.click(f".nav-item[data-page='{pg}']")
+                page.wait_for_timeout(260)
+
+                check(f"{pg}: the screen loads",
+                      page.locator(f"#page-{pg}").is_visible())
+                runs = page.locator(f"#{pg}-runs")
+                check(f"{pg}: it has a previous-runs container",
+                      runs.count() == 1,
+                      "loadAgentRuns returns silently without one, which looks identical "
+                      "to a project that has never run this agent")
+                check(f"{pg}: ...and it is visible, not pushed off the page",
+                      runs.is_visible())
+
+                # Above the result, height-capped: the shape D-271 settled on. Neither
+                # element may push the other away.
+                check(f"{pg}: the list is rendered above the result it describes",
+                      page.evaluate("""(ids) => {
+                          const r = document.getElementById(ids[0]);
+                          const res = document.getElementById(ids[1]);
+                          if (!r || !res) return false;
+                          return !!(r.compareDocumentPosition(res)
+                                    & Node.DOCUMENT_POSITION_FOLLOWING);
+                      }""", [f"{pg}-runs", spec["result"]]),
+                      f"#{pg}-runs must precede #{spec['result']}")
+                check(f"{pg}: ...and capped so a long history cannot bury the result",
+                      page.evaluate("""(id) => {
+                          const el = document.getElementById(id);
+                          if (!el) return false;
+                          const max = getComputedStyle(el).maxHeight;
+                          return max !== 'none' && parseFloat(max) > 0;
+                      }""", f"{pg}-runs"))
+
+                # It has to have *answered*. Stuck on the loading placeholder, or empty
+                # markup, both read to a user as a broken screen.
+                text = runs.inner_text().strip()
+                check(f"{pg}: the history answered rather than hanging",
+                      bool(text) and "Loading" not in text,
+                      f"showing: {text[:90]!r}")
+                # With no runs for this project the honest answer names what this agent
+                # produces -- "No reviews yet" on a test-case generator is the wrong noun.
+                if "No " in text:
+                    check(f"{pg}: ...and the empty state names what this agent produces",
+                          spec["noun"] in text, f"expected {spec['noun']!r} in {text[:90]!r}")
+                check(f"{pg}: its result container exists",
+                      page.locator(f"#{spec['result']}").count() == 1, spec["result"])
+
+            # The three screens deliberately absent from the table keep what they had.
+            section("11b. The screens with their own history keep it")
+            page.click(".nav-item[data-page='modernization']")
+            page.wait_for_timeout(300)
+            check("modernization keeps its own richer run list",
+                  page.locator("#mod-runs").count() == 1,
+                  "it carries status, stage and spend chips the generic card does not")
+            check("...and is not given a second, generic one",
+                  page.locator("#modernization-runs").count() == 0,
+                  "two run lists on one screen is a worse answer than either alone")
+            page.click(".nav-item[data-page='governance-report']")
+            page.wait_for_timeout(300)
+            check("the governance report keeps its Previous reports list",
+                  page.locator("#report-list").count() == 1,
+                  "it reads GET /api/reports -- a `reports` row, not a `reviews` row")
+
             for label, page_id in (("Findings", "page-findings"),
                                    ("Dashboard", "page-dashboard"),
-                                   ("History", "page-history"),
-                                   ("VAPT", "page-vapt")):
+                                   ("History", "page-history")):
                 goto_page(page, label)
-                check(f"the {label} screen loads", page.locator(f"#{page_id}").is_visible())
+                check(f"the {label} screen still loads",
+                      page.locator(f"#{page_id}").is_visible())
+
 
             # ── 12. Optional: a full review, gateway stubbed ──────────────
             if args.with_review:
@@ -808,6 +900,20 @@ def main():
             check("the hidden input carries no stale value",
                   (page.get_attribute("#code-project", "value") or "") == "",
                   page.get_attribute("#code-project", "value"))
+
+            # ...and the screens with no quote step do not claim one. The caption is shared
+            # by every screen, and "estimating a cost works without one" describes a button
+            # that exists on two of twenty-one.
+            goto_page(page, "Prompt Safety")
+            page.wait_for_timeout(200)
+            _pcap = page.locator("#page-prompt .project-caption").first.text_content() or ""
+            check("a screen with no cost estimate does not promise one",
+                  "No project selected" in _pcap
+                  and "Estimating a cost" not in _pcap,
+                  _pcap.strip()[:140])
+            check("...and still says a run will be refused",
+                  "refused" in _pcap, _pcap.strip()[:140])
+            goto_page(page, "Code Review")
 
             if select_project(page, "Caption check"):
                 goto_page(page, "Code Review")
