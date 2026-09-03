@@ -301,6 +301,36 @@ async def legacy_product_guard(request, call_next):
     model = effective_llm.get("model") or config.MODEL
     provider = effective_llm.get("provider") or "anthropic"
     cost_usd = agent_guard._price_usage(usage, model)
+
+    # ── What it cost, back to the caller ─────────────────────────────────────
+    #
+    # All of this was computed here and none of it ever reached the browser. `guarded_call`
+    # attaches it to the body as `_budget_stats`, but this middleware runs *around* the
+    # handler: by the time the numbers exist, `call_next` has already serialized the
+    # response and there is no body left to add a key to. So every agent screen except Code
+    # Review and VAPT showed a set of findings with no indication of what the run cost, how
+    # many calls it took, or which model produced them — and the sidebar's model is the
+    # deployment default, which a team on its own key is not using.
+    #
+    # Headers are the one channel still open after `call_next`, which the rate-limit block
+    # above already relies on. `apiFetch` folds these into `_budget_stats` when the body has
+    # none, so the existing spend strip renders unchanged.
+    #
+    # The figures come from `_price_usage` — the same arithmetic that writes the ledger
+    # below. Deriving them any other way would let the number on screen and the number
+    # billed drift apart, which is worse than showing nothing.
+    response.headers["X-Spend-Cost-USD"] = f"{cost_usd:.6f}"
+    response.headers["X-Spend-Calls"] = str(usage["calls"])
+    response.headers["X-Spend-Tokens-In"] = str(usage["input_tokens"])
+    response.headers["X-Spend-Tokens-Out"] = str(usage["output_tokens"])
+    response.headers["X-Spend-Model"] = model
+    response.headers["X-Spend-Provider"] = provider
+    # These routes resolve no caller BYOL config (a browser session has no API-key record to
+    # hang one on), so the platform always pays — stated rather than left to be inferred.
+    response.headers["X-Spend-Billable"] = "1"
+    if agent_guard._is_estimated(model):
+        response.headers["X-Spend-Cost-Estimated"] = "1"
+
     if subject.project_id:
         database.record_project_cost(subject.project_id, cost_usd)
     if key_id:

@@ -150,6 +150,18 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Response headers a browser is allowed to *read*. Without this list, only the six
+    # CORS-safelisted headers are visible to JavaScript on a cross-origin request — so a
+    # client served from anywhere but this app could not see what a run cost, and could not
+    # see how much rate-limit budget it had left in order to back off. Both sets exist to be
+    # read; the bundled SPA is same-origin and never needed the permission, which is why it
+    # was missing.
+    expose_headers=[
+        "X-Spend-Cost-USD", "X-Spend-Calls", "X-Spend-Tokens-In", "X-Spend-Tokens-Out",
+        "X-Spend-Model", "X-Spend-Provider", "X-Spend-Billable", "X-Spend-Cost-Estimated",
+        "X-RateLimit-Limit-Minute", "X-RateLimit-Remaining-Minute",
+        "X-RateLimit-Limit-Day", "X-RateLimit-Remaining-Day",
+    ],
 )
 
 

@@ -492,6 +492,7 @@ function renderCodegenAdvisory(targetId, result) {
     <div class="result-header">
       <h2>Recommendation</h2>
     </div>
+    ${renderReviewTransparency(result)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
     ${suggestions.length ? `
@@ -734,6 +735,7 @@ function renderMigrationAssessment(targetId, r) {
       <h2>Migration Assessment</h2>
       <span class="risk-score">Complexity: <b style="color:${complexityColor}">${esc(r.complexity || '—')}</b></span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
     <div class="quality-grid" style="margin-top:16px">
@@ -927,6 +929,7 @@ function renderIssueTriageReport(targetId, r) {
       <h2>Issue Triage Report</h2>
       ${gateStatusBadge(r.gate_status)}
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.issue_summary || r.reasoning_summary || '')}</div>
 
     <div class="quality-grid" style="margin-top:16px">
@@ -1360,6 +1363,7 @@ function renderTestScenarios(targetId, r) {
       <h2>Test Scenario Catalogue</h2>
       <span style="color:var(--text-muted);font-size:13px">${r.total_scenarios || scenarios.length} scenarios · ${r.critical_count || 0} critical</span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
     ${(r.missing_acceptance_criteria || []).length ? `
@@ -1443,6 +1447,7 @@ function renderTestCases(targetId, r) {
       <h2>Test Cases</h2>
       <span style="color:var(--text-muted);font-size:13px">${r.total_test_cases || cases.length} test cases · ${r.critical_count || 0} critical</span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
     ${(r.untestable_items || []).length ? `
@@ -1994,6 +1999,7 @@ function renderFullResult(targetId, result) {
       <span class="risk-score-badge">Overall Risk: ${score.toFixed ? score.toFixed(0) : score}/100</span>
       <span style="color:var(--text-muted);font-size:13px">${result.total_findings ?? 0} findings (${result.critical_count ?? 0} critical, ${result.high_count ?? 0} high)</span>
     </div>
+    ${renderReviewTransparency(result)}
   `;
 
   if (result.summary) {
@@ -2831,7 +2837,51 @@ async function apiFetch(url, options = {}) {
     if ([402, 403, 429].includes(res.status) && !_silent) refreshEntitlements();
     throw new Error(detailMsg || `HTTP ${res.status}`);
   }
-  return res.json();
+  const body = await res.json();
+  return _foldSpendHeaders(res, body);
+}
+
+/** Move what a run cost from the response headers onto the body.
+ *
+ *  `agent_guard.guarded_call` puts this in the body as `_budget_stats`, but the synchronous
+ *  `/api/review/*` routes are metered by middleware that runs *around* the handler — by the
+ *  time the cost is known, the body has already been serialized. So on every agent screen
+ *  but Code Review and VAPT the figures were computed, written to the ledger, and never
+ *  shown. `legacy_guard` now emits them as `X-Spend-*` headers; this puts them where the
+ *  spend strip already looks, so no renderer changes.
+ *
+ *  A body that already carries `_budget_stats` wins. That path has strictly more —
+ *  the remaining monthly budget, the per-project figures, whether the call was billable at
+ *  all — and overwriting it with the header subset would be a downgrade dressed as a fix.
+ */
+function _foldSpendHeaders(res, body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  if (body._budget_stats) return body;
+  // A response without a readable header bag is not an error worth raising from inside a
+  // successful request: cross-origin without `expose_headers`, or a test double.
+  if (!res || !res.headers || typeof res.headers.get !== 'function') return body;
+  const cost = res.headers.get('X-Spend-Cost-USD');
+  const calls = res.headers.get('X-Spend-Calls');
+  // No header at all means the route is not metered this way (a v1 route, a static file, a
+  // free preflight); zero calls means nothing reached a model, and a "cost $0.0000" strip
+  // on a cache hit or a validation error is noise, not transparency.
+  if (cost == null && calls == null) return body;
+  if (Number(calls || 0) === 0) return body;
+  const num = (name) => {
+    const v = res.headers.get(name);
+    return v == null ? undefined : Number(v);
+  };
+  body._budget_stats = {
+    cost_usd: num('X-Spend-Cost-USD'),
+    calls: num('X-Spend-Calls'),
+    input_tokens: num('X-Spend-Tokens-In'),
+    output_tokens: num('X-Spend-Tokens-Out'),
+    model: res.headers.get('X-Spend-Model') || undefined,
+    provider: res.headers.get('X-Spend-Provider') || undefined,
+    billable: res.headers.get('X-Spend-Billable') === '1',
+    cost_estimated: res.headers.get('X-Spend-Cost-Estimated') === '1',
+  };
+  return body;
 }
 
 // ── Architecture Review ────────────────────────────────────────────────────
@@ -2891,6 +2941,7 @@ function renderArchitectureResult(targetId, r) {
       <h2>Architecture Review ${gateStatusBadge(r.gate_status)}</h2>
       <span class="risk-score">Risk Score: <b>${r.risk_score ?? '—'}</b>/100</span>
     </div>
+    ${renderReviewTransparency(r)}
 
     <span class="arch-type-badge">🏗️ ${esc(r.architecture_type || 'Unknown')}</span>
     ${r.architecture_description ? `<div class="summary-box" style="margin-bottom:16px;">${esc(r.architecture_description)}</div>` : ''}
@@ -3134,6 +3185,7 @@ function renderSecurityResult(targetId, r) {
       <h2>Security Review Results ${gateStatusBadge(r.gate_status)}</h2>
       <span class="risk-score">Risk Score: <b>${r.risk_score ?? '—'}</b>/100</span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
     ${findings.length ? `<div class="section-title">Architecture Findings (${findings.length})</div>${findings.map(f => renderFindingCard(f)).join('')}` : ''}
     ${stride.length ? `
@@ -3457,6 +3509,7 @@ function renderSensitiveDataResult(targetId, r) {
       <h2>Sensitive Data Scan ${gateStatusBadge(r.gate_status)}</h2>
       <span class="risk-score">Risk Score: <b>${r.risk_score ?? '—'}</b>/100</span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
     <div class="sd-category-bar">
       ${Object.entries(catCounts).map(([cat, cnt]) => `
@@ -3539,6 +3592,7 @@ function renderAIProvenanceResult(targetId, r) {
       </h2>
       <span class="risk-score">Score: <b>${r.score ?? '—'}</b>/100 · Confidence: ${esc(r.confidence || '—')}</span>
     </div>
+    ${renderReviewTransparency(r)}
 
     <div class="summary-box" style="border-left:3px solid ${likelihoodColor}">${esc(r.summary || '')}</div>
 
@@ -3658,6 +3712,7 @@ function renderCFR21Result(targetId, r) {
       <h2>21 CFR Part 11 Verification ${gateStatusBadge(r.overall_gate_status)}</h2>
       <span class="risk-score">Risk Score: <b>${r.overall_risk_score ?? '—'}</b>/100</span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
     ${scanned.length ? `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">Files scanned (${scanned.length}): ${scanned.map(esc).join(', ')}</p>` : ''}
@@ -3761,6 +3816,7 @@ function renderGxPDocumentResult(targetId, r) {
       <h2>${esc(r.document_type || 'Document')} ${gateStatusBadge(r.overall_gate_status)}</h2>
       <span class="risk-score">Completeness: <b>${r.completeness_score ?? '—'}</b>% · Risk: <b>${r.overall_risk_score ?? '—'}</b>/100</span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
     ${elements.length ? `
@@ -3874,6 +3930,7 @@ function renderGxPPlan(targetId, r) {
     <div class="result-header">
       <h2>Validation Plan — <span style="color:${classColor}">${esc(r.gxp_classification || 'Unknown')}</span></h2>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.classification_rationale || '')}</div>
     ${r.system_summary ? `<div class="section-title" style="margin-top:16px">System Summary</div><div class="summary-box">${esc(r.system_summary)}</div>` : ''}
 
@@ -4145,6 +4202,7 @@ function renderSwarmResult(targetId, r) {
         ${(r.agents_run || []).length} agents · ${r.total_critical || 0} critical · ${r.total_high || 0} high
       </span>
     </div>
+    ${renderReviewTransparency(r)}
     <div class="summary-box">
       Policy <strong>${esc(document.getElementById('swarm-policy').value)}</strong>
       (required: ${esc((r.policy_applied?.required_agents || []).join(' · ') || 'none')})
@@ -9914,7 +9972,13 @@ function renderReviewTransparency(r) {
   // bottom of the findings list: a security team's first question about a new tool is whether
   // its output reaches the dashboard they already watch, and the answer should not be
   // something they have to scroll for.
-  if (r.review_id) {
+  // Offered only where there is something for a code-scanning dashboard to receive. SARIF
+  // is a static-analysis format: `sarif.from_review` will happily export any review
+  // (`findings.py:213`), but a "Download as SARIF" button under a set of generated test
+  // cases or a stack recommendation is an export of an empty file, and offering it teaches
+  // a reader that the buttons on this platform are decorative.
+  const _exportable = (r.findings || []).length || (r.suppressed_findings || []).length;
+  if (r.review_id && _exportable) {
     html += `<div class="export-row">
       <button type="button" class="btn-link" onclick="downloadSarif('${esc(r.review_id)}')"
          title="SARIF 2.1.0 — upload it from CI and these appear as GitHub code scanning alerts, or feed it to Azure DevOps, GitLab or a SIEM">

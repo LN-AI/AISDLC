@@ -86,6 +86,7 @@ const document = {
 // assert the URL (and therefore the paging query) the code actually asked for.
 const fetchLog = [];
 let nextFetchBody = {};
+let nextFetchHeaders = {};
 
 const sandbox = {
   document,
@@ -95,9 +96,16 @@ const sandbox = {
   // logger.js is a separate script tag in index.html, so it isn't in `source`; the
   // renderers don't touch it but the loaders' error paths do.
   feLog: { error() {}, warn() {}, info() {}, debug() {} },
+  // `nextFetchHeaders` lets a test drive the X-Spend-* path: the synchronous review routes
+  // report what a run cost in response headers, because the middleware that prices them
+  // runs after the body has been serialized and has nowhere else to put it.
   fetch: async (url) => {
     fetchLog.push(url);
-    return { ok: true, status: 200, json: async () => nextFetchBody, text: async () => '' };
+    return {
+      ok: true, status: 200,
+      headers: { get: (k) => (nextFetchHeaders[k] !== undefined ? nextFetchHeaders[k] : null) },
+      json: async () => nextFetchBody, text: async () => '',
+    };
   },
   setTimeout, clearTimeout, setInterval, clearInterval,
   alert() {}, confirm: () => true, prompt: () => null,
@@ -1858,9 +1866,30 @@ check('the source and what was filtered out of it is stated on the result', () =
 });
 
 check('the result offers a way to get the findings out of the platform', () => {
-  const html = sandbox.renderReviewTransparency({ review_id: 'rid-9' });
+  const html = sandbox.renderReviewTransparency({
+    review_id: 'rid-9', findings: [{ title: 'SQLi', severity: 5, file_path: 'a.py' }],
+  });
   if (!/Download as SARIF/i.test(html)) throw new Error('no export affordance');
   if (!html.includes('rid-9')) throw new Error('the export link does not name the review');
+});
+
+check('...but not on a result with no findings to export', () => {
+  // SARIF is a static-analysis format. The transparency block is now on every agent
+  // screen, including the generative ones, and 'Download as SARIF' under a set of
+  // generated test cases exports an empty file -- which teaches a reader that the buttons
+  // on this platform are decorative.
+  const html = sandbox.renderReviewTransparency({ review_id: 'rid-10', findings: [] });
+  if (/SARIF/i.test(html)) throw new Error('offered an export of nothing');
+});
+
+check('...and it counts suppressed findings, which the export does include', () => {
+  const html = sandbox.renderReviewTransparency({
+    review_id: 'rid-11', findings: [],
+    suppressed_findings: [{ title: 'fixture key', file_path: 'tests/x.py', severity: 5 }],
+  });
+  if (!/Download as SARIF/i.test(html))
+    throw new Error('a review whose only findings are in test paths still has a SARIF file '
+      + 'worth exporting -- they are included, marked suppressed');
 });
 
 check('a result with no id offers no broken export link', () => {
@@ -2181,6 +2210,178 @@ await checkAsync('every screen in the table names a renderer that exists', async
     assert(typeof s.result === 'string' && s.result, `${page}: no result container id`);
     assert(typeof s.noun === 'string' && s.noun, `${page}: nothing to call its runs`);
   }
+});
+
+section('What a run cost, carried in headers');
+
+// The synchronous review routes are metered by middleware that runs around the handler, so
+// the cost is known only after the body has been serialized. `legacy_guard` reports it in
+// `X-Spend-*` headers and `apiFetch` folds them into `_budget_stats`, which is where the
+// spend strip already looks -- so no renderer had to change.
+
+const _hdrs = (o) => o;   // the stub's header bag is a plain object
+
+check('the headers become _budget_stats, so the existing strip renders', () => {
+  const body = { gate_status: 'Green', findings: [] };
+  const res = { headers: { get: (k) => ({
+    'X-Spend-Cost-USD': '0.041200', 'X-Spend-Calls': '3',
+    'X-Spend-Tokens-In': '12405', 'X-Spend-Tokens-Out': '1880',
+    'X-Spend-Model': 'claude-sonnet-4-6', 'X-Spend-Provider': 'anthropic',
+    'X-Spend-Billable': '1',
+  })[k] ?? null } };
+  const out = sandbox._foldSpendHeaders(res, body);
+  assert(out._budget_stats, 'no _budget_stats was folded in');
+  assert(out._budget_stats.cost_usd === 0.0412, `cost was ${out._budget_stats.cost_usd}`);
+  assert(out._budget_stats.calls === 3, 'call count lost');
+  assert(out._budget_stats.input_tokens === 12405, 'input tokens lost');
+  assert(out._budget_stats.model === 'claude-sonnet-4-6', 'model lost');
+  assert(out._budget_stats.billable === true, 'billable flag lost');
+  const html = sandbox.renderReviewTransparency(out);
+  assert(html.includes('spend-strip'), 'the strip did not render from folded headers');
+  assert(html.includes('0.0412'), 'the cost is not on screen');
+  assert(html.includes('claude-sonnet-4-6'), 'the model is not on screen');
+});
+
+check('a body that already has _budget_stats is not downgraded', () => {
+  // The `guarded_call` path carries strictly more: remaining monthly budget, the
+  // per-project figures, whether the call was billable at all. Overwriting it with the
+  // header subset would be a downgrade dressed as a fix.
+  const rich = { cost_usd: 0.99, calls: 9, monthly_budget_usd: 50, budget_used_usd: 12 };
+  const body = { _budget_stats: rich };
+  const res = { headers: { get: () => '0.01' } };
+  const out = sandbox._foldSpendHeaders(res, body);
+  assert(out._budget_stats === rich, 'the richer body figures were overwritten by headers');
+  assert(out._budget_stats.monthly_budget_usd === 50, 'budget context lost');
+});
+
+check('a run that reached no model reports no spend at all', () => {
+  // A validation error, a cache hit, or a free preflight. "cost $0.0000" on those is
+  // noise pretending to be transparency.
+  const res = { headers: { get: (k) => ({
+    'X-Spend-Cost-USD': '0.000000', 'X-Spend-Calls': '0',
+  })[k] ?? null } };
+  const out = sandbox._foldSpendHeaders(res, { gate_status: 'Green' });
+  assert(!out._budget_stats, 'a zero-call response produced a spend strip');
+});
+
+check('a response with no spend headers is left alone', () => {
+  const out = sandbox._foldSpendHeaders({ headers: { get: () => null } }, { a: 1 });
+  assert(!out._budget_stats, 'invented spend figures from nothing');
+  assert(out.a === 1, 'the body was mangled');
+});
+
+check('a response with no readable headers does not throw', () => {
+  // Cross-origin without `expose_headers`, or an older test double. A successful request
+  // must not fail inside the transport for want of a header.
+  const out = sandbox._foldSpendHeaders({}, { a: 1 });
+  assert(out.a === 1, 'the body was lost');
+  const out2 = sandbox._foldSpendHeaders({ headers: {} }, { a: 1 });
+  assert(out2.a === 1, 'the body was lost when headers had no getter');
+});
+
+check('a non-object body passes through untouched', () => {
+  assert(sandbox._foldSpendHeaders({ headers: { get: () => '1' } }, null) === null);
+  assert(Array.isArray(sandbox._foldSpendHeaders({ headers: { get: () => '1' } }, [1, 2])));
+});
+
+check('an estimated price says so, rather than implying a quoted one', () => {
+  const res = { headers: { get: (k) => ({
+    'X-Spend-Cost-USD': '0.010000', 'X-Spend-Calls': '1',
+    'X-Spend-Model': 'some-local-router', 'X-Spend-Cost-Estimated': '1',
+  })[k] ?? null } };
+  const out = sandbox._foldSpendHeaders(res, { gate_status: 'Green' });
+  assert(out._budget_stats.cost_estimated === true, 'the estimate flag was dropped');
+  const html = sandbox.renderReviewTransparency(out);
+  assert(html.includes('cost is an estimate'),
+    'a model with no published price must not present its cost as a fact');
+});
+
+section('What the run cost, on every agent screen');
+
+// `renderReviewTransparency` reads only result keys -- coverage, the gate the model itself
+// returned, the findings discarded because their quoted code was not in the source, the
+// spend, the model that answered, the SARIF export. It was entirely screen-agnostic and
+// called from two renderers out of sixteen, so seventeen screens computed all of it and
+// rendered none of it. A person approved nothing and was shown nothing.
+//
+// Driven from the table so a nineteenth screen is covered without touching this file.
+check('every screen renders the spend strip, not just the two that had it', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const missing = [];
+  const threw = [];
+  for (const [page, spec] of Object.entries(TABLE)) {
+    const target = `_spend_${page}`;
+    elements.delete(target);
+    try {
+      spec.render(target, {
+        review_type: spec.reviewType, review_id: `rv-${page}`,
+        gate_status: 'Amber', risk_score: 40, summary: 'A summary.',
+        _budget_stats: {
+          cost_usd: 0.0412, calls: 3, input_tokens: 12405, output_tokens: 1880,
+          model: 'claude-sonnet-4-6', provider: 'anthropic',
+        },
+      });
+    } catch (e) {
+      threw.push(`${page}: ${e.message}`);
+      continue;
+    }
+    const html = document.getElementById(target).innerHTML;
+    if (!html.includes('spend-strip')) missing.push(page);
+  }
+  assert(threw.length === 0, `renderer threw on a minimal result -- ${threw.join(' | ')}`);
+  assert(missing.length === 0,
+    `no spend strip on: ${missing.join(', ')} -- the cost was computed and dropped`);
+});
+
+check('...and it names the model, because whoever reads the answer is entitled to know', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const quiet = [];
+  for (const [page, spec] of Object.entries(TABLE)) {
+    const target = `_model_${page}`;
+    elements.delete(target);
+    spec.render(target, {
+      review_type: spec.reviewType, review_id: `rv-${page}`, gate_status: 'Green',
+      _budget_stats: { cost_usd: 0.01, calls: 1, model: 'llama-3.3-70b', provider: 'ollama' },
+    });
+    const html = document.getElementById(target).innerHTML;
+    // The sidebar shows the *deployment default*, which a team on its own key is not using.
+    if (!html.includes('llama-3.3-70b')) quiet.push(page);
+  }
+  assert(quiet.length === 0, `the model is not shown on: ${quiet.join(', ')}`);
+});
+
+check('...and a partial review says so on every screen, not only on Code Review', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const silent = [];
+  for (const [page, spec] of Object.entries(TABLE)) {
+    const target = `_cov_${page}`;
+    elements.delete(target);
+    spec.render(target, {
+      review_type: spec.reviewType, review_id: `rv-${page}`, gate_status: 'Green',
+      coverage: { chunks_total: 4, chunks_succeeded: 3, chunks_failed: 1,
+                  failures: [{ chunk: 2, error: 'timeout' }] },
+    });
+    const html = document.getElementById(target).innerHTML;
+    // A gate over part of a codebase is a different claim from a gate over all of it.
+    if (!html.includes('coverage-bad')) silent.push(page);
+  }
+  assert(silent.length === 0,
+    `a Green gate over an incomplete review looks complete on: ${silent.join(', ')}`);
+});
+
+check('a generative agent is offered no SARIF export, having no findings', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const spec = TABLE['test-case'];
+  elements.delete('_gen_tc');
+  spec.render('_gen_tc', {
+    review_type: 'test_cases', review_id: 'rv-tc', summary: 'Forty cases.',
+    test_cases: [{ id: 1, title: 'login' }],
+    _budget_stats: { cost_usd: 0.02, calls: 1, model: 'claude-sonnet-4-6' },
+  });
+  const html = document.getElementById('_gen_tc').innerHTML;
+  assert(html.includes('spend-strip'), 'a generated set of test cases still cost money');
+  assert(!/SARIF/i.test(html),
+    'a static-analysis export under generated test cases would download an empty file');
 });
 }
 

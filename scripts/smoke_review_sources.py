@@ -1897,6 +1897,147 @@ def main():
               "claiming it without a route that calls review_source_store.record would "
               "render a checkbox guaranteed to fail (D-268)")
 
+        # ── 27. What a run cost comes back on every synchronous route ───
+        #
+        # `agent_guard.guarded_call` attaches cost, calls, tokens and model to the response
+        # *body* as `_budget_stats`. The synchronous `/api/review/*` routes cannot: they are
+        # metered by middleware that runs around the handler, so by the time the numbers
+        # exist `call_next` has already serialized the body. Every agent screen except Code
+        # Review and VAPT therefore showed findings with no indication of what producing
+        # them cost or which model produced them -- all of it computed, written to the
+        # ledger, and thrown away.
+        #
+        # Headers are the channel still open after `call_next`. The figures must come from
+        # `agent_guard._price_usage`, the same arithmetic that writes the ledger, or the
+        # number on screen and the number billed drift apart.
+        #
+        # This suite has never exercised metering: it stubs `call_tool`, so
+        # `_record_usage` is never called and every run above costs zero. The stub is
+        # wrapped here to record usage the way a real call does, and restored afterwards.
+        section("27. What a run cost comes back on every synchronous route")
+
+        from backend.services import legacy_guard as _lg
+        from backend.services import agent_guard as _ag
+        from backend.products import registry as _reg
+
+        _METERED = ("X-Spend-Cost-USD", "X-Spend-Calls", "X-Spend-Tokens-In",
+                    "X-Spend-Tokens-Out", "X-Spend-Model", "X-Spend-Provider")
+
+        _plain_call_tool = llm_gateway.call_tool
+
+        def _metered_call_tool(*a, **k):
+            llm_gateway._record_usage("anthropic", config.MODEL, 1200, 340)
+            return _plain_call_tool(*a, **k)
+
+        llm_gateway.call_tool = _metered_call_tool
+        try:
+            _r = client.post("/api/review/requirement?project_name=Sources",
+                             json={"content": "The system shall be fast.", "context": ""},
+                             headers=H)
+            check("a synchronous agent run answers 200", _r.status_code == 200,
+                  _r.text[:200])
+            _missing = [h for h in _METERED if h not in _r.headers]
+            check("EVERY SPEND HEADER IS PRESENT ON A METERED RUN", not _missing,
+                  f"absent: {_missing} -- without them the screen has nothing to show and "
+                  f"the person who approved nothing is told nothing")
+            check("...the model that answered is named, not the deployment default",
+                  _r.headers.get("X-Spend-Model") == config.MODEL,
+                  _r.headers.get("X-Spend-Model"))
+            check("...the call count is real, not zero",
+                  int(_r.headers.get("X-Spend-Calls", 0)) >= 1,
+                  _r.headers.get("X-Spend-Calls"))
+            check("...and the tokens are the ones the gateway recorded",
+                  int(_r.headers.get("X-Spend-Tokens-In", 0)) >= 1200
+                  and int(_r.headers.get("X-Spend-Tokens-Out", 0)) >= 340,
+                  f"{_r.headers.get('X-Spend-Tokens-In')} in / "
+                  f"{_r.headers.get('X-Spend-Tokens-Out')} out")
+
+            # The figure on screen and the figure billed must be the same arithmetic.
+            _calls = int(_r.headers.get("X-Spend-Calls"))
+            _expected = _ag._price_usage(
+                {"calls": _calls,
+                 "input_tokens": int(_r.headers.get("X-Spend-Tokens-In")),
+                 "output_tokens": int(_r.headers.get("X-Spend-Tokens-Out"))},
+                _r.headers.get("X-Spend-Model"))
+            check("THE COST SHOWN IS THE COST BILLED",
+                  abs(float(_r.headers.get("X-Spend-Cost-USD")) - _expected) < 1e-6,
+                  f"header says {_r.headers.get('X-Spend-Cost-USD')}, _price_usage says "
+                  f"{_expected:.6f} -- a display cost derived any other way drifts from "
+                  f"the ledger, which is worse than showing nothing")
+
+            # `product_id` is published by this middleware now, so the run is attributable
+            # to the agent that produced it rather than matched on review type alone.
+            _reqs = database.list_reviews(limit=5, product_id="requirement")
+            check("...and the run is attributed to its product, not left NULL",
+                  any(r["product_id"] == "requirement" for r in _reqs),
+                  str([r.get("product_id") for r in _reqs][:5]))
+
+            # A free route reached no model. "cost $0.0000" on a preflight is noise, and
+            # the frontend drops a zero-call header set for the same reason.
+            _pf = client.post("/api/review/code/preflight",
+                              json={"content": "print(1)", "project_name": "Sources"},
+                              headers=H)
+            check("a run that reached no model reports no spend",
+                  int(_pf.headers.get("X-Spend-Calls", 0)) == 0,
+                  f"a free preflight claimed {_pf.headers.get('X-Spend-Calls')} call(s)")
+
+            # Iterate the map rather than spot-checking one route, so a product that
+            # reports its spend by no mechanism at all is named by the test instead of
+            # passing quietly. There are exactly three mechanisms and every product must
+            # use one:
+            #
+            #   * in LEGACY_PRODUCT_ROUTES  -> the X-Spend-* headers checked above
+            #   * a 202 job, or a /api/v1 route -> `_budget_stats` on the body, attached by
+            #     `agent_guard.guarded_call`. These are deliberately absent from the map
+            #     (main.py:774-779): they do their model work after the response is sent, so
+            #     there is nothing request-scoped left for a middleware to meter.
+            #   * its own accounting -- modernization prices per run and shows spent-of-cap
+            #     in its own header.
+            # Header-metered by the dict, *and* by the universal-runner regex beside it
+            # (`_AGENT_RUN_PATH`, POST /api/agents/{id}/run) -- which is how `compliance`,
+            # the one product with no screen of its own, is metered. Written out because
+            # the first version of this check knew only about the dict and reported
+            # `compliance` as unmetered when it is not.
+            from backend.routes.agents import SUPPORTED_AGENTS as _RUNNER_AGENTS
+            _dict_metered = set(_lg.LEGACY_PRODUCT_ROUTES.values())
+            _legacy = _dict_metered | set(_RUNNER_AGENTS)
+            check("the legacy route map is where this test thinks it is",
+                  len(_legacy) > 20, f"{len(_legacy)} products mapped")
+            check("...and the universal runner's products are metered by the same middleware",
+                  _lg._AGENT_RUN_PATH.match("/api/agents/compliance/run") is not None,
+                  "if this regex moves, compliance stops being metered silently")
+
+            _BODY_METERED = {
+                "full": "202 job; guarded_call attaches _budget_stats to the job result",
+                "swarm": "/api/v1/swarm forwards _budget_stats",
+                "report-generate": "/api/v1/agents/report-generate forwards _budget_stats",
+                "modernization": "prices per run; shows spent-of-cap in its own header",
+            }
+            _unmetered = sorted(
+                p.id for p in _reg.list_products()
+                if p.id not in _legacy and p.id not in _BODY_METERED)
+            check("EVERY PRODUCT REPORTS ITS SPEND BY SOME MECHANISM", not _unmetered,
+                  f"no spend path for: {_unmetered} -- a run whose cost reaches neither "
+                  f"the headers nor the body is a run the person who paid for it cannot "
+                  f"see. Add it to the route map, or record here which mechanism it uses "
+                  f"and why")
+            # Compared against the *dict*, not the union: the universal runner is a third
+            # entry point, and `full` legitimately has two -- POST /api/review/full is a 202
+            # job whose spend lands on the body, while POST /api/agents/full/run is metered
+            # by the middleware and lands in the headers. Asserting against the union made
+            # this check fail on a product that is metered twice over, which is the opposite
+            # of the thing it exists to catch.
+            for _pid, _why in sorted(_BODY_METERED.items()):
+                check(f"{_pid} is body-metered on purpose ({_why[:34]}...)",
+                      _pid not in _dict_metered,
+                      "it is in the synchronous route map as well, so its spend arrives in "
+                      "the headers and this exemption is now misleading")
+        finally:
+            llm_gateway.call_tool = _plain_call_tool
+
+        check("the gateway stub is restored for anything after this section",
+              llm_gateway.call_tool is _plain_call_tool)
+
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")
 
