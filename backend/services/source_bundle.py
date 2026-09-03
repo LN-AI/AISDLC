@@ -124,12 +124,32 @@ class Bundle:
             file_header(f["path"]) + (f.get("content") or "") for f in self.files
         )
 
+    @property
+    def files_covered(self) -> int:
+        """How many of the customer's files this source covers.
+
+        Not `len(self.files)`, which is the number of *artifacts* the chunker is handed — and
+        for a diff that is always 1, because a unified diff is a single artifact holding
+        every changed file. Reporting that as "1 file(s)" on a twelve-file pull request is
+        true about our internal representation and false about the only question being asked.
+        """
+        changed = (self.meta or {}).get("files_changed") or []
+        if self.is_diff and changed:
+            return len(changed)
+        return len(self.files)
+
     def summary(self) -> Dict[str, Any]:
         """The shape that goes on an API response and onto the screen."""
         return {
             "source_type": self.source_type,
             "label": self.label,
-            "files_reviewed": len(self.files),
+            # The customer's files, not our artifacts — see `files_covered`.
+            "files_reviewed": self.files_covered,
+            # Kept separately because the two genuinely differ for a diff and the arithmetic
+            # downstream cares: one artifact is one chunk is one model call, which is why the
+            # quote can honestly say "12 files, 1 model call" without contradicting itself.
+            "artifacts": len(self.files),
+            "is_diff": self.is_diff,
             "files_skipped": len(self.skipped),
             "total_chars": self.total_chars,
             "truncated": self.truncated,

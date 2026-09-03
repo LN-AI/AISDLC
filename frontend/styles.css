@@ -2529,3 +2529,10 @@ pre.fix-diff {
    than "here is why it does not apply to your pull request". */
 .radio-stack label.radio-off { color: var(--text-muted); cursor: not-allowed; }
 .radio-stack .radio-why { font-style: italic; }
+
+/* A qualifier under a number in the quote grid. "12 file(s)" beside "1 model call" needs
+   one word of context or it reads as a contradiction rather than as two facts. */
+.cost-grid .cost-sub {
+  display: block; font-size: 10.5px; color: var(--text-muted); margin-top: 2px;
+  letter-spacing: .02em;
+}

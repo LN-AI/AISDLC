@@ -9051,10 +9051,23 @@ function describeRetention(agent) {
   // A GitHub source is never copied — it is read back from the repository at the exact
   // commit the review used. Saying so matters: otherwise "keep nothing" reads as "you will
   // not be able to open files", which for a repository is not true.
-  if (mode === 'repo' || mode === 'pr' || mode === 'compare') {
-    el.innerHTML = 'Not used for a GitHub source. Nothing is copied here — a file is read '
-      + 'back from the repository at the exact commit this review used, so the code you see '
-      + 'later is the code that was reviewed, not whatever the branch has since become.';
+  // A control that has no effect is worse than no control -- your screenshot showed "30
+  // days" selected above a sentence saying it is not used. Disabled rather than hidden, so
+  // the reason travels with it: a setting that vanishes when you pick a repository reads as
+  // a bug, and the explanation is the useful part.
+  const sel = document.getElementById(`${agent}-retention`);
+  const refetchable = mode === 'repo' || mode === 'pr' || mode === 'compare';
+  if (sel) {
+    sel.disabled = refetchable;
+    sel.title = refetchable
+      ? 'Not used for a GitHub source — nothing is copied, so there is nothing to expire.'
+      : '';
+  }
+  if (refetchable) {
+    el.innerHTML = '<b>Not used for a GitHub source, so this is switched off.</b> Nothing is '
+      + 'copied here — a file is read back from the repository at the exact commit this '
+      + 'review used, so the code you see later is the code that was reviewed, not whatever '
+      + 'the branch has since become.';
     return;
   }
   el.innerHTML = days > 0
@@ -9411,7 +9424,8 @@ function renderCostPreview(agent, q) {
         </span>
       </div>
       <div class="cost-grid">
-        <div><span class="cost-label">Will be reviewed</span><b>${(s.files_reviewed ?? 1).toLocaleString()} file(s)</b></div>
+        <div><span class="cost-label">Will be reviewed</span><b>${(s.files_reviewed ?? 1).toLocaleString()} file(s)</b>${
+          s.is_diff ? '<span class="cost-sub">changed in this diff</span>' : ''}</div>
         <div><span class="cost-label">Model calls</span><b>${e.calls ?? '—'}</b></div>
         <div><span class="cost-label">Filtered out</span><b>${(s.files_skipped || 0).toLocaleString()}</b></div>
         <div><span class="cost-label">Secrets already found</span><b>${q.secrets_already_found || 0}</b></div>
@@ -9710,7 +9724,8 @@ function renderReviewTransparency(r) {
     </div>`;
   } else if (total) {
     html += `<div class="coverage-strip coverage-ok">
-      Reviewed ${cov.files_reviewed ? `${cov.files_reviewed.toLocaleString()} file(s) in ` : ''}${total} piece(s), all successful.
+      Reviewed ${(src.files_reviewed || cov.files_reviewed)
+        ? `${Number(src.files_reviewed || cov.files_reviewed).toLocaleString()} file(s) in ` : ''}${total} piece(s), all successful.
       ${src.files_skipped ? `${src.files_skipped.toLocaleString()} file(s) were filtered out before the review.` : ''}
     </div>`;
   }

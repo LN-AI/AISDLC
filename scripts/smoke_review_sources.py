@@ -1652,6 +1652,55 @@ def main():
               "without it the fix controls on its findings could not resolve a file -- "
               "which is the defect a user hit on this exact screen")
 
+        # ── 24b. One count, and it is the customer's ──────────────────────
+        #
+        # The quote said "WILL BE REVIEWED: 1 file(s)" directly above "12 file(s) will be
+        # read — see which". Both were true about different things: one artifact for the
+        # chunker, twelve files for the person. Only one of them is a statement anybody
+        # asked for, and "1 file(s)" on a twelve-file pull request reads as "it will only
+        # look at one of them" — the exact doubt this work exists to remove.
+        #
+        # Every suite passed while that was on screen, which is why these checks exist:
+        # nothing compared the number in the tile to the length of the list beneath it.
+        section("24b. The file count on a diff is the files, not the artifact")
+
+        pr_sum = pr_bundle.summary()
+        pr_prev = _files_preview(pr_bundle)
+        check("a pull request reports the files it touches, not one pseudo-file",
+              pr_sum["files_reviewed"] == 2, str(pr_sum["files_reviewed"]))
+        check("THE COUNT MATCHES THE LIST BENEATH IT",
+              pr_sum["files_reviewed"] == len(pr_prev),
+              f"tile said {pr_sum['files_reviewed']}, list had {len(pr_prev)} -- "
+              f"a quote that contradicts itself is not a quote")
+        check("the artifact count is still available, because the arithmetic needs it",
+              pr_sum["artifacts"] == 1,
+              "one artifact is one chunk is one model call, which is how the quote can say "
+              "'12 files, 1 model call' without contradicting itself")
+        check("...and the response says it is a diff, so a screen can qualify the number",
+              pr_sum["is_diff"] is True)
+
+        # The same invariant for every other shape, so this cannot be fixed for diffs and
+        # broken for the rest.
+        for _label, _b in (
+            ("a file list", source_bundle.from_files(
+                [{"path": f"n{i}.py", "content": "x = 1\n"} for i in range(4)], label="four")),
+            ("a paste", source_bundle.from_text("print(1)\n", label="paste")),
+            ("a zip", source_bundle.from_zip_bytes(make_zip(APP_FILES), label="z")),
+        ):
+            _s, _p = _b.summary(), _files_preview(_b)
+            check(f"{_label}: the count matches the list",
+                  _s["files_reviewed"] == len(_p),
+                  f"{_s['files_reviewed']} vs {len(_p)}")
+            check(f"{_label}: not reported as a diff", _s["is_diff"] is False)
+
+        # And through the route a browser actually calls.
+        _q = client.post("/api/review/code/preflight",
+                         json={"files": files_payload, "project_name": "Sources"}, headers=H)
+        check("the quote endpoint agrees with itself",
+              _q.json()["source"]["files_reviewed"] == len(_q.json()["files_preview"]),
+              f"{_q.json()['source']['files_reviewed']} vs "
+              f"{len(_q.json()['files_preview'])}")
+
         # ── 25. Where a fix may go ────────────────────────────────────────
         #
         # Your call: offer both, default to a new pull request. Committing into the pull
