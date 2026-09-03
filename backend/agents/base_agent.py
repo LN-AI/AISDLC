@@ -219,9 +219,32 @@ VAPT_TOOL_SCHEMA = {
                 "description": "List of vulnerabilities found",
                 "items": {
                     "type": "object",
-                    "required": ["vuln_id", "control_id", "severity", "risk_level", "cvss_score", "title", "description", "affected_component", "attack_scenario", "recommendation", "is_blocking"],
+                    # `evidence` and `confidence` are required for the same reason they are on
+                    # the code-review schema: without a verbatim quote there is nothing for
+                    # `finding_pipeline.verify_evidence_per_file` to check, so an invented
+                    # CVSS 9.1 was stored exactly like a real one, could never be waived (a
+                    # fingerprint with no file and no quote never matches a baseline row), and
+                    # the gate had only the model's word for it. `file_path`/`line_start` stay
+                    # optional: VAPT legitimately assesses OpenAPI specs, architecture prose
+                    # and URL lists, which have no file to name.
+                    "required": ["vuln_id", "control_id", "severity", "risk_level", "cvss_score", "title", "description", "affected_component", "attack_scenario", "recommendation", "is_blocking", "evidence", "confidence"],
                     "properties": {
                         "vuln_id": {"type": "string", "description": "Sequential ID e.g. VLN-001"},
+                        "file_path": {
+                            "type": "string",
+                            "description": "Path of the file this vulnerability is in, exactly as shown in the chunk header. Empty if the artifact had no file structure (an API spec, an architecture description, a URL list).",
+                        },
+                        "line_start": {"type": "integer", "description": "First line of the vulnerable code, using the absolute line numbers shown to you — not renumbered from the top of the chunk."},
+                        "line_end": {"type": "integer", "description": "Last line of the vulnerable code."},
+                        "evidence": {
+                            "type": "string",
+                            "description": "The vulnerable code or specification text, quoted VERBATIM from what you were shown — up to 3 lines. This is checked against the source: a quote that does not appear in the file this finding names causes the finding to be discarded. Never paraphrase, never reconstruct from memory, never quote something you were not shown.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["High", "Medium", "Low"],
+                            "description": "High only when the artifact shown is sufficient to prove the vulnerability is reachable. Use Low if you are inferring from code or configuration you cannot see.",
+                        },
                         "control_id": {"type": "string", "description": "VAPT control ID e.g. VAPT-003, SEC-001"},
                         "severity": {"type": "integer", "minimum": 1, "maximum": 5},
                         "risk_level": {"type": "string", "enum": ["Low", "Minor", "Moderate", "High", "Critical"]},
@@ -315,17 +338,24 @@ SECURITY_REVIEW_TOOL_SCHEMA = {
 
 
 class VAPTBaseAgent(BaseAgent):
+    # VAPT's schema is verbose (per-finding attack_scenario/proof_of_concept/cvss_vector
+    # plus a top-level attack_surface_summary), and the platform default of 4096 was
+    # observed truncating this call to an empty findings/summary response — a false
+    # "Green, 0 findings". The answer used to be a bigger ceiling: 4096, then 8000, then
+    # 14000, then 28000, each raise chasing the same symptom.
+    #
+    # A ceiling only ever moves the limit. Now that the assessment is split
+    # (`chunked_review`) and a truncated chunk is halved and retried rather than lost, the
+    # ceiling is back to the code reviewer's 16000 — a chunk sized for ten to fifteen
+    # findings fits it with room, one long call is no longer the failure mode, and 28000 of
+    # output on a single call was both slower and more fragile than four calls of 8000.
+    MAX_OUTPUT_TOKENS = 16000
+
     def _call_claude_vapt(self, user_content: str, llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        # VAPT's schema is verbose (per-finding attack_scenario/proof_of_concept/
-        # cvss_vector plus a top-level attack_surface_summary) — the platform
-        # default max_tokens (4096) was observed truncating this call down to an
-        # empty findings/summary response (false "Green, 0 findings"), so this
-        # call needs more headroom than the generic REVIEW_TOOL_SCHEMA agents.
-        # 8000 was still observed truncating (confirmed via the new truncation-raising
-        # error path rather than a silent empty result), then 14000; now 28000, so a
-        # thorough pentest report on a large surface has room to be thorough rather than
-        # being cut off and discarded.
-        return llm_gateway.call_tool(self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override, max_tokens=28000)
+        return llm_gateway.call_tool(
+            self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override,
+            max_tokens=self.MAX_OUTPUT_TOKENS,
+        )
 
     def review_vapt(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_content = content

@@ -1,0 +1,477 @@
+{
+  "prompt_version": "2026-09-02.1",
+  "generated_at": "2026-09-02T11:11:00.086703+00:00",
+  "cases": 10,
+  "repeat": 1,
+  "errors": 0,
+  "recall": 1.0,
+  "false_positive_rate": 0.375,
+  "gate_accuracy": 0.9,
+  "hallucinated_findings_discarded": 0,
+  "unverified_findings": 0,
+  "determinism_jaccard": null,
+  "tokens_in": 5943,
+  "tokens_out": 10885,
+  "cache_read_tokens": 27477,
+  "estimated_cost_usd": 0.181104,
+  "runs": [
+    {
+      "case": "fp-example-credentials",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 597,
+        "output_tokens": 320,
+        "cache_write_tokens": 3053,
+        "cache_read_tokens": 0
+      },
+      "seconds": 7.5
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Amber",
+      "model_gate": "Amber",
+      "gate_ok": false,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 2,
+      "tripped": [
+        {
+          "match": "csrf",
+          "note": "Django's CsrfViewMiddleware handles CSRF on every POST by default"
+        },
+        {
+          "match": "xss",
+          "note": "Django templates auto-escape by default, so rendering `bio` is not XSS"
+        }
+      ],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "30779c6f2ad0f7d0771eb3e05c05654b",
+        "6faf46fd563d218af062747993978b63",
+        "f6a13fc32dc71876130d5f83b5b1c259"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-009",
+          "title": "Unsanitized user input stored and potentially rendered without output encoding",
+          "line_start": 8,
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-010",
+          "title": "CSRF protection relies solely on Django default middleware \u2014 confirm it is active",
+          "line_start": 7,
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Missing input validation / size limit on user-supplied POST field",
+          "line_start": 8,
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1591,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 29.3
+    },
+    {
+      "case": "fp-parameterized-orm",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 337,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 8.3
+    },
+    {
+      "case": "fp-test-fixture",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 429,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 11.8
+    },
+    {
+      "case": "hardcoded-secret",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "8e6dd7afb34556229e6e5869471e9a5c",
+        "cebb1b7acf442bfdad2b7d107bb65462"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-003",
+          "title": "Hardcoded AWS Secret Access Key",
+          "line_start": 3,
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-003",
+          "title": "AWS Secret Access Key Passed as Plaintext Argument",
+          "line_start": 4,
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 1188,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 21.4
+    },
+    {
+      "case": "llm-output-to-exec",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 5,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "098a9d73264387a7ce3367efaf0dff1f",
+        "23ecde568a77f6e8b037da6305dd7254",
+        "4a297997ba6a21018fe157a287f81ca6",
+        "bf623a33f4589dd109f1fe5a4e55e7c0",
+        "cc3dba263bdfdc63785517949b54c932"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "Arbitrary code injection via exec() on untrusted LLM response",
+          "line_start": 3,
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "AI-002",
+          "title": "LLM output executed directly via exec() without any validation",
+          "line_start": 3,
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "AI-001",
+          "title": "Unsanitized user input passed directly to LLM",
+          "line_start": 2,
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "AI-007",
+          "title": "Agent implicitly granted unrestricted code execution permissions",
+          "line_start": 3,
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-005",
+          "title": "No rate limiting, timeout, or max_tokens on LLM API call",
+          "line_start": 2,
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 593,
+        "output_tokens": 2092,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 36.9
+    },
+    {
+      "case": "missing-auth",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 1,
+      "tripped": [
+        {
+          "control_id": "SEC-001",
+          "match": "injection",
+          "note": "the DELETE is correctly parameterized"
+        }
+      ],
+      "findings_total": 4,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "78c7addf25db33c2c15c32703b83bdc8",
+        "b79e23f6e79efe25924329a33805daca",
+        "c0838480e8b39914fbae904aef6ca1aa",
+        "de81f5f3a56056a9717062794e0d5682"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-001",
+          "title": "No Authentication on Destructive DELETE Endpoint",
+          "line_start": 4,
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-002",
+          "title": "Missing Role/Ownership Check \u2014 BOLA/IDOR Risk",
+          "line_start": 5,
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-005",
+          "title": "No Rate Limiting on Destructive Endpoint",
+          "line_start": 4,
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-004",
+          "title": "user_id Reflected Directly in API Response",
+          "line_start": 7,
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 1588,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 28.3
+    },
+    {
+      "case": "pii-in-logs",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "0b230addcebece79b440a86d636f46d6"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-004",
+          "title": "PII/Sensitive Data Logged \u2014 SSN and Credit Card Number",
+          "line_start": 4,
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 581,
+        "output_tokens": 939,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 19.2
+    },
+    {
+      "case": "sql-injection",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "3b78f9af4d232524d8c077276a8c2251",
+        "adc1876f94821708feebbe361d33ae29"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "SQL Injection via String Concatenation",
+          "line_start": 2,
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-004",
+          "title": "No Error Handling \u2014 Database Exceptions May Leak Schema/Internal Details",
+          "line_start": 3,
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 577,
+        "output_tokens": 1496,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 27.7
+    },
+    {
+      "case": "weak-crypto",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "f1cff8cab8226858f76043d327d00bcd"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-006",
+          "title": "MD5 Used for Password Hashing",
+          "line_start": 4,
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 565,
+        "output_tokens": 905,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 29.1
+    }
+  ]
+}

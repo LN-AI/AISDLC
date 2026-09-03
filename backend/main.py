@@ -6,10 +6,11 @@ import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security, UploadFile, File, Form
-from pydantic import BaseModel
+from fastapi import (Depends, FastAPI, File, Form, HTTPException, Query, Request,
+                     Response, Security, UploadFile)
+from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.staticfiles import StaticFiles
@@ -29,6 +30,8 @@ from backend.routes.audit_trail import router as audit_router
 from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
 from backend.routes.findings import router as findings_router
+from backend.routes.github_credentials import router as github_credentials_router
+from backend.routes.github_webhook import router as github_webhook_router
 from backend.routes.modernization import router as modernization_router
 from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.api_keys import router as api_keys_router
@@ -54,6 +57,8 @@ from backend.models.schemas import (
     VAPTReviewRequest,
     SecurityReviewRequest,
     ArchitectureReviewRequest,
+    CodeReviewSourceRequest,
+    VAPTSourceRequest,
 )
 from backend.models.api_models import (
     AIProvenanceRequest,
@@ -74,6 +79,9 @@ from backend.services.orchestrator import SDLCOrchestrator
 from backend.services import job_service
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
+from backend.services import (fix_apply, guardrail_service, review_estimate,
+                              review_source_store, source_bundle)
+from backend.services.subject_service import resolve_subject
 from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
     RateLimitExceeded,
@@ -109,6 +117,20 @@ async def lifespan(app: FastAPI):
     from backend.services.modernization import runner as modernization_runner
     modernization_runner.recover_all()
     _init_default_admin()
+    # Two housekeeping sweeps that stand in for the scheduler this deployment does not have.
+    # Both are also called on the read paths that depend on them (a baseline lookup, an
+    # inventory read), so a long-running process does not drift — this is the cheap pass that
+    # makes a restarted process correct immediately rather than on first use.
+    try:
+        lapsed = database.lapse_expired_waivers()
+        swept = review_source_store.sweep_expired()
+        if lapsed or swept:
+            logger.info("Housekeeping: %d risk acceptance(s) lapsed, %d source(s) expired",
+                        lapsed, swept)
+    except Exception:
+        # Never allowed to stop the app coming up. A missed sweep is a stale row; a failed
+        # startup is an outage.
+        logger.exception("Startup housekeeping failed — continuing")
     knowledge_base.load()  # preload all docs/ markdown files into memory
     logger.info("Startup complete")
     yield
@@ -240,6 +262,8 @@ app.include_router(agents_router)
 app.include_router(inventory_router)
 app.include_router(v1_agents_router)
 app.include_router(findings_router)
+app.include_router(github_credentials_router)
+app.include_router(github_webhook_router)
 app.include_router(modernization_router)
 app.include_router(api_keys_router)
 app.include_router(plans_router)
@@ -277,6 +301,383 @@ def _require_llm() -> None:
 # credential falls through to require_reader's own 401 rather than FastAPI's terser one.
 _read_api_key_hdr = APIKeyHeader(name="X-API-Key", auto_error=False)
 _read_bearer = HTTPBearer(auto_error=False)
+
+
+# ── Review sources: preflight, zip upload, repository ─────────────────────
+#
+# The three screens the plan is about (Code Review, VAPT, GitHub PR) posted to routes that
+# accepted a paste and nothing else, while the v1 API behind them accepted PR and file URLs
+# — so users concluded the capability did not exist because the screen said so (C-74).
+#
+# Two things every route below shares:
+#
+# * **`def`, not `async def`.** Every other legacy handler is `async def` and then calls the
+#   orchestrator synchronously, which holds the event loop for the whole review — measured:
+#   during a ten-minute VAPT, `GET /` never returned (C-31). Plain `def` makes FastAPI run
+#   the handler on its threadpool instead. These are the routes where it matters most,
+#   because a repository scan makes every call that long. The sweep across the other ~30
+#   legacy routes is deliberately not done here: it changes concurrency for all of them at
+#   once and wants measuring rather than a blind edit.
+# * **A quote before the spend.** `/preflight` prices the exact call, free, so the screen can
+#   show it and ask. The modernization plan gate is the precedent; `review_estimate` is the
+#   shared arithmetic.
+
+
+def _ui_subject(request: Request) -> Any:
+    """The project a browser call is governed by, for a quote's budget line.
+
+    Resolved the same way `legacy_guard` resolves it for metering, so the headroom shown
+    beside a price is the headroom that will actually be checked. Degrades to an unbound
+    subject rather than failing: a quote is more useful without a budget line than not at
+    all.
+    """
+    try:
+        caller, _ = legacy_guard.resolve_caller(request.headers)
+        return resolve_subject(caller, request.headers)
+    except Exception:
+        logger.info("Could not resolve a subject for the quote — omitting the budget line")
+        return None
+
+
+def _project_id_for(request: Request) -> Optional[str]:
+    """The project a browser call names, for picking its GitHub credential."""
+    subject = _ui_subject(request)
+    return getattr(subject, "project_id", None) if subject is not None else None
+
+
+
+def _free_findings_summary(bundle) -> dict:
+    """What the free scanners already know, for the cost quote.
+
+    On the quote because it sometimes answers the question before any money is spent: "5
+    vulnerable dependencies and 3 hardcoded credentials, found for nothing" may be the whole
+    of what someone needed. `dependency` also says what could *not* be checked, so a quote
+    never implies a clean bill of health it has not earned.
+    """
+    from backend.services import source_bundle as _sb
+    deterministic = _sb.deterministic_findings(bundle)
+    secrets = sum(1 for f in deterministic["findings"] if f.get("detector") == "pattern")
+    deps = sum(1 for f in deterministic["findings"]
+               if f.get("detector") == "dependency-database")
+    return {
+        "secrets_already_found": secrets,
+        "vulnerable_dependencies_found": deps,
+        "dependency_scan": deterministic["dependency"],
+    }
+
+def _preflight(req, request: Request, agent: str) -> dict:
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Preflight source resolution failed for %s", agent)
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+
+    quote = review_estimate.for_bundle(bundle, agent=agent)
+    subject = _ui_subject(request)
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": agent,
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")
+        ),
+        "within_budget": (
+            None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]
+        ),
+        # Deterministic findings the ingest scanner already has, before any model runs. Shown
+        # on the quote because "we already found 3 hardcoded credentials, for free" changes
+        # whether someone wants to spend the money at all.
+        **_free_findings_summary(bundle),
+        # Which files, by name. The quote used to give a count and no way to check it, so
+        # "6 filtered out" could not be reconciled with what the customer believed they had
+        # uploaded. Inline here because a preflight has no review id yet to hang an inventory
+        # off; a finished review answers the same question through `/sources`, which is paged
+        # and does not travel inside `result_json`.
+        "files_preview": _files_preview(bundle),
+        "files_preview_truncated": max(
+            0, len((bundle.meta or {}).get("files_changed") or bundle.files) - 400),
+        "skipped_all": bundle.skipped[:400],
+        "retention": _retention_note(req, bundle),
+    }
+
+
+def _files_preview(bundle) -> list:
+    """The files a quote is for, by name.
+
+    A diff-shaped source is *one* pseudo-file holding the whole diff, so listing
+    `bundle.files` for a pull request produced a single nameless row — "1 file(s)" with
+    nothing to check it against, which is what made a real user doubt the review had seen
+    their code. A diff knows which files it touches, so those are the list; sizes are absent
+    because a diff carries changed lines rather than whole files, and inventing a size would
+    be worse than omitting one.
+    """
+    changed = (bundle.meta or {}).get("files_changed") or []
+    if bundle.is_diff and changed:
+        return [{"path": p, "in_diff": True} for p in changed[:400]]
+    return [
+        {"path": f.get("path") or "(pasted content)",
+         "chars": len(f.get("content") or ""),
+         "lines": (f.get("content") or "").count("\n") + 1}
+        for f in bundle.files[:400]
+    ]
+
+
+def _retention_note(req, bundle) -> dict:
+    """What will happen to this source after the run, in the quote that precedes it.
+
+    On the quote rather than only in the form, because it is a data-handling commitment and
+    the moment a person is deciding to spend money is the moment they are actually reading.
+    """
+    days = review_source_store.normalize_retention(
+        getattr(req, "retention_days", None)
+        if getattr(req, "retention_days", None) is not None
+        else review_source_store.DEFAULT_RETENTION_DAYS
+    )
+    refetchable = bundle.source_type in review_source_store.REFETCHABLE
+    return {
+        "days": 0 if refetchable else days,
+        "refetchable": refetchable,
+        "choices": list(review_source_store.RETENTION_CHOICES),
+        "note": (
+            "Nothing is copied: this source is read back from the repository at the exact "
+            "commit this review used, so there is nothing to keep or expire."
+            if refetchable else review_source_store.describe_retention(days)
+        ),
+    }
+
+
+@app.post("/api/review/code/preflight")
+def preflight_code_ui(req: CodeReviewSourceRequest, request: Request):
+    return _preflight(req, request, "code")
+
+
+@app.post("/api/review/vapt/preflight")
+def preflight_vapt_ui(req: VAPTSourceRequest, request: Request):
+    return _preflight(req, request, "vapt")
+
+
+def _run_bundle_review(bundle, agent: str, project_name: str, context: str = "",
+                       language: str = "", scope: str = "", on_progress=None,
+                       retention_days=None) -> dict:
+    """Shared body for a bundle-backed review on the UI surface."""
+    _require_llm()
+    label = bundle.untrusted_label
+    ctx_parts = [f"Source: {bundle.source_type} — {bundle.label}"]
+    if label:
+        ctx_parts.append(guardrail_service.untrusted_notice(label))
+    if context:
+        ctx_parts.append(context)
+    if len(bundle.files) > 1:
+        ctx_parts.append(
+            f"This review covers {len(bundle.files)} file(s) from one codebase. Each chunk "
+            f"lists the files it contains and the files it does not; do not assert that a "
+            f"control is missing when the file that would contain it was not shown to you."
+        )
+
+    args: dict = {
+        "context": "\n".join(ctx_parts),
+        "project_name": project_name or bundle.label[:60],
+        "coverage_incomplete": bundle.truncated,
+        "coverage_reason": bundle.truncation_reason,
+        "source": bundle.summary(),
+        "on_progress": on_progress,
+    }
+    deterministic = source_bundle.deterministic_findings(bundle)
+    args["extra_findings"] = deterministic["findings"]
+    args["source"] = {**args["source"], "dependency": deterministic["dependency"]}
+    single = len(bundle.files) == 1 and not bundle.files[0].get("path")
+    if single:
+        text = bundle.files[0].get("content") or ""
+        if label:
+            text = guardrail_service.wrap_untrusted_content(text, label)
+    else:
+        args["files"] = bundle.files
+
+    if agent == "vapt":
+        if single:
+            args["artifact"] = text
+        result = orchestrator.review_vapt(scope=scope, **args)
+    else:
+        if single:
+            args["code"] = text
+        result = orchestrator.review_code(language=language, **args)
+
+    # Recorded here rather than inside the orchestrator for two reasons: `review_id` does not
+    # exist until the result is saved, and the retention choice belongs to the surface the
+    # person chose it on — the orchestrator has 19 `save_review` call sites and none of them
+    # should have to know about it.
+    _record_sources(result, bundle, retention_days)
+    return result
+
+
+def _record_sources(result: dict, bundle, retention_days) -> None:
+    """Store what this review looked at. Never allowed to fail the review.
+
+    A review that has already been paid for must not be lost to a bookkeeping error, so
+    everything here is best-effort and logged. The response says whether it worked, so a
+    screen can offer a file viewer only when there is something to view.
+    """
+    review_id = (result or {}).get("review_id")
+    if not review_id:
+        return
+    try:
+        days = review_source_store.normalize_retention(
+            retention_days if retention_days is not None
+            else review_source_store.DEFAULT_RETENTION_DAYS)
+        chunk_of_path = {}
+        for row in ((result.get("coverage") or {}).get("chunk_files") or []):
+            for path in (row.get("files") or []):
+                chunk_of_path.setdefault(path, row.get("index"))
+        review_source_store.record(
+            review_id, bundle, days,
+            findings=result.get("findings") or [],
+            chunk_of_path=chunk_of_path,
+        )
+        result.setdefault("source", {})["inventory"] = review_source_store.summarize(review_id)
+    except Exception:
+        logger.exception("Could not record the source inventory for review %s", review_id)
+
+
+@app.post("/api/review/code/source")
+def review_code_source(req: CodeReviewSourceRequest, request: Request):
+    """Code review over any source: paste, file list, zip-by-reference, repo, PR, branch diff.
+
+    Separate from `/api/review/code` rather than replacing it, because that route is the one
+    every existing screen and integration posts to and its contract is "one artifact in,
+    one review out". This one takes the full source set.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _run_bundle_review(
+            bundle, "code", req.project_name or "", req.context or "", req.language or "",
+            retention_days=req.retention_days)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/vapt/source")
+def review_vapt_source(req: VAPTSourceRequest, request: Request):
+    """VAPT over any source. See `/api/review/code/source`."""
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _run_bundle_review(
+            bundle, "vapt", req.project_name or "", req.context or "", scope=req.scope or "",
+            retention_days=req.retention_days)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+def _upload_bundle(raw: bytes, filename: str):
+    """One upload, whether it is an archive or a single source file.
+
+    `from_upload` decides from the bytes rather than the extension — see its docstring for
+    why the screen's two upload modes have to land in one place.
+    """
+    try:
+        return source_bundle.from_upload(raw, filename=filename or "")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/review/code/upload-zip")
+def review_code_zip(
+    file: UploadFile = File(..., description="A zip of the source, or a single source file."),
+    project_name: str = Form(""),
+    language: str = Form(""),
+    context: str = Form(""),
+    retention_days: int = Form(
+        review_source_store.DEFAULT_RETENTION_DAYS,
+        description="Days to keep the uploaded source so files can be opened and fixed "
+                    "later: 0, 1, 3, 7, 14 or 30. An upload has no origin to re-read, so "
+                    "this is the only thing that decides whether a file can be shown again."),
+):
+    """Review a whole codebase from a zip.
+
+    Path safety, symlink rejection, credential-file skipping, secret redaction and zip-bomb
+    limits all come from `repo_ingest`, the ingester modernization already uses — not from a
+    second implementation written here.
+    """
+    bundle = _upload_bundle(file.file.read(), file.filename or "")
+    try:
+        return _run_bundle_review(bundle, "code", project_name, context, language,
+                                  retention_days=retention_days)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/vapt/upload-zip")
+def review_vapt_zip(
+    file: UploadFile = File(..., description="A zip of the source, or a single source file."),
+    project_name: str = Form(""),
+    scope: str = Form(""),
+    context: str = Form(""),
+    retention_days: int = Form(review_source_store.DEFAULT_RETENTION_DAYS),
+):
+    """Assess a whole codebase from a zip. See `/api/review/code/upload-zip`."""
+    bundle = _upload_bundle(file.file.read(), file.filename or "")
+    try:
+        return _run_bundle_review(bundle, "vapt", project_name, context, scope=scope,
+                                  retention_days=retention_days)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/zip/preflight")
+def preflight_zip(
+    file: UploadFile = File(...),
+    agent: str = Form("code"),
+    request: Request = None,
+):
+    """Price a zip before reviewing it — the same quote, for the upload path.
+
+    Reads and filters the archive (free) and returns the count of files that will actually be
+    reviewed, which is the number people are most surprised by: a 900-file repository is
+    often 300 reviewable files, and seeing that before the spend is the point.
+    """
+    if agent not in ("code", "vapt"):
+        raise HTTPException(status_code=400, detail="agent must be 'code' or 'vapt'.")
+    bundle = _upload_bundle(file.file.read(), file.filename or "")
+    quote = review_estimate.for_bundle(bundle, agent=agent)
+    subject = _ui_subject(request) if request is not None else None
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": agent,
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        **_free_findings_summary(bundle),
+    }
 
 class _NoCacheStaticFiles(StaticFiles):
     """Forces browsers to revalidate (If-None-Match/ETag) on every load instead of
@@ -349,6 +750,122 @@ def _visible_project_ids(reader: dict, request: Request) -> Optional[List[str]]:
     return scope.visible_project_ids(reader, request)
 
 
+
+# ── Long scans as background jobs ─────────────────────────────────────────
+#
+# A paste is one model call and a synchronous request is the right shape for it. A repository
+# is fifty to a hundred calls, and holding an HTTP connection open for that is how a review
+# gets lost to a proxy timeout with the spend already incurred. The chunk fan-out already
+# reports its progress — `chunked_review._fan_out` calls `on_progress(done, total)` after
+# every chunk — and until now nothing consumed it.
+#
+# Modelled on `/api/review/full`, which has done this since it shipped, and guarded the same
+# way and for the same reason: these routes are deliberately absent from the legacy
+# middleware's product map, because they return 202 and do their LLM work after the response
+# is sent, so there is nothing request-scoped left for a middleware to meter. The preflight
+# therefore runs *here*, before the 202, so a denied caller gets 402/403/429 rather than an
+# accepted job that fails a minute later.
+
+
+def _start_review_job(req, request: Request, agent: str) -> dict:
+    """Accept a review, return a job id, and run it on a background thread."""
+    _require_llm()
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Async review source resolution failed for %s", agent)
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+
+    # The **real** chunk count, not `estimate_chunks*`. Those divide and document that they
+    # err low — the right trade inside a middleware that has only a request body, and the
+    # wrong one here for two reasons: the progress bar would read "6 of 4 pieces", and the
+    # reservation would be short on exactly the large scans it exists to bound. The split is
+    # free (pure string work, no model), and `review_estimate.for_bundle` has already run it.
+    quote = review_estimate.for_bundle(bundle, agent=agent)
+    expected = max(quote.get("chunks") or 1, 1)
+
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    # Stashed now because `_run` executes on a background thread with no request headers —
+    # without it the job would meter against no project at all.
+    caller["_subject"] = subject_service.resolve_subject(caller, request.headers)
+    check_project_rate_limit(caller["_subject"], request.url.path)
+    with agent_guard.expect_calls(expected):
+        agent_guard.preflight(caller["_subject"], agent)
+
+    project_name = (getattr(req, "project_name", "") or bundle.label[:60])
+    language = getattr(req, "language", "") or ""
+    scope_text = getattr(req, "scope", "") or ""
+    context_text = getattr(req, "context", "") or ""
+
+    def _run(on_progress):
+        # `on_progress` from job_service takes (step_index, total, label); the agent reports
+        # (done, total). Adapting here rather than changing either signature keeps the agent
+        # unaware of jobs, which is what lets the same agent serve the synchronous route.
+        def report(done, total):
+            on_progress(done, total, f"Reviewed {done} of {total} piece(s)")
+
+        with agent_guard.expect_calls(expected):
+            return agent_guard.guarded_call(
+                caller, agent, None, skip_preflight=True, project_name=project_name,
+                fn=lambda: _run_bundle_review(
+                    bundle, agent, project_name, context_text, language, scope_text,
+                    on_progress=report,
+                    retention_days=getattr(req, "retention_days", None),
+                ),
+            )
+
+    job_id = job_service.start_job(agent, total_steps=expected, run_fn=_run)
+    logger.info(
+        "Started %s review job %s over %d file(s), ~%d call(s)",
+        agent, job_id, len(bundle.files), expected,
+    )
+    return {
+        "job_id": job_id,
+        "status": "accepted",
+        "agent": agent,
+        # The source summary and the estimate come back with the 202 so the screen can show
+        # what it is waiting for, and how much it agreed to, while it waits.
+        "source": bundle.summary(),
+        "estimate": quote,
+        "poll_url": f"/api/review/jobs/{job_id}",
+    }
+
+
+@app.post("/api/review/code/source/async", status_code=202)
+async def review_code_source_async(req: CodeReviewSourceRequest, request: Request):
+    """Start a code review and return a job id. For a repository or a large zip.
+
+    `async def` is load-bearing here, unlike the synchronous twins: `job_service.start_job`
+    schedules the work with `asyncio.create_task`, which needs a running loop on the calling
+    thread. The handler itself does no blocking work, so it does not hold the loop.
+    """
+    return _start_review_job(req, request, "code")
+
+
+@app.post("/api/review/vapt/source/async", status_code=202)
+async def review_vapt_source_async(req: VAPTSourceRequest, request: Request):
+    """Start a VAPT assessment and return a job id. See the code twin."""
+    return _start_review_job(req, request, "vapt")
+
+
+@app.get("/api/review/jobs/{job_id}")
+async def review_job_status(job_id: str, reader: dict = Depends(require_reader)):
+    """Progress, then the finished review.
+
+    Behind `require_reader` because a completed job carries the whole result — the findings
+    and the quoted source lines — which is a read of customer work product, not a status
+    ping.
+    """
+    job = job_service.get_job_status(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"No job found with id '{job_id}'")
+    return job
+
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
 @app.get("/api/dashboard")
@@ -359,21 +876,250 @@ async def get_dashboard(request: Request, reader: dict = Depends(require_reader)
 @app.get("/api/reviews")
 async def list_reviews(request: Request, limit: int = Query(20, ge=1, le=200),
                        offset: int = Query(0, ge=0),
+                       review_type: Optional[str] = Query(
+                           None, description="Only this kind of review — 'code', 'vapt', "
+                                             "'architecture' and so on. Omit for all. "
+                                             "Coarser than product_id: 'code' covers Code "
+                                             "Review, the GitHub PR review and Auto-Fix."),
+                       product_id: Optional[str] = Query(
+                           None, description="Only this product's reviews — 'code-review', "
+                                             "'github-pr-review', 'auto-fix', 'vapt'. This "
+                                             "is what a single agent's screen should filter "
+                                             "on. Rows written before this was recorded have "
+                                             "no product_id, so pass review_type as well to "
+                                             "include them."),
                        reader: dict = Depends(require_reader)):
     """One page of reviews, newest first.
 
     `count` is how many rows this page holds; `total` is how many the caller may see in
     all, which is what a pager needs to know whether there is a next page.
+
+    Summary columns only — a list does not carry `result_json`. Fetch one review by id for
+    that.
     """
     visible = _visible_project_ids(reader, request)
-    reviews = database.list_reviews(limit=limit, offset=offset, project_ids=visible)
+    reviews = database.list_reviews(limit=limit, offset=offset, project_ids=visible,
+                                    review_type=review_type, product_id=product_id)
     return {
         "reviews": reviews,
         "count": len(reviews),
-        "total": database.count_reviews(project_ids=visible),
+        "total": database.count_reviews(project_ids=visible, review_type=review_type,
+                                        product_id=product_id),
         "limit": limit,
         "offset": offset,
+        "review_type": review_type,
+        "product_id": product_id,
     }
+
+
+# ── Applying fixes ────────────────────────────────────────────────────────
+#
+# Auto-Fix existed and could only be pointed at a pull request, which meant it re-ran the
+# review, chose the findings itself, and had one possible output. These two routes are the
+# same machinery started from a finished review and the findings a person ticked.
+#
+# `/fix/plan` is free and calls no model, like every other quote on this platform. `/fix`
+# spends, and refuses to spend on a selection the plan said it could not serve.
+
+
+class FixRequest(BaseModel):
+    finding_ids: Optional[List[str]] = Field(
+        None,
+        description="Which findings to fix, by their `id`. Omit to take every fixable "
+                    "finding in the review — which is a larger bill, so the plan endpoint "
+                    "will tell you what that costs first.")
+    output: str = Field(
+        "diff",
+        description="Where the fix goes. `diff` shows it and writes nothing. `zip` returns "
+                    "the patched files plus a unified diff. `branch` pushes a branch off the "
+                    "commit the review read. `pr` does that and opens a pull request against "
+                    "the branch it came from. The last two need a repository source and a "
+                    "token with write access.")
+    context: Optional[str] = Field(
+        None, description="Anything the fixer should know that is not in the code.")
+
+
+@app.post("/api/reviews/{review_id}/fix/plan",
+          summary="What fixing this selection would involve, and cost. Free.")
+async def fix_plan(review_id: str, req: FixRequest, request: Request,
+                   reader: dict = Depends(require_reader)):
+    """Price a fix before running one, and say up front what cannot be fixed and why.
+
+    Calls no model. The one number people misread here is the call count: a fix call carries
+    a whole file, so five findings in one file is **one** call, not five — the response says
+    so in `note` rather than leaving it to be inferred from a total.
+    """
+    review = _review_in_scope(review_id, request, reader)
+    try:
+        return fix_apply.plan(review_id, req.finding_ids,
+                              project_id=review.get("project_id"))
+    except fix_apply.FixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/reviews/{review_id}/fix",
+          summary="Fix the selected findings and return the result in the requested shape")
+async def fix_run(review_id: str, req: FixRequest, request: Request,
+                  reader: dict = Depends(require_reader)):
+    """Generate patches, guard every one of them, then deliver.
+
+    Two guardrails, both mandatory and neither skippable: a patch that introduces a hardcoded
+    secret is rejected, and every patch is **re-reviewed** by the same reviewer that found
+    the original problem — a patched file that still holds a Critical does not ship. Both run
+    before anything is written to a repository, because a push cannot be undone by returning
+    an error.
+
+    A partial result is a success: three files patched and two rejected returns both lists
+    rather than an error, because the three are worth having.
+    """
+    review = _review_in_scope(review_id, request, reader)
+    _require_llm()
+    # Resolved the same way the review routes resolve it, so a fix is entitled, budgeted,
+    # quota'd and metered against the same project the review it came from was.
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    caller["_subject"] = subject_service.resolve_subject(caller, request.headers)
+    check_project_rate_limit(caller["_subject"], request.url.path)
+
+    try:
+        sized = fix_apply.plan(review_id, req.finding_ids,
+                               project_id=review.get("project_id"))
+    except fix_apply.FixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    expected = max(1, sized.get("calls") or 1)
+    try:
+        with agent_guard.expect_calls(expected):
+            result = agent_guard.guarded_call(
+                caller, "auto-fix", None, project_name=review.get("project_name") or "",
+                fn=lambda: fix_apply.apply(
+                    orchestrator, review_id, req.finding_ids,
+                    project_id=review.get("project_id"),
+                    output=req.output, context=req.context or "",
+                ),
+            )
+    except fix_apply.FixError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Fix run failed for review %s", review_id)
+        status, body = format_error_response(exc, agent_name="auto-fix")
+        raise HTTPException(status_code=status, detail=body)
+
+    # A zip cannot travel in JSON. It is held for one download rather than written to disk:
+    # the patches are already in the response, so the archive is a convenience and losing it
+    # to a restart costs nothing but a re-run of the delivery step.
+    if result.get("zip_bytes") is not None:
+        blob = result.pop("zip_bytes")
+        token = uuid.uuid4().hex
+        _FIX_ZIPS[token] = (blob, review_id)
+        result["download_url"] = f"/api/reviews/{review_id}/fix/download/{token}"
+        result["download_bytes"] = len(blob)
+    return result
+
+
+# One pending archive per download, keyed by a single-use token. Capped so a long-lived
+# process cannot accumulate archives it will never be asked for.
+_FIX_ZIPS: dict = {}
+_MAX_PENDING_ZIPS = 8
+
+
+@app.get("/api/reviews/{review_id}/fix/download/{token}",
+         summary="Download the patched files from a fix run")
+async def fix_download(review_id: str, token: str, request: Request,
+                       reader: dict = Depends(require_reader)):
+    """Hand over the archive a fix run produced. Single use.
+
+    Single use because it is a copy of the customer's patched source: a URL that keeps
+    working is a URL that ends up in a chat log.
+    """
+    _review_in_scope(review_id, request, reader)
+    entry = _FIX_ZIPS.pop(token, None)
+    if not entry or entry[1] != review_id:
+        raise HTTPException(
+            status_code=404,
+            detail="That download has already been taken, or belongs to another review. "
+                   "Run the fix again to produce a new archive.")
+    return Response(
+        content=entry[0], media_type="application/zip",
+        headers={"Content-Disposition":
+                 f'attachment; filename="fixes-{review_id[:8]}.zip"'},
+    )
+
+
+# ── What a review looked at ────────────────────────────────────────────────
+#
+# A result could say "4 file(s) read, 6 filtered out" and not say which. These two routes
+# are the answer, and they are deliberately separate from `GET /api/reviews/{id}`: the
+# inventory of a 1,500-file repository has no business travelling inside every read of the
+# review row, and it needs paging that a nested field cannot have.
+#
+# Both are scoped the same way as every other governance read, and answer 404 rather than
+# 403 for a review in someone else's project — whether it exists is itself not this
+# caller's business.
+
+
+def _review_in_scope(review_id: str, request: Request, reader: dict) -> dict:
+    review = database.get_review(review_id)
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    visible = _visible_project_ids(reader, request)
+    if visible is not None and review.get("project_id") not in visible:
+        raise HTTPException(status_code=404, detail="Review not found")
+    return review
+
+
+@app.get("/api/reviews/{review_id}/sources",
+         summary="Which files a review read, and which it filtered out")
+async def review_sources(review_id: str, request: Request,
+                         included: Optional[bool] = Query(
+                             None, description="True for only the files that were reviewed, "
+                                               "False for only the exclusions."),
+                         limit: int = Query(500, ge=1, le=2000),
+                         offset: int = Query(0, ge=0),
+                         reader: dict = Depends(require_reader)):
+    """The file-by-file record, with each exclusion's reason and each finding's count.
+
+    Content is never returned here — a list endpoint that carried file bodies would be the
+    largest response in the app and would defeat the retention window it is describing.
+    """
+    _review_in_scope(review_id, request, reader)
+    return review_source_store.get_inventory(
+        review_id, included=included, limit=limit, offset=offset)
+
+
+@app.get("/api/reviews/{review_id}/sources/file",
+         summary="Read one file exactly as the review saw it")
+async def review_source_file(review_id: str, request: Request,
+                             path: str = Query(..., description="Path as listed by /sources"),
+                             reader: dict = Depends(require_reader)):
+    """One file, from the stored copy or re-read from its repository at the recorded commit.
+
+    Answers 200 with an `unavailable` reason rather than an error status when the content is
+    genuinely gone, because "we never kept this", "the retention window passed" and "the
+    token that read this repository no longer works" are three different problems with three
+    different fixes, and a 404 for all of them sends someone to the wrong one.
+    """
+    review = _review_in_scope(review_id, request, reader)
+    return review_source_store.get_file(
+        review_id, path, project_id=review.get("project_id"))
+
+
+@app.delete("/api/reviews/{review_id}/sources",
+            summary="Delete a review's stored source now, before its window expires")
+async def delete_review_sources(review_id: str, request: Request,
+                                reader: dict = Depends(require_reader)):
+    """Forget the source early.
+
+    Retention is a ceiling, not a commitment to hold something for that long. Somebody who
+    uploaded the wrong archive, or who has been asked to remove a copy, should not have to
+    wait out a window they chose before they knew that.
+    """
+    _review_in_scope(review_id, request, reader)
+    review_source_store.delete_for_review(review_id)
+    return {"deleted": True, "review_id": review_id}
 
 
 @app.get("/api/reviews/{review_id}")
@@ -604,6 +1350,9 @@ async def review_github_pr(req: GithubPRRequest):
             pr_url=req.pr_url,
             jira_ticket=req.jira_ticket or "",
             include_prompt_review=req.include_prompt_review,
+            post_mode=req.post_mode,
+            set_status=req.set_status,
+            request_changes=req.request_changes,
         )
         return result
     except ValueError as e:

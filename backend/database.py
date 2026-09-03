@@ -5,8 +5,11 @@ import json
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
-from backend import context
+from backend import config, context
 from backend.config import DATABASE_PATH, JOB_STALE_MINUTES, SQLITE_BUSY_TIMEOUT_MS
+# Imported here rather than lazily: `crypto_service` depends only on `config`, so there
+# is no cycle, and a lazy import inside the credential helpers would run on every call.
+from backend.services import crypto_service
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +272,52 @@ def init_db():
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS github_credentials (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            label TEXT NOT NULL,
+            token_encrypted TEXT NOT NULL,
+            -- Owner or owner/repo this credential is for, lowercased. NULL means "any
+            -- repository this project reaches". Scoping matters because a customer may hold
+            -- one token per org, and reaching for the wrong one produces a 404 that reads
+            -- exactly like "the repo does not exist".
+            scope_pattern TEXT,
+            can_write INTEGER DEFAULT 0,
+            -- A webhook secret is a credential, so it lives in the same encrypted column
+            -- family as the token rather than in config. NULL until someone enables
+            -- delivery, and its absence is what makes `/api/github/webhook` refuse a
+            -- repository outright -- an endpoint that accepts unsigned events is a way to
+            -- spend a budget from the internet.
+            webhook_secret_encrypted TEXT DEFAULT NULL,
+            last_test_status TEXT,
+            last_test_at TEXT,
+            last_test_detail TEXT,
+            created_by TEXT DEFAULT 'admin',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_github_credentials_project
+            ON github_credentials(project_id);
+
+        CREATE TABLE IF NOT EXISTS webhook_reviews (
+            id TEXT PRIMARY KEY,
+            repo TEXT NOT NULL,
+            head_sha TEXT NOT NULL,
+            pr_url TEXT,
+            job_id TEXT,
+            review_id TEXT,
+            delivery_id TEXT,
+            created_at TEXT NOT NULL
+        );
+
+        -- The uniqueness that stops a push storm becoming a spend storm. `synchronize` fires
+        -- on every push, GitHub retries any delivery it believes failed, and a force-push can
+        -- replay a sha -- so without this a branch pushed twenty times is twenty reviews and
+        -- twenty charges for the same answer.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_reviews_commit
+            ON webhook_reviews(repo, head_sha);
+
         CREATE TABLE IF NOT EXISTS platform_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -464,6 +513,62 @@ def init_db():
         pass  # column already exists
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_project ON approvals(project_id, status, created_at)")
 
+    # A risk accepted with no end date is not accepted, it is forgotten. `waiver_expires_at`
+    # is set only for `accepted_risk`: "waived" (by design, not applicable) and
+    # "false_positive" (we were wrong) are permanent, because neither is a decision a clock
+    # should reopen. ALTER rather than DDL for the same reason `project_id` above is —
+    # CREATE TABLE IF NOT EXISTS never revisits a table that already exists.
+    for _col, _type in (("waiver_expires_at", "TEXT DEFAULT NULL"),
+                        ("waiver_lapsed_at", "TEXT DEFAULT NULL")):
+        try:
+            cursor.execute(f"ALTER TABLE findings ADD COLUMN {_col} {_type}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_findings_waiver_expiry "
+                   "ON findings(status, waiver_expires_at)")
+
+    # Which product produced a review. `review_type` cannot answer that: "code" is written by
+    # Code Review, by `workflows/review_pr.py` and by `workflows/autofix_pr.py`, so a
+    # per-agent history filtered on it showed all three agents on all three screens. NULL on
+    # every row written before this existed, which is why `list_reviews` falls back to
+    # `review_type` for those rather than showing an empty history -- an empty history looks
+    # exactly like data loss.
+    try:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN product_id TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_product "
+                   "ON reviews(product_id, created_at DESC)")
+
+    cursor.executescript("""
+        -- What a user told us we got wrong. The only free signal about our own accuracy,
+        -- and until now it died in a `resolution_comment`. Each row is a candidate for
+        -- `evals/code_review/`, where the corpus is ten cases and too small to tune a
+        -- prompt against.
+        CREATE TABLE IF NOT EXISTS false_positive_reports (
+            id            TEXT PRIMARY KEY,
+            finding_id    TEXT NOT NULL,
+            review_id     TEXT DEFAULT '',
+            project_id    TEXT DEFAULT NULL,
+            control_id    TEXT DEFAULT '',
+            severity      INTEGER DEFAULT 0,
+            title         TEXT DEFAULT '',
+            description   TEXT DEFAULT '',
+            file_path     TEXT DEFAULT '',
+            line_start    INTEGER DEFAULT NULL,
+            evidence      TEXT DEFAULT '',
+            fingerprint   TEXT DEFAULT '',
+            -- Why the user says it is wrong. The most valuable field here: it is the only
+            -- place a human explains the mistake in their own words.
+            reason        TEXT DEFAULT '',
+            reported_by   TEXT DEFAULT '',
+            created_at    TEXT NOT NULL,
+            exported_at   TEXT DEFAULT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_fp_reports_created
+            ON false_positive_reports(created_at DESC);
+    """)
+
     # Modernization owns six tables of its own. Their DDL lives with the code that queries
     # them rather than here — this module is already read by everything, and those tables
     # are read by one subsystem — but they are still created in exactly one place, at
@@ -471,6 +576,12 @@ def init_db():
     # `get_connection` from this one.
     from backend.services.modernization.store import init_schema as _init_modernization
     _init_modernization(cursor)
+
+    # What each review looked at, and (when a retention window was chosen) the source
+    # itself. Same reasoning as above for where the DDL lives: beside the code that queries
+    # it, created here so there is still exactly one place tables come into existence.
+    from backend.services.review_source_store import init_schema as _init_review_sources
+    _init_review_sources(cursor)
 
     conn.commit()
     conn.close()
@@ -513,13 +624,17 @@ def save_review(
         INSERT INTO reviews
             (id, review_type, project_name, input_summary, input_content,
              result_json, findings_count, critical_count, high_count,
-             risk_score, gate_status, created_at, project_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             risk_score, gate_status, created_at, project_id, product_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             review_id, review_type, project_name, input_summary, input_content,
             json.dumps(result), findings_count, critical_count, high_count,
             risk_score, gate_status, created_at, project_id,
+            # Which product this came from, published by `agent_guard.guarded_call`.
+            # `review_type` cannot answer it: "code" is written by Code Review, the GitHub PR
+            # review and Auto-Fix, so a screen filtering on it showed all three histories.
+            context.current_product_id(),
         ),
     )
 
@@ -654,13 +769,51 @@ def _review_scope_sql(project_ids: Optional[List[str]], alias: str = "") -> tupl
     return f" AND {prefix}project_id IN ({placeholders})", tuple(project_ids)
 
 
+# The columns a list needs. `SELECT *` was shipping `result_json` and `input_content` —
+# every finding, every evidence quote and up to 5,000 characters of the customer's source —
+# to draw a summary row. Harmless while this database held three reviews (measured: 29 KB in
+# the largest row); a whole-repo review with fifty findings runs to hundreds of kilobytes,
+# and a ten-row page then downloads megabytes to render ten lines of text. Naming the columns
+# was the cheap half of adding a second caller for this query.
+_REVIEW_LIST_COLUMNS = (
+    "id, review_type, product_id, project_name, project_id, input_summary, findings_count, "
+    "critical_count, high_count, risk_score, gate_status, created_at, created_by"
+)
+
+
 def list_reviews(limit: int = 20, offset: int = 0,
-                 project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+                 project_ids: Optional[List[str]] = None,
+                 review_type: Optional[str] = None,
+                 product_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """One page of review summary rows, newest first.
+
+    These two filters exist so an agent's own screen can show its own history. Without them
+    the record was stored, listed on the Dashboard and the History page, and unreachable
+    from where the work is actually done — which is where somebody looks for "what did we
+    find last time".
+
+    **`product_id` is the one to filter a screen on.** `review_type` is a coarser bucket:
+    "code" is written by Code Review, by the GitHub PR review and by Auto-Fix, so filtering
+    a screen on it shows all three histories on all three screens. `product_id` is NULL for
+    every row written before it existed, so a caller passing it also gets those matched by
+    `review_type` — otherwise every existing customer's history would read as empty, which
+    looks exactly like data loss.
+    """
     scope, params = _review_scope_sql(project_ids)
+    if product_id and review_type:
+        scope += " AND (product_id = ? OR (product_id IS NULL AND review_type = ?))"
+        params = params + (product_id, review_type)
+    elif product_id:
+        scope += " AND product_id = ?"
+        params = params + (product_id,)
+    elif review_type:
+        scope += " AND review_type = ?"
+        params = params + (review_type,)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        f"SELECT * FROM reviews WHERE 1 = 1{scope} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        f"SELECT {_REVIEW_LIST_COLUMNS} FROM reviews WHERE 1 = 1{scope} "
+        f"ORDER BY created_at DESC LIMIT ? OFFSET ?",
         params + (limit, offset),
     )
     rows = cursor.fetchall()
@@ -668,13 +821,27 @@ def list_reviews(limit: int = 20, offset: int = 0,
     return [dict(r) for r in rows]
 
 
-def count_reviews(project_ids: Optional[List[str]] = None) -> int:
+def count_reviews(project_ids: Optional[List[str]] = None,
+                  review_type: Optional[str] = None,
+                  product_id: Optional[str] = None) -> int:
     """How many reviews the caller may see — the denominator a pager needs.
 
-    Scoped through the same `_review_scope_sql` as `list_reviews`, so the count and the
-    page it describes can never disagree about which projects are in view.
+    Scoped through the same `_review_scope_sql` as `list_reviews` and taking the same two
+    filters *with the same fallback*, so the count and the page it describes can never
+    disagree about which projects or which agent are in view. Duplicating the predicate here
+    is the bug this docstring exists to prevent: a count that forgot the NULL fallback would
+    say "3 of 0".
     """
     scope, params = _review_scope_sql(project_ids)
+    if product_id and review_type:
+        scope += " AND (product_id = ? OR (product_id IS NULL AND review_type = ?))"
+        params = params + (product_id, review_type)
+    elif product_id:
+        scope += " AND product_id = ?"
+        params = params + (product_id,)
+    elif review_type:
+        scope += " AND review_type = ?"
+        params = params + (review_type,)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(f"SELECT COUNT(*) as total FROM reviews WHERE 1 = 1{scope}", params)
@@ -2202,6 +2369,45 @@ def get_usage_totals(key_id: str, product_id: str, since_iso: str) -> Dict[str, 
     }
 
 
+def get_output_calibration(product_id: str, sample: int = 40) -> Optional[Dict[str, Any]]:
+    """Median output tokens per model call for one product, from what it has actually done.
+
+    Exists so a cost quote is calibrated rather than guessed. `modernization/estimate.py`
+    needs an expected-output multiplier and states plainly that its table is "set by
+    judgement, not measured" — the honest position when nothing had run yet. For the review
+    agents the data is already here: every metered call writes `calls` and `output_tokens`,
+    so the expected output per call is a measurement the moment a project has any history.
+
+    **Median, not mean.** One response cut off at a 28,000-token ceiling drags a mean far
+    above anything typical, and a quote inflated by an outlier is a quote nobody trusts.
+
+    Returns None when there is not enough history to be worth using, so the caller falls
+    back to its documented default rather than quoting from a sample of two.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT output_tokens, calls FROM usage_events "
+        "WHERE product_id = ? AND status = 'ok' AND calls > 0 AND output_tokens > 0 "
+        "ORDER BY created_at DESC LIMIT ?",
+        (product_id, max(1, int(sample))),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    per_call = sorted((r["output_tokens"] / r["calls"]) for r in rows)
+    # Five is the floor for reporting a median at all: below that a single unusual run moves
+    # it more than the population does, which is the failure this function exists to avoid.
+    if len(per_call) < 5:
+        return None
+    mid = len(per_call) // 2
+    median = per_call[mid] if len(per_call) % 2 else (per_call[mid - 1] + per_call[mid]) / 2
+    return {
+        "median_output_tokens_per_call": int(median),
+        "sample_size": len(per_call),
+        "p90_output_tokens_per_call": int(per_call[min(int(len(per_call) * 0.9), len(per_call) - 1)]),
+    }
+
+
 _USAGE_SUMS = (
     "COUNT(*) AS events, "
     "COALESCE(SUM(calls), 0) AS calls, "
@@ -2530,8 +2736,14 @@ def get_finding(finding_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+# How long an accepted risk stands before it comes back for re-decision. Editable per
+# waiver; this is only the default offered.
+DEFAULT_RISK_ACCEPTANCE_DAYS = 90
+
+
 def set_finding_status(
     finding_id: str, status: str, actor: str = "system", comment: str = "",
+    expires_in_days: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Waive, dismiss or reopen a finding. Returns the updated row, or None if unknown.
 
@@ -2539,6 +2751,17 @@ def set_finding_status(
     schema and nothing ever wrote to them, which is why there was no way to tell the
     platform "we know, we accept this" — and therefore no way for a gate to ever go green
     on a codebase with history.
+
+    Two things happen beyond the status change, and both exist because three of the four
+    statuses used to behave identically — which taught users the choice did not matter:
+
+    * **`accepted_risk` expires.** A date is set (90 days by default, `expires_in_days` to
+      override) after which `lapse_expired_waivers` puts the finding back. `waived` and
+      `false_positive` never expire: "by design" and "the tool was wrong" are not decisions
+      a clock should reopen.
+    * **`false_positive` writes a corpus candidate.** The code, the claim and the reason in
+      the user's own words, kept for `evals/`. It is the only free signal we get about our
+      own accuracy and it was being thrown away.
     """
     now = datetime.utcnow().isoformat()
     conn = get_connection()
@@ -2550,21 +2773,102 @@ def set_finding_status(
         return None
     resolved_by = actor if status != "open" else None
     resolved_at = now if status != "open" else None
+    expires_at = None
+    if status == "accepted_risk":
+        days = DEFAULT_RISK_ACCEPTANCE_DAYS if expires_in_days is None else int(expires_in_days)
+        # A caller can ask for no expiry explicitly (0), which is a decision rather than an
+        # oversight — but it is not the default, and the audit row records which it was.
+        if days > 0:
+            expires_at = (datetime.utcnow() + timedelta(days=days)).isoformat()
     cursor.execute(
-        "UPDATE findings SET status = ?, resolved_by = ?, resolved_at = ?, resolution_comment = ? "
+        "UPDATE findings SET status = ?, resolved_by = ?, resolved_at = ?, "
+        "resolution_comment = ?, waiver_expires_at = ?, waiver_lapsed_at = NULL "
         "WHERE id = ?",
-        (status, resolved_by, resolved_at, comment or None, finding_id),
+        (status, resolved_by, resolved_at, comment or None, expires_at, finding_id),
     )
     log_audit(
         cursor, "finding_status_changed", "finding", finding_id, actor,
         json.dumps({"status": status, "comment": comment, "control_id": row["control_id"],
-                    "fingerprint": row["fingerprint"]}),
+                    "fingerprint": row["fingerprint"], "expires_at": expires_at}),
     )
+    if status == "false_positive":
+        cursor.execute(
+            """INSERT INTO false_positive_reports
+               (id, finding_id, review_id, project_id, control_id, severity, title,
+                description, file_path, line_start, evidence, fingerprint, reason,
+                reported_by, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(uuid.uuid4()), finding_id, row["review_id"],
+             (row["project_id"] if "project_id" in row.keys() else None),
+             row["control_id"], row["severity"], row["title"],
+             (row["description"] if "description" in row.keys() else "") or "",
+             (row["file_path"] if "file_path" in row.keys() else "") or "",
+             (row["line_start"] if "line_start" in row.keys() else None),
+             (row["evidence"] if "evidence" in row.keys() else "") or "",
+             row["fingerprint"] or "", comment or "", actor, now),
+        )
     conn.commit()
     cursor.execute("SELECT * FROM findings WHERE id = ?", (finding_id,))
     updated = dict(cursor.fetchone())
     conn.close()
     return updated
+
+
+def lapse_expired_waivers() -> int:
+    """Reopen accepted risks whose window has passed. Returns how many lapsed.
+
+    No scheduler exists here, so this runs at startup and whenever a baseline is looked up —
+    which is every review. That is the moment it matters: a lapsed acceptance has to be back
+    in front of somebody by the next run, not on a particular hour.
+
+    `waiver_lapsed_at` is kept rather than the row being reset, so the history says "this was
+    accepted, and the acceptance ran out" instead of looking like it was never decided.
+    """
+    now = datetime.utcnow().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM findings WHERE status = 'accepted_risk' "
+        "AND waiver_expires_at IS NOT NULL AND waiver_expires_at < ?", (now,))
+    ids = [r["id"] for r in cursor.fetchall()]
+    if not ids:
+        conn.close()
+        return 0
+    marks = ",".join("?" * len(ids))
+    cursor.execute(
+        f"UPDATE findings SET status = 'open', waiver_lapsed_at = ?, "
+        f"resolution_comment = COALESCE(resolution_comment, '') || "
+        f"' [risk acceptance lapsed ' || ? || ']' WHERE id IN ({marks})",
+        [now, now[:10]] + ids)
+    for fid in ids:
+        log_audit(cursor, "waiver_lapsed", "finding", fid, "system",
+                  json.dumps({"reason": "the risk acceptance window passed"}))
+    conn.commit()
+    conn.close()
+    logger.info("Risk acceptance lapsed on %d finding(s)", len(ids))
+    return len(ids)
+
+
+def list_false_positive_reports(limit: int = 200,
+                                project_ids: Optional[List[str]] = None
+                                ) -> List[Dict[str, Any]]:
+    """What users have told us we got wrong, newest first — the eval corpus queue."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if project_ids is None:
+        cursor.execute("SELECT * FROM false_positive_reports "
+                       "ORDER BY created_at DESC LIMIT ?", (limit,))
+    elif not project_ids:
+        conn.close()
+        return []
+    else:
+        marks = ",".join("?" * len(project_ids))
+        cursor.execute(
+            f"SELECT * FROM false_positive_reports WHERE project_id IN ({marks}) "
+            f"ORDER BY created_at DESC LIMIT ?", list(project_ids) + [limit])
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
 
 
 def recover_orphaned_jobs() -> int:
@@ -2619,3 +2923,251 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     data["error"] = json.loads(data["error_json"]) if data["error_json"] else None
     del data["result_json"], data["error_json"]
     return data
+
+
+# ── GitHub credentials ────────────────────────────────────────────────────
+#
+# One `GITHUB_TOKEN` in the environment was read once at import and shared by every
+# customer (C-76): two customers could not connect their own repositories, one tenant's
+# access could not be revoked, and Auto-Fix's write scope was deployment-wide or absent.
+# These rows are the per-project version, encrypted with the same `crypto_service` the BYOL
+# provider keys use — so rotating SECRET_KEY invalidates them and they are re-entered, which
+# is the documented trade there too.
+#
+# The token is never returned by any read below. `has_token` and a masked hint are enough for
+# a screen to show that one is configured, and a value that cannot be read back cannot be
+# leaked by a screen, a log line or an export.
+
+
+def _github_credential_public(row: dict) -> Dict[str, Any]:
+    """A credential as it may be shown. Never includes the token."""
+    token = crypto_service.decrypt(row.get("token_encrypted") or "")
+    return {
+        "id": row["id"],
+        "project_id": row.get("project_id"),
+        "label": row.get("label"),
+        "scope_pattern": row.get("scope_pattern"),
+        "can_write": bool(row.get("can_write")),
+        "has_token": bool(token),
+        "has_webhook_secret": bool(row.get("webhook_secret_encrypted")),
+        # Last four characters only. Enough for a person to tell two tokens apart when
+        # deciding which to replace, and useless to anyone else.
+        "token_hint": f"…{token[-4:]}" if len(token) > 8 else ("set" if token else ""),
+        "last_test_status": row.get("last_test_status"),
+        "last_test_at": row.get("last_test_at"),
+        "last_test_detail": row.get("last_test_detail"),
+        "created_by": row.get("created_by"),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def save_github_credential(
+    project_id: Optional[str],
+    label: str,
+    token: str,
+    scope_pattern: Optional[str] = None,
+    can_write: bool = False,
+    created_by: str = "admin",
+    credential_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Store or replace a credential. Returns the public shape, never the token."""
+    now = datetime.utcnow().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    encrypted = crypto_service.encrypt(token) if token else ""
+
+    if credential_id:
+        # An empty token on an update means "leave the stored one alone" — so a person can
+        # rename a credential or change its scope without re-typing a secret they may not
+        # have to hand.
+        if encrypted:
+            cursor.execute(
+                "UPDATE github_credentials SET label = ?, token_encrypted = ?, "
+                "scope_pattern = ?, can_write = ?, updated_at = ? WHERE id = ?",
+                (label, encrypted, (scope_pattern or "").lower() or None,
+                 1 if can_write else 0, now, credential_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE github_credentials SET label = ?, scope_pattern = ?, "
+                "can_write = ?, updated_at = ? WHERE id = ?",
+                (label, (scope_pattern or "").lower() or None,
+                 1 if can_write else 0, now, credential_id),
+            )
+        new_id = credential_id
+    else:
+        new_id = str(uuid.uuid4())
+        cursor.execute(
+            "INSERT INTO github_credentials (id, project_id, label, token_encrypted, "
+            "scope_pattern, can_write, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (new_id, project_id, label, encrypted, (scope_pattern or "").lower() or None,
+             1 if can_write else 0, created_by, now, now),
+        )
+    conn.commit()
+    cursor.execute("SELECT * FROM github_credentials WHERE id = ?", (new_id,))
+    row = cursor.fetchone()
+    conn.close()
+    logger.info("Saved GitHub credential %s for project %s", new_id, project_id)
+    return _github_credential_public(dict(row)) if row else {}
+
+
+def list_github_credentials(project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Credentials this caller may see. Tokens are never included."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    if project_ids is None:
+        cursor.execute("SELECT * FROM github_credentials ORDER BY created_at DESC")
+    elif not project_ids:
+        conn.close()
+        return []
+    else:
+        marks = ",".join("?" for _ in project_ids)
+        cursor.execute(
+            f"SELECT * FROM github_credentials WHERE project_id IN ({marks}) "
+            f"ORDER BY created_at DESC",
+            tuple(project_ids),
+        )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return [_github_credential_public(r) for r in rows]
+
+
+def get_github_credential(credential_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM github_credentials WHERE id = ?", (credential_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_github_credential(credential_id: str) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM github_credentials WHERE id = ?", (credential_id,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if deleted:
+        logger.info("Deleted GitHub credential %s", credential_id)
+    return deleted
+
+
+def record_github_credential_test(credential_id: str, status: str, detail: str = "") -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE github_credentials SET last_test_status = ?, last_test_at = ?, "
+        "last_test_detail = ? WHERE id = ?",
+        (status, datetime.utcnow().isoformat(), detail[:500], credential_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def resolve_github_token(project_id: Optional[str], owner_repo: str = "") -> Dict[str, Any]:
+    """The token to use for `owner_repo`, and where it came from.
+
+    Resolution order, most specific first — the same shape as `llm_gateway.resolve_override`,
+    so there is one mental model for "whose credentials serve this call":
+
+      1. a credential for this project whose `scope_pattern` matches `owner/repo` exactly
+      2. a credential for this project whose `scope_pattern` matches the owner
+      3. a credential for this project with no scope (its default)
+      4. the deployment's `GITHUB_TOKEN`
+
+    Returns `{token, source, credential_id, label, can_write}`. `source` is reported on the
+    response and in the error when a fetch fails, because "which token did we even try" is
+    the first question when a repository 404s and was previously unanswerable.
+    """
+    owner_repo = (owner_repo or "").lower().strip("/")
+    owner = owner_repo.split("/")[0] if owner_repo else ""
+
+    if project_id:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM github_credentials WHERE project_id = ? ORDER BY created_at DESC",
+            (project_id,),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+
+        def pick(predicate):
+            for row in rows:
+                if predicate(row):
+                    token = crypto_service.decrypt(row.get("token_encrypted") or "")
+                    if token:
+                        return {
+                            "token": token,
+                            "source": "project",
+                            "credential_id": row["id"],
+                            "label": row.get("label"),
+                            "can_write": bool(row.get("can_write")),
+                        }
+            return None
+
+        for predicate in (
+            lambda r: (r.get("scope_pattern") or "") == owner_repo and owner_repo,
+            lambda r: (r.get("scope_pattern") or "") == owner and owner,
+            lambda r: not r.get("scope_pattern"),
+        ):
+            found = pick(predicate)
+            if found:
+                return found
+
+    return {
+        "token": config.GITHUB_TOKEN,
+        "source": "deployment" if config.GITHUB_TOKEN else "none",
+        "credential_id": None,
+        "label": "GITHUB_TOKEN from the environment" if config.GITHUB_TOKEN else "",
+        # A deployment token's scopes are unknown here, so writing is not asserted. The
+        # write paths already check for themselves and fail with GitHub's own message.
+        "can_write": bool(config.GITHUB_TOKEN),
+    }
+
+
+def record_webhook_review(repo: str, head_sha: str, pr_url: str, job_id: str,
+                          delivery_id: str = "") -> None:
+    """Remember that this commit has been reviewed. Idempotent by (repo, head_sha)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT OR IGNORE INTO webhook_reviews "
+            "(id, repo, head_sha, pr_url, job_id, delivery_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), repo, head_sha, pr_url, job_id, delivery_id,
+             datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def find_webhook_review(repo: str, head_sha: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT * FROM webhook_reviews WHERE repo = ? AND head_sha = ?", (repo, head_sha))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_github_webhook_secret(credential_id: str, secret: str) -> bool:
+    """Store or clear a webhook secret on an existing credential. Never returned by a read."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE github_credentials SET webhook_secret_encrypted = ?, updated_at = ? "
+        "WHERE id = ?",
+        (crypto_service.encrypt(secret) if secret else "", datetime.utcnow().isoformat(),
+         credential_id),
+    )
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated

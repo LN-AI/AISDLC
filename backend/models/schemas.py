@@ -130,6 +130,25 @@ class GithubPRRequest(BaseModel):
     pr_url: str
     jira_ticket: Optional[str] = None
     include_prompt_review: bool = False
+    # The screen has offered these three since the post-back options landed, and the route
+    # silently dropped them -- so "Do not post" still posted, and the merge-blocking check
+    # was always on regardless of the checkbox. Defaults match the previous behaviour
+    # exactly, so an existing caller that sends none of them is unaffected.
+    post_mode: str = Field(
+        "summary",
+        description="Where findings go: 'summary' (one comment, edited in place on a "
+                    "re-run), 'inline' (positioned on the diff lines, with the rest in the "
+                    "summary), or 'none' (review it and return the comment without writing "
+                    "anything to GitHub).")
+    set_status: bool = Field(
+        True,
+        description="Report the gate as a commit status, so a Red verdict blocks the merge "
+                    "button under branch protection. Needs `repo:status` on the token.")
+    request_changes: bool = Field(
+        False,
+        description="Also submit the review as REQUEST_CHANGES (inline mode only). Off by "
+                    "default: on many repositories that blocks the author until a human "
+                    "dismisses it, which is the customer's policy call.")
 
 
 class GithubAutoFixRequest(BaseModel):
@@ -293,3 +312,54 @@ class ArchitectureReviewResult(BaseModel):
     compliance_flags:            List[str]
     summary:                     str
     recommendations:             List[str]
+
+
+# ── Source-capable request bodies for the UI surface ──────────────────────
+#
+# New models rather than extra fields on `CodeReviewRequest` / `VAPTReviewRequest`. Those
+# two are what every existing screen and integration posts to, `code`/`artifact` is required
+# on them, and 380-odd offline checks assert their behaviour — widening them would put all
+# of that at risk to save two classes. These carry the full source set for the new
+# `/source`, `/upload-zip` and `/preflight` routes.
+
+
+class SourceFile(BaseModel):
+    path: str = Field(description="Repo-relative path, e.g. src/api/auth.py")
+    content: str = Field(description="The file's full text")
+
+
+class _UISourceBase(BaseModel):
+    project_name: Optional[str] = ""
+    context: Optional[str] = None
+    files: Optional[List[SourceFile]] = Field(
+        None, description="Explicit file list — highest precedence source")
+    github_pr_url: Optional[str] = Field(None, description="Review a pull request diff")
+    github_repo_url: Optional[str] = Field(
+        None, description="Review a repository's source at `ref`, or a `base_ref...head_ref` diff")
+    ref: Optional[str] = Field(None, description="Branch, tag or commit for github_repo_url")
+    base_ref: Optional[str] = Field(None, description="With head_ref: review a branch comparison")
+    head_ref: Optional[str] = Field(None, description="The branch being proposed")
+    github_file_url: Optional[str] = Field(None, description="Review a single file")
+    github_token: Optional[str] = Field(
+        None, description="A token for this call only — never stored. Overrides the saved "
+                          "credential and the deployment default.")
+    retention_days: Optional[int] = Field(
+        None,
+        description="How long to keep the reviewed source so files can be opened and fixes "
+                    "applied afterwards: 0 (keep nothing), 1, 3, 7, 14 or 30 days. Defaults "
+                    "to 7. Ignored for GitHub sources, which are re-read from the repository "
+                    "at the commit the review recorded rather than copied. The list of which "
+                    "files were read is always kept, whatever this is set to.",
+        examples=[7, 0],
+    )
+
+
+class CodeReviewSourceRequest(_UISourceBase):
+    code: Optional[str] = Field(None, description="Pasted code or a unified diff")
+    language: Optional[str] = None
+
+
+class VAPTSourceRequest(_UISourceBase):
+    artifact: Optional[str] = Field(
+        None, description="Pasted code, API spec, architecture description, or URL list")
+    scope: Optional[str] = None

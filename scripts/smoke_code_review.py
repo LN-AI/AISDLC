@@ -544,6 +544,53 @@ check("the waive endpoint is actually registered on the app",
       "a router that is imported but never included is invisible until someone calls it")
 check("it is a PATCH", "patch" in _paths.get("/api/v1/findings/{finding_id}", {}))
 
+section("Control mapping -- every id the prompt offers has to exist")
+
+# The prompt hands the model a list of control ids and the model returns one per finding.
+# An id on that list with no row behind it produces findings that carry a label nothing can
+# resolve: `get_control` returns None, compliance mapping drops them, and the Governance
+# Report groups them nowhere -- silently, because nothing checks. Cheap invariant, and it is
+# the failure the SEC-013..016 work was fixing the other half of.
+import re as _re
+
+from backend.agents.developer_intelligence.code_reviewer import SYSTEM_PROMPT as _CODE_PROMPT
+from backend.agents.security_intelligence.vapt_agent import VAPT_SYSTEM_PROMPT as _VAPT_PROMPT
+from backend.controls.control_library import ALL_CONTROLS as _CATALOGUE
+
+# Two prompts, two formats: code review lists "- SEC-001: ...", VAPT maps "A01 -> VAPT-001".
+# Matching any id-shaped token covers both without teaching the test either layout.
+for _name, _prompt in (("code review", _CODE_PROMPT), ("VAPT", _VAPT_PROMPT)):
+    _offered = sorted(set(_re.findall(r"\b((?:SEC|AI|GOV|VAPT|ARCH|HIPAA|ISO|GXP|PCI)-\d{3})\b",
+                                      _prompt)))
+    _missing = [i for i in _offered if i not in _CATALOGUE]
+    check(f"the {_name} prompt offers at least one control id", bool(_offered),
+          f"{len(_offered)} found")
+    check(f"...and every id the {_name} prompt offers exists in the catalogue",
+          not _missing, str(_missing))
+
+# The four added on 2026-09-03, and the distinction that caused them. A real finding
+# ("PHI returned with no access audit log") wore SEC-004, which is the opposite defect.
+for _cid, _word in (("SEC-013", "log"), ("SEC-014", "stack trace"),
+                    ("SEC-015", "origin"), ("SEC-016", "authorization")):
+    check(f"{_cid} exists", _cid in _CATALOGUE)
+check("SEC-013 is a *missing* access log, not data leaking into one",
+      "too little logging" in _CATALOGUE["SEC-013"].description
+      and "SEC-004" in _CATALOGUE["SEC-013"].description,
+      _CATALOGUE["SEC-013"].description[:120])
+check("SEC-016 says why it is not SEC-002",
+      "SEC-002" in _CATALOGUE["SEC-016"].description,
+      "role can be correct and the object still not theirs -- a reader needs that stated")
+check("the reviewer is told a missing access log is SEC-013, not SEC-004",
+      "SEC-013" in _CODE_PROMPT and "opposite defect" in _CODE_PROMPT)
+check("the regulated-data ids are gated on the data type being visible in the code",
+      "only when the code itself shows the data type" in _CODE_PROMPT,
+      "otherwise an ecommerce app gets HIPAA citations")
+check("...and the reviewer is told not to infer it from the project name",
+      "Do not infer it from the project name" in _CODE_PROMPT)
+check("HIPAA-003 is now reachable -- it is what the mis-filed finding actually was",
+      "HIPAA-003" in _CODE_PROMPT and _CATALOGUE["HIPAA-003"].title.startswith("Audit Logging"))
+
+
 print()
 print("-" * 60)
 if _failures:

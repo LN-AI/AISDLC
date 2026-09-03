@@ -61,6 +61,7 @@ from backend.models.api_models import (
 )
 from backend.services import (
     agent_guard, code_chunker, guardrail_service, llm_gateway, job_service, subject_service,
+    review_estimate, source_bundle,
 )
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
@@ -71,6 +72,7 @@ from backend.services.api_key_service import (
 )
 from backend.services.auth_service import decode_token
 from backend.services.github_service import GitHubService
+from backend.services.subject_service import subject_from_caller
 from backend.services.jira_service import JiraService
 from backend.services.orchestrator import SDLCOrchestrator
 
@@ -341,6 +343,189 @@ def _wrap(agent: str, result: dict, source_type: str, source_ref: str,
     }
 
 
+
+# ── Source bundles and cost preview ───────────────────────────────────────
+#
+# `_resolve` above returns one string, which is all a single-artifact agent needed.
+# `_bundle` returns a `source_bundle.Bundle`: the same sources plus a zip, an explicit file
+# list, a whole repository at a ref, and a branch comparison — and, for every one of them,
+# an account of what was filtered out. Code Review and VAPT use this; the other agents keep
+# `_resolve` because they review prose, not files.
+
+
+def _bundle(req, agent: str = "code", caller: Optional[dict] = None) -> "source_bundle.Bundle":
+    """Resolve a request to a Bundle, or fail with a message aimed at the caller.
+
+    `caller` selects the GitHub credential: an API key's own project, or the project a
+    browser session named. Without it every repository fetch would use the deployment token,
+    which is the whole of C-76.
+    """
+    project_id = None
+    if caller is not None:
+        try:
+            project_id = subject_from_caller(caller).project_id
+        except Exception:
+            logger.info("Could not resolve a project for the GitHub credential — using the default")
+    try:
+        return source_bundle.resolve(req, _github, project_id=project_id)
+    except source_bundle.SourceError as exc:
+        raise HTTPException(400, str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Source resolution failed for %s", agent)
+        raise HTTPException(502, f"Could not read the requested source: {exc}")
+
+
+def _review_args(bundle, req, agent: str) -> dict:
+    """The kwargs both `review_code` and `review_vapt` take for a Bundle.
+
+    A single artifact keeps travelling as `code`/`artifact` and is wrapped with the existing
+    untrusted-content delimiters. A file list travels as `files` and is *not* wrapped — the
+    notice goes in the context instead, because a wrapper inside a file's text would shift
+    every line number and a finding's line now anchors an inline PR comment. See
+    `guardrail_service.untrusted_notice`.
+    """
+    label = bundle.untrusted_label
+    notice = guardrail_service.untrusted_notice(label) if label else ""
+    ctx_parts = [f"Source: {bundle.source_type} — {bundle.label}"]
+    if notice:
+        ctx_parts.append(notice)
+    if getattr(req, "context", None):
+        ctx_parts.append(req.context)
+    if len(bundle.files) > 1:
+        ctx_parts.append(
+            f"This review covers {len(bundle.files)} file(s) from one codebase. Each chunk "
+            f"lists the files it contains and the files it does not; do not assert that a "
+            f"control is missing when the file that would contain it was not shown to you."
+        )
+
+    args: dict = {
+        "context": "\n".join(ctx_parts),
+        "coverage_incomplete": bundle.truncated,
+        "coverage_reason": bundle.truncation_reason,
+        "source": bundle.summary(),
+    }
+    # Everything a parser or a vulnerability database can answer, before any model runs:
+    # hardcoded credentials from the ingest scan, and known-vulnerable dependencies from OSV.
+    # `dependency` carries what could *not* be checked, which has to reach the result — a
+    # scan that checked nothing looks identical to one that found nothing.
+    deterministic = source_bundle.deterministic_findings(bundle)
+    args["extra_findings"] = deterministic["findings"]
+    args["source"] = {**args["source"], "dependency": deterministic["dependency"]}
+    if len(bundle.files) == 1 and not bundle.files[0].get("path"):
+        text = bundle.files[0].get("content") or ""
+        if label:
+            text = guardrail_service.wrap_untrusted_content(text, label)
+        args["code" if agent == "code" else "artifact"] = text
+    else:
+        args["files"] = bundle.files
+    return args
+
+
+def _expected_calls(bundle) -> int:
+    """Chunk count for the budget reservation, before the real split happens."""
+    if len(bundle.files) == 1 and not bundle.files[0].get("path"):
+        return code_chunker.estimate_chunks(bundle.files[0].get("content") or "")
+    return code_chunker.estimate_chunks_for_files(bundle.files)
+
+
+
+def _free_findings_summary(bundle) -> dict:
+    """What the free scanners already know, for the cost quote.
+
+    On the quote because it sometimes answers the question before any money is spent: "5
+    vulnerable dependencies and 3 hardcoded credentials, found for nothing" may be the whole
+    of what someone needed. `dependency` also says what could *not* be checked, so a quote
+    never implies a clean bill of health it has not earned.
+    """
+    from backend.services import source_bundle as _sb
+    deterministic = _sb.deterministic_findings(bundle)
+    secrets = sum(1 for f in deterministic["findings"] if f.get("detector") == "pattern")
+    deps = sum(1 for f in deterministic["findings"]
+               if f.get("detector") == "dependency-database")
+    return {
+        "secrets_already_found": secrets,
+        "vulnerable_dependencies_found": deps,
+        "dependency_scan": deterministic["dependency"],
+    }
+
+def _preflight_quote(req, caller: dict, agent: str) -> dict:
+    """What this review will cost, and what the caller has left — before anything is spent.
+
+    Free: it reads the source, splits it, and prices the split. No model is called, nothing
+    is metered, nothing is stored.
+
+    Entitlement *is* checked, because quoting a product the caller may not invoke is worse
+    than refusing. The budget is deliberately **not** enforced here — showing someone their
+    remaining headroom next to a price is the entire point, and a 402 in its place tells
+    them less than the number does.
+    """
+    subject = subject_from_caller(caller)
+    agent_guard.check_scope(subject, agent)
+    bundle = _bundle(req, agent, caller)
+    override = _effective_llm_override(req, caller, agent)
+    model = (override or {}).get("model") or ""
+    quote = review_estimate.for_bundle(bundle, agent=agent, model=model)
+    headroom = review_estimate.budget_headroom(subject)
+    return {
+        "agent": agent,
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        # The one sentence a person reads before pressing the button. Assembled server-side
+        # so the API and the UI cannot disagree about what was quoted.
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")
+        ),
+        "within_budget": (
+            None if headroom is None
+            else quote["expected_usd"] <= headroom["remaining_usd"]
+        ),
+        "ceiling_within_budget": (
+            None if headroom is None
+            else quote["ceiling_usd"] <= headroom["remaining_usd"]
+        ),
+        # Findings the ingest scanner already has, before any model runs. On the quote
+        # because "3 hardcoded credentials, found for free" sometimes answers the question
+        # without spending anything at all.
+        **_free_findings_summary(bundle),
+    }
+
+
+_PREFLIGHT_DESCRIPTION = """Price a review before running it. **Free — no model call, nothing metered.**
+
+Reads the source you name, splits it exactly as the review would, and returns:
+
+- `estimate.calls` — how many model calls the review will make
+- `estimate.expected_usd` — the expected cost, calibrated from this agent's recent runs
+- `estimate.ceiling_usd` — a hard upper bound (a provider cannot emit more than `max_tokens`)
+- `source.files_reviewed` / `source.files_skipped` — what will and will not be read
+- `budget` — what this caller has left this month, so the price can be read against it
+- `explanation` — the same sentence the UI shows
+
+Takes the identical body as the review endpoint, so the quote describes the exact call you
+are about to make.
+"""
+
+
+@router.post(
+    "/code/preflight",
+    summary="Cost estimate for a code review (free, no model call)",
+    description=_PREFLIGHT_DESCRIPTION,
+)
+def preflight_code(req: CodeReviewRequest, caller: dict = Depends(get_caller)):
+    return _preflight_quote(req, caller, "code")
+
+
+@router.post(
+    "/vapt/preflight",
+    summary="Cost estimate for a VAPT assessment (free, no model call)",
+    description=_PREFLIGHT_DESCRIPTION,
+)
+def preflight_vapt(req: VAPTRequest, caller: dict = Depends(get_caller)):
+    return _preflight_quote(req, caller, "vapt")
+
 # ── Catalogue & health ────────────────────────────────────────────────────
 
 @router.get(
@@ -418,19 +603,24 @@ def run_requirement(req: RequirementReviewRequest, caller: dict = Depends(get_ca
 """,
 )
 def run_code(req: CodeReviewRequest, caller: dict = Depends(get_caller)):
-    artifact, src_type, src_ref, pb_ref = _resolve(req)
-    ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
+    bundle = _bundle(req, "code", caller)
+    args = _review_args(bundle, req, "code")
     override = _effective_llm_override(req, caller, "code")
     # A large artifact is reviewed as N parallel calls, not one, so the reservation has to
     # be sized from N. Without this a 40-chunk review reserved for a single call and could
     # spend far past a budget cap that had already been checked.
-    with agent_guard.expect_calls(code_chunker.estimate_chunks(artifact)):
+    with agent_guard.expect_calls(_expected_calls(bundle)):
         result = agent_guard.guarded_call(
             caller, "code", override,
-            lambda: _orch.review_code(artifact, req.language or "", ctx, req.project_name or src_ref[:60]),
+            lambda: _orch.review_code(
+                language=req.language or "",
+                project_name=req.project_name or bundle.label[:60],
+                **args,
+            ),
         )
-    pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
-    return _wrap("code", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+    pb = _do_postback(bundle.source_type, bundle.ref, result) if req.post_back else "not_requested"
+    return _wrap("code", result, bundle.source_type, bundle.label, pb,
+                 req.project_name or "", llm_gateway.describe(override))
 
 
 # ── 3. Prompt Safety ──────────────────────────────────────────────────────
@@ -546,15 +736,23 @@ Supply `scope` to focus the assessment (e.g. "API endpoints only, skip frontend"
 """,
 )
 def run_vapt(req: VAPTRequest, caller: dict = Depends(get_caller)):
-    artifact, src_type, src_ref, pb_ref = _resolve(req)
-    ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
+    bundle = _bundle(req, "vapt", caller)
+    args = _review_args(bundle, req, "vapt")
     override = _effective_llm_override(req, caller, "vapt")
-    result = agent_guard.guarded_call(
-        caller, "vapt", override,
-        lambda: _orch.review_vapt(artifact, req.scope or "", ctx, req.project_name or src_ref[:60]),
-    )
-    pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
-    return _wrap("vapt", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+    # VAPT is chunked now (C-73), so it reserves like Code Review does. Before, a
+    # repository-sized assessment reserved for one call.
+    with agent_guard.expect_calls(_expected_calls(bundle)):
+        result = agent_guard.guarded_call(
+            caller, "vapt", override,
+            lambda: _orch.review_vapt(
+                scope=req.scope or "",
+                project_name=req.project_name or bundle.label[:60],
+                **args,
+            ),
+        )
+    pb = _do_postback(bundle.source_type, bundle.ref, result) if req.post_back else "not_requested"
+    return _wrap("vapt", result, bundle.source_type, bundle.label, pb,
+                 req.project_name or "", llm_gateway.describe(override))
 
 
 # ── 6. Security Review ────────────────────────────────────────────────────

@@ -1,0 +1,467 @@
+{
+  "prompt_version": "2026-09-02.1",
+  "generated_at": "2026-09-02T11:15:49.175930+00:00",
+  "cases": 10,
+  "repeat": 1,
+  "errors": 0,
+  "recall": 1.0,
+  "false_positive_rate": 0.125,
+  "gate_accuracy": 1.0,
+  "hallucinated_findings_discarded": 0,
+  "unverified_findings": 0,
+  "determinism_jaccard": null,
+  "tokens_in": 5943,
+  "tokens_out": 10146,
+  "cache_read_tokens": 30530,
+  "estimated_cost_usd": 0.170019,
+  "runs": [
+    {
+      "case": "fp-example-credentials",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 597,
+        "output_tokens": 340,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 8.1
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 1,
+      "tripped": [
+        {
+          "match": "csrf",
+          "note": "Django's CsrfViewMiddleware handles CSRF on every POST by default"
+        }
+      ],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "5f6f85cf42cfb55ec351c6308f3a7d64",
+        "b36f4106aef46ef6904fc7cb291d0d3e"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-010",
+          "title": "CSRF protection \u2014 verify CsrfViewMiddleware is active",
+          "line_start": 7,
+          "description": "The POST handler updates persistent user state (`request.user.bio`, `save()`), making it a meaningful CSRF target. Django's `CsrfViewMiddleware` is enabled by default in the MIDDLEWARE setting and covers this view automatically, so this is ",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Unvalidated and unsanitized user input written directly to model field",
+          "line_start": 8,
+          "description": "The `bio` field is taken directly from POST data without any length check, type validation, or sanitization before being written to the user model and persisted to the database. While Django's ORM prevents SQL injection, a missing length co",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1513,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 27.5
+    },
+    {
+      "case": "fp-parameterized-orm",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 321,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 7.9
+    },
+    {
+      "case": "fp-test-fixture",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 411,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 10.5
+    },
+    {
+      "case": "hardcoded-secret",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "e1ac8b5e341bb3848b994d26cfb64855",
+        "e9df99c87db1c243e760a146ecce1366"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-003",
+          "title": "Hardcoded AWS Secret Access Key",
+          "line_start": 3,
+          "description": "A plaintext AWS Secret Access Key is hardcoded directly in the source file and passed to the boto3 S3 client. If this file is committed to version control, shared, or leaked, the credential immediately grants the holder full programmatic ac",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-003",
+          "title": "AWS Secret Access Key Passed as Plaintext Argument to SDK Client",
+          "line_start": 4,
+          "description": "Beyond being stored in a variable, the secret is explicitly passed as the `aws_secret_access_key` keyword argument to `boto3.client()`. This compounds the exposure: the value will appear in stack traces, debugger output, process memory dump",
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 1284,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 25.8
+    },
+    {
+      "case": "llm-output-to-exec",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 5,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "23ecde568a77f6e8b037da6305dd7254",
+        "9c6a8817bb375ee6329c9bae71835723",
+        "bf3db6653cbe87c9cf5fc627e86f2c2d",
+        "bf623a33f4589dd109f1fe5a4e55e7c0",
+        "cf669714c58115598927cb4cccd22976"
+      ],
+      "findings": [
+        {
+          "control_id": "AI-002",
+          "title": "LLM output executed directly via exec() without any validation",
+          "line_start": 3,
+          "description": "`exec()` is called on the raw text returned by the LLM with no validation, sanitization, or sandboxing. Because the LLM can produce arbitrary text \u2014 and that text can be influenced by a prompt injection attack (see AI-001) \u2014 this is effecti",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "AI-001",
+          "title": "Unsanitized user input passed directly to LLM",
+          "line_start": 2,
+          "description": "The raw `user_prompt` parameter is forwarded to the LLM API without any sanitization, filtering, or validation. This creates a direct prompt injection vector: a malicious user can craft input that manipulates the LLM's behavior, overrides i",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "AI-007",
+          "title": "Agent tool grants unrestricted code execution permissions",
+          "line_start": 3,
+          "description": "The agent step hands full arbitrary code execution capability to LLM-generated output. This is the most over-permissioned agent tool possible: it can read/write files, open network connections, spawn processes, exfiltrate data, or destroy t",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-004",
+          "title": "No error handling \u2014 exceptions propagate raw API/LLM error details to caller",
+          "line_start": 1,
+          "description": "There is no try/except block around the API call or the `exec()` invocation. If either raises an exception, the full stack trace and any embedded sensitive details (API error messages, partial prompt content, internal paths) will propagate ",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-005",
+          "title": "No max_tokens or timeout on LLM API call (DoS risk)",
+          "line_start": 2,
+          "description": "The `client.messages.create()` call specifies no `max_tokens` and no request timeout. A slow or adversarially crafted prompt can cause the call to block indefinitely, consuming resources and potentially causing denial-of-service. An unbound",
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 593,
+        "output_tokens": 2079,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 35.3
+    },
+    {
+      "case": "missing-auth",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 4,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "7043f453b80cc921a817b86794027d85",
+        "78c7addf25db33c2c15c32703b83bdc8",
+        "92707099c6185e1a403658bb600127ab",
+        "b79e23f6e79efe25924329a33805daca"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-001",
+          "title": "No Authentication on Destructive DELETE Endpoint",
+          "line_start": 4,
+          "description": "The DELETE /api/users/{user_id} endpoint performs a permanent database deletion but has no authentication or authorization guard. Any unauthenticated caller who can reach the API can delete any user record by supplying a user_id. FastAPI do",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-002",
+          "title": "Missing Role/Authorization Check \u2014 BOLA/IDOR Risk",
+          "line_start": 5,
+          "description": "Even if authentication were added, there is no object-level authorization check. Any authenticated user could supply an arbitrary user_id to delete another user's account (Broken Object-Level Authorization / IDOR). The endpoint must verify ",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-005",
+          "title": "No Rate Limiting on Destructive Endpoint",
+          "line_start": 4,
+          "description": "The DELETE endpoint has no rate limiting applied. Without throttling, an attacker could automate requests to enumerate and delete large numbers of user records in a short time window, effectively a denial-of-service or mass-account-deletion",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-004",
+          "title": "Deleted user_id Reflected in Response May Expose PII",
+          "line_start": 7,
+          "description": "The response body echoes back the caller-supplied user_id: {\"deleted\": user_id}. If user_id values are email addresses, usernames, or other PII (a common pattern), this data is surfaced unnecessarily in the response and will appear in acces",
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 1661,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 39.9
+    },
+    {
+      "case": "pii-in-logs",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "692d0b644735b52938eafc244676353c"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-004",
+          "title": "PII/Sensitive Data (SSN and Credit Card Number) Written to Logs",
+          "line_start": 4,
+          "description": "The on_login function logs the user's Social Security Number (user.ssn) and credit card number (user.card_number) in plaintext to the application log. This exposes highly sensitive PII and financial data to anyone with access to log files, ",
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 581,
+        "output_tokens": 859,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 17.3
+    },
+    {
+      "case": "sql-injection",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "adc1876f94821708feebbe361d33ae29"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "SQL Injection via String Concatenation",
+          "line_start": 2,
+          "description": "The `user_id` parameter is concatenated directly into the SQL query string without any parameterization, escaping, or validation. An attacker can supply a malicious `user_id` value (e.g., `1 OR 1=1` or `1; DROP TABLE users;--`) to manipulat",
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 577,
+        "output_tokens": 822,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 15.8
+    },
+    {
+      "case": "weak-crypto",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "0db39da62ad535fa20fdd89dc13b9140"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-006",
+          "title": "MD5 used for password hashing \u2014 cryptographically broken",
+          "line_start": 4,
+          "description": "MD5 is a fast, collision-prone hashing algorithm that is entirely unsuitable for password storage. It provides no resistance to brute-force or rainbow-table attacks. An attacker who obtains the hash database can crack most passwords in seco",
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 565,
+        "output_tokens": 856,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3053
+      },
+      "seconds": 17.9
+    }
+  ]
+}

@@ -246,15 +246,29 @@ async function setActiveProject(projectId) {
  * comes from. With no project selected they stay editable and free-text, which is how
  * the app worked before, so nothing regresses for a deployment that doesn't use projects.
  */
+/** Keep every screen's project field in step with the sidebar selector.
+ *
+ *  These used to be visible text inputs, on 21 screens, that the selector overwrote and set
+ *  read-only — a form row per screen spent echoing a dropdown two inches away. They are now
+ *  hidden inputs with a caption beside them.
+ *
+ *  Hidden rather than removed on purpose: `project_name` is not the governing project (that
+ *  is `project_id`, sent as the `X-Project-Id` header and what entitlement, budget, quota,
+ *  waiver baselines and GitHub credentials all resolve from). Its one real job is selecting
+ *  project-scoped Knowledge Base documents, which `knowledge_base.get_context` does by
+ *  slugifying this name — so dropping it would quietly stop those docs being found, with
+ *  nothing to say so. */
 function _syncProjectInputs() {
   const name = _activeProject ? _activeProject.name : '';
   document.querySelectorAll('input.project-bound').forEach(input => {
-    if (name) {
-      input.value = name;
-      input.readOnly = true;
-    } else {
-      input.readOnly = false;
-    }
+    input.value = name;
+    if (input.type !== 'hidden') input.readOnly = !!name;   // the last few text ones, if any
+  });
+  document.querySelectorAll('.project-caption').forEach(el => {
+    el.innerHTML = name
+      ? `<b>${esc(name)}</b> <span class="project-caption-note">· set in the sidebar; its Knowledge Base docs are used</span>`
+      : `<span class="project-caption-none">No project selected — pick one in the sidebar. `
+        + `Estimating a cost works without one; running a review does not.</span>`;
   });
 }
 
@@ -336,6 +350,17 @@ document.querySelectorAll('.nav-item').forEach(item => {
     item.classList.add('active');
     document.getElementById('page-' + page).classList.add('active');
     if (page === 'dashboard') loadDashboard();
+    // The source pickers are built on first visit rather than at load: they are two of
+    // thirty-seven screens, and building every screen's controls up front is what makes a
+    // no-build-step SPA slow to open.
+    if (page === 'code' || page === 'vapt') {
+      renderSourcePicker(page);
+      // Refreshed on every visit rather than built once: the sidebar project
+      // selector can change between visits, and a history list showing another
+      // project's runs is worse than no history list.
+      loadAgentRuns(page);
+    }
+    if (page === 'github') renderGithubOptions();
     if (page === 'history') loadHistory();
     if (page === 'knowledge-base') { loadKBCategories(); loadKnowledgeBase(); }
     if (page === 'cost-optimization') loadCostOptimizationPage();
@@ -1439,28 +1464,12 @@ function renderTestCases(targetId, r) {
 
 // ── Code Review ───────────────────────────────────────────────────────────
 
-async function reviewCode() {
-  const code = document.getElementById('code-content').value.trim();
-  if (!code) { alert('Please enter code to review.'); return; }
-  const project = document.getElementById('code-project').value.trim();
-  const language = document.getElementById('code-language').value.trim();
-  const context = document.getElementById('code-context').value.trim();
 
-  showLoading('Running Code Security Review...');
-  try {
-    const result = await apiFetch(`/api/review/code?project_name=${encodeURIComponent(project)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, language, context }),
-    });
-    renderResult('code-result', result);
-    loadDashboard();
-  } catch (e) {
-    showError('code-result', e.message);
-  } finally {
-    hideLoading();
-  }
-}
+// The Code Review and VAPT screens no longer have a direct "run" handler. Both go through
+// `previewCost()` -> `runReviewFromQuote()` so a cost estimate is always seen first — see the
+// review-sources section at the end of this file. The old `reviewCode` / `runVAPT` /
+// `uploadVAPT` functions were removed rather than left unreachable, so there is only one live
+// flow to read.
 
 // ── Prompt Safety Review ──────────────────────────────────────────────────
 
@@ -1569,23 +1578,28 @@ async function reviewGithubPR() {
   const pr_url = document.getElementById('gh-url').value.trim();
   if (!pr_url) { alert('Please enter a GitHub PR URL.'); return; }
   const jira_ticket = document.getElementById('gh-jira').value.trim();
-  const include_prompt_review = document.getElementById('gh-prompt').checked;
+  // `include_prompt_review` is sent as false and always was: the orchestrator has never
+  // implemented it. The checkbox that set it is gone rather than left on the screen doing
+  // nothing — a control with no effect is worse than no control.
+  const include_prompt_review = false;
 
-  showLoading('Fetching PR and running review...');
+  const opts = githubPostOptions();
+  showLoading('Fetching the PR and running the review — a large diff is split into pieces…');
   try {
     const result = await apiFetch('/api/github/pr', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pr_url, jira_ticket, include_prompt_review }),
+      body: JSON.stringify({ pr_url, jira_ticket, include_prompt_review, ...opts }),
     });
     const wrap = document.getElementById('gh-result');
     wrap.classList.remove('hidden');
     const review = result.review_result || {};
     wrap.innerHTML = `
-      <div style="margin-bottom:12px">
+      <div class="gh-result-head">
         <strong>PR #${result.pr_number}:</strong> ${esc(result.pr_title)}
-        ${result.comment_posted ? '<span style="color:var(--green);margin-left:12px">✓ Comment posted to GitHub</span>' : ''}
+        ${result.files_changed ? `<span class="field-hint">${result.files_changed} file(s) changed</span>` : ''}
       </div>
+      ${renderGithubPostback(result)}
     `;
     const el = document.createElement('div');
     el.id = '_gh_result_inner';
@@ -1984,12 +1998,31 @@ function renderResult(targetId, result, clear = true) {
     html += `</div><br/>`;
   }
 
+  // Everything the backend computed and this screen used to throw away (C-79).
+  html += renderReviewTransparency(result);
+
+  // The file-by-file record. Fetched after the result paints rather than carried inside it:
+  // the inventory of a 1,500-file repository has no business travelling in `result_json`,
+  // which every list endpoint also reads (see `database.list_reviews`).
+  const _invAgent = (result.review_type === 'vapt' || result.agent_name === 'VAPT Agent')
+    ? 'vapt' : 'code';
+  // Which review the fix bar acts on. Set here rather than read from the DOM: a stale id
+  // would patch the wrong review's files, which is the worst available failure.
+  _fixReviewId = result.review_id || null;
+  const _staleBar = document.getElementById('fix-bar');
+  if (_staleBar) _staleBar.remove();
+  const _stalePanel = document.getElementById('fix-panel');
+  if (_stalePanel) _stalePanel.remove();
+  if (result.review_id && document.getElementById(`${_invAgent}-sources`)) {
+    setTimeout(() => loadReviewSources(_invAgent, result.review_id), 0);
+  }
+
   if (findings.length) {
     html += `<div class="findings-section"><h3>Findings (${findings.length})</h3>`;
     const sorted = [...findings].sort((a, b) => (b.severity || 0) - (a.severity || 0));
-    sorted.forEach(f => {
-      html += renderFinding(f);
-    });
+    // Grouped by file once there is more than one — a flat list of four hundred findings
+    // across a repository is not something anyone reads.
+    html += renderFindingsByFile(sorted);
     html += `</div>`;
   } else {
     html += `<div class="summary-box" style="color:var(--green)">✓ No findings identified.</div>`;
@@ -2109,6 +2142,29 @@ function renderFinding(f) {
     ? `<div class="finding-loc">${esc(f.file_path)}${f.line_start ? ':' + f.line_start : ''}</div>` : '';
   const evidence = f.evidence
     ? `<pre class="finding-evidence">${esc(String(f.evidence).slice(0, 400))}</pre>` : '';
+  // How much to trust this one. A reader who cannot tell a proven finding from an inferred
+  // one treats them all as inferred, which wastes the proven ones.
+  const marks = [];
+  if (f.detector === 'pattern') {
+    marks.push('<span class="mark-chip mark-scanner" title="Matched by a pattern scanner before any model ran. Nothing was asked of a model, so there is nothing here to hallucinate.">scanner</span>');
+  } else if (f.evidence_verified === true) {
+    marks.push('<span class="mark-chip mark-verified" title="The quoted code was found in the file this finding names">evidence verified</span>');
+  } else if (f.evidence_verified === false) {
+    marks.push(`<span class="mark-chip mark-unverified" title="${esc(f.evidence_note || 'No verbatim quote could be checked against the source')}">unverified</span>`);
+  }
+  if (f.confidence && f.confidence !== 'High') {
+    marks.push(`<span class="mark-chip mark-conf" title="The reviewer's own stated confidence">${esc(f.confidence.toLowerCase())} confidence</span>`);
+  }
+  if (f.file_path_corrected) {
+    marks.push(`<span class="mark-chip mark-refiled" title="The reviewer filed this against ${esc(f.reported_file_path || 'another file')}; the quoted code is actually here">re-filed</span>`);
+  }
+  if (f.is_pre_existing) {
+    marks.push('<span class="mark-chip" title="On an unchanged line — not introduced by this change">pre-existing line</span>');
+  }
+  if (f.occurrences > 1) {
+    marks.push(`<span class="mark-chip" title="Reported ${f.occurrences} times and merged into one">×${f.occurrences}</span>`);
+  }
+  const markRow = marks.length ? `<div class="mark-row">${marks.join('')}</div>` : '';
 
   return `
     <div class="finding-card sev-${sev}" id="finding-${esc(f.id || '')}">
@@ -2121,12 +2177,246 @@ function renderFinding(f) {
       </div>
       <div class="finding-title">${esc(f.title || 'Finding')}</div>
       ${where}
+      ${markRow}
       <div class="finding-desc">${esc(f.description || '')}</div>
       ${evidence}
       ${f.recommendation ? `<div class="finding-rec">${esc(f.recommendation)}</div>` : ''}
+      ${renderFixCheckbox(f)}
       ${f.id ? renderWaiveControl(f) : ''}
     </div>
   `;
+}
+
+// ── Choosing what to fix ──────────────────────────────────────────────────
+//
+// Auto-Fix could only be pointed at a pull request, where it re-ran the review and picked
+// the findings itself. Here a person picks, and the reasons a finding *cannot* be picked are
+// shown beside it — a disabled checkbox with no explanation reads as a broken feature, and
+// each of these reasons is worth knowing:
+//
+//   * the quoted code was not found in your source, so a "fix" would be an invented change
+//     to code that may not exist;
+//   * the finding names no file, because it is about the design rather than a line;
+//   * it is in a test or vendored path, reported but not counted.
+
+function fixEligibility(f) {
+  if (f.evidence_verified === false) {
+    return 'The code this finding quotes could not be found in your source, so a fix for it '
+      + 'would be a change to code that may not exist.';
+  }
+  if (f.suppressed_reason) {
+    return `In a path that is reported but not counted — ${f.suppressed_reason}.`;
+  }
+  if (!f.file_path) {
+    return 'This finding names no file. It is about the design rather than a line of code, '
+      + 'so there is nothing to patch.';
+  }
+  if (f.status && f.status !== 'open') return `Already marked '${f.status}'.`;
+  return '';
+}
+
+function renderFixCheckbox(f) {
+  if (!f.id) return '';
+  const why = fixEligibility(f);
+  if (why) {
+    return `<div class="fix-pick fix-pick-off" title="${esc(why)}">
+      <label><input type="checkbox" disabled /> Cannot be fixed automatically</label>
+      <div class="field-hint">${esc(why)}</div>
+    </div>`;
+  }
+  return `<div class="fix-pick">
+    <label><input type="checkbox" class="fix-check" value="${esc(f.id)}"
+      data-file="${esc(f.file_path || '')}" onchange="refreshFixBar()" /> Fix this</label>
+  </div>`;
+}
+
+// ── The fix bar ───────────────────────────────────────────────────────────
+//
+// Appears once something is ticked. It states the file count as well as the finding count,
+// because **cost is per file, not per finding** — five findings in one file is one model
+// call, and a bar that only counted findings would make the quote look wrong.
+
+let _fixReviewId = null;
+
+function refreshFixBar() {
+  const picked = [...document.querySelectorAll('.fix-check:checked')];
+  let bar = document.getElementById('fix-bar');
+  if (!picked.length) { if (bar) bar.remove(); return; }
+  const files = new Set(picked.map(c => c.dataset.file).filter(Boolean));
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'fix-bar';
+    bar.className = 'fix-bar';
+    document.body.appendChild(bar);
+  }
+  bar.innerHTML = `
+    <div class="fix-bar-count">
+      <b>${picked.length}</b> finding(s) in <b>${files.size}</b> file(s) selected
+      <span class="field-hint">Cost is per file — every finding in one file is fixed in a
+        single call.</span>
+    </div>
+    <button class="btn btn-secondary btn-sm" onclick="clearFixSelection()">Clear</button>
+    <button class="btn btn-primary btn-sm" onclick="planFix()">What would this cost?</button>`;
+}
+
+function clearFixSelection() {
+  document.querySelectorAll('.fix-check:checked').forEach(c => { c.checked = false; });
+  refreshFixBar();
+  const panel = document.getElementById('fix-panel');
+  if (panel) panel.remove();
+}
+
+/** Price the fix. Free, calls no model — same contract as every other quote here. */
+async function planFix() {
+  const picked = [...document.querySelectorAll('.fix-check:checked')].map(c => c.value);
+  const reviewId = _fixReviewId;
+  if (!reviewId) { alert('This result has no review id, so a fix cannot be started from it.'); return; }
+  let panel = document.getElementById('fix-panel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'fix-panel';
+    (document.querySelector('.page.active') || document.body).appendChild(panel);
+  }
+  panel.innerHTML = '<div class="source-panel">Working out what this would involve…</div>';
+  panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  try {
+    const d = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/fix/plan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ finding_ids: picked }),
+    });
+    panel.innerHTML = renderFixPlan(reviewId, d, picked);
+  } catch (e) {
+    panel.innerHTML = `<div class="source-panel"><div class="cost-warn">${esc(e.message)}</div></div>`;
+  }
+}
+
+function renderFixPlan(reviewId, d, picked) {
+  const e = d.estimate || {};
+  const outs = d.outputs || [];
+  return `
+    <div class="source-panel fix-plan">
+      <div class="section-title" style="margin-top:0">Before anything is changed</div>
+      <div class="cost-grid">
+        <div><span class="cost-label">Findings</span><b>${d.findings_selected}</b></div>
+        <div><span class="cost-label">Files to change</span><b>${d.files_to_change}</b></div>
+        <div><span class="cost-label">Model calls</span><b>${d.calls}</b></div>
+        <div><span class="cost-label">Estimated</span><b>$${Number(e.expected_usd || 0).toFixed(2)}</b></div>
+        <div><span class="cost-label">Ceiling</span><b>$${Number(e.ceiling_usd || 0).toFixed(2)}</b></div>
+      </div>
+      <div class="cost-explanation">${esc(d.note || '')}</div>
+      <div class="cost-warn">${esc(d.caveat || '')}</div>
+      ${(d.unavailable_files || []).length ? `
+        <details class="cost-skipped" open>
+          <summary>${d.unavailable_files.length} file(s) cannot be patched</summary>
+          <ul>${d.unavailable_files.map(u => `<li><code>${esc(u.path)}</code> — ${esc(u.reason)}</li>`).join('')}</ul>
+        </details>` : ''}
+      <div class="form-group">
+        <label>Where the fix goes</label>
+        <div class="radio-stack">
+          ${outs.map((o, i) => `<label><input type="radio" name="fix-output" value="${esc(o.id)}"${i === 0 ? ' checked' : ''} />
+            <b>${esc(o.label)}</b> — ${esc(o.note)}</label>`).join('')}
+        </div>
+      </div>
+      <div class="cost-actions">
+        <button class="btn btn-primary" onclick="runFix('${esc(reviewId)}')">
+          Fix them — up to $${Number(e.ceiling_usd || 0).toFixed(2)}
+        </button>
+        <button class="btn btn-secondary" onclick="document.getElementById('fix-panel').remove()">Cancel</button>
+      </div>
+    </div>`;
+}
+
+async function runFix(reviewId) {
+  const picked = [...document.querySelectorAll('.fix-check:checked')].map(c => c.value);
+  const output = document.querySelector('input[name="fix-output"]:checked')?.value || 'diff';
+  const panel = document.getElementById('fix-panel');
+  if (panel) panel.innerHTML = `<div class="source-panel">Fixing, then re-reviewing every
+    patch before offering it. This is the slow part and it is the point — a patch nobody
+    re-read is how a fix introduces a worse problem.</div>`;
+  try {
+    const d = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/fix`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ finding_ids: picked, output }),
+    });
+    if (panel) panel.innerHTML = renderFixResult(d);
+  } catch (e) {
+    if (panel) panel.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not
+      apply the fixes — ${esc(e.message)}</div></div>`;
+  }
+}
+
+function renderFixResult(d) {
+  if (!d.applied) {
+    return `<div class="source-panel">
+      <div class="section-title" style="margin-top:0">Nothing was changed</div>
+      <div class="cost-warn">${esc(d.reason || 'No patch was produced.')}</div>
+      ${(d.blocked_patches || []).length ? `<ul>${d.blocked_patches.map(b =>
+        `<li><code>${esc(b.path)}</code> — ${esc(b.reason)}</li>`).join('')}</ul>` : ''}
+      ${(d.unfixed_finding_titles || []).length ? `
+        <details class="cost-skipped" open>
+          <summary>${d.unfixed_finding_titles.length} finding(s) deliberately not fixed</summary>
+          <ul>${d.unfixed_finding_titles.map(u => `<li>${esc(u)}</li>`).join('')}</ul>
+        </details>` : ''}
+    </div>`;
+  }
+  return `
+    <div class="source-panel">
+      <div class="section-title" style="margin-top:0">
+        ${d.files_patched.length} file(s) patched${d.pr_url ? ', pull request opened' : ''}
+      </div>
+      <div class="cost-warn">${esc(d.verification_note || '')}</div>
+      ${d.pr_url ? `<div class="cost-note">Pull request:
+        <a href="${esc(d.pr_url)}" target="_blank" rel="noopener">${esc(d.pr_url)}</a>
+        — nothing lands until somebody merges it.</div>` : ''}
+      ${d.branch && !d.pr_url ? `<div class="cost-note">Branch <code>${esc(d.branch)}</code>
+        created off <code>${esc(String(d.base_commit || '').slice(0, 8))}</code> — the commit
+        this review read, not the branch tip, so the patch cannot silently revert somebody
+        else's change.</div>` : ''}
+      ${d.download_url ? `<div class="cost-note">
+        <button class="btn-link" onclick="downloadFixZip('${esc(d.download_url)}')">Download the
+        patched files (${Math.round((d.download_bytes || 0) / 1024)} KB)</button>
+        — single use, because it is a copy of your source.</div>` : ''}
+      <ul>${d.files_patched.map(f => `<li><code>${esc(f.path)}</code> — ${esc(f.explanation || 'patched')}</li>`).join('')}</ul>
+      ${(d.blocked_patches || []).length ? `
+        <details class="review-panel panel-discarded" open>
+          <summary>${d.blocked_patches.length} patch(es) rejected before being offered</summary>
+          <div class="field-hint">The guardrail working: a patch that introduced a secret, or
+            one whose re-review still found a Critical. These were not included.</div>
+          <ul>${d.blocked_patches.map(b => `<li><code>${esc(b.path)}</code> — ${esc(b.reason)}</li>`).join('')}</ul>
+        </details>` : ''}
+      ${(d.unfixed_finding_titles || []).length ? `
+        <details class="cost-skipped">
+          <summary>${d.unfixed_finding_titles.length} finding(s) deliberately not fixed</summary>
+          <ul>${d.unfixed_finding_titles.map(u => `<li>${esc(u)}</li>`).join('')}</ul>
+        </details>` : ''}
+      ${d.diff ? `<details class="review-panel" open>
+        <summary>The diff — read this before applying any of it</summary>
+        <div class="file-view-body"><pre class="fix-diff">${esc(d.diff)}</pre></div>
+      </details>` : ''}
+    </div>`;
+}
+
+/** Same reason `downloadSarif` exists: a link sends no auth header and 401s. */
+async function downloadFixZip(url) {
+  const token = localStorage.getItem('sdlc_token');
+  const headers = token ? { Authorization: 'Bearer ' + token } : {};
+  const projectId = getActiveProjectId();
+  if (projectId) headers['X-Project-Id'] = projectId;
+  try {
+    const res = await fetch(API + url, { headers });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = 'fixes.zip';
+    a.click();
+    URL.revokeObjectURL(objUrl);
+  } catch (e) {
+    alert('Could not download the patched files: ' + (e.message || e));
+  }
 }
 
 // ── Findings ──────────────────────────────────────────────────────────────
@@ -2204,39 +2494,96 @@ function pageFindings(direction) {
 // control that lets a team say "we know, we accept this", after which the finding drops
 // out of future reviews *of that project* and stops blocking.
 
+// The four statuses are not four labels for one action, which is how they used to behave:
+// all three of waived / accepted_risk / false_positive suppressed identically and forever,
+// so the choice changed nothing and users learned it did not matter. Now each one means
+// something —
+//   accepted_risk  expires and comes back (a risk accepted with no end date is forgotten,
+//                  not accepted);
+//   false_positive writes a case into the eval corpus queue, which is the only free signal
+//                  we get about our own accuracy;
+//   waived         is permanent, for genuinely-not-applicable;
+//   resolved       never suppresses, because if it is fixed the next review will not find it,
+//                  and if it does find it then it is not fixed.
+const RISK_WINDOWS = [
+  { days: 90,  label: '90 days (recommended)' },
+  { days: 30,  label: '30 days' },
+  { days: 60,  label: '60 days' },
+  { days: 180, label: '180 days' },
+  { days: 365, label: '1 year' },
+  { days: 0,   label: 'No expiry — accept it indefinitely' },
+];
+
 function renderWaiveControl(f) {
   const waived = f.status && f.status !== 'open';
   if (waived) {
+    const until = f.waiver_expires_at
+      ? ` until <b>${esc(String(f.waiver_expires_at).slice(0, 10))}</b>, after which it comes back`
+      : (f.status === 'accepted_risk' ? ', with no expiry' : '');
     return `<div class="finding-waived">
-      Waived as <strong>${esc(f.status)}</strong>${f.resolved_by ? ' by ' + esc(f.resolved_by) : ''}
+      Waived as <strong>${esc(f.status)}</strong>${f.resolved_by ? ' by ' + esc(f.resolved_by) : ''}${until}
       ${f.resolution_comment ? '— ' + esc(f.resolution_comment) : ''}
       <button class="btn btn-link" onclick="waiveFinding('${esc(f.id)}', 'open')">Reopen</button>
     </div>`;
   }
   return `<div class="finding-actions">
-    <select id="waive-status-${esc(f.id)}" class="waive-select">
-      <option value="waived">Waive — known and accepted</option>
-      <option value="accepted_risk">Accepted risk</option>
+    <select id="waive-status-${esc(f.id)}" class="waive-select"
+            onchange="toggleWaiveExpiry('${esc(f.id)}')">
+      <option value="waived">Waive — not applicable here, permanently</option>
+      <option value="accepted_risk">Accept the risk — for a set period</option>
       <option value="false_positive">False positive — the tool was wrong</option>
       <option value="resolved">Resolved — fixed in code</option>
     </select>
+    <select id="waive-expiry-${esc(f.id)}" class="waive-select hidden">
+      ${RISK_WINDOWS.map(w => `<option value="${w.days}">${w.label}</option>`).join('')}
+    </select>
     <button class="btn btn-secondary btn-sm" onclick="waiveFinding('${esc(f.id)}')">Apply</button>
+    <div class="field-hint" id="waive-hint-${esc(f.id)}"></div>
   </div>`;
+}
+
+/** Show the expiry choice only for the status it applies to, and say what each one does. */
+function toggleWaiveExpiry(findingId) {
+  const status = document.getElementById('waive-status-' + findingId)?.value;
+  const expiry = document.getElementById('waive-expiry-' + findingId);
+  const hint = document.getElementById('waive-hint-' + findingId);
+  if (expiry) expiry.classList.toggle('hidden', status !== 'accepted_risk');
+  if (!hint) return;
+  hint.textContent = {
+    waived: 'Removed from every future review of this project, permanently. Use this when the '
+      + 'finding does not apply here at all.',
+    accepted_risk: 'Removed from future reviews until the date above, then it returns as open '
+      + 'for someone to decide again.',
+    false_positive: 'Removed permanently, and recorded as something we got wrong — the code, '
+      + 'the claim and your reason are kept so the reviewer can be improved. Your reason is '
+      + 'the most useful part.',
+    resolved: 'Marked fixed. Deliberately NOT suppressed: if it is really fixed the next '
+      + 'review will not find it, and if it does find it, it is not fixed.',
+  }[status] || '';
 }
 
 async function waiveFinding(findingId, forcedStatus) {
   const select = document.getElementById('waive-status-' + findingId);
   const status = forcedStatus || (select && select.value) || 'waived';
+  const expirySelect = document.getElementById('waive-expiry-' + findingId);
+  const expiresInDays = status === 'accepted_risk' && expirySelect
+    ? Number(expirySelect.value) : null;
   // A waiver is a governance decision and lands in the audit trail with a name against it,
   // so it is worth one confirmation rather than being a single misclick.
   const verb = status === 'open' ? 'Reopen' : 'Waive';
-  const comment = prompt(`${verb} this finding — why? (recorded in the audit trail)`, '');
+  const ask = status === 'false_positive'
+    ? 'What did the tool get wrong? (kept as a test case so this is not reported again)'
+    : `${verb} this finding — why? (recorded in the audit trail)`;
+  const comment = prompt(ask, '');
   if (comment === null) return;
   try {
     const updated = await apiFetch(`/api/v1/findings/${findingId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status, comment }),
+      body: JSON.stringify({
+        status, comment,
+        ...(expiresInDays === null ? {} : { expires_in_days: expiresInDays }),
+      }),
     });
     const card = document.getElementById('finding-' + findingId);
     if (card) {
@@ -2506,6 +2853,21 @@ async function apiFetch(url, options = {}) {
       }
       throw new Error('Sign in required.');
     }
+    // A bare FastAPI 404 on one of our own POST routes means the running server does not
+    // have that endpoint — almost always a stale process, which C-65 records as a live
+    // landmine here: the reloader stops firing and the app serves old code silently while
+    // the browser, which fetches the frontend no-cache, shows the new screens. The
+    // resulting "Not Found" told nobody anything, and GitHub's own 404 body says exactly
+    // the same two words, which made it look like a GitHub problem.
+    if (res.status === 404 && url.startsWith('/api/') && (options.method || 'GET') === 'POST') {
+      const body = await res.clone().json().catch(() => ({}));
+      if ((body.detail || '') === 'Not Found') {
+        throw new Error(
+          `This build of the server does not have ${url}. It is running older code than ` +
+          `the page you are looking at — restart it (stop run.py and start it again; the ` +
+          `auto-reloader is known to stop firing). Nothing was spent.`);
+      }
+    }
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     // Legacy routes now nest a structured error body inside `detail` (see
     // backend/services/error_utils.py) — {detail: {detail: "...", error_type, ...}} —
@@ -2696,41 +3058,7 @@ function renderArchitectureAlternative(a) {
 
 // ── VAPT ──────────────────────────────────────────────────────────────────
 
-async function runVAPT() {
-  const artifact = document.getElementById('vapt-artifact').value.trim();
-  if (!artifact) { alert('Please enter an artifact to assess.'); return; }
-  showLoading('Running VAPT assessment… this may take 20–40 seconds');
-  try {
-    const result = await apiFetch('/api/review/vapt', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        artifact,
-        scope:        document.getElementById('vapt-scope').value.trim(),
-        context:      document.getElementById('vapt-context').value.trim(),
-        project_name: document.getElementById('vapt-project').value.trim(),
-      }),
-    });
-    renderVAPTResult('vapt-result', result);
-  } catch (e) { showError('vapt-result', e.message); }
-  finally { hideLoading(); }
-}
 
-async function uploadVAPT() {
-  const file = document.getElementById('vapt-file').files[0];
-  if (!file) return;
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('scope',        document.getElementById('vapt-scope').value.trim());
-  fd.append('context',      document.getElementById('vapt-context').value.trim());
-  fd.append('project_name', document.getElementById('vapt-project').value.trim());
-  showLoading(`Assessing ${file.name}…`);
-  try {
-    const result = await apiFetch('/api/review/vapt/upload', { method: 'POST', body: fd });
-    renderVAPTResult('vapt-result', result);
-  } catch (e) { showError('vapt-result', e.message); }
-  finally { hideLoading(); }
-}
 
 function renderVAPTResult(targetId, r) {
   const wrap = document.getElementById(targetId);
@@ -2755,6 +3083,7 @@ function renderVAPTResult(targetId, r) {
       <div class="vapt-summary-card low"> <div class="count">${low}</div> <div class="label">Low/Info</div></div>
       <div class="vapt-summary-card">    <div class="count" style="color:var(--accent)">${findings.length}</div><div class="label">Total</div></div>
     </div>
+    ${renderReviewTransparency(r)}
     ${r.attack_surface_summary ? `<div class="section-title">Attack Surface</div><div class="summary-box" style="margin-bottom:20px;">${esc(r.attack_surface_summary)}</div>` : ''}
     <div class="section-title">Vulnerabilities (${findings.length})</div>
     ${sorted.map(f => renderVAPTFinding(f)).join('')}
@@ -2787,6 +3116,10 @@ function renderVAPTFinding(f) {
           <div class="vapt-detail-block"><label>Affected Component</label><div class="vapt-affected">${esc(f.affected_component || 'N/A')}</div></div>
           <div class="vapt-detail-block"><label>Attack Scenario</label><p>${esc(f.attack_scenario || '')}</p></div>
           <div class="vapt-detail-block"><label>Remediation</label><p>${esc(f.recommendation || '')}</p></div>
+          ${f.cvss_vector ? `<div class="vapt-detail-block"><label>CVSS vector</label><code class="vapt-vector">${esc(f.cvss_vector)}</code></div>` : ''}
+          ${f.proof_of_concept ? `<div class="vapt-detail-block"><label>Proof of concept</label><pre class="vapt-poc">${esc(f.proof_of_concept)}</pre></div>` : ''}
+          ${(f.file_path || f.line_start) ? `<div class="vapt-detail-block"><label>Location</label><code>${esc(f.file_path || '')}${f.line_start ? ':' + f.line_start : ''}</code></div>` : ''}
+          ${f.evidence ? `<div class="vapt-detail-block"><label>Evidence${f.evidence_verified === true ? ' (verified against the source)' : f.evidence_verified === false ? ' (not verified)' : ''}</label><pre class="finding-evidence">${esc(String(f.evidence).slice(0, 400))}</pre></div>` : ''}
         </div>
         ${f.proof_of_concept ? `<div style="margin-top:10px;"><label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-muted);letter-spacing:.05em;display:block;margin-bottom:4px;">Proof of Concept</label><div class="vapt-poc">${esc(f.proof_of_concept)}</div></div>` : ''}
         ${f.cvss_vector ? `<div style="margin-top:8px;font-size:11px;color:var(--text-muted);font-family:monospace;">${esc(f.cvss_vector)}</div>` : ''}
@@ -8505,4 +8838,1147 @@ async function deleteLlmConnection(connectionId, name) {
   } catch (e) {
     alert('Could not delete the connection: ' + e.message);
   }
+}
+
+
+// ── Review sources, cost preview, and result transparency ─────────────────
+//
+// Three problems this section solves, all of them "the backend already does this and the
+// screen does not show it":
+//
+// 1. **The screens offered less than the API.** Code Review was a bare textarea with no
+//    GitHub field and no upload, while the API behind it already accepted a PR URL and a
+//    file URL. VAPT took one file at a time and showed no GitHub input at all despite
+//    accepting three kinds (C-74). Users concluded the capability was missing.
+// 2. **Nothing said what a run would cost.** The modernization plan gate quotes a customer
+//    before any spend, and that gate is why a 500-file conversion is approvable. A
+//    repository review is the same shape of commitment and had no equivalent.
+// 3. **`renderResult` discarded eight fields the backend computed** (C-79) — coverage, the
+//    discarded list, the suppressed list, the new/pre-existing/waived split, the model's own
+//    gate before the arithmetic corrected it, and per-finding verification and confidence.
+//    The discarded list matters most: "4 findings were dropped because the code they quoted
+//    is not in your source" is the strongest evidence the tool polices itself, and it was
+//    calculated on every run and shown to nobody.
+
+const SOURCE_MODES = [
+  { id: 'paste',   label: 'Paste',            hint: 'Paste code or a unified diff.' },
+  { id: 'file',    label: 'Upload file',      hint: 'One source file.' },
+  { id: 'zip',     label: 'Upload zip',       hint: 'A whole codebase. Binaries, build output and credential files are filtered out; hardcoded secrets are redacted before anything is sent to a model.' },
+  { id: 'pr',      label: 'GitHub PR',        hint: 'Reviews the pull request diff.' },
+  { id: 'repo',    label: 'GitHub repo',      hint: 'Reads the repository\'s source at a branch, tag or commit — not just its README.' },
+  { id: 'compare', label: 'Branch vs branch', hint: 'Reviews base...head as a diff — the gate\'s answer before the PR is raised.' },
+];
+
+// Which mode each screen is currently on. Module-level rather than read from the DOM so the
+// two screens cannot interfere with each other.
+const _sourceMode = { code: 'paste', vapt: 'paste' };
+
+/** Render the source picker for one screen into its container. */
+function renderSourcePicker(agent) {
+  const wrap = document.getElementById(`${agent}-source-picker`);
+  if (!wrap) return;
+  wrap.innerHTML = `
+    <div class="source-tabs" role="tablist">
+      ${SOURCE_MODES.map(m => `
+        <button type="button" role="tab" class="source-tab${_sourceMode[agent] === m.id ? ' active' : ''}"
+                aria-selected="${_sourceMode[agent] === m.id}"
+                onclick="setSourceMode('${agent}', '${m.id}')">${esc(m.label)}</button>`).join('')}
+    </div>
+    <div class="field-hint" id="${agent}-source-hint"></div>
+  `;
+  setSourceMode(agent, _sourceMode[agent]);
+}
+
+function setSourceMode(agent, mode) {
+  _sourceMode[agent] = mode;
+  const picker = document.getElementById(`${agent}-source-picker`);
+  if (picker) {
+    picker.querySelectorAll('.source-tab').forEach(btn => {
+      const on = btn.textContent === (SOURCE_MODES.find(m => m.id === mode) || {}).label;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+  }
+  const hint = document.getElementById(`${agent}-source-hint`);
+  const spec = SOURCE_MODES.find(m => m.id === mode);
+  if (hint && spec) hint.textContent = spec.hint;
+
+  // Show only the inputs this mode uses. Hiding rather than rebuilding keeps whatever the
+  // user already typed in another mode, which they will want back if they switch away and
+  // return.
+  // `compare` needs the repository URL as well as the two branch fields, so it reveals the
+  // repo block too rather than duplicating that input in two places and leaving a user to
+  // wonder which one counts.
+  const visible = mode === 'compare' ? new Set(['repo', 'compare']) : new Set([mode]);
+  ['paste', 'file', 'zip', 'pr', 'repo', 'compare'].forEach(id => {
+    const el = document.getElementById(`${agent}-src-${id}`);
+    if (el) el.classList.toggle('hidden', !visible.has(id));
+  });
+  // Credentials only matter for the modes that reach GitHub.
+  const isGithub = ['pr', 'repo', 'compare'].includes(mode);
+  const authBox = document.getElementById(`${agent}-src-auth`);
+  if (authBox) authBox.classList.toggle('hidden', !isGithub);
+  if (isGithub) showResolvedCredential(agent);
+  // In compare mode the branch/tag box is meaningless — base and head replace it.
+  const refBox = document.getElementById(`${agent}-repo-ref`)?.closest('.form-group');
+  if (refBox) refBox.classList.toggle('hidden', mode === 'compare');
+  // Retention means something different for a GitHub source (nothing is copied) than for an
+  // upload (this is the only thing that decides whether a file can be opened later), so the
+  // wording is refreshed on every mode change rather than written once.
+  renderRetentionControl(agent);
+  describeRetention(agent);
+  // The quote belongs to the source that produced it.
+  clearCostPreview(agent);
+}
+
+/** Build the request body (or FormData) for the current mode. Returns null with an alert
+ *  when a required field is empty, so callers can just bail. */
+function buildSourceBody(agent) {
+  const mode = _sourceMode[agent];
+  const v = id => (document.getElementById(id)?.value || '').trim();
+  const base = {
+    project_name: v(`${agent}-project`),
+    context: v(`${agent}-context`),
+    // How long the reviewed source is kept so files can be opened, and fixes applied, after
+    // the run. Sent on every source: harmless on a GitHub source (the server ignores it and
+    // re-reads from the recorded commit instead) and load-bearing on an upload or a paste,
+    // which have no origin to go back to.
+    retention_days: Number(v(`${agent}-retention`) || RETENTION_DEFAULT),
+  };
+  if (agent === 'code') base.language = v('code-language');
+  if (agent === 'vapt') base.scope = v('vapt-scope');
+
+  if (mode === 'paste') {
+    const text = v(agent === 'code' ? 'code-content' : 'vapt-artifact');
+    if (!text) { alert('Paste something to review first.'); return null; }
+    return { kind: 'json', body: { ...base, [agent === 'code' ? 'code' : 'artifact']: text } };
+  }
+  // A one-off token, when there is one. Sent for this call only and never stored — the
+  // durable answer is a credential saved against the project, which is what the link beside
+  // the field opens.
+  const ghToken = v(`${agent}-gh-token`);
+  const withToken = (extra) => ({
+    kind: 'json', body: { ...base, ...extra, ...(ghToken ? { github_token: ghToken } : {}) },
+  });
+
+  if (mode === 'pr') {
+    const url = v(`${agent}-pr-url`);
+    if (!url) { alert('Enter a GitHub pull request URL.'); return null; }
+    return withToken({ github_pr_url: url });
+  }
+  if (mode === 'repo') {
+    const url = v(`${agent}-repo-url`);
+    if (!url) { alert('Enter a GitHub repository URL.'); return null; }
+    return withToken({ github_repo_url: url, ref: v(`${agent}-repo-ref`) });
+  }
+  if (mode === 'compare') {
+    const url = v(`${agent}-repo-url`);
+    const b = v(`${agent}-base-ref`), h = v(`${agent}-head-ref`);
+    if (!url || !b || !h) { alert('Enter the repository URL and both branches.'); return null; }
+    return withToken({ github_repo_url: url, base_ref: b, head_ref: h });
+  }
+  if (mode === 'file' || mode === 'zip') {
+    const input = document.getElementById(`${agent}-${mode}-input`);
+    const file = input?.files?.[0];
+    if (!file) { alert(`Choose a ${mode === 'zip' ? 'zip archive' : 'file'} first.`); return null; }
+    const fd = new FormData();
+    fd.append('file', file);
+    // `val || ''` would turn a deliberate `retention_days: 0` -- "keep nothing" -- into an
+    // empty string, which the int field rejects. Numbers go through String().
+    Object.entries(base).forEach(([k, val]) =>
+      fd.append(k, typeof val === 'number' ? String(val) : (val || '')));
+    return { kind: 'form', body: fd, file };
+  }
+  return null;
+}
+
+// ── How long the source is kept ───────────────────────────────────────────
+//
+// A review used to be able to say "4 file(s) read, 6 filtered out" and not say which four,
+// and the source itself lived only for the duration of the request. Keeping it is what makes
+// three things possible: opening a file, reopening last week's run with its code beside it,
+// and applying a fix to an upload that has no repository to patch.
+//
+// It is a per-run choice rather than a setting, because it is a data-handling decision and
+// the person making it is different from the person who configured the deployment. Default
+// 7 days: long enough to come back on Monday to Friday's review, short enough that a trial
+// upload is not still there next month.
+
+const RETENTION_CHOICES = [
+  { days: 0,  label: 'Keep nothing' },
+  { days: 1,  label: '1 day' },
+  { days: 3,  label: '3 days' },
+  { days: 7,  label: '7 days' },
+  { days: 14, label: '14 days' },
+  { days: 30, label: '30 days' },
+];
+const RETENTION_DEFAULT = 7;
+
+function renderRetentionControl(agent) {
+  const wrap = document.getElementById(`${agent}-retention-wrap`);
+  if (!wrap || wrap.dataset.built) return;
+  wrap.dataset.built = '1';
+  wrap.innerHTML = `
+    <div class="form-group">
+      <label for="${agent}-retention">Keep the reviewed source for</label>
+      <select id="${agent}-retention" onchange="describeRetention('${agent}')">
+        ${RETENTION_CHOICES.map(c => `<option value="${c.days}"${c.days === RETENTION_DEFAULT ? ' selected' : ''}>${c.label}</option>`).join('')}
+      </select>
+      <div class="field-hint" id="${agent}-retention-note"></div>
+    </div>`;
+  describeRetention(agent);
+}
+
+function describeRetention(agent) {
+  const el = document.getElementById(`${agent}-retention-note`);
+  if (!el) return;
+  const days = Number(document.getElementById(`${agent}-retention`)?.value || RETENTION_DEFAULT);
+  const mode = _sourceMode[agent];
+  // A GitHub source is never copied — it is read back from the repository at the exact
+  // commit the review used. Saying so matters: otherwise "keep nothing" reads as "you will
+  // not be able to open files", which for a repository is not true.
+  if (mode === 'repo' || mode === 'pr' || mode === 'compare') {
+    el.innerHTML = 'Not used for a GitHub source. Nothing is copied here — a file is read '
+      + 'back from the repository at the exact commit this review used, so the code you see '
+      + 'later is the code that was reviewed, not whatever the branch has since become.';
+    return;
+  }
+  el.innerHTML = days > 0
+    ? `Stored encrypted for ${days} day${days === 1 ? '' : 's'}, then deleted. `
+      + 'The list of which files were read stays permanently either way. '
+      + 'You can also delete it sooner from the result.'
+    : 'Only the file list is kept. You will see exactly which files were read and which were '
+      + 'filtered out, but you will not be able to open one or apply a fix afterwards.';
+}
+
+// ── The file inventory ────────────────────────────────────────────────────
+//
+// Two questions this answers that nothing could before: which files were actually read, and
+// what was in them. The exclusions are grouped by what the exclusion *means* rather than
+// listed as one total, because they are not equivalent — a skipped `node_modules` is the
+// review working correctly, and `file_limit_reached` means code went unread and the scope
+// needs narrowing. One number for both hides the one that matters.
+
+let _inventoryFor = {};
+
+async function loadReviewSources(agent, reviewId) {
+  const box = document.getElementById(`${agent}-sources`);
+  if (!box || !reviewId) return;
+  box.innerHTML = '<div class="mod-panel">Loading the file list…</div>';
+  try {
+    const data = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/sources?limit=2000`,
+                                { _silent: true });
+    _inventoryFor[agent] = { reviewId, data };
+    box.innerHTML = renderReviewSources(agent, data);
+  } catch (e) {
+    // A review that predates the inventory has no rows, which is not an error — it is a
+    // review that ran before this existed, and saying so is more useful than an error box.
+    box.innerHTML = `<div class="source-panel"><div class="field-hint">No file list was
+      recorded for this review${e.message ? ' (' + esc(e.message) + ')' : ''}. Reviews run
+      before this feature shipped have counts but no inventory.</div></div>`;
+  }
+}
+
+function renderReviewSources(agent, d) {
+  const src = d.source || {};
+  const files = d.files || [];
+  if (!files.length) {
+    return `<div class="source-panel"><div class="field-hint">No file list was recorded for
+      this review.</div></div>`;
+  }
+  const included = files.filter(f => f.included);
+  const excluded = files.filter(f => !f.included);
+  const kinds = d.excluded_by_kind || {};
+  const gaps = d.coverage_gaps || 0;
+
+  const KIND_LABEL = {
+    'coverage': 'Not read, and it should have been',
+    'not-source': 'Not source code this review reads',
+    'safety': 'Deliberately never read',
+    'other': 'Other',
+  };
+  const byKind = new Map();
+  excluded.forEach(f => {
+    const k = (f.why || {}).kind || 'other';
+    if (!byKind.has(k)) byKind.set(k, []);
+    byKind.get(k).push(f);
+  });
+  // Coverage gaps first — they are the only kind that changes what the review means.
+  const kindOrder = ['coverage', 'not-source', 'safety', 'other'].filter(k => byKind.has(k));
+
+  return `
+    <div class="source-panel">
+      <div class="section-title" style="margin-top:0">What was reviewed</div>
+      <p class="subtitle" style="margin-top:-6px">Every file this review read, and every file
+        it did not. ${src.content_stored
+          ? 'Click a path to read the file exactly as the review saw it.'
+          : (['github_repo','github_pr','github_compare','github_branch_compare','github_file'].includes(src.source_type || '')
+              ? 'Click a path to read it back from the repository at the commit this review used.'
+              : 'Contents were not kept for this run, so paths and sizes are all there is.')}</p>
+      <div class="source-tally">
+        <div><span class="cost-label">Read</span><b>${included.length.toLocaleString()}</b></div>
+        <div><span class="cost-label">Not read</span><b>${excluded.length.toLocaleString()}</b></div>
+        <div><span class="cost-label">Characters</span><b>${Number(src.total_chars || 0).toLocaleString()}</b></div>
+        ${src.commit_sha ? `<div><span class="cost-label">Commit</span><b><code>${esc(String(src.commit_sha).slice(0, 8))}</code></b></div>` : ''}
+      </div>
+      ${gaps ? `<div class="cost-warn"><b>${gaps} file(s) were never read because a limit was
+        reached</b>, not because they were filtered as irrelevant. Part of this codebase was
+        not examined — narrow the scope and run again to cover it.</div>` : ''}
+      ${src.storage_note ? `<div class="field-hint" style="margin-bottom:10px">${esc(src.storage_note)}</div>` : ''}
+      ${src.expires_at ? `<div class="field-hint" style="margin-bottom:10px">Source kept until
+        ${esc(String(src.expires_at).slice(0, 16).replace('T', ' '))} UTC, then deleted.
+        <button class="btn-link" onclick="forgetReviewSources('${agent}', '${esc(d.review_id)}')">Delete it now</button></div>` : ''}
+
+      <details class="file-group" open>
+        <summary><code>Read by the review</code>
+          <span class="file-group-count">${included.length} file(s)</span></summary>
+        <table class="source-table">
+          <thead><tr><th>File</th><th>Lines</th><th>Chars</th><th>Chunk</th><th>Findings</th></tr></thead>
+          <tbody>${included.map(f => `
+            <tr>
+              <td>${f.readable || d.openable
+                    ? `<button class="btn-link" onclick="openReviewFile('${agent}', '${esc(d.review_id)}', '${esc(f.path).replace(/'/g, "\\'")}')">${esc(f.path)}</button>`
+                    : `<code>${esc(f.path)}</code>`}
+                  ${f.language ? `<span class="lang-chip">${esc(f.language)}</span>` : ''}</td>
+              <td class="num">${f.lines ? Number(f.lines).toLocaleString() : '—'}</td>
+              <td class="num">${f.chars ? Number(f.chars).toLocaleString() : '—'}</td>
+              <td class="num">${f.chunk_index == null ? '—' : f.chunk_index}</td>
+              <td class="num">${f.findings_count ? `<b>${f.findings_count}</b>` : '—'}</td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </details>
+
+      ${kindOrder.map(k => `
+        <details class="file-group${k === 'coverage' ? ' file-group-warn' : ''}">
+          <summary><code>${esc(KIND_LABEL[k])}</code>
+            <span class="file-group-count">${byKind.get(k).length} file(s)</span></summary>
+          <div class="field-hint" style="padding:8px 12px">${esc((byKind.get(k)[0].why || {}).text || '')}</div>
+          <table class="source-table">
+            <thead><tr><th>File</th><th>Why</th></tr></thead>
+            <tbody>${byKind.get(k).map(f => `
+              <tr><td><code>${esc(f.path)}</code></td>
+                  <td>${esc((f.why || {}).code || f.reason || '')}${(f.why || {}).detail
+                        ? ` <span class="field-hint">(${esc((f.why || {}).detail)})</span>` : ''}</td></tr>`).join('')}</tbody>
+          </table>
+        </details>`).join('')}
+      <div id="${agent}-file-view"></div>
+    </div>`;
+}
+
+async function openReviewFile(agent, reviewId, path) {
+  const box = document.getElementById(`${agent}-file-view`);
+  if (!box) return;
+  box.innerHTML = `<div class="mod-panel">Reading <code>${esc(path)}</code>…</div>`;
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  try {
+    const d = await apiFetch(
+      `/api/reviews/${encodeURIComponent(reviewId)}/sources/file?path=${encodeURIComponent(path)}`,
+      { _silent: true });
+    if (d.unavailable) {
+      box.innerHTML = `<div class="source-panel"><div class="section-title" style="margin-top:0">
+        <code>${esc(path)}</code></div><div class="cost-warn">${esc(d.unavailable)}</div></div>`;
+      return;
+    }
+    const lines = String(d.content || '').split('\n');
+    box.innerHTML = `
+      <div class="source-panel">
+        <div class="file-view-head">
+          <code>${esc(path)}</code>
+          <span class="mark-chip ${d.origin === 'stored' ? 'mark-verified' : 'mark-conf'}"
+                title="${d.origin === 'stored'
+                  ? 'The copy kept when this review ran — byte for byte what the model was shown'
+                  : 'Read back from the repository at the commit this review used'}">
+            ${d.origin === 'stored' ? 'as reviewed' : 'refetched at ' + esc(String(d.commit_sha || '').slice(0, 8))}</span>
+          <button class="btn-link" onclick="document.getElementById('${agent}-file-view').innerHTML=''">Close</button>
+        </div>
+        <div class="file-view-body"><table class="code-view"><tbody>${lines.map((l, i) =>
+          `<tr><td class="ln">${i + 1}</td><td class="src">${esc(l) || '&nbsp;'}</td></tr>`).join('')}</tbody></table></div>
+      </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not read
+      ${esc(path)} — ${esc(e.message)}</div></div>`;
+  }
+}
+
+async function forgetReviewSources(agent, reviewId) {
+  if (!confirm('Delete the stored copy of this source now? The list of which files were '
+    + 'reviewed is kept; the code itself is removed and cannot be opened or fixed afterwards.')) return;
+  try {
+    await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/sources`, { method: 'DELETE' });
+    const box = document.getElementById(`${agent}-sources`);
+    if (box) box.innerHTML = `<div class="source-panel"><div class="field-hint">The stored
+      source for this review has been deleted.</div></div>`;
+  } catch (e) {
+    alert('Could not delete the stored source: ' + (e.message || e));
+  }
+}
+
+// ── This agent's previous runs ────────────────────────────────────────────
+//
+// The record was already stored and already listed -- on the Dashboard and the History
+// screen -- and reachable from neither of the places the work happens. "What did we find
+// last time" is asked on the review screen, not on a dashboard.
+//
+// Built from the modernization run list, which is the pattern here that works: ten at a
+// time, an honest total from the server, and a `selected` state. That last one matters more
+// than it looks -- the detail panel is a single element below the list, so clicking a second
+// run swaps its contents in place, and with two runs at the same gate the swap is invisible
+// and clicking reads as a dead control.
+//
+// Reopening a run calls no model and costs nothing: the full result is already stored.
+
+const RUNS_PAGE_SIZE = 10;
+const _runsOffset = { code: 0, vapt: 0 };
+let _openRunId = null;
+
+async function loadAgentRuns(agent) {
+  const box = document.getElementById(`${agent}-runs`);
+  if (!box) return;
+  // `review_type` alone was wrong here: "code" is written by Code Review, by the GitHub PR
+  // review and by Auto-Fix, so this screen listed all three agents' runs. `product_id` is
+  // the specific one. Both are sent because rows written before product_id existed have
+  // none, and dropping them would make every existing project's history read as empty —
+  // which looks exactly like data loss. Those rows are labelled below instead.
+  const type = agent === 'vapt' ? 'vapt' : 'code';
+  const product = agent === 'vapt' ? 'vapt' : 'code';
+  try {
+    const d = await apiFetch(
+      `/api/reviews?product_id=${product}&review_type=${type}`
+      + `&limit=${RUNS_PAGE_SIZE}&offset=${_runsOffset[agent]}`,
+      { _silent: true });
+    const runs = d.reviews || [];
+    const total = typeof d.total === 'number' ? d.total : runs.length;
+
+    if (!runs.length) {
+      // An empty page past the first means rows were deleted, or the project selector moved,
+      // under us. Fall back to the newest page rather than showing an empty list that reads
+      // as "you have never run this". Same reasoning as `loadRecentReviews`.
+      if (_runsOffset[agent] > 0) { _runsOffset[agent] = 0; return loadAgentRuns(agent); }
+      box.innerHTML = `<div class="empty-state">No ${type === 'vapt' ? 'assessments' : 'reviews'}
+        yet for this project. Estimating is free — nothing is billed until you approve a quote.</div>`;
+      return;
+    }
+
+    box.innerHTML = `
+      <div class="run-list">${runs.map(r => `
+        <div class="run-card ${r.id === _openRunId ? 'selected' : ''}"
+             onclick="openAgentRun('${agent}', '${esc(r.id)}')">
+          <div class="run-card-head">
+            <span class="run-gate ${esc(r.gate_status || 'Green')}">${esc(r.gate_status || '—')}</span>
+            <b>${Number(r.findings_count || 0)} finding(s)</b>
+            ${r.critical_count ? `<span class="run-gate Red">${r.critical_count} critical</span>` : ''}
+            ${r.high_count ? `<span class="run-gate Amber">${r.high_count} high</span>` : ''}
+            ${!r.product_id ? `<span class="run-gate" title="This run predates the record of which agent produced it, so it is matched on review type alone — it may have come from the GitHub PR review or Auto-Fix rather than this screen">before agents were recorded</span>` : ''}
+            <span class="run-when">${esc(String(r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
+          </div>
+          <div class="run-card-meta">${esc(r.input_summary || 'No summary')}</div>
+        </div>`).join('')}</div>
+      <div class="run-pager">
+        <span>Showing ${_runsOffset[agent] + 1}–${_runsOffset[agent] + runs.length} of ${total}</span>
+        <button class="btn btn-secondary btn-sm" onclick="pageAgentRuns('${agent}', -1)"
+          ${_runsOffset[agent] === 0 ? 'disabled' : ''}>Newer</button>
+        <button class="btn btn-secondary btn-sm" onclick="pageAgentRuns('${agent}', 1)"
+          ${_runsOffset[agent] + runs.length >= total ? 'disabled' : ''}>Older</button>
+      </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty-state">Could not load previous runs: ${esc(e.message)}</div>`;
+  }
+}
+
+function pageAgentRuns(agent, direction) {
+  const next = _runsOffset[agent] + direction * RUNS_PAGE_SIZE;
+  if (next < 0) return;
+  _runsOffset[agent] = next;
+  loadAgentRuns(agent);
+}
+
+/** Reopen a stored run in the result panel, with its file inventory beneath it. */
+async function openAgentRun(agent, reviewId) {
+  _openRunId = reviewId;
+  loadAgentRuns(agent);
+  const target = document.getElementById(`${agent}-result`);
+  if (!target) return;
+  target.classList.remove('hidden');
+  target.innerHTML = '<div class="mod-panel">Loading that run…</div>';
+  try {
+    const row = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}`);
+    const result = typeof row.result_json === 'string'
+      ? JSON.parse(row.result_json || '{}') : (row.result_json || {});
+    result.review_id = reviewId;
+    // A stored run renders through exactly the same function as a fresh one, so a reader is
+    // never comparing two differently-shaped accounts of the same thing. The banner is the
+    // only difference, and it is there because the gate on a month-old run is a statement
+    // about the code as it was, not as it is.
+    renderResult(`${agent}-result`, result);
+    target.insertAdjacentHTML('afterbegin', `
+      <div class="cost-note">Reopened from ${esc(String(row.created_at || '').slice(0, 16).replace('T', ' '))} UTC.
+        No model was called and nothing was billed — this is the stored result. The gate below
+        describes the code as it was then.</div>`);
+  } catch (e) {
+    target.innerHTML = `<div class="summary-box">Could not open that run — ${esc(e.message)}</div>`;
+  }
+}
+
+// ── Cost preview ──────────────────────────────────────────────────────────
+//
+// Modelled on the modernization plan gate, which is the pattern in this codebase that works:
+// a number, a hard ceiling beside it, a plain sentence, and an explicit button to proceed.
+// Two differences, both because they are available here and were not there:
+// the expected cost is calibrated from this agent's own recent runs rather than a judgement
+// constant, and the quote reports how many hardcoded secrets the free scanner already found
+// — which sometimes answers the question without spending anything at all.
+
+const _pendingQuote = {};   // agent -> the body the quote was taken for
+const _pendingCalls = {};   // agent -> how many model calls that quote priced
+
+function clearCostPreview(agent) {
+  delete _pendingQuote[agent];
+  delete _pendingCalls[agent];
+  const box = document.getElementById(`${agent}-cost-preview`);
+  if (box) { box.classList.add('hidden'); box.innerHTML = ''; }
+}
+
+async function previewCost(agent) {
+  const built = buildSourceBody(agent);
+  if (!built) return;
+  const box = document.getElementById(`${agent}-cost-preview`);
+  if (!box) return;
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="cost-preview-loading">Reading the source and pricing the review…</div>';
+  try {
+    let quote;
+    if (built.kind === 'form') {
+      const fd = new FormData();
+      fd.append('file', built.file);
+      fd.append('agent', agent);
+      quote = await apiFetch('/api/review/zip/preflight', { method: 'POST', body: fd });
+    } else {
+      quote = await apiFetch(`/api/review/${agent}/preflight`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(built.body),
+      });
+    }
+    _pendingQuote[agent] = built;
+    _pendingCalls[agent] = (quote.estimate || {}).calls || 1;
+    // Kept so the result can be shown against the ceiling that was actually approved. A
+    // quote nobody ever compares to an invoice can drift in either direction indefinitely.
+    _approvedQuote[agent] = {
+      ceiling_usd: (quote.estimate || {}).ceiling_usd,
+      expected_usd: (quote.estimate || {}).expected_usd,
+      calls: (quote.estimate || {}).calls,
+    };
+    box.innerHTML = renderCostPreview(agent, quote);
+  } catch (e) {
+    box.innerHTML = `<div class="cost-preview-error">Could not price this review — ${esc(e.message)}</div>`;
+  }
+}
+
+function renderCostPreview(agent, q) {
+  const e = q.estimate || {};
+  const s = q.source || {};
+  const b = q.budget;
+  const overBudget = q.within_budget === false;
+  return `
+    <div class="cost-preview${overBudget ? ' over-budget' : ''}">
+      <div class="cost-preview-head">
+        <span class="cost-preview-title">Before you spend anything</span>
+        <span class="cost-figure">
+          est. <b>$${Number(e.expected_usd || 0).toFixed(2)}</b>
+          <span class="cost-ceiling">ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}</span>
+        </span>
+      </div>
+      <div class="cost-grid">
+        <div><span class="cost-label">Will be reviewed</span><b>${(s.files_reviewed ?? 1).toLocaleString()} file(s)</b></div>
+        <div><span class="cost-label">Model calls</span><b>${e.calls ?? '—'}</b></div>
+        <div><span class="cost-label">Filtered out</span><b>${(s.files_skipped || 0).toLocaleString()}</b></div>
+        <div><span class="cost-label">Secrets already found</span><b>${q.secrets_already_found || 0}</b></div>
+        <div><span class="cost-label">Vulnerable deps found</span><b>${q.vulnerable_dependencies_found || 0}</b></div>
+      </div>
+      ${renderDependencyNote(q.dependency_scan)}
+      <div class="cost-explanation">${esc(q.explanation || '')}</div>
+      ${s.secrets_redacted ? `<div class="cost-note">${s.secrets_redacted} hardcoded secret(s) were redacted at ingest — the values are not stored here and will not be sent to a model. They are reported as findings by the free scanner, not by the model.</div>` : ''}
+      ${s.truncated ? `<div class="cost-warn">${esc(s.truncation_reason || 'This source is larger than one scan covers.')}</div>` : ''}
+      ${b ? `<div class="cost-note">Budget for ${esc(b.scope)}: $${Number(b.remaining_usd).toFixed(2)} of $${Number(b.monthly_budget_usd).toFixed(2)} left this month.</div>` : ''}
+      ${!getActiveProjectId() ? `<div class="cost-warn">No project is selected, so this review would be
+        refused — every call has to be attributed to one. Pick a project in the sidebar first.
+        (Estimating is free and needs no project, which is why you got this far.)</div>` : ''}
+      ${overBudget ? `<div class="cost-warn">This estimate is above the remaining budget. The review will stop when the cap is reached and report what it covered.</div>` : ''}
+      ${renderQuoteFileList(q)}
+      ${(s.files_skipped && (q.skipped_all?.length || s.skipped_sample?.length)) ? `
+        <details class="cost-skipped">
+          <summary>${s.files_skipped.toLocaleString()} file(s) will not be read — see why</summary>
+          <ul>${(q.skipped_all?.length ? q.skipped_all : s.skipped_sample).map(x =>
+            `<li><code>${esc(x.path)}</code> — ${esc(x.reason)}</li>`).join('')}</ul>
+          ${s.files_skipped > (q.skipped_all?.length || s.skipped_sample.length) ? `<div class="field-hint">…and ${(s.files_skipped - (q.skipped_all?.length || s.skipped_sample.length)).toLocaleString()} more.</div>` : ''}
+        </details>` : ''}
+      <div class="cost-actions">
+        <button class="btn btn-primary" onclick="runReviewFromQuote('${agent}')">
+          Run the review — up to $${Number(e.ceiling_usd || 0).toFixed(2)}
+        </button>
+        <button class="btn btn-secondary" onclick="clearCostPreview('${agent}')">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+/** The files a quote is for, by name.
+ *
+ * The quote used to give a count and no way to check it, so "1 file(s)" on a pull request
+ * was unverifiable — and on a diff it was literally one nameless pseudo-file, which is what
+ * made a real user doubt the review had seen their code. A diff reports the files it
+ * touches; sizes are omitted for those, because a diff carries changed lines rather than
+ * whole files and an invented size is worse than none.
+ */
+function renderQuoteFileList(q) {
+  const files = q.files_preview || [];
+  if (!files.length) return '';
+  const isDiff = files.some(f => f.in_diff);
+  const more = q.files_preview_truncated || 0;
+  return `
+    <details class="cost-skipped" ${files.length <= 12 ? 'open' : ''}>
+      <summary>${files.length.toLocaleString()} file(s) will be read — see which</summary>
+      ${isDiff ? `<div class="field-hint">These are the files this diff touches. Only the
+        changed lines are reviewed, not the whole of each file.</div>` : ''}
+      <table class="source-table">
+        <thead><tr><th>File</th>${isDiff ? '' : '<th>Lines</th><th>Chars</th>'}</tr></thead>
+        <tbody>${files.map(f => `<tr>
+          <td><code>${esc(f.path)}</code></td>
+          ${isDiff ? '' : `<td class="num">${Number(f.lines || 0).toLocaleString()}</td>
+          <td class="num">${Number(f.chars || 0).toLocaleString()}</td>`}
+        </tr>`).join('')}</tbody>
+      </table>
+      ${more ? `<div class="field-hint">…and ${more.toLocaleString()} more.</div>` : ''}
+    </details>`;
+}
+
+// Above this many model calls the review goes to a background job and the screen polls it.
+// Below it, a synchronous request is simpler and finishes before a progress bar would help.
+// Four is where a fan-out starts to outlast a patient user and, more importantly, starts to
+// risk a proxy timeout with the spend already incurred.
+const ASYNC_CALL_THRESHOLD = 4;
+
+let _reviewPollTimer = null;
+
+// The quote the user pressed the button on, per agent. Lives beside `_pendingQuote` rather
+// than inside it because `_pendingQuote` is cleared the moment the run starts.
+const _approvedQuote = {};
+
+/** Run the review the quote was taken for.
+ *
+ *  A zip upload always takes the synchronous route: the archive travels as FormData and the
+ *  async endpoints take JSON. That is a real remaining limitation, and it is bounded — the
+ *  file and character caps in `source_bundle` stop a zip review running away — but a very
+ *  large zip is the one case that can still hold a connection open. */
+async function runReviewFromQuote(agent) {
+  const built = _pendingQuote[agent];
+  if (!built) { alert('Get an estimate first.'); return; }
+  const quotedCalls = _pendingCalls[agent] || 1;
+  clearCostPreview(agent);
+  const target = `${agent}-result`;
+
+  if (built.kind === 'json' && quotedCalls >= ASYNC_CALL_THRESHOLD) {
+    return runReviewAsJob(agent, built, target, quotedCalls);
+  }
+
+  showLoading(agent === 'vapt' ? 'Running the VAPT assessment…' : 'Running the security review…');
+  try {
+    let result;
+    if (built.kind === 'form') {
+      result = await apiFetch(`/api/review/${agent}/upload-zip`, { method: 'POST', body: built.body });
+    } else {
+      result = await apiFetch(`/api/review/${agent}/source`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(built.body),
+      });
+    }
+    if (agent === 'vapt') renderVAPTResult(target, result);
+    else renderResult(target, result);
+    loadDashboard();
+  } catch (e) {
+    showError(target, e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+/** Start the review as a background job and show its progress until it finishes.
+ *
+ *  Deliberately no `showLoading()`. A modal spinner over a five-minute scan is worse than
+ *  none: it blocks the rest of the app and says nothing about how far along the work is. The
+ *  progress panel renders into the result area instead, so the page stays usable. */
+async function runReviewAsJob(agent, built, target, quotedCalls) {
+  const wrap = document.getElementById(target);
+  wrap.classList.remove('hidden');
+  wrap.innerHTML = renderReviewProgress(
+    { current_step: 0, total_steps: quotedCalls, step_label: 'Reading the source…' });
+  try {
+    const accepted = await apiFetch(`/api/review/${agent}/source/async`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(built.body),
+    });
+    pollReviewJob(agent, accepted.job_id, target, accepted);
+  } catch (e) {
+    showError(target, e.message);
+  }
+}
+
+function pollReviewJob(agent, jobId, target, accepted) {
+  if (_reviewPollTimer) clearInterval(_reviewPollTimer);
+  const wrap = document.getElementById(target);
+  let misses = 0;
+
+  _reviewPollTimer = setInterval(async () => {
+    try {
+      const job = await apiFetch(`/api/review/jobs/${jobId}`, { _silent: true });
+      misses = 0;
+      if (job.status === 'completed') {
+        clearInterval(_reviewPollTimer);
+        _reviewPollTimer = null;
+        const result = job.result || {};
+        if (agent === 'vapt') renderVAPTResult(target, result);
+        else renderResult(target, result);
+        loadDashboard();
+        return;
+      }
+      if (job.status === 'failed') {
+        clearInterval(_reviewPollTimer);
+        _reviewPollTimer = null;
+        const err = job.error || {};
+        showError(target, err.detail || err.message || 'The review failed.');
+        return;
+      }
+      wrap.innerHTML = renderReviewProgress(job, accepted);
+    } catch (e) {
+      // One failed poll is a blip; five in a row means the job is unreachable, and saying so
+      // beats spinning forever on a review that has already gone.
+      if (++misses >= 5) {
+        clearInterval(_reviewPollTimer);
+        _reviewPollTimer = null;
+        showError(target,
+          `Lost contact with the review — ${e.message}. Its result may still appear in History.`);
+      }
+    }
+  }, 2500);
+}
+
+function renderReviewProgress(job, accepted) {
+  const done = job.current_step || 0;
+  const total = job.total_steps || 1;
+  const pct = Math.min(100, Math.round((done / Math.max(total, 1)) * 100));
+  const src = (accepted && accepted.source) || {};
+  const est = (accepted && accepted.estimate) || {};
+  return `
+    <div class="review-progress">
+      <div class="review-progress-head">
+        <b>Reviewing…</b>
+        <span class="review-progress-count">${done} of ${total} piece(s)</span>
+      </div>
+      <div class="review-progress-track"><div class="review-progress-bar" style="width:${pct}%"></div></div>
+      <div class="review-progress-label">${esc(job.step_label || 'Working…')}</div>
+      ${src.files_reviewed ? `<div class="field-hint">
+        ${src.files_reviewed.toLocaleString()} file(s) from ${esc(src.label || 'the source')}
+        ${est.ceiling_usd ? ` · agreed ceiling $${Number(est.ceiling_usd).toFixed(2)}` : ''}
+      </div>` : ''}
+      <div class="field-hint">You can leave this page — the review keeps running, and the result
+        is in History when it finishes.</div>
+    </div>
+  `;
+}
+
+// ── What the review did and did not cover ─────────────────────────────────
+
+/** The transparency block: coverage, the counts row, and the panels behind them.
+ *  Shared by the Code Review and VAPT renderers so neither can drift from the other. */
+function renderReviewTransparency(r) {
+  const cov = r.coverage || {};
+  const src = r.source || {};
+  let html = '';
+
+  // Coverage first. A gate over part of a codebase is a different claim from a gate over all
+  // of it, and this is the only place the reader can tell them apart.
+  const total = cov.chunks_total || 0;
+  const failed = cov.chunks_failed || 0;
+  if (failed) {
+    html += `<div class="coverage-strip coverage-bad">
+      <b>Partial review.</b> ${cov.chunks_succeeded} of ${total} piece(s) were reviewed;
+      ${failed} failed, so part of this code was never examined. This gate does not cover it.
+      ${cov.failures?.length ? `<details><summary>What failed</summary><ul>${
+        cov.failures.map(f => `<li>Piece ${f.chunk}${f.files?.length ? ` (${esc(f.files.join(', '))})` : ''} — ${esc(f.error || '')}</li>`).join('')
+      }</ul></details>` : ''}
+    </div>`;
+  } else if (r.coverage_complete === false) {
+    html += `<div class="coverage-strip coverage-bad">
+      <b>Partial review.</b> Part of the source was not provided to the reviewer, so this gate
+      does not cover all of it.${src.truncation_reason ? ' ' + esc(src.truncation_reason) : ''}
+    </div>`;
+  } else if (total) {
+    html += `<div class="coverage-strip coverage-ok">
+      Reviewed ${cov.files_reviewed ? `${cov.files_reviewed.toLocaleString()} file(s) in ` : ''}${total} piece(s), all successful.
+      ${src.files_skipped ? `${src.files_skipped.toLocaleString()} file(s) were filtered out before the review.` : ''}
+    </div>`;
+  }
+
+  // What it cost, against what was approved, and what produced it. All three came back on
+  // every response already and none of them were rendered — so a person approved a ceiling
+  // and was never shown the bill, and a set of findings never said which model wrote them.
+  const spend = r._budget_stats;
+  if (spend && (spend.cost_usd != null || spend.calls)) {
+    const approved = _approvedQuote[(r.review_type === 'vapt' ? 'vapt' : 'code')] || {};
+    const actual = Number(spend.cost_usd || 0);
+    const ceiling = Number(approved.ceiling_usd || 0);
+    const over = ceiling > 0 && actual > ceiling;
+    html += `<div class="spend-strip${over ? ' spend-over' : ''}">
+      <span class="spend-figure">cost <b>$${actual.toFixed(4)}</b>${ceiling
+        ? ` of the $${ceiling.toFixed(2)} ceiling you approved` : ''}</span>
+      ${spend.calls ? `<span class="spend-item">${spend.calls} model call(s)${
+        approved.calls && approved.calls !== spend.calls
+          ? ` — the quote said ${approved.calls}` : ''}</span>` : ''}
+      ${spend.input_tokens ? `<span class="spend-item">${Number(spend.input_tokens).toLocaleString()} in / ${Number(spend.output_tokens || 0).toLocaleString()} out</span>` : ''}
+      ${spend.model ? `<span class="spend-item" title="Whoever reads these findings is entitled to know what produced them. The sidebar shows the deployment default, which is not necessarily what this run used.">${esc(spend.model)}</span>` : ''}
+      ${spend.billable === false ? `<span class="spend-item" title="Run on your own provider key, so it was not charged to the budget">not charged to budget</span>` : ''}
+      ${spend.cost_estimated ? `<span class="spend-item" title="No published price for this model, so the cost is estimated from a comparable one">cost is an estimate</span>` : ''}
+    </div>`;
+    if (over) {
+      html += `<div class="cost-warn">This run cost more than the ceiling it was approved
+        against. That is a pricing bug, not an overspend that was allowed — the guard stops
+        a run at the budget, not at the quote. Worth reporting.</div>`;
+    }
+  }
+
+  // The model's own verdict, when the arithmetic overruled it. This is the disagreement the
+  // gate floor exists to catch, and seeing it is what makes the floor believable.
+  if (r.model_gate_status && r.model_gate_status !== r.gate_status) {
+    html += `<div class="gate-provenance">
+      The model returned <b>${esc(r.model_gate_status)}</b>; the severity arithmetic over its own
+      findings requires <b>${esc(r.gate_status)}</b>, and the stricter of the two is used.
+    </div>`;
+  }
+
+  // The counts row, each expanding into its list.
+  const chips = [];
+  if (r.new_findings_count != null) chips.push(`<span class="tally-chip tally-new">${r.new_findings_count} new</span>`);
+  if (r.pre_existing_count) chips.push(`<span class="tally-chip">${r.pre_existing_count} pre-existing</span>`);
+  if (r.deterministic_findings_count) chips.push(`<span class="tally-chip tally-scanner" title="Found by a pattern scanner before any model ran — no model was asked, so there is nothing to hallucinate">${r.deterministic_findings_count} from the scanner</span>`);
+  if (r.waived_count) chips.push(`<span class="tally-chip">${r.waived_count} waived</span>`);
+  if (r.suppressed_findings?.length) chips.push(`<span class="tally-chip">${r.suppressed_findings.length} in test/vendor paths</span>`);
+  if (r.discarded_findings?.length) chips.push(`<span class="tally-chip tally-discarded">${r.discarded_findings.length} discarded</span>`);
+  if (chips.length) html += `<div class="tally-row">${chips.join('')}</div>`;
+
+  // The discarded panel. The single most valuable thing that was being thrown away: it shows
+  // the tool refusing its own output.
+  if (r.discarded_findings?.length) {
+    html += `<details class="review-panel panel-discarded">
+      <summary>${r.discarded_findings.length} finding(s) discarded — the code they quoted is not in your source</summary>
+      <div class="field-hint">Every finding has to quote the offending code verbatim. That quote is
+        checked against the file the finding names; when it is not there, the finding is dropped
+        rather than reported. These are those.</div>
+      <ul>${r.discarded_findings.map(f => `
+        <li><b>${esc(f.title || 'Finding')}</b>
+          ${f.file_path ? `<code>${esc(f.file_path)}</code>` : ''}
+          <div class="field-hint">${esc(f.discard_reason || '')}</div>
+        </li>`).join('')}</ul>
+    </details>`;
+  }
+
+  // The suppressed panel, with the findings themselves so a reader can overrule the filter.
+  if (r.suppressed_findings?.length) {
+    html += `<details class="review-panel panel-suppressed">
+      <summary>${r.suppressed_findings.length} finding(s) hidden — test, fixture, vendored or generated code</summary>
+      <div class="field-hint">Still reported here, but not counted toward the gate: a fake key in a
+        test fixture is not a production risk, and flagging it is the fastest way to teach a team
+        to ignore this tool. Read them if you want to overrule that.</div>
+      ${r.suppressed_findings.map(f => renderFinding(f)).join('')}
+    </details>`;
+  }
+
+  // Getting the findings out of here. Placed with the coverage and counts rather than at the
+  // bottom of the findings list: a security team's first question about a new tool is whether
+  // its output reaches the dashboard they already watch, and the answer should not be
+  // something they have to scroll for.
+  if (r.review_id) {
+    html += `<div class="export-row">
+      <button type="button" class="btn-link" onclick="downloadSarif('${esc(r.review_id)}')"
+         title="SARIF 2.1.0 — upload it from CI and these appear as GitHub code scanning alerts, or feed it to Azure DevOps, GitLab or a SIEM">
+        Download as SARIF
+      </button>
+      <span class="field-hint">Discarded findings are not included; test and vendor findings
+        are, marked as suppressed.</span>
+    </div>`;
+  }
+
+  if (src.dependency) html += renderDependencyNote(src.dependency);
+
+  // What the source was, and what was left out of it.
+  if (src.files_reviewed != null) {
+    html += `<div class="source-line">
+      Source: <b>${esc(src.label || src.source_type || 'artifact')}</b>
+      · ${(src.files_reviewed || 0).toLocaleString()} file(s) read
+      ${src.files_skipped ? `· ${src.files_skipped.toLocaleString()} filtered out` : ''}
+      ${src.secrets_redacted ? `· ${src.secrets_redacted} secret(s) redacted before any model call` : ''}
+    </div>`;
+  }
+  return html;
+}
+
+/** Download a review's findings as SARIF.
+ *
+ * A plain `<a href download>` cannot do this. Every route under `/api/v1` authenticates
+ * through `get_caller`, which wants `Authorization: Bearer <jwt>` — and a browser
+ * navigating to a link sends no such header, so the request 401s and the download manager
+ * reports "Needs authorization" with no indication that the session was fine all along.
+ * Fetch it with the header, hand the browser a blob. Same shape as
+ * `downloadModernizationExport`, which is why that one has always worked.
+ */
+async function downloadSarif(reviewId) {
+  const token = localStorage.getItem('sdlc_token');
+  const headers = token ? { Authorization: 'Bearer ' + token } : {};
+  const projectId = getActiveProjectId();
+  if (projectId) headers['X-Project-Id'] = projectId;
+  try {
+    const res = await fetch(
+      `${API}/api/v1/findings/export/sarif/${encodeURIComponent(reviewId)}?download=true`,
+      { headers });
+    if (res.status === 401) throw new Error('Your session has expired — sign in again.');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `review-${reviewId}.sarif`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Could not download the SARIF file: ' + (e.message || e));
+  }
+}
+
+/** Group a finding list by file, most severe file first. Flat lists stop being readable at
+ *  around thirty findings, and a repository scan produces hundreds. */
+function renderFindingsByFile(findings) {
+  const groups = new Map();
+  findings.forEach(f => {
+    const key = f.file_path || '(no file)';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(f);
+  });
+  if (groups.size <= 1) return findings.map(f => renderFinding(f)).join('');
+  const ordered = [...groups.entries()].sort((a, b) => {
+    const worst = list => Math.max(...list.map(f => f.severity || 0));
+    return worst(b[1]) - worst(a[1]) || b[1].length - a[1].length;
+  });
+  return ordered.map(([path, list], i) => {
+    const worst = Math.max(...list.map(f => f.severity || 0));
+    return `<details class="file-group" ${i < 3 ? 'open' : ''}>
+      <summary>
+        <span class="file-group-sev sev-dot-${worst}"></span>
+        <code>${esc(path)}</code>
+        <span class="file-group-count">${list.length} finding(s)</span>
+      </summary>
+      ${list.map(f => renderFinding(f)).join('')}
+    </details>`;
+  }).join('');
+}
+
+
+// ── GitHub PR options ─────────────────────────────────────────────────────
+//
+// The screen previously had one behaviour and no choice about it: running a review wrote a
+// comment to the customer's pull request. So nobody could try the tool for the first time
+// without an audience, and there was no way to make a Red gate actually block anything
+// (C-75). These three controls are the whole difference.
+
+function renderGithubOptions() {
+  const wrap = document.getElementById('gh-options');
+  if (!wrap || wrap.dataset.built) return;
+  wrap.dataset.built = '1';
+  wrap.innerHTML = `
+    <div class="form-group">
+      <label>Where the findings go</label>
+      <div class="radio-stack">
+        <label><input type="radio" name="gh-post-mode" value="summary" checked />
+          <b>One summary comment</b> — edited in place on a re-run, so the thread does not fill up.</label>
+        <label><input type="radio" name="gh-post-mode" value="inline" />
+          <b>Comments on the diff lines</b> — each verified finding posted on the line it is about,
+          capped and filtered by severity, with the rest in the summary.</label>
+        <label><input type="radio" name="gh-post-mode" value="none" />
+          <b>Do not post</b> — review it and show me here first. Nothing is written to GitHub.</label>
+      </div>
+    </div>
+    <div class="form-group checkbox-group">
+      <label><input type="checkbox" id="gh-set-status" checked />
+        Report a commit status, so a Red gate blocks the merge button under branch protection</label>
+      <div class="field-hint">Amber and Green report as a passing check whose description says what was
+        found. Only Red fails. Needs <code>repo:status</code> on the token.</div>
+    </div>
+    <div class="form-group checkbox-group">
+      <label><input type="checkbox" id="gh-request-changes" />
+        Also formally request changes (line-comment mode only)</label>
+      <div class="field-hint">Off by default: on many repositories this blocks the author until a human
+        dismisses it, which is your policy call, not ours. The commit status above is the mechanism
+        designed for blocking.</div>
+    </div>
+  `;
+}
+
+function githubPostOptions() {
+  const mode = document.querySelector('input[name="gh-post-mode"]:checked')?.value || 'summary';
+  return {
+    post_mode: mode,
+    set_status: !!document.getElementById('gh-set-status')?.checked,
+    request_changes: !!document.getElementById('gh-request-changes')?.checked,
+  };
+}
+
+
+/** What actually reached GitHub. Previously a single tick that said "comment posted" whether
+ *  one comment or five had been created, and said nothing at all about the merge check. */
+function renderGithubPostback(result) {
+  const d = result.post_detail || {};
+  const st = result.status_check || {};
+  const rows = [];
+
+  if (result.post_mode === 'none') {
+    rows.push(`<div class="gh-row gh-row-neutral">Nothing was written to GitHub — preview only.</div>`);
+    if (result.comment_preview) {
+      rows.push(`<details class="review-panel"><summary>What would have been posted</summary>
+        <pre class="gh-preview">${esc(result.comment_preview)}</pre></details>`);
+    }
+  } else if (result.comment_posted) {
+    const what = d.inline_comments
+      ? `${d.inline_comments} comment(s) on the diff lines${d.summary_only ? `, ${d.summary_only} in the summary` : ''}`
+      : (d.updated ? 'summary comment updated in place' : 'summary comment posted');
+    rows.push(`<div class="gh-row gh-row-ok">✓ ${esc(what)}${
+      d.comment_url || d.review_url ? ` — <a href="${esc(d.comment_url || d.review_url)}" target="_blank" rel="noopener">view on GitHub</a>` : ''}</div>`);
+    if (d.superseded) {
+      rows.push(`<div class="field-hint">${d.superseded} older review comment(s) from previous runs are still on the thread.</div>`);
+    }
+    if (d.inline_rejected) {
+      rows.push(`<div class="gh-row gh-row-warn">${d.inline_rejected} finding(s) could not be anchored to a diff line (the line is not part of this diff) — they are in the summary instead.</div>`);
+    }
+  } else {
+    rows.push(`<div class="gh-row gh-row-warn">Could not post to GitHub — ${esc(d.reason || 'unknown reason')}</div>`);
+  }
+
+  if (st.posted) {
+    const blocking = st.state === 'failure';
+    rows.push(`<div class="gh-row ${blocking ? 'gh-row-block' : 'gh-row-ok'}">
+      ${blocking ? '⛔ Merge check reported as <b>failing</b> — under branch protection this blocks the merge.'
+                 : '✓ Merge check reported as passing.'}
+    </div>`);
+  } else if (st.reason) {
+    rows.push(`<div class="gh-row gh-row-warn">Merge check not reported — ${esc(st.reason)}</div>`);
+  }
+  return rows.join('');
+}
+
+
+// ── Which GitHub credential is in play ────────────────────────────────────
+//
+// "Which token did we even try" is the first question when a repository 404s, and it had no
+// answer anywhere in the product. GitHub returns 404 rather than 403 for anything a
+// credential cannot see — deliberately, so it will not confirm a private repository exists
+// to someone who cannot see it — which means a private repo, an expired token, a token from
+// the wrong org and a plain typo all look identical. Naming the credential before the run is
+// most of the diagnosis.
+
+async function showResolvedCredential(agent) {
+  const box = document.getElementById(`${agent}-cred-status`);
+  if (!box) return;
+  const url = (document.getElementById(`${agent}-repo-url`)?.value
+    || document.getElementById(`${agent}-pr-url`)?.value || '').trim();
+  if (!url) { box.innerHTML = ''; return; }
+  try {
+    const r = await apiFetch(
+      `/api/v1/github-credentials/resolve?repo_url=${encodeURIComponent(url)}`, { _silent: true });
+    const where = {
+      project: 'this project\'s saved credential',
+      deployment: 'the deployment-wide GITHUB_TOKEN',
+      none: 'no credential at all',
+    }[r.token_source] || r.token_source;
+    const bad = r.token_source === 'none';
+    box.innerHTML = `<div class="cred-status ${bad ? 'cred-status-bad' : ''}">
+      This request will use <b>${esc(where)}</b>${r.label ? ` — ${esc(r.label)}` : ''}.
+      ${bad ? 'A private repository will return "not found" until you supply a token below or save one for this project.' : ''}
+    </div>`;
+  } catch {
+    box.innerHTML = '';   // never let a diagnostic aid break the form
+  }
+}
+
+// ── Saved GitHub credentials ──────────────────────────────────────────────
+
+async function saveGithubCredential(agent) {
+  const token = (document.getElementById(`${agent}-gh-token`)?.value || '').trim();
+  if (!token) { alert('Enter a token first.'); return; }
+  const repoUrl = (document.getElementById(`${agent}-repo-url`)?.value
+    || document.getElementById(`${agent}-pr-url`)?.value || '').trim();
+  // Default the scope to the owner in the URL: one token per organisation is the common
+  // shape, and an unscoped credential would then be reached for repositories it cannot see.
+  const owner = repoUrl.split('//').pop().split('/')[1] || '';
+  const label = prompt(
+    'Name this credential so you can tell it apart later:',
+    owner ? `${owner} — from the review screen` : 'GitHub credential') || '';
+  if (!label.trim()) return;
+  try {
+    const saved = await apiFetch('/api/v1/github-credentials', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: label.trim(), token, scope_pattern: owner || null,
+                             can_write: false }),
+    });
+    const id = saved.credential.id;
+    const test = await apiFetch(`/api/v1/github-credentials/${id}/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repo_url: repoUrl || null }),
+    });
+    // Clear the box on success: the token is stored now, and leaving a secret sitting in a
+    // form field is how it ends up in a screenshot.
+    if (test.ok) document.getElementById(`${agent}-gh-token`).value = '';
+    alert(test.ok
+      ? `Saved and verified — ${test.detail}. Future reviews of this owner will use it.`
+      : `Saved, but the check failed: ${test.detail}`);
+    showResolvedCredential(agent);
+  } catch (e) {
+    alert(`Could not save the credential: ${e.message}`);
+  }
+}
+
+
+/** What the dependency database was asked, and what it could not answer.
+ *
+ *  Shown on both the quote and the result, because the two failure modes are invisible
+ *  otherwise and only one of them is good news: a scan that found nothing and a scan that
+ *  *checked* nothing produce the same empty finding list. A range with no lockfile to
+ *  resolve it, and a database that could not be reached, both mean "not checked" — and a
+ *  reader who is not told that will read silence as safety. */
+function renderDependencyNote(dep) {
+  if (!dep) return '';
+  if (dep.error) {
+    return `<div class="cost-warn">${esc(dep.error)}</div>`;
+  }
+  if (!dep.manifests?.length) return '';
+  const bits = [
+    `${dep.versions_checked} dependency version(s) checked against the OSV vulnerability `
+    + `database across ${dep.manifests.length} manifest(s)`,
+  ];
+  if (dep.vulnerable) bits.push(`<b>${dep.vulnerable} vulnerable</b>`);
+  // Kept on one line: a template literal's newline survives into the HTML as whitespace,
+  // which splits the sentence for anything matching on it.
+  let html = `<div class="cost-note">${bits.join(' · ')}. This is a database lookup, not a model's recollection — it costs nothing and cannot be wrong about a version.</div>`;
+  if (dep.unresolved?.length) {
+    html += `<details class="review-panel panel-unresolved">
+      <summary>${dep.unresolved.length} dependenc${dep.unresolved.length === 1 ? 'y was' : 'ies were'} NOT checked</summary>
+      <div class="field-hint">A version range like <code>^1.2.3</code> is not a version, and the
+        database can only answer for a concrete one. Commit a lockfile and these get checked too.
+        Until then they are unknown, not clean.</div>
+      <ul>${dep.unresolved.slice(0, 20).map(u => `<li><code>${esc(u.name)}</code>
+        <span class="field-hint">${esc(u.spec || '')} in ${esc(u.path)}${u.line ? ':' + u.line : ''}</span></li>`).join('')}</ul>
+      ${dep.unresolved.length > 20 ? `<div class="field-hint">…and ${dep.unresolved.length - 20} more.</div>` : ''}
+    </details>`;
+  }
+  return html;
 }

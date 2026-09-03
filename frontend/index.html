@@ -282,9 +282,14 @@
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name (optional)</label>
-            <input type="text" id="req-project" class="project-bound" placeholder="e.g. Patient Portal AI Feature" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="req-project" class="project-bound" />
+              <div class="project-caption" data-for="req-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement Text <span class="required">*</span></label>
             <textarea id="req-content" rows="12" placeholder="Paste your user story, BRD, FRD, or PRD here...
@@ -322,9 +327,14 @@ Acceptance Criteria:
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name (optional)</label>
-            <input type="text" id="ts-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="ts-project" class="project-bound" />
+              <div class="project-caption" data-for="ts-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement / User Story <span class="required">*</span></label>
             <textarea id="ts-requirement" rows="10" placeholder="Paste the requirement or user story to generate test scenarios for...
@@ -353,9 +363,14 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name (optional)</label>
-            <input type="text" id="tc-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="tc-project" class="project-bound" />
+              <div class="project-caption" data-for="tc-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement / User Story <span class="required">*</span></label>
             <textarea id="tc-requirement" rows="8" placeholder="Paste the requirement or user story to generate test cases for..."></textarea>
@@ -383,42 +398,142 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
       <!-- Code Review Page -->
       <div id="page-code" class="page">
         <div class="page-header">
-          <h1>Code & PR Security Reviewer</h1>
-          <p class="subtitle">Scan code for security vulnerabilities, secrets, PHI exposure, and AI-specific risks</p>
+          <h1>Code &amp; PR Security Reviewer</h1>
+          <p class="subtitle">Scans code for injection, hardcoded secrets, broken authorization,
+            PHI/PII exposure, weak cryptography, vulnerable dependencies and AI-specific risks.
+            Takes a paste, a file, a zip of a whole codebase, a pull request, a repository at a
+            branch, or one branch against another. A large codebase is split into pieces and
+            reviewed in parallel rather than cut short; every finding must quote the offending code,
+            and a finding whose quote is not in your source is discarded rather than reported.
+            You are shown the cost before anything is spent.</p>
         </div>
         <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. Choose what to review</div>
+          <div id="code-source-picker"></div>
+
+          <div id="code-src-paste">
+            <div class="form-group">
+              <label>Code / PR diff</label>
+              <textarea id="code-content" rows="16" placeholder="Paste your code, function, class, or PR diff here..."></textarea>
+            </div>
+          </div>
+
+          <div id="code-src-file" class="hidden">
+            <div class="form-group">
+              <label>Source file</label>
+              <input type="file" id="code-file-input" accept=".txt,.py,.js,.ts,.tsx,.jsx,.java,.go,.php,.rb,.cs,.vb,.c,.h,.cpp,.sql,.yaml,.yml,.json,.xml,.ini,.conf,.tf,.html,.md" />
+              <div class="field-hint">One file. For a whole codebase use <b>Upload zip</b>.</div>
+            </div>
+          </div>
+
+          <div id="code-src-zip" class="hidden">
+            <div class="form-group">
+              <label>Zip of the codebase</label>
+              <input type="file" id="code-zip-input" accept=".zip" />
+              <div class="field-hint">Build output, binaries, <code>node_modules</code> and credential
+                files (<code>.env</code>, <code>*.pem</code>, private keys) are skipped. Hardcoded
+                secrets are redacted before anything reaches a model — and reported as findings by
+                the scanner that found them, which costs nothing.</div>
+            </div>
+          </div>
+
+          <div id="code-src-pr" class="hidden">
+            <div class="form-group">
+              <label>GitHub pull request URL</label>
+              <input type="url" id="code-pr-url" placeholder="https://github.com/owner/repo/pull/123" />
+              <div class="field-hint">Reviews the diff. Large PRs are split into pieces rather than cut short.</div>
+            </div>
+          </div>
+
+          <div id="code-src-repo" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>GitHub repository URL</label>
+                <input type="url" id="code-repo-url" placeholder="https://github.com/owner/repo" />
+              </div>
+              <div class="form-group">
+                <label>Branch / tag / commit (optional)</label>
+                <input type="text" id="code-repo-ref" placeholder="main" />
+              </div>
+            </div>
+            <div class="field-hint">Reads the repository's <b>source code</b>. A private repository needs a
+              token — supply one below for this call, or save one for the project. Get an estimate first: a
+              large repository is many model calls.</div>
+          </div>
+
+          <div id="code-src-compare" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>Base branch</label>
+                <input type="text" id="code-base-ref" placeholder="main" />
+              </div>
+              <div class="form-group flex1">
+                <label>Branch being proposed</label>
+                <input type="text" id="code-head-ref" placeholder="feature/new-auth" />
+              </div>
+            </div>
+            <div class="field-hint">Reviews <code>base...head</code> as a diff — the gate's answer before the pull request is raised.</div>
+          </div>
+
+          <div id="code-src-auth" class="hidden">
+            <div id="code-cred-status"></div>
+            <div class="form-group">
+              <label>GitHub token for this call (optional)</label>
+              <input type="password" id="code-gh-token" autocomplete="off"
+                     placeholder="ghp_… or a fine-grained token — used once, never stored" />
+              <div class="field-hint">
+                Only needed for a <b>private</b> repository, or when the deployment token cannot
+                see this one. GitHub answers <b>404 "not found"</b> — not 403 — for anything a
+                token cannot see, so a private repo, an expired token and a typo all look the
+                same; supplying the right token here is the quickest way to tell them apart.
+                <button type="button" class="btn-link" onclick="saveGithubCredential('code')">
+                  Save it for this project instead
+                </button>
+                — stored encrypted, never shown again, and reused for this owner automatically.
+              </div>
+            </div>
+          </div>
+
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="code-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="code-project" class="project-bound" />
+              <div class="project-caption" data-for="code-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Language (optional)</label>
               <input type="text" id="code-language" placeholder="e.g. Python, JavaScript, Java" />
             </div>
           </div>
-          <div class="form-group">
-            <label>Code / PR Diff <span class="required">*</span></label>
-            <textarea id="code-content" rows="16" placeholder="Paste your code, function, class, or PR diff here...
 
-Example:
-def get_patient_data(patient_id, query):
-    conn = sqlite3.connect('patients.db')
-    result = conn.execute(f'SELECT * FROM patients WHERE id = {patient_id}')
-    logging.info(f'Retrieved patient: {result}')
-    return result"></textarea>
-          </div>
           <div class="form-group">
             <label>Context (optional)</label>
-            <input type="text" id="code-context" placeholder="e.g. Healthcare API endpoint, processes PHI" />
+            <input type="text" id="code-context" placeholder="e.g. Healthcare API endpoint, processes PHI, external-facing" />
           </div>
+
+          <div class="section-title">2. See what it will cost</div>
           <div class="form-actions">
-            <button class="btn btn-primary" onclick="reviewCode()">
-              <span class="btn-icon">🔒</span> Run Security Review
+            <button class="btn btn-primary" onclick="previewCost('code')">
+              <span class="btn-icon">$</span> Estimate cost
             </button>
           </div>
+          <div class="field-hint">Reading the source, filtering it and pricing the work is free — no
+            model is called. You are shown the expected cost and a hard ceiling, and asked again
+            before anything is spent.</div>
+          <div id="code-retention-wrap"></div>
+          <div id="code-cost-preview" class="hidden"></div>
         </div>
         <div id="code-result" class="result-area hidden"></div>
+        <div id="code-sources"></div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">Every review this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran.</p>
+          <div id="code-runs"></div>
+        </div>
       </div>
 
       <!-- Prompt Safety Page -->
@@ -429,9 +544,14 @@ def get_patient_data(patient_id, query):
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name</label>
-            <input type="text" id="prompt-project" class="project-bound" placeholder="e.g. Clinical AI Assistant" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="prompt-project" class="project-bound" />
+              <div class="project-caption" data-for="prompt-project"></div>
+            </div>
           <div class="form-group">
             <label>System Prompt</label>
             <textarea id="prompt-system" rows="8" placeholder="Paste your system prompt / instructions here...
@@ -474,9 +594,10 @@ Answer questions about patients based on the provided context."></textarea>
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name <span class="required">*</span></label>
-            <input type="text" id="full-project" class="project-bound" placeholder="e.g. AI Patient Risk Scoring Feature v2.1" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <input type="hidden" id="full-project" class="project-bound" />
+              <div class="project-caption" data-for="full-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement / User Story</label>
             <textarea id="full-req" rows="6" placeholder="Paste your requirement or user story..."></textarea>
@@ -536,9 +657,14 @@ Answer questions about patients based on the provided context."></textarea>
       <div id="page-github" class="page">
         <div class="page-header">
           <h1>GitHub PR Review</h1>
-          <p class="subtitle">Connect to GitHub and automatically review a pull request for security and AI risks</p>
+          <p class="subtitle">Reviews a pull request and reports the result back to GitHub. Findings
+            carry the file and line they are about, so they can be posted as comments on the diff
+            itself. A Red gate can be reported as a commit status, which blocks the merge button under
+            branch protection — the difference between a comment someone may scroll past and a gate.
+            Re-running edits the existing comment rather than adding another.</p>
         </div>
         <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. The pull request</div>
           <div class="form-group">
             <label>GitHub PR URL <span class="required">*</span></label>
             <input type="url" id="gh-url" placeholder="https://github.com/owner/repo/pull/123" />
@@ -547,29 +673,34 @@ Answer questions about patients based on the provided context."></textarea>
             <label>Jira Ticket (optional)</label>
             <input type="text" id="gh-jira" placeholder="e.g. PROJ-456" />
           </div>
-          <div class="form-group checkbox-group">
-            <label>
-              <input type="checkbox" id="gh-prompt" />
-              Also run Prompt Safety Review (for AI feature PRs)
-            </label>
-          </div>
-          <div class="form-group">
-            <label>Max files to auto-fix (auto-fix only)</label>
-            <input type="number" id="gh-max-files" value="5" min="1" max="15" />
-          </div>
+
+          <div class="section-title">2. What to post back</div>
+          <div id="gh-options"></div>
+
+          <div class="section-title">3. Run</div>
           <div class="form-actions">
             <button class="btn btn-primary" onclick="reviewGithubPR()">
-              <span class="btn-icon">🐙</span> Review PR
+              <span class="btn-icon">&#128025;</span> Review PR
             </button>
             <button class="btn btn-secondary" data-product="auto-fix" onclick="autoFixGithubPR()">
-              <span class="btn-icon">🛠️</span> Auto-Fix &amp; Open PR
+              <span class="btn-icon">&#128736;</span> Auto-Fix &amp; Open PR
             </button>
           </div>
+          <div class="form-group" style="margin-top:12px">
+            <label>Max files to auto-fix (Auto-Fix only)</label>
+            <input type="number" id="gh-max-files" value="5" min="1" max="15" />
+            <div class="field-hint">Auto-Fix works one file per model call and only on findings whose
+              evidence was verified against the source. Files are chosen by where the most severe
+              findings are, not by the order they appear in the diff.</div>
+          </div>
           <div class="info-box">
-            <strong>Note:</strong> Requires GITHUB_TOKEN configured in .env. "Review PR" posts findings as a PR comment.
-            "Auto-Fix &amp; Open PR" additionally requires <strong>write</strong> access on that token — it commits
-            fixes to a new <code>lm-autofix/pr-N</code> branch off the PR's head branch and opens a follow-up PR back
-            into it. This pushes real commits to GitHub — review the diff before merging.
+            <strong>What each option needs.</strong> Posting a comment or a review needs
+            <code>GITHUB_TOKEN</code>. Reporting a merge-blocking check needs
+            <code>repo:status</code> on that token. <strong>Auto-Fix additionally needs write
+            access</strong> — it commits to a new <code>lm-autofix/pr-N</code> branch off the PR's head
+            branch and opens a follow-up PR back into it. Every patch is scanned for newly-introduced
+            secrets <em>and</em> re-reviewed before it is committed; a patch that still carries a
+            Critical is refused rather than pushed.
           </div>
         </div>
         <div id="gh-result" class="result-area hidden"></div>
@@ -584,8 +715,13 @@ Answer questions about patients based on the provided context."></textarea>
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="gate-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="gate-project" class="project-bound" />
+              <div class="project-caption" data-for="gate-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Release Version</label>
@@ -637,8 +773,13 @@ Answer questions about patients based on the provided context."></textarea>
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="report-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="report-project" class="project-bound" />
+              <div class="project-caption" data-for="report-project"></div>
             </div>
           </div>
           <div class="form-group">
@@ -755,8 +896,13 @@ Answer questions about patients based on the provided context."></textarea>
         <div class="form-card">
           <div class="form-row">
             <div class="form-group">
-              <label>Project Name (optional)</label>
-              <input type="text" id="arch-project" class="project-bound" placeholder="e.g. Clinical AI Platform" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="arch-project" class="project-bound" />
+              <div class="project-caption" data-for="arch-project"></div>
             </div>
             <div class="form-group">
               <label>Review Mode</label>
@@ -813,9 +959,12 @@ e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI feature
           <div class="section-title" style="margin-top:0">1. Get a Recommendation</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="cg-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
-              <span style="font-size:11px;color:var(--text-muted)">Matches this name against the Knowledge Base — any docs uploaded there under the same project are used as authoritative context.</span>
+              <label>Project</label>
+              <input type="hidden" id="cg-project" class="project-bound" />
+              <div class="project-caption" data-for="cg-project"></div>
+              <div class="field-hint">The project's name is matched against the Knowledge Base — any docs
+                uploaded there under the same project are used as authoritative context. This is why the
+                name still travels with the request even though the field is no longer typed into.</div>
             </div>
           </div>
           <div class="form-group">
@@ -922,8 +1071,13 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div class="section-title" style="margin-top:0">1. Assess Migration</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="mg-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="mg-project" class="project-bound" />
+              <div class="project-caption" data-for="mg-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Migration Target <span class="required">*</span></label>
@@ -1053,8 +1207,13 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div class="section-title" style="margin-top:0">1. Submit an Issue</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="it-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="it-project" class="project-bound" />
+              <div class="project-caption" data-for="it-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Environment</label>
@@ -1147,8 +1306,13 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
               <input type="number" id="it-batch-limit" value="10" min="1" max="25" />
             </div>
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="it-batch-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="it-batch-project" class="project-bound" />
+              <div class="project-caption" data-for="it-batch-project"></div>
             </div>
           </div>
           <div class="form-actions">
@@ -1180,46 +1344,140 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
       <div id="page-vapt" class="page">
         <div class="page-header">
           <h1>VAPT — Vulnerability Assessment &amp; Penetration Testing</h1>
-          <p class="subtitle">Identify security vulnerabilities with CVSS v3.1 scoring, OWASP mapping, CWE IDs, and exploitation scenarios</p>
+          <p class="subtitle">OWASP Web and API Top 10 with CVSS v3.1 scoring, CWE mapping and a
+            realistic attack scenario per finding. Takes a paste, an OpenAPI document, a file, a zip
+            of a whole codebase, a pull request, or a repository at a branch. Every finding must
+            quote the code or specification text it is about, checked against the file it names —
+            an unfounded finding is discarded, not reported. Findings can be waived, and a repeat
+            assessment tells you what is new. You are shown the cost before anything is spent.</p>
         </div>
         <div class="form-card">
-          <div class="form-row">
+          <div class="section-title" style="margin-top:0">1. Choose what to review</div>
+          <div id="vapt-source-picker"></div>
+
+          <div id="vapt-src-paste">
             <div class="form-group">
-              <label>Project Name (optional)</label>
-              <input type="text" id="vapt-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Artifact to assess</label>
+              <textarea id="vapt-artifact" rows="14" placeholder="Paste code, an OpenAPI/Swagger document, an architecture description, or a list of endpoints."></textarea>
             </div>
+          </div>
+
+          <div id="vapt-src-file" class="hidden">
             <div class="form-group">
+              <label>Source file</label>
+              <input type="file" id="vapt-file-input" accept=".txt,.py,.js,.ts,.tsx,.jsx,.java,.go,.php,.rb,.cs,.vb,.c,.h,.cpp,.sql,.yaml,.yml,.json,.xml,.ini,.conf,.tf,.html,.md" />
+              <div class="field-hint">One file. For a whole codebase use <b>Upload zip</b>.</div>
+            </div>
+          </div>
+
+          <div id="vapt-src-zip" class="hidden">
+            <div class="form-group">
+              <label>Zip of the codebase</label>
+              <input type="file" id="vapt-zip-input" accept=".zip" />
+              <div class="field-hint">Build output, binaries, <code>node_modules</code> and credential
+                files (<code>.env</code>, <code>*.pem</code>, private keys) are skipped. Hardcoded
+                secrets are redacted before anything reaches a model — and reported as findings by
+                the scanner that found them, which costs nothing.</div>
+            </div>
+          </div>
+
+          <div id="vapt-src-pr" class="hidden">
+            <div class="form-group">
+              <label>GitHub pull request URL</label>
+              <input type="url" id="vapt-pr-url" placeholder="https://github.com/owner/repo/pull/123" />
+              <div class="field-hint">Reviews the diff. Large PRs are split into pieces rather than cut short.</div>
+            </div>
+          </div>
+
+          <div id="vapt-src-repo" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>GitHub repository URL</label>
+                <input type="url" id="vapt-repo-url" placeholder="https://github.com/owner/repo" />
+              </div>
+              <div class="form-group">
+                <label>Branch / tag / commit (optional)</label>
+                <input type="text" id="vapt-repo-ref" placeholder="main" />
+              </div>
+            </div>
+            <div class="field-hint">Reads the repository's <b>source code</b>. A private repository needs a
+              token — supply one below for this call, or save one for the project. Get an estimate first: a
+              large repository is many model calls.</div>
+          </div>
+
+          <div id="vapt-src-compare" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>Base branch</label>
+                <input type="text" id="vapt-base-ref" placeholder="main" />
+              </div>
+              <div class="form-group flex1">
+                <label>Branch being proposed</label>
+                <input type="text" id="vapt-head-ref" placeholder="feature/new-auth" />
+              </div>
+            </div>
+            <div class="field-hint">Reviews <code>base...head</code> as a diff — the gate's answer before the pull request is raised.</div>
+          </div>
+
+          <div id="vapt-src-auth" class="hidden">
+            <div id="vapt-cred-status"></div>
+            <div class="form-group">
+              <label>GitHub token for this call (optional)</label>
+              <input type="password" id="vapt-gh-token" autocomplete="off"
+                     placeholder="ghp_… or a fine-grained token — used once, never stored" />
+              <div class="field-hint">
+                Only needed for a <b>private</b> repository, or when the deployment token cannot
+                see this one. GitHub answers <b>404 "not found"</b> — not 403 — for anything a
+                token cannot see, so a private repo, an expired token and a typo all look the
+                same; supplying the right token here is the quickest way to tell them apart.
+                <button type="button" class="btn-link" onclick="saveGithubCredential('vapt')">
+                  Save it for this project instead
+                </button>
+                — stored encrypted, never shown again, and reused for this owner automatically.
+              </div>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="vapt-project" class="project-bound" />
+              <div class="project-caption" data-for="vapt-project"></div>
+            </div>
+            <div class="form-group flex1">
               <label>Scope (optional)</label>
               <input type="text" id="vapt-scope" placeholder="e.g. REST API endpoints, authentication module, admin panel" />
             </div>
           </div>
-          <div class="form-group">
-            <label>Artifact to Assess <span class="required">*</span></label>
-            <textarea id="vapt-artifact" rows="14" placeholder="Paste code, API specification, architecture description, or endpoint list.
 
-Examples:
-• Python FastAPI code with authentication endpoints
-• OpenAPI/Swagger specification
-• Architecture: React frontend → Node.js API → PostgreSQL DB, JWT auth, AWS S3 file storage
-• List of URLs: /api/login, /api/users/{id}, /api/admin/users, /upload/file
-• Express.js route handlers for user management"></textarea>
-          </div>
           <div class="form-group">
-            <label>Additional Context (optional)</label>
-            <input type="text" id="vapt-context" placeholder="e.g. Healthcare app handling PHI, external-facing, no WAF in place" />
+            <label>Context (optional)</label>
+            <input type="text" id="vapt-context" placeholder="e.g. Healthcare API endpoint, processes PHI, external-facing" />
           </div>
+
+          <div class="section-title">2. See what it will cost</div>
           <div class="form-actions">
-            <button class="btn btn-primary btn-security" onclick="runVAPT()">
-              <span class="btn-icon">🛡️</span> Run VAPT Assessment
+            <button class="btn btn-primary" onclick="previewCost('vapt')">
+              <span class="btn-icon">$</span> Estimate cost
             </button>
-            <span class="or-divider">or</span>
-            <label class="btn btn-secondary file-upload-btn">
-              <input type="file" id="vapt-file" accept=".txt,.py,.js,.ts,.java,.go,.php,.rb,.yaml,.yml,.json,.md" onchange="uploadVAPT()" hidden />
-              Upload File
-            </label>
           </div>
+          <div class="field-hint">Reading the source, filtering it and pricing the work is free — no
+            model is called. You are shown the expected cost and a hard ceiling, and asked again
+            before anything is spent.</div>
+          <div id="vapt-retention-wrap"></div>
+          <div id="vapt-cost-preview" class="hidden"></div>
         </div>
         <div id="vapt-result" class="result-area hidden"></div>
+        <div id="vapt-sources"></div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">Every assessment this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran.</p>
+          <div id="vapt-runs"></div>
+        </div>
       </div>
 
       <!-- Security Review Page -->
@@ -1231,8 +1489,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group">
-              <label>Project Name (optional)</label>
-              <input type="text" id="sec-project" class="project-bound" placeholder="e.g. Clinical AI Platform" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="sec-project" class="project-bound" />
+              <div class="project-caption" data-for="sec-project"></div>
             </div>
             <div class="form-group">
               <label>System Type (optional)</label>
@@ -1291,8 +1554,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="sd-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="sd-project" class="project-bound" />
+              <div class="project-caption" data-for="sd-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Context (optional)</label>
@@ -1333,8 +1601,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="ap-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="ap-project" class="project-bound" />
+              <div class="project-caption" data-for="ap-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Context (optional)</label>
@@ -1410,8 +1683,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="cfr-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="cfr-project" class="project-bound" />
+              <div class="project-caption" data-for="cfr-project"></div>
             </div>
             <div class="form-group flex1">
               <label>System Description (optional)</label>
@@ -1453,8 +1731,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="gxp-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="gxp-project" class="project-bound" />
+              <div class="project-caption" data-for="gxp-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Document Type Hint (optional — verified, not just trusted)</label>
@@ -1498,8 +1781,13 @@ Examples:
           <div class="section-title" style="margin-top:0">1. Plan the Validation Package</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="gxg-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="gxg-project" class="project-bound" />
+              <div class="project-caption" data-for="gxg-project"></div>
             </div>
             <div class="form-group flex1">
               <label>System Description (optional)</label>
@@ -1556,8 +1844,13 @@ Examples:
               <p class="field-hint" id="swarm-policy-hint">&nbsp;</p>
             </div>
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="swarm-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="swarm-project" class="project-bound" />
+              <div class="project-caption" data-for="swarm-project"></div>
             </div>
           </div>
           <div class="form-group">
