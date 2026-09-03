@@ -1029,9 +1029,18 @@ function renderIssueTriageReport(targetId, r) {
 async function runIssueTriageBatchGithub() {
   const repoUrl = document.getElementById('it-batch-repo').value.trim();
   if (!repoUrl) { alert('Please provide a GitHub repo URL.'); return; }
-  showLoading('Fetching open issues and triaging each one — this may take a while for larger batches…');
+  // Watched rather than waited on. The batch is serial by design — each issue re-reads the
+  // project's triage history so later issues can be matched as duplicates of earlier ones —
+  // so it is one model call per issue, in sequence. Forty issues behind a spinner saying
+  // "this may take a while" is the case this exists for, and the label names the issue
+  // being read: "12 of 40" alone cannot tell a batch that is working from one stuck on 12.
+  const target = document.getElementById('issue-triage-batch-result');
+  if (target) {
+    target.classList.remove('hidden');
+    target.innerHTML = '<div class="review-progress"><b>Fetching the open issues…</b></div>';
+  }
   try {
-    const result = await apiFetch('/api/review/issue-triage/batch-github', {
+    const accepted = await apiFetch('/api/review/issue-triage/batch-github/async', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1040,10 +1049,14 @@ async function runIssueTriageBatchGithub() {
         project_name: document.getElementById('it-batch-project').value.trim(),
       }),
     });
-    renderIssueTriageBatch('issue-triage-batch-result', result);
-    loadDashboard();
+    pollReviewJob('issue-triage', accepted.job_id, 'issue-triage-batch-result',
+                  { ...accepted, title: 'Triaging the repository…', unit: 'issue' },
+                  (result) => {
+                    renderIssueTriageBatch('issue-triage-batch-result', result);
+                    loadDashboard();
+                    loadAgentRuns('issue-triage');
+                  });
   } catch (e) { showError('issue-triage-batch-result', e.message); }
-  finally { hideLoading(); }
 }
 
 function renderIssueTriageBatch(targetId, r) {
@@ -1570,7 +1583,17 @@ async function runFullReview() {
     return;
   }
 
-  showLoading('Submitting Core SDLC Review…');
+  // Paint into the result panel rather than behind a modal. This is the highest-call-count
+  // workflow on the platform — up to seven sequential model calls, routinely over five
+  // minutes — and it already reported a real stage label per step. That label went into a
+  // full-screen blocking spinner: one line of text, on top of the page, with the form and
+  // the run history underneath it unreachable. The same label in the result panel costs the
+  // reader nothing and lets them leave the tab, which the job's own text says they can.
+  const _fullTarget = document.getElementById('full-result');
+  if (_fullTarget) {
+    _fullTarget.classList.remove('hidden');
+    _fullTarget.innerHTML = '<div class="review-progress"><b>Submitting…</b></div>';
+  }
   try {
     const submitResp = await apiFetch('/api/review/full', {
       method: 'POST',
@@ -1583,17 +1606,22 @@ async function runFullReview() {
     const result = await pollFullReviewJob(submitResp.job_id);
     renderFullResult('full-result', result);
     loadDashboard();
+    loadAgentRuns('full');
   } catch (e) {
     showError('full-result', e.message);
-  } finally {
-    hideLoading();
   }
 }
 
-// full_review chains up to 7 sequential LLM calls and can run 300s+, so the
-// backend returns a job_id immediately (202) instead of blocking the request —
-// poll for progress and show the live step label instead of a static message.
+// full_review chains up to 7 sequential LLM calls and can run 300s+, so the backend returns
+// a job_id immediately (202) instead of blocking the request. The live stage label goes into
+// the result panel through the same `renderReviewProgress` the review screens use, rather
+// than into a blocking modal: one shared progress panel means one set of wording and one
+// place to fix it, and a reader can still see the form and the run history behind it.
 async function pollFullReviewJob(jobId) {
+  const target = document.getElementById('full-result');
+  // "stage" rather than "piece": this fans out over named review stages, not chunks of one
+  // artifact, and calling them pieces would suggest the code was split up.
+  const shape = { title: 'Running the Core SDLC Review…', unit: 'stage' };
   while (true) {
     const job = await apiFetch(`/api/review/full/jobs/${jobId}`, { _silent: true });
     if (job.status === 'completed') return job.result;
@@ -1601,10 +1629,7 @@ async function pollFullReviewJob(jobId) {
       const err = job.error || {};
       throw new Error(err.detail || 'Full SDLC Review failed.');
     }
-    const label = job.step_label
-      ? `Running Full SDLC Review — step ${job.current_step}/${job.total_steps}: ${job.step_label}…`
-      : 'Running Full SDLC Review…';
-    showLoading(label);
+    if (target) target.innerHTML = renderReviewProgress(job, shape);
     await new Promise(resolve => setTimeout(resolve, 2500));
   }
 }
@@ -4192,19 +4217,33 @@ async function runSwarm() {
   }
   if (document.getElementById('swarm-postback').checked) body.post_back = true;
 
-  showLoading('Running the swarm — agents run in parallel…');
+  // Started as a background job and watched, rather than held behind a modal. A swarm fans
+  // out to three to six agents and routinely takes minutes; the old spinner said "agents
+  // run in parallel" for the whole run, which is indistinguishable from a hang on the
+  // second slowest thing here. Progress is reported as agents *finish*, naming the one that
+  // just landed — they run concurrently, so a start order tells a reader nothing.
+  const target = document.getElementById('swarm-result');
+  if (target) {
+    target.classList.remove('hidden');
+    target.innerHTML = '<div class="review-progress"><b>Starting the swarm…</b></div>';
+  }
   try {
-    const result = await apiFetch('/api/v1/swarm', {
+    const accepted = await apiFetch('/api/v1/swarm/async', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    renderSwarmResult('swarm-result', result);
-    loadDashboard();
+    // Reuses the one job poller: one set of retry rules, one honest "lost contact" message.
+    // `onDone` is passed because a swarm result has its own renderer.
+    pollReviewJob('agent-hub', accepted.job_id, 'swarm-result',
+                  { ...accepted, title: 'Running the swarm…', unit: 'agent' },
+                  (result) => {
+                    renderSwarmResult('swarm-result', result);
+                    loadDashboard();
+                    loadAgentRuns('agent-hub');
+                  });
   } catch (e) {
     showError('swarm-result', e.message);
-  } finally {
-    hideLoading();
   }
 }
 
@@ -9957,7 +9996,7 @@ function renderReviewProgress(job, accepted) {
   return `
     <div class="review-progress">
       <div class="review-progress-head">
-        <b>Reviewing…</b>
+        <b>${esc((accepted && accepted.title) || 'Reviewing…')}</b>
         <span class="review-progress-count">${done} of ${total} ${esc((accepted && accepted.unit) || 'piece')}(s)</span>
       </div>
       <div class="review-progress-track"><div class="review-progress-bar" style="width:${pct}%"></div></div>

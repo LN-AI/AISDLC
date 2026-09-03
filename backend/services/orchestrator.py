@@ -674,6 +674,7 @@ class SDLCOrchestrator:
         context: str = "",
         project_name: str = "Unnamed Project",
         llm_override: Optional[Dict[str, Any]] = None,
+        on_progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
         return issue_triage_batch_workflow.run(
             self,
@@ -683,6 +684,7 @@ class SDLCOrchestrator:
             context=context,
             project_name=project_name,
             llm_override=llm_override,
+            on_progress=on_progress,
         )
     @_log_call
     def generate_test_scenarios(

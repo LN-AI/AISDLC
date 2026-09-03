@@ -24,7 +24,7 @@ import contextvars
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend import config, database
 from backend.models.swarm_models import (
@@ -304,7 +304,9 @@ class SwarmService:
 
     # ── Public entry point ─────────────────────────────────────────────────
 
-    def run_swarm(self, req: SwarmRequest, orch: SDLCOrchestrator, caller: Optional[dict] = None) -> SwarmResponse:
+    def run_swarm(self, req: SwarmRequest, orch: SDLCOrchestrator,
+                  caller: Optional[dict] = None,
+                  on_progress: Optional[Callable[[int, int, str], None]] = None) -> SwarmResponse:
         """
         1. Resolve source → artifact text
         2. Determine policy (builtin shortcut → custom object → default)
@@ -350,6 +352,15 @@ class SwarmService:
                 ): name
                 for name in agents_to_run
             }
+            # Reported as agents *finish*, not as they start. They run concurrently, so
+            # "starting Security" tells a reader nothing about how much is left; a
+            # completion count does. The label names the agent that just landed, because a
+            # bare "4 of 6" cannot distinguish a swarm making progress from one where the
+            # slow agent is still the slow agent.
+            _total = len(future_to_agent) or 1
+            if on_progress:
+                on_progress(0, _total, f"Running {_total} agent(s) in parallel")
+            _done = 0
             for future in as_completed(future_to_agent):
                 agent_name = future_to_agent[future]
                 try:
@@ -364,6 +375,14 @@ class SwarmService:
                         summary="",
                         error=str(exc)[:500],
                     )
+                _done += 1
+                if on_progress:
+                    on_progress(_done, _total,
+                                f"{_done} of {_total} agent(s) finished "
+                                f"— {agent_name} just completed")
+
+        if on_progress:
+            on_progress(_total, _total, "Aggregating and applying the gate policy")
 
         # ── 5 & 6. Aggregate + enforce policy ─────────────────────────────
         response = self._aggregate(

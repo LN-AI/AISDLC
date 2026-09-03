@@ -2079,6 +2079,69 @@ async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/issue-triage/batch-github/async", status_code=202)
+async def review_issue_triage_batch_github_async(req: IssueTriageBatchGitHubRequest,
+                                                 request: Request):
+    """Start a repository-wide triage and return a job id.
+
+    The batch is **serial by design** — each issue re-reads the project's triage history so
+    later issues can be matched as duplicates of earlier ones from the same run — which makes
+    it one model call per issue, in sequence. Forty issues is forty sequential calls, and the
+    synchronous twin holds the connection for all of them while reporting nothing. That is
+    both a long spinner and a real risk of a proxy timeout with the spend already incurred.
+
+    Progress names the issue being read, not just a count: "12 of 40" cannot distinguish a
+    batch that is working from one that is stuck on issue 12.
+
+    The synchronous route is kept — it is the documented surface, and this route is
+    deliberately absent from `legacy_guard`'s product map for the reason the other 202
+    routes are (see `_start_review_job`): the work happens after the response is sent, so
+    `guarded_call` inside the job is what meters it.
+    """
+    if not req.github_repo_url.strip():
+        raise HTTPException(status_code=400, detail="github_repo_url is required")
+    _require_llm()
+
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    caller["_subject"] = subject_service.resolve_subject(caller, request.headers)
+    check_project_rate_limit(caller["_subject"], request.url.path)
+
+    # One call per issue, capped by `limit`. An upper bound rather than the real count: the
+    # real count needs a GitHub round trip, which is work this route exists to move off the
+    # request thread. The first progress report replaces it with the number actually found,
+    # before the bar has moved, so it can only revise downward.
+    expected = max(int(req.limit or 10), 1)
+    with agent_guard.expect_calls(expected):
+        agent_guard.preflight(caller["_subject"], "issue-triage-batch-github")
+
+    project_name = req.project_name or req.github_repo_url
+
+    def _run(on_progress):
+        with agent_guard.expect_calls(expected):
+            return agent_guard.guarded_call(
+                caller, "issue-triage-batch-github", None, skip_preflight=True,
+                project_name=project_name,
+                fn=lambda: orchestrator.triage_github_repo_issues(
+                    github_repo_url=req.github_repo_url, limit=req.limit,
+                    team_roster=req.team_roster or "", context=req.context or "",
+                    project_name=project_name, on_progress=on_progress,
+                ),
+            )
+
+    job_id = job_service.start_job("issue-triage-batch-github",
+                                   total_steps=expected, run_fn=_run)
+    return {
+        "job_id": job_id,
+        "status": "accepted",
+        "agent": "issue-triage-batch-github",
+        "unit": "issue",
+        "estimate": {"calls": expected},
+        "poll_url": f"/api/review/jobs/{job_id}",
+    }
+
+
 # ── QA Intelligence — Test Scenario / Test Case Generation ──────────────────
 
 @app.post("/api/review/test-scenario")

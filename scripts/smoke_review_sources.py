@@ -2038,6 +2038,143 @@ def main():
         check("the gateway stub is restored for anything after this section",
               llm_gateway.call_tool is _plain_call_tool)
 
+        # ── 28. The slow runs report what they are doing ────────────
+        #
+        # Three screens fanned out over many model calls behind a static sentence. The Core
+        # SDLC Review already produced a real stage label per step and threw it into a
+        # full-screen blocking spinner; the swarm and the repository-wide triage produced
+        # nothing at all.
+        #
+        # The other two candidates were checked and deliberately left alone:
+        # `codegen_scaffold.run` and `migration_execute.run` each make **one** agent call, so
+        # a progress bar over them would be a bar that goes 0 to 100 with an invented label
+        # in between. A spinner at least does not claim to know anything.
+        section("28. The slow runs report what they are doing")
+
+        from backend.services import swarm_service as _sw
+        from backend.workflows import issue_triage_batch as _itb
+        from backend.workflows import codegen_scaffold as _cgs
+        from backend.workflows import migration_execute as _mex
+        from backend.services.orchestrator import SDLCOrchestrator as _Orch28
+        import inspect as _inspect
+
+        _p28 = main.app.openapi()["paths"]
+        for _sync, _async in (
+            ("/api/v1/swarm", "/api/v1/swarm/async"),
+            ("/api/review/issue-triage/batch-github",
+             "/api/review/issue-triage/batch-github/async"),
+        ):
+            check(f"{_async} exists", _async in _p28, str(_async))
+            check(f"...and answers 202, not 200",
+                  "202" in _p28.get(_async, {}).get("post", {}).get("responses", {}),
+                  str(list(_p28.get(_async, {}).get("post", {}).get("responses", {}))))
+            check(f"...and {_sync} is kept, since it is the documented surface",
+                  _sync in _p28,
+                  "an API surface is a promise, and scripts/ and n8n drive these")
+
+        # ── The swarm reports per agent, as they finish ──────────────────────
+        check("run_swarm accepts a progress reporter",
+              "on_progress" in _inspect.signature(_sw.SwarmService.run_swarm).parameters)
+
+        _seen28 = []
+        _orig_one = _sw._run_one_agent
+        _orig_resolve = _sw._SourceResolver.resolve
+
+        def _fake_one(name, artifact, req, orch, ctx, caller):
+            return _sw.AgentSwarmResult(agent=name, gate_status="Green", risk_score=1.0,
+                                        summary=f"{name} done")
+
+        _sw._run_one_agent = _fake_one
+        _sw._SourceResolver.resolve = lambda self, req: ("print(1)", "text", "pasted", "")
+        try:
+            from backend.models.swarm_models import SwarmRequest as _SReq
+            _resp = _sw.SwarmService().run_swarm(
+                _SReq(text="print(1)", project_name="Sources", policy_name="standard"),
+                _Orch28(), {"type": "anonymous"},
+                on_progress=lambda i, t, l: _seen28.append((i, t, l)))
+            check("the swarm reports progress as agents finish",
+                  len(_seen28) >= 3, str(_seen28[:4]))
+            check("...naming the agent that just landed, not only a count",
+                  any("just completed" in l for _, _, l in _seen28),
+                  "a bare '4 of 6' cannot tell a swarm that is progressing from one where "
+                  "the slow agent is still the slow agent")
+            check("...counting up, never down",
+                  [i for i, _, _ in _seen28] == sorted(i for i, _, _ in _seen28),
+                  str([i for i, _, _ in _seen28]))
+            check("...against one total, so the bar cannot go backwards mid-run",
+                  len({t for _, t, _ in _seen28}) == 1,
+                  str({t for _, t, _ in _seen28}))
+            check("...and the run still produced its gate",
+                  bool(getattr(_resp, "swarm_gate", None)),
+                  str(getattr(_resp, "swarm_gate", None)))
+        finally:
+            _sw._run_one_agent = _orig_one
+            _sw._SourceResolver.resolve = _orig_resolve
+        check("the swarm stubs are restored", _sw._run_one_agent is _orig_one)
+
+        # ── The repository triage reports per issue, by name ─────────────────
+        check("the batch triage accepts a progress reporter",
+              "on_progress" in _inspect.signature(_itb.run).parameters)
+
+        _seen_it = []
+        _orig_triage = _itb.issue_triage.run
+
+        class _FakeGH:
+            def list_open_issues(self, url, limit):
+                return [{"number": n, "title": f"Issue {n} title", "body": "b",
+                         "url": f"{url}/issues/{n}"} for n in range(1, 5)]
+
+        class _FakeOrch:
+            github = _FakeGH()
+
+        _itb.issue_triage.run = lambda orch, **k: {"severity": "High", "summary": "x"}
+        try:
+            _res_it = _itb.run(_FakeOrch(), github_repo_url="https://github.com/acme/portal",
+                               limit=4, project_name="Sources",
+                               on_progress=lambda i, t, l: _seen_it.append((i, t, l)))
+            check("the batch reports progress per issue",
+                  len(_seen_it) >= 5, str(_seen_it[:3]))
+            check("...naming the issue being read, not only its index",
+                  any("Issue 2 title" in l for _, _, l in _seen_it),
+                  "'12 of 40' alone cannot distinguish a batch that is working from one "
+                  "stuck on issue 12")
+            check("...and the total is the number actually found",
+                  {t for _, t, _ in _seen_it} == {4}, str({t for _, t, _ in _seen_it}))
+            check("...and it still triaged every issue",
+                  _res_it["issues_triaged"] == 4, str(_res_it.get("issues_triaged")))
+        finally:
+            _itb.issue_triage.run = _orig_triage
+        check("the triage stub is restored", _itb.issue_triage.run is _orig_triage)
+
+        # ── Driven through HTTP, the way the browser does ────────────────────
+        _acc28 = client.post("/api/review/issue-triage/batch-github/async",
+                             json={"github_repo_url": "https://github.com/acme/portal",
+                                   "limit": 2, "project_name": "Sources"}, headers=UI)
+        check("the batch route accepts rather than holding the connection",
+              _acc28.status_code == 202, f"{_acc28.status_code}: {_acc28.text[:200]}")
+        _acc28j = _acc28.json()
+        check("...returning a job id and where to poll",
+              bool(_acc28j.get("job_id"))
+              and _acc28j.get("poll_url", "").endswith(_acc28j.get("job_id", "x")),
+              _acc28.text[:200])
+        check("...and naming the unit, so the bar does not say 'piece(s)' about issues",
+              _acc28j.get("unit") == "issue", str(_acc28j.get("unit")))
+
+        # ── The two that correctly get no progress bar ───────────────────────
+        for _mod, _name in ((_cgs, "codegen_scaffold"), (_mex, "migration_execute")):
+            check(f"{_name} is a single call, so it is given no progress bar",
+                  "on_progress" not in _inspect.signature(_mod.run).parameters,
+                  "if this workflow ever fans out, it should report progress -- but a bar "
+                  "over one model call is an invented label between 0 and 100, and a "
+                  "spinner at least does not claim to know anything")
+
+        # ── The Core SDLC Review already had labels; it kept them ────────────
+        check("the Core SDLC Review still answers 202 with a job",
+              "202" in _p28.get("/api/review/full", {}).get("post", {}).get("responses", {}),
+              str(list(_p28.get("/api/review/full", {}).get("post", {}).get("responses", {}))))
+        check("...and its own poll route is still there",
+              "/api/review/full/jobs/{job_id}" in _p28)
+
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")
 
