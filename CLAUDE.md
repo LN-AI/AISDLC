@@ -174,6 +174,16 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   *and* on the read path that depends on it: `lapse_expired_waivers` (before every baseline
   lookup) and `review_source_store.sweep_expired` (on every inventory read).
 - `backend/config.py` — env var loading (see below).
+- **What a run cost reaches the browser two different ways, and you need to know which.**
+  `agent_guard.guarded_call` attaches `_budget_stats` to the response *body* — that covers
+  the `/api/v1` surface and every 202 job route. The synchronous `/api/review/*` routes
+  cannot: `legacy_guard` meters them *around* the handler, so by the time the cost is known
+  `call_next` has already serialized the body. Those report it in `X-Spend-*` response
+  headers, which `apiFetch` folds into `_budget_stats` (body wins if both are present).
+  Either way the figure comes from `agent_guard._price_usage`, the same arithmetic that
+  writes `usage_events` — derive a display cost any other way and the screen will disagree
+  with the invoice. `renderReviewTransparency` is the one renderer that draws it, and every
+  result renderer calls it.
 - **`AGENT_SCREENS` in `frontend/app.js` is where an agent screen says what it is.** One row
   per screen keyed by its nav `data-page`, giving the product id, the `reviews.review_type`
   it writes, its result container id, its renderer function and what to call its runs. The

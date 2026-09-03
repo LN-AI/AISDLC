@@ -1927,11 +1927,79 @@ function renderGovernanceReport(targetId, report) {
       <ol class="recs-list">${recs.map(r => `<li>${esc(r)}</li>`).join('')}</ol></div>`;
   }
 
-  if (report.report_id) {
-    html += `<div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Report ID: ${esc(report.report_id)}</div>`;
-  }
+  // Getting it out of the platform. This screen calls itself the audit-ready report and
+  // offered no way to hand it to an auditor — the only affordance was a report id, which
+  // is a UUID nobody can do anything with outside this application. Markdown rather than
+  // PDF because it is the format the rest of this codebase already exports
+  // (`MODERNIZATION_REPORT.md`, the GxP documents) and because a diffable artifact is more
+  // useful in a governance trail than a rendered one.
+  _lastGovernanceReport = report;
+  html += `<div class="export-row">
+      <button type="button" class="btn-link" onclick="downloadGovernanceReport()"
+        title="Markdown — the same content as this screen, in a file you can attach to an audit record or commit alongside the release">
+        Download the report
+      </button>
+      ${report.report_id ? `<span class="field-hint">Report ID
+        <code>${esc(report.report_id)}</code> — reopen it any time from Previous reports;
+        nothing is billed to read a stored report.</span>` : ''}
+    </div>`;
 
   wrap.innerHTML = html;
+}
+
+// The report on screen, so the export writes exactly what is being read rather than
+// re-fetching and risking a different one.
+let _lastGovernanceReport = null;
+
+function downloadGovernanceReport() {
+  const r = _lastGovernanceReport;
+  if (!r) { alert('Generate or open a report first.'); return; }
+  const name = `governance-report-${(r.project_name || 'project')
+    .replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${(r.review_date || '').slice(0, 10) || 'latest'}.md`;
+  _downloadTextAsFile(name, governanceReportMarkdown(r));
+}
+
+/** The report as Markdown. A pure function of the report, kept separate from the download
+ *  so that what it writes can be asserted without a browser and without a file. */
+function governanceReportMarkdown(r) {
+  const lines = [
+    `# Governance Report — ${r.project_name || 'Unnamed Project'}`,
+    '',
+    `- **Gate:** ${r.gate_status || 'Unknown'}`,
+    `- **Overall risk:** ${Math.round(r.overall_risk_score ?? 0)}/100`,
+    `- **Date:** ${r.review_date || ''}`,
+    r.report_id ? `- **Report ID:** ${r.report_id}` : '',
+    '',
+  ];
+  if (r.executive_summary) lines.push('## Executive summary', '', r.executive_summary, '');
+  const byCategory = r.findings_by_category || {};
+  Object.entries(byCategory).forEach(([category, findings]) => {
+    if (!(findings || []).length) return;
+    lines.push(`## ${category} (${findings.length})`, '');
+    [...findings].sort((a, b) => (b.severity || 0) - (a.severity || 0)).forEach(f => {
+      lines.push(`### ${f.title || 'Finding'}`);
+      const where = [f.control_id, f.file_path
+        ? `${f.file_path}${f.line_start ? ':' + f.line_start : ''}` : ''].filter(Boolean);
+      if (where.length) lines.push(`*${where.join(' · ')}*`, '');
+      if (f.description) lines.push(f.description, '');
+      if (f.recommendation) lines.push(`**Recommendation:** ${f.recommendation}`, '');
+      // A waived finding must say so in the export, or the report reads as though the
+      // problem is open when somebody has already decided to carry it.
+      if (f.status && f.status !== 'open') {
+        lines.push(`**Status:** ${f.status}`
+          + (f.resolved_by ? ` (by ${f.resolved_by})` : '')
+          + (f.waiver_expires_at ? `, expires ${String(f.waiver_expires_at).slice(0, 10)}` : ''),
+          '');
+      }
+    });
+  });
+  const recs = r.recommendations || [];
+  if (recs.length) {
+    lines.push('## Recommendations', '');
+    recs.forEach((rec, i) => lines.push(`${i + 1}. ${rec}`));
+    lines.push('');
+  }
+  return lines.filter(l => l !== undefined).join('\n');
 }
 
 // ── Render Results ────────────────────────────────────────────────────────

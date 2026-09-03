@@ -2212,6 +2212,76 @@ await checkAsync('every screen in the table names a renderer that exists', async
   }
 });
 
+section('The audit-ready report can be handed to an auditor');
+
+// This screen calls itself the audit-ready report and offered no way to get it out. The
+// only affordance was a report id -- a UUID nobody can do anything with outside this
+// application. Markdown rather than PDF: it is what the rest of this codebase exports
+// (MODERNIZATION_REPORT.md, the GxP documents), and a diffable artifact is worth more in a
+// governance trail than a rendered one.
+
+const _REPORT = {
+  report_id: 'rep-1', project_name: 'Care Brief', review_date: '2026-09-03',
+  gate_status: 'Amber', overall_risk_score: 41,
+  executive_summary: 'Two controls are unevidenced.',
+  findings_by_category: {
+    Security: [
+      { id: 'g1', title: 'No audit trail for PHI reads', severity: 5,
+        control_id: 'HIPAA-003', file_path: 'app/records.py', line_start: 88,
+        description: 'Reads are not logged.', recommendation: 'Log them.' },
+      { id: 'g2', title: 'Verbose error body', severity: 2, control_id: 'SEC-014',
+        description: 'Stack traces reach the client.', recommendation: 'Return a code.',
+        status: 'accepted_risk', resolved_by: 'sam',
+        waiver_expires_at: '2026-12-01T00:00:00' },
+    ],
+  },
+  recommendations: ['Add the access log.', 'Strip internal detail from responses.'],
+};
+
+check('the report screen offers a download, not just a UUID', () => {
+  elements.delete('report-result');
+  sandbox.renderGovernanceReport('report-result', _REPORT);
+  const html = document.getElementById('report-result').innerHTML;
+  assert(/Download the report/i.test(html), 'no export affordance on the report screen');
+  assert(html.includes('rep-1'), 'the report id is no longer shown at all');
+});
+
+check('the exported markdown carries what the screen shows', () => {
+  const md = sandbox.governanceReportMarkdown(_REPORT);
+  assert(md.includes('# Governance Report — Care Brief'), 'no title');
+  assert(md.includes('**Gate:** Amber'), 'the gate is missing from the export');
+  assert(md.includes('41/100'), 'the risk score is missing');
+  assert(md.includes('Two controls are unevidenced.'), 'the executive summary is missing');
+  assert(md.includes('## Security (2)'), 'the category heading is missing');
+  assert(md.includes('No audit trail for PHI reads'), 'a finding is missing');
+  assert(md.includes('HIPAA-003'), 'the control id an auditor cites is missing');
+  assert(md.includes('app/records.py:88'), 'the location is missing');
+  assert(md.includes('Add the access log.'), 'the recommendations are missing');
+});
+
+check('...and says which findings someone has already decided to carry', () => {
+  const md = sandbox.governanceReportMarkdown(_REPORT);
+  assert(md.includes('**Status:** accepted_risk'),
+    'a waived finding exported as though it were open reads as an unresolved problem, '
+    + 'which is the opposite of what the waiver recorded');
+  assert(md.includes('by sam'), 'who accepted the risk is not in the export');
+  assert(md.includes('2026-12-01'),
+    'an accepted risk with an expiry that is not exported looks permanent');
+});
+
+check('the highest severity is written first, as on screen', () => {
+  const md = sandbox.governanceReportMarkdown(_REPORT);
+  assert(md.indexOf('No audit trail') < md.indexOf('Verbose error body'),
+    'the export order does not match the screen order, so the two disagree about what '
+    + 'matters most');
+});
+
+check('a report with nothing in it exports a header rather than throwing', () => {
+  const md = sandbox.governanceReportMarkdown({ project_name: 'Empty' });
+  assert(md.includes('# Governance Report — Empty'), 'no title on a bare report');
+  assert(!/undefined/.test(md), `"undefined" leaked into the export: ${md.slice(0, 160)}`);
+});
+
 section('A finding can be acted on from the screen that reported it');
 
 // `renderWaiveControl` was called from exactly one place -- inside the shared
