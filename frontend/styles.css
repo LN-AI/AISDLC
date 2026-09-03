@@ -2536,3 +2536,30 @@ pre.fix-diff {
   display: block; font-size: 10.5px; color: var(--text-muted); margin-top: 2px;
   letter-spacing: .02em;
 }
+
+/* ── What an agent accepts, and where you stand against your plan ──────────
+   A quiet strip under each agent screen's header. Deliberately low-contrast: it is
+   reference material a reader consults once and then stops seeing, and it sits directly
+   above the form they came to fill in. The one part allowed to shout is `.about-spent`
+   when the allowance is gone, because that changes what pressing the button will do. */
+.agent-about { margin: -6px 0 18px; }
+.about-row {
+  display: flex; flex-wrap: wrap; gap: 6px 22px; align-items: center;
+  font-size: 12px; color: var(--text-muted);
+}
+.about-item { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.about-label {
+  text-transform: uppercase; letter-spacing: .06em; font-size: 10px;
+  color: var(--text-muted); opacity: .75;
+}
+.about-chip {
+  border: 1px solid var(--border); border-radius: 10px; padding: 1px 7px;
+  font-size: 11px; color: var(--text); background: var(--surface2);
+}
+.about-item.about-spent { color: var(--amber, #d19a2f); font-weight: 600; }
+.about-item.about-spent .about-label { color: inherit; opacity: 1; }
+.about-denied {
+  border: 1px solid var(--amber, #d19a2f); border-left-width: 3px; border-radius: 6px;
+  padding: 8px 11px; margin-bottom: 10px; font-size: 12.5px;
+  background: rgba(209,154,47,.07);
+}

@@ -289,10 +289,24 @@ function _syncProjectInputs() {
  * Which products the active project's plan allows, so the nav can show the rest as locked.
  * Null means unrestricted — either no plan, or no project selected.
  */
+// The full product catalogue from the last entitlement refresh: title, description, the
+// sources each agent accepts, the frameworks it maps to, and this period's quota and usage.
+// Kept because `refreshEntitlements` already fetches all of it and threw everything but the
+// entitled/not-entitled bit away — so the per-agent header strip costs no extra request,
+// and is refreshed on the same events (login, project change, a governance refusal).
+let _productCatalogue = [];
+
 async function refreshEntitlements() {
   try {
     const data = await apiFetch('/api/v1/products', { _silent: true });
     const ent = data.entitlement || {};
+    _productCatalogue = data.products || [];
+    // Repaint whatever agent screen is open, so switching project updates its quota figures
+    // rather than leaving the previous project's numbers on screen.
+    const open = document.querySelector('.page.active');
+    if (open && open.id && AGENT_SCREENS[open.id.replace(/^page-/, '')]) {
+      renderAgentAbout(open.id.replace(/^page-/, ''));
+    }
     _entitledProducts = ent.unlimited
       ? null
       : new Set((data.products || []).filter(p => p.entitled).map(p => p.id));
@@ -374,7 +388,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     // change between visits, and a history list showing another project's runs is worse
     // than no history list. Screens absent from `AGENT_SCREENS` -- modernization and the
     // governance report -- keep the richer lists they already had.
-    if (AGENT_SCREENS[page]) loadAgentRuns(page);
+    if (AGENT_SCREENS[page]) { loadAgentRuns(page); renderAgentAbout(page); }
     // The GitHub PR screen is retired -- the nav item lands on the review screen with
     // the source already set, so there is one implementation of reviewing a pull
     // request rather than two that drift apart.
@@ -9366,6 +9380,96 @@ function screenForReview(result) {
     if (type && spec.reviewType === type) return page;
   }
   return null;
+}
+
+// ── What this agent accepts, and where you stand against your plan ───────
+//
+// All of it was already computed and served by `GET /api/v1/products` — what the agent
+// accepts, which compliance frameworks its findings map to, whether this project's plan
+// allows it at all, and how much of the monthly call and dollar allowance it has used
+// (`routes/products.py`). Every bit of it was rendered on the admin-only Plans screen and
+// nowhere a person actually runs anything.
+//
+// The consequence was that a user out of quota, or on a plan that never included this
+// agent, found out by filling in the form, pressing the button and being refused. The
+// refusal is correct and its wording is good; discovering the fact *afterwards* is not.
+//
+// Deliberately not repeating the registry `description` here: the page subtitle already
+// says what the screen is for, and two sentences saying the same thing in slightly
+// different words is how a header stops being read at all.
+//
+// Inserted after each screen's `.page-header` rather than into nineteen new markup slots.
+// One id per screen would be one more thing to keep in step with `AGENT_SCREENS`, and the
+// strip has no meaning on a screen the table does not know about.
+
+// Deliberately NOT showing the registry's `sources` here. It reads like "what this agent
+// accepts" and is not: nothing in the backend consumes it, and what it actually documents is
+// the parameter names of the product's `/api/v1` endpoint. Code Review's is
+// `("code", "github_pr_url", "github_file_url")` while the screen visibly offers a zip
+// upload, a repository at a ref and a branch comparison as well — so rendering it as
+// "Accepts" would contradict the tabs directly above it, which is worse than saying nothing.
+function renderAgentAbout(page) {
+  const spec = AGENT_SCREENS[page];
+  if (!spec) return;
+  const header = document.querySelector(`#page-${page} .page-header`);
+  if (!header) return;
+
+  let box = document.getElementById(`${page}-about`);
+  if (!box) {
+    box = document.createElement('div');
+    box.id = `${page}-about`;
+    box.className = 'agent-about';
+    header.insertAdjacentElement('afterend', box);
+  }
+
+  const p = _productCatalogue.find(x => x.id === spec.product);
+  if (!p) { box.innerHTML = ''; return; }
+
+  const bits = [];
+
+  if ((p.frameworks || []).length) {
+    bits.push(`<span class="about-item" title="Findings from this agent carry control ids from these frameworks, so a compliance report can cite them">
+      <span class="about-label">Maps to</span>
+      ${p.frameworks.map(f => `<span class="about-chip">${esc(f)}</span>`).join('')}</span>`);
+  }
+
+  // Quota. `used_*` come back null when there is no project or no entitlement, and a null
+  // is not a zero — reporting "0 of 100 used" to someone whose usage we did not look up
+  // would be a number we made up.
+  const calls = p.quota_calls_per_month;
+  const usd = p.quota_usd_per_month;
+  const usedCalls = p.used_calls_this_period;
+  const usedUsd = p.used_usd_this_period;
+  const quota = [];
+  if (calls != null) {
+    quota.push(`${usedCalls != null ? Number(usedCalls).toLocaleString() : '—'} of
+      ${Number(calls).toLocaleString()} call(s)`);
+  } else if (usedCalls != null) {
+    quota.push(`${Number(usedCalls).toLocaleString()} call(s), no cap on this plan`);
+  }
+  if (usd != null) {
+    quota.push(`$${Number(usedUsd || 0).toFixed(2)} of $${Number(usd).toFixed(2)}`);
+  } else if (usedUsd != null) {
+    quota.push(`$${Number(usedUsd).toFixed(2)} spent`);
+  }
+  if (quota.length) {
+    const overCalls = calls != null && usedCalls != null && usedCalls >= calls;
+    const overUsd = usd != null && usedUsd != null && usedUsd >= usd;
+    bits.push(`<span class="about-item${overCalls || overUsd ? ' about-spent' : ''}">
+      <span class="about-label">This month</span> ${quota.join(' · ')}${
+        overCalls || overUsd
+          ? ' — the next run will be refused' : ''}</span>`);
+  }
+
+  const denied = p.entitled === false
+    ? `<div class="about-denied">Your plan does not include this agent, so a run will be
+        refused. Estimating, where a screen offers it, still works and still costs nothing.
+        An administrator can add it to the project's plan.</div>`
+    : '';
+
+  box.innerHTML = (bits.length || denied)
+    ? `${denied}${bits.length ? `<div class="about-row">${bits.join('')}</div>` : ''}`
+    : '';
 }
 
 // ── This agent's previous runs ────────────────────────────────────────────

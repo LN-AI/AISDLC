@@ -757,6 +757,78 @@ def main():
                   page.locator("#report-list").count() == 1,
                   "it reads GET /api/reports -- a `reports` row, not a `reviews` row")
 
+            # ── 11c. What the plan allows, before the button is pressed ───
+            #
+            # All of this was already computed and served by GET /api/v1/products -- the
+            # frameworks an agent's findings map to, whether the project's plan includes it
+            # at all, and how much of the monthly allowance is gone -- and rendered only on
+            # the admin-only Plans screen. So a user out of quota, or on a plan that never
+            # included this agent, found out by filling in the form, pressing the button and
+            # being refused. The refusal is correct; learning it afterwards is not.
+            #
+            # The catalogue is injected here rather than set up as four real plans, because
+            # the branches worth testing are the rendering ones.
+            section("11c. Where you stand against your plan, before you run")
+
+            page.click(".nav-item[data-page='security']")
+            page.wait_for_timeout(250)
+            check("an agent screen has a plan strip under its header",
+                  page.locator("#security-about").count() == 1,
+                  "inserted after .page-header rather than needing nineteen markup slots")
+
+            def _about(entry):
+                page.evaluate(
+                    """(e) => { _productCatalogue = [e]; renderAgentAbout('security'); }""",
+                    entry)
+                page.wait_for_timeout(120)
+                return page.locator("#security-about").inner_text()
+
+            txt = _about({"id": "security", "entitled": True,
+                          "frameworks": ["STRIDE", "HIPAA"],
+                          "quota_calls_per_month": 100, "used_calls_this_period": 12,
+                          "quota_usd_per_month": 50, "used_usd_this_period": 3.1})
+            check("the frameworks its findings map to are named",
+                  "STRIDE" in txt and "HIPAA" in txt, txt[:160])
+            check("...and where the month's allowance stands",
+                  "12" in txt and "100" in txt, txt[:160])
+            check("...in money as well as calls",
+                  "3.10" in txt and "50.00" in txt, txt[:160])
+            check("...and it does not claim to describe the screen's inputs",
+                  "Accepts" not in txt,
+                  "the registry's `sources` documents the v1 endpoint's parameters, not "
+                  "this screen's tabs -- showing it here would contradict them")
+
+            txt = _about({"id": "security", "entitled": True,
+                          "frameworks": ["STRIDE"],
+                          "quota_calls_per_month": 100, "used_calls_this_period": 100,
+                          "quota_usd_per_month": None, "used_usd_this_period": 4.0})
+            check("an exhausted allowance says the next run will be refused",
+                  "refused" in txt.lower(), txt[:200])
+
+            txt = _about({"id": "security", "entitled": False,
+                          "frameworks": ["STRIDE"],
+                          "quota_calls_per_month": None, "used_calls_this_period": None,
+                          "quota_usd_per_month": None, "used_usd_this_period": None})
+            check("a plan that does not include this agent says so up front",
+                  "does not include this agent" in txt, txt[:220])
+            check("...and says an estimate still works and still costs nothing",
+                  "costs nothing" in txt, txt[:260])
+            check("...without inventing a usage figure it never looked up",
+                  " 0 of " not in txt and "$0.00 of" not in txt,
+                  "a null usage is not a zero; reporting '0 used' for a lookup that was "
+                  "never made is a number we made up")
+
+            txt = _about({"id": "security", "entitled": True, "frameworks": [],
+                          "quota_calls_per_month": None, "used_calls_this_period": None,
+                          "quota_usd_per_month": None, "used_usd_this_period": None})
+            check("an agent with nothing to report renders an empty strip, not scaffolding",
+                  txt.strip() == "", repr(txt[:120]))
+
+            # Restore the real catalogue so nothing downstream reads the injected one.
+            page.evaluate("() => refreshEntitlements()")
+            page.wait_for_timeout(300)
+
+
             for label, page_id in (("Findings", "page-findings"),
                                    ("Dashboard", "page-dashboard"),
                                    ("History", "page-history")):
