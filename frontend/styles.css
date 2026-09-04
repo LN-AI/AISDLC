@@ -2506,6 +2506,17 @@ table.code-view tr:hover td.src { background: rgba(255,255,255,.04); }
 .fix-pick label { display: inline-flex; gap: 7px; align-items: center; cursor: pointer; }
 .fix-pick-off label { cursor: not-allowed; color: var(--text-muted); }
 .fix-pick-off .field-hint { margin-top: 3px; }
+/* The header variant, for cards whose body is collapsed by default (VAPT). Sits with the
+   CVSS/CWE chips, so it is sized and spaced like one rather than like a form control. */
+.fix-pick-compact {
+  display: inline-flex; gap: 5px; align-items: center; cursor: pointer;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 2px 8px; border-radius: 10px; margin-left: 4px;
+  border: 1px solid var(--border); color: var(--text-muted);
+}
+.fix-pick-compact:hover { border-color: var(--accent); color: var(--accent); }
+.fix-pick-compact input { cursor: pointer; margin: 0; }
+.fix-unavailable { margin: 10px 0 16px; }
 
 /* Docked, because the findings list is long and the selection is made while scrolling
    through it -- a button at the bottom would be found only by accident. */

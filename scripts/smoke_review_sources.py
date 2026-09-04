@@ -1308,7 +1308,7 @@ def main():
         import backend.workflows.autofix_pr as _afp
         _real_verify = _afp._verify_patch
         try:
-            _afp._verify_patch = lambda orch, patch, ctx: dict(orch._verdict)
+            _afp._verify_patch = lambda orch, patch, ctx, **kw: dict(orch._verdict)
             guarded = fix_apply._guard_patches(
                 _Orch({"blocked": False}), [dict(_secret_patch), dict(_clean_patch)], "")
             check("a patch that introduces a hardcoded secret is rejected",
@@ -2174,6 +2174,292 @@ def main():
               str(list(_p28.get("/api/review/full", {}).get("post", {}).get("responses", {}))))
         check("...and its own poll route is still there",
               "/api/review/full/jobs/{job_id}" in _p28)
+
+        # ── 29. A vulnerability assessment's findings can be fixed ────
+        #
+        # Apply Fixes was built review-type agnostic and VAPT already met every precondition
+        # it has -- the same bundle path records its source, its findings carry the verified
+        # quote and the file path -- so the only thing missing was that the VAPT screen never
+        # armed it. What is checked here is the backend half: that the plan, the delivery
+        # options, the quote and the guardrail all behave when the review is a VAPT one.
+        #
+        # The guardrail is the reason this section is long. It has two changes, and both are
+        # the kind that fail silently: the re-review is now done by the agent that found the
+        # problem, and a Critical the original review already reported no longer blocks the
+        # patch. Get the second one wrong in either direction and either every VAPT patch is
+        # rejected, or a vulnerability the fixer introduced ships.
+        section("29. A vulnerability assessment's findings can be fixed")
+
+        VAPT_FIX_FINDINGS = [
+            {"id": "v1", "title": "SQL injection in login", "file_path": "app/auth.py",
+             "line_start": 4, "severity": 5, "risk_level": "Critical",
+             "control_id": "VAPT-003", "cvss_score": 9.8, "cwe_id": "CWE-89",
+             "owasp_category": "A03:2021 Injection", "vuln_id": "VLN-001",
+             "attack_scenario": "An unauthenticated caller posts a crafted username.",
+             "proof_of_concept": "curl -X POST /login -d \"u=' OR 1=1--\"",
+             "affected_component": "POST /login", "evidence": "SELECT",
+             "evidence_verified": True, "is_blocking": True,
+             "recommendation": "Use a parameterised query."},
+            {"id": "v2", "title": "Verbose error body", "file_path": "app/auth.py",
+             "line_start": 20, "severity": 3, "risk_level": "Moderate",
+             "control_id": "VAPT-011", "cvss_score": 5.3, "cwe_id": "CWE-209",
+             "vuln_id": "VLN-002", "attack_scenario": "Stack traces reach the client.",
+             "evidence": "id", "evidence_verified": True, "is_blocking": False},
+            # VAPT legitimately assesses things with no file at all -- an OpenAPI spec, an
+            # architecture description, a list of URLs. Those findings are real and are not
+            # fixable, and the difference has to be visible rather than inferred.
+            {"id": "v3", "title": "No rate limit on the auth endpoint", "severity": 4,
+             "risk_level": "High", "control_id": "VAPT-020", "cvss_score": 7.5,
+             "vuln_id": "VLN-003", "affected_component": "POST /login",
+             "evidence": "no limiter", "evidence_verified": True},
+        ]
+
+        _vapt_bundle = source_bundle.from_files(
+            [{"path": "app/auth.py", "content": APP_FILES["app/auth.py"]}],
+            label="vapt fix demo")
+        # Saved inside the project the UI headers are scoped to, because the route below is
+        # driven as the browser drives it and `_review_in_scope` 404s anything outside the
+        # caller's projects. A review with a NULL project id is invisible to it -- which the
+        # check at section 21 relies on, and which is easy to reproduce here by accident.
+        with _ctx.bind_project(pid, "Sources", product_id="vapt"):
+            _vapt_rid = database.save_review(
+                "vapt", "fix", "s", "c",
+                {"findings": _copy.deepcopy(VAPT_FIX_FINDINGS), "gate_status": "Red",
+                 "risk_score": 88.0})
+        _store.record(_vapt_rid, _vapt_bundle, retention_days=7)
+        _VID = {f["title"]: f["id"] for f in
+                json.loads(database.get_review(_vapt_rid)["result_json"])["findings"]}
+
+        _vsplit = fix_apply.eligible(
+            json.loads(database.get_review(_vapt_rid)["result_json"])["findings"])
+        check("a vulnerability in a real file is offered for fixing",
+              {f["title"] for f in _vsplit["fixable"]}
+              == {"SQL injection in login", "Verbose error body"},
+              str(sorted(f["title"] for f in _vsplit["fixable"])))
+        check("...and one that names no file is not, with the reason it is not",
+              any(f["title"].startswith("No rate limit")
+                  and "nothing to patch" in f["fix_blocked_reason"]
+                  for f in _vsplit["not_fixable"]),
+              "a VAPT assessment of an API spec has findings with no file, and the "
+              "difference between 'cannot' and 'will not' has to be visible")
+
+        _vplan = fix_apply.plan(_vapt_rid, [_VID["SQL injection in login"]])
+        check("a VAPT review can be planned for fixing at all",
+              _vplan["files_to_change"] == 1, str(_vplan["files_to_change"]))
+        check("...and is quoted, so the price is not discovered afterwards",
+              (_vplan["estimate"] or {}).get("ceiling_usd", 0) > 0,
+              str(_vplan["estimate"])[:160])
+        check("...and its note says who does the re-review",
+              "vulnerability assessor" in _vplan["note"], _vplan["note"][-160:])
+        check("a VAPT zip assessment is offered the diff and the zip, not a pull request",
+              {o["id"] for o in _vplan["outputs"]} == {"diff", "zip"},
+              str(sorted(o["id"] for o in _vplan["outputs"])))
+
+        # ── The quote is priced against the agents that will actually be called ──
+        #
+        # Not "a VAPT fix costs more than a code fix": measured, the VAPT prompt frame is
+        # *smaller* than the code reviewer's (3416 vs 3975 tokens), so asserting a direction
+        # would encode a guess. What is asserted is the arithmetic -- that the frame charged
+        # is the sum of the fixer's and the re-reviewer's, which pins which two agents were
+        # priced without depending on which of them is larger.
+        _af_frame = review_estimate._frame_tokens("auto-fix")
+        _vp_frame = review_estimate._frame_tokens("vapt")
+        _cd_frame = review_estimate._frame_tokens("code")
+        _code_plan = fix_apply.plan(fix_rid, [FID["SQL injection"]])
+        check("a fix is priced against the fixer's prompt plus the re-reviewer's",
+              _vplan["estimate"]["prompt_frame_tokens"] == _af_frame + _vp_frame,
+              f"{_vplan['estimate']['prompt_frame_tokens']} != {_af_frame}+{_vp_frame}")
+        check("...and a code review's fix against the code reviewer's, not the assessor's",
+              _code_plan["estimate"]["prompt_frame_tokens"] == _af_frame + _cd_frame,
+              f"{_code_plan['estimate']['prompt_frame_tokens']} != {_af_frame}+{_cd_frame}")
+        check("the fixer's own prompt frame is measured, not the reviewer's",
+              _af_frame != _cd_frame and _af_frame > 0,
+              f"auto-fix={_af_frame} code={_cd_frame} -- these were the same number until "
+              f"`_frame_tokens` gained an auto-fix branch, so Apply Fixes was quoted "
+              f"against a prompt it never sends")
+        check("the file's content is counted for both calls, since both carry it whole",
+              _vplan["estimate"]["est_input_tokens"]
+              > 2 * (_vplan["estimate"]["est_input_tokens"] - _af_frame - _vp_frame) - 1,
+              str(_vplan["estimate"]["est_input_tokens"]))
+        check("...and the ceiling allows the fixer its full output budget",
+              _vplan["estimate"]["max_output_tokens_per_call"]
+              == review_estimate.MAX_OUTPUT_TOKENS["auto-fix"] == 32000,
+              str(_vplan["estimate"]["max_output_tokens_per_call"]))
+        check("both halves are still reported as two calls per file",
+              _vplan["calls"] == 2, str(_vplan["calls"]))
+
+        # A quote must never be free of charge for work that costs money.
+        check("combining two quotes sums the money rather than taking one of them",
+              review_estimate.combine(
+                  {"expected_usd": 1.0, "ceiling_usd": 2.0, "calls": 1},
+                  {"expected_usd": 0.5, "ceiling_usd": 1.0, "calls": 1},
+              )["expected_usd"] == 1.5)
+        check("...and reports the price as estimated if either half was",
+              review_estimate.combine(
+                  {"expected_usd": 1.0, "price_is_estimated": False, "calls": 1},
+                  {"expected_usd": 1.0, "price_is_estimated": True, "calls": 1},
+              )["price_is_estimated"] is True,
+              "a quote that hides that its price table was guessed is worse than one that "
+              "says so")
+        check("...and an empty combine is empty, not a zero-dollar quote",
+              review_estimate.combine() == {} and review_estimate.combine(None, {}) == {})
+
+        # ── A VAPT of a pull request can be fixed in that pull request ───────
+        _vpr = source_bundle.from_files(
+            [{"path": "app/auth.py", "content": APP_FILES["app/auth.py"]}],
+            label="acme/portal#42")
+        _vpr.source_type = "github_pr"
+        _vpr.ref = "https://github.com/acme/portal"
+        _vpr.meta = {"commit_sha": "d" * 40, "head_branch": "feature/login",
+                     "pr_number": 42, "head_repo_full_name": "acme/portal",
+                     "base_repo_full_name": "acme/portal"}
+        _vpr_rid = database.save_review(
+            "vapt", "fix", "s", "c",
+            {"findings": _copy.deepcopy(VAPT_FIX_FINDINGS[:1]), "gate_status": "Red"})
+        _store.record(_vpr_rid, _vpr, retention_days=0)
+        _vpr_outs = {o["id"]: o for o in fix_apply.plan(
+            _vpr_rid,
+            [json.loads(database.get_review(_vpr_rid)["result_json"])["findings"][0]["id"]],
+        )["outputs"]}
+        check("a VAPT of a pull request can be fixed in that pull request",
+              "same_pr" in _vpr_outs and not _vpr_outs["same_pr"].get("unavailable"),
+              str(sorted(_vpr_outs)))
+        check("...and names the branch the fix would land on",
+              "feature/login" in _vpr_outs["same_pr"]["label"],
+              _vpr_outs["same_pr"]["label"])
+        check("...and can open a new pull request instead",
+              {"pr", "branch"} <= set(_vpr_outs), str(sorted(_vpr_outs)))
+
+        # ── The fixer is told how the vulnerability is exploited ────────────
+        from backend.agents.developer_intelligence.autofix_agent import AutoFixAgent as _AFA
+        _desc_v = _AFA._describe_finding(VAPT_FIX_FINDINGS[0])
+        check("the fixer is given the CWE and the OWASP category",
+              "CWE-89" in _desc_v and "A03:2021" in _desc_v, _desc_v[:120])
+        check("...and how the vulnerability is actually reached",
+              "How it is exploited" in _desc_v and "crafted username" in _desc_v,
+              "a patch that sanitises the wrong end of the path closes nothing, and the "
+              "attack scenario is the only field that says which end is which")
+        check("...and the proof of concept, which is the shortest statement of the bug",
+              "Proof of concept" in _desc_v and "OR 1=1" in _desc_v, _desc_v[-200:])
+        _desc_c = _AFA._describe_finding(
+            {"severity": 5, "risk_level": "Critical", "control_id": "SEC-008",
+             "title": "SQL injection", "line_start": 4, "evidence": "SELECT",
+             "description": "concat", "recommendation": "parameterise"})
+        check("a code-review finding reads exactly as it did before",
+              _desc_c == ("- [5/5 Critical] SEC-008 SQL injection\n"
+                          "  Location: line 4\n"
+                          "  Offending code (verbatim):\n    SELECT\n"
+                          "  Why: concat\n"
+                          "  Recommended fix: parameterise"),
+              repr(_desc_c))
+
+        # ── The re-review is done by the agent that found the problem ───────
+        _called29 = []
+
+        class _Agent29:
+            def __init__(self, name, findings):
+                self._name, self._findings = name, findings
+
+            def review_code(self, files, context=""):
+                _called29.append("code")
+                return {"findings": self._findings, "gate_status": "Red"}
+
+            def run_vapt(self, files, context=""):
+                _called29.append("vapt")
+                return {"findings": self._findings, "gate_status": "Red"}
+
+        class _Orch29:
+            def __init__(self, findings):
+                self.code_agent = _Agent29("code", findings)
+                self.vapt_agent = _Agent29("vapt", findings)
+
+        _p29 = {"path": "app/auth.py", "fixed_content": "def login(u, p):\n    return 1\n"}
+        _afp._verify_patch(_Orch29([]), dict(_p29), "")
+        check("a fix with no review type stated is still re-reviewed by the code reviewer",
+              _called29 == ["code"],
+              "Auto-Fix on a pull request must reach exactly the code path it always did")
+        _called29.clear()
+        _afp._verify_patch(_Orch29([]), dict(_p29), "", review_agent="vapt")
+        check("a VAPT fix is re-reviewed by the vulnerability assessor",
+              _called29 == ["vapt"], str(_called29))
+        _called29.clear()
+
+        # ── A Critical that was already there does not block the patch ──────
+        #
+        # This is the check that matters most, because getting it wrong is invisible in both
+        # directions. Too strict and every VAPT patch is thrown away -- a file with three
+        # vulnerabilities where you fix one still has two Criticals in it, truthfully
+        # reported. Too loose and a vulnerability the fixer introduced ships.
+        _old_crit = {"severity": 5, "title": "SQL injection in login",
+                     "fingerprint": "known-fp-1", "evidence_verified": True}
+        _new_crit = {"severity": 5, "title": "Command injection in the new sanitiser",
+                     "fingerprint": "fresh-fp-9", "evidence_verified": True}
+
+        _v_old = _afp._verify_patch(_Orch29([_old_crit]), dict(_p29), "",
+                                    review_agent="vapt",
+                                    known_fingerprints={"known-fp-1"})
+        check("a Critical the original review already reported does not block the patch",
+              _v_old["blocked"] is False, str(_v_old))
+        check("...but is reported, so passing the guard is not read as the file being clean",
+              _v_old.get("carried_over") == ["SQL injection in login"],
+              str(_v_old.get("carried_over")))
+
+        _v_new = _afp._verify_patch(_Orch29([_new_crit]), dict(_p29), "",
+                                    review_agent="vapt",
+                                    known_fingerprints={"known-fp-1"})
+        check("a Critical the original review did NOT report blocks the patch",
+              _v_new["blocked"] is True, str(_v_new))
+        check("...and says it was not in the original review, rather than merely 'still'",
+              "did not report" in _v_new["reason"], _v_new["reason"])
+        check("...and names it",
+              _v_new.get("introduced") == ["Command injection in the new sanitiser"],
+              str(_v_new.get("introduced")))
+
+        _v_mixed = _afp._verify_patch(_Orch29([_old_crit, _new_crit]), dict(_p29), "",
+                                      review_agent="vapt",
+                                      known_fingerprints={"known-fp-1"})
+        check("one old and one new Critical still blocks, on the new one",
+              _v_mixed["blocked"] is True
+              and _v_mixed["introduced"] == ["Command injection in the new sanitiser"],
+              str(_v_mixed))
+
+        _v_nofp = _afp._verify_patch(_Orch29([_old_crit]), dict(_p29), "",
+                                     review_agent="vapt")
+        check("with no fingerprints supplied, every Critical blocks as it always did",
+              _v_nofp["blocked"] is True,
+              "a caller that cannot say what was there before must get the strict rule, "
+              "not the lenient one")
+
+        # Fingerprints are grouped per file. Pooling them would let an old vulnerability in
+        # one file excuse a new one in another.
+        _guard29 = fix_apply._guard_patches(
+            _Orch29([_old_crit]),
+            [{"path": "app/admin.py", "fixed_content": "x = 1\n"}],
+            "", review_agent="vapt",
+            prior_findings=[{"file_path": "app/auth.py", "fingerprint": "known-fp-1"}])
+        check("a fingerprint known in one file does not excuse a Critical in another",
+              not _guard29["safe"] and _guard29["blocked"],
+              str(_guard29)[:200])
+        _guard29b = fix_apply._guard_patches(
+            _Orch29([_old_crit]),
+            [{"path": "./app/auth.py", "fixed_content": "x = 1\n"}],
+            "", review_agent="vapt",
+            prior_findings=[{"file_path": "app/auth.py", "fingerprint": "known-fp-1"}])
+        check("...and a leading ./ on either side is the same file, not a different one",
+              len(_guard29b["safe"]) == 1, str(_guard29b)[:200])
+        check("the guard reports which agent re-read the patch",
+              (_guard29b["safe"][0].get("post_fix_review") or {}).get("reviewed_by") == "vapt",
+              str(_guard29b["safe"][0].get("post_fix_review")))
+
+        # ── Driven through the real route, with a VAPT review id ───────────
+        _vroute = client.post(f"/api/reviews/{_vapt_rid}/fix/plan",
+                              json={"finding_ids": [_VID["SQL injection in login"]]},
+                              headers=UI)
+        check("the fix-plan route accepts a VAPT review, not only a code review",
+              _vroute.status_code == 200, f"{_vroute.status_code}: {_vroute.text[:200]}")
+        check("...and it calls no model, so a quote is always free",
+              (_vroute.json().get("estimate") or {}).get("calls", 0) > 0
+              and _vroute.json()["files_to_change"] == 1, _vroute.text[:200])
 
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")

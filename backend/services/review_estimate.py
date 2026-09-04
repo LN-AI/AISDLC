@@ -49,7 +49,10 @@ MAX_OUTPUT_TOKENS = {
     "code": 16000,
     "vapt": 16000,
     "security": 8000,
-    "auto-fix": 16000,
+    # 32000, not 16000: `AutoFixAgent.MAX_OUTPUT_TOKENS` is 32000 because a fix call returns
+    # a whole rewritten file, not a findings list. This key was dormant until Apply Fixes
+    # started pricing its own half of the quote, so the wrong number never reached a screen.
+    "auto-fix": 32000,
     "github-pr-review": 16000,
 }
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
@@ -76,6 +79,14 @@ def _frame_tokens(agent: str) -> int:
         if agent == "vapt":
             from backend.agents.base_agent import VAPT_TOOL_SCHEMA as schema
             from backend.agents.security_intelligence.vapt_agent import VAPT_SYSTEM_PROMPT as prompt
+        elif agent == "auto-fix":
+            # A fix call is not a review call and its frame is not the reviewer's. Before
+            # this branch existed, `agent="auto-fix"` fell through to the code reviewer's
+            # prompt below — so Apply Fixes was quoted against a prompt it never sends.
+            from backend.agents.developer_intelligence.autofix_agent import (
+                AUTOFIX_TOOL_SCHEMA as schema,
+                SYSTEM_PROMPT as prompt,
+            )
         elif agent == "security":
             from backend.agents.base_agent import SECURITY_REVIEW_TOOL_SCHEMA as schema
             from backend.agents.security_intelligence.security_review_agent import (
@@ -155,6 +166,47 @@ def for_chunks(
         "output_sample_size": expected["sample_size"],
         "prompt_frame_tokens": frame,
     }
+
+
+def combine(*quotes: Dict[str, Any]) -> Dict[str, Any]:
+    """Total a run whose calls do not all go to the same agent.
+
+    Apply Fixes is the case this exists for: the fix call carries the fixer's prompt and can
+    return a whole rewritten file, while the re-check that follows it carries the *reviewer's*
+    prompt and returns a findings list. Pricing both halves off one agent means one of them
+    is quoted against a prompt it never sends.
+
+    Dollars are summed rather than re-derived, which is sound because `band` is linear in
+    tokens and has no per-call minimum — the same reason `modernization/estimate.roll_up`
+    sums per-unit costs. `model` and `price_is_estimated` come from the parts: they describe
+    the price table used, not the size of the work, so a disagreement between halves would
+    mean two different models, and the caller needs to see the estimated flag if *either*
+    half was estimated.
+    """
+    live = [q for q in quotes if q]
+    if not live:
+        return {}
+    if len(live) == 1:
+        return dict(live[0])
+    summed = {
+        "calls": sum(int(q.get("calls") or 0) for q in live),
+        "chunks": max(int(q.get("chunks") or 0) for q in live),
+        "est_input_tokens": sum(int(q.get("est_input_tokens") or 0) for q in live),
+        "est_output_tokens": sum(int(q.get("est_output_tokens") or 0) for q in live),
+        # A per-call figure cannot be summed. The largest of the parts is the honest answer
+        # to "how big can one response be", which is what this number is for.
+        "max_output_tokens_per_call": max(
+            int(q.get("max_output_tokens_per_call") or 0) for q in live),
+        "expected_usd": round(sum(float(q.get("expected_usd") or 0.0) for q in live), 6),
+        "ceiling_usd": round(sum(float(q.get("ceiling_usd") or 0.0) for q in live), 6),
+        "model": live[0].get("model", ""),
+        "price_is_estimated": any(bool(q.get("price_is_estimated")) for q in live),
+        "output_basis": " + ".join(
+            str(q.get("output_basis") or "") for q in live if q.get("output_basis")),
+        "output_sample_size": min(int(q.get("output_sample_size") or 0) for q in live),
+        "prompt_frame_tokens": sum(int(q.get("prompt_frame_tokens") or 0) for q in live),
+    }
+    return summed
 
 
 def for_bundle(bundle, agent: str = "code", model: str = "", extra_calls: int = 0) -> Dict[str, Any]:

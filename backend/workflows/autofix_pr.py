@@ -12,7 +12,7 @@ code review back even when no fix was produced. Individual file fetches are also
 tolerated — a deleted/binary/renamed file is skipped rather than failing the run.
 """
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from backend import database
 from backend.services import agent_guard, code_chunker, guardrail_service
@@ -206,14 +206,28 @@ def run(orch, pr_url: str, jira_ticket: str = "", max_files: int = 5) -> Dict[st
     }
 
 
-def _verify_patch(orch, patch: dict, context: str) -> dict:
+def _verify_patch(orch, patch: dict, context: str, review_agent: str = "code",
+                  known_fingerprints: Optional[set] = None) -> dict:
     """Re-review a patch before it is committed.
 
-    Blocks on a Critical only. The bar has to be set where it does not turn Auto-Fix off: a
-    patched file will still carry Moderate findings — the ones the original review reported
-    and this patch was never asked to fix — so blocking on those would reject every patch.
-    A *new* Critical in code the tool just wrote is a different thing, and is the case this
-    exists to stop.
+    Blocks on a Critical that was **not already there**. The bar has to be set where it does
+    not turn Auto-Fix off: a patched file still carries the findings this patch was never
+    asked to fix, so blocking on those would reject good patches — and on a vulnerability
+    assessment, where a file with three vulnerabilities is ordinary, blocking on any Critical
+    would reject nearly every patch. A *new* Critical in code the tool just wrote is a
+    different thing, and is the case this exists to stop. `known_fingerprints` is what the
+    original review recorded for this file; anything matching one of those was there before
+    the fixer touched the file and is reported, not blocked on.
+
+    Omit `known_fingerprints` and every Critical blocks, which is what this did before and
+    what a caller that cannot supply the original review's findings should still get.
+
+    `review_agent` picks who does the re-review: the vulnerability assessor for a VAPT fix,
+    the code reviewer otherwise. It matters because the promise made to the user is that the
+    patch was re-read by *the reviewer that found the problem*, and because a code reviewer
+    asked whether an attack path is closed is being asked a question it was not built for.
+    Both agents return `findings` with an integer `severity` and the same
+    `evidence_verified` flag, so the filter below stays one expression.
 
     Fails **open** on an error, deliberately. If the verification call itself fails we are no
     worse off than before this check existed, and the secret scan still ran; refusing the
@@ -221,14 +235,21 @@ def _verify_patch(orch, patch: dict, context: str) -> dict:
     unavailable. The outcome is recorded either way, so a silent skip is visible.
     """
     path = patch.get("path", "")
+    reread_context = (
+        f"{context}\n\nThis file has just been modified by an automated fix. Review "
+        f"the result as it now stands."
+    ).strip()
     try:
-        review = orch.code_agent.review_code(
-            files=[{"path": path, "content": patch.get("fixed_content", "")}],
-            context=(
-                f"{context}\n\nThis file has just been modified by an automated fix. Review "
-                f"the result as it now stands."
-            ).strip(),
-        )
+        if review_agent == "vapt":
+            review = orch.vapt_agent.run_vapt(
+                files=[{"path": path, "content": patch.get("fixed_content", "")}],
+                context=reread_context,
+            )
+        else:
+            review = orch.code_agent.review_code(
+                files=[{"path": path, "content": patch.get("fixed_content", "")}],
+                context=reread_context,
+            )
     except Exception as exc:
         logger.exception("Post-fix review failed for %s — committing on the secret scan alone", path)
         return {"checked": False, "blocked": False, "reason": f"verification skipped: {type(exc).__name__}"}
@@ -238,22 +259,44 @@ def _verify_patch(orch, patch: dict, context: str) -> dict:
         f for f in findings
         if (f.get("severity") == 5) and f.get("evidence_verified") is not False
     ]
+    # Pre-existing Criticals are reported, not blocked on. Matched by fingerprint rather than
+    # by title because the fingerprint is what identifies a finding across runs everywhere
+    # else in this codebase (`finding_pipeline.fingerprint`). It includes the model-written
+    # title, so a re-worded description of the same vulnerability will not match and the
+    # patch is rejected — the safe direction to fail, but it is why a rejection says
+    # "appears to be new" rather than asserting the fixer introduced it.
+    carried = []
+    if known_fingerprints:
+        fresh = []
+        for f in criticals:
+            if (f.get("fingerprint") or "") in known_fingerprints:
+                carried.append(f.get("title", "unnamed"))
+            else:
+                fresh.append(f)
+        criticals = fresh
     if criticals:
         titles = [f.get("title", "unnamed") for f in criticals[:3]]
         return {
             "checked": True,
             "blocked": True,
             "reason": (
-                f"Blocked: the patched file still contains {len(criticals)} Critical "
-                f"finding(s) — {', '.join(titles)}."
+                f"Blocked: re-reviewing the patched file found {len(criticals)} Critical "
+                f"finding(s) that the original review did not report — {', '.join(titles)}."
             ),
             "introduced": titles,
+            "carried_over": carried,
+            "reviewed_by": review_agent,
             "gate_status": review.get("gate_status"),
             "review_id": review.get("review_id"),
         }
     return {
         "checked": True,
         "blocked": False,
+        # Named so a reader of the result can see that a Critical the patch was never asked
+        # to fix is still in the file. Passing the guard is not the same as the file being
+        # clean, and reporting nothing here would let it read that way.
+        "carried_over": carried,
+        "reviewed_by": review_agent,
         "gate_status": review.get("gate_status"),
         "findings_remaining": len(findings),
         "review_id": review.get("review_id"),

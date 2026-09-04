@@ -2212,6 +2212,208 @@ await checkAsync('every screen in the table names a renderer that exists', async
   }
 });
 
+section('A vulnerability can be sent for fixing from the screen that found it');
+
+// Apply Fixes needs three things and the VAPT screen had all three: `fix_apply` never looked
+// at the review type, a VAPT assessment records its source through the same bundle path a
+// code review does, and its findings carry the verified quote and the file path. What it did
+// not have was a renderer that armed any of it -- `renderVAPTResult` never set `_fixReviewId`
+// and never fetched an inventory, so `#vapt-sources` was a container nothing ever filled.
+//
+// The arming now lives in one function, `armResultActions`, called by both renderers. These
+// checks exist because the last three defects on this path were all of the form "the other
+// renderer does it differently".
+
+const _VAPT_FIXABLE = {
+  review_type: 'vapt', review_id: 'rv-vapt', gate_status: 'Red', risk_score: 88,
+  summary: 'One injection path reachable without authentication.',
+  attack_surface_summary: 'One unauthenticated POST endpoint.',
+  findings: [
+    { id: 'v1', vuln_id: 'VLN-001', title: 'SQL injection in login', severity: 5,
+      risk_level: 'Critical', cvss_score: 9.8,
+      cvss_vector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H',
+      cwe_id: 'CWE-89', owasp_category: 'A03:2021 Injection', control_id: 'VAPT-003',
+      file_path: 'app/auth.py', line_start: 4, evidence: 'SELECT * FROM u WHERE n=',
+      evidence_verified: true, is_blocking: true,
+      affected_component: 'POST /login',
+      attack_scenario: 'An unauthenticated caller posts a crafted username.',
+      proof_of_concept: "curl -X POST /login -d \"u=' OR 1=1--\"",
+      description: 'The query is built by concatenation.',
+      recommendation: 'Use a parameterised query.' },
+    // No file: VAPT legitimately assesses an OpenAPI spec, an architecture description or a
+    // list of URLs, and those findings are real and unpatchable.
+    { id: 'v2', vuln_id: 'VLN-002', title: 'No rate limit on the auth endpoint',
+      severity: 4, risk_level: 'High', cvss_score: 7.5, control_id: 'VAPT-020',
+      affected_component: 'POST /login', evidence: 'no limiter',
+      evidence_verified: true, description: 'Nothing throttles login.' },
+  ],
+};
+
+const tick2 = () => new Promise(r => setTimeout(r, 0));
+
+await checkAsync('a VAPT assessment arms the fix bar and fetches its own file list', async () => {
+  vm.runInContext('_entitledProducts = null', sandbox);
+  elements.delete('vapt-sources');
+  elements.delete('vapt-result');
+  fetchLog.length = 0;
+  sandbox.renderVAPTResult('vapt-result', _VAPT_FIXABLE);
+  await tick2();
+  assert(vm.runInContext('_fixReviewId', sandbox) === 'rv-vapt',
+    'the fix bar has no review to act on, so ticking a vulnerability would do nothing');
+  assert(vm.runInContext('_fixCapable', sandbox) === true,
+    'a VAPT review records its source exactly as a code review does');
+  const asked = fetchLog.filter(u => String(u).includes('/sources'));
+  assert(asked.length === 1,
+    `expected one inventory fetch for the assessment on screen, got ${asked.length} -- `
+    + 'this panel was empty on every VAPT run since it was added');
+  assert(String(asked[0]).includes('rv-vapt'),
+    `the inventory fetched belongs to another review: ${asked[0]}`);
+});
+
+await checkAsync('...offering a tickable box on the vulnerability that has a file', async () => {
+  const html = document.getElementById('vapt-result').innerHTML;
+  assert(html.includes('fix-check'), 'no vulnerability can be selected for fixing');
+  assert(html.includes('v1'), 'the tickable box does not carry the finding id');
+  assert(/fix-pick-compact[\s\S]{0,400}value="v1"/.test(html),
+    'the box is not the compact header variant -- these cards are collapsed by default, so '
+    + 'a box in the body needs every card expanded before anything can be ticked');
+  assert(html.includes('event.stopPropagation()'),
+    'ticking the box would also collapse the card being read');
+});
+
+await checkAsync('...and no tickable box, but a reason, on the one with no file', async () => {
+  const html = document.getElementById('vapt-result').innerHTML;
+  assert((html.match(/class="fix-check"/g) || []).length === 1,
+    'a vulnerability that names no file was offered for fixing, and `fix_apply` would '
+    + 'refuse it after the quote');
+  assert(html.includes('Cannot be fixed automatically'),
+    'the unpatchable vulnerability says nothing about why -- a missing control reads as a '
+    + 'bug, a stated reason reads as an answer');
+  assert(html.includes('nothing to patch'), 'the reason itself is missing');
+});
+
+await checkAsync('...without trading away the substance of the assessment', async () => {
+  // The lesson from routing findings through a shared renderer: a waiver button is not
+  // worth the CVSS vector, the attack scenario and the proof of concept.
+  const html = document.getElementById('vapt-result').innerHTML;
+  for (const [what, needle] of [
+    ['the CVSS score', 'CVSS 9.8'],
+    ['the CVSS vector', 'CVSS:3.1/AV:N'],
+    ['the CWE', 'CWE-89'],
+    ['the OWASP category', 'A03:2021'],
+    ['the attack scenario', 'crafted username'],
+    ['the proof of concept', 'OR 1=1'],
+    ['the affected component', 'POST /login'],
+    ['the verified-evidence mark', 'SELECT * FROM u WHERE n='],
+  ]) {
+    assert(html.includes(needle), `${what} is gone from the assessment`);
+  }
+  assert(html.includes('setFindingStatus') || html.includes('waive'),
+    'the waiver control was lost while adding the fix control');
+  // Each exactly once. Both were rendered twice per card -- the detail grid, plus an older
+  // inline-styled copy below it that predates the grid -- and the duplicate read as a long
+  // card rather than as a bug. It also silently propped up the check above: deleting the
+  // grid copy left the test green.
+  assert((html.match(/CVSS:3\.1\/AV:N/g) || []).length === 1,
+    'the CVSS vector is rendered more than once in the same card');
+  assert((html.match(/OR 1=1/g) || []).length === 1,
+    'the proof of concept is rendered more than once in the same card');
+});
+
+await checkAsync('...and says what the fix will come back as', async () => {
+  const html = document.getElementById('vapt-result').innerHTML;
+  assert(/pull request/i.test(html) && /zip/i.test(html) && /diff/i.test(html),
+    'the screen offers a fix without saying what arrives -- which is the first question');
+  assert(/compiles or runs/i.test(html) || /Nothing here compiles/i.test(html),
+    'a security fix must not read as verified code: nothing in this pipeline builds or '
+    + 'runs the patch');
+});
+
+await checkAsync('a plan without Auto-Fix hides the control and says so', async () => {
+  vm.runInContext("_entitledProducts = new Set(['vapt'])", sandbox);
+  elements.delete('vapt-result');
+  elements.delete('vapt-sources');
+  sandbox.renderVAPTResult('vapt-result', _VAPT_FIXABLE);
+  await tick2();
+  const html = document.getElementById('vapt-result').innerHTML;
+  assert(vm.runInContext('_fixCapable', sandbox) === false,
+    'a fix is entitlement-checked against `auto-fix`, so this selection would be refused '
+    + 'after the quote');
+  assert(!html.includes('fix-check'), 'a tickable box on a plan that cannot run the fix');
+  assert(/does not include/i.test(html),
+    'the control was withheld silently -- a reader who knows the feature exists is left '
+    + 'hunting for it');
+  assert(html.includes('waived') || html.includes('setFindingStatus'),
+    'withholding the fix control must not withhold the one that still works');
+  vm.runInContext('_entitledProducts = null', sandbox);
+});
+
+await checkAsync('...and Code Review says the same thing, not just VAPT', async () => {
+  // The entitlement gap was never VAPT-specific: a Code-Review-only plan has always shown
+  // the checkbox and been refused after the free quote.
+  vm.runInContext("_entitledProducts = new Set(['code'])", sandbox);
+  elements.delete('code-result');
+  elements.delete('code-sources');
+  sandbox.renderResult('code-result', {
+    review_type: 'code', review_id: 'rv-ent', gate_status: 'Red', summary: 'x',
+    findings: [{ id: 'e1', title: 'SQLi', severity: 5, file_path: 'a.py',
+                 evidence: 'q', evidence_verified: true }],
+  });
+  await tick2();
+  const html = document.getElementById('code-result').innerHTML;
+  assert(!html.includes('fix-check'), 'a tickable box on a plan without Auto-Fix');
+  assert(/does not include/i.test(html),
+    'Code Review withheld the control silently while VAPT explained itself');
+  vm.runInContext('_entitledProducts = null', sandbox);
+});
+
+await checkAsync('a screen that never had a fix control says nothing about one', async () => {
+  vm.runInContext("_entitledProducts = new Set(['requirement'])", sandbox);
+  elements.delete('req-result');
+  sandbox.renderResult('req-result', {
+    review_type: 'requirement', review_id: 'rv-req2', gate_status: 'Amber', summary: 'x',
+    findings: [{ id: 'q2', title: 'Ambiguous', severity: 3, file_path: 'reqs/a.md',
+                 evidence: 'fast', evidence_verified: true }],
+  });
+  await tick2();
+  const html = document.getElementById('req-result').innerHTML;
+  assert(!/does not include/i.test(html),
+    'nineteen screens never had a fix control, so explaining its absence is noise about a '
+    + 'feature that was never on offer here');
+  vm.runInContext('_entitledProducts = null', sandbox);
+});
+
+await checkAsync('a VAPT result with no review id arms nothing', async () => {
+  elements.delete('vapt-result');
+  fetchLog.length = 0;
+  sandbox.renderVAPTResult('vapt-result', { ...(_VAPT_FIXABLE), review_id: undefined });
+  await tick2();
+  assert(vm.runInContext('_fixCapable', sandbox) === false,
+    'a fix with no review id would be sent to /api/reviews/undefined/fix');
+  assert(fetchLog.filter(u => String(u).includes('/sources')).length === 0,
+    'an inventory was fetched for a review that has no id');
+});
+
+await checkAsync('the Agent Hub does not fetch an inventory into a screen you are not on', async () => {
+  // The hub renders a review into its own container. Fetching the inventory would paint it
+  // into the owning screen's panel, where it sits disagreeing with the result beside it.
+  elements.delete('code-sources');
+  elements.delete('_hub_inner_code');
+  fetchLog.length = 0;
+  sandbox.renderResult('_hub_inner_code', {
+    review_type: 'code', review_id: 'rv-hub', gate_status: 'Red', summary: 'x',
+    findings: [{ id: 'h1', title: 'SQLi', severity: 5, file_path: 'a.py',
+                 evidence: 'q', evidence_verified: true }],
+  }, false);
+  await tick2();
+  assert(fetchLog.filter(u => String(u).includes('/sources')).length === 0,
+    'the hub fetched a file inventory into the Code Review screen behind it');
+  assert(document.getElementById('code-sources').innerHTML === '',
+    "the Code Review screen's panel was written to from the Agent Hub");
+  assert(vm.runInContext('_fixCapable', sandbox) === true,
+    'the hub may still fix -- the fix bar is mounted on the body and works from any screen');
+});
+
 section('The audit-ready report can be handed to an auditor');
 
 // This screen calls itself the audit-ready report and offered no way to get it out. The
