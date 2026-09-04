@@ -275,12 +275,23 @@ async def legacy_product_guard(request, call_next):
     # runs — every agent screen except Code Review and VAPT posts here — so a per-agent run
     # history had nothing but `review_type` to match on, and the row was labelled "before
     # agents were recorded" on a screen where the agent was perfectly well known.
+    # `collect_saved_reviews` is the only one of these that reports *back*. The cost of a
+    # run is not known until the model calls finish, which is long after `save_review` has
+    # written and serialized the row — so a review could never carry its own cost, and
+    # reopening a run from history showed a set of findings with no indication of what it
+    # cost or which model produced it. `usage_events` has had a `review_id` column for this
+    # link all along; on these routes it was always NULL, because this middleware never
+    # learned which review the handler wrote.
     with context.bind_project(subject.project_id, subject.project_name,
                               product_id=product_id), \
             agent_guard.hold_budget_reservation(subject), \
-            llm_gateway.track_usage():
+            llm_gateway.track_usage(), \
+            context.collect_saved_reviews():
         response = await call_next(request)
         usage = llm_gateway.get_tracked_usage()
+        # Read inside the block for the same reason `usage` is: the collector resets on
+        # exit, so reading it afterwards always yields nothing.
+        saved_reviews = context.saved_review_ids()
 
     if rate:
         response.headers["X-RateLimit-Limit-Minute"] = str(rate["limit_per_minute"])
@@ -354,6 +365,12 @@ async def legacy_product_guard(request, call_next):
             cost_estimated=agent_guard._is_estimated(model),
             project_id=subject.project_id,
             project_name=subject.project_name,
+            # The **last** review saved, when a request saved more than one. A composite
+            # like the Core SDLC Review writes each stage's review and then its own on top,
+            # so the last is the one whose result the caller was handed and the one a
+            # reader reopens from history. The stages keep no cost of their own, which is
+            # honest: they were not separately metered, they were parts of a single call.
+            review_id=saved_reviews[-1] if saved_reviews else None,
             status="ok" if response.status_code < 400 else "error",
         )
     except Exception:

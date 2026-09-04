@@ -373,6 +373,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_usage_events_product_time
             ON usage_events(product_id, created_at);
 
+        -- What a stored run cost is read from here, once per reopened run and once per
+        -- page of run history. Without the index that is a full scan of the billing
+        -- ledger, which is the fastest-growing table in the schema.
+        CREATE INDEX IF NOT EXISTS idx_usage_events_review
+            ON usage_events(review_id);
+
         -- Project-scoped quota checks run on every guarded call once a project has a plan.
         CREATE INDEX IF NOT EXISTS idx_usage_events_project_time
             ON usage_events(project_id, created_at);
@@ -596,6 +602,9 @@ def save_review(
     result: Dict[str, Any],
 ) -> str:
     review_id = str(uuid.uuid4())
+    # Reported back to whatever is metering this request, so the ledger row it writes can
+    # name this review and history can later say what the run cost. See backend/context.py.
+    context.note_review_saved(review_id)
     created_at = datetime.utcnow().isoformat()
     # Whose work this is. `project_name` is free text a user typed into a form and means
     # nothing to governance; the real project is the one the call was authorised against,
@@ -819,6 +828,55 @@ def list_reviews(limit: int = 20, offset: int = 0,
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_review_spend(review_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """What each of these runs cost, read from the billing ledger. Keyed by review id.
+
+    **Read, never stored a second time.** The cost is not a column on `reviews`: it is
+    computed once by `agent_guard._price_usage` and written once to `usage_events`, and a
+    copy on the review row would be a second number that could disagree with the invoice.
+    Reviews with no ledger row are simply absent from the result rather than present with
+    zeroes — a run that predates this link, or one served entirely from cache, cost an
+    unknown amount and not nothing, and "$0.00" is a claim.
+
+    Summed rather than taken from one row, because a review can be metered more than once:
+    a run that fails and is retried leaves a non-billable row beside the billable one, and
+    `billable_cost_usd` is what a budget actually moved by.
+    """
+    ids = [r for r in (review_ids or []) if r]
+    if not ids:
+        return {}
+    conn = get_connection()
+    cursor = conn.cursor()
+    out: Dict[str, Dict[str, Any]] = {}
+    # Chunked: SQLite's default parameter ceiling is 999, and a history page is small but
+    # this is also called with whatever a caller asked for.
+    for start in range(0, len(ids), 500):
+        batch = ids[start:start + 500]
+        cursor.execute(
+            "SELECT review_id, SUM(calls) AS calls, SUM(input_tokens) AS input_tokens, "
+            "SUM(output_tokens) AS output_tokens, SUM(cost_usd) AS cost_usd, "
+            "SUM(CASE WHEN billable = 1 THEN cost_usd ELSE 0 END) AS billable_cost_usd, "
+            "MAX(cost_estimated) AS cost_estimated, MAX(model) AS model, "
+            "MAX(provider) AS provider "
+            f"FROM usage_events WHERE review_id IN ({','.join('?' * len(batch))}) "
+            "GROUP BY review_id",
+            tuple(batch),
+        )
+        for row in cursor.fetchall():
+            out[row["review_id"]] = {
+                "calls": row["calls"] or 0,
+                "input_tokens": row["input_tokens"] or 0,
+                "output_tokens": row["output_tokens"] or 0,
+                "cost_usd": round(row["cost_usd"] or 0.0, 6),
+                "billable_cost_usd": round(row["billable_cost_usd"] or 0.0, 6),
+                "cost_estimated": bool(row["cost_estimated"]),
+                "model": row["model"] or "",
+                "provider": row["provider"] or "",
+            }
+    conn.close()
+    return out
 
 
 def count_reviews(project_ids: Optional[List[str]] = None,

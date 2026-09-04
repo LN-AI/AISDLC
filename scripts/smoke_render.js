@@ -116,6 +116,9 @@ const sandbox = {
 };
 sandbox.globalThis = sandbox;
 sandbox.self = sandbox;
+// Held so a check can assert nobody left a replacement installed. See the guard at the end
+// of the paging section.
+const sharedFetch = sandbox.fetch;
 
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox, { filename: 'app.js' });
@@ -375,15 +378,35 @@ async function runPagingChecks() {
 
     let call = 0;
     fetchLog.length = 0;
-    sandbox.fetch = async (url) => {
-      fetchLog.push(url);
-      const body = call++ === 0 ? { reviews: [], count: 0, total: 0 } : fakePage(0, 4, 4);
-      return { ok: true, status: 200, json: async () => body, text: async () => '' };
-    };
-    await sandbox.loadRecentReviews();
-    assert(fetchLog.length === 2, `expected a retry, saw ${fetchLog.length} call(s)`);
-    assert(fetchLog[1].includes('offset=0'), `retry asked for ${fetchLog[1]}`);
-    assert(rangeEl().textContent === 'Showing 1–4 of 4', `label was "${rangeEl().textContent}"`);
+    // Saved and restored, like the other two temporary replacements in this file. It was
+    // not, and that made every test after this one read `fakePage(0, 4, 4)` no matter what
+    // it had just assigned to `nextFetchBody` -- silently, because a fixture from an
+    // unrelated test is still a plausible-looking response. The `finally` matters: an
+    // assertion below throws past a plain restore.
+    const savedFetch = sandbox.fetch;
+    try {
+      sandbox.fetch = async (url) => {
+        fetchLog.push(url);
+        const body = call++ === 0 ? { reviews: [], count: 0, total: 0 } : fakePage(0, 4, 4);
+        return { ok: true, status: 200, json: async () => body, text: async () => '' };
+      };
+      await sandbox.loadRecentReviews();
+      assert(fetchLog.length === 2, `expected a retry, saw ${fetchLog.length} call(s)`);
+      assert(fetchLog[1].includes('offset=0'), `retry asked for ${fetchLog[1]}`);
+      assert(rangeEl().textContent === 'Showing 1–4 of 4', `label was "${rangeEl().textContent}"`);
+    } finally {
+      sandbox.fetch = savedFetch;
+    }
+  });
+
+  check('the shared fetch stub is the one the rest of this file relies on', () => {
+    // A guard on the harness, not on the app. Three checks in this file swap `sandbox.fetch`
+    // for a closure over their own body; one of them used to leave it swapped, and the next
+    // test to depend on `nextFetchBody` got someone else's fixture instead. That is the kind
+    // of failure that reads as an application bug for an hour.
+    assert(sandbox.fetch === sharedFetch,
+      'a test replaced sandbox.fetch and did not restore it -- every later test that sets '
+      + '`nextFetchBody` is now reading a stale fixture from an unrelated check');
   });
 }
 
@@ -2412,6 +2435,112 @@ await checkAsync('the Agent Hub does not fetch an inventory into a screen you ar
     "the Code Review screen's panel was written to from the Agent Hub");
   assert(vm.runInContext('_fixCapable', sandbox) === true,
     'the hub may still fix -- the fix bar is mounted on the body and works from any screen');
+});
+
+section('A stored run says what it cost, or says it does not know');
+
+// The cost could never travel inside a stored result: it is not known until the model calls
+// finish, which is after the row has been written. It is read from the billing ledger and
+// folded into the same `_budget_stats` shape a live run carries, so the existing
+// transparency block draws it -- rather than a second renderer that could disagree with the
+// first about the same money.
+
+const _RUN_ROW = (spend) => ({
+  id: 'rv-hist-1', review_type: 'code', product_id: 'code',
+  created_at: '2026-09-01T09:30:00', gate_status: 'Red', findings_count: 2,
+  critical_count: 1, high_count: 1, input_summary: 'Reviewed app/auth.py',
+  ...(spend ? { spend } : {}),
+  result_json: JSON.stringify({
+    gate_status: 'Red', risk_score: 71, summary: 'One injection path.',
+    findings: [{ id: 'h1', title: 'SQLi', severity: 5, file_path: 'app/auth.py',
+                 line_start: 4, evidence: 'q = "x" + u', evidence_verified: true }],
+  }),
+});
+
+const _SPEND = {
+  cost_usd: 0.0412, billable_cost_usd: 0.0412, calls: 3,
+  input_tokens: 24100, output_tokens: 5300,
+  model: 'claude-sonnet-4-6', provider: 'anthropic', cost_estimated: false,
+};
+
+await checkAsync('reopening a run shows what that run cost', async () => {
+  vm.runInContext('_entitledProducts = null', sandbox);
+  elements.delete('code-result');
+  elements.delete('code-runs');
+  nextFetchBody = _RUN_ROW(_SPEND);
+  await sandbox.openAgentRun('code', 'rv-hist-1');
+  const html = document.getElementById('code-result').innerHTML;
+  assert(/0\.0412/.test(html),
+    'the run cost $0.0412 and the reopened view says nothing about it');
+  assert(html.includes('claude-sonnet-4-6'),
+    'whoever reads a stored set of findings is entitled to know what produced them');
+  assert(/3\b/.test(html), 'the call count is missing');
+});
+
+await checkAsync('...while being clear that reopening it cost nothing', async () => {
+  const html = document.getElementById('code-result').innerHTML;
+  assert(/called no model and cost nothing/i.test(html),
+    'without this a reader could take the figure for a fresh charge');
+  assert(/cost \$0\.0412 when it ran/i.test(html),
+    'the two costs -- what the run cost, and what reopening it cost -- have to be told '
+    + 'apart, or the number reads as a new charge');
+});
+
+await checkAsync('a run with no recorded cost says so, rather than showing $0.00', async () => {
+  elements.delete('code-result');
+  nextFetchBody = _RUN_ROW(null);
+  await sandbox.openAgentRun('code', 'rv-hist-1');
+  const html = document.getElementById('code-result').innerHTML;
+  assert(/not recorded against it/i.test(html),
+    'a run from before the cost was linked to its review cost an unknown amount, and '
+    + 'silence invites the reader to assume the feature is broken');
+  assert(!/\$0\.0000/.test(html) && !/\$0\.00\b/.test(html),
+    'a confident zero on a run whose cost nobody recorded is a false statement about money');
+});
+
+await checkAsync('the history list prices each run on its own card', async () => {
+  elements.delete('code-runs');
+  nextFetchBody = {
+    reviews: [
+      { id: 'a', review_type: 'code', product_id: 'code', gate_status: 'Red',
+        findings_count: 4, critical_count: 1, created_at: '2026-09-01T09:00:00',
+        input_summary: 'run a', spend: { cost_usd: 1.2345, calls: 9,
+                                         model: 'claude-sonnet-4-6' } },
+      { id: 'b', review_type: 'code', product_id: 'code', gate_status: 'Green',
+        findings_count: 0, created_at: '2026-08-30T09:00:00', input_summary: 'run b',
+        spend: { cost_usd: 0.0031, calls: 1, model: 'claude-sonnet-4-6' } },
+      { id: 'c', review_type: 'code', product_id: 'code', gate_status: 'Amber',
+        findings_count: 1, created_at: '2026-08-01T09:00:00', input_summary: 'run c' },
+    ],
+    count: 3, total: 3, limit: 30, offset: 0,
+  };
+  await sandbox.loadAgentRuns('code');
+  const html = document.getElementById('code-runs').innerHTML;
+  assert(html.includes('$1.2345'), 'the expensive run is not priced on its card');
+  assert(html.includes('$0.0031'),
+    'a sub-cent run rounded to $0.00 would read as free -- four decimals, not two');
+  const costs = (html.match(/class="run-cost"/g) || []).length;
+  assert(costs === 2,
+    `expected a cost on the two runs that have one, got ${costs} -- the third has no `
+    + 'ledger row and must show nothing rather than a zero');
+  assert(!/\$0\.0000/.test(html),
+    'the run with no recorded cost was priced at zero');
+});
+
+await checkAsync('...and says when a price was guessed rather than measured', async () => {
+  elements.delete('code-runs');
+  nextFetchBody = {
+    reviews: [{ id: 'd', review_type: 'code', product_id: 'code', gate_status: 'Green',
+                findings_count: 0, created_at: '2026-09-02T09:00:00',
+                input_summary: 'local model run',
+                spend: { cost_usd: 0.02, calls: 1, model: 'some-local-model',
+                         cost_estimated: true } }],
+    count: 1, total: 1, limit: 30, offset: 0,
+  };
+  await sandbox.loadAgentRuns('code');
+  const html = document.getElementById('code-runs').innerHTML;
+  assert(/no published price/i.test(html),
+    'an estimated cost shown as a measurement is the one way this figure can mislead');
 });
 
 section('The audit-ready report can be handed to an auditor');

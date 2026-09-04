@@ -2461,6 +2461,174 @@ def main():
               (_vroute.json().get("estimate") or {}).get("calls", 0) > 0
               and _vroute.json()["files_to_change"] == 1, _vroute.text[:200])
 
+        # ── 30. A stored run remembers what it cost ────────────────
+        #
+        # Reopening a run from history showed findings with no cost. The figure could never
+        # travel inside `result_json`: it is not known until the model calls finish, which
+        # is after `save_review` has written and serialized the row. `usage_events` has had
+        # a `review_id` column for this link all along, and on the synchronous routes it was
+        # always NULL because the middleware doing the metering never learned which review
+        # the handler wrote.
+        #
+        # The cost is **read** from the ledger, never copied onto the review row. A second
+        # copy of a billing figure is a second number that can disagree with the invoice.
+        section("30. A stored run remembers what it cost")
+
+        from backend import context as _ctx30
+
+        # ── The contextvar reports back across a worker thread ──────────────
+        #
+        # This is the subtle half. A synchronous FastAPI endpoint runs in a threadpool with
+        # a *copy* of the caller's context, so `ContextVar.set()` inside it is invisible to
+        # the middleware outside. The collector holds a mutable list and appends to it,
+        # which is the same trick `llm_gateway.track_usage` uses and for the same reason.
+        import contextvars as _cv30
+
+        def _save_in_child():
+            return database.save_review("code", "ctx", "s", "c",
+                                        {"findings": [], "gate_status": "Green"})
+
+        with _ctx30.collect_saved_reviews():
+            _child_ctx = _cv30.copy_context()
+            _child_rid = _child_ctx.run(_save_in_child)
+            check("A REVIEW SAVED IN A COPIED CONTEXT IS STILL REPORTED BACK",
+                  _ctx30.saved_review_ids() == [_child_rid],
+                  f"{_ctx30.saved_review_ids()} != [{_child_rid}] -- a plain ContextVar.set "
+                  f"here is invisible to the caller, which is why this uses a mutable list; "
+                  f"get it wrong and every synchronous route silently records no review id")
+        check("...and the collector is empty again outside its block",
+              _ctx30.saved_review_ids() == [], str(_ctx30.saved_review_ids()))
+        check("saving a review with nobody collecting is not an error",
+              bool(database.save_review("code", "nocollect", "s", "c", {"findings": []})),
+              "the smoke suites and scripts/ save reviews outside any request")
+
+        with _ctx30.collect_saved_reviews():
+            _a30 = database.save_review("security", "multi", "s", "c", {"findings": []})
+            _b30 = database.save_review("full", "multi", "s", "c", {"findings": []})
+            check("several reviews in one request are collected in order, newest last",
+                  _ctx30.saved_review_ids() == [_a30, _b30],
+                  str(_ctx30.saved_review_ids()))
+
+        # ── Driven through a real synchronous route, with the gateway metered ──
+        _plain30 = llm_gateway.call_tool
+
+        def _metered30(*a, **k):
+            llm_gateway._record_usage("anthropic", config.MODEL, 2100, 480)
+            return _plain30(*a, **k)
+
+        llm_gateway.call_tool = _metered30
+        try:
+            _before30 = {r["id"] for r in database.list_reviews(limit=200)}
+            _run30 = client.post("/api/review/requirement?project_name=Sources",
+                                 json={"content": "The system shall be quick.",
+                                       "context": ""},
+                                 headers=UI)
+            check("the metered run answered 200", _run30.status_code == 200,
+                  _run30.text[:200])
+            _new30 = [r for r in database.list_reviews(limit=200)
+                      if r["id"] not in _before30]
+            check("...and stored a review", len(_new30) == 1,
+                  str([r["id"] for r in _new30]))
+            _rid30 = _new30[0]["id"]
+
+            _spend30 = database.get_review_spend([_rid30])
+            check("THE RUN'S COST IS LINKED TO THE RUN", _rid30 in _spend30,
+                  "the ledger row named no review, so history has nothing to read and a "
+                  "reopened run shows findings with no cost -- which is the whole defect")
+            _s30 = _spend30[_rid30]
+            check("...with the tokens the gateway actually recorded",
+                  _s30["input_tokens"] >= 2100 and _s30["output_tokens"] >= 480,
+                  f"{_s30['input_tokens']} in / {_s30['output_tokens']} out")
+            check("...and at least one call",
+                  _s30["calls"] >= 1, str(_s30["calls"]))
+            check("THE STORED COST IS THE COST BILLED",
+                  abs(_s30["cost_usd"] - _ag._price_usage(
+                      {"calls": _s30["calls"], "input_tokens": _s30["input_tokens"],
+                       "output_tokens": _s30["output_tokens"]}, _s30["model"])) < 1e-6,
+                  f"{_s30['cost_usd']} is not what _price_usage says for the same tokens -- "
+                  f"a cost read any other way drifts from the invoice")
+            check("...and it agrees with the header the same run returned",
+                  abs(_s30["cost_usd"]
+                      - float(_run30.headers.get("X-Spend-Cost-USD", -1))) < 1e-6,
+                  f"ledger {_s30['cost_usd']} vs header "
+                  f"{_run30.headers.get('X-Spend-Cost-USD')} -- the live figure and the "
+                  f"remembered one must be one number, or reopening a run contradicts it")
+            check("...naming the model that answered",
+                  _s30["model"] == config.MODEL, _s30["model"])
+
+            # ── The two read paths the browser uses ────────────────────────
+            _one30 = client.get(f"/api/reviews/{_rid30}", headers=UI)
+            check("a reopened run carries its cost", _one30.status_code == 200
+                  and (_one30.json().get("spend") or {}).get("cost_usd", 0) > 0,
+                  _one30.text[:240])
+            _list30 = client.get("/api/reviews?limit=50&product_id=requirement",
+                                 headers=UI)
+            _row30 = next((r for r in _list30.json()["reviews"]
+                           if r["id"] == _rid30), None)
+            check("...and so does its card in the history list",
+                  _row30 is not None and (_row30.get("spend") or {}).get("cost_usd", 0) > 0,
+                  str(_row30)[:240])
+            check("...which is one ledger query for the page, not one per card",
+                  "spend" in (_list30.json()["reviews"][0] or {}),
+                  "every row is annotated, so a page of ten runs is not ten round trips")
+        finally:
+            llm_gateway.call_tool = _plain30
+        check("the metering stub is restored", llm_gateway.call_tool is _plain30)
+
+        # ── A run with no ledger row is absent, not zero ────────────────────
+        # Project-bound, because the endpoint below is driven as the browser drives it and
+        # `_review_in_scope` 404s anything outside the caller's projects.
+        with _ctx.bind_project(pid, "Sources", product_id="code"):
+            _bare30 = database.save_review("code", "bare", "s", "c",
+                                           {"findings": [], "gate_status": "Green"})
+        check("A RUN WHOSE COST WAS NEVER RECORDED REPORTS NO COST, NOT $0.00",
+              database.get_review_spend([_bare30]) == {},
+              "every run from before this link exists cost an unknown amount, and a "
+              "confident zero beside it is a false statement about money")
+        _bare_get = client.get(f"/api/reviews/{_bare30}", headers=UI)
+        check("...and the endpoint sends null rather than an empty cost",
+              _bare_get.status_code == 200 and _bare_get.json().get("spend") is None,
+              _bare_get.text[:200])
+        check("asking about no reviews at all is empty, not an error",
+              database.get_review_spend([]) == {}
+              and database.get_review_spend([None, ""]) == {})
+        check("asking about a review id that does not exist is empty",
+              database.get_review_spend(["not-a-real-review-id"]) == {})
+
+        # ── Billable and non-billable are summed apart ──────────────────────
+        #
+        # A failed run leaves a non-billable ledger row beside the billable one. Both are
+        # real spend; only one moved a budget, and conflating them would either overstate
+        # what a project was charged or hide tokens that were genuinely burned.
+        _dual30 = database.save_review("code", "dual", "s", "c", {"findings": []})
+        for _billable, _cost in ((1, 0.20), (0, 0.05)):
+            database.record_usage_event(
+                key_id=None, caller_type="ui", caller_ref=None, product_id="code",
+                product_kind="agent", calls=1, input_tokens=100, output_tokens=50,
+                cost_usd=_cost, model=config.MODEL, provider="anthropic",
+                billable=bool(_billable), cost_estimated=False, project_id=None,
+                project_name="", review_id=_dual30, status="ok")
+        _d30 = database.get_review_spend([_dual30])[_dual30]
+        check("two ledger rows for one run are summed, not overwritten",
+              abs(_d30["cost_usd"] - 0.25) < 1e-6 and _d30["calls"] == 2,
+              f"${_d30['cost_usd']} over {_d30['calls']} call(s)")
+        check("...and what a budget actually moved by is reported apart",
+              abs(_d30["billable_cost_usd"] - 0.20) < 1e-6,
+              f"billable ${_d30['billable_cost_usd']} of ${_d30['cost_usd']} total")
+
+        # An unpriced model must stay flagged through the sum, or an estimate is read as a
+        # measurement.
+        _est30 = database.save_review("code", "est", "s", "c", {"findings": []})
+        database.record_usage_event(
+            key_id=None, caller_type="ui", caller_ref=None, product_id="code",
+            product_kind="agent", calls=1, input_tokens=10, output_tokens=5,
+            cost_usd=0.01, model="some-local-model", provider="ollama", billable=True,
+            cost_estimated=True, project_id=None, project_name="", review_id=_est30,
+            status="ok")
+        check("a guessed price stays marked as guessed after summing",
+              database.get_review_spend([_est30])[_est30]["cost_estimated"] is True,
+              "an estimate presented as a measurement is the one way this figure can lie")
+
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")
 

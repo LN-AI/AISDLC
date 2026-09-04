@@ -194,6 +194,18 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   writes `usage_events` — derive a display cost any other way and the screen will disagree
   with the invoice. `renderReviewTransparency` is the one renderer that draws it, and every
   result renderer calls it.
+
+  **A third way, for a run that has already finished.** Neither of the above can reach a
+  *stored* run: the cost is not known until the model calls end, which is after
+  `save_review` has written the row. So it is not stored on the review at all — it is read
+  back out of the billing ledger by `database.get_review_spend`, which `GET /api/reviews`
+  and `GET /api/reviews/{id}` serve as `spend`, and `openAgentRun` folds into the same
+  `_budget_stats` shape so the same renderer draws it. The link is
+  `usage_events.review_id`; `legacy_guard` learns which review to name via
+  `context.collect_saved_reviews()`, which is the one contextvar in `backend/context.py`
+  that reports **back up** rather than down — and it has to hold a mutable list, because a
+  synchronous endpoint runs in a worker thread with a copy of the context (D-311). A run
+  with no ledger row reports **no cost rather than zero**.
 - **`AGENT_SCREENS` in `frontend/app.js` is where an agent screen says what it is.** One row
   per screen keyed by its nav `data-page`, giving the product id, the `reviews.review_type`
   it writes, its result container id, its renderer function and what to call its runs. The
