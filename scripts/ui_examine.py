@@ -136,7 +136,14 @@ def start_server(port, db_path, stub_llm):
 # Stub the gateway before the app imports it, so no review can reach a provider even by
 # accident. A stubbed reply is still a *shaped* reply, so the renderers get real work to do.
 from backend.services import llm_gateway
+from backend import config as _cfg
 def _stub(system_prompt, user_content, schema, override=None, max_tokens=None, **kw):
+    # Token usage is recorded as a real call would, because otherwise every run in this
+    # examination costs zero and nothing about the money reaching the screen can be
+    # checked at all -- not the spend strip, not the cost on a history card, not the
+    # figure on a reopened run. `_record_usage` lives inside the real `call_tool`, so
+    # replacing that function replaces the metering with it unless this is here.
+    llm_gateway._record_usage('anthropic', _cfg.MODEL, 1800, 420)
     name = schema.get('name', '')
     common = dict(risk_score=10.0, gate_status='Green', summary='Stubbed assessment.',
                   compliance_flags=[], recommendations=['Parameterize queries.'])
@@ -943,6 +950,42 @@ def main():
                           page.locator("#code-runs .run-card.selected").count() == 1,
                           "with two runs at the same gate an unmarked swap reads as a dead control")
                 shot(page, "run-list-persists")
+
+                # ── 13d. What the run cost, remembered ────────────────────
+                #
+                # The whole chain, and the only place it can be checked end to end: the
+                # gateway records tokens, the middleware prices them and names the review
+                # the handler wrote, the ledger keeps the row, and both read paths hand it
+                # back. Every link is invisible from the others.
+                section("13d. A stored run still knows what it cost")
+                # 13b clicked a card, so the panel already holds a *reopened* run by the
+                # time this section starts. Worth stating: a check called "a fresh run says
+                # what it cost" here would be reading the stored path and passing for the
+                # wrong reason -- which the breakage pass caught by failing it when the
+                # ledger link was cut, a link a fresh run does not depend on.
+                _cards = page.locator("#code-runs .run-cost")
+                check("every run in the history is priced on its own card",
+                      _cards.count() >= 1,
+                      "the ledger row named no review, so the card had nothing to show")
+                _card_cost = _cards.first.inner_text()
+                check("...as a real number, not a rounded-away zero",
+                      _card_cost.startswith("$") and float(_card_cost[1:]) > 0,
+                      f"card shows {_card_cost!r}")
+                # Reopen it: the figure has to survive the round trip, and the banner has to
+                # keep "opening this cost nothing" apart from "the run cost this".
+                page.locator("#code-runs .run-card").first.click()
+                page.wait_for_selector("#code-result .cost-note", timeout=30000)
+                page.wait_for_timeout(500)
+                _re = page.locator("#code-result").inner_text()
+                check("REOPENING A RUN STILL SHOWS WHAT THAT RUN COST",
+                      "$" in _re.split("Reopened from")[-1][:600], _re[:500])
+                check("...while saying that opening it was free",
+                      "called no model and cost nothing" in _re, _re[:300])
+                check("...and not claiming the cost was never recorded",
+                      "not recorded against it" not in _re,
+                      "the ledger has this run's cost, so the honest-ignorance branch is "
+                      "the wrong one to take here")
+                shot(page, "run-cost-remembered")
                 # ── 13c. The same, on the screen that never had it ──────
                 #
                 # `#vapt-sources` has existed since the panel was added and nothing ever

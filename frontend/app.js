@@ -9771,6 +9771,17 @@ async function loadAgentRuns(agent) {
             ${r.critical_count ? `<span class="run-gate Red">${r.critical_count} critical</span>` : ''}
             ${r.high_count ? `<span class="run-gate Amber">${r.high_count} high</span>` : ''}` : ''}
             ${!r.product_id ? `<span class="run-gate" title="This run predates the record of which agent produced it, so it is matched on review type alone — another product writing the same review type could appear here">before agents were recorded</span>` : ''}
+            <!-- What the run cost, on the card, so "which of these was expensive" is
+                 answerable by looking rather than by opening eight runs. Rendered only
+                 when the ledger has a figure: a run from before the cost was linked to
+                 its review cost an unknown amount, and a confident "$0.00" beside it
+                 would be a lie about money. Four decimal places because a single-chunk
+                 review really does cost under a cent, and "$0.00" for a run that spent
+                 something reads as free. -->
+            ${r.spend ? `<span class="run-cost" title="${esc(r.spend.calls)} model call(s)
+              · ${esc(r.spend.model || 'model not recorded')}${r.spend.cost_estimated
+                ? ' · this model has no published price, so the figure is estimated' : ''}"
+              >$${Number(r.spend.cost_usd).toFixed(4)}</span>` : ''}
             <span class="run-when">${esc(String(r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
           </div>
           <div class="run-card-meta">${esc(r.input_summary || 'No summary')}</div>
@@ -9820,6 +9831,27 @@ async function openAgentRun(agent, reviewId) {
     // guessing, and so a reopened run is attributed the same way a fresh one is.
     if (!result.review_type) result.review_type = row.review_type || spec.reviewType;
     if (!result.product_id) result.product_id = row.product_id || spec.product;
+    // What the run cost, so a reopened run says it as plainly as a live one does. The
+    // figure could never travel inside `result_json`: it is not known until the model calls
+    // finish, which is after the row has been written. It is read from the billing ledger
+    // instead, and folded into the same `_budget_stats` shape a live run carries so
+    // `renderReviewTransparency` draws it unchanged rather than gaining a second code path.
+    //
+    // Left absent when the server sends nothing. A run from before this link existed cost
+    // an unknown amount, not nothing, and a confident "$0.00" on it would be a lie about
+    // money.
+    if (row.spend && !result._budget_stats) {
+      result._budget_stats = {
+        cost_usd: row.spend.cost_usd,
+        calls: row.spend.calls,
+        input_tokens: row.spend.input_tokens,
+        output_tokens: row.spend.output_tokens,
+        model: row.spend.model,
+        provider: row.spend.provider,
+        billable: (row.spend.billable_cost_usd || 0) > 0,
+        cost_estimated: !!row.spend.cost_estimated,
+      };
+    }
     // A stored run renders through exactly the same function as a fresh one, so a reader is
     // never comparing two differently-shaped accounts of the same thing. That claim used to
     // be false for VAPT: a fresh assessment went through `renderVAPTResult` with its CVSS,
@@ -9829,8 +9861,12 @@ async function openAgentRun(agent, reviewId) {
     spec.render(spec.result, result);
     target.insertAdjacentHTML('afterbegin', `
       <div class="cost-note">Reopened from ${esc(String(row.created_at || '').slice(0, 16).replace('T', ' '))} UTC.
-        No model was called and nothing was billed — this is the stored result. The gate below
-        describes the code as it was then.</div>`);
+        <b>Opening it called no model and cost nothing.</b> ${row.spend
+          ? `The run itself cost $${Number(row.spend.cost_usd).toFixed(4)} when it ran, shown
+             below with the rest of what it recorded.`
+          : `What that run cost was not recorded against it, so the figures below do not
+             include a cost — your usage records are where that lives.`}
+        The gate below describes the code as it was then.</div>`);
     // The list is above the result now, so bring the answer up rather than leaving the
     // reader to guess that something appeared below the fold.
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
