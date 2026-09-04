@@ -6,6 +6,11 @@
   const ENDPOINT = '/api/client-log';
   const MAX_PER_SESSION = 25; // stop hammering the backend if something loops
   let sent = 0;
+  // Set once the page is going away, which is the only moment a report needs to survive
+  // teardown. See the note in `send()`.
+  let unloading = false;
+  window.addEventListener('pagehide', () => { unloading = true; });
+  window.addEventListener('beforeunload', () => { unloading = true; });
 
   function redact(str) {
     if (!str) return str;
@@ -26,12 +31,25 @@
       col: (extra && extra.col) || undefined,
       stack: extra && extra.stack ? redact(String(extra.stack)).slice(0, 2000) : undefined,
     };
+    const body = JSON.stringify(payload);
     try {
+      // `keepalive: true` used to be set on every report. It is the wrong tool for routine
+      // logging: Chromium services keepalive fetches through a separate pipeline with a hard
+      // cap on concurrent requests and a 64KB *total* in-flight body budget shared across the
+      // page, so a burst of error reports can start failing outright — and a logger that
+      // drops reports under load is a logger that goes quiet exactly when it is needed.
+      //
+      // What `keepalive` was actually there for is the last report before the page goes away,
+      // and `sendBeacon` is the API designed for that one case — so it is used there and only
+      // there.
+      if (unloading && navigator.sendBeacon) {
+        navigator.sendBeacon(ENDPOINT, new Blob([body], { type: 'application/json' }));
+        return;
+      }
       fetch(ENDPOINT, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        keepalive: true,
+        body,
       }).catch(() => {});
     } catch { /* logging must never break the app */ }
   }

@@ -77,6 +77,118 @@ SECURITY_CONTROLS: Dict[str, Control] = {
         frameworks=["OWASP-LLM", "NIST-AI-RMF", "SOC2"],
         blocking=False,
     ),
+    # SEC-008..012 were added on 2026-09-02 after the first real eval run, which surfaced the
+    # gap: the Code Review prompt lists injection **first** under what to detect and grades it
+    # Critical, and there was no control id for it. Anything the model found had to be filed
+    # under an unrelated code — the corpus itself guessed `SEC-001` ("Authentication
+    # Required") for a string-concatenated SQL query. Three consequences, all worse than the
+    # missing row: compliance mapping files injection under authentication, the Governance
+    # Report groups it wrong, and — because `finding_pipeline.fingerprint` includes
+    # `control_id` — the *same* SQL injection can get a different fingerprint on the next run
+    # and read as new forever, which quietly defeats the baseline and every waiver on it.
+    #
+    # Adding ids is safe where changing one would not be: nothing persisted moves, because no
+    # existing row carries these.
+    "SEC-008": Control(
+        id="SEC-008",
+        category="Security",
+        title="No Injection Vectors",
+        description="User-controlled data must never reach an interpreter unparameterized. Covers SQL, NoSQL, OS command, LDAP, XPath, XML and template injection. Use parameterized queries, argument lists rather than shells, and never build a query or command by concatenation. CWE-89, CWE-77, CWE-78, CWE-917.",
+        severity=5,
+        frameworks=["OWASP-Web-Top10", "OWASP-LLM", "SOC2", "PCI-DSS"],
+        blocking=True,
+    ),
+    "SEC-009": Control(
+        id="SEC-009",
+        category="Security",
+        title="Output Encoding Against XSS",
+        description="Data rendered into a page, response or template must be encoded for its context. Covers reflected, stored and DOM-based cross-site scripting, and any use of an escaping bypass (raw/safe/innerHTML/dangerouslySetInnerHTML) on untrusted data. CWE-79.",
+        severity=4,
+        frameworks=["OWASP-Web-Top10", "SOC2"],
+        blocking=True,
+    ),
+    "SEC-010": Control(
+        id="SEC-010",
+        category="Security",
+        title="Cross-Site Request Forgery Protection",
+        description="State-changing requests must carry an anti-forgery token or an equivalent origin check. A control the framework provides by default (Django's CsrfViewMiddleware, Rails' protect_from_forgery) satisfies this and must not be reported as missing. CWE-352.",
+        severity=4,
+        frameworks=["OWASP-Web-Top10", "SOC2"],
+        blocking=True,
+    ),
+    "SEC-011": Control(
+        id="SEC-011",
+        category="Security",
+        title="Safe Deserialization",
+        description="Untrusted input must not be deserialized into arbitrary objects. Covers pickle, yaml.load without SafeLoader, PHP unserialize, Java ObjectInputStream and equivalents, and any path where a payload chooses the type it becomes. CWE-502.",
+        severity=5,
+        frameworks=["OWASP-Web-Top10", "SOC2"],
+        blocking=True,
+    ),
+    "SEC-012": Control(
+        id="SEC-012",
+        category="Security",
+        title="Server-Side Request and Path Safety",
+        description="A URL or file path derived from user input must be validated against an allow-list before it is fetched or opened. Covers server-side request forgery — including cloud metadata endpoints — and path traversal in file reads, writes and archive extraction. CWE-918, CWE-22.",
+        severity=4,
+        frameworks=["OWASP-Web-Top10", "SOC2"],
+        blocking=True,
+    ),
+    # SEC-013..016 were added on 2026-09-03 for the same reason as SEC-008..012 above, found
+    # the same way — a real finding wearing a control id that contradicted it. A code review
+    # of a healthcare API reported "appointment data returned without field-level access audit
+    # logging" under SEC-004, which is *sensitive data in logs*: the opposite defect. Too
+    # little logging filed under too much.
+    #
+    # The cause was not one missing row. `ALL_CONTROLS` holds 89 controls across nine
+    # families and the Code Review prompt offered the model sixteen of them from two, so five
+    # finding classes its own detection list explicitly asks for had nowhere to go: audit
+    # logging, information disclosure through errors, CORS, object-level authorization, and
+    # input size limits — the last of which the prompt names as an example of a *mis-filed*
+    # id without saying where it should go instead.
+    #
+    # These four stay in SEC-* rather than reusing the VAPT-* equivalents (VAPT-011, -013,
+    # -017, -018) on purpose. `finding_pipeline.fingerprint` includes `control_id`, so a
+    # finding that a code review calls VAPT-018 and a VAPT scan calls VAPT-018 would share an
+    # identity across two agents with different evidence standards and different gates — one
+    # agent's waiver would silently suppress the other's finding. Same reasoning that keeps
+    # ids stable: identity is a promise, not a label.
+    "SEC-013": Control(
+        id="SEC-013",
+        category="Security",
+        title="Access Logging for Sensitive Data",
+        description="Reads, writes, deletes and exports of sensitive or regulated data must emit an access log carrying who, when, and which record — not merely that the endpoint was called. Distinct from SEC-004, which is the opposite defect: this is too little logging, SEC-004 is too much. CWE-778.",
+        severity=4,
+        frameworks=["HIPAA", "SOC2", "GDPR", "PCI-DSS"],
+        blocking=False,
+    ),
+    "SEC-014": Control(
+        id="SEC-014",
+        category="Security",
+        title="No Internal Detail in Responses",
+        description="Errors returned to a caller must not carry stack traces, SQL text, file paths, dependency versions or internal hostnames, and a successful response must not return fields the caller has no need for. Covers debug mode left enabled in a deployed configuration. CWE-209, CWE-497.",
+        severity=3,
+        frameworks=["OWASP-Web-Top10", "SOC2"],
+        blocking=False,
+    ),
+    "SEC-015": Control(
+        id="SEC-015",
+        category="Security",
+        title="Origin Restriction and Security Headers",
+        description="Cross-origin access must name its allowed origins — a wildcard, a reflected Origin header, or a wildcard sent with credentials is a finding. Covers absent Content-Security-Policy, HSTS, X-Content-Type-Options and frame-ancestors on responses that render in a browser. CWE-942, CWE-693.",
+        severity=3,
+        frameworks=["OWASP-Web-Top10", "SOC2"],
+        blocking=False,
+    ),
+    "SEC-016": Control(
+        id="SEC-016",
+        category="Security",
+        title="Object-Level Authorization",
+        description="An identifier supplied by the caller must be checked against what that caller may see before the record is returned or modified. Distinct from SEC-002: the caller's role can be entirely correct and the object still not theirs. Covers insecure direct object reference and tenant bleed in a multi-tenant query. CWE-639, CWE-863.",
+        severity=4,
+        frameworks=["OWASP-Web-Top10", "OWASP-API", "SOC2", "HIPAA"],
+        blocking=True,
+    ),
 }
 
 AI_CONTROLS: Dict[str, Control] = {

@@ -282,9 +282,14 @@
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name (optional)</label>
-            <input type="text" id="req-project" class="project-bound" placeholder="e.g. Patient Portal AI Feature" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="req-project" class="project-bound" />
+              <div class="project-caption" data-for="req-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement Text <span class="required">*</span></label>
             <textarea id="req-content" rows="12" placeholder="Paste your user story, BRD, FRD, or PRD here...
@@ -311,6 +316,15 @@ Acceptance Criteria:
             </label>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('requirement')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="requirement-runs" class="run-history-scroll"></div>
+        </div>
         <div id="req-result" class="result-area hidden"></div>
       </div>
 
@@ -322,9 +336,14 @@ Acceptance Criteria:
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name (optional)</label>
-            <input type="text" id="ts-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="ts-project" class="project-bound" />
+              <div class="project-caption" data-for="ts-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement / User Story <span class="required">*</span></label>
             <textarea id="ts-requirement" rows="10" placeholder="Paste the requirement or user story to generate test scenarios for...
@@ -342,6 +361,15 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('test-scenario')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All generations this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="test-scenario-runs" class="run-history-scroll"></div>
+        </div>
         <div id="test-scenario-result" class="result-area hidden"></div>
       </div>
 
@@ -353,9 +381,14 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name (optional)</label>
-            <input type="text" id="tc-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="tc-project" class="project-bound" />
+              <div class="project-caption" data-for="tc-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement / User Story <span class="required">*</span></label>
             <textarea id="tc-requirement" rows="8" placeholder="Paste the requirement or user story to generate test cases for..."></textarea>
@@ -377,48 +410,172 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('test-case')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All generations this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="test-case-runs" class="run-history-scroll"></div>
+        </div>
         <div id="test-case-result" class="result-area hidden"></div>
       </div>
 
       <!-- Code Review Page -->
       <div id="page-code" class="page">
         <div class="page-header">
-          <h1>Code & PR Security Reviewer</h1>
-          <p class="subtitle">Scan code for security vulnerabilities, secrets, PHI exposure, and AI-specific risks</p>
+          <h1>Code &amp; PR Security Reviewer</h1>
+          <p class="subtitle">Scans code for injection, hardcoded secrets, broken authorization,
+            PHI/PII exposure, weak cryptography, vulnerable dependencies and AI-specific risks.
+            Takes a paste, a file, a zip of a whole codebase, a pull request, a repository at a
+            branch, or one branch against another. A large codebase is split into pieces and
+            reviewed in parallel rather than cut short; every finding must quote the offending code,
+            and a finding whose quote is not in your source is discarded rather than reported.
+            You are shown the cost before anything is spent.</p>
         </div>
         <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. Choose what to review</div>
+          <div id="code-source-picker"></div>
+
+          <div id="code-src-paste">
+            <div class="form-group">
+              <label>Code / PR diff</label>
+              <textarea id="code-content" rows="16" placeholder="Paste your code, function, class, or PR diff here..."></textarea>
+            </div>
+          </div>
+
+          <div id="code-src-file" class="hidden">
+            <div class="form-group">
+              <label>Source file</label>
+              <input type="file" id="code-file-input" accept=".txt,.py,.js,.ts,.tsx,.jsx,.java,.go,.php,.rb,.cs,.vb,.c,.h,.cpp,.sql,.yaml,.yml,.json,.xml,.ini,.conf,.tf,.html,.md" />
+              <div class="field-hint">One file. For a whole codebase use <b>Upload zip</b>.</div>
+            </div>
+          </div>
+
+          <div id="code-src-zip" class="hidden">
+            <div class="form-group">
+              <label>Zip of the codebase</label>
+              <input type="file" id="code-zip-input" accept=".zip" />
+              <div class="field-hint">Build output, binaries, <code>node_modules</code> and credential
+                files (<code>.env</code>, <code>*.pem</code>, private keys) are skipped. Hardcoded
+                secrets are redacted before anything reaches a model — and reported as findings by
+                the scanner that found them, which costs nothing.</div>
+            </div>
+          </div>
+
+          <div id="code-src-pr" class="hidden">
+            <div class="form-group">
+              <label>GitHub pull request URL</label>
+              <input type="url" id="code-pr-url" placeholder="https://github.com/owner/repo/pull/123" />
+              <div class="field-hint">Reviews the diff. Large PRs are split into pieces rather than cut short.</div>
+            </div>
+          </div>
+
+          <div id="code-src-repo" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>GitHub repository URL</label>
+                <input type="url" id="code-repo-url" placeholder="https://github.com/owner/repo" />
+              </div>
+              <div class="form-group">
+                <label>Branch / tag / commit (optional)</label>
+                <input type="text" id="code-repo-ref" placeholder="main" />
+              </div>
+            </div>
+            <div class="field-hint">Reads the repository's <b>source code</b>. A private repository needs a
+              token — supply one below for this call, or save one for the project. Get an estimate first: a
+              large repository is many model calls.</div>
+          </div>
+
+          <div id="code-src-compare" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>Base branch</label>
+                <input type="text" id="code-base-ref" placeholder="main" />
+              </div>
+              <div class="form-group flex1">
+                <label>Branch being proposed</label>
+                <input type="text" id="code-head-ref" placeholder="feature/new-auth" />
+              </div>
+            </div>
+            <div class="field-hint">Reviews <code>base...head</code> as a diff — the gate's answer before the pull request is raised.</div>
+          </div>
+
+          <div id="code-src-auth" class="hidden">
+            <div id="code-cred-status"></div>
+            <div class="form-group">
+              <label>GitHub token for this call (optional)</label>
+              <input type="password" id="code-gh-token" autocomplete="off"
+                     placeholder="ghp_… or a fine-grained token — used once, never stored" />
+              <div class="field-hint">
+                Only needed for a <b>private</b> repository, or when the deployment token cannot
+                see this one. GitHub answers <b>404 "not found"</b> — not 403 — for anything a
+                token cannot see, so a private repo, an expired token and a typo all look the
+                same; supplying the right token here is the quickest way to tell them apart.
+                <button type="button" class="btn-link" onclick="saveGithubCredential('code')">
+                  Save it for this project instead
+                </button>
+                — stored encrypted, never shown again, and reused for this owner automatically.
+              </div>
+            </div>
+          </div>
+
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="code-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="code-project" class="project-bound" />
+              <div class="project-caption" data-for="code-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Language (optional)</label>
               <input type="text" id="code-language" placeholder="e.g. Python, JavaScript, Java" />
             </div>
           </div>
-          <div class="form-group">
-            <label>Code / PR Diff <span class="required">*</span></label>
-            <textarea id="code-content" rows="16" placeholder="Paste your code, function, class, or PR diff here...
 
-Example:
-def get_patient_data(patient_id, query):
-    conn = sqlite3.connect('patients.db')
-    result = conn.execute(f'SELECT * FROM patients WHERE id = {patient_id}')
-    logging.info(f'Retrieved patient: {result}')
-    return result"></textarea>
-          </div>
           <div class="form-group">
             <label>Context (optional)</label>
-            <input type="text" id="code-context" placeholder="e.g. Healthcare API endpoint, processes PHI" />
+            <input type="text" id="code-context" placeholder="e.g. Healthcare API endpoint, processes PHI, external-facing" />
           </div>
+
+          <div class="section-title">2. See what it will cost</div>
           <div class="form-actions">
-            <button class="btn btn-primary" onclick="reviewCode()">
-              <span class="btn-icon">🔒</span> Run Security Review
+            <button class="btn btn-primary" onclick="previewCost('code')">
+              <span class="btn-icon">$</span> Estimate cost
             </button>
           </div>
+          <div class="field-hint">Reading the source, filtering it and pricing the work is free — no
+            model is called. You are shown the expected cost and a hard ceiling, and asked again
+            before anything is spent.</div>
+          <!--
+            Post-back options. Shown only when the source is a GitHub pull request, the same
+            way the token block is: they are meaningless for a paste, and a control that
+            does nothing is worse than no control. This is also the switch that decides
+            which *product* the run is billed against -- see `runReviewFromQuote`.
+          -->
+          <div id="code-gh-options" class="hidden"></div>
+          <div id="code-retention-wrap"></div>
+          <div id="code-cost-preview" class="hidden"></div>
+        </div>
+        <!--
+          The run list sits ABOVE the result, height-capped, with its own scrollbar. It was
+          below, and opening a run repainted a long result above it and pushed it off the
+          page -- so switching runs meant leaving the screen and coming back. Modernization
+          hit the same problem from the other direction and its comment says why this is the
+          shape that works: the detail panel is what a reader came for, so the list must not
+          be able to push it away, and the list must not be pushed away either.
+        -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">Every review this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="code-runs" class="run-history-scroll"></div>
         </div>
         <div id="code-result" class="result-area hidden"></div>
+        <div id="code-sources"></div>
       </div>
 
       <!-- Prompt Safety Page -->
@@ -429,9 +586,14 @@ def get_patient_data(patient_id, query):
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name</label>
-            <input type="text" id="prompt-project" class="project-bound" placeholder="e.g. Clinical AI Assistant" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="prompt-project" class="project-bound" />
+              <div class="project-caption" data-for="prompt-project"></div>
+            </div>
           <div class="form-group">
             <label>System Prompt</label>
             <textarea id="prompt-system" rows="8" placeholder="Paste your system prompt / instructions here...
@@ -461,6 +623,15 @@ Answer questions about patients based on the provided context."></textarea>
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('prompt')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="prompt-runs" class="run-history-scroll"></div>
+        </div>
         <div id="prompt-result" class="result-area hidden"></div>
       </div>
 
@@ -474,9 +645,10 @@ Answer questions about patients based on the provided context."></textarea>
         </div>
         <div class="form-card">
           <div class="form-group">
-            <label>Project Name <span class="required">*</span></label>
-            <input type="text" id="full-project" class="project-bound" placeholder="e.g. AI Patient Risk Scoring Feature v2.1" title="Set by the project selector in the sidebar" />
-          </div>
+              <label>Project</label>
+              <input type="hidden" id="full-project" class="project-bound" />
+              <div class="project-caption" data-for="full-project"></div>
+            </div>
           <div class="form-group">
             <label>Requirement / User Story</label>
             <textarea id="full-req" rows="6" placeholder="Paste your requirement or user story..."></textarea>
@@ -529,53 +701,40 @@ Answer questions about patients based on the provided context."></textarea>
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('full')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="full-runs" class="run-history-scroll"></div>
+        </div>
         <div id="full-result" class="result-area hidden"></div>
       </div>
 
       <!-- GitHub PR Page -->
+      <!--
+        Retired. This screen reviewed pull requests with its own form, its own handler and
+        its own result renderer -- and without the token field, the cost quote, the progress,
+        the run history, the file inventory or the staged fix that the review screen has.
+        Two implementations of one job is how those gaps appeared, so there is now one, and
+        the nav item lands on it with the source set to GitHub PR.
+      -->
       <div id="page-github" class="page">
         <div class="page-header">
           <h1>GitHub PR Review</h1>
-          <p class="subtitle">Connect to GitHub and automatically review a pull request for security and AI risks</p>
+          <p class="subtitle">Opening the review screen with a pull request selected…</p>
         </div>
-        <div class="form-card">
-          <div class="form-group">
-            <label>GitHub PR URL <span class="required">*</span></label>
-            <input type="url" id="gh-url" placeholder="https://github.com/owner/repo/pull/123" />
-          </div>
-          <div class="form-group">
-            <label>Jira Ticket (optional)</label>
-            <input type="text" id="gh-jira" placeholder="e.g. PROJ-456" />
-          </div>
-          <div class="form-group checkbox-group">
-            <label>
-              <input type="checkbox" id="gh-prompt" />
-              Also run Prompt Safety Review (for AI feature PRs)
-            </label>
-          </div>
-          <div class="form-group">
-            <label>Max files to auto-fix (auto-fix only)</label>
-            <input type="number" id="gh-max-files" value="5" min="1" max="15" />
-          </div>
-          <div class="form-actions">
-            <button class="btn btn-primary" onclick="reviewGithubPR()">
-              <span class="btn-icon">🐙</span> Review PR
-            </button>
-            <button class="btn btn-secondary" data-product="auto-fix" onclick="autoFixGithubPR()">
-              <span class="btn-icon">🛠️</span> Auto-Fix &amp; Open PR
-            </button>
-          </div>
-          <div class="info-box">
-            <strong>Note:</strong> Requires GITHUB_TOKEN configured in .env. "Review PR" posts findings as a PR comment.
-            "Auto-Fix &amp; Open PR" additionally requires <strong>write</strong> access on that token — it commits
-            fixes to a new <code>lm-autofix/pr-N</code> branch off the PR's head branch and opens a follow-up PR back
-            into it. This pushes real commits to GitHub — review the diff before merging.
-          </div>
+        <div class="empty-state">
+          Pull request review now lives on the <button class="btn-link"
+            onclick="openPRReview()">Code Review</button> screen, where it gets a cost quote,
+          progress, your project's saved credentials, and the choice of which findings to fix.
+          Everything that posts back to GitHub is still here — it is the
+          <strong>Where the findings go</strong> section of that screen.
         </div>
-        <div id="gh-result" class="result-area hidden"></div>
       </div>
 
-      <!-- Release Gate Page -->
       <div id="page-gate" class="page">
         <div class="page-header">
           <h1>Release Gate</h1>
@@ -584,8 +743,13 @@ Answer questions about patients based on the provided context."></textarea>
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="gate-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="gate-project" class="project-bound" />
+              <div class="project-caption" data-for="gate-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Release Version</label>
@@ -624,6 +788,15 @@ Answer questions about patients based on the provided context."></textarea>
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('gate')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All gate decisions this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="gate-runs" class="run-history-scroll"></div>
+        </div>
         <div id="gate-result" class="result-area hidden"></div>
       </div>
 
@@ -637,8 +810,13 @@ Answer questions about patients based on the provided context."></textarea>
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="report-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="report-project" class="project-bound" />
+              <div class="project-caption" data-for="report-project"></div>
             </div>
           </div>
           <div class="form-group">
@@ -755,8 +933,13 @@ Answer questions about patients based on the provided context."></textarea>
         <div class="form-card">
           <div class="form-row">
             <div class="form-group">
-              <label>Project Name (optional)</label>
-              <input type="text" id="arch-project" class="project-bound" placeholder="e.g. Clinical AI Platform" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="arch-project" class="project-bound" />
+              <div class="project-caption" data-for="arch-project"></div>
             </div>
             <div class="form-group">
               <label>Review Mode</label>
@@ -799,6 +982,15 @@ e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI feature
             </label>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('architecture')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="architecture-runs" class="run-history-scroll"></div>
+        </div>
         <div id="arch-result" class="result-area hidden"></div>
       </div>
 
@@ -813,9 +1005,12 @@ e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI feature
           <div class="section-title" style="margin-top:0">1. Get a Recommendation</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="cg-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
-              <span style="font-size:11px;color:var(--text-muted)">Matches this name against the Knowledge Base — any docs uploaded there under the same project are used as authoritative context.</span>
+              <label>Project</label>
+              <input type="hidden" id="cg-project" class="project-bound" />
+              <div class="project-caption" data-for="cg-project"></div>
+              <div class="field-hint">The project's name is matched against the Knowledge Base — any docs
+                uploaded there under the same project are used as authoritative context. This is why the
+                name still travels with the request even though the field is no longer typed into.</div>
             </div>
           </div>
           <div class="form-group">
@@ -861,6 +1056,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
               <span class="btn-icon">🧭</span> Get Recommendation
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('codegen')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All recommendations this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="codegen-runs" class="run-history-scroll"></div>
         </div>
         <div id="codegen-advisory-result" class="result-area hidden"></div>
 
@@ -922,8 +1126,13 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div class="section-title" style="margin-top:0">1. Assess Migration</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="mg-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="mg-project" class="project-bound" />
+              <div class="project-caption" data-for="mg-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Migration Target <span class="required">*</span></label>
@@ -943,6 +1152,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
               <span class="btn-icon">🧭</span> Assess Migration
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('migration')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All assessments this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="migration-runs" class="run-history-scroll"></div>
         </div>
         <div id="migration-assessment-result" class="result-area hidden"></div>
 
@@ -994,6 +1212,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             <div class="form-group flex1">
               <label>Run Name <span class="required">*</span></label>
               <input type="text" id="mod-name" placeholder="e.g. Billing engine → .NET 8" />
+              <!-- The caption only. This was the one agent screen with neither a bound
+                   input nor a caption, so which project a conversion would be charged and
+                   scoped to was invisible here. There is deliberately no hidden
+                   `project-bound` input to go with it: modernization resolves its project
+                   from the X-Project-Id header alone and has no project_name field to
+                   fill, and an input nothing reads is the sort of thing that gets wired up
+                   later by mistake. `_syncProjectInputs` fills every `.project-caption`
+                   regardless of `data-for`, so this needs no other change. -->
+              <div class="project-caption"></div>
             </div>
             <div class="form-group flex1">
               <label>Target Stack <span class="required">*</span></label>
@@ -1053,8 +1280,13 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           <div class="section-title" style="margin-top:0">1. Submit an Issue</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="it-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="it-project" class="project-bound" />
+              <div class="project-caption" data-for="it-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Environment</label>
@@ -1132,6 +1364,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('issue-triage')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All triages this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="issue-triage-runs" class="run-history-scroll"></div>
+        </div>
         <div id="issue-triage-result" class="result-area hidden"></div>
 
         <div class="form-card" style="margin-top:24px">
@@ -1147,8 +1388,13 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
               <input type="number" id="it-batch-limit" value="10" min="1" max="25" />
             </div>
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="it-batch-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="it-batch-project" class="project-bound" />
+              <div class="project-caption" data-for="it-batch-project"></div>
             </div>
           </div>
           <div class="form-actions">
@@ -1180,46 +1426,148 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
       <div id="page-vapt" class="page">
         <div class="page-header">
           <h1>VAPT — Vulnerability Assessment &amp; Penetration Testing</h1>
-          <p class="subtitle">Identify security vulnerabilities with CVSS v3.1 scoring, OWASP mapping, CWE IDs, and exploitation scenarios</p>
+          <p class="subtitle">OWASP Web and API Top 10 with CVSS v3.1 scoring, CWE mapping and a
+            realistic attack scenario per finding. Takes a paste, an OpenAPI document, a file, a zip
+            of a whole codebase, a pull request, or a repository at a branch. Every finding must
+            quote the code or specification text it is about, checked against the file it names —
+            an unfounded finding is discarded, not reported. Findings can be waived, and a repeat
+            assessment tells you what is new. You are shown the cost before anything is spent.</p>
         </div>
         <div class="form-card">
-          <div class="form-row">
+          <div class="section-title" style="margin-top:0">1. Choose what to review</div>
+          <div id="vapt-source-picker"></div>
+
+          <div id="vapt-src-paste">
             <div class="form-group">
-              <label>Project Name (optional)</label>
-              <input type="text" id="vapt-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Artifact to assess</label>
+              <textarea id="vapt-artifact" rows="14" placeholder="Paste code, an OpenAPI/Swagger document, an architecture description, or a list of endpoints."></textarea>
             </div>
+          </div>
+
+          <div id="vapt-src-file" class="hidden">
             <div class="form-group">
+              <label>Source file</label>
+              <input type="file" id="vapt-file-input" accept=".txt,.py,.js,.ts,.tsx,.jsx,.java,.go,.php,.rb,.cs,.vb,.c,.h,.cpp,.sql,.yaml,.yml,.json,.xml,.ini,.conf,.tf,.html,.md" />
+              <div class="field-hint">One file. For a whole codebase use <b>Upload zip</b>.</div>
+            </div>
+          </div>
+
+          <div id="vapt-src-zip" class="hidden">
+            <div class="form-group">
+              <label>Zip of the codebase</label>
+              <input type="file" id="vapt-zip-input" accept=".zip" />
+              <div class="field-hint">Build output, binaries, <code>node_modules</code> and credential
+                files (<code>.env</code>, <code>*.pem</code>, private keys) are skipped. Hardcoded
+                secrets are redacted before anything reaches a model — and reported as findings by
+                the scanner that found them, which costs nothing.</div>
+            </div>
+          </div>
+
+          <div id="vapt-src-pr" class="hidden">
+            <div class="form-group">
+              <label>GitHub pull request URL</label>
+              <input type="url" id="vapt-pr-url" placeholder="https://github.com/owner/repo/pull/123" />
+              <div class="field-hint">Reviews the diff. Large PRs are split into pieces rather than cut short.</div>
+            </div>
+          </div>
+
+          <div id="vapt-src-repo" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>GitHub repository URL</label>
+                <input type="url" id="vapt-repo-url" placeholder="https://github.com/owner/repo" />
+              </div>
+              <div class="form-group">
+                <label>Branch / tag / commit (optional)</label>
+                <input type="text" id="vapt-repo-ref" placeholder="main" />
+              </div>
+            </div>
+            <div class="field-hint">Reads the repository's <b>source code</b>. A private repository needs a
+              token — supply one below for this call, or save one for the project. Get an estimate first: a
+              large repository is many model calls.</div>
+          </div>
+
+          <div id="vapt-src-compare" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>Base branch</label>
+                <input type="text" id="vapt-base-ref" placeholder="main" />
+              </div>
+              <div class="form-group flex1">
+                <label>Branch being proposed</label>
+                <input type="text" id="vapt-head-ref" placeholder="feature/new-auth" />
+              </div>
+            </div>
+            <div class="field-hint">Reviews <code>base...head</code> as a diff — the gate's answer before the pull request is raised.</div>
+          </div>
+
+          <div id="vapt-src-auth" class="hidden">
+            <div id="vapt-cred-status"></div>
+            <div class="form-group">
+              <label>GitHub token for this call (optional)</label>
+              <input type="password" id="vapt-gh-token" autocomplete="off"
+                     placeholder="ghp_… or a fine-grained token — used once, never stored" />
+              <div class="field-hint">
+                Only needed for a <b>private</b> repository, or when the deployment token cannot
+                see this one. GitHub answers <b>404 "not found"</b> — not 403 — for anything a
+                token cannot see, so a private repo, an expired token and a typo all look the
+                same; supplying the right token here is the quickest way to tell them apart.
+                <button type="button" class="btn-link" onclick="saveGithubCredential('vapt')">
+                  Save it for this project instead
+                </button>
+                — stored encrypted, never shown again, and reused for this owner automatically.
+              </div>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="vapt-project" class="project-bound" />
+              <div class="project-caption" data-for="vapt-project"></div>
+            </div>
+            <div class="form-group flex1">
               <label>Scope (optional)</label>
               <input type="text" id="vapt-scope" placeholder="e.g. REST API endpoints, authentication module, admin panel" />
             </div>
           </div>
-          <div class="form-group">
-            <label>Artifact to Assess <span class="required">*</span></label>
-            <textarea id="vapt-artifact" rows="14" placeholder="Paste code, API specification, architecture description, or endpoint list.
 
-Examples:
-• Python FastAPI code with authentication endpoints
-• OpenAPI/Swagger specification
-• Architecture: React frontend → Node.js API → PostgreSQL DB, JWT auth, AWS S3 file storage
-• List of URLs: /api/login, /api/users/{id}, /api/admin/users, /upload/file
-• Express.js route handlers for user management"></textarea>
-          </div>
           <div class="form-group">
-            <label>Additional Context (optional)</label>
-            <input type="text" id="vapt-context" placeholder="e.g. Healthcare app handling PHI, external-facing, no WAF in place" />
+            <label>Context (optional)</label>
+            <input type="text" id="vapt-context" placeholder="e.g. Healthcare API endpoint, processes PHI, external-facing" />
           </div>
+
+          <div class="section-title">2. See what it will cost</div>
           <div class="form-actions">
-            <button class="btn btn-primary btn-security" onclick="runVAPT()">
-              <span class="btn-icon">🛡️</span> Run VAPT Assessment
+            <button class="btn btn-primary" onclick="previewCost('vapt')">
+              <span class="btn-icon">$</span> Estimate cost
             </button>
-            <span class="or-divider">or</span>
-            <label class="btn btn-secondary file-upload-btn">
-              <input type="file" id="vapt-file" accept=".txt,.py,.js,.ts,.java,.go,.php,.rb,.yaml,.yml,.json,.md" onchange="uploadVAPT()" hidden />
-              Upload File
-            </label>
           </div>
+          <div class="field-hint">Reading the source, filtering it and pricing the work is free — no
+            model is called. You are shown the expected cost and a hard ceiling, and asked again
+            before anything is spent.</div>
+          <div id="vapt-retention-wrap"></div>
+          <div id="vapt-cost-preview" class="hidden"></div>
+        </div>
+        <!--
+          The run list sits ABOVE the result, height-capped, with its own scrollbar. It was
+          below, and opening a run repainted a long result above it and pushed it off the
+          page -- so switching runs meant leaving the screen and coming back. Modernization
+          hit the same problem from the other direction and its comment says why this is the
+          shape that works: the detail panel is what a reader came for, so the list must not
+          be able to push it away, and the list must not be pushed away either.
+        -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">Every assessment this project has run, newest first. Opening one costs nothing and calls no model — the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="vapt-runs" class="run-history-scroll"></div>
         </div>
         <div id="vapt-result" class="result-area hidden"></div>
+        <div id="vapt-sources"></div>
       </div>
 
       <!-- Security Review Page -->
@@ -1231,8 +1579,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group">
-              <label>Project Name (optional)</label>
-              <input type="text" id="sec-project" class="project-bound" placeholder="e.g. Clinical AI Platform" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="sec-project" class="project-bound" />
+              <div class="project-caption" data-for="sec-project"></div>
             </div>
             <div class="form-group">
               <label>System Type (optional)</label>
@@ -1268,6 +1621,15 @@ Examples:
             </label>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('security')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="security-runs" class="run-history-scroll"></div>
+        </div>
         <div id="security-result" class="result-area hidden"></div>
       </div>
 
@@ -1291,8 +1653,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="sd-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="sd-project" class="project-bound" />
+              <div class="project-caption" data-for="sd-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Context (optional)</label>
@@ -1321,6 +1688,15 @@ Examples:
             </label>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('sensitive')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All scans this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="sensitive-runs" class="run-history-scroll"></div>
+        </div>
         <div id="sd-result" class="result-area hidden"></div>
       </div>
 
@@ -1333,8 +1709,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="ap-project" class="project-bound" placeholder="e.g. Patient Portal API" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="ap-project" class="project-bound" />
+              <div class="project-caption" data-for="ap-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Context (optional)</label>
@@ -1398,6 +1779,15 @@ Examples:
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('ai-provenance')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All scans this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="ai-provenance-runs" class="run-history-scroll"></div>
+        </div>
         <div id="ap-result" class="result-area hidden"></div>
       </div>
 
@@ -1410,8 +1800,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="cfr-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="cfr-project" class="project-bound" />
+              <div class="project-caption" data-for="cfr-project"></div>
             </div>
             <div class="form-group flex1">
               <label>System Description (optional)</label>
@@ -1441,6 +1836,15 @@ Examples:
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('cfr21')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All verifications this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="cfr21-runs" class="run-history-scroll"></div>
+        </div>
         <div id="cfr21-result" class="result-area hidden"></div>
       </div>
 
@@ -1453,8 +1857,13 @@ Examples:
         <div class="form-card">
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="gxp-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="gxp-project" class="project-bound" />
+              <div class="project-caption" data-for="gxp-project"></div>
             </div>
             <div class="form-group flex1">
               <label>Document Type Hint (optional — verified, not just trusted)</label>
@@ -1484,6 +1893,15 @@ Examples:
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('gxp-docs')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All checks this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="gxp-docs-runs" class="run-history-scroll"></div>
+        </div>
         <div id="gxp-docs-result" class="result-area hidden"></div>
       </div>
 
@@ -1498,8 +1916,13 @@ Examples:
           <div class="section-title" style="margin-top:0">1. Plan the Validation Package</div>
           <div class="form-row">
             <div class="form-group flex1">
-              <label>Project Name (optional)</label>
-              <input type="text" id="gxg-project" class="project-bound" placeholder="e.g. Clinical Trial Data System" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="gxg-project" class="project-bound" />
+              <div class="project-caption" data-for="gxg-project"></div>
             </div>
             <div class="form-group flex1">
               <label>System Description (optional)</label>
@@ -1529,6 +1952,15 @@ Examples:
             </button>
           </div>
         </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('gxp-generate')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All plans this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="gxp-generate-runs" class="run-history-scroll"></div>
+        </div>
         <div id="gxg-plan-result" class="result-area hidden"></div>
 
         <div id="gxg-documents-result" class="result-area hidden" style="margin-top:20px"></div>
@@ -1556,8 +1988,13 @@ Examples:
               <p class="field-hint" id="swarm-policy-hint">&nbsp;</p>
             </div>
             <div class="form-group flex1">
-              <label>Project Name</label>
-              <input type="text" id="swarm-project" class="project-bound" placeholder="Project name" title="Set by the project selector in the sidebar" />
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. The sidebar
+                   selector writes it (see `_syncProjectInputs`); the caption below is what a
+                   person reads. -->
+              <input type="hidden" id="swarm-project" class="project-bound" />
+              <div class="project-caption" data-for="swarm-project"></div>
             </div>
           </div>
           <div class="form-group">
@@ -1588,6 +2025,15 @@ Examples:
               <span class="btn-icon">⚡</span> Run Swarm
             </button>
           </div>
+        </div>
+        <!-- Previous runs. Above the result and height-capped, for the reason in
+             the Code Review screen's comment: neither element may push the other off
+             the page. Filled by `loadAgentRuns('agent-hub')`, which reads this screen's row
+             in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">All swarm runs this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
+          <div id="agent-hub-runs" class="run-history-scroll"></div>
         </div>
         <div id="swarm-result" class="result-area hidden"></div>
 

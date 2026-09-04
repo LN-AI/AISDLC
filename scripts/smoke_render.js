@@ -44,6 +44,11 @@ function makeEl(id) {
       contains(c) { return c === 'hidden' ? this._el.hidden : false; },
     },
     dataset: {},
+    // `remove()` detaches an element. The stub tracks it rather than doing nothing, so a
+    // test can assert that a stale panel was torn down -- and so code that calls it does
+    // not fail here for a reason the browser would never produce.
+    removed: false,
+    remove() { this.removed = true; },
     addEventListener() {},
     insertAdjacentHTML(_pos, html) { this.innerHTML += html; },
     scrollIntoView() {},
@@ -51,6 +56,13 @@ function makeEl(id) {
     focus() {},
     appendChild() {},
     querySelectorAll() { return []; },
+    querySelector() { return null; },
+    setAttribute(k, v) { (this.attrs = this.attrs || {})[k] = v; },
+    getAttribute(k) { return (this.attrs || {})[k]; },
+    // The source picker hides the branch/tag box by walking up to its wrapping
+    // `.form-group`. Returning a fresh element is enough: the assertion is on the element
+    // the picker toggles, not on the DOM tree's shape.
+    closest() { return makeEl(`${this.id}__closest`); },
   };
   el.classList._el = el;  // classList needs a way back for the `hidden` bookkeeping above
   return el;
@@ -74,6 +86,7 @@ const document = {
 // assert the URL (and therefore the paging query) the code actually asked for.
 const fetchLog = [];
 let nextFetchBody = {};
+let nextFetchHeaders = {};
 
 const sandbox = {
   document,
@@ -83,9 +96,16 @@ const sandbox = {
   // logger.js is a separate script tag in index.html, so it isn't in `source`; the
   // renderers don't touch it but the loaders' error paths do.
   feLog: { error() {}, warn() {}, info() {}, debug() {} },
+  // `nextFetchHeaders` lets a test drive the X-Spend-* path: the synchronous review routes
+  // report what a run cost in response headers, because the middleware that prices them
+  // runs after the body has been serialized and has nowhere else to put it.
   fetch: async (url) => {
     fetchLog.push(url);
-    return { ok: true, status: 200, json: async () => nextFetchBody, text: async () => '' };
+    return {
+      ok: true, status: 200,
+      headers: { get: (k) => (nextFetchHeaders[k] !== undefined ? nextFetchHeaders[k] : null) },
+      json: async () => nextFetchBody, text: async () => '',
+    };
   },
   setTimeout, clearTimeout, setInterval, clearInterval,
   alert() {}, confirm: () => true, prompt: () => null,
@@ -99,6 +119,13 @@ sandbox.self = sandbox;
 
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox, { filename: 'app.js' });
+
+
+function section(title) {
+  console.log(`
+${title}`);
+  console.log('-'.repeat(title.length));
+}
 
 let failures = 0;
 function check(label, fn) {
@@ -1525,7 +1552,1013 @@ async function runModernizationChecks() {
   sandbox.fetch = saved;
 }
 
-runCharterChecks().then(runPagingChecks).then(runModernizationChecks).then(() => {
+function runReviewSourceChecks() {
+
+// ── Review sources, cost preview, and result transparency ──────────────────
+//
+// Every check below is for something the backend already computed and the screen used to
+// throw away, or for a source the API accepted and the screen did not offer. The renderers
+// are the only place those two facts become visible to a user, so a silent property typo
+// here is the difference between the work existing and the work being usable.
+
+section('Source picker');
+
+check('the picker offers every source the API accepts', () => {
+  sandbox.renderSourcePicker('code');
+  const html = document.getElementById('code-source-picker').innerHTML;
+  ['Paste', 'Upload file', 'Upload zip', 'GitHub PR', 'GitHub repo', 'Branch vs branch']
+    .forEach(label => {
+      if (!html.includes(label)) throw new Error(`missing source mode: ${label}`);
+    });
+});
+
+check('it starts on paste, so the old behaviour is the default', () => {
+  sandbox.renderSourcePicker('vapt');
+  const paste = document.getElementById('vapt-src-paste');
+  if (paste.hidden) throw new Error('paste inputs are hidden on first render');
+});
+
+check('choosing a source hides the others', () => {
+  sandbox.setSourceMode('code', 'repo');
+  if (!document.getElementById('code-src-paste').hidden) throw new Error('paste still visible');
+  if (document.getElementById('code-src-repo').hidden) throw new Error('repo inputs hidden');
+});
+
+check('branch-vs-branch shows the repository URL as well as the two branches', () => {
+  sandbox.setSourceMode('code', 'compare');
+  if (document.getElementById('code-src-repo').hidden) {
+    throw new Error('the repo URL field is hidden in compare mode, so it cannot be filled in');
+  }
+  if (document.getElementById('code-src-compare').hidden) throw new Error('compare inputs hidden');
+});
+
+check('each source explains itself', () => {
+  sandbox.setSourceMode('vapt', 'zip');
+  const hint = document.getElementById('vapt-source-hint').textContent;
+  if (!hint || hint.length < 20) throw new Error(`no usable hint: ${hint}`);
+  if (!/redact/i.test(hint)) throw new Error('the zip hint does not mention secret redaction');
+});
+
+check('switching source clears a stale quote', () => {
+  const box = document.getElementById('code-cost-preview');
+  box.innerHTML = 'old quote';
+  box.hidden = false;
+  sandbox.setSourceMode('code', 'pr');
+  if (box.innerHTML !== '') throw new Error('a quote for the previous source survived');
+  if (!box.hidden) throw new Error('the quote panel is still showing');
+});
+
+check('a body is built for each source shape', () => {
+  sandbox.setSourceMode('code', 'repo');
+  document.getElementById('code-repo-url').value = 'https://github.com/acme/app';
+  document.getElementById('code-repo-ref').value = 'release/3.2';
+  const built = sandbox.buildSourceBody('code');
+  if (!built || built.kind !== 'json') throw new Error('no JSON body built');
+  if (built.body.github_repo_url !== 'https://github.com/acme/app') throw new Error('repo URL lost');
+  if (built.body.ref !== 'release/3.2') throw new Error('ref lost');
+});
+
+check('a branch comparison sends both refs', () => {
+  sandbox.setSourceMode('code', 'compare');
+  document.getElementById('code-base-ref').value = 'main';
+  document.getElementById('code-head-ref').value = 'feature/x';
+  const built = sandbox.buildSourceBody('code');
+  if (built.body.base_ref !== 'main' || built.body.head_ref !== 'feature/x') {
+    throw new Error(`refs lost: ${JSON.stringify(built.body)}`);
+  }
+});
+
+check('an empty required field stops the request instead of sending nothing', () => {
+  sandbox.setSourceMode('vapt', 'pr');
+  document.getElementById('vapt-pr-url').value = '';
+  if (sandbox.buildSourceBody('vapt') !== null) throw new Error('an empty PR URL was accepted');
+});
+
+section('Cost preview');
+
+const QUOTE = {
+  agent: 'code',
+  source: {
+    source_type: 'zip', label: 'demo.zip', files_reviewed: 312, files_skipped: 588,
+    total_chars: 900000, truncated: false, secrets_redacted: 3,
+    skipped_sample: [{ path: 'node_modules/x.js', reason: 'excluded_directory' }],
+  },
+  estimate: {
+    calls: 14, chunks: 14, expected_usd: 2.4137, ceiling_usd: 7.9012,
+    model: 'claude-sonnet-4-6', price_is_estimated: false,
+    output_basis: 'measured', output_sample_size: 22,
+  },
+  budget: { scope: "project 'Acme'", monthly_budget_usd: 50, used_usd: 12.5, remaining_usd: 37.5 },
+  explanation: '312 file(s) will be reviewed in 14 piece(s), 14 model call(s) in total. Estimated $2.41, hard ceiling $7.90.',
+  within_budget: true,
+  secrets_already_found: 3,
+};
+
+check('the quote leads with the money', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!html.includes('$2.41')) throw new Error('expected cost missing');
+  if (!html.includes('$7.90')) throw new Error('ceiling missing');
+});
+
+check('it says how many files will actually be read, and how many will not', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!html.includes('312')) throw new Error('reviewed count missing');
+  if (!html.includes('588')) throw new Error('skipped count missing');
+});
+
+check('it reports the findings the free scanner already has', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!/Secrets already found/i.test(html)) throw new Error('scanner findings not surfaced');
+});
+
+check('it says the secrets were redacted before any model call', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!/redacted at ingest/i.test(html)) throw new Error('redaction not explained');
+});
+
+check('it shows the budget the price is drawn against', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!html.includes('37.50')) throw new Error('remaining budget missing');
+});
+
+check('a quote above the remaining budget is called out', () => {
+  const html = sandbox.renderCostPreview('code', { ...QUOTE, within_budget: false });
+  if (!html.includes('over-budget')) throw new Error('over-budget state not marked');
+  if (!/above the remaining budget/i.test(html)) throw new Error('no explanation of the overrun');
+});
+
+check('a truncated source is warned about, not glossed over', () => {
+  const html = sandbox.renderCostPreview('code', {
+    ...QUOTE,
+    source: { ...QUOTE.source, truncated: true, truncation_reason: 'Only the first 1,500 files.' },
+  });
+  if (!html.includes('cost-warn')) throw new Error('no warning rendered');
+  if (!html.includes('Only the first 1,500 files.')) throw new Error('reason not shown');
+});
+
+check('the skipped files can be inspected before agreeing to spend', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!html.includes('node_modules/x.js')) throw new Error('skip sample not rendered');
+  if (!html.includes('excluded_directory')) throw new Error('skip reason not rendered');
+});
+
+check('the confirm button names the worst case, not the estimate', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!/Run the review — up to \$7\.90/.test(html)) {
+    throw new Error('the button does not state the ceiling');
+  }
+});
+
+check('there is a way to back out', () => {
+  const html = sandbox.renderCostPreview('code', QUOTE);
+  if (!html.includes('Cancel')) throw new Error('no cancel');
+});
+
+check('an uncalibrated estimate does not read as a measurement', () => {
+  const html = sandbox.renderCostPreview('code', {
+    ...QUOTE,
+    estimate: { ...QUOTE.estimate, price_is_estimated: true },
+    explanation: 'Priced with default rates — indicative only.',
+  });
+  if (!/indicative/i.test(html)) throw new Error('an indicative price is not labelled');
+});
+
+check('the quote reports vulnerable dependencies found for free', () => {
+  const html = sandbox.renderCostPreview('code', {
+    ...QUOTE, vulnerable_dependencies_found: 5,
+    dependency_scan: { versions_checked: 42, manifests: ['requirements.txt'],
+                       vulnerable: 5, unresolved: [], error: '' },
+  });
+  if (!/Vulnerable deps found/i.test(html)) throw new Error('not surfaced on the quote');
+  if (!html.includes('42 dependency version(s) checked')) throw new Error('no count of what was checked');
+  if (!/database lookup, not a model/i.test(html)) throw new Error('provenance not stated');
+});
+
+check('a dependency the database could not answer for is called unknown, not clean', () => {
+  const html = sandbox.renderDependencyNote({
+    versions_checked: 3, manifests: ['web/package.json'], vulnerable: 0, error: '',
+    unresolved: [{ name: 'lodash', spec: '^4.17.11', path: 'web/package.json', line: 7 }],
+  });
+  if (!/NOT checked/.test(html)) throw new Error('unresolved dependencies are invisible');
+  if (!html.includes('lodash')) throw new Error('the package is not named');
+  if (!/unknown, not clean/i.test(html)) throw new Error('silence could still read as safety');
+});
+
+check('an unreachable database is a warning, never a clean report', () => {
+  const html = sandbox.renderDependencyNote({
+    versions_checked: 0, manifests: ['requirements.txt'], vulnerable: 0, unresolved: [],
+    error: 'Could not reach the vulnerability database (TimeoutError), so 12 dependency '
+         + 'version(s) were not checked. This is not a clean result.',
+  });
+  if (!html.includes('cost-warn')) throw new Error('an outage is not marked as a warning');
+  if (!/not a clean result/.test(html)) throw new Error('the outage could be read as clean');
+});
+
+check('a codebase with no manifests produces no dependency noise', () => {
+  const html = sandbox.renderDependencyNote(
+    { versions_checked: 0, manifests: [], vulnerable: 0, unresolved: [], error: '' });
+  if (html.trim() !== '') throw new Error(`expected nothing, got: ${html.slice(0, 80)}`);
+});
+
+check('a result carries the dependency account too, not just the quote', () => {
+  const html = sandbox.renderReviewTransparency({
+    source: { files_reviewed: 12, dependency: {
+      versions_checked: 8, manifests: ['go.mod'], vulnerable: 2, unresolved: [], error: '' } },
+  });
+  if (!html.includes('8 dependency version(s) checked')) throw new Error('missing on the result');
+});
+
+section('What the review did and did not cover');
+
+check('a fully covered review says so', () => {
+  const html = sandbox.renderReviewTransparency({
+    gate_status: 'Green',
+    coverage: { chunks_total: 6, chunks_succeeded: 6, chunks_failed: 0, files_reviewed: 41 },
+  });
+  if (!html.includes('coverage-ok')) throw new Error('no coverage strip');
+  if (!html.includes('all successful')) throw new Error('does not say it was complete');
+});
+
+check('a partial review is flagged before the findings, not after', () => {
+  const html = sandbox.renderReviewTransparency({
+    gate_status: 'Amber',
+    coverage: {
+      chunks_total: 6, chunks_succeeded: 4, chunks_failed: 2,
+      failures: [{ chunk: 3, files: ['a.py'], error: 'RuntimeError: timeout' }],
+    },
+  });
+  if (!html.includes('coverage-bad')) throw new Error('a failed chunk is not flagged');
+  if (!/never examined/i.test(html)) throw new Error('does not say part of the code was not read');
+  if (!html.includes('RuntimeError: timeout')) throw new Error('the failure cannot be inspected');
+});
+
+check('a source cut short upstream is flagged even when every chunk succeeded', () => {
+  const html = sandbox.renderReviewTransparency({
+    gate_status: 'Amber',
+    coverage_complete: false,
+    coverage: { chunks_total: 2, chunks_succeeded: 2, chunks_failed: 0 },
+    source: { truncation_reason: 'The PR diff was truncated.' },
+  });
+  if (!/Partial review/i.test(html)) throw new Error('an upstream truncation is invisible');
+  if (!html.includes('The PR diff was truncated.')) throw new Error('reason not shown');
+});
+
+check('the gate the model wanted is shown when the arithmetic overruled it', () => {
+  const html = sandbox.renderReviewTransparency({
+    gate_status: 'Red', model_gate_status: 'Green',
+  });
+  if (!html.includes('gate-provenance')) throw new Error('the disagreement is hidden');
+  if (!html.includes('Green') || !html.includes('Red')) throw new Error('both gates not named');
+});
+
+check('agreement between the model and the arithmetic is not narrated', () => {
+  const html = sandbox.renderReviewTransparency({
+    gate_status: 'Red', model_gate_status: 'Red',
+  });
+  if (html.includes('gate-provenance')) throw new Error('noise when the two agree');
+});
+
+check('the counts row separates new work from a backlog', () => {
+  const html = sandbox.renderReviewTransparency({
+    new_findings_count: 3, pre_existing_count: 41, waived_count: 2,
+  });
+  if (!html.includes('3 new')) throw new Error('new count missing');
+  if (!html.includes('41 pre-existing')) throw new Error('pre-existing count missing');
+  if (!html.includes('2 waived')) throw new Error('waived count missing');
+});
+
+check('findings from the scanner are counted separately from the model', () => {
+  const html = sandbox.renderReviewTransparency({ deterministic_findings_count: 4 });
+  if (!/from the scanner/i.test(html)) throw new Error('scanner findings not distinguished');
+});
+
+check('discarded findings are shown, which is the tool policing itself', () => {
+  const html = sandbox.renderReviewTransparency({
+    discarded_findings: [
+      { title: 'Invented RCE', file_path: 'app/a.py',
+        discard_reason: 'evidence quote does not appear in app/a.py' },
+    ],
+  });
+  if (!html.includes('panel-discarded')) throw new Error('no discard panel');
+  if (!html.includes('Invented RCE')) throw new Error('the discarded finding is not listed');
+  if (!html.includes('does not appear in app/a.py')) throw new Error('the reason is not given');
+});
+
+check('suppressed findings are readable, so the filter can be overruled', () => {
+  const html = sandbox.renderReviewTransparency({
+    suppressed_findings: [{
+      title: 'Fixture key', file_path: 'tests/conftest.py', severity: 5,
+      suppressed_reason: 'path is test, vendored, generated or build output',
+    }],
+  });
+  if (!html.includes('panel-suppressed')) throw new Error('no suppressed panel');
+  if (!html.includes('Fixture key')) throw new Error('the suppressed finding is not rendered');
+});
+
+check('the source and what was filtered out of it is stated on the result', () => {
+  const html = sandbox.renderReviewTransparency({
+    source: { label: 'acme/app@main', source_type: 'github_repo',
+              files_reviewed: 312, files_skipped: 588, secrets_redacted: 3 },
+  });
+  if (!html.includes('acme/app@main')) throw new Error('source not named');
+  if (!html.includes('312')) throw new Error('read count missing');
+  if (!html.includes('588')) throw new Error('filtered count missing');
+});
+
+check('the result offers a way to get the findings out of the platform', () => {
+  const html = sandbox.renderReviewTransparency({
+    review_id: 'rid-9', findings: [{ title: 'SQLi', severity: 5, file_path: 'a.py' }],
+  });
+  if (!/Download as SARIF/i.test(html)) throw new Error('no export affordance');
+  if (!html.includes('rid-9')) throw new Error('the export link does not name the review');
+});
+
+check('...but not on a result with no findings to export', () => {
+  // SARIF is a static-analysis format. The transparency block is now on every agent
+  // screen, including the generative ones, and 'Download as SARIF' under a set of
+  // generated test cases exports an empty file -- which teaches a reader that the buttons
+  // on this platform are decorative.
+  const html = sandbox.renderReviewTransparency({ review_id: 'rid-10', findings: [] });
+  if (/SARIF/i.test(html)) throw new Error('offered an export of nothing');
+});
+
+check('...and it counts suppressed findings, which the export does include', () => {
+  const html = sandbox.renderReviewTransparency({
+    review_id: 'rid-11', findings: [],
+    suppressed_findings: [{ title: 'fixture key', file_path: 'tests/x.py', severity: 5 }],
+  });
+  if (!/Download as SARIF/i.test(html))
+    throw new Error('a review whose only findings are in test paths still has a SARIF file '
+      + 'worth exporting -- they are included, marked suppressed');
+});
+
+check('a result with no id offers no broken export link', () => {
+  const html = sandbox.renderReviewTransparency({ gate_status: 'Green' });
+  if (/SARIF/i.test(html)) throw new Error('an export link was rendered with no review id');
+});
+
+check('a plain result renders nothing rather than empty scaffolding', () => {
+  const html = sandbox.renderReviewTransparency({ gate_status: 'Green' });
+  if (html.trim() !== '') throw new Error(`expected no output, got: ${html.slice(0, 120)}`);
+});
+
+section('Per-finding trust marks');
+
+check('a verified finding says so', () => {
+  const html = sandbox.renderFinding({
+    title: 'SQLi', severity: 5, file_path: 'a.py', line_start: 4,
+    evidence: 'q = "..." + u', evidence_verified: true, confidence: 'High',
+  });
+  if (!html.includes('evidence verified')) throw new Error('verification not shown');
+  if (!html.includes('a.py')) throw new Error('location not shown');
+});
+
+check('an unverified finding is not presented as proven', () => {
+  const html = sandbox.renderFinding({
+    title: 'Maybe', severity: 3, evidence_verified: false,
+    evidence_note: 'the quoted code appears in 3 files',
+  });
+  if (!html.includes('unverified')) throw new Error('an unverified finding looks proven');
+  if (!html.includes('appears in 3 files')) throw new Error('the reason is not carried');
+});
+
+check('a scanner finding is marked as a scanner finding', () => {
+  const html = sandbox.renderFinding({
+    title: 'Hardcoded credential', severity: 5, detector: 'pattern',
+    file_path: 'cfg.py', line_start: 1, evidence: 'P = "__REDACTED_X__"',
+  });
+  if (!html.includes('mark-scanner')) throw new Error('a pattern match reads as a model finding');
+});
+
+check('low confidence is visible without reading the description', () => {
+  const html = sandbox.renderFinding({ title: 'X', severity: 3, confidence: 'Low' });
+  if (!/low confidence/i.test(html)) throw new Error('confidence not shown');
+});
+
+check('a re-filed finding admits it was re-filed', () => {
+  const html = sandbox.renderFinding({
+    title: 'Command injection', severity: 4,
+    file_path: 'app/admin.py', file_path_corrected: true, reported_file_path: 'app/auth.py',
+  });
+  if (!html.includes('re-filed')) throw new Error('the correction is invisible');
+});
+
+check('a merged duplicate reports how many times it was seen', () => {
+  const html = sandbox.renderFinding({ title: 'X', severity: 3, occurrences: 4 });
+  if (!html.includes('×4')) throw new Error('occurrence count missing');
+});
+
+section('Findings grouped by file');
+
+check('one file stays a flat list', () => {
+  const html = sandbox.renderFindingsByFile([
+    { title: 'A', severity: 5, file_path: 'a.py' },
+    { title: 'B', severity: 3, file_path: 'a.py' },
+  ]);
+  if (html.includes('file-group')) throw new Error('a single file was grouped unnecessarily');
+});
+
+check('several files are grouped, worst file first', () => {
+  const html = sandbox.renderFindingsByFile([
+    { title: 'Low one', severity: 2, file_path: 'b.py' },
+    { title: 'Critical one', severity: 5, file_path: 'a.py' },
+  ]);
+  if (!html.includes('file-group')) throw new Error('not grouped');
+  if (html.indexOf('a.py') > html.indexOf('b.py')) {
+    throw new Error('the file with the Critical is not first');
+  }
+});
+
+check('a group states how many findings it holds', () => {
+  const html = sandbox.renderFindingsByFile([
+    { title: 'A', severity: 5, file_path: 'a.py' },
+    { title: 'B', severity: 4, file_path: 'a.py' },
+    { title: 'C', severity: 2, file_path: 'b.py' },
+  ]);
+  if (!html.includes('2 finding(s)')) throw new Error('per-file count missing');
+});
+
+section('GitHub post-back');
+
+check('the options offer a way to review without writing to the PR', () => {
+  // The block now renders into the review screen's own container -- the separate GitHub PR
+  // screen is retired, because two screens reviewing one artifact is how the token field
+  // and the fix controls ended up on only one of them.
+  sandbox.renderGithubOptions('code-gh-options');
+  const html = document.getElementById('code-gh-options').innerHTML;
+  if (!html.includes('value="none"')) throw new Error('no dry-run option');
+  if (!html.includes('value="inline"')) throw new Error('no line-comment option');
+  if (!html.includes('gh-set-status')) throw new Error('no merge-blocking option');
+});
+
+check('a preview shows what would have been posted', () => {
+  const html = sandbox.renderGithubPostback({
+    post_mode: 'none', comment_posted: false,
+    comment_preview: '## Gate: Red\nSQL injection at app/auth.py:42',
+  });
+  if (!/Nothing was written to GitHub/i.test(html)) throw new Error('does not say nothing was posted');
+  if (!html.includes('app/auth.py:42')) throw new Error('the preview is not shown');
+});
+
+check('an edited comment is reported as edited, not as a new one', () => {
+  const html = sandbox.renderGithubPostback({
+    post_mode: 'summary', comment_posted: true,
+    post_detail: { posted: true, updated: true, comment_url: 'https://github.com/x#c1' },
+  });
+  if (!/updated in place/i.test(html)) throw new Error('an edit reads as a new comment');
+  if (!html.includes('https://github.com/x#c1')) throw new Error('no link to what was posted');
+});
+
+check('line comments report how many landed and how many did not', () => {
+  const html = sandbox.renderGithubPostback({
+    post_mode: 'inline', comment_posted: true,
+    post_detail: { posted: true, inline_comments: 7, summary_only: 12,
+                   review_url: 'https://github.com/x#r1' },
+  });
+  if (!html.includes('7 comment(s) on the diff lines')) throw new Error('inline count missing');
+  if (!html.includes('12 in the summary')) throw new Error('the remainder is unaccounted for');
+});
+
+check('findings GitHub refused to anchor are accounted for, not lost', () => {
+  const html = sandbox.renderGithubPostback({
+    post_mode: 'inline', comment_posted: true,
+    post_detail: { posted: true, inline_comments: 0, inline_rejected: 5, summary_only: 5 },
+  });
+  if (!/could not be anchored/i.test(html)) throw new Error('rejected anchors are silent');
+});
+
+check('a Red gate reported to GitHub says it blocks the merge', () => {
+  const html = sandbox.renderGithubPostback({
+    post_mode: 'summary', comment_posted: true, post_detail: { posted: true },
+    status_check: { posted: true, state: 'failure', gate_status: 'Red' },
+  });
+  if (!html.includes('gh-row-block')) throw new Error('a blocking check is not marked');
+  if (!/blocks the merge/i.test(html)) throw new Error('does not say what the check does');
+});
+
+check('a token without permission to report a check says so', () => {
+  const html = sandbox.renderGithubPostback({
+    post_mode: 'summary', comment_posted: true, post_detail: { posted: true },
+    status_check: { posted: false, reason: 'Resource not accessible by personal access token' },
+  });
+  if (!/Merge check not reported/i.test(html)) throw new Error('a failed check is silent');
+  if (!html.includes('personal access token')) throw new Error('the reason is not carried');
+});
+
+check('a failed post is reported as failed', () => {
+  const html = sandbox.renderGithubPostback({
+    post_mode: 'summary', comment_posted: false,
+    post_detail: { posted: false, reason: 'GITHUB_TOKEN is not configured' },
+  });
+  if (!html.includes('gh-row-warn')) throw new Error('a failure is not marked');
+  if (!html.includes('GITHUB_TOKEN is not configured')) throw new Error('the reason is not shown');
+});
+
+section('The full result renderers still hold together');
+
+check('a code review result renders end to end', () => {
+  sandbox.renderResult('code-result', {
+    gate_status: 'Red', risk_score: 82, model_gate_status: 'Green',
+    summary: 'One injection path.',
+    coverage: { chunks_total: 3, chunks_succeeded: 3, chunks_failed: 0, files_reviewed: 12 },
+    new_findings_count: 1, pre_existing_count: 4,
+    discarded_findings: [{ title: 'invented', discard_reason: 'not in source' }],
+    suppressed_findings: [{ title: 'fixture', file_path: 'tests/x.py', severity: 5 }],
+    source: { label: 'demo.zip', files_reviewed: 12, files_skipped: 30 },
+    findings: [
+      { title: 'SQLi', severity: 5, file_path: 'a.py', line_start: 4,
+        evidence: 'q = "x" + u', evidence_verified: true, is_new: true },
+      { title: 'Weak hash', severity: 3, file_path: 'b.py', line_start: 9,
+        detector: 'pattern' },
+    ],
+    recommendations: ['Parameterize queries.'],
+  });
+  const html = document.getElementById('code-result').innerHTML;
+  if (!html.includes('coverage-ok')) throw new Error('coverage missing from the result');
+  if (!html.includes('panel-discarded')) throw new Error('discard panel missing');
+  if (!html.includes('gate-provenance')) throw new Error('gate disagreement missing');
+  if (!html.includes('file-group')) throw new Error('findings not grouped by file');
+  if (!html.includes('SQLi')) throw new Error('findings missing');
+});
+
+check('a VAPT result renders its own fields as well as the shared ones', () => {
+  sandbox.renderVAPTResult('vapt-result', {
+    gate_status: 'Red', risk_score: 91, model_gate_status: 'Green',
+    summary: 'Assessed.', attack_surface_summary: 'One login endpoint.',
+    coverage: { chunks_total: 2, chunks_succeeded: 2, chunks_failed: 0 },
+    new_findings_count: 1,
+    discarded_findings: [{ title: 'invented', discard_reason: 'not in source' }],
+    findings: [{
+      vuln_id: 'VLN-001', title: 'SQL injection', severity: 5, cvss_score: 9.8,
+      cvss_vector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H',
+      owasp_category: 'A03:2021 Injection', cwe_id: 'CWE-89',
+      description: 'Concatenated query.', affected_component: 'login()',
+      attack_scenario: "' OR 1=1--", proof_of_concept: 'curl -d "x=1"',
+      recommendation: 'Parameterize.', file_path: 'app/auth.py', line_start: 4,
+      evidence: 'q = "SELECT" + u', evidence_verified: true,
+    }],
+    recommendations: ['Parameterize.'],
+  });
+  const html = document.getElementById('vapt-result').innerHTML;
+  if (!html.includes('CVSS:3.1/AV:N')) throw new Error('the CVSS vector is still being dropped');
+  if (!html.includes('curl -d')) throw new Error('the proof of concept is still being dropped');
+  if (!html.includes('app/auth.py:4')) throw new Error('the location is not shown');
+  if (!html.includes('verified against the source')) throw new Error('verification not shown');
+  if (!html.includes('coverage-ok')) throw new Error('coverage missing');
+  if (!html.includes('gate-provenance')) throw new Error('gate disagreement missing');
+});
+}
+
+
+// ── One screen must not paint into another, and a control must be able to work ──
+//
+// Two defects lived here undetected because neither had a test.
+//
+// The first: `renderResult` inferred the owning screen as "code" for anything that was not
+// VAPT, and `#code-sources` exists on every page load -- so running Requirement Review,
+// Prompt Safety or the Release Gate fetched *that* review's inventory and painted it into
+// the **Code Review screen's** panel. Silent, because the panel being vandalised was on a
+// screen you were not looking at.
+//
+// The second: the Apply Fixes checkbox rendered on every agent's findings, but applying a
+// fix needs the source read back, and only the review pipeline records one. On seventeen
+// screens the checkbox was tickable and guaranteed to fail. Same rule as D-268.
+//
+// The inventory fetch is a `setTimeout(..., 0)`, so these have to await a turn of the event
+// loop -- which is exactly why the defect survived: nothing that could see it ever waited.
+async function runScreenIsolationChecks() {
+section('One screen does not paint into another');
+
+const tick = () => new Promise(r => setTimeout(r, 0));
+
+await checkAsync('a requirement review does not touch the Code Review file panel', async () => {
+  elements.delete('code-sources');
+  elements.delete('req-result');
+  fetchLog.length = 0;
+  sandbox.renderResult('req-result', {
+    review_type: 'requirement', review_id: 'rv-req', gate_status: 'Amber',
+    summary: 'Two ambiguous acceptance criteria.',
+    findings: [{ id: 'q1', title: 'Ambiguous criterion', severity: 3,
+                 file_path: 'reqs/login.md', line_start: 8,
+                 evidence: 'should be fast', evidence_verified: true }],
+  });
+  await tick();
+  const inv = document.getElementById('code-sources').innerHTML;
+  assert(inv === '', `Code Review's file panel was written to by another screen: ${inv.slice(0, 80)}`);
+  const leaked = fetchLog.filter(u => String(u).includes('/sources'));
+  assert(leaked.length === 0,
+    `a requirement review fetched a file inventory it has none of: ${leaked.join(', ')}`);
+});
+
+await checkAsync('...and offers no fix checkbox, because it has no source to patch', async () => {
+  const html = document.getElementById('req-result').innerHTML;
+  assert(!html.includes('fix-check'),
+    'a tickable fix checkbox on a review whose source was never stored -- fix_apply would '
+    + 'refuse it after the round trip');
+  assert(!html.includes('Cannot be fixed'),
+    'not even the disabled box: twenty of those explain a limitation of the screen, not '
+    + 'of the finding, and the waiver controls beside them are the action available here');
+});
+
+await checkAsync('...while the waiver controls it CAN act on are still there', async () => {
+  const html = document.getElementById('req-result').innerHTML;
+  assert(html.includes('setFindingStatus') || html.includes('waive'),
+    'removing the fix affordance must not remove the one that works');
+});
+
+await checkAsync('a code review keeps its fix checkbox and its file panel', async () => {
+  elements.delete('code-sources');
+  elements.delete('code-result');
+  fetchLog.length = 0;
+  sandbox.renderResult('code-result', {
+    review_type: 'code', review_id: 'rv-code', gate_status: 'Red',
+    summary: 'One injection path.',
+    findings: [{ id: 'f1', title: 'SQLi', severity: 5, file_path: 'app/db.py',
+                 line_start: 4, evidence: 'q = "x" + u', evidence_verified: true }],
+  });
+  await tick();
+  const html = document.getElementById('code-result').innerHTML;
+  assert(html.includes('fix-check'), 'Code Review lost the fix checkbox');
+  assert(html.includes('Fix this'), 'the fix affordance is gone from the screen that has it');
+  const asked = fetchLog.filter(u => String(u).includes('/sources'));
+  assert(asked.length === 1,
+    `expected one inventory fetch for the review on screen, got ${asked.length}`);
+  assert(String(asked[0]).includes('rv-code'),
+    `the inventory fetched belongs to another review: ${asked[0]}`);
+});
+
+await checkAsync('a VAPT assessment reopens through the VAPT renderer, not the plain one', async () => {
+  // D-261 claimed a stored run renders through the same function as a fresh one. For VAPT
+  // that was false: `openAgentRun` always called `renderResult`, so reopening an assessment
+  // dropped its CVSS, CWE and proof of concept -- the substance of the assessment.
+  // `const` at a script's top level is a lexical binding, not a property of globalThis,
+  // so it is unreachable as `sandbox.AGENT_SCREENS`. Evaluating in the same context reads
+  // the binding itself.
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const spec = TABLE && TABLE.vapt;
+  assert(spec, 'the screen table has no vapt row');
+  assert(spec.render === sandbox.renderVAPTResult,
+    'the vapt row does not point at renderVAPTResult, so a reopened assessment would '
+    + 'render through the generic renderer and show none of its own fields');
+  const code = TABLE.code;
+  assert(code.render === sandbox.renderResult, 'the code row lost its renderer');
+});
+
+await checkAsync('every screen in the table names a renderer that exists', async () => {
+  for (const [page, s] of Object.entries(vm.runInContext('AGENT_SCREENS', sandbox))) {
+    assert(typeof s.render === 'function', `${page}: render is not a function`);
+    assert(typeof s.result === 'string' && s.result, `${page}: no result container id`);
+    assert(typeof s.noun === 'string' && s.noun, `${page}: nothing to call its runs`);
+  }
+});
+
+section('The audit-ready report can be handed to an auditor');
+
+// This screen calls itself the audit-ready report and offered no way to get it out. The
+// only affordance was a report id -- a UUID nobody can do anything with outside this
+// application. Markdown rather than PDF: it is what the rest of this codebase exports
+// (MODERNIZATION_REPORT.md, the GxP documents), and a diffable artifact is worth more in a
+// governance trail than a rendered one.
+
+const _REPORT = {
+  report_id: 'rep-1', project_name: 'Care Brief', review_date: '2026-09-03',
+  gate_status: 'Amber', overall_risk_score: 41,
+  executive_summary: 'Two controls are unevidenced.',
+  findings_by_category: {
+    Security: [
+      { id: 'g1', title: 'No audit trail for PHI reads', severity: 5,
+        control_id: 'HIPAA-003', file_path: 'app/records.py', line_start: 88,
+        description: 'Reads are not logged.', recommendation: 'Log them.' },
+      { id: 'g2', title: 'Verbose error body', severity: 2, control_id: 'SEC-014',
+        description: 'Stack traces reach the client.', recommendation: 'Return a code.',
+        status: 'accepted_risk', resolved_by: 'sam',
+        waiver_expires_at: '2026-12-01T00:00:00' },
+    ],
+  },
+  recommendations: ['Add the access log.', 'Strip internal detail from responses.'],
+};
+
+check('the report screen offers a download, not just a UUID', () => {
+  elements.delete('report-result');
+  sandbox.renderGovernanceReport('report-result', _REPORT);
+  const html = document.getElementById('report-result').innerHTML;
+  assert(/Download the report/i.test(html), 'no export affordance on the report screen');
+  assert(html.includes('rep-1'), 'the report id is no longer shown at all');
+});
+
+check('the exported markdown carries what the screen shows', () => {
+  const md = sandbox.governanceReportMarkdown(_REPORT);
+  assert(md.includes('# Governance Report — Care Brief'), 'no title');
+  assert(md.includes('**Gate:** Amber'), 'the gate is missing from the export');
+  assert(md.includes('41/100'), 'the risk score is missing');
+  assert(md.includes('Two controls are unevidenced.'), 'the executive summary is missing');
+  assert(md.includes('## Security (2)'), 'the category heading is missing');
+  assert(md.includes('No audit trail for PHI reads'), 'a finding is missing');
+  assert(md.includes('HIPAA-003'), 'the control id an auditor cites is missing');
+  assert(md.includes('app/records.py:88'), 'the location is missing');
+  assert(md.includes('Add the access log.'), 'the recommendations are missing');
+});
+
+check('...and says which findings someone has already decided to carry', () => {
+  const md = sandbox.governanceReportMarkdown(_REPORT);
+  assert(md.includes('**Status:** accepted_risk'),
+    'a waived finding exported as though it were open reads as an unresolved problem, '
+    + 'which is the opposite of what the waiver recorded');
+  assert(md.includes('by sam'), 'who accepted the risk is not in the export');
+  assert(md.includes('2026-12-01'),
+    'an accepted risk with an expiry that is not exported looks permanent');
+});
+
+check('the highest severity is written first, as on screen', () => {
+  const md = sandbox.governanceReportMarkdown(_REPORT);
+  assert(md.indexOf('No audit trail') < md.indexOf('Verbose error body'),
+    'the export order does not match the screen order, so the two disagree about what '
+    + 'matters most');
+});
+
+check('a report with nothing in it exports a header rather than throwing', () => {
+  const md = sandbox.governanceReportMarkdown({ project_name: 'Empty' });
+  assert(md.includes('# Governance Report — Empty'), 'no title on a bare report');
+  assert(!/undefined/.test(md), `"undefined" leaked into the export: ${md.slice(0, 160)}`);
+});
+
+section('A finding can be acted on from the screen that reported it');
+
+// `renderWaiveControl` was called from exactly one place -- inside the shared
+// `renderFinding` -- so any screen with its own per-finding markup rendered findings a
+// person could not waive, resolve, accept the risk on, or report as a false positive
+// without going to the separate Findings screen and locating them by hand.
+//
+// VAPT was the worst of these because **its own page subtitle said "Findings can be
+// waived"**. Four renderers were affected: VAPT, Sensitive Data, 21 CFR Part 11 and the
+// GxP Document Check. Everything else already routed through `renderFinding`, including
+// Security and Architecture, whose `renderFindingCard` is a one-line delegation to it.
+//
+// Fixed by calling the control from each bespoke renderer rather than by routing them
+// through the shared one: VAPT's own renderer is the only thing that shows the CVSS vector,
+// the attack scenario and the proof of concept, and trading those for a button would be a
+// bad deal.
+
+const _WAIVABLE = {
+  vapt: {
+    vuln_id: 'VLN-1', title: 'SQLi', severity: 5, cvss_score: 9.8,
+    cvss_vector: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H', cwe_id: 'CWE-89',
+    description: 'Concatenated query.', attack_scenario: "' OR 1=1--",
+    proof_of_concept: 'curl -d "x=1"', recommendation: 'Parameterize.',
+    file_path: 'app/auth.py', line_start: 4, evidence: 'q = "S" + u',
+  },
+  sensitive: {
+    title: 'Unmasked SSN', severity: 5, category: 'PII', control_id: 'HIPAA-001',
+    risk_level: 'Critical', description: 'Logged in the clear.', location: 'log.py:22',
+    recommendation: 'Redact it.', regulation_refs: ['HIPAA'],
+  },
+  cfr21: {
+    title: 'No audit trail', severity: 4, control_id: 'CFR-001', cfr_section: '11.10(e)',
+    risk_level: 'High', description: 'No record of who changed what.',
+    evidence: 'update()', recommendation: 'Add an audit table.',
+  },
+  'gxp-docs': {
+    title: 'Missing signature block', severity: 3, control_id: 'GXP-002',
+    gxp_reference: 'Annex 11', risk_level: 'Medium',
+    description: 'No approver.', evidence: 'section 4', recommendation: 'Add one.',
+  },
+};
+
+check('the four screens with bespoke finding markup now offer the waiver controls', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const missing = [];
+  for (const [page, finding] of Object.entries(_WAIVABLE)) {
+    const spec = TABLE[page];
+    assert(spec, `${page} is not in the screen table`);
+    const target = `_waive_${page}`;
+    elements.delete(target);
+    spec.render(target, {
+      review_type: spec.reviewType, review_id: `rv-${page}`, gate_status: 'Red',
+      risk_score: 70, summary: 'One issue.',
+      findings: [{ ...finding, id: `find-${page}` }],
+    });
+    const html = document.getElementById(target).innerHTML;
+    if (!html.includes(`waive-status-find-${page}`)) missing.push(page);
+  }
+  assert(missing.length === 0,
+    `no way to act on a finding from: ${missing.join(', ')} -- it can only be waived from `
+    + `the separate Findings screen, by locating it there by hand`);
+});
+
+check('...and VAPT keeps everything its own renderer shows', () => {
+  // The point of not routing VAPT through the shared renderer. If this fails, the waiver
+  // button was bought with the substance of the assessment.
+  const html = document.getElementById('_waive_vapt').innerHTML;
+  assert(html.includes('CVSS:3.1/AV:N'), 'the CVSS vector was lost');
+  assert(html.includes('curl -d'), 'the proof of concept was lost');
+  assert(html.includes("' OR 1=1--"), 'the attack scenario was lost');
+  assert(html.includes('CWE-89'), 'the CWE reference was lost');
+  assert(html.includes('app/auth.py'), 'the location was lost');
+});
+
+check('...and the regulated screens keep the control ids a report has to cite', () => {
+  assert(document.getElementById('_waive_cfr21').innerHTML.includes('11.10(e)'),
+    'the CFR section was lost');
+  assert(document.getElementById('_waive_gxp-docs').innerHTML.includes('Annex 11'),
+    'the GxP reference was lost');
+  assert(document.getElementById('_waive_sensitive').innerHTML.includes('HIPAA-001'),
+    'the control id was lost');
+});
+
+check('an already-waived finding says so, and offers to reopen it, on those screens too', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  for (const [page, finding] of Object.entries(_WAIVABLE)) {
+    const target = `_waived_${page}`;
+    elements.delete(target);
+    TABLE[page].render(target, {
+      review_type: TABLE[page].reviewType, review_id: `rv-${page}`, gate_status: 'Amber',
+      findings: [{ ...finding, id: `w-${page}`, status: 'accepted_risk',
+                   resolved_by: 'alex', waiver_expires_at: '2026-12-01T00:00:00' }],
+    });
+    const html = document.getElementById(target).innerHTML;
+    assert(html.includes('finding-waived'), `${page}: a waived finding is not marked as one`);
+    assert(html.includes('2026-12-01'),
+      `${page}: the expiry is not shown -- an accepted risk that silently comes back is `
+      + `worse than one that never lapsed`);
+    assert(html.includes('Reopen'), `${page}: no way to undo the waiver`);
+  }
+});
+
+section('What a run cost, carried in headers');
+
+// The synchronous review routes are metered by middleware that runs around the handler, so
+// the cost is known only after the body has been serialized. `legacy_guard` reports it in
+// `X-Spend-*` headers and `apiFetch` folds them into `_budget_stats`, which is where the
+// spend strip already looks -- so no renderer had to change.
+
+const _hdrs = (o) => o;   // the stub's header bag is a plain object
+
+check('the headers become _budget_stats, so the existing strip renders', () => {
+  const body = { gate_status: 'Green', findings: [] };
+  const res = { headers: { get: (k) => ({
+    'X-Spend-Cost-USD': '0.041200', 'X-Spend-Calls': '3',
+    'X-Spend-Tokens-In': '12405', 'X-Spend-Tokens-Out': '1880',
+    'X-Spend-Model': 'claude-sonnet-4-6', 'X-Spend-Provider': 'anthropic',
+    'X-Spend-Billable': '1',
+  })[k] ?? null } };
+  const out = sandbox._foldSpendHeaders(res, body);
+  assert(out._budget_stats, 'no _budget_stats was folded in');
+  assert(out._budget_stats.cost_usd === 0.0412, `cost was ${out._budget_stats.cost_usd}`);
+  assert(out._budget_stats.calls === 3, 'call count lost');
+  assert(out._budget_stats.input_tokens === 12405, 'input tokens lost');
+  assert(out._budget_stats.model === 'claude-sonnet-4-6', 'model lost');
+  assert(out._budget_stats.billable === true, 'billable flag lost');
+  const html = sandbox.renderReviewTransparency(out);
+  assert(html.includes('spend-strip'), 'the strip did not render from folded headers');
+  assert(html.includes('0.0412'), 'the cost is not on screen');
+  assert(html.includes('claude-sonnet-4-6'), 'the model is not on screen');
+});
+
+check('a body that already has _budget_stats is not downgraded', () => {
+  // The `guarded_call` path carries strictly more: remaining monthly budget, the
+  // per-project figures, whether the call was billable at all. Overwriting it with the
+  // header subset would be a downgrade dressed as a fix.
+  const rich = { cost_usd: 0.99, calls: 9, monthly_budget_usd: 50, budget_used_usd: 12 };
+  const body = { _budget_stats: rich };
+  const res = { headers: { get: () => '0.01' } };
+  const out = sandbox._foldSpendHeaders(res, body);
+  assert(out._budget_stats === rich, 'the richer body figures were overwritten by headers');
+  assert(out._budget_stats.monthly_budget_usd === 50, 'budget context lost');
+});
+
+check('a run that reached no model reports no spend at all', () => {
+  // A validation error, a cache hit, or a free preflight. "cost $0.0000" on those is
+  // noise pretending to be transparency.
+  const res = { headers: { get: (k) => ({
+    'X-Spend-Cost-USD': '0.000000', 'X-Spend-Calls': '0',
+  })[k] ?? null } };
+  const out = sandbox._foldSpendHeaders(res, { gate_status: 'Green' });
+  assert(!out._budget_stats, 'a zero-call response produced a spend strip');
+});
+
+check('a response with no spend headers is left alone', () => {
+  const out = sandbox._foldSpendHeaders({ headers: { get: () => null } }, { a: 1 });
+  assert(!out._budget_stats, 'invented spend figures from nothing');
+  assert(out.a === 1, 'the body was mangled');
+});
+
+check('a response with no readable headers does not throw', () => {
+  // Cross-origin without `expose_headers`, or an older test double. A successful request
+  // must not fail inside the transport for want of a header.
+  const out = sandbox._foldSpendHeaders({}, { a: 1 });
+  assert(out.a === 1, 'the body was lost');
+  const out2 = sandbox._foldSpendHeaders({ headers: {} }, { a: 1 });
+  assert(out2.a === 1, 'the body was lost when headers had no getter');
+});
+
+check('a non-object body passes through untouched', () => {
+  assert(sandbox._foldSpendHeaders({ headers: { get: () => '1' } }, null) === null);
+  assert(Array.isArray(sandbox._foldSpendHeaders({ headers: { get: () => '1' } }, [1, 2])));
+});
+
+check('an estimated price says so, rather than implying a quoted one', () => {
+  const res = { headers: { get: (k) => ({
+    'X-Spend-Cost-USD': '0.010000', 'X-Spend-Calls': '1',
+    'X-Spend-Model': 'some-local-router', 'X-Spend-Cost-Estimated': '1',
+  })[k] ?? null } };
+  const out = sandbox._foldSpendHeaders(res, { gate_status: 'Green' });
+  assert(out._budget_stats.cost_estimated === true, 'the estimate flag was dropped');
+  const html = sandbox.renderReviewTransparency(out);
+  assert(html.includes('cost is an estimate'),
+    'a model with no published price must not present its cost as a fact');
+});
+
+section('What the run cost, on every agent screen');
+
+// `renderReviewTransparency` reads only result keys -- coverage, the gate the model itself
+// returned, the findings discarded because their quoted code was not in the source, the
+// spend, the model that answered, the SARIF export. It was entirely screen-agnostic and
+// called from two renderers out of sixteen, so seventeen screens computed all of it and
+// rendered none of it. A person approved nothing and was shown nothing.
+//
+// Driven from the table so a nineteenth screen is covered without touching this file.
+check('every screen renders the spend strip, not just the two that had it', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const missing = [];
+  const threw = [];
+  for (const [page, spec] of Object.entries(TABLE)) {
+    const target = `_spend_${page}`;
+    elements.delete(target);
+    try {
+      spec.render(target, {
+        review_type: spec.reviewType, review_id: `rv-${page}`,
+        gate_status: 'Amber', risk_score: 40, summary: 'A summary.',
+        _budget_stats: {
+          cost_usd: 0.0412, calls: 3, input_tokens: 12405, output_tokens: 1880,
+          model: 'claude-sonnet-4-6', provider: 'anthropic',
+        },
+      });
+    } catch (e) {
+      threw.push(`${page}: ${e.message}`);
+      continue;
+    }
+    const html = document.getElementById(target).innerHTML;
+    if (!html.includes('spend-strip')) missing.push(page);
+  }
+  assert(threw.length === 0, `renderer threw on a minimal result -- ${threw.join(' | ')}`);
+  assert(missing.length === 0,
+    `no spend strip on: ${missing.join(', ')} -- the cost was computed and dropped`);
+});
+
+check('...and it names the model, because whoever reads the answer is entitled to know', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const quiet = [];
+  for (const [page, spec] of Object.entries(TABLE)) {
+    const target = `_model_${page}`;
+    elements.delete(target);
+    spec.render(target, {
+      review_type: spec.reviewType, review_id: `rv-${page}`, gate_status: 'Green',
+      _budget_stats: { cost_usd: 0.01, calls: 1, model: 'llama-3.3-70b', provider: 'ollama' },
+    });
+    const html = document.getElementById(target).innerHTML;
+    // The sidebar shows the *deployment default*, which a team on its own key is not using.
+    if (!html.includes('llama-3.3-70b')) quiet.push(page);
+  }
+  assert(quiet.length === 0, `the model is not shown on: ${quiet.join(', ')}`);
+});
+
+check('...and a partial review says so on every screen, not only on Code Review', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const silent = [];
+  for (const [page, spec] of Object.entries(TABLE)) {
+    const target = `_cov_${page}`;
+    elements.delete(target);
+    spec.render(target, {
+      review_type: spec.reviewType, review_id: `rv-${page}`, gate_status: 'Green',
+      coverage: { chunks_total: 4, chunks_succeeded: 3, chunks_failed: 1,
+                  failures: [{ chunk: 2, error: 'timeout' }] },
+    });
+    const html = document.getElementById(target).innerHTML;
+    // A gate over part of a codebase is a different claim from a gate over all of it.
+    if (!html.includes('coverage-bad')) silent.push(page);
+  }
+  assert(silent.length === 0,
+    `a Green gate over an incomplete review looks complete on: ${silent.join(', ')}`);
+});
+
+check('a generative agent is offered no SARIF export, having no findings', () => {
+  const TABLE = vm.runInContext('AGENT_SCREENS', sandbox);
+  const spec = TABLE['test-case'];
+  elements.delete('_gen_tc');
+  spec.render('_gen_tc', {
+    review_type: 'test_cases', review_id: 'rv-tc', summary: 'Forty cases.',
+    test_cases: [{ id: 1, title: 'login' }],
+    _budget_stats: { cost_usd: 0.02, calls: 1, model: 'claude-sonnet-4-6' },
+  });
+  const html = document.getElementById('_gen_tc').innerHTML;
+  assert(html.includes('spend-strip'), 'a generated set of test cases still cost money');
+  assert(!/SARIF/i.test(html),
+    'a static-analysis export under generated test cases would download an empty file');
+});
+}
+
+runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
+  .then(runReviewSourceChecks).then(runScreenIsolationChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

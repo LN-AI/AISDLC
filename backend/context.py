@@ -23,26 +23,41 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Optional
 
-__all__ = ["bind_project", "current_project_id", "current_project_name"]
+__all__ = ["bind_project", "current_project_id", "current_project_name",
+           "current_product_id"]
 
 _project_id: ContextVar[Optional[str]] = ContextVar("current_project_id", default=None)
 _project_name: ContextVar[str] = ContextVar("current_project_name", default="")
 
+# Which *product* is running, for the same reason and by the same route as the project.
+#
+# `review_type` is too coarse to identify a screen's own history: "code" is written by
+# `orchestrator.review_code`, by `workflows/review_pr.py` and by `workflows/autofix_pr.py`,
+# which are three different products on three different screens — so a per-agent run list
+# filtered on review_type showed all three everywhere. The product id is known at
+# `agent_guard.guarded_call`, which already opens `bind_project`, so it costs one more
+# contextvar and no new call sites.
+_product_id: ContextVar[Optional[str]] = ContextVar("current_product_id", default=None)
+
 
 @contextmanager
-def bind_project(project_id: Optional[str], project_name: str = ""):
+def bind_project(project_id: Optional[str], project_name: str = "",
+                 product_id: Optional[str] = None):
     """Mark everything done inside this block as belonging to `project_id`.
 
     Binding None is meaningful and must still be done: it says "this work has no project",
     which stops a previous request's value leaking into one that isn't bound to anything.
+    The same applies to `product_id`.
     """
     id_token = _project_id.set(project_id or None)
     name_token = _project_name.set(project_name or "")
+    product_token = _product_id.set(product_id or None)
     try:
         yield
     finally:
         _project_id.reset(id_token)
         _project_name.reset(name_token)
+        _product_id.reset(product_token)
 
 
 def current_project_id() -> Optional[str]:
@@ -51,3 +66,7 @@ def current_project_id() -> Optional[str]:
 
 def current_project_name() -> str:
     return _project_name.get()
+
+
+def current_product_id() -> Optional[str]:
+    return _product_id.get()

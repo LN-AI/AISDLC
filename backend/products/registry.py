@@ -641,4 +641,10 @@ def to_public_dict(product: Product) -> Dict[str, Any]:
         "endpoint": product.endpoint,
         "sources": list(product.sources),
         "frameworks": list(product.frameworks),
+        # Which `reviews.review_type` this product writes, "" for the two that write
+        # somewhere else (`report-generate` → `reports`, `modernization` → its own tables).
+        # Served so a screen's run history can pass both axes to `GET /api/reviews`, and so
+        # the offline check has a served contract to compare the frontend's table against
+        # rather than re-parsing this file.
+        "review_type": product.review_type,
     }

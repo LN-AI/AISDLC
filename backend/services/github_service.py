@@ -1,7 +1,9 @@
 import logging
+import os
+import time
 
 import httpx
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from backend import config
 
 logger = logging.getLogger(__name__)
@@ -9,13 +11,51 @@ logger = logging.getLogger(__name__)
 
 class GitHubService:
     BASE_URL = "https://api.github.com"
-    # Nothing downstream chunks a diff yet, so a very large PR still has to be cut to fit
-    # one agent call. Raise this only once the reviewer can split its input — a bigger
-    # slice on its own just moves the cut, it doesn't make the review complete.
-    MAX_DIFF_CHARS = 50000
 
-    def __init__(self):
-        self.token = config.GITHUB_TOKEN
+    # The old value here was 50,000, and the comment above it said why: "nothing downstream
+    # chunks a diff yet". Something does — `code_chunker._split_diff` splits per file and
+    # per hunk using the `@@` headers, and `chunked_review` fans the pieces out — so the cap
+    # was outliving its reason and cutting large PRs to their first quarter (C-07).
+    #
+    # It is not removed, because a cap still does a job: it bounds one fetch, and therefore
+    # bounds how much a single button press can spend. What changed is that the bound is now
+    # generous enough to cover essentially every real PR (400,000 characters is roughly six
+    # review chunks), and that the spend behind it is quoted to the caller before the review
+    # runs — see `review_estimate`. Overridable so an operator can tighten or widen it
+    # without a patch.
+    MAX_DIFF_CHARS = int(os.getenv("MAX_DIFF_CHARS", "400000"))
+
+    # GitHub returns 30 items per page by default. Nothing here asked for more, so
+    # `files_changed` silently stopped at 30 on any larger PR — which matters less for
+    # display than for accuracy: that list becomes the chunker's "files in this change you
+    # were NOT shown" manifest, the thing that stops the model reporting a missing control
+    # that lives in a file it never saw. A short list means more false positives.
+    PER_PAGE = 100
+    MAX_FILE_PAGES = 30          # 3,000 files; beyond that the manifest is not the problem
+
+    def __init__(self, token: Optional[str] = None, token_source: str = "",
+                 token_label: str = ""):
+        """A client bound to one credential.
+
+        `token=None` keeps the original behaviour — the deployment's `GITHUB_TOKEN` — so
+        every existing caller is unchanged. `for_project` is the way to get a client that
+        uses a customer's own credential (C-76): the deployment token was read once at
+        import and shared by everyone, so two customers could not connect their own
+        repositories and one tenant's access could not be revoked.
+
+        `token_source` / `token_label` exist for the error messages. "Which credential did
+        we even try" is the first question when a repository 404s, and it was previously
+        unanswerable — a private repo and a typo produce the identical 404, because GitHub
+        will not confirm that a repository exists to someone who cannot see it.
+        """
+        if token is None:
+            self.token = config.GITHUB_TOKEN
+            self.token_source = "deployment" if config.GITHUB_TOKEN else "none"
+            self.token_label = "GITHUB_TOKEN from the environment" if config.GITHUB_TOKEN else ""
+        else:
+            self.token = token
+            self.token_source = token_source or ("request" if token else "none")
+            self.token_label = token_label
         self.headers = {
             "Accept": "application/vnd.github.v3+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -23,18 +63,94 @@ class GitHubService:
         if self.token:
             self.headers["Authorization"] = f"Bearer {self.token}"
 
+    @classmethod
+    def for_project(cls, project_id: Optional[str], target: str = "",
+                    override_token: str = "") -> "GitHubService":
+        """A client using this project's credential for `target` (an owner or owner/repo).
+
+        Resolution order is `database.resolve_github_token`'s: an exact `owner/repo`
+        credential, then one for the owner, then the project's default, then the
+        deployment's. `override_token` wins over all of it — the one-off case, mirroring how
+        a per-request `llm_api_key` beats a stored BYOL connection.
+        """
+        if override_token:
+            return cls(token=override_token, token_source="request",
+                       token_label="a token supplied with this request")
+        from backend import database
+        resolved = database.resolve_github_token(project_id, target)
+        return cls(token=resolved["token"], token_source=resolved["source"],
+                   token_label=resolved.get("label") or "")
+
+    def describe_credential(self) -> Dict[str, Any]:
+        """What served this call. Safe to put on a response — never the token itself."""
+        return {
+            "token_source": self.token_source,
+            "token_label": self.token_label,
+            "authenticated": bool(self.token),
+        }
+
+    def _credential_sentence(self) -> str:
+        if not self.token:
+            return "No GitHub credential was used (none is configured for this project)."
+        where = {
+            "project": "this project's stored GitHub credential",
+            "deployment": "the deployment-wide GITHUB_TOKEN",
+            "request": "the token supplied with this request",
+        }.get(self.token_source, "the configured GitHub credential")
+        return f"The request used {where}" + (
+            f" ({self.token_label})." if self.token_label and self.token_source == "project" else "."
+        )
+
     def _raise_friendly(self, resp: httpx.Response) -> None:
-        """Like resp.raise_for_status(), but explains 403/404s that are likely
-        caused by GitHub's unauthenticated rate limit or a private repo when no
-        GITHUB_TOKEN is configured, instead of a bare GitHub error body."""
+        """`resp.raise_for_status()`, but with an explanation a person can act on.
+
+        The old version only helped when there was **no** token, which left the common
+        multi-tenant case — a token that exists but cannot see this repository — surfacing a
+        raw httpx string. Worse, GitHub answers "not visible to you" with **404, not 403**,
+        deliberately, so it will not confirm a private repository exists to someone who
+        cannot see it. That means a private repo, a revoked token, a token belonging to a
+        different org and a plain typo are all the same status code, and the message has to
+        name all four rather than guess.
+        """
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
-            if not self.token and resp.status_code in (401, 403, 404):
+            status = resp.status_code
+            cred = self._credential_sentence()
+
+            if status == 404:
                 raise ValueError(
-                    f"GitHub request failed (status {resp.status_code}) without GITHUB_TOKEN — "
-                    "this may be a private repo or GitHub's unauthenticated rate limit (60 req/hr) "
-                    "was hit. Set GITHUB_TOKEN in .env for private repos or higher limits."
+                    f"GitHub returned 404 for {resp.request.url.path}. {cred} "
+                    f"GitHub answers 404 rather than 403 for anything the credential cannot "
+                    f"see, so this means one of: the repository is private and this "
+                    f"credential has no access to it; the credential has expired or been "
+                    f"revoked; it belongs to a different account or organisation; or the "
+                    f"owner/repository name is wrong. Check the URL first, then add a GitHub "
+                    f"credential for this project under Settings."
+                ) from e
+
+            if status in (401, 403):
+                remaining = resp.headers.get("x-ratelimit-remaining")
+                if remaining == "0":
+                    reset = resp.headers.get("x-ratelimit-reset", "")
+                    raise ValueError(
+                        f"GitHub's rate limit is exhausted for this credential"
+                        f"{f' (resets at epoch {reset})' if reset else ''}. {cred} "
+                        f"An authenticated credential gets 5,000 requests an hour where an "
+                        f"anonymous one gets 60 — adding a GitHub credential for this project "
+                        f"is the fix if none is configured."
+                    ) from e
+                raise ValueError(
+                    f"GitHub refused the request ({status}). {cred} "
+                    f"The credential is most likely missing a scope this operation needs — "
+                    f"reading a private repository needs `Contents: Read`, posting a review "
+                    f"needs `Pull requests: Write`, and reporting a merge check needs "
+                    f"`Commit statuses: Write`."
+                ) from e
+
+            if status == 451:
+                raise ValueError(
+                    "GitHub has made this repository unavailable (DMCA or legal hold)."
                 ) from e
             raise
 
@@ -69,17 +185,16 @@ class GitHubService:
             self._raise_friendly(diff_resp)
             diff_content = diff_resp.text
 
-            files_resp = client.get(
-                f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}/files"
+            files_data = self._paged(
+                client, f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{pr_number}/files"
             )
-            self._raise_friendly(files_resp)
-            files_data = files_resp.json()
 
-        # A diff over the cap used to be sliced silently, so a large PR was reviewed on
-        # its first 50k characters and the result was reported as covering the whole PR
-        # — a clean gate on code nobody looked at. The cut is still made (nothing
-        # downstream chunks yet), but it is now announced in the text the model sees and
-        # flagged on the payload so callers can refuse to report Green over it.
+        # A diff over the cap used to be sliced silently, so a large PR was reviewed on its
+        # first slice and the result was reported as covering the whole PR — a clean gate on
+        # code nobody looked at. The cut is still made, because a cap bounds what one button
+        # press can spend, but it is announced in the text the model sees and flagged on the
+        # payload so callers refuse to report Green over it. See MAX_DIFF_CHARS for why the
+        # bound is now high enough that real PRs no longer reach it.
         diff_full_chars = len(diff_content)
         diff_truncated = diff_full_chars > self.MAX_DIFF_CHARS
         diff_text = diff_content[:self.MAX_DIFF_CHARS]
@@ -101,6 +216,22 @@ class GitHubService:
             "author": pr_data.get("user", {}).get("login", ""),
             "base_branch": pr_data.get("base", {}).get("ref", ""),
             "head_branch": pr_data.get("head", {}).get("ref", ""),
+            # The commit this diff is of. It was in the response and discarded, and it is
+            # what lets a file be read back later at the version that was reviewed — a
+            # branch name cannot do that, because the branch moves.
+            "head_sha": pr_data.get("head", {}).get("sha", ""),
+            "base_sha": pr_data.get("base", {}).get("sha", ""),
+            # Whether a fix may be committed into this pull request's own branch. Both were
+            # in the response and dropped. A fork's head branch belongs to the contributor,
+            # so pushing to it is refused unless they allowed maintainer edits -- and finding
+            # that out by attempting the push means discovering it after the money is spent.
+            "head_repo": ((pr_data.get("head") or {}).get("repo") or {}).get("full_name", ""),
+            "base_repo": ((pr_data.get("base") or {}).get("repo") or {}).get("full_name", ""),
+            "from_fork": bool(
+                ((pr_data.get("head") or {}).get("repo") or {}).get("full_name")
+                and ((pr_data.get("head") or {}).get("repo") or {}).get("full_name")
+                != ((pr_data.get("base") or {}).get("repo") or {}).get("full_name")),
+            "maintainer_can_modify": bool(pr_data.get("maintainer_can_modify")),
             "diff": diff_text,
             "diff_truncated": diff_truncated,
             "diff_full_chars": diff_full_chars,
@@ -139,17 +270,30 @@ class GitHubService:
 
     def get_file_content_at_ref(self, owner: str, repo: str, path: str, ref: str) -> Dict[str, Any]:
         """Fetch a single file's content directly by owner/repo/path/ref (avoids the URL parser's
-        assumption that a branch name has no slashes)."""
-        if not self.token:
-            raise ValueError("GITHUB_TOKEN is not configured")
+        assumption that a branch name has no slashes).
+
+        No token is required: the Contents API answers unauthenticated for a public
+        repository, and refusing to try was wrong for the case this is most used in — reading
+        a file back out of the same public repo a review just read through the zipball, which
+        also needs no token. `_raise_friendly` turns GitHub's 404-for-everything-unreadable
+        into a sentence that distinguishes "no such file" from "this credential cannot see
+        it", which `raise_for_status` could not.
+        """
         import base64
         with httpx.Client(headers=self.headers, timeout=30) as client:
-            resp = client.get(
+            resp = self._get_with_retry(
+                client,
                 f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{path}",
                 params={"ref": ref},
             )
-            resp.raise_for_status()
+            self._raise_friendly(resp)
             data = resp.json()
+        if isinstance(data, list):
+            raise ValueError(f"{path} is a directory in {owner}/{repo}, not a file.")
+        if data.get("encoding") != "base64" or not data.get("content"):
+            raise ValueError(
+                f"{path} has no readable text content — it may be binary, or larger than "
+                f"the 1 MB the Contents API will return inline.")
         content = base64.b64decode(data["content"]).decode("utf-8", errors="ignore")
         return {"path": path, "content": content, "name": data.get("name", ""), "size": data.get("size", 0)}
 
@@ -440,7 +584,17 @@ class GitHubService:
         ]
         with httpx.Client(headers=self.headers, timeout=30) as client:
             repo_resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}")
-            repo_data = repo_resp.json() if repo_resp.is_success else {}
+            # The repository lookup itself must raise. It used to be swallowed by
+            # `if repo_resp.is_success`, so a repository that does not exist — or that the
+            # credential cannot see — returned a perfectly well-formed overview containing
+            # "Description: N/A" and no documents, and the Architecture and Security agents
+            # then reviewed nothing and reported on it. It also made the credential test lie:
+            # "can read this repository" was true for every repository, readable or not.
+            #
+            # A *missing candidate document* is still tolerated below, which is the case this
+            # leniency was for: almost no repository has an ARCHITECTURE.md.
+            self._raise_friendly(repo_resp)
+            repo_data = repo_resp.json()
             for path in CANDIDATE_PATHS:
                 r = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/contents/{path}")
                 if r.is_success:
@@ -558,42 +712,477 @@ class GitHubService:
             logger.exception("Failed to post issue comment on %s", issue_url)
             return False
 
-    def format_pr_review_comment(self, review_result: Dict[str, Any]) -> str:
-        """Format review result as a GitHub PR comment."""
+    # Beyond this many findings the comment becomes a wall nobody scrolls, so the tail is
+    # summarised as a count and the reader is pointed at the full result. Findings arrive
+    # sorted severity-first, so what gets cut is always the least important.
+    MAX_COMMENT_FINDINGS = 25
+
+    def format_pr_review_comment(self, review_result: Dict[str, Any],
+                                 result_url: str = "") -> str:
+        """Format a review result as a GitHub comment.
+
+        What this used to omit is the whole point of the rewrite (C-75). It printed severity,
+        control, title, description and fix — and dropped `file_path`, `line_start` and
+        `evidence`, every one of which the pipeline had established and line-corrected. So a
+        developer read "SQL injection in a query built by string concatenation" and then went
+        looking for it. It also said nothing about how much of the PR was actually reviewed,
+        nothing about which findings were new, and nothing about the findings the verifier
+        threw away — which is the strongest evidence the tool polices itself.
+        """
         gate = review_result.get("gate_status", "Unknown")
-        score = review_result.get("risk_score", 0)
-        findings = review_result.get("findings", [])
+        score = review_result.get("risk_score", 0) or 0
+        findings = review_result.get("findings", []) or []
+        coverage = review_result.get("coverage") or {}
 
         gate_emoji = {"Green": "✅", "Amber": "⚠️", "Red": "🔴"}.get(gate, "❓")
-
         severity_map = {5: "🔴 Critical", 4: "🟠 High", 3: "🟡 Moderate", 2: "🔵 Minor", 1: "⚪ Low"}
 
         lines = [
-            f"## {gate_emoji} LM AI-SDLC Review — Gate: **{gate}** | Risk Score: **{score:.0f}/100**",
-            "",
-            f"**Summary:** {review_result.get('summary', 'No summary.')}",
+            f"## {gate_emoji} LM AI-SDLC Review — Gate: **{gate}** · Risk **{score:.0f}/100**",
             "",
         ]
 
+        # The counts row. "3 new, 41 already seen" is the difference between a comment a team
+        # acts on and the tenth identical comment they mute.
+        tally = []
+        if review_result.get("new_findings_count") is not None:
+            tally.append(f"**{review_result['new_findings_count']} new**")
+        if review_result.get("pre_existing_count"):
+            tally.append(f"{review_result['pre_existing_count']} pre-existing")
+        if review_result.get("waived_count"):
+            tally.append(f"{review_result['waived_count']} waived")
+        if review_result.get("suppressed_findings"):
+            tally.append(f"{len(review_result['suppressed_findings'])} in test/vendor paths")
+        if review_result.get("discarded_findings"):
+            tally.append(
+                f"{len(review_result['discarded_findings'])} discarded (quoted code not "
+                f"found in the source)"
+            )
+        if tally:
+            lines += [" · ".join(tally), ""]
+
+        # Coverage, stated before the findings. A gate over part of a PR is a different claim
+        # from a gate over all of it, and the reader cannot tell them apart otherwise.
+        if coverage:
+            total = coverage.get("chunks_total", 0)
+            ok = coverage.get("chunks_succeeded", 0)
+            if coverage.get("chunks_failed"):
+                lines += [
+                    f"> ⚠️ **Partial review.** {ok} of {total} piece(s) of this change were "
+                    f"reviewed; {coverage['chunks_failed']} failed, so part of the diff was "
+                    f"never examined.",
+                    "",
+                ]
+            elif total > 1:
+                lines += [f"_Reviewed in {total} pieces, all successful._", ""]
+        if review_result.get("coverage_complete") is False and not coverage.get("chunks_failed"):
+            lines += [
+                "> ⚠️ **Partial review.** Part of this change was not provided to the "
+                "reviewer, so this gate does not cover the whole diff.",
+                "",
+            ]
+
+        if review_result.get("summary"):
+            lines += [f"**Summary:** {review_result['summary']}", ""]
+
         if findings:
-            lines.append(f"### Findings ({len(findings)} total)")
+            shown = findings[:self.MAX_COMMENT_FINDINGS]
+            lines.append(f"### Findings ({len(findings)})")
             lines.append("")
-            for f in findings:
+            for f in shown:
                 sev_label = severity_map.get(f.get("severity", 1), "⚪ Unknown")
                 blocking = " ⛔ BLOCKING" if f.get("is_blocking") else ""
-                lines.append(f"**{sev_label}{blocking}** — `{f.get('control_id', 'N/A')}` {f.get('title', '')}")
-                lines.append(f"> {f.get('description', '')}")
-                lines.append(f"**Fix:** {f.get('recommendation', '')}")
+                new_tag = " 🆕" if f.get("is_new") else ""
+                lines.append(
+                    f"**{sev_label}{blocking}{new_tag}** — `{f.get('control_id', 'N/A')}` "
+                    f"{f.get('title', '')}"
+                )
+                # The location. The single most important thing this comment was missing.
+                where = self._format_location(f)
+                if where:
+                    lines.append(where)
+                if f.get("evidence"):
+                    quoted = str(f["evidence"]).strip().splitlines()[:3]
+                    lines += ["", "```", *quoted, "```"]
+                if f.get("description"):
+                    lines.append(f"> {f['description']}")
+                if f.get("recommendation"):
+                    lines.append(f"**Fix:** {f['recommendation']}")
+                # Say when a finding is not proven. A reader who cannot tell a verified
+                # finding from an inferred one treats them all as inferred.
+                marks = []
+                if f.get("evidence_verified") is False:
+                    marks.append("evidence not verified against the source")
+                if f.get("confidence") and f["confidence"] != "High":
+                    marks.append(f"confidence: {f['confidence'].lower()}")
+                if f.get("file_path_corrected"):
+                    marks.append(f"re-filed from `{f.get('reported_file_path', '?')}`")
+                if f.get("is_pre_existing"):
+                    marks.append("pre-existing, not introduced by this change")
+                if marks:
+                    lines.append(f"_{' · '.join(marks)}_")
                 lines.append("")
+            if len(findings) > len(shown):
+                lines += [
+                    f"_…and {len(findings) - len(shown)} lower-severity finding(s) not shown "
+                    f"here._",
+                    "",
+                ]
+        else:
+            lines += ["_No findings._", ""]
 
-        recs = review_result.get("recommendations", [])
+        recs = review_result.get("recommendations", []) or []
         if recs:
             lines.append("### Recommendations")
-            for i, r in enumerate(recs, 1):
-                lines.append(f"{i}. {r}")
+            lines += [f"{i}. {r}" for i, r in enumerate(recs[:10], 1)]
             lines.append("")
 
         lines.append("---")
-        lines.append("*Reviewed by [LM AI-SDLC ReviewOps Agent](https://learnedmachine.ai)*")
+        footer = "*Reviewed by [LM AI-SDLC ReviewOps Agent](https://learnedmachine.ai)"
+        if result_url:
+            footer += f" — [full result]({result_url})"
+        footer += ".*"
+        lines.append(footer)
+        if review_result.get("review_id"):
+            lines.append(f"<sub>Review ID: `{review_result['review_id']}`</sub>")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_location(f: Dict[str, Any]) -> str:
+        path = (f.get("file_path") or "").strip()
+        line = f.get("line_start")
+        if not path and not isinstance(line, int):
+            # A finding with no location at all — an architecture-level observation, or one
+            # the model declined to place. Saying nothing is better than "unknown:0".
+            return ""
+        if path and isinstance(line, int) and line > 0:
+            end = f.get("line_end")
+            span = f"{line}" if not isinstance(end, int) or end <= line else f"{line}-{end}"
+            return f"`{path}:{span}`"
+        return f"`{path or 'line ' + str(line)}`"
+
+    # ── Paging, comparison, and the write side of a review ─────────────────
+
+    def _paged(self, client: httpx.Client, url: str, params: Optional[dict] = None) -> List[dict]:
+        """Every page of a list endpoint, not just the first thirty.
+
+        Stops at `MAX_FILE_PAGES` rather than following `Link` forever: a pull request with
+        3,000 changed files is a conversation about scope, not a paging problem, and an
+        unbounded loop here is an unbounded number of API calls against a rate limit.
+        """
+        out: List[dict] = []
+        for page in range(1, self.MAX_FILE_PAGES + 1):
+            resp = self._get_with_retry(
+                client, url, {**(params or {}), "per_page": self.PER_PAGE, "page": page})
+            self._raise_friendly(resp)
+            batch = resp.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            out.extend(batch)
+            if len(batch) < self.PER_PAGE:
+                break
+        return out
+
+    # A connect/read timeout to api.github.com is a fact of life, not a defect, and it cost a
+    # real verification run on 2026-09-02: `upsert_pr_comment` failed on the *read* half of
+    # its find-then-edit, so an already-paid-for review was not posted. Retried only for
+    # GETs, which are idempotent — a POST retry risks a duplicate comment or a second commit,
+    # which is worse than the failure it would be papering over.
+    GET_RETRIES = 2
+    GET_RETRY_BACKOFF_SECONDS = 1.5
+
+    def _get_with_retry(self, client: httpx.Client, url: str,
+                        params: Optional[dict] = None) -> httpx.Response:
+        """A GET that survives one transient. Status codes are returned untouched — this
+        retries *transport* failures only, so a 404 still reaches `_raise_friendly` and gets
+        its explanation rather than being retried into a timeout."""
+        last: Optional[Exception] = None
+        for attempt in range(self.GET_RETRIES + 1):
+            try:
+                return client.get(url, params=params)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+                    httpx.RemoteProtocolError) as exc:
+                last = exc
+                if attempt == self.GET_RETRIES:
+                    break
+                delay = self.GET_RETRY_BACKOFF_SECONDS * (attempt + 1)
+                logger.warning(
+                    "GitHub GET %s failed (%s) — retrying in %.1fs (attempt %d of %d)",
+                    url, type(exc).__name__, delay, attempt + 2, self.GET_RETRIES + 1)
+                time.sleep(delay)
+        raise ValueError(
+            f"Could not reach GitHub after {self.GET_RETRIES + 1} attempt(s): "
+            f"{type(last).__name__}. This is a network failure rather than a rejection — "
+            f"nothing was written, so the operation is safe to repeat."
+        ) from last
+
+    def get_compare_diff(self, repo_url: str, base: str, head: str) -> Dict[str, Any]:
+        """`base...head` as a unified diff — a review before anyone opens a PR.
+
+        The most-asked-for shape that had no route: a team wants the gate's answer *before*
+        raising the pull request, and the only way to get one was to raise it first. GitHub's
+        compare endpoint returns the same diff media type as a PR, so everything downstream —
+        the hunk splitter, the line numbers, the inline anchors — works unchanged.
+        """
+        p = self._parse_url_type(repo_url)
+        owner, repo = p["owner"], p["repo"]
+        # `...` is the three-dot form: changes on `head` since it diverged from `base`, which
+        # is what a PR shows. Two dots would also report everything that landed on `base`
+        # afterwards and read as the branch's own work.
+        spec = f"{base}...{head}"
+        with httpx.Client(headers=self.headers, timeout=60) as client:
+            meta_resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/compare/{spec}")
+            self._raise_friendly(meta_resp)
+            meta = meta_resp.json()
+
+            diff_resp = client.get(
+                f"{self.BASE_URL}/repos/{owner}/{repo}/compare/{spec}",
+                headers={**self.headers, "Accept": "application/vnd.github.v3.diff"},
+            )
+            self._raise_friendly(diff_resp)
+            diff = diff_resp.text
+
+        full = len(diff)
+        truncated = full > self.MAX_DIFF_CHARS
+        text = diff[:self.MAX_DIFF_CHARS]
+        if truncated:
+            logger.warning("Compare %s %s diff truncated: %d of %d chars",
+                           repo_url, spec, self.MAX_DIFF_CHARS, full)
+            text += (
+                f"\n\n[TRUNCATED: this diff was cut off at {self.MAX_DIFF_CHARS:,} of "
+                f"{full:,} characters. The remainder has NOT been provided — do not treat "
+                f"anything below this point as reviewed or absent.]"
+            )
+        # The head commit of the comparison, so a file can be read back at the version that
+        # was reviewed rather than at whatever the branch has since become. Taken from the
+        # commits the compare API already returned — the last one is the head — rather than
+        # resolving the ref again, which on a busy branch could answer with a different
+        # commit than the diff above is actually of.
+        _commits = meta.get("commits") or []
+        head_sha = (_commits[-1].get("sha") if _commits else "") or ""
+        return {
+            "base": base, "head": head, "diff": text,
+            "head_sha": head_sha,
+            "diff_truncated": truncated, "diff_full_chars": full,
+            "truncation_reason": (
+                f"The {base}...{head} diff was truncated to {self.MAX_DIFF_CHARS:,} of "
+                f"{full:,} characters; the remainder was not reviewed." if truncated else ""
+            ),
+            "files_changed": [f.get("filename", "") for f in (meta.get("files") or [])],
+            "commits": len(meta.get("commits") or []),
+            "url": f"https://github.com/{owner}/{repo}/compare/{spec}",
+            "fetch_type": "compare",
+        }
+
+    # An HTML comment carrying our identity. Invisible in the rendered comment, and the only
+    # reliable way to find our own previous comment again: matching on the visible heading
+    # would also match a human who quoted us.
+    COMMENT_MARKER = "<!-- lm-ai-sdlc:review -->"
+
+    def upsert_pr_comment(self, pr_url: str, comment_body: str) -> Dict[str, Any]:
+        """Edit our previous comment on this PR, or post the first one.
+
+        Posting was an unconditional create, so reviewing the same PR five times left five
+        comments, each contradicting the last, and the thread became something people mute
+        (C-75). An active PR gets reviewed on every push, so this is the normal case rather
+        than an edge one.
+
+        Falls back to creating when the previous comment cannot be found or edited — a failed
+        lookup must not mean no review is posted at all.
+        """
+        if not self.token:
+            return {"posted": False, "reason": "GITHUB_TOKEN is not configured"}
+        body = f"{self.COMMENT_MARKER}\n{comment_body}"
+        try:
+            p = self._parse_url_type(pr_url)
+            owner, repo, number = p["owner"], p["repo"], p["number"]
+            with httpx.Client(headers=self.headers, timeout=30) as client:
+                existing = self._paged(
+                    client, f"{self.BASE_URL}/repos/{owner}/{repo}/issues/{number}/comments"
+                )
+                mine = [c for c in existing if self.COMMENT_MARKER in (c.get("body") or "")]
+                if mine:
+                    # The oldest is the one to keep: its permalink may already be referenced
+                    # from a Slack thread or a Jira ticket, and moving the review to a new
+                    # comment id breaks those.
+                    target = mine[0]
+                    resp = client.patch(
+                        f"{self.BASE_URL}/repos/{owner}/{repo}/issues/comments/{target['id']}",
+                        json={"body": body},
+                    )
+                    resp.raise_for_status()
+                    logger.info("Updated existing review comment %s on %s", target["id"], pr_url)
+                    return {"posted": True, "updated": True,
+                            "comment_url": resp.json().get("html_url", ""),
+                            "superseded": len(mine) - 1}
+                resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/issues/{number}/comments",
+                    json={"body": body},
+                )
+                resp.raise_for_status()
+                return {"posted": True, "updated": False,
+                        "comment_url": resp.json().get("html_url", "")}
+        except Exception as exc:
+            logger.exception("Failed to upsert review comment on %s", pr_url)
+            return {"posted": False, "reason": str(exc)[:200]}
+
+    # GitHub rejects a review with a very large `comments` array, and forty inline comments
+    # is worse for a reader than none — the diff becomes unreadable. Both limits are one
+    # decision: comment inline on what is worth interrupting someone for, summarise the rest.
+    MAX_INLINE_COMMENTS = 20
+    MIN_INLINE_SEVERITY = 3
+
+    def post_pr_review(
+        self,
+        pr_url: str,
+        summary_body: str,
+        findings: List[dict],
+        commit_sha: str = "",
+        request_changes: bool = False,
+    ) -> Dict[str, Any]:
+        """Post findings as line-level review comments, with a summary body above them.
+
+        Only a finding that survived evidence verification is anchored. An unverified or
+        re-filed finding may name a line that is not the line, and an inline comment on the
+        wrong line is read as the tool being wrong about the code — far more damaging than
+        the same finding appearing in the summary.
+
+        `event` is COMMENT by default. REQUEST_CHANGES is available but is not the default
+        even for a Red gate: on many repositories that blocks the author until a human
+        dismisses it, which is a policy decision for the customer, not for us. Merge blocking
+        belongs to the check run (`set_commit_status`), which is designed for it.
+        """
+        if not self.token:
+            return {"posted": False, "reason": "GITHUB_TOKEN is not configured"}
+        owner, repo, number = self._parse_pr_url(pr_url)
+
+        anchored, unanchored = [], []
+        for f in findings or []:
+            path = (f.get("file_path") or "").lstrip("./")
+            line = f.get("line_start")
+            severity = f.get("severity") or 0
+            if (path and isinstance(line, int) and line > 0
+                    and f.get("evidence_verified")
+                    and severity >= self.MIN_INLINE_SEVERITY
+                    and not f.get("suppressed_reason")
+                    and len(anchored) < self.MAX_INLINE_COMMENTS):
+                anchored.append({
+                    "path": path,
+                    "line": line,
+                    "side": "RIGHT",
+                    "body": self._inline_body(f),
+                })
+            else:
+                unanchored.append(f)
+
+        payload: Dict[str, Any] = {
+            "body": f"{self.COMMENT_MARKER}\n{summary_body}",
+            "event": "REQUEST_CHANGES" if request_changes else "COMMENT",
+        }
+        if commit_sha:
+            payload["commit_id"] = commit_sha
+        if anchored:
+            payload["comments"] = anchored
+
+        try:
+            with httpx.Client(headers=self.headers, timeout=60) as client:
+                resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{number}/reviews",
+                    json=payload,
+                )
+                if resp.status_code == 422 and anchored:
+                    # A line that is not part of the diff is rejected for the whole review.
+                    # Retrying without anchors still delivers the findings, which matters
+                    # more than where they appear.
+                    logger.warning(
+                        "PR review rejected with %d inline comment(s) (%s) — retrying as a "
+                        "summary-only review", len(anchored), resp.text[:200],
+                    )
+                    payload.pop("comments", None)
+                    resp = client.post(
+                        f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{number}/reviews",
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    return {"posted": True, "inline_comments": 0,
+                            "inline_rejected": len(anchored),
+                            "summary_only": len(findings or []),
+                            "review_url": resp.json().get("html_url", "")}
+                resp.raise_for_status()
+                return {"posted": True, "inline_comments": len(anchored),
+                        "summary_only": len(unanchored),
+                        "review_url": resp.json().get("html_url", "")}
+        except Exception as exc:
+            logger.exception("Failed to post PR review on %s", pr_url)
+            return {"posted": False, "reason": str(exc)[:200]}
+
+    def _inline_body(self, f: dict) -> str:
+        sev = {5: "Critical", 4: "High", 3: "Moderate", 2: "Minor", 1: "Low"}.get(
+            f.get("severity", 1), "Finding")
+        parts = [f"**{sev} · `{f.get('control_id', 'N/A')}`** — {f.get('title', '')}"]
+        if f.get("description"):
+            parts.append(str(f["description"]))
+        if f.get("recommendation"):
+            parts.append(f"**Fix:** {f['recommendation']}")
+        if f.get("cvss_score") is not None:
+            vector = f.get("cvss_vector")
+            parts.append(f"CVSS {f['cvss_score']}" + (f" `{vector}`" if vector else ""))
+        if f.get("confidence"):
+            parts.append(f"_Confidence: {f['confidence']}_")
+        return "\n\n".join(parts)
+
+    def set_commit_status(
+        self,
+        owner: str,
+        repo: str,
+        sha: str,
+        gate_status: str,
+        description: str = "",
+        target_url: str = "",
+        context_label: str = "lm-ai-sdlc/review",
+    ) -> Dict[str, Any]:
+        """Report the gate to GitHub as a commit status, so a Red verdict can block a merge.
+
+        This is the difference between a governance *tool* and a governance *control*. The
+        product calls its verdict a gate; on GitHub it was a paragraph anyone could scroll
+        past (C-75). A status under branch protection greys out the merge button.
+
+        Commit statuses rather than check runs on purpose: a check run requires a GitHub App
+        installation token, and the platform authenticates with a personal access token
+        today. Statuses work with a PAT, need only `repo:status`, and satisfy branch
+        protection identically. When per-tenant GitHub App credentials land, this is the
+        function that gains a check-run branch.
+        """
+        if not self.token:
+            return {"posted": False, "reason": "GITHUB_TOKEN is not configured"}
+        # Amber is deliberately `success`, not `pending` or `failure`. `pending` never
+        # resolves and blocks the PR forever; `failure` would make every advisory finding
+        # block a merge, which is how a team turns the check off altogether. Amber is
+        # reported as a passing check whose description says it needs a look.
+        state = {"Red": "failure", "Amber": "success", "Green": "success"}.get(gate_status, "success")
+        try:
+            with httpx.Client(headers=self.headers, timeout=30) as client:
+                resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/statuses/{sha}",
+                    json={
+                        "state": state,
+                        "description": (description or f"Gate: {gate_status}")[:140],
+                        "context": context_label,
+                        **({"target_url": target_url} if target_url else {}),
+                    },
+                )
+                resp.raise_for_status()
+            logger.info("Set commit status %s=%s on %s/%s@%s",
+                        context_label, state, owner, repo, sha[:8])
+            return {"posted": True, "state": state, "gate_status": gate_status}
+        except Exception as exc:
+            logger.exception("Failed to set commit status on %s/%s@%s", owner, repo, sha)
+            return {"posted": False, "reason": str(exc)[:200]}
+
+    def get_pr_head_sha(self, pr_url: str) -> str:
+        owner, repo, number = self._parse_pr_url(pr_url)
+        with httpx.Client(headers=self.headers, timeout=30) as client:
+            resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/pulls/{number}")
+            self._raise_friendly(resp)
+            return (resp.json().get("head") or {}).get("sha", "")

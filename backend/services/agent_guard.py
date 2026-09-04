@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ScopeDeniedError", "BudgetExceededError", "QuotaExceededError", "ProjectBindingError",
     "check_scope", "preflight", "guarded_call", "hold_budget_reservation", "expect_calls",
+    "estimate_cost", "remaining_budget",
 ]
 
 
@@ -161,6 +162,44 @@ def _is_estimated(model: str) -> bool:
     """True when we priced with DEFAULT_PRICING because the model isn't in the table —
     a BYOL caller can name any model, and a guess must not be shown as a measurement."""
     return model not in MODEL_PRICING_PER_MILLION_TOKENS
+
+
+def remaining_budget(subject: "Subject") -> Optional[Dict[str, Any]]:
+    """What this caller has left to spend, or None if nothing caps them.
+
+    Public for the same reason `estimate_cost` is: a quote shown without the budget it will
+    be drawn against still leaves the reader doing the arithmetic that decides whether to
+    press the button. The tightest of the two caps is the one that governs, matching
+    `preflight` — a project envelope and, inside it, an API key's own ceiling, whichever is
+    exhausted first.
+
+    Deliberately returns None rather than a large number for an uncapped caller. "Unlimited"
+    rendered as a figure is how a reader concludes there is a limit they are near.
+    """
+    caps = []
+    if subject.project_id:
+        budget = database.get_project_budget(subject.project_id)
+        if budget.get("monthly_budget_usd") is not None:
+            caps.append((budget, f"project '{subject.project_name or subject.project_id}'"))
+    record = subject.key_record
+    if record:
+        budget = database.get_api_key_budget(record["id"])
+        if budget.get("monthly_budget_usd") is not None:
+            caps.append((budget, "this API key"))
+    if not caps:
+        return None
+
+    budget, label = min(
+        caps, key=lambda pair: pair[0]["monthly_budget_usd"] - pair[0]["budget_used_usd"]
+    )
+    cap = float(budget["monthly_budget_usd"])
+    used = float(budget["budget_used_usd"] or 0.0)
+    return {
+        "scope": label,
+        "monthly_budget_usd": round(cap, 4),
+        "used_usd": round(used, 4),
+        "remaining_usd": round(max(cap - used, 0.0), 4),
+    }
 
 
 def _caller_identity(caller: Optional[dict]) -> tuple:
@@ -392,7 +431,12 @@ def guarded_call(
         # `bind_project` publishes the governing project so `database.save_review` can
         # attribute whatever this produces without every orchestrator method having to
         # pass it down — see backend/context.py.
-        with context.bind_project(project_id, project_name), \
+        # `product` is a registry record, not an id — bind the id, which is what a
+        # review row stores and what a screen filters on. `agent_name` is the id even
+        # when the registry has no record for it (an internal stage), which is the
+        # better fallback: a labelled row beats a NULL one.
+        with context.bind_project(project_id, project_name,
+                                  product_id=getattr(product, "id", None) or agent_name), \
                 hold_budget_reservation(subject, model_for_reservation, _expected_calls(product)), \
                 llm_gateway.track_usage():
             try:
@@ -466,6 +510,16 @@ def guarded_call(
                 "output_tokens": usage["output_tokens"],
                 "cost_usd": cost_usd,
                 "billable": billable,
+                # Both of these were computed here and dropped. A person approves a quote
+                # naming a ceiling and a number of calls, and was then never shown the
+                # invoice -- so a quote could be systematically wrong in either direction
+                # forever without anybody noticing. `model` matters because whoever reads a
+                # set of findings is entitled to know what produced them: the sidebar shows
+                # the deployment default, which a team that brought its own key is not using.
+                "calls": usage["calls"],
+                "model": model,
+                "provider": provider,
+                "cost_estimated": bool(usage["calls"]) and _is_estimated(model),
             }
             if key_id:
                 fresh = database.get_api_key_budget(key_id)

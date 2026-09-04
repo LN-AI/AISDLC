@@ -29,6 +29,7 @@ What it does and does not change
 LLM work in a background job after the response is sent, so there is nothing for a
 request-scoped middleware to meter. It is guarded inside its own handler instead.
 """
+import json
 import logging
 import re
 from typing import Optional, Tuple
@@ -37,7 +38,7 @@ from starlette.responses import JSONResponse
 
 from backend import config, context, database
 from backend.products import registry
-from backend.services import agent_guard, llm_gateway
+from backend.services import agent_guard, code_chunker, llm_gateway
 from backend.services.agent_guard import (
     BudgetExceededError,
     QuotaExceededError,
@@ -59,6 +60,16 @@ LEGACY_PRODUCT_ROUTES = {
     "/api/review/requirement": "requirement",
     "/api/review/requirement/upload": "requirement",
     "/api/review/code": "code",
+    # The source-capable twins. Same product, so the same entitlement, quota and budget
+    # apply — a customer entitled to `code` gets zip and repository review without a new
+    # product id, and a customer who is not cannot reach it by using the other route.
+    # `/preflight` is deliberately absent from this map: it makes no model call, spends
+    # nothing, and refusing to quote a caller who is near their cap tells them less than
+    # the quote would.
+    "/api/review/code/source": "code",
+    "/api/review/code/upload-zip": "code",
+    "/api/review/vapt/source": "vapt",
+    "/api/review/vapt/upload-zip": "vapt",
     "/api/review/prompt": "prompt",
     "/api/review/architecture": "architecture",
     "/api/review/architecture/upload": "architecture",
@@ -139,6 +150,86 @@ def resolve_caller(headers) -> Tuple[dict, Optional[JSONResponse]]:
     return {"type": "anonymous"}, None
 
 
+
+# Routes whose agent fans out over N model calls rather than making one. Everything else
+# reserves for one call, as it always has.
+_CHUNKABLE_ROUTES = {
+    "/api/review/code": "code",
+    "/api/review/code/source": "code",
+    "/api/review/code/upload-zip": "code",
+    "/api/review/vapt": "artifact",
+    "/api/review/vapt/source": "artifact",
+    "/api/review/vapt/upload-zip": "artifact",
+    "/api/github/pr": "",
+    "/api/github/pr/auto-fix": "",
+}
+
+# Only a JSON body under this size is read for sizing. A zip upload is not read at all: the
+# body would have to be buffered in memory purely to count chunks, and the file-count guard
+# in `source_bundle` already bounds those.
+_MAX_SIZING_BODY_BYTES = 4_000_000
+
+
+async def _expected_calls(request, product_id: str) -> int:
+    """How many model calls this request is about to make, for the budget reservation.
+
+    Why this is awkward, and why it is worth being awkward: `agent_guard.expect_calls` is a
+    contextvar the *agent* sets after chunking, and the reservation is taken here, before the
+    handler runs. `POST /api/v1/agents/code` solves it by sizing from the request body it
+    already has (D-25). A middleware has no body — so the browser path reserved for one call
+    while the agent made forty, and a caller near a cap could start a review that had passed
+    a check sized for a fortieth of it (C-77).
+
+    Reading the body here is safe because Starlette caches it on the request object, so the
+    handler's own `await request.json()` gets the cached copy rather than an exhausted
+    stream. Everything below fails **open** to 1 — a sizing error must never turn a working
+    review into a 500.
+    """
+    field = _CHUNKABLE_ROUTES.get(request.url.path)
+    if field is None:
+        return 1
+    # A PR review's size is not in the request at all (the diff is fetched later), so the
+    # workflow reserves for itself via `agent_guard.expect_calls`. Nothing to do here.
+    if not field:
+        return 1
+    try:
+        content_type = (request.headers.get("content-type") or "").lower()
+        if "application/json" not in content_type:
+            return 1
+        length = int(request.headers.get("content-length") or 0)
+        if length > _MAX_SIZING_BODY_BYTES:
+            return 1
+        body = await request.body()
+        if not body:
+            return 1
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            return 1
+        files = payload.get("files")
+        if isinstance(files, list) and files:
+            return code_chunker.estimate_chunks_for_files(
+                [f for f in files if isinstance(f, dict)]
+            )
+        text = payload.get(field) or payload.get("code") or payload.get("artifact") or ""
+        if isinstance(text, str) and text:
+            return code_chunker.estimate_chunks(text)
+        # A repo or PR URL: the source has not been fetched yet, so its size is unknown.
+        # Reserving one call would be the old bug; reserving a plausible floor is closer to
+        # the truth and still cheap to be wrong about.
+        if payload.get("github_repo_url") or payload.get("github_pr_url"):
+            return _UNKNOWN_REMOTE_SOURCE_CALLS
+    except Exception:
+        logger.exception("Could not size the reservation for %s — reserving one call", request.url.path)
+    return 1
+
+
+# What to reserve when the source is a URL we have not fetched yet. Deliberately a modest
+# floor rather than a worst case: over-reserving denies calls that would have succeeded,
+# which is a worse failure than under-reserving, and the real spend is metered afterwards
+# either way.
+_UNKNOWN_REMOTE_SOURCE_CALLS = 4
+
+
 async def legacy_product_guard(request, call_next):
     product_id = product_for_request(request.method, request.url.path)
     if not product_id:
@@ -172,12 +263,20 @@ async def legacy_product_guard(request, call_next):
 
     caller_type, caller_ref, key_id = agent_guard._caller_identity(caller)
     product = registry.get(product_id)
+    expected_calls = await _expected_calls(request, product_id)
 
     # Same reservation the v1 surface takes (see agent_guard.hold_budget_reservation):
     # without it two browser calls starting together both pass the budget check against the
     # same pre-call total and both spend. `bind_project` publishes the project so the
     # review row this produces is attributed to it (see backend/context.py).
-    with context.bind_project(subject.project_id, subject.project_name), \
+    # `product_id` is published for the same reason `agent_guard.guarded_call` publishes it
+    # (D-265): `database.save_review` reads it from the context, and without it every run
+    # served by one of these synchronous routes stored `product_id = NULL`. That is *most*
+    # runs — every agent screen except Code Review and VAPT posts here — so a per-agent run
+    # history had nothing but `review_type` to match on, and the row was labelled "before
+    # agents were recorded" on a screen where the agent was perfectly well known.
+    with context.bind_project(subject.project_id, subject.project_name,
+                              product_id=product_id), \
             agent_guard.hold_budget_reservation(subject), \
             llm_gateway.track_usage():
         response = await call_next(request)
@@ -202,6 +301,36 @@ async def legacy_product_guard(request, call_next):
     model = effective_llm.get("model") or config.MODEL
     provider = effective_llm.get("provider") or "anthropic"
     cost_usd = agent_guard._price_usage(usage, model)
+
+    # ── What it cost, back to the caller ─────────────────────────────────────
+    #
+    # All of this was computed here and none of it ever reached the browser. `guarded_call`
+    # attaches it to the body as `_budget_stats`, but this middleware runs *around* the
+    # handler: by the time the numbers exist, `call_next` has already serialized the
+    # response and there is no body left to add a key to. So every agent screen except Code
+    # Review and VAPT showed a set of findings with no indication of what the run cost, how
+    # many calls it took, or which model produced them — and the sidebar's model is the
+    # deployment default, which a team on its own key is not using.
+    #
+    # Headers are the one channel still open after `call_next`, which the rate-limit block
+    # above already relies on. `apiFetch` folds these into `_budget_stats` when the body has
+    # none, so the existing spend strip renders unchanged.
+    #
+    # The figures come from `_price_usage` — the same arithmetic that writes the ledger
+    # below. Deriving them any other way would let the number on screen and the number
+    # billed drift apart, which is worse than showing nothing.
+    response.headers["X-Spend-Cost-USD"] = f"{cost_usd:.6f}"
+    response.headers["X-Spend-Calls"] = str(usage["calls"])
+    response.headers["X-Spend-Tokens-In"] = str(usage["input_tokens"])
+    response.headers["X-Spend-Tokens-Out"] = str(usage["output_tokens"])
+    response.headers["X-Spend-Model"] = model
+    response.headers["X-Spend-Provider"] = provider
+    # These routes resolve no caller BYOL config (a browser session has no API-key record to
+    # hang one on), so the platform always pays — stated rather than left to be inferred.
+    response.headers["X-Spend-Billable"] = "1"
+    if agent_guard._is_estimated(model):
+        response.headers["X-Spend-Cost-Estimated"] = "1"
+
     if subject.project_id:
         database.record_project_cost(subject.project_id, cost_usd)
     if key_id:

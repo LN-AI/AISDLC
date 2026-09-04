@@ -2,8 +2,20 @@
   "must_find": [],
   "must_not_find": [
     {
+      "match": "csrf",
+      "note": "Django's CsrfViewMiddleware handles CSRF on every POST by default"
+    },
+    {
+      "match": "xss",
+      "note": "Django templates auto-escape by default, so rendering `bio` is not XSS"
+    },
+    {
       "control_id": "SEC-002",
-      "note": "Django's CsrfViewMiddleware handles CSRF; @login_required handles auth"
+      "note": "@login_required already enforces authentication on this view"
+    },
+    {
+      "control_id": "SEC-001",
+      "note": "same -- auth is present, via the decorator"
     }
   ],
   "expected_gate": [

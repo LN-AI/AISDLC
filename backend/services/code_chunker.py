@@ -220,10 +220,28 @@ def _manifest(chunk: Chunk, all_paths: List[str], diff_mode: bool) -> str:
     if chunk.total == 1 and not chunk.paths:
         return ""
 
+    # One row per file, not per unit. A chunk holding twelve hunks of one file, or a file
+    # that split at every declaration, used to produce twelve near-identical rows — which
+    # buries the part of this header that actually does work (the "not shown to you" list)
+    # under noise the model has to read past. Ranges are merged only where consecutive units
+    # are contiguous; a genuine gap is kept, because "lines 1-40, 900-980" and "lines 1-980"
+    # tell the model different things about what it may assert.
     here = []
     for u in chunk.units:
         label = u.path or "(artifact)"
-        here.append(f"  - {label} (lines {u.start_line}-{u.end_line})")
+        if here and here[-1][0] == label and u.start_line <= here[-1][2] + 1:
+            here[-1][2] = max(here[-1][2], u.end_line)
+            continue
+        if here and here[-1][0] == label:
+            here[-1][3].append((u.start_line, u.end_line))
+            continue
+        here.append([label, u.start_line, u.end_line, []])
+
+    rendered = []
+    for label, start, end, extra in here:
+        spans = ", ".join([f"{start}-{end}"] + [f"{a}-{b}" for a, b in extra])
+        rendered.append(f"  - {label} (lines {spans})")
+    here = rendered
     elsewhere = [p for p in all_paths if p not in chunk.paths]
 
     parts = [f"REVIEW CHUNK {chunk.index} OF {chunk.total}", "", "In this chunk:"]
@@ -307,3 +325,117 @@ def chunk_artifact(
     for c in chunks:
         c.body = _manifest(c, all_paths, diff_mode) + c.body
     return chunks
+
+
+# ── Multi-file artifacts ──────────────────────────────────────────────────
+#
+# Everything above assumes the artifact is one string. That was true while the only inputs
+# were a paste, one file, or one PR diff. A repository or a zip is a *list* of files, and
+# concatenating it before splitting throws away the two things that make a finding usable:
+#
+# * **The real path.** A model reading a concatenated blob infers `file_path` from a header
+#   it saw somewhere above; here every unit carries its path as a fact, so the finding does
+#   too, and the PR comment and the inline anchor can rely on it.
+# * **Per-file line numbers.** In a concatenated blob, line 42 of `auth.py` is line 1,847 of
+#   the artifact, and the two are indistinguishable afterwards. Units built per file keep
+#   the file's own numbering, which is what a reviewer, a diff anchor and
+#   `finding_pipeline.verify_evidence_per_file` all need.
+
+
+def unit_header(path: str, start_line: int, end_line: int) -> str:
+    """How a unit announces which file and which lines it is.
+
+    Carried on every unit rather than only in the chunk manifest: a chunk holding units from
+    six files needs the boundary marked at each unit, or the model cannot tell which text
+    belongs to which path — and it will guess, which is how a finding gets filed against the
+    wrong file.
+    """
+    return f"----- {path or '(artifact)'} lines {start_line}-{end_line} -----\n"
+
+
+def units_for_files(files: List[dict]) -> List[Unit]:
+    """Split each file independently, so line numbers stay file-relative."""
+    units: List[Unit] = []
+    for f in files:
+        path = f.get("path") or ""
+        content = f.get("content") or ""
+        if not content.strip():
+            continue
+        units.extend(_split_flat(content, path))
+    return units
+
+
+def chunk_files(
+    files: List[dict],
+    max_tokens: int = DEFAULT_CHUNK_TOKENS,
+    overlap_lines: int = DEFAULT_OVERLAP_LINES,
+    token_counter: Optional[Callable[[str], int]] = None,
+) -> List[Chunk]:
+    """Pack a list of `{path, content}` into chunks whose findings fit one response each.
+
+    Same packing rules as `chunk_artifact` — order preserved, structural boundaries
+    respected, oversized units windowed with overlap — with one addition: a unit's text is
+    prefixed with `unit_header`, so the path travels with the code instead of only with the
+    manifest.
+    """
+    count = token_counter or estimate_tokens
+    units = units_for_files(files)
+    if not units:
+        return []
+
+    expanded: List[Unit] = []
+    for u in units:
+        expanded.extend(
+            _window(u, max_tokens, overlap_lines, count) if count(u.text) > max_tokens else [u]
+        )
+
+    # Stamp the header on after windowing, so a window's header names the window's own line
+    # range rather than the whole unit's.
+    for u in expanded:
+        u.text = unit_header(u.path, u.start_line, u.end_line) + u.text
+
+    packed: List[List[Unit]] = []
+    current: List[Unit] = []
+    current_tokens = 0
+    for u in expanded:
+        t = count(u.text)
+        if current and current_tokens + t > max_tokens:
+            packed.append(current)
+            current, current_tokens = [], 0
+        current.append(u)
+        current_tokens += t
+    if current:
+        packed.append(current)
+
+    all_paths: List[str] = []
+    for u in expanded:
+        if u.path and u.path not in all_paths:
+            all_paths.append(u.path)
+
+    chunks = []
+    for i, group in enumerate(packed, start=1):
+        c = Chunk(index=i, total=len(packed), units=group)
+        c.body = "\n\n".join(u.text for u in group)
+        chunks.append(c)
+    for c in chunks:
+        c.body = _manifest(c, all_paths, diff_mode=False) + c.body
+    return chunks
+
+
+def estimate_chunks_for_files(files: List[dict], max_tokens: int = DEFAULT_CHUNK_TOKENS) -> int:
+    """How many model calls a file list will take, without doing the split.
+
+    Same contract as `estimate_chunks`: close enough to size a budget reservation and a
+    quote, never used for correctness. Sums per-file rather than over the concatenation
+    because a file is never packed across a chunk boundary without being counted, and the
+    per-unit header adds real tokens that the raw character count misses.
+    """
+    if not files:
+        return 1
+    total = 0
+    for f in files:
+        content = f.get("content") or ""
+        if not content.strip():
+            continue
+        total += estimate_tokens(content) + estimate_tokens(unit_header(f.get("path") or "", 1, 1))
+    return max(1, -(-total // max(max_tokens, 1)))

@@ -82,6 +82,63 @@ _normalize = normalize
 _line_of_offset = line_of_offset
 
 
+
+# A unified diff carries a one-character marker on every line: `+` added, `-` removed, ` `
+# unchanged context. A model asked to "quote the offending code verbatim" quotes the *code*,
+# without those markers — which is the natural reading and what a human would do.
+_DIFF_HEAD_RE = re.compile(r"^(diff --git |--- a/|\+\+\+ b/|@@ )", re.MULTILINE)
+
+
+def looks_like_diff(text: str) -> bool:
+    """Cheap structural check, on the head only. Mirrors `code_chunker.is_unified_diff`;
+    duplicated rather than imported so this module stays dependency-free for its callers."""
+    head = (text or "")[:4000]
+    return bool(_DIFF_HEAD_RE.search(head)) or ("--- a/" in head and "+++ b/" in head)
+
+
+def diff_views(text: str) -> Tuple[str, str]:
+    """A diff as two searchable views, both excluding what the change removed.
+
+    Returns `(with_markers, without_markers)`. Every finding's evidence is checked against
+    both, and the raw diff is **not** searched at all, which fixes two separate defects.
+
+    **Multi-line quotes were being discarded.** Measured on a real pull request on
+    2026-09-02: of 13 findings on a 3-file diff, **10 were dropped** as unfounded and none of
+    them were invented. The model had quoted two or three lines of code without the `+`
+    prefixes — the natural reading of "quote the offending code verbatim" — and the
+    normalized diff has a `+` between every pair of lines, so the needle
+    `api_key = "..." dsn = "..."` could never be a substring of `+ api_key = "..." + dsn =
+    "..."`. Single-line quotes survived by luck, being substrings of their own prefixed line.
+    So every multi-line quote on every PR review was thrown away, in the flagship use case,
+    and the discard count offered as a hallucination rate was mostly measuring prefix
+    stripping. `without_markers` is what fixes it.
+
+    **A quote of a deleted line used to verify.** Searching the raw diff found `-` lines,
+    so a finding could report a vulnerability that the change *removes* and be marked
+    verified — the reviewer contradicting the fix in front of it. Both views drop `-` lines,
+    so such a quote now fails, which is correct: the code is not there any more.
+
+    Neither view admits anything that was not literally in the diff, so this is a more
+    accurate check rather than a looser one. Context (` `) lines are kept, because the prompt
+    permits reporting a pre-existing problem on one as long as it is flagged
+    `is_pre_existing`.
+    """
+    with_markers, without_markers = [], []
+    for line in (text or "").splitlines():
+        if line.startswith(("+++", "---", "@@", "diff --git", "index ", "\\ No newline")):
+            continue
+        if not line:
+            with_markers.append("")
+            without_markers.append("")
+            continue
+        marker = line[0]
+        if marker == "-":
+            continue
+        with_markers.append(line)
+        without_markers.append(line[1:] if marker in "+ " else line)
+    return "\n".join(with_markers), "\n".join(without_markers)
+
+
 def verify_evidence(
     findings: List[Dict[str, Any]],
     artifact: str,
@@ -104,6 +161,14 @@ def verify_evidence(
     """
     lines = artifact.splitlines()
     normalized = _normalize(artifact)
+    # A diff is searched through `diff_views` instead of raw: two views, both without the
+    # lines the change removed. See that function for the two defects this fixes.
+    is_diff = looks_like_diff(artifact)
+    if is_diff:
+        marked, unmarked = diff_views(artifact)
+        haystacks = [_normalize(marked), _normalize(unmarked)]
+    else:
+        haystacks = [normalized]
     kept, discarded = [], []
 
     for f in findings or []:
@@ -121,14 +186,23 @@ def verify_evidence(
             kept.append(f)
             continue
 
-        idx = normalized.find(needle)
+        idx = next((h.find(needle) for h in haystacks if h.find(needle) != -1), -1)
         if idx == -1:
-            f["discard_reason"] = "evidence quote does not appear in the reviewed artifact"
+            f["discard_reason"] = (
+                "evidence quote does not appear in the change under review"
+                if is_diff else
+                "evidence quote does not appear in the reviewed artifact"
+            )
             discarded.append(f)
             continue
 
         f["evidence_verified"] = True
-        if correct_lines:
+        if is_diff:
+            f["evidence_scope"] = "diff"
+        # A position recovered from a diff view is an offset into that view, not into the
+        # diff, so no line is derived from it. `correct_lines` is False for diffs anyway —
+        # the model's number comes from the `@@` header and refers to the file.
+        if correct_lines and not is_diff:
             actual = _line_of_offset(lines, idx)
             if actual is not None:
                 reported = f.get("line_start")
@@ -323,6 +397,195 @@ def process(
     this first, look the fingerprints up, and then apply what it found.
     """
     verified, discarded = verify_evidence(findings, artifact, correct_lines)
+    kept, suppressed = apply_path_suppression(verified)
+    merged = sort_findings(merge_findings(kept))
+    for f in merged:
+        f["fingerprint"] = fingerprint(f)
+    return {
+        "findings": merged,
+        "discarded_findings": discarded,
+        "suppressed_findings": sort_findings(suppressed),
+    }
+
+
+# ── Per-file verification ─────────────────────────────────────────────────
+#
+# `verify_evidence` above searches one haystack. That is right for a paste and for a diff,
+# and wrong for a repository, in two separate ways:
+#
+# 1. **Line numbers become meaningless.** Line 42 of `auth.py` is line 1,847 of a
+#    concatenated bundle, so "correcting" a finding's line from a position recovered in the
+#    bundle replaces a right answer with a wrong one — the same trap the diff case already
+#    avoids by switching correction off. Switching it off for repositories too would mean
+#    giving up line numbers on the exact input where they matter most.
+#
+# 2. **Mis-attribution passes verification.** A finding filed against `login.py` whose quote
+#    actually lives in `admin.py` is verified today, because the quote is somewhere in the
+#    haystack. It then anchors a PR comment to the wrong file.
+#
+# Verifying per file fixes both, and turns a weaker check into a stronger one: the evidence
+# must appear in *the file the finding names*, not merely somewhere in the input.
+
+# A quote found in exactly one other file is re-filed rather than discarded. More than one
+# and we cannot tell which was meant, so the finding keeps its own claim and loses its
+# verified status instead.
+_REFILE_WHEN_UNIQUE = True
+
+
+def _index_files(files: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Path -> everything needed to verify against that file, computed once, not per finding."""
+    index: Dict[str, Any] = {}
+    by_basename: Dict[str, List[str]] = {}
+    for f in files or []:
+        path = (f.get("path") or "").lstrip("./")
+        if not path:
+            continue
+        content = f.get("content") or ""
+        index[path] = {
+            "content": content,
+            "lines": content.splitlines(),
+            "normalized": normalize(content),
+        }
+        by_basename.setdefault(path.rsplit("/", 1)[-1].lower(), []).append(path)
+    return {"by_path": index, "by_basename": by_basename,
+            "lower": {p.lower(): p for p in index}}
+
+
+def _resolve_path(claimed: str, index: Dict[str, Any]) -> Optional[str]:
+    """The real path a model meant, or None.
+
+    Four tolerances, in order of confidence. A model shown `backend/routes/auth.py` will
+    sometimes answer `routes/auth.py` or just `auth.py`, and discarding a real finding over a
+    dropped directory prefix is a worse error than accepting it. Every tolerance below the
+    first requires the match to be *unambiguous*, so nothing is guessed.
+    """
+    claimed = (claimed or "").lstrip("./").strip().replace("\\", "/")
+    if not claimed:
+        return None
+    by_path = index["by_path"]
+    if claimed in by_path:
+        return claimed
+    lowered = index["lower"].get(claimed.lower())
+    if lowered:
+        return lowered
+    suffix_hits = [
+        p for p in by_path
+        if p.lower().endswith("/" + claimed.lower())
+    ]
+    if len(suffix_hits) == 1:
+        return suffix_hits[0]
+    basename_hits = index["by_basename"].get(claimed.rsplit("/", 1)[-1].lower(), [])
+    if len(basename_hits) == 1:
+        return basename_hits[0]
+    return None
+
+
+def verify_evidence_per_file(
+    findings: List[Dict[str, Any]],
+    files: List[Dict[str, Any]],
+    correct_lines: bool = True,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split findings into (kept, discarded), checking each against the file it names.
+
+    Sets, per finding:
+      `evidence_verified`   — the quote is really in that file
+      `evidence_scope`      — "file", "ambiguous", or "unattributed"
+      `reported_file_path`  — the model's original path, kept whenever it was corrected
+      `file_path_corrected` — true when the finding was re-filed to where the quote really is
+
+    Falls back to whole-artifact verification when no file carries a path, which is the
+    paste and single-diff case — so this is a superset of `verify_evidence`, never a
+    replacement that loses a behaviour.
+    """
+    index = _index_files(files)
+    if not index["by_path"]:
+        whole = "\n\n".join(f.get("content") or "" for f in files or [])
+        return verify_evidence(findings, whole, correct_lines)
+
+    kept, discarded = [], []
+
+    for f in findings or []:
+        evidence = (f.get("evidence") or "").strip()
+        needle = normalize(evidence)
+        claimed = str(f.get("file_path") or "")
+        resolved = _resolve_path(claimed, index)
+
+        if not evidence or len(needle) < 8:
+            f["evidence_verified"] = False
+            f["evidence_scope"] = "file" if resolved else "unattributed"
+            if resolved and resolved != claimed.lstrip("./"):
+                f["reported_file_path"], f["file_path"] = claimed, resolved
+            kept.append(f)
+            continue
+
+        if resolved:
+            entry = index["by_path"][resolved]
+            idx = entry["normalized"].find(needle)
+            if idx != -1:
+                if resolved != claimed.lstrip("./"):
+                    f["reported_file_path"], f["file_path"] = claimed, resolved
+                f["evidence_verified"] = True
+                f["evidence_scope"] = "file"
+                if correct_lines:
+                    actual = line_of_offset(entry["lines"], idx)
+                    if actual is not None and f.get("line_start") != actual:
+                        f["reported_line_start"] = f.get("line_start")
+                        f["line_start"] = actual
+                kept.append(f)
+                continue
+
+        # Either the path is unknown, or the quote is not in the file it named. Look for the
+        # quote everywhere before discarding: a real issue filed against the wrong file is
+        # still a real issue, and re-filing it is strictly more useful than dropping it.
+        elsewhere = [
+            p for p, entry in index["by_path"].items()
+            if entry["normalized"].find(needle) != -1
+        ]
+        if _REFILE_WHEN_UNIQUE and len(elsewhere) == 1:
+            real = elsewhere[0]
+            entry = index["by_path"][real]
+            f["reported_file_path"] = claimed
+            f["file_path"] = real
+            f["file_path_corrected"] = True
+            f["evidence_verified"] = True
+            f["evidence_scope"] = "file"
+            if correct_lines:
+                actual = line_of_offset(entry["lines"], entry["normalized"].find(needle))
+                if actual is not None and f.get("line_start") != actual:
+                    f["reported_line_start"] = f.get("line_start")
+                    f["line_start"] = actual
+            kept.append(f)
+            continue
+
+        if elsewhere:
+            # Ambiguous: the quoted code exists, in several files, and the finding named a
+            # different one. Unverified is the honest answer — there is real code behind it,
+            # but we cannot say where, so nothing downstream should anchor a comment to it.
+            f["evidence_verified"] = False
+            f["evidence_scope"] = "ambiguous"
+            f["evidence_note"] = (
+                f"the quoted code appears in {len(elsewhere)} file(s), none of them the one "
+                f"this finding names"
+            )
+            kept.append(f)
+            continue
+
+        f["discard_reason"] = (
+            f"evidence quote does not appear in "
+            f"{resolved or claimed or 'any reviewed file'}"
+        )
+        discarded.append(f)
+
+    return kept, discarded
+
+
+def process_files(
+    findings: List[Dict[str, Any]],
+    files: List[Dict[str, Any]],
+    correct_lines: bool = True,
+) -> Dict[str, Any]:
+    """`process`, for a multi-file artifact. Same three passes, per-file verification."""
+    verified, discarded = verify_evidence_per_file(findings, files, correct_lines)
     kept, suppressed = apply_path_suppression(verified)
     merged = sort_findings(merge_findings(kept))
     for f in merged:

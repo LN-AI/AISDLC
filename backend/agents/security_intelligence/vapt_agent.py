@@ -1,5 +1,12 @@
-from backend.agents.base_agent import VAPTBaseAgent
+import logging
+from typing import Any, Callable, Dict, List, Optional
+
+from backend.agents import chunked_review
+from backend.agents.base_agent import VAPT_TOOL_SCHEMA, VAPTBaseAgent
 from backend.controls.control_library import VAPT_CONTROLS, OWASP_WEB_TOP10_2021, OWASP_API_TOP10_2023
+from backend.services import llm_gateway
+
+logger = logging.getLogger(__name__)
 
 
 VAPT_SYSTEM_PROMPT = """You are a senior penetration tester and security engineer conducting a Vulnerability Assessment and Penetration Testing (VAPT) engagement. Your job is to identify security vulnerabilities with the same rigour as a real penetration test.
@@ -78,6 +85,44 @@ Use these control IDs for findings:
    - Amber: High findings that need approval, or Moderate findings without workarounds
    - Green: Only Low/Informational findings
 7. Be thorough — a missed vulnerability in production is a real security incident.
+
+## Redacted values you will see
+Text of the form `__REDACTED_ASSIGNED_CREDENTIAL__` or `__REDACTED_AWS_ACCESS_KEY__` is not
+in the customer's source. The platform's scanner found a real hardcoded credential there,
+replaced the value before you were shown the file, and has already reported it. Do not
+report a hardcoded secret at a placeholder, and do not treat the placeholder as the
+vulnerability. Do report anything else the surrounding code reveals — a credential sent over
+plain HTTP, a secret logged, an authentication comparison that is not constant-time.
+
+## Evidence — every finding must be provable
+Quote the offending code or specification text verbatim in `evidence`, copied exactly from
+what you were shown, at most 3 lines. That quote is checked in software against the file
+this finding names: if it does not appear there, the finding is discarded as unfounded. Do
+not paraphrase, do not reconstruct from memory, do not quote something you were not shown.
+
+Name the file in `file_path` exactly as it appears in the chunk header above the code, and
+give absolute line numbers — the numbers shown to you, not renumbered from the top of the
+chunk. Leave both empty when the artifact genuinely has no file structure (an OpenAPI
+document, an architecture description, a list of URLs); the quote is still required.
+
+Set `confidence` honestly. High means the artifact in front of you proves the vulnerability
+is reachable. If you are inferring from configuration or code you cannot see, that is Low —
+report it anyway, but say so. A pentest report that cannot distinguish a proven finding from
+a suspected one is one a customer cannot prioritise.
+
+## What NOT to report
+A report full of things the team already knows are fine is a report they stop reading, and on
+a penetration test that costs more credibility than a missed low-severity finding. Do not
+report:
+- A control the framework provides by default — CSRF tokens in Django/Rails form helpers,
+  template auto-escaping, authentication enforced by middleware you were shown.
+- A query already parameterized or built through an ORM's query builder.
+- Placeholder or example credentials: `AKIAIOSFODNN7EXAMPLE`, `sk-test-...`,
+  `password = "changeme"`, anything in a `.env.example` or `*.sample` file.
+- Anything in test, fixture, mock, vendored, generated, minified or build-output code.
+- A missing control when the code that would contain it is not in front of you. If you were
+  told other files exist but were not shown them, that control may well be there — say so in
+  `confidence` rather than asserting the gap.
 """
 
 
@@ -88,16 +133,71 @@ class VAPTAgent(VAPTBaseAgent):
             system_prompt=VAPT_SYSTEM_PROMPT,
         )
 
-    def run_vapt(self, artifact: str, context: str = "", scope: str = "") -> dict:
-        controls_ref = "\n".join([
-            f"- {c.id}: {c.title}" for c in VAPT_CONTROLS.values()
-        ])
-        owasp_web = "\n".join([f"- {k}: {v}" for k, v in OWASP_WEB_TOP10_2021.items()])
-        owasp_api = "\n".join([f"- {k}: {v}" for k, v in OWASP_API_TOP10_2023.items()])
+    def run_vapt(
+        self,
+        artifact: str = "",
+        context: str = "",
+        scope: str = "",
+        files: Optional[List[Dict[str, Any]]] = None,
+        coverage_incomplete: bool = False,
+        coverage_reason: str = "",
+        is_diff: Optional[bool] = None,
+        extra_findings: Optional[List[Dict[str, Any]]] = None,
+        llm_override: Optional[Dict[str, Any]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
+        """Assess one artifact — pasted text, a diff, or a whole repository — and gate it.
+
+        Everything after the model call is `chunked_review.run`, which is the same eleven
+        stages the Code Review agent has had all along: split so a large surface is not
+        truncated, verify every quote against the file it names, drop invented findings,
+        de-duplicate, suppress test and vendor paths, fingerprint so findings can be waived
+        and tracked run to run, and floor the gate so a Critical can never come out Green
+        (C-73).
+
+        Signature note: `artifact` and `context` keep their positions, because
+        `orchestrator.review_vapt` and `swarm_service` both call this positionally.
+        """
+        def call_chunk(body: str) -> Dict[str, Any]:
+            return self._assess_chunk(body, context, scope, llm_override)
+
+        result = chunked_review.run(
+            agent_name=self.agent_name,
+            review_type="vapt",
+            call_chunk=call_chunk,
+            artifact=artifact if not files else None,
+            files=files,
+            is_diff=is_diff,
+            coverage_incomplete=coverage_incomplete,
+            coverage_reason=coverage_reason,
+            extra_findings=extra_findings,
+            baseline_lookup=chunked_review.default_baseline,
+            on_progress=on_progress,
+        )
+        # Counts the UI and the dashboard read. Computed here rather than in the
+        # orchestrator so every caller gets them — `swarm_service` reaches this agent
+        # without going through `orchestrator.review_vapt` at all.
+        findings = result.get("findings") or []
+        result["critical_count"] = sum(1 for f in findings if f.get("severity") == 5)
+        result["high_count"] = sum(1 for f in findings if f.get("severity") == 4)
+        result["total_findings"] = len(findings)
+        return result
+
+    def _assess_chunk(
+        self,
+        body: str,
+        context: str,
+        scope: str,
+        llm_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """One model call over one chunk of the attack surface."""
+        controls_ref = "\n".join(f"- {c.id}: {c.title}" for c in VAPT_CONTROLS.values())
+        owasp_web = "\n".join(f"- {k}: {v}" for k, v in OWASP_WEB_TOP10_2021.items())
+        owasp_api = "\n".join(f"- {k}: {v}" for k, v in OWASP_API_TOP10_2023.items())
 
         prompt = f"""## Artifact for VAPT Assessment
 
-{artifact}
+{body}
 
 ## Scope
 {scope if scope else "Full application security assessment — web, API, authentication, authorization, injection, cryptography, business logic, and infrastructure."}
@@ -111,6 +211,18 @@ class VAPTAgent(VAPTBaseAgent):
 ## OWASP API Top 10 (2023)
 {owasp_api}
 
-Conduct a thorough VAPT assessment. For every vulnerability found, provide realistic exploitation details and CVSS v3.1 scoring. Be specific about affected endpoints and functions.
+Conduct a thorough VAPT assessment. For every vulnerability found, provide realistic
+exploitation details and CVSS v3.1 scoring. Be specific about affected endpoints and
+functions. Quote the offending code or specification text verbatim in `evidence`, name its
+file in `file_path`, and give absolute line numbers.
 """
-        return self.review_vapt(prompt, context)
+        user_content = prompt
+        if context:
+            user_content = f"Context:\n{context}\n\n---\n\nArtifact to Assess:\n{prompt}"
+
+        result = llm_gateway.call_tool(
+            self.system_prompt, user_content, VAPT_TOOL_SCHEMA, llm_override,
+            max_tokens=self.MAX_OUTPUT_TOKENS,
+        )
+        result["agent_name"] = self.agent_name
+        return result

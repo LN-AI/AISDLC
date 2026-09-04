@@ -131,17 +131,57 @@ class SDLCOrchestrator:
         return result
 
     @_log_call
-    def review_code(self, code: str, language: str = "", context: str = "", project_name: str = "", pr_url: str = "") -> Dict[str, Any]:
-        context = self._kb("code-review", context, code, project_name)
-        compressed_code, cost_stats = self._compress(code)
-        result = self.code_agent.review_code(compressed_code, language, context)
+    def review_code(self, code: str = "", language: str = "", context: str = "",
+                    project_name: str = "", pr_url: str = "",
+                    files: Optional[List[Dict[str, Any]]] = None,
+                    coverage_incomplete: bool = False, coverage_reason: str = "",
+                    source: Optional[Dict[str, Any]] = None,
+                    extra_findings: Optional[List[Dict[str, Any]]] = None,
+                    on_progress=None) -> Dict[str, Any]:
+        """Review a paste, a diff, or a whole file list (a zip or a repository).
+
+        **Cost-optimization compression is deliberately skipped for `files`.** Headroom
+        rewrites the artifact, and on the single-artifact path that is self-consistent: the
+        agent verifies evidence against the same compressed text it was shown, so a quote
+        still matches. Per file it is not safe. A finding's `line_start` now anchors an
+        inline GitHub review comment on the customer's real file, and a line recovered from
+        compressed text does not point at the same line in the original. A few percent of
+        input tokens is not worth a comment landing on the wrong line.
+        """
+        artifact_for_kb = code or "\n".join(
+            (f.get("content") or "")[:2000] for f in (files or [])[:20]
+        )
+        context = self._kb("code-review", context, artifact_for_kb, project_name)
+
+        cost_stats = None
+        if files:
+            result = self.code_agent.review_code(
+                language=language, context=context, files=files,
+                coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
+                extra_findings=extra_findings, on_progress=on_progress,
+            )
+            label = (source or {}).get("label", "")
+            input_summary = f"Code review over {len(files)} file(s)" + (f" — {label}" if label else "")
+            input_content = "\n".join(f.get("path", "") for f in files)[:5000]
+        else:
+            compressed_code, cost_stats = self._compress(code)
+            result = self.code_agent.review_code(
+                code=compressed_code, language=language, context=context,
+                coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
+                on_progress=on_progress,
+            )
+            input_summary = f"Code review{f' for PR: {pr_url}' if pr_url else ''} ({len(code)} chars)"
+            input_content = code[:5000]
+
         if cost_stats:
             result["_cost_stats"] = cost_stats
+        if source:
+            result["source"] = source
         review_id = database.save_review(
             review_type="code",
             project_name=project_name,
-            input_summary=f"Code review{f' for PR: {pr_url}' if pr_url else ''} ({len(code)} chars)",
-            input_content=code[:5000],
+            input_summary=input_summary,
+            input_content=input_content,
             result=result,
         )
         result["review_id"] = review_id
@@ -228,34 +268,65 @@ class SDLCOrchestrator:
     @_log_call
     def review_vapt(
         self,
-        artifact: str,
+        artifact: str = "",
         scope: str = "",
         context: str = "",
         project_name: str = "Unnamed Project",
+        files: Optional[List[Dict[str, Any]]] = None,
+        coverage_incomplete: bool = False,
+        coverage_reason: str = "",
+        source: Optional[Dict[str, Any]] = None,
+        extra_findings: Optional[List[Dict[str, Any]]] = None,
+        on_progress=None,
     ) -> Dict[str, Any]:
-        context = self._kb("vapt", context, artifact, project_name)
-        compressed_artifact, cost_stats = self._compress(artifact)
-        result = self.vapt_agent.run_vapt(compressed_artifact, context, scope)
-        findings = result.get("findings", [])
-        if not findings and not (result.get("summary") or "").strip():
-            raise RuntimeError(
-                "VAPT agent returned an empty assessment (no findings and no summary) — "
-                "this usually means the LLM response was truncated or malformed rather than "
-                "a genuine clean result. Try again or narrow the artifact/scope."
+        """Assess a paste, a diff, or a whole file list, and persist a gated result.
+
+        The empty-assessment refusal that used to live here is now
+        `finding_gate.looks_degenerate`, applied inside `chunked_review.run` — so it covers
+        every caller of the agent rather than only this one (`swarm_service` reaches the
+        agent directly). The counts likewise moved onto the agent.
+
+        Compression is skipped for `files` for the same reason as `review_code`: a line
+        number recovered from compressed text does not point at the same line in the
+        customer's file.
+        """
+        artifact_for_kb = artifact or "\n".join(
+            (f.get("content") or "")[:2000] for f in (files or [])[:20]
+        )
+        context = self._kb("vapt", context, artifact_for_kb, project_name)
+
+        cost_stats = None
+        if files:
+            result = self.vapt_agent.run_vapt(
+                context=context, scope=scope, files=files,
+                coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
+                extra_findings=extra_findings, on_progress=on_progress,
             )
+            label = (source or {}).get("label", "")
+            input_summary = f"VAPT over {len(files)} file(s)" + (f" — {label}" if label else "")
+            input_content = "\n".join(f.get("path", "") for f in files)[:5000]
+        else:
+            compressed_artifact, cost_stats = self._compress(artifact)
+            result = self.vapt_agent.run_vapt(
+                artifact=compressed_artifact, context=context, scope=scope,
+                coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
+                on_progress=on_progress,
+            )
+            input_summary = f"VAPT — {artifact[:150]}{'...' if len(artifact) > 150 else ''}"
+            input_content = artifact[:5000]
+
         if cost_stats:
             result["_cost_stats"] = cost_stats
+        if source:
+            result["source"] = source
         review_id = database.save_review(
             review_type="vapt",
             project_name=project_name,
-            input_summary=f"VAPT — {artifact[:150]}{'...' if len(artifact) > 150 else ''}",
-            input_content=artifact[:5000],
+            input_summary=input_summary,
+            input_content=input_content,
             result=result,
         )
         result["review_id"] = review_id
-        result["critical_count"] = sum(1 for f in findings if f.get("severity") == 5)
-        result["high_count"] = sum(1 for f in findings if f.get("severity") == 4)
-        result["total_findings"] = len(findings)
         return result
 
     @_log_call
@@ -603,6 +674,7 @@ class SDLCOrchestrator:
         context: str = "",
         project_name: str = "Unnamed Project",
         llm_override: Optional[Dict[str, Any]] = None,
+        on_progress: Optional[Any] = None,
     ) -> Dict[str, Any]:
         return issue_triage_batch_workflow.run(
             self,
@@ -612,6 +684,7 @@ class SDLCOrchestrator:
             context=context,
             project_name=project_name,
             llm_override=llm_override,
+            on_progress=on_progress,
         )
     @_log_call
     def generate_test_scenarios(
@@ -714,10 +787,16 @@ class SDLCOrchestrator:
             findings=findings,
         )
     @_log_call
-    def review_github_pr(self, pr_url: str, jira_ticket: str = "", include_prompt_review: bool = False) -> Dict[str, Any]:
+    def review_github_pr(self, pr_url: str, jira_ticket: str = "",
+                         include_prompt_review: bool = False,
+                         post_mode: str = "summary", set_status: bool = True,
+                         request_changes: bool = False, on_progress=None) -> Dict[str, Any]:
         # `include_prompt_review` has never been implemented; kept so existing callers
         # that pass it keep working.
-        return review_pr_workflow.run(self, pr_url=pr_url, jira_ticket=jira_ticket)
+        return review_pr_workflow.run(
+            self, pr_url=pr_url, jira_ticket=jira_ticket, post_mode=post_mode,
+            set_status=set_status, request_changes=request_changes, on_progress=on_progress,
+        )
     @_log_call
     def auto_fix_github_pr(self, pr_url: str, jira_ticket: str = "", max_files: int = 5) -> Dict[str, Any]:
         """Review a GitHub PR, then commit fixes for its findings to a new branch off the PR's head branch

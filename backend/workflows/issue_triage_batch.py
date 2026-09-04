@@ -7,7 +7,7 @@ earlier ones from the same run.
 Failure policy: all-or-nothing, matching `full_review`. One failing issue aborts the
 batch.
 """
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from backend.workflows import issue_triage
 
@@ -22,10 +22,23 @@ def run(
     context: str = "",
     project_name: str = "Unnamed Project",
     llm_override: Optional[Dict[str, Any]] = None,
+    on_progress: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[str, Any]:
     issues = orch.github.list_open_issues(github_repo_url, limit)
+    total = len(issues) or 1
+    # Reported per issue, naming the one being read. This is serial by design and one model
+    # call per issue, so a batch over forty issues is forty sequential calls -- the
+    # difference between "working..." and "issue 12 of 40: Login times out" is the difference
+    # between a screen that looks stuck and one that does not.
+    if on_progress:
+        on_progress(0, total, f"Found {len(issues)} open issue(s)")
     results = []
-    for issue in issues:
+    for index, issue in enumerate(issues, start=1):
+        if on_progress:
+            on_progress(index - 1, total,
+                        f"Triaging issue {index} of {total}"
+                        + (f" — #{issue.get('number')} {(issue.get('title') or '')[:60]}"
+                           if issue.get("number") else ""))
         r = issue_triage.run(
             orch,
             title=issue.get("title", ""),
@@ -38,6 +51,8 @@ def run(
         r["github_issue_number"] = issue.get("number")
         r["github_issue_url"] = issue.get("url", "")
         results.append(r)
+        if on_progress:
+            on_progress(index, total, f"Triaged {index} of {total} issue(s)")
 
     return {
         "repo": github_repo_url,

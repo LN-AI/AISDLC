@@ -40,6 +40,49 @@ _swarm_svc = SwarmService()
 # so a change to rate-limit headers or the 401 body had to be made in two places.
 
 
+def _validate(req: SwarmRequest, caller: dict) -> None:
+    """Refuse what cannot run, before anything is started.
+
+    Shared by both entry points on purpose: an async twin that accepted a request the
+    synchronous route rejects would answer 202 and then fail in the background, which turns
+    a clear 400 into a job a person has to go and read the error of.
+    """
+    if not llm_settings_service.is_llm_configured() and not has_any_byol(req, caller):
+        raise HTTPException(
+            status_code=503,
+            detail="No LLM configured. Activate a connection under Settings → LLM Providers, "
+                   "set ANTHROPIC_API_KEY in .env, or supply llm_provider/llm_api_key on this "
+                   "call (or via PUT /api/v1/llm-config) to bring your own.",
+        )
+
+    has_source = any([
+        req.github_pr_url,
+        req.github_file_url,
+        req.github_repo_url,
+        req.jira_ticket,
+        req.text,
+        req.architecture,
+        req.system_prompt,
+    ])
+    if not has_source:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No source provided. Supply one of: github_pr_url, github_file_url, "
+                "github_repo_url, jira_ticket, text, architecture, or system_prompt."
+            ),
+        )
+
+    if req.policy_name and req.policy_name.lower() not in BUILTIN_POLICY_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown policy_name '{req.policy_name}'. "
+                f"Valid values: {', '.join(BUILTIN_POLICY_NAMES)}."
+            ),
+        )
+
+
 # ── POST /api/v1/swarm ────────────────────────────────────────────────────
 
 @router.post(
@@ -80,42 +123,7 @@ See `GET /api/v1/swarm/policies` for the full policy catalogue.
 """,
 )
 def run_swarm(req: SwarmRequest, caller: dict = Depends(get_caller)) -> SwarmResponse:
-    if not llm_settings_service.is_llm_configured() and not has_any_byol(req, caller):
-        raise HTTPException(
-            status_code=503,
-            detail="No LLM configured. Activate a connection under Settings → LLM Providers, "
-                   "set ANTHROPIC_API_KEY in .env, or supply llm_provider/llm_api_key on this "
-                   "call (or via PUT /api/v1/llm-config) to bring your own.",
-        )
-
-    # Validate that at least one source is provided
-    has_source = any([
-        req.github_pr_url,
-        req.github_file_url,
-        req.github_repo_url,
-        req.jira_ticket,
-        req.text,
-        req.architecture,
-        req.system_prompt,
-    ])
-    if not has_source:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No source provided. Supply one of: github_pr_url, github_file_url, "
-                "github_repo_url, jira_ticket, text, architecture, or system_prompt."
-            ),
-        )
-
-    # Validate policy_name if supplied
-    if req.policy_name and req.policy_name.lower() not in BUILTIN_POLICY_NAMES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unknown policy_name '{req.policy_name}'. "
-                f"Valid values: {', '.join(BUILTIN_POLICY_NAMES)}."
-            ),
-        )
+    _validate(req, caller)
 
     # A swarm run fans out to 3-5 agents in parallel and was previously the platform's
     # single biggest metering hole: authenticated and rate-limited, but never scoped,
@@ -138,8 +146,16 @@ def run_swarm(req: SwarmRequest, caller: dict = Depends(get_caller)) -> SwarmRes
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Swarm execution failed: {exc}")
 
-    # Each agent may have resolved a different LLM (per-agent BYOL) — summarise:
-    # a single combo if everyone used the same one, else flag it as mixed.
+    return _summarise_llm(response)
+
+
+def _summarise_llm(response: SwarmResponse) -> SwarmResponse:
+    """Each agent may have resolved a different LLM (per-agent BYOL) — summarise:
+    a single combo if everyone used the same one, else flag it as mixed.
+
+    Extracted so the async twin cannot drift from the synchronous route on the one thing a
+    reader uses to judge the findings: what produced them.
+    """
     combos = {}
     for r in response.results:
         if r.llm_used:
@@ -152,6 +168,80 @@ def run_swarm(req: SwarmRequest, caller: dict = Depends(get_caller)) -> SwarmRes
     else:
         response.llm_used = llm_gateway.describe(None)
     return response
+
+
+# ── POST /api/v1/swarm/async ──────────────────────────────────────────────
+
+@router.post(
+    "/async",
+    status_code=202,
+    summary="Start a swarm run and return a job id",
+    description="""
+The same run as `POST /api/v1/swarm`, started in the background so the caller can watch it.
+
+A swarm fans out to three to six agents in parallel and routinely takes minutes. The
+synchronous route holds the connection for all of it and reports nothing until it is done,
+so the screen could only show a spinner — indistinguishable from a hang, on the second
+slowest thing this platform does.
+
+Poll `GET /api/review/jobs/{job_id}`. Progress is reported as agents **finish**, naming the
+one that just landed: they run concurrently, so "starting Security" says nothing about how
+much is left, and a bare "4 of 6" cannot tell a swarm that is progressing from one where
+the slow agent is still the slow agent.
+
+The synchronous route is kept. It is the documented API surface, and a caller that wants to
+block on one request should not have to poll.
+""",
+)
+async def run_swarm_async(req: SwarmRequest, caller: dict = Depends(get_caller)) -> dict:
+    """`async def` is load-bearing: `job_service.start_job` schedules with
+    `asyncio.create_task`, which needs a running loop on the calling thread. This handler
+    does no blocking work itself, so it does not hold the loop."""
+    from backend.services import job_service
+
+    _validate(req, caller)
+
+    # An upper bound on the agent count, knowable without resolving the source — which is a
+    # network call for a GitHub ref and is exactly the slow work being moved off this
+    # thread. `_select_agents` narrows it once the source type is known, and the service's
+    # first progress report corrects the total before the bar has moved, so it can only ever
+    # revise downward and never appears to go backwards.
+    policy = (BUILTIN_POLICIES.get((req.policy_name or "").lower()) or DEFAULT_POLICY)
+    expected = max(len(set(policy.required_agents) | set(policy.optional_agents)), 1)
+
+    def _run(on_progress):
+        on_progress(0, expected, "Resolving the source")
+        with agent_guard.expect_calls(expected):
+            response = agent_guard.guarded_call(
+                caller, "swarm", None, skip_preflight=True,
+                project_name=req.project_name or "",
+                fn=lambda: _swarm_svc.run_swarm(req, _orch, caller, on_progress=on_progress),
+            )
+        # `guarded_call` returns whatever `fn` returned, and attaches `_budget_stats` only to
+        # a dict. A SwarmResponse is a model, so the spend is carried in the serialised body
+        # below rather than being silently dropped on the floor.
+        summarised = _summarise_llm(response)
+        body = summarised.model_dump() if hasattr(summarised, "model_dump") \
+            else summarised.dict()
+        stats = getattr(response, "_budget_stats", None)
+        if stats:
+            body["_budget_stats"] = stats
+        return body
+
+    # The preflight runs here, before the 202, so a caller who is out of budget or quota
+    # gets 402/403/429 now rather than an accepted job that fails a minute later.
+    with agent_guard.expect_calls(expected):
+        agent_guard.preflight(caller, "swarm")
+
+    job_id = job_service.start_job("swarm", total_steps=expected, run_fn=_run)
+    return {
+        "job_id": job_id,
+        "status": "accepted",
+        "agent": "swarm",
+        "unit": "agent",
+        "estimate": {"calls": expected},
+        "poll_url": f"/api/review/jobs/{job_id}",
+    }
 
 
 # ── GET /api/v1/swarm/policies ────────────────────────────────────────────

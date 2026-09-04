@@ -1,0 +1,337 @@
+{
+  "prompt_version": "2026-08-07.1",
+  "generated_at": "2026-09-02T10:57:12.688468+00:00",
+  "cases": 10,
+  "repeat": 1,
+  "errors": 0,
+  "recall": 0.833,
+  "false_positive_rate": 0.2,
+  "gate_accuracy": 0.9,
+  "hallucinated_findings_discarded": 0,
+  "unverified_findings": 0,
+  "determinism_jaccard": null,
+  "tokens_in": 5943,
+  "tokens_out": 13270,
+  "cache_read_tokens": 23427,
+  "estimated_cost_usd": null,
+  "runs": [
+    {
+      "case": "fp-example-credentials",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 597,
+        "output_tokens": 406,
+        "cache_write_tokens": 2603,
+        "cache_read_tokens": 0
+      },
+      "seconds": 11.0
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Amber",
+      "model_gate": "Amber",
+      "gate_ok": false,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 1,
+      "tripped": [
+        {
+          "control_id": "SEC-002",
+          "note": "Django's CsrfViewMiddleware handles CSRF; @login_required handles auth"
+        }
+      ],
+      "findings_total": 4,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "5d633ea8f344f3b740e398fceb7df25c",
+        "6b709a7a3dda9ec2811593ac19db06ee",
+        "d11159255f2649c1401a5c0bfeedb69c",
+        "f46b86aaaf7788ddc49d7faccd4f9b70"
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 2075,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 38.3
+    },
+    {
+      "case": "fp-parameterized-orm",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 345,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 8.9
+    },
+    {
+      "case": "fp-test-fixture",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 350,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 10.3
+    },
+    {
+      "case": "hardcoded-secret",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "8e6dd7afb34556229e6e5869471e9a5c",
+        "aa429826a3fd8375f76e226c0c57fa04",
+        "cb67abf045cc9fd0ca90909eb6b1337d"
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 1873,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 34.6
+    },
+    {
+      "case": "llm-output-to-exec",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 5,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "054a3a5923c82f45e66fd8bdeee88c60",
+        "23ecde568a77f6e8b037da6305dd7254",
+        "a4839e3215f1e96150ea54bdab4eb03a",
+        "bf623a33f4589dd109f1fe5a4e55e7c0",
+        "fa7f77f586e43a9d62df778e6aec1cf4"
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 593,
+        "output_tokens": 2333,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 41.2
+    },
+    {
+      "case": "missing-auth",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 5,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "78c7addf25db33c2c15c32703b83bdc8",
+        "a72a396f40b0ab296792a39669d62793",
+        "aec3b332c42c06f127821e2992aa6544",
+        "d7e0bbcc7521160db59f2eeca61b2f70",
+        "fa9c1c76b0c063f7870cda42e952d3de"
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 2101,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 37.9
+    },
+    {
+      "case": "pii-in-logs",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "cf12a30a9d8237348bd8ab007fcf4a8a"
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 581,
+        "output_tokens": 1339,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 25.2
+    },
+    {
+      "case": "sql-injection",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 0,
+      "missed": [
+        {
+          "control_id": "SEC-001",
+          "line_range": [
+            1,
+            3
+          ],
+          "note": "string-concatenated SQL"
+        }
+      ],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "adc1876f94821708feebbe361d33ae29",
+        "c1d59c707d7e16cc865bb57f9ae781fb",
+        "c78f93bcb153f52c4cc34e3dbfb6eab6"
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 577,
+        "output_tokens": 1471,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 25.6
+    },
+    {
+      "case": "weak-crypto",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "f1cff8cab8226858f76043d327d00bcd"
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 565,
+        "output_tokens": 977,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 2603
+      },
+      "seconds": 20.5
+    }
+  ]
+}

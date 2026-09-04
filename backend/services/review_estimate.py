@@ -1,0 +1,255 @@
+"""What a review will cost, before it is run.
+
+The modernization plan gate quotes a customer before any spend, and that gate is the reason
+a 500-file conversion is approvable at all. The review agents had nothing: you pasted a
+repository's worth of code, pressed the button, and found out afterwards. That is survivable
+while an input is one file and one call. It stops being survivable the moment a repository
+can be scanned, because the same button now means fifty to a hundred model calls.
+
+This is the review-side equivalent, and it deliberately reuses modernization's arithmetic
+rather than restating it — `estimate.band()` and, underneath it,
+`agent_guard.estimate_cost`, so **a quote and an invoice come from one price table.** A
+duplicated price table is precisely how the two start disagreeing.
+
+Three things it does differently from the conversion estimate, each because it can:
+
+**It counts the real chunks.** `code_chunker.estimate_chunks` divides, and documents that
+it errs toward under-counting. That is the right trade inside a budget reservation, where
+being one chunk out only changes when a marginal caller gets a 402. It is the wrong trade in
+a quote, where landing *below* actual is the one direction that matters. So this module runs
+the actual split. It is free — chunking is pure string work, no model involved.
+
+**It measures the prompt frame instead of guessing it.** The system prompt and the tool
+schema are constants in this process; their token cost is a fact, not the "roughly measured
+3,000" the conversion estimate has to assume.
+
+**It calibrates the expected output from history.** `database.get_output_calibration` reads
+the median output tokens per call this product has actually produced. Below five recorded
+calls it returns nothing and we fall back to the default below — which is labelled as
+judgement, in the same terms modernization labels its own.
+
+`ceiling_usd` remains a *bound*, not a forecast: a provider cannot emit more than
+`max_tokens`, so the ceiling is arithmetic. Quote both. A single number over an LLM run is a
+fiction; a range with a real ceiling is something a finance team can approve against.
+"""
+import json
+import logging
+from typing import Any, Dict, List, Optional
+
+from backend import config
+from backend.services import agent_guard, code_chunker
+from backend.services.modernization import estimate as mod_estimate
+
+logger = logging.getLogger(__name__)
+
+# Output budget each agent asks for, per call. Mirrors the `max_tokens=` at each agent's
+# `call_tool` site; kept here as one table so the quote cannot drift from what is actually
+# requested. A mismatch here understates the ceiling, which is the direction that hurts.
+MAX_OUTPUT_TOKENS = {
+    "code": 16000,
+    "vapt": 16000,
+    "security": 8000,
+    "auto-fix": 16000,
+    "github-pr-review": 16000,
+}
+DEFAULT_MAX_OUTPUT_TOKENS = 8000
+
+# Expected output per call when there is no history to calibrate against. A chunk sized for
+# ten to fifteen findings, at roughly 250 tokens of prose each, plus a summary and
+# recommendations. **Judgement, not measurement** — and it stops being used for a product
+# the moment that product has five recorded calls.
+FALLBACK_OUTPUT_TOKENS_PER_CALL = 3_000
+
+# Findings-per-chunk is what actually drives output length, and it is the number a reader
+# will ask about. Recorded here so the quote can explain itself rather than only assert.
+ASSUMED_FINDINGS_PER_CHUNK = 10
+
+
+def _frame_tokens(agent: str) -> int:
+    """Tokens spent per call on things that are not the customer's code.
+
+    Imported lazily: this module is loaded by routes at import time, and the agent modules
+    pull in `llm_gateway` and therefore the provider SDKs. A quote must not be the thing
+    that makes a route fail to import.
+    """
+    try:
+        if agent == "vapt":
+            from backend.agents.base_agent import VAPT_TOOL_SCHEMA as schema
+            from backend.agents.security_intelligence.vapt_agent import VAPT_SYSTEM_PROMPT as prompt
+        elif agent == "security":
+            from backend.agents.base_agent import SECURITY_REVIEW_TOOL_SCHEMA as schema
+            from backend.agents.security_intelligence.security_review_agent import (
+                SECURITY_REVIEW_SYSTEM_PROMPT as prompt,
+            )
+        else:
+            from backend.agents.base_agent import CODE_REVIEW_TOOL_SCHEMA as schema
+            from backend.agents.developer_intelligence.code_reviewer import SYSTEM_PROMPT as prompt
+    except Exception:
+        logger.exception("Could not measure the prompt frame for %s — using a default", agent)
+        return 3_000
+    return (
+        code_chunker.estimate_tokens(prompt)
+        + code_chunker.estimate_tokens(json.dumps(schema))
+        # The chunk manifest, the language hint, and the caller's context line.
+        + 400
+    )
+
+
+def _expected_output(agent: str) -> Dict[str, Any]:
+    """Expected output tokens per call, and where the number came from."""
+    try:
+        from backend import database
+        calibration = database.get_output_calibration(agent)
+    except Exception:
+        logger.exception("Output calibration lookup failed for %s — using the default", agent)
+        calibration = None
+
+    if calibration:
+        return {
+            "tokens": calibration["median_output_tokens_per_call"],
+            "basis": "measured",
+            "sample_size": calibration["sample_size"],
+        }
+    return {
+        "tokens": FALLBACK_OUTPUT_TOKENS_PER_CALL,
+        "basis": "default",
+        "sample_size": 0,
+    }
+
+
+def for_chunks(
+    chunk_bodies: List[str],
+    agent: str = "code",
+    model: str = "",
+    extra_calls: int = 0,
+) -> Dict[str, Any]:
+    """Price a review whose split is already known.
+
+    `extra_calls` covers the stages a workflow adds around the review itself — the Prompt
+    Safety pass on a PR, the Sensitive Data scan in a governance check — so a composite
+    product does not quote only its largest part.
+    """
+    max_out = MAX_OUTPUT_TOKENS.get(agent, DEFAULT_MAX_OUTPUT_TOKENS)
+    frame = _frame_tokens(agent)
+    expected = _expected_output(agent)
+
+    input_tokens = sum(code_chunker.estimate_tokens(b) for b in chunk_bodies) + frame * len(chunk_bodies)
+    calls = len(chunk_bodies) + extra_calls
+    expected_output = expected["tokens"] * calls
+    # Uncached input for the extra calls too — they carry their own frame.
+    if extra_calls:
+        input_tokens += frame * extra_calls
+
+    numbers = mod_estimate.band(input_tokens, expected_output, max_out * calls, model)
+    return {
+        "calls": calls,
+        "chunks": len(chunk_bodies),
+        "est_input_tokens": input_tokens,
+        "est_output_tokens": expected_output,
+        "max_output_tokens_per_call": max_out,
+        "expected_usd": numbers["expected_usd"],
+        "ceiling_usd": numbers["ceiling_usd"],
+        "model": numbers["model"],
+        "price_is_estimated": numbers["estimated"],
+        "output_basis": expected["basis"],
+        "output_sample_size": expected["sample_size"],
+        "prompt_frame_tokens": frame,
+    }
+
+
+def for_bundle(bundle, agent: str = "code", model: str = "", extra_calls: int = 0) -> Dict[str, Any]:
+    """Price a review of a `source_bundle.Bundle`. The real split, not a division.
+
+    A `Bundle` is either a diff/paste (one artifact, split by `chunk_artifact`) or a file
+    list (split by `chunk_files`), and the two produce different chunk counts for the same
+    byte count — so which one is used has to match what the agent will actually do.
+    """
+    if bundle.is_diff or (len(bundle.files) == 1 and not bundle.files[0].get("path")):
+        chunks = code_chunker.chunk_artifact(bundle.files[0].get("content") or "")
+    else:
+        chunks = code_chunker.chunk_files(bundle.files)
+
+    quote = for_chunks([c.body for c in chunks], agent=agent, model=model, extra_calls=extra_calls)
+    quote["files"] = len(bundle.files)
+    quote["source_type"] = bundle.source_type
+    quote["source_label"] = bundle.label
+    quote["files_skipped"] = len(bundle.skipped)
+    quote["truncated"] = bundle.truncated
+    return quote
+
+
+def for_text(text: str, agent: str = "code", model: str = "", extra_calls: int = 0) -> Dict[str, Any]:
+    """Price a review of one artifact string, for callers that have no Bundle."""
+    chunks = code_chunker.chunk_artifact(text or "")
+    quote = for_chunks([c.body for c in chunks], agent=agent, model=model, extra_calls=extra_calls)
+    quote["files"] = 1
+    return quote
+
+
+def describe(quote: Dict[str, Any], cap_usd: Optional[float] = None) -> str:
+    """The sentence a person reads before approving.
+
+    Written to be read by someone who has not seen this codebase: what will happen, what it
+    will cost, what the worst case is, and — when the number is not a measurement — that it
+    is not.
+    """
+    parts = []
+    if quote.get("files", 0) > 1:
+        parts.append(
+            f"{quote['files']:,} file(s) will be reviewed in {quote['chunks']} piece(s), "
+            f"{quote['calls']} model call(s) in total."
+        )
+    else:
+        parts.append(
+            f"{quote['chunks']} piece(s), {quote['calls']} model call(s)."
+        )
+    parts.append(
+        f"Estimated ${quote['expected_usd']:.2f}, hard ceiling ${quote['ceiling_usd']:.2f}."
+    )
+    if quote.get("output_basis") == "measured":
+        parts.append(
+            f"The estimate uses the median response size from this agent's last "
+            f"{quote['output_sample_size']} call(s)."
+        )
+    else:
+        parts.append(
+            "The estimate assumes a typical response size; this agent has no recorded "
+            "history yet, so treat it as indicative."
+        )
+    if quote.get("price_is_estimated"):
+        parts.append(
+            "Priced with default rates because the selected model is not in the price "
+            "table — indicative only."
+        )
+    if quote.get("files_skipped"):
+        parts.append(
+            f"{quote['files_skipped']:,} file(s) were filtered out and will not be reviewed."
+        )
+    if quote.get("truncated"):
+        parts.append(
+            "This source is larger than one scan covers, so part of it will not be reviewed "
+            "and the result cannot report a clean gate over the whole thing."
+        )
+    if cap_usd is not None:
+        if cap_usd < quote["expected_usd"]:
+            parts.append(
+                f"Your ${cap_usd:.2f} cap is below the estimate, so the review will stop "
+                f"partway through and report what it covered."
+            )
+        else:
+            parts.append(f"Your ${cap_usd:.2f} cap stops the review before it exceeds that.")
+    return " ".join(parts)
+
+
+def budget_headroom(subject) -> Optional[Dict[str, Any]]:
+    """What this caller has left to spend, so the quote can be read against it.
+
+    A price with no budget beside it still leaves the reader doing arithmetic. Returns None
+    when the caller is unrestricted, which is the default for a project on no plan — and
+    saying nothing is better than showing an unlimited budget as a number.
+    """
+    try:
+        return agent_guard.remaining_budget(subject)
+    except Exception:
+        logger.exception("Budget headroom lookup failed — omitting it from the quote")
+        return None

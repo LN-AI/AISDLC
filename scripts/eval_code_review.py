@@ -42,12 +42,34 @@ RESULTS = os.path.join(CORPUS, "results")
 
 # Bump when the system prompt or the tool schema changes, so a result file can be tied to
 # what produced it. Without this, comparing two runs is guesswork.
-PROMPT_VERSION = "2026-08-07.1"
+# 2026-09-02.1: SEC-008..012 added to the control mapping (injection had no id at
+# all), framework defaults made concrete per framework, and stretching a control id
+# called out explicitly. Bumped so the two result files can be compared rather than
+# remembered.
+PROMPT_VERSION = "2026-09-03.1"
 
 # A recall floor the corpus must keep clearing. Set from a measured baseline, not from
 # ambition — a floor nobody can meet gets deleted, and then nothing is enforced.
-MIN_RECALL = 0.70
-MAX_FALSE_POSITIVE_RATE = 0.30
+# **Measured, not judged** — from `results/measured-baseline.json`, PROMPT_VERSION
+# 2026-09-02.1, the first honest run of this corpus (2026-09-02): recall 100% over 6
+# must-find specs, 12.5% of 8 traps tripped, gate 100% over 10 cases, 0 hallucinated.
+#
+# The floors sit one step below each measurement rather than at it, because **variance is
+# still unmeasured**: this is n=1 at this prompt version, and finding counts visibly moved
+# between runs (the same SQL-injection case returned 3, then 2, then 1 finding). A floor set
+# at the measurement would fail on noise, and a suite that cries wolf gets deleted.
+#
+# Each step is one whole spec, so the floors mean something concrete:
+#   recall 0.83  -> tolerates losing 1 of 6 real findings, fails on 2
+#   fp     0.25  -> tolerates 2 of 8 traps, fails on 3
+#   gate   0.90  -> tolerates 1 wrong gate of 10, fails on 2
+# Run `--repeat 3` (about $0.50) to measure variance, then tighten toward the measurement.
+MIN_RECALL = 0.83
+MAX_FALSE_POSITIVE_RATE = 0.25
+# The gate is what blocks a release, so it gets a threshold of its own. It had none, which
+# meant a run could regress from a correct verdict to a wrong one and still report "within
+# thresholds".
+MIN_GATE_ACCURACY = 0.90
 
 
 def load_cases(only=None):
@@ -74,18 +96,32 @@ def load_cases(only=None):
     return cases
 
 
-def matches(finding, spec):
+def matches(finding, spec, *, claim_only=False):
     """Did this finding satisfy a must_find/must_not_find spec?
 
     Control ID is the primary key. The line range is checked with slack, because a finding
     that points one line off is still a finding a human would act on — being stricter than
     that measures formatting, not detection.
+
+    `claim_only` restricts the text search to the **title**, and traps pass it. The two
+    directions genuinely want different strictness:
+
+    - For **recall** (`must_find`), searching title *and* description is right: the concept
+      can legitimately be named anywhere in the finding.
+    - For a **trap** (`must_not_find`), what matters is what the finding *claims*, and the
+      claim is the title. Searching the description made a trap fire on a finding that merely
+      *mentioned* the word while ruling the problem out. Measured on 2026-09-02: the
+      `missing-auth` case reported "No Authentication on Destructive DELETE Endpoint" —
+      exactly the finding its own `must_find` asks for — and tripped a trap watching for
+      "injection", because the description noted that the query was correctly parameterized.
+      That inflated the false-positive rate with a finding that was not merely acceptable but
+      required.
     """
     if spec.get("control_id") and finding.get("control_id") != spec["control_id"]:
         return False
-    if spec.get("match") and spec["match"].lower() not in (
-        f"{finding.get('title', '')} {finding.get('description', '')}".lower()
-    ):
+    haystack = (finding.get("title", "") if claim_only
+                else f"{finding.get('title', '')} {finding.get('description', '')}")
+    if spec.get("match") and spec["match"].lower() not in haystack.lower():
         return False
     rng = spec.get("line_range")
     line = finding.get("line_start")
@@ -115,7 +151,8 @@ def run_case(agent, case):
 
     found = [s for s in expected.get("must_find", []) if any(matches(f, s) for f in findings)]
     missed = [s for s in expected.get("must_find", []) if s not in found]
-    tripped = [s for s in expected.get("must_not_find", []) if any(matches(f, s) for f in findings)]
+    tripped = [s for s in expected.get("must_not_find", [])
+               if any(matches(f, s, claim_only=True) for f in findings)]
 
     gate_ok = result.get("gate_status") in (expected.get("expected_gate") or [])
     discarded = result.get("discarded_findings", [])
@@ -136,6 +173,22 @@ def run_case(agent, case):
         "findings_unverified": sum(1 for f in findings if not f.get("evidence_verified")),
         "discarded_hallucinated": len(discarded),
         "fingerprints": sorted(f.get("fingerprint", "") for f in findings),
+        # The findings themselves, trimmed. Without these a failed case says only "recall
+        # 0/1" and the only way to learn *why* is to pay for another run — which is what
+        # happened on the first real run of this script, where a miss turned out to be the
+        # corpus expecting a control id that did not exist rather than a detection failure.
+        # Four fields are enough to tell a wrong id from a wrong line from a real miss.
+        "findings": [
+            {
+                "control_id": f.get("control_id"),
+                "title": f.get("title"),
+                "line_start": f.get("line_start"),
+                "description": (f.get("description") or "")[:240],
+                "severity": f.get("severity"),
+                "evidence_verified": f.get("evidence_verified"),
+            }
+            for f in findings
+        ],
         "usage": usage,
         "seconds": round(elapsed, 1),
     }
@@ -148,6 +201,21 @@ def jaccard(a, b):
     return len(sa & sb) / len(sa | sb)
 
 
+
+def _priced(tokens_in: int, tokens_out: int) -> float:
+    """What this run cost, from the same price table the platform bills on.
+
+    Was reported as `None`, which made the one number a reader wants after paying for a run
+    the one number it did not have. Prompt-cache reads are deliberately not subtracted: they
+    make the real figure *lower*, and a quote that lands above actual is the right direction.
+    """
+    try:
+        from backend.services.agent_guard import estimate_cost
+        return estimate_cost(tokens_in, tokens_out)["cost_usd"]
+    except Exception:
+        return 0.0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("cases", nargs="*", help="case names to run (default: all)")
@@ -155,8 +223,17 @@ def main():
     ap.add_argument("--label", default="", help="name for the results file")
     args = ap.parse_args()
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        print("ANTHROPIC_API_KEY is not set. This script calls the real model.")
+    # Importing `backend.config` is what loads `.env` — it calls `load_dotenv()` and is the
+    # project's single definition of environment loading. This check used to read
+    # `os.getenv` directly, *before* anything imported that module, so the key was invisible
+    # unless it happened to be exported in the shell. Since every other entry point in this
+    # repo is configured through `.env`, the script could never run as documented — which is
+    # the most likely reason C-18 records that it never has been.
+    from backend import config as _config
+
+    if not (_config.ANTHROPIC_API_KEY or os.getenv("ANTHROPIC_API_KEY")):
+        print("ANTHROPIC_API_KEY is not set (checked .env and the environment). "
+              "This script calls the real model.")
         return 1
 
     from backend.agents.developer_intelligence.code_reviewer import CodeReviewAgent
@@ -207,8 +284,11 @@ def main():
     tokens_in = sum(r["usage"].get("input_tokens", 0) for r in ok)
     tokens_out = sum(r["usage"].get("output_tokens", 0) for r in ok)
     cache_read = sum(r["usage"].get("cache_read_tokens", 0) for r in ok)
-    cost = cost_optimization_service.estimate_cost_usd(tokens_in, tokens_out) \
-        if hasattr(cost_optimization_service, "estimate_cost_usd") else None
+    # `cost_optimization_service.estimate_cost_usd` does not exist, so this always
+    # resolved to None and a run that had just spent real money reported no cost at all.
+    # Priced from `agent_guard.estimate_cost` -- the same table the platform bills on, so
+    # the eval and the invoice cannot disagree.
+    cost = _priced(tokens_in, tokens_out)
 
     determinism = None
     if args.repeat > 1:
@@ -237,11 +317,12 @@ def main():
     print("\n" + "-" * 60)
     print(f"recall               {recall:.1%}   (floor {MIN_RECALL:.0%})")
     print(f"false-positive rate  {fp_rate:.1%}   (ceiling {MAX_FALSE_POSITIVE_RATE:.0%})")
-    print(f"gate accuracy        {gate_acc:.1%}")
+    print(f"gate accuracy        {gate_acc:.1%}   (floor {MIN_GATE_ACCURACY:.0%})")
     print(f"hallucinated (discarded by evidence check)  {summary['hallucinated_findings_discarded']}")
     if determinism is not None:
         print(f"determinism          {determinism:.1%} finding overlap across runs")
     print(f"tokens               in={tokens_in:,} out={tokens_out:,} cache_read={cache_read:,}")
+    print(f"cost                 ${cost:.4f}")
 
     os.makedirs(RESULTS, exist_ok=True)
     label = args.label or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -255,6 +336,8 @@ def main():
         failed.append(f"recall {recall:.1%} is below the {MIN_RECALL:.0%} floor")
     if fp_rate > MAX_FALSE_POSITIVE_RATE:
         failed.append(f"false-positive rate {fp_rate:.1%} is above the {MAX_FALSE_POSITIVE_RATE:.0%} ceiling")
+    if gate_acc < MIN_GATE_ACCURACY:
+        failed.append(f"gate accuracy {gate_acc:.1%} is below the {MIN_GATE_ACCURACY:.0%} floor")
     if failed:
         print("\nFAILED: " + "; ".join(failed))
         return 1

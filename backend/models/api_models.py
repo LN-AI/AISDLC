@@ -50,6 +50,65 @@ class _SourceBase(LLMOverrideFields):
     )
 
 
+class SourceFileInput(BaseModel):
+    """One file in an explicit `files[]` list."""
+    path: str = Field(..., description="Repo-relative path, e.g. `src/api/auth.py`",
+                      examples=["src/api/auth.py"])
+    content: str = Field(..., description="The file's full text content")
+
+
+class _CodeSourceBase(_SourceBase):
+    """The source fields every code-reading agent accepts.
+
+    Shared so Code Review, VAPT and Security Review take the same inputs. Previously each
+    declared its own subset: Code Review had no repository field at all, VAPT's
+    `github_repo_url` was documented as a "full-repo assessment" and read only the README,
+    and none of the three could take a zip or a file list (C-74).
+    """
+    files: Optional[List[SourceFileInput]] = Field(
+        None,
+        description="Explicit file list. Highest-precedence source — use it to review an "
+                    "exact set of files without an archive or a repository.",
+    )
+    github_pr_url: Optional[str] = Field(
+        None,
+        description="GitHub Pull Request URL — fetches the PR diff automatically",
+        examples=["https://github.com/owner/repo/pull/88"],
+    )
+    github_repo_url: Optional[str] = Field(
+        None,
+        description="GitHub repository URL. Downloads the repository at `ref` and reviews "
+                    "its **source code**. Combine with `base_ref`+`head_ref` to review a "
+                    "branch comparison instead of the whole tree.",
+        examples=["https://github.com/acme/patient-portal"],
+    )
+    ref: Optional[str] = Field(
+        None, description="Branch, tag or commit to read when `github_repo_url` is used. "
+                          "Defaults to the repository's default branch.",
+        examples=["main", "release/3.2", "a1b2c3d"],
+    )
+    base_ref: Optional[str] = Field(
+        None, description="With `head_ref` and `github_repo_url`, reviews `base...head` as "
+                          "a diff — the gate's answer before a PR is raised.",
+        examples=["main"],
+    )
+    head_ref: Optional[str] = Field(
+        None, description="The branch being proposed. See `base_ref`.",
+        examples=["feature/new-auth"],
+    )
+    github_file_url: Optional[str] = Field(
+        None,
+        description="GitHub file blob URL — reviews one file",
+        examples=["https://github.com/owner/repo/blob/main/src/api/auth.py"],
+    )
+    github_token: Optional[str] = Field(
+        None,
+        description="A GitHub token for this call only — never stored. Overrides this "
+                    "project's saved credential and the deployment default. Use it for a "
+                    "one-off; store a credential under Settings for anything repeated.",
+    )
+
+
 # ── Per-agent request models ──────────────────────────────────────────────
 
 class RequirementReviewRequest(_SourceBase):
@@ -71,20 +130,10 @@ class RequirementReviewRequest(_SourceBase):
     )
 
 
-class CodeReviewRequest(_SourceBase):
-    """Security and quality review of code, diffs, or pull requests."""
+class CodeReviewRequest(_CodeSourceBase):
+    """Security and quality review of code, diffs, pull requests, or a whole repository."""
     code: Optional[str] = Field(
         None, description="Source code, git diff, or file content to review"
-    )
-    github_pr_url: Optional[str] = Field(
-        None,
-        description="GitHub Pull Request URL — fetches the PR diff automatically",
-        examples=["https://github.com/owner/repo/pull/88"]
-    )
-    github_file_url: Optional[str] = Field(
-        None,
-        description="GitHub file blob URL",
-        examples=["https://github.com/owner/repo/blob/main/src/api/auth.py"]
     )
     language: Optional[str] = Field(
         None,
@@ -130,23 +179,11 @@ class ComplianceRequest(_SourceBase):
     )
 
 
-class VAPTRequest(_SourceBase):
+class VAPTRequest(_CodeSourceBase):
     """Full vulnerability assessment with CVSS scoring and OWASP mapping."""
     code: Optional[str] = Field(
-        None, description="Code, config, or infrastructure-as-code to assess"
-    )
-    github_pr_url: Optional[str] = Field(
-        None,
-        description="GitHub PR URL",
-        examples=["https://github.com/owner/repo/pull/92"]
-    )
-    github_file_url: Optional[str] = Field(
-        None, description="GitHub file URL"
-    )
-    github_repo_url: Optional[str] = Field(
-        None,
-        description="GitHub repository URL for full-repo assessment",
-        examples=["https://github.com/owner/repo"]
+        None, description="Code, config, infrastructure-as-code, an OpenAPI document, an "
+                          "architecture description, or a list of endpoints to assess"
     )
     scope: Optional[str] = Field(
         None,
