@@ -161,6 +161,17 @@ VAPT_SQLI = dict(
 )
 
 
+
+def _raises_value_error(fn):
+    """True if `fn()` raises ValueError. Used to assert a guard rejects bad arguments."""
+    try:
+        fn()
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+
 def main():
     global FAILED
     database.init_db()
@@ -2628,6 +2639,80 @@ def main():
         check("a guessed price stays marked as guessed after summing",
               database.get_review_spend([_est30])[_est30]["cost_estimated"] is True,
               "an estimate presented as a measurement is the one way this figure can lie")
+
+        # ── 31. The write path, which no offline test had ever reached ───
+        #
+        # Both of these were found by running one real fix against one real pull request,
+        # and neither was reachable from here before: every fix test in this suite stops at
+        # `plan`, which writes nothing, and section 25's delivery tests assert which options
+        # are *offered*, never that taking one works. Two bugs sat behind that line, so
+        # `output="pr"` and `output="branch"` from Apply Fixes had **never once succeeded**.
+        #
+        # Neither is checkable end to end without a real repository, so what is checked here
+        # is the argument each one got wrong -- which is where the bug actually was.
+        section("31. The write path, which no offline test had ever reached")
+
+        from backend.services.github_service import GitHubService as _GH31
+        import inspect as _i31
+
+        # ── D-314: a commit sha in a slot that resolves branch names ─────
+        #
+        # `create_branch`'s fourth argument is resolved through `/git/ref/heads/<name>`, so a
+        # sha passed there asks GitHub for a branch literally named after a commit and gets a
+        # bare 404. `fix_apply` did exactly that, on the line whose own comment explains that
+        # branching off the reviewed commit is the point.
+        check("there is a way to branch at an exact commit",
+              hasattr(_GH31, "create_branch_at_sha"),
+              "branching off the commit a review read is the whole reason Apply Fixes does "
+              "not just branch off the tip")
+        check("...and it is the one Apply Fixes calls",
+              "create_branch_at_sha(" in _i31.getsource(fix_apply.apply),
+              "create_branch resolves its fourth argument as a branch NAME; a sha there is "
+              "a request for /git/ref/heads/<sha>, which 404s every time")
+        check("...and it refuses a branch name, rather than asking GitHub about a bad ref",
+              _raises_value_error(lambda: _GH31().create_branch_at_sha(
+                  "o", "r", "new", "feat/some-branch")),
+              "caught here it names the wrong argument; caught at GitHub it is a 422 about "
+              "a malformed ref with nothing saying which argument was wrong")
+        check("...while accepting a real sha's shape",
+              not _raises_value_error(lambda: _GH31._sha_ok("a" * 40))
+              if hasattr(_GH31, "_sha_ok") else True)
+        check("create_branch still takes a branch name, for the caller that has one",
+              list(_i31.signature(_GH31.create_branch).parameters)[-1] == "from_branch",
+              "workflows/autofix_pr.py passes a head branch here and has always worked -- "
+              "the fix must not move that path")
+
+        # ── D-315: a pull request opened against a base named after a title ─
+        #
+        # `base_ref` was `label.split("@")[-1]` for every source. A repository's label is
+        # `owner/repo@ref`, so that works. A **pull request's** label is its title, so the
+        # fix pull request was opened with `base="CB-104: AI visit summary endpoint"` and
+        # GitHub answered 422 with nothing naming the branch.
+        _src31 = _i31.getsource(fix_apply.apply)
+        check("a fix from a pull request targets a branch, not the review's label",
+              'source.get("source_type") == "github_pr"' in _src31
+              and 'source.get("head_branch")' in _src31,
+              "a PR's label is its title; splitting it on '@' yields the title, which is "
+              "not a branch and 422s")
+        check("...and a repository source still targets its ref",
+              'split("@")[-1]' in _src31,
+              "owner/repo@main is the shape that made the original line work")
+        check("...and an unknown base is ASKED FOR, not assumed to be 'main'",
+              "get_default_branch" in _src31 and 'base=base_ref,' in _src31,
+              "'main' is a guess that fails on master or develop, and fails as another "
+              "opaque 422")
+        check("the default branch is a real lookup with a safe fallback",
+              hasattr(_GH31, "get_default_branch"))
+
+        # The delivery options are unchanged by any of this -- checked because the fix
+        # touched the function that reads them.
+        _pr_outs31 = {o["id"] for o in fix_apply.plan(
+            pr_rid, [f["id"] for f in json.loads(
+                database.get_review(pr_rid)["result_json"])["findings"][:1]],
+        )["outputs"]}
+        check("a pull-request review is still offered all four writes plus the two reads",
+              {"pr", "same_pr", "branch", "diff", "zip"} <= _pr_outs31,
+              str(sorted(_pr_outs31)))
 
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")

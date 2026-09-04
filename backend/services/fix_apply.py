@@ -520,7 +520,22 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     # From here on the repository is written to, and none of it can be rolled back by
     # returning an error — so it is last, after both guards have passed on every patch.
     repo_url = source.get("ref") or ""
-    base_ref = (source.get("label") or "").split("@")[-1] or ""
+    # Which branch a fix pull request should target.
+    #
+    # This was `label.split("@")[-1]` for every source. That is right for a repository,
+    # whose label is `owner/repo@ref` — and badly wrong for a pull request, whose label is
+    # the PR **title**: it asked GitHub to open a pull request against a base branch called
+    # "CB-104: AI visit summary endpoint" and got a bare 422 (D-315). For a pull request the
+    # answer is the branch the review read, which is what `_available_outputs` already
+    # promises: "a pull request against the branch it came from".
+    if source.get("source_type") == "github_pr":
+        base_ref = source.get("head_branch") or ""
+    else:
+        base_ref = (source.get("label") or "").split("@")[-1] or ""
+    if not base_ref:
+        # Asked, not assumed. "main" is a guess that fails on every repository still using
+        # master, or develop, and fails as another opaque 422 rather than as a sentence.
+        base_ref = gh.get_default_branch(owner, repo)
     owner_repo = repo_url.rstrip("/").split("github.com/")[-1].strip("/")
     owner, _, repo = owner_repo.partition("/")
     repo = repo.split("/")[0]
@@ -543,7 +558,12 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
         # since become: a patch computed against last week's file, committed on top of this
         # week's, is how a fix silently reverts somebody else's change.
         branch = f"lm-fix/review-{review_id[:8]}"
-        gh.create_branch(owner, repo, branch, source["commit_sha"])
+        # `create_branch_at_sha`, not `create_branch`: the latter's fourth argument is a
+        # branch *name* which it resolves through `/git/ref/heads/<name>`, so passing a
+        # commit asked GitHub for a branch named after a sha and 404'd every time. This
+        # delivery had therefore never once succeeded, and no offline test could see it --
+        # they stop at `plan`, which writes nothing (D-314).
+        gh.create_branch_at_sha(owner, repo, branch, source["commit_sha"])
     committed = []
     message = result["commit_message"] or f"fix: remediate findings from review {review_id[:8]}"
     for p in safe:
@@ -578,7 +598,7 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     pr = gh.create_pull_request(
         owner, repo,
         title=result["pr_title"] or f"Fix {len(safe)} review finding(s)",
-        body=body, head=branch, base=base_ref or "main",
+        body=body, head=branch, base=base_ref,
     )
     result["pr_url"] = pr.get("url", "")
     result["pr_number"] = pr.get("number")
