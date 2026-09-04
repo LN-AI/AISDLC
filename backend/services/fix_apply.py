@@ -100,6 +100,20 @@ def eligible(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _review_agent(review: Dict[str, Any]) -> str:
+    """Which reviewer produced this review, as `review_estimate` and `_verify_patch` name it.
+
+    A VAPT assessment and a code review are fixed by the same fixer but are **not** re-checked
+    by the same reviewer, and are not priced against the same prompt. Kept as one mapping so
+    the quote and the guardrail cannot disagree about which agent a review belongs to — if
+    they did, the run would be checked by one agent and billed as another.
+
+    Anything unrecognised falls back to the code reviewer, which is what every non-VAPT
+    review used before this existed.
+    """
+    return "vapt" if (review or {}).get("review_type") == "vapt" else "code"
+
+
 def _load(review_id: str, project_id: Optional[str]) -> Dict[str, Any]:
     from backend import database
 
@@ -170,10 +184,20 @@ def plan(review_id: str, finding_ids: Optional[List[str]] = None,
     # not free, so it is quoted rather than discovered on the invoice. Priced off a body per
     # file, which is what `for_chunks` reads -- a fix call carries the whole file, so the
     # file's own size is the right proxy and a character count would be guessed twice.
+    #
+    # The two halves go to different agents and are therefore priced separately. One
+    # `for_chunks(agent="code", extra_calls=n)` call was wrong twice over: it charged the
+    # fixer's call against the *reviewer's* prompt frame and the reviewer's 16k output
+    # ceiling (a fix returns a whole rewritten file and asks for 32k), and it counted each
+    # file's content **once** for two calls that each carry it in full. Both errors ran in
+    # the same direction -- under-quoting -- which is the direction that loses trust.
     bodies = ["x" * r["chars"] for r in ready]
     calls = len(ready) * 2
-    quote = review_estimate.for_chunks(
-        bodies, agent="code", extra_calls=len(ready)) if bodies else {}
+    recheck_agent = _review_agent(loaded["review"])
+    quote = review_estimate.combine(
+        review_estimate.for_chunks(bodies, agent="auto-fix"),
+        review_estimate.for_chunks(bodies, agent=recheck_agent),
+    ) if bodies else {}
 
     return {
         "review_id": review_id,
@@ -190,7 +214,10 @@ def plan(review_id: str, finding_ids: Optional[List[str]] = None,
         "note": (
             f"{len(chosen)} finding(s) across {len(ready)} file(s). Cost is per file, not per "
             f"finding — every finding in one file is fixed in a single call, and each patch is "
-            f"then re-reviewed before it is offered, which is the second call per file."
+            f"then re-reviewed before it is offered, which is the second call per file. Both "
+            f"calls carry the whole file, and the re-review is done by the "
+            f"{'vulnerability assessor' if recheck_agent == 'vapt' else 'code reviewer'} that "
+            f"found the problem, so the two halves are priced separately."
         ),
         "caveat": (
             "Nothing here compiles or runs your code. A patch that passes the checks below is "
@@ -249,15 +276,29 @@ def _available_outputs(source: Dict[str, Any]) -> List[Dict[str, str]]:
     return out
 
 
-def _guard_patches(orch, patches: List[Dict[str, Any]], context: str) -> Dict[str, Any]:
+def _guard_patches(orch, patches: List[Dict[str, Any]], context: str,
+                   review_agent: str = "code",
+                   prior_findings: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """The two checks every patch must pass, in one place.
 
     Lifted out of `workflows/autofix_pr.py` unchanged rather than reimplemented: it is the
     only thing standing between a model's rewrite and a customer's repository, and two copies
     of it would mean the weaker one guards whichever path someone happens to use.
+
+    `review_agent` and `prior_findings` are passed straight through to `_verify_patch`. The
+    fingerprints are grouped **per file** rather than pooled: a Critical carried over in
+    `a.py` says nothing about whether the same-looking Critical in `b.py` was already there,
+    and pooling them would let a genuinely new vulnerability in one file be excused by an
+    old one in another.
     """
     from backend.services import guardrail_service
     from backend.workflows.autofix_pr import _verify_patch
+
+    known: Dict[str, set] = {}
+    for f in prior_findings or []:
+        fp = f.get("fingerprint")
+        if fp:
+            known.setdefault((f.get("file_path") or "").lstrip("./"), set()).add(fp)
 
     safe, blocked = [], []
     for p in patches:
@@ -268,10 +309,12 @@ def _guard_patches(orch, patches: List[Dict[str, Any]], context: str) -> Dict[st
                 "Blocked: the patch appears to introduce a hardcoded secret. Fixing one "
                 "problem by creating a worse one is not a fix.")})
             continue
-        verdict = _verify_patch(orch, p, context)
+        verdict = _verify_patch(orch, p, context, review_agent=review_agent,
+                                known_fingerprints=known.get((p.get("path") or "").lstrip("./")))
         if verdict.get("blocked"):
             blocked.append({"path": p["path"], "reason": verdict["reason"],
-                            "introduced": verdict.get("introduced", [])})
+                            "introduced": verdict.get("introduced", []),
+                            "reviewed_by": verdict.get("reviewed_by", review_agent)})
             continue
         p["post_fix_review"] = verdict
         safe.append(p)
@@ -353,6 +396,10 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     if output not in OUTPUTS:
         raise FixError(f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}.")
 
+    loaded = _load(review_id, project_id)
+    review_agent = _review_agent(loaded["review"])
+    prior_findings = loaded["result"].get("findings") or []
+
     sized = plan(review_id, finding_ids, project_id)
     if sized["over_file_limit"]:
         raise FixError(
@@ -415,7 +462,8 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
         on_progress(len(files_payload), len(files_payload) * 2,
                     "Re-reviewing each patch before offering it")
 
-    guarded = _guard_patches(orch, patches, context)
+    guarded = _guard_patches(orch, patches, context, review_agent=review_agent,
+                             prior_findings=prior_findings)
     safe, blocked = guarded["safe"], guarded["blocked"]
     if not safe:
         return {
@@ -443,10 +491,20 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
         "pr_title": fix.get("pr_title") or "",
         "pr_description": fix.get("pr_description") or "",
         "verified": False,
+        "reviewed_by": review_agent,
         "verification_note": (
-            "Each patch passed a secret scan and was re-reviewed by the same reviewer that "
-            "found the original problem. Neither of those compiles or runs your code — no "
-            "build ran and no test ran. Read the diff before applying it."),
+            "Each patch passed a secret scan and was re-reviewed by the "
+            + ("vulnerability assessor" if review_agent == "vapt" else "code reviewer")
+            + " that found the original problem. Neither of those compiles or runs your "
+              "code — no build ran and no test ran. Read the diff before applying it."
+            + (" A security fix that closes the vulnerability and breaks the code looks "
+               "exactly like a good one to everything in this pipeline."
+               if review_agent == "vapt" else "")),
+        # Criticals the re-review still found and that the original review had already
+        # reported. They did not block the patch and they are still in the file.
+        "carried_over_criticals": sorted({
+            t for p in safe for t in (p.get("post_fix_review") or {}).get("carried_over", [])
+        }),
     }
 
     if output == "diff":
@@ -462,7 +520,22 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     # From here on the repository is written to, and none of it can be rolled back by
     # returning an error — so it is last, after both guards have passed on every patch.
     repo_url = source.get("ref") or ""
-    base_ref = (source.get("label") or "").split("@")[-1] or ""
+    # Which branch a fix pull request should target.
+    #
+    # This was `label.split("@")[-1]` for every source. That is right for a repository,
+    # whose label is `owner/repo@ref` — and badly wrong for a pull request, whose label is
+    # the PR **title**: it asked GitHub to open a pull request against a base branch called
+    # "CB-104: AI visit summary endpoint" and got a bare 422 (D-315). For a pull request the
+    # answer is the branch the review read, which is what `_available_outputs` already
+    # promises: "a pull request against the branch it came from".
+    if source.get("source_type") == "github_pr":
+        base_ref = source.get("head_branch") or ""
+    else:
+        base_ref = (source.get("label") or "").split("@")[-1] or ""
+    if not base_ref:
+        # Asked, not assumed. "main" is a guess that fails on every repository still using
+        # master, or develop, and fails as another opaque 422 rather than as a sentence.
+        base_ref = gh.get_default_branch(owner, repo)
     owner_repo = repo_url.rstrip("/").split("github.com/")[-1].strip("/")
     owner, _, repo = owner_repo.partition("/")
     repo = repo.split("/")[0]
@@ -485,7 +558,12 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
         # since become: a patch computed against last week's file, committed on top of this
         # week's, is how a fix silently reverts somebody else's change.
         branch = f"lm-fix/review-{review_id[:8]}"
-        gh.create_branch(owner, repo, branch, source["commit_sha"])
+        # `create_branch_at_sha`, not `create_branch`: the latter's fourth argument is a
+        # branch *name* which it resolves through `/git/ref/heads/<name>`, so passing a
+        # commit asked GitHub for a branch named after a sha and 404'd every time. This
+        # delivery had therefore never once succeeded, and no offline test could see it --
+        # they stop at `plan`, which writes nothing (D-314).
+        gh.create_branch_at_sha(owner, repo, branch, source["commit_sha"])
     committed = []
     message = result["commit_message"] or f"fix: remediate findings from review {review_id[:8]}"
     for p in safe:
@@ -520,7 +598,7 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     pr = gh.create_pull_request(
         owner, repo,
         title=result["pr_title"] or f"Fix {len(safe)} review finding(s)",
-        body=body, head=branch, base=base_ref or "main",
+        body=body, head=branch, base=base_ref,
     )
     result["pr_url"] = pr.get("url", "")
     result["pr_number"] = pr.get("number")

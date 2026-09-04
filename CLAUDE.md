@@ -157,11 +157,30 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   see D-256), and keeps the source itself for a per-run retention window: 7 days by default,
   encrypted, and **never for a GitHub source**, which is re-read from the repository at the
   commit sha the review recorded. `fix_apply.py` is Apply Fixes — it starts from a review and
-  the findings a person ticked, reuses the per-file fixer and *both* of Auto-Fix's guardrails
-  unchanged, and delivers as a diff, a zip, a branch, or a branch and a pull request
-  depending on what the source was. Two things to hold onto before changing either: a fix
-  costs **per file, not per finding**, and nothing in the review pipeline ever compiles or
-  runs the code it produces.
+  the findings a person ticked, reuses the per-file fixer and *both* of Auto-Fix's guardrails,
+  and delivers as a diff, a zip, a branch, a new pull request, or a commit into the pull
+  request being reviewed, depending on what the source was.
+
+  **It works from a VAPT assessment as well as a code review, and nothing about it is
+  review-type specific** — `/api/reviews/{id}/fix` takes any review in scope. What differs
+  is who re-reads the patch: `fix_apply._review_agent` maps the review to its own reviewer,
+  and `_verify_patch(..., review_agent=)` sends a VAPT fix to the vulnerability assessor.
+  That one mapping also picks the price basis, so the quote and the guardrail cannot
+  disagree about which agent a review belongs to. Four things to hold onto before changing
+  any of it: a fix costs **per file, not per finding**; both calls per file carry the whole
+  file, so the quote sums **two half-quotes against two different agents**
+  (`review_estimate.combine`); the re-review blocks only on a Critical the *original review
+  did not report*, matched by fingerprint (D-303); and nothing in the review pipeline ever
+  compiles or runs the code it produces.
+
+  **That last point is not theoretical, and it has a specific shape.** A live fix closed six
+  real vulnerabilities and produced a file that would not import, because
+  `autofix_agent._fix_one_file` sends **one file per call and nothing else** — so the model
+  invents the helper it needs rather than using the one already in the project (D-316). Read
+  that row before changing the fixer's prompt. Relatedly, Apply Fixes' `pr` and `branch`
+  deliveries were broken from the day they shipped (D-314, D-315) and no offline test could
+  see it: every fix test stops at `plan`, which writes nothing. `verify_pr_review.py` covers
+  PR *review* writes and there is still no equivalent for fixes.
 - `backend/services/modernization/` — the one subsystem with its own schema and its own durable
   execution model: whole-codebase conversion runs (ingest → dependency graph → charter → claim-and-lease
   worker loop → Tier-0 validation). Its DDL lives in `store.py` and is called from `database.init_db()`.
@@ -184,6 +203,18 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   writes `usage_events` — derive a display cost any other way and the screen will disagree
   with the invoice. `renderReviewTransparency` is the one renderer that draws it, and every
   result renderer calls it.
+
+  **A third way, for a run that has already finished.** Neither of the above can reach a
+  *stored* run: the cost is not known until the model calls end, which is after
+  `save_review` has written the row. So it is not stored on the review at all — it is read
+  back out of the billing ledger by `database.get_review_spend`, which `GET /api/reviews`
+  and `GET /api/reviews/{id}` serve as `spend`, and `openAgentRun` folds into the same
+  `_budget_stats` shape so the same renderer draws it. The link is
+  `usage_events.review_id`; `legacy_guard` learns which review to name via
+  `context.collect_saved_reviews()`, which is the one contextvar in `backend/context.py`
+  that reports **back up** rather than down — and it has to hold a mutable list, because a
+  synchronous endpoint runs in a worker thread with a copy of the context (D-311). A run
+  with no ledger row reports **no cost rather than zero**.
 - **`AGENT_SCREENS` in `frontend/app.js` is where an agent screen says what it is.** One row
   per screen keyed by its nav `data-page`, giving the product id, the `reviews.review_type`
   it writes, its result container id, its renderer function and what to call its runs. The

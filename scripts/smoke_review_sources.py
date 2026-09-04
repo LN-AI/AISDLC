@@ -161,6 +161,17 @@ VAPT_SQLI = dict(
 )
 
 
+
+def _raises_value_error(fn):
+    """True if `fn()` raises ValueError. Used to assert a guard rejects bad arguments."""
+    try:
+        fn()
+    except ValueError:
+        return True
+    except Exception:
+        return False
+    return False
+
 def main():
     global FAILED
     database.init_db()
@@ -1308,7 +1319,7 @@ def main():
         import backend.workflows.autofix_pr as _afp
         _real_verify = _afp._verify_patch
         try:
-            _afp._verify_patch = lambda orch, patch, ctx: dict(orch._verdict)
+            _afp._verify_patch = lambda orch, patch, ctx, **kw: dict(orch._verdict)
             guarded = fix_apply._guard_patches(
                 _Orch({"blocked": False}), [dict(_secret_patch), dict(_clean_patch)], "")
             check("a patch that introduces a hardcoded secret is rejected",
@@ -2174,6 +2185,534 @@ def main():
               str(list(_p28.get("/api/review/full", {}).get("post", {}).get("responses", {}))))
         check("...and its own poll route is still there",
               "/api/review/full/jobs/{job_id}" in _p28)
+
+        # ── 29. A vulnerability assessment's findings can be fixed ────
+        #
+        # Apply Fixes was built review-type agnostic and VAPT already met every precondition
+        # it has -- the same bundle path records its source, its findings carry the verified
+        # quote and the file path -- so the only thing missing was that the VAPT screen never
+        # armed it. What is checked here is the backend half: that the plan, the delivery
+        # options, the quote and the guardrail all behave when the review is a VAPT one.
+        #
+        # The guardrail is the reason this section is long. It has two changes, and both are
+        # the kind that fail silently: the re-review is now done by the agent that found the
+        # problem, and a Critical the original review already reported no longer blocks the
+        # patch. Get the second one wrong in either direction and either every VAPT patch is
+        # rejected, or a vulnerability the fixer introduced ships.
+        section("29. A vulnerability assessment's findings can be fixed")
+
+        VAPT_FIX_FINDINGS = [
+            {"id": "v1", "title": "SQL injection in login", "file_path": "app/auth.py",
+             "line_start": 4, "severity": 5, "risk_level": "Critical",
+             "control_id": "VAPT-003", "cvss_score": 9.8, "cwe_id": "CWE-89",
+             "owasp_category": "A03:2021 Injection", "vuln_id": "VLN-001",
+             "attack_scenario": "An unauthenticated caller posts a crafted username.",
+             "proof_of_concept": "curl -X POST /login -d \"u=' OR 1=1--\"",
+             "affected_component": "POST /login", "evidence": "SELECT",
+             "evidence_verified": True, "is_blocking": True,
+             "recommendation": "Use a parameterised query."},
+            {"id": "v2", "title": "Verbose error body", "file_path": "app/auth.py",
+             "line_start": 20, "severity": 3, "risk_level": "Moderate",
+             "control_id": "VAPT-011", "cvss_score": 5.3, "cwe_id": "CWE-209",
+             "vuln_id": "VLN-002", "attack_scenario": "Stack traces reach the client.",
+             "evidence": "id", "evidence_verified": True, "is_blocking": False},
+            # VAPT legitimately assesses things with no file at all -- an OpenAPI spec, an
+            # architecture description, a list of URLs. Those findings are real and are not
+            # fixable, and the difference has to be visible rather than inferred.
+            {"id": "v3", "title": "No rate limit on the auth endpoint", "severity": 4,
+             "risk_level": "High", "control_id": "VAPT-020", "cvss_score": 7.5,
+             "vuln_id": "VLN-003", "affected_component": "POST /login",
+             "evidence": "no limiter", "evidence_verified": True},
+        ]
+
+        _vapt_bundle = source_bundle.from_files(
+            [{"path": "app/auth.py", "content": APP_FILES["app/auth.py"]}],
+            label="vapt fix demo")
+        # Saved inside the project the UI headers are scoped to, because the route below is
+        # driven as the browser drives it and `_review_in_scope` 404s anything outside the
+        # caller's projects. A review with a NULL project id is invisible to it -- which the
+        # check at section 21 relies on, and which is easy to reproduce here by accident.
+        with _ctx.bind_project(pid, "Sources", product_id="vapt"):
+            _vapt_rid = database.save_review(
+                "vapt", "fix", "s", "c",
+                {"findings": _copy.deepcopy(VAPT_FIX_FINDINGS), "gate_status": "Red",
+                 "risk_score": 88.0})
+        _store.record(_vapt_rid, _vapt_bundle, retention_days=7)
+        _VID = {f["title"]: f["id"] for f in
+                json.loads(database.get_review(_vapt_rid)["result_json"])["findings"]}
+
+        _vsplit = fix_apply.eligible(
+            json.loads(database.get_review(_vapt_rid)["result_json"])["findings"])
+        check("a vulnerability in a real file is offered for fixing",
+              {f["title"] for f in _vsplit["fixable"]}
+              == {"SQL injection in login", "Verbose error body"},
+              str(sorted(f["title"] for f in _vsplit["fixable"])))
+        check("...and one that names no file is not, with the reason it is not",
+              any(f["title"].startswith("No rate limit")
+                  and "nothing to patch" in f["fix_blocked_reason"]
+                  for f in _vsplit["not_fixable"]),
+              "a VAPT assessment of an API spec has findings with no file, and the "
+              "difference between 'cannot' and 'will not' has to be visible")
+
+        _vplan = fix_apply.plan(_vapt_rid, [_VID["SQL injection in login"]])
+        check("a VAPT review can be planned for fixing at all",
+              _vplan["files_to_change"] == 1, str(_vplan["files_to_change"]))
+        check("...and is quoted, so the price is not discovered afterwards",
+              (_vplan["estimate"] or {}).get("ceiling_usd", 0) > 0,
+              str(_vplan["estimate"])[:160])
+        check("...and its note says who does the re-review",
+              "vulnerability assessor" in _vplan["note"], _vplan["note"][-160:])
+        check("a VAPT zip assessment is offered the diff and the zip, not a pull request",
+              {o["id"] for o in _vplan["outputs"]} == {"diff", "zip"},
+              str(sorted(o["id"] for o in _vplan["outputs"])))
+
+        # ── The quote is priced against the agents that will actually be called ──
+        #
+        # Not "a VAPT fix costs more than a code fix": measured, the VAPT prompt frame is
+        # *smaller* than the code reviewer's (3416 vs 3975 tokens), so asserting a direction
+        # would encode a guess. What is asserted is the arithmetic -- that the frame charged
+        # is the sum of the fixer's and the re-reviewer's, which pins which two agents were
+        # priced without depending on which of them is larger.
+        _af_frame = review_estimate._frame_tokens("auto-fix")
+        _vp_frame = review_estimate._frame_tokens("vapt")
+        _cd_frame = review_estimate._frame_tokens("code")
+        _code_plan = fix_apply.plan(fix_rid, [FID["SQL injection"]])
+        check("a fix is priced against the fixer's prompt plus the re-reviewer's",
+              _vplan["estimate"]["prompt_frame_tokens"] == _af_frame + _vp_frame,
+              f"{_vplan['estimate']['prompt_frame_tokens']} != {_af_frame}+{_vp_frame}")
+        check("...and a code review's fix against the code reviewer's, not the assessor's",
+              _code_plan["estimate"]["prompt_frame_tokens"] == _af_frame + _cd_frame,
+              f"{_code_plan['estimate']['prompt_frame_tokens']} != {_af_frame}+{_cd_frame}")
+        check("the fixer's own prompt frame is measured, not the reviewer's",
+              _af_frame != _cd_frame and _af_frame > 0,
+              f"auto-fix={_af_frame} code={_cd_frame} -- these were the same number until "
+              f"`_frame_tokens` gained an auto-fix branch, so Apply Fixes was quoted "
+              f"against a prompt it never sends")
+        check("the file's content is counted for both calls, since both carry it whole",
+              _vplan["estimate"]["est_input_tokens"]
+              > 2 * (_vplan["estimate"]["est_input_tokens"] - _af_frame - _vp_frame) - 1,
+              str(_vplan["estimate"]["est_input_tokens"]))
+        check("...and the ceiling allows the fixer its full output budget",
+              _vplan["estimate"]["max_output_tokens_per_call"]
+              == review_estimate.MAX_OUTPUT_TOKENS["auto-fix"] == 32000,
+              str(_vplan["estimate"]["max_output_tokens_per_call"]))
+        check("both halves are still reported as two calls per file",
+              _vplan["calls"] == 2, str(_vplan["calls"]))
+
+        # A quote must never be free of charge for work that costs money.
+        check("combining two quotes sums the money rather than taking one of them",
+              review_estimate.combine(
+                  {"expected_usd": 1.0, "ceiling_usd": 2.0, "calls": 1},
+                  {"expected_usd": 0.5, "ceiling_usd": 1.0, "calls": 1},
+              )["expected_usd"] == 1.5)
+        check("...and reports the price as estimated if either half was",
+              review_estimate.combine(
+                  {"expected_usd": 1.0, "price_is_estimated": False, "calls": 1},
+                  {"expected_usd": 1.0, "price_is_estimated": True, "calls": 1},
+              )["price_is_estimated"] is True,
+              "a quote that hides that its price table was guessed is worse than one that "
+              "says so")
+        check("...and an empty combine is empty, not a zero-dollar quote",
+              review_estimate.combine() == {} and review_estimate.combine(None, {}) == {})
+
+        # ── A VAPT of a pull request can be fixed in that pull request ───────
+        _vpr = source_bundle.from_files(
+            [{"path": "app/auth.py", "content": APP_FILES["app/auth.py"]}],
+            label="acme/portal#42")
+        _vpr.source_type = "github_pr"
+        _vpr.ref = "https://github.com/acme/portal"
+        _vpr.meta = {"commit_sha": "d" * 40, "head_branch": "feature/login",
+                     "pr_number": 42, "head_repo_full_name": "acme/portal",
+                     "base_repo_full_name": "acme/portal"}
+        _vpr_rid = database.save_review(
+            "vapt", "fix", "s", "c",
+            {"findings": _copy.deepcopy(VAPT_FIX_FINDINGS[:1]), "gate_status": "Red"})
+        _store.record(_vpr_rid, _vpr, retention_days=0)
+        _vpr_outs = {o["id"]: o for o in fix_apply.plan(
+            _vpr_rid,
+            [json.loads(database.get_review(_vpr_rid)["result_json"])["findings"][0]["id"]],
+        )["outputs"]}
+        check("a VAPT of a pull request can be fixed in that pull request",
+              "same_pr" in _vpr_outs and not _vpr_outs["same_pr"].get("unavailable"),
+              str(sorted(_vpr_outs)))
+        check("...and names the branch the fix would land on",
+              "feature/login" in _vpr_outs["same_pr"]["label"],
+              _vpr_outs["same_pr"]["label"])
+        check("...and can open a new pull request instead",
+              {"pr", "branch"} <= set(_vpr_outs), str(sorted(_vpr_outs)))
+
+        # ── The fixer is told how the vulnerability is exploited ────────────
+        from backend.agents.developer_intelligence.autofix_agent import AutoFixAgent as _AFA
+        _desc_v = _AFA._describe_finding(VAPT_FIX_FINDINGS[0])
+        check("the fixer is given the CWE and the OWASP category",
+              "CWE-89" in _desc_v and "A03:2021" in _desc_v, _desc_v[:120])
+        check("...and how the vulnerability is actually reached",
+              "How it is exploited" in _desc_v and "crafted username" in _desc_v,
+              "a patch that sanitises the wrong end of the path closes nothing, and the "
+              "attack scenario is the only field that says which end is which")
+        check("...and the proof of concept, which is the shortest statement of the bug",
+              "Proof of concept" in _desc_v and "OR 1=1" in _desc_v, _desc_v[-200:])
+        _desc_c = _AFA._describe_finding(
+            {"severity": 5, "risk_level": "Critical", "control_id": "SEC-008",
+             "title": "SQL injection", "line_start": 4, "evidence": "SELECT",
+             "description": "concat", "recommendation": "parameterise"})
+        check("a code-review finding reads exactly as it did before",
+              _desc_c == ("- [5/5 Critical] SEC-008 SQL injection\n"
+                          "  Location: line 4\n"
+                          "  Offending code (verbatim):\n    SELECT\n"
+                          "  Why: concat\n"
+                          "  Recommended fix: parameterise"),
+              repr(_desc_c))
+
+        # ── The re-review is done by the agent that found the problem ───────
+        _called29 = []
+
+        class _Agent29:
+            def __init__(self, name, findings):
+                self._name, self._findings = name, findings
+
+            def review_code(self, files, context=""):
+                _called29.append("code")
+                return {"findings": self._findings, "gate_status": "Red"}
+
+            def run_vapt(self, files, context=""):
+                _called29.append("vapt")
+                return {"findings": self._findings, "gate_status": "Red"}
+
+        class _Orch29:
+            def __init__(self, findings):
+                self.code_agent = _Agent29("code", findings)
+                self.vapt_agent = _Agent29("vapt", findings)
+
+        _p29 = {"path": "app/auth.py", "fixed_content": "def login(u, p):\n    return 1\n"}
+        _afp._verify_patch(_Orch29([]), dict(_p29), "")
+        check("a fix with no review type stated is still re-reviewed by the code reviewer",
+              _called29 == ["code"],
+              "Auto-Fix on a pull request must reach exactly the code path it always did")
+        _called29.clear()
+        _afp._verify_patch(_Orch29([]), dict(_p29), "", review_agent="vapt")
+        check("a VAPT fix is re-reviewed by the vulnerability assessor",
+              _called29 == ["vapt"], str(_called29))
+        _called29.clear()
+
+        # ── A Critical that was already there does not block the patch ──────
+        #
+        # This is the check that matters most, because getting it wrong is invisible in both
+        # directions. Too strict and every VAPT patch is thrown away -- a file with three
+        # vulnerabilities where you fix one still has two Criticals in it, truthfully
+        # reported. Too loose and a vulnerability the fixer introduced ships.
+        _old_crit = {"severity": 5, "title": "SQL injection in login",
+                     "fingerprint": "known-fp-1", "evidence_verified": True}
+        _new_crit = {"severity": 5, "title": "Command injection in the new sanitiser",
+                     "fingerprint": "fresh-fp-9", "evidence_verified": True}
+
+        _v_old = _afp._verify_patch(_Orch29([_old_crit]), dict(_p29), "",
+                                    review_agent="vapt",
+                                    known_fingerprints={"known-fp-1"})
+        check("a Critical the original review already reported does not block the patch",
+              _v_old["blocked"] is False, str(_v_old))
+        check("...but is reported, so passing the guard is not read as the file being clean",
+              _v_old.get("carried_over") == ["SQL injection in login"],
+              str(_v_old.get("carried_over")))
+
+        _v_new = _afp._verify_patch(_Orch29([_new_crit]), dict(_p29), "",
+                                    review_agent="vapt",
+                                    known_fingerprints={"known-fp-1"})
+        check("a Critical the original review did NOT report blocks the patch",
+              _v_new["blocked"] is True, str(_v_new))
+        check("...and says it was not in the original review, rather than merely 'still'",
+              "did not report" in _v_new["reason"], _v_new["reason"])
+        check("...and names it",
+              _v_new.get("introduced") == ["Command injection in the new sanitiser"],
+              str(_v_new.get("introduced")))
+
+        _v_mixed = _afp._verify_patch(_Orch29([_old_crit, _new_crit]), dict(_p29), "",
+                                      review_agent="vapt",
+                                      known_fingerprints={"known-fp-1"})
+        check("one old and one new Critical still blocks, on the new one",
+              _v_mixed["blocked"] is True
+              and _v_mixed["introduced"] == ["Command injection in the new sanitiser"],
+              str(_v_mixed))
+
+        _v_nofp = _afp._verify_patch(_Orch29([_old_crit]), dict(_p29), "",
+                                     review_agent="vapt")
+        check("with no fingerprints supplied, every Critical blocks as it always did",
+              _v_nofp["blocked"] is True,
+              "a caller that cannot say what was there before must get the strict rule, "
+              "not the lenient one")
+
+        # Fingerprints are grouped per file. Pooling them would let an old vulnerability in
+        # one file excuse a new one in another.
+        _guard29 = fix_apply._guard_patches(
+            _Orch29([_old_crit]),
+            [{"path": "app/admin.py", "fixed_content": "x = 1\n"}],
+            "", review_agent="vapt",
+            prior_findings=[{"file_path": "app/auth.py", "fingerprint": "known-fp-1"}])
+        check("a fingerprint known in one file does not excuse a Critical in another",
+              not _guard29["safe"] and _guard29["blocked"],
+              str(_guard29)[:200])
+        _guard29b = fix_apply._guard_patches(
+            _Orch29([_old_crit]),
+            [{"path": "./app/auth.py", "fixed_content": "x = 1\n"}],
+            "", review_agent="vapt",
+            prior_findings=[{"file_path": "app/auth.py", "fingerprint": "known-fp-1"}])
+        check("...and a leading ./ on either side is the same file, not a different one",
+              len(_guard29b["safe"]) == 1, str(_guard29b)[:200])
+        check("the guard reports which agent re-read the patch",
+              (_guard29b["safe"][0].get("post_fix_review") or {}).get("reviewed_by") == "vapt",
+              str(_guard29b["safe"][0].get("post_fix_review")))
+
+        # ── Driven through the real route, with a VAPT review id ───────────
+        _vroute = client.post(f"/api/reviews/{_vapt_rid}/fix/plan",
+                              json={"finding_ids": [_VID["SQL injection in login"]]},
+                              headers=UI)
+        check("the fix-plan route accepts a VAPT review, not only a code review",
+              _vroute.status_code == 200, f"{_vroute.status_code}: {_vroute.text[:200]}")
+        check("...and it calls no model, so a quote is always free",
+              (_vroute.json().get("estimate") or {}).get("calls", 0) > 0
+              and _vroute.json()["files_to_change"] == 1, _vroute.text[:200])
+
+        # ── 30. A stored run remembers what it cost ────────────────
+        #
+        # Reopening a run from history showed findings with no cost. The figure could never
+        # travel inside `result_json`: it is not known until the model calls finish, which
+        # is after `save_review` has written and serialized the row. `usage_events` has had
+        # a `review_id` column for this link all along, and on the synchronous routes it was
+        # always NULL because the middleware doing the metering never learned which review
+        # the handler wrote.
+        #
+        # The cost is **read** from the ledger, never copied onto the review row. A second
+        # copy of a billing figure is a second number that can disagree with the invoice.
+        section("30. A stored run remembers what it cost")
+
+        from backend import context as _ctx30
+
+        # ── The contextvar reports back across a worker thread ──────────────
+        #
+        # This is the subtle half. A synchronous FastAPI endpoint runs in a threadpool with
+        # a *copy* of the caller's context, so `ContextVar.set()` inside it is invisible to
+        # the middleware outside. The collector holds a mutable list and appends to it,
+        # which is the same trick `llm_gateway.track_usage` uses and for the same reason.
+        import contextvars as _cv30
+
+        def _save_in_child():
+            return database.save_review("code", "ctx", "s", "c",
+                                        {"findings": [], "gate_status": "Green"})
+
+        with _ctx30.collect_saved_reviews():
+            _child_ctx = _cv30.copy_context()
+            _child_rid = _child_ctx.run(_save_in_child)
+            check("A REVIEW SAVED IN A COPIED CONTEXT IS STILL REPORTED BACK",
+                  _ctx30.saved_review_ids() == [_child_rid],
+                  f"{_ctx30.saved_review_ids()} != [{_child_rid}] -- a plain ContextVar.set "
+                  f"here is invisible to the caller, which is why this uses a mutable list; "
+                  f"get it wrong and every synchronous route silently records no review id")
+        check("...and the collector is empty again outside its block",
+              _ctx30.saved_review_ids() == [], str(_ctx30.saved_review_ids()))
+        check("saving a review with nobody collecting is not an error",
+              bool(database.save_review("code", "nocollect", "s", "c", {"findings": []})),
+              "the smoke suites and scripts/ save reviews outside any request")
+
+        with _ctx30.collect_saved_reviews():
+            _a30 = database.save_review("security", "multi", "s", "c", {"findings": []})
+            _b30 = database.save_review("full", "multi", "s", "c", {"findings": []})
+            check("several reviews in one request are collected in order, newest last",
+                  _ctx30.saved_review_ids() == [_a30, _b30],
+                  str(_ctx30.saved_review_ids()))
+
+        # ── Driven through a real synchronous route, with the gateway metered ──
+        _plain30 = llm_gateway.call_tool
+
+        def _metered30(*a, **k):
+            llm_gateway._record_usage("anthropic", config.MODEL, 2100, 480)
+            return _plain30(*a, **k)
+
+        llm_gateway.call_tool = _metered30
+        try:
+            _before30 = {r["id"] for r in database.list_reviews(limit=200)}
+            _run30 = client.post("/api/review/requirement?project_name=Sources",
+                                 json={"content": "The system shall be quick.",
+                                       "context": ""},
+                                 headers=UI)
+            check("the metered run answered 200", _run30.status_code == 200,
+                  _run30.text[:200])
+            _new30 = [r for r in database.list_reviews(limit=200)
+                      if r["id"] not in _before30]
+            check("...and stored a review", len(_new30) == 1,
+                  str([r["id"] for r in _new30]))
+            _rid30 = _new30[0]["id"]
+
+            _spend30 = database.get_review_spend([_rid30])
+            check("THE RUN'S COST IS LINKED TO THE RUN", _rid30 in _spend30,
+                  "the ledger row named no review, so history has nothing to read and a "
+                  "reopened run shows findings with no cost -- which is the whole defect")
+            _s30 = _spend30[_rid30]
+            check("...with the tokens the gateway actually recorded",
+                  _s30["input_tokens"] >= 2100 and _s30["output_tokens"] >= 480,
+                  f"{_s30['input_tokens']} in / {_s30['output_tokens']} out")
+            check("...and at least one call",
+                  _s30["calls"] >= 1, str(_s30["calls"]))
+            check("THE STORED COST IS THE COST BILLED",
+                  abs(_s30["cost_usd"] - _ag._price_usage(
+                      {"calls": _s30["calls"], "input_tokens": _s30["input_tokens"],
+                       "output_tokens": _s30["output_tokens"]}, _s30["model"])) < 1e-6,
+                  f"{_s30['cost_usd']} is not what _price_usage says for the same tokens -- "
+                  f"a cost read any other way drifts from the invoice")
+            check("...and it agrees with the header the same run returned",
+                  abs(_s30["cost_usd"]
+                      - float(_run30.headers.get("X-Spend-Cost-USD", -1))) < 1e-6,
+                  f"ledger {_s30['cost_usd']} vs header "
+                  f"{_run30.headers.get('X-Spend-Cost-USD')} -- the live figure and the "
+                  f"remembered one must be one number, or reopening a run contradicts it")
+            check("...naming the model that answered",
+                  _s30["model"] == config.MODEL, _s30["model"])
+
+            # ── The two read paths the browser uses ────────────────────────
+            _one30 = client.get(f"/api/reviews/{_rid30}", headers=UI)
+            check("a reopened run carries its cost", _one30.status_code == 200
+                  and (_one30.json().get("spend") or {}).get("cost_usd", 0) > 0,
+                  _one30.text[:240])
+            _list30 = client.get("/api/reviews?limit=50&product_id=requirement",
+                                 headers=UI)
+            _row30 = next((r for r in _list30.json()["reviews"]
+                           if r["id"] == _rid30), None)
+            check("...and so does its card in the history list",
+                  _row30 is not None and (_row30.get("spend") or {}).get("cost_usd", 0) > 0,
+                  str(_row30)[:240])
+            check("...which is one ledger query for the page, not one per card",
+                  "spend" in (_list30.json()["reviews"][0] or {}),
+                  "every row is annotated, so a page of ten runs is not ten round trips")
+        finally:
+            llm_gateway.call_tool = _plain30
+        check("the metering stub is restored", llm_gateway.call_tool is _plain30)
+
+        # ── A run with no ledger row is absent, not zero ────────────────────
+        # Project-bound, because the endpoint below is driven as the browser drives it and
+        # `_review_in_scope` 404s anything outside the caller's projects.
+        with _ctx.bind_project(pid, "Sources", product_id="code"):
+            _bare30 = database.save_review("code", "bare", "s", "c",
+                                           {"findings": [], "gate_status": "Green"})
+        check("A RUN WHOSE COST WAS NEVER RECORDED REPORTS NO COST, NOT $0.00",
+              database.get_review_spend([_bare30]) == {},
+              "every run from before this link exists cost an unknown amount, and a "
+              "confident zero beside it is a false statement about money")
+        _bare_get = client.get(f"/api/reviews/{_bare30}", headers=UI)
+        check("...and the endpoint sends null rather than an empty cost",
+              _bare_get.status_code == 200 and _bare_get.json().get("spend") is None,
+              _bare_get.text[:200])
+        check("asking about no reviews at all is empty, not an error",
+              database.get_review_spend([]) == {}
+              and database.get_review_spend([None, ""]) == {})
+        check("asking about a review id that does not exist is empty",
+              database.get_review_spend(["not-a-real-review-id"]) == {})
+
+        # ── Billable and non-billable are summed apart ──────────────────────
+        #
+        # A failed run leaves a non-billable ledger row beside the billable one. Both are
+        # real spend; only one moved a budget, and conflating them would either overstate
+        # what a project was charged or hide tokens that were genuinely burned.
+        _dual30 = database.save_review("code", "dual", "s", "c", {"findings": []})
+        for _billable, _cost in ((1, 0.20), (0, 0.05)):
+            database.record_usage_event(
+                key_id=None, caller_type="ui", caller_ref=None, product_id="code",
+                product_kind="agent", calls=1, input_tokens=100, output_tokens=50,
+                cost_usd=_cost, model=config.MODEL, provider="anthropic",
+                billable=bool(_billable), cost_estimated=False, project_id=None,
+                project_name="", review_id=_dual30, status="ok")
+        _d30 = database.get_review_spend([_dual30])[_dual30]
+        check("two ledger rows for one run are summed, not overwritten",
+              abs(_d30["cost_usd"] - 0.25) < 1e-6 and _d30["calls"] == 2,
+              f"${_d30['cost_usd']} over {_d30['calls']} call(s)")
+        check("...and what a budget actually moved by is reported apart",
+              abs(_d30["billable_cost_usd"] - 0.20) < 1e-6,
+              f"billable ${_d30['billable_cost_usd']} of ${_d30['cost_usd']} total")
+
+        # An unpriced model must stay flagged through the sum, or an estimate is read as a
+        # measurement.
+        _est30 = database.save_review("code", "est", "s", "c", {"findings": []})
+        database.record_usage_event(
+            key_id=None, caller_type="ui", caller_ref=None, product_id="code",
+            product_kind="agent", calls=1, input_tokens=10, output_tokens=5,
+            cost_usd=0.01, model="some-local-model", provider="ollama", billable=True,
+            cost_estimated=True, project_id=None, project_name="", review_id=_est30,
+            status="ok")
+        check("a guessed price stays marked as guessed after summing",
+              database.get_review_spend([_est30])[_est30]["cost_estimated"] is True,
+              "an estimate presented as a measurement is the one way this figure can lie")
+
+        # ── 31. The write path, which no offline test had ever reached ───
+        #
+        # Both of these were found by running one real fix against one real pull request,
+        # and neither was reachable from here before: every fix test in this suite stops at
+        # `plan`, which writes nothing, and section 25's delivery tests assert which options
+        # are *offered*, never that taking one works. Two bugs sat behind that line, so
+        # `output="pr"` and `output="branch"` from Apply Fixes had **never once succeeded**.
+        #
+        # Neither is checkable end to end without a real repository, so what is checked here
+        # is the argument each one got wrong -- which is where the bug actually was.
+        section("31. The write path, which no offline test had ever reached")
+
+        from backend.services.github_service import GitHubService as _GH31
+        import inspect as _i31
+
+        # ── D-314: a commit sha in a slot that resolves branch names ─────
+        #
+        # `create_branch`'s fourth argument is resolved through `/git/ref/heads/<name>`, so a
+        # sha passed there asks GitHub for a branch literally named after a commit and gets a
+        # bare 404. `fix_apply` did exactly that, on the line whose own comment explains that
+        # branching off the reviewed commit is the point.
+        check("there is a way to branch at an exact commit",
+              hasattr(_GH31, "create_branch_at_sha"),
+              "branching off the commit a review read is the whole reason Apply Fixes does "
+              "not just branch off the tip")
+        check("...and it is the one Apply Fixes calls",
+              "create_branch_at_sha(" in _i31.getsource(fix_apply.apply),
+              "create_branch resolves its fourth argument as a branch NAME; a sha there is "
+              "a request for /git/ref/heads/<sha>, which 404s every time")
+        check("...and it refuses a branch name, rather than asking GitHub about a bad ref",
+              _raises_value_error(lambda: _GH31().create_branch_at_sha(
+                  "o", "r", "new", "feat/some-branch")),
+              "caught here it names the wrong argument; caught at GitHub it is a 422 about "
+              "a malformed ref with nothing saying which argument was wrong")
+        check("...while accepting a real sha's shape",
+              not _raises_value_error(lambda: _GH31._sha_ok("a" * 40))
+              if hasattr(_GH31, "_sha_ok") else True)
+        check("create_branch still takes a branch name, for the caller that has one",
+              list(_i31.signature(_GH31.create_branch).parameters)[-1] == "from_branch",
+              "workflows/autofix_pr.py passes a head branch here and has always worked -- "
+              "the fix must not move that path")
+
+        # ── D-315: a pull request opened against a base named after a title ─
+        #
+        # `base_ref` was `label.split("@")[-1]` for every source. A repository's label is
+        # `owner/repo@ref`, so that works. A **pull request's** label is its title, so the
+        # fix pull request was opened with `base="CB-104: AI visit summary endpoint"` and
+        # GitHub answered 422 with nothing naming the branch.
+        _src31 = _i31.getsource(fix_apply.apply)
+        check("a fix from a pull request targets a branch, not the review's label",
+              'source.get("source_type") == "github_pr"' in _src31
+              and 'source.get("head_branch")' in _src31,
+              "a PR's label is its title; splitting it on '@' yields the title, which is "
+              "not a branch and 422s")
+        check("...and a repository source still targets its ref",
+              'split("@")[-1]' in _src31,
+              "owner/repo@main is the shape that made the original line work")
+        check("...and an unknown base is ASKED FOR, not assumed to be 'main'",
+              "get_default_branch" in _src31 and 'base=base_ref,' in _src31,
+              "'main' is a guess that fails on master or develop, and fails as another "
+              "opaque 422")
+        check("the default branch is a real lookup with a safe fallback",
+              hasattr(_GH31, "get_default_branch"))
+
+        # The delivery options are unchanged by any of this -- checked because the fix
+        # touched the function that reads them.
+        _pr_outs31 = {o["id"] for o in fix_apply.plan(
+            pr_rid, [f["id"] for f in json.loads(
+                database.get_review(pr_rid)["result_json"])["findings"][:1]],
+        )["outputs"]}
+        check("a pull-request review is still offered all four writes plus the two reads",
+              {"pr", "same_pr", "branch", "diff", "zip"} <= _pr_outs31,
+              str(sorted(_pr_outs31)))
 
         # ── 18. The webhook ───────────────────────────────────────────────
         section("18. Webhook -- signed, deduplicated, and it refuses to be a spend amplifier")

@@ -912,6 +912,11 @@ async def list_reviews(request: Request, limit: int = Query(20, ge=1, le=200),
     visible = _visible_project_ids(reader, request)
     reviews = database.list_reviews(limit=limit, offset=offset, project_ids=visible,
                                     review_type=review_type, product_id=product_id)
+    # One ledger query for the whole page, not one per row — a run list is the only place
+    # in this app that reads the same thing once per card, and N+1 there would be felt.
+    spend = database.get_review_spend([r["id"] for r in reviews])
+    for row in reviews:
+        row["spend"] = spend.get(row["id"])
     return {
         "reviews": reviews,
         "count": len(reviews),
@@ -1144,6 +1149,11 @@ async def get_review(review_id: str, request: Request, reader: dict = Depends(re
     # something this caller has no business learning.
     if visible is not None and review.get("project_id") not in visible:
         raise HTTPException(status_code=404, detail="Review not found")
+    # What it cost, read from the billing ledger rather than stored on the row — so the
+    # figure on a reopened run is the same number that moved the budget. Absent, not zero,
+    # for a run that predates the link: "$0.00" would be a claim about a run whose cost
+    # nobody recorded. See `database.get_review_spend`.
+    review["spend"] = database.get_review_spend([review_id]).get(review_id)
     return review
 
 

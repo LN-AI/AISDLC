@@ -1,4 +1,5 @@
 import logging
+import re
 import os
 import time
 
@@ -252,10 +253,59 @@ class GitHubService:
             return resp.json()["object"]["sha"]
 
     def create_branch(self, owner: str, repo: str, new_branch: str, from_branch: str) -> Dict[str, Any]:
-        """Create a new branch pointing at the current head of from_branch. Idempotent if it already exists."""
+        """Create a new branch pointing at the current head of from_branch. Idempotent if it already exists.
+
+        **`from_branch` is a branch NAME, not a commit sha.** It is resolved through
+        `/git/ref/heads/<from_branch>`, so a sha passed here produces a request for a branch
+        literally named `61f9b8f…` and GitHub answers 404. Use `create_branch_at_sha` when
+        you have a commit — which is what you want whenever the point is to branch off the
+        exact commit something was reviewed at.
+        """
         if not self.token:
             raise ValueError("GITHUB_TOKEN is not configured")
         sha = self.get_branch_head_sha(owner, repo, from_branch)
+        result = self.create_branch_at_sha(owner, repo, new_branch, sha)
+        if not result["already_existed"]:
+            logger.info("Created branch %s/%s:%s from %s", owner, repo, new_branch, from_branch)
+        return result
+
+    def get_default_branch(self, owner: str, repo: str) -> str:
+        """The repository's own default branch.
+
+        Worth a request rather than assuming "main": a repository still on master, or one
+        whose default is develop, otherwise fails as an opaque 422 from the pull-request
+        endpoint with nothing naming the branch that did not exist. Falls back to "main"
+        only if the lookup itself fails, which keeps a caller working where it used to.
+        """
+        try:
+            with httpx.Client(headers=self.headers, timeout=30) as client:
+                resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}")
+                resp.raise_for_status()
+                return resp.json().get("default_branch") or "main"
+        except Exception:
+            logger.warning("Could not read the default branch for %s/%s — assuming main",
+                           owner, repo)
+            return "main"
+
+    def create_branch_at_sha(self, owner: str, repo: str, new_branch: str,
+                             sha: str) -> Dict[str, Any]:
+        """Create a branch pointing at an exact commit. Idempotent if it already exists.
+
+        Split out from `create_branch` because Apply Fixes needs to branch off the commit a
+        review actually read, not off whatever the branch has since become — a patch computed
+        against last week's file and committed on top of this week's silently reverts
+        somebody else's change. It was calling `create_branch` with a sha in the `from_branch`
+        slot, which asked GitHub for a branch named after a commit and 404'd every time, so
+        the `pr` and `branch` deliveries had never once succeeded (D-314).
+        """
+        if not self.token:
+            raise ValueError("GITHUB_TOKEN is not configured")
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha or ""):
+            # Caught here rather than at GitHub, which would answer 422 with a message about
+            # a malformed ref and leave the caller guessing which argument was wrong.
+            raise ValueError(
+                f"create_branch_at_sha needs a commit sha, got {sha!r}. For a branch name, "
+                f"call create_branch instead.")
         with httpx.Client(headers=self.headers, timeout=30) as client:
             resp = client.post(
                 f"{self.BASE_URL}/repos/{owner}/{repo}/git/refs",
@@ -265,7 +315,7 @@ class GitHubService:
                 logger.info("Branch %s/%s:%s already exists - reusing", owner, repo, new_branch)
                 return {"branch": new_branch, "sha": sha, "already_existed": True}
             resp.raise_for_status()
-        logger.info("Created branch %s/%s:%s from %s", owner, repo, new_branch, from_branch)
+        logger.info("Created branch %s/%s:%s at %s", owner, repo, new_branch, sha[:8])
         return {"branch": new_branch, "sha": sha, "already_existed": False}
 
     def get_file_content_at_ref(self, owner: str, repo: str, path: str, ref: str) -> Dict[str, Any]:

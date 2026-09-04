@@ -2038,37 +2038,11 @@ function renderResult(targetId, result, clear = true) {
   // Everything the backend computed and this screen used to throw away (C-79).
   html += renderReviewTransparency(result);
 
-  // The file-by-file record. Fetched after the result paints rather than carried inside it:
-  // the inventory of a 1,500-file repository has no business travelling in `result_json`,
-  // which every list endpoint also reads (see `database.list_reviews`).
-  // Which screen this result belongs to, asked rather than guessed. The old line inferred
-  // "code" for anything that was not VAPT -- and `#code-sources` always exists -- so
-  // running Requirement Review, Prompt Safety or the Release Gate fetched that review's
-  // (empty) inventory and painted it into the **Code Review screen's** panel. Silent,
-  // because the panel you were vandalising was on a screen you were not looking at.
-  const _owner = screenForReview(result);
-  const _spec = _owner ? AGENT_SCREENS[_owner] : null;
-  const _hasInventory = !!(_spec && _spec.inventory);
-
-  // Which review the fix bar acts on. Set here rather than read from the DOM: a stale id
-  // would patch the wrong review's files, which is the worst available failure.
-  //
-  // `_fixCapable` is the other half. Applying a fix needs the source read back -- from the
-  // per-run store, or from GitHub at the recorded sha -- and only the review pipeline
-  // records one (`review_source_store.record`, called from `_record_sources`). On every
-  // other agent the checkbox was rendered, tickable, and guaranteed to fail at
-  // `fix_apply.plan`. Same rule as D-268: an affordance that cannot work is worse than no
-  // affordance, because it costs the reader a round trip to learn nothing.
-  _fixReviewId = result.review_id || null;
-  _fixCapable = _hasInventory && !!result.review_id;
-  const _staleBar = document.getElementById('fix-bar');
-  if (_staleBar) _staleBar.remove();
-  const _stalePanel = document.getElementById('fix-panel');
-  if (_stalePanel) _stalePanel.remove();
-  if (_hasInventory && result.review_id
-      && document.getElementById(`${_owner}-sources`)) {
-    setTimeout(() => loadReviewSources(_owner, result.review_id), 0);
-  }
+  armResultActions(result, targetId);
+  // Said once, here, rather than as one disabled checkbox per finding. Only ever non-empty
+  // on a screen where a fix *would* have been possible -- the other nineteen never had the
+  // control to withhold.
+  html += renderFixUnavailable();
 
   if (findings.length) {
     html += `<div class="findings-section"><h3>Findings (${findings.length})</h3>`;
@@ -2269,13 +2243,28 @@ function fixEligibility(f) {
   return '';
 }
 
-function renderFixCheckbox(f) {
+function renderFixCheckbox(f, variant) {
   // Nothing at all -- not even the disabled "cannot be fixed" box -- where this review has
   // no source to read back. Twenty disabled checkboxes explaining a limitation of the
   // screen rather than of the finding is noise, and the waiver controls beside them still
   // work, which is the action actually available here.
   if (!_fixCapable || !f.id) return '';
   const why = fixEligibility(f);
+  // The compact variant is for a card whose body is collapsed by default -- VAPT. The box
+  // has to sit in the header, where it can be reached without expanding twelve cards to
+  // tick three; the *reason* a vulnerability cannot be fixed stays in the body, where there
+  // is room for a sentence, so compact renders nothing for those.
+  // ...and its other half, for the body of the same card. Renders the reason and never a
+  // second tickable box, so one finding cannot end up with two checkboxes carrying the same
+  // finding id.
+  if (variant === 'reasons') return why ? renderFixCheckbox(f) : '';
+  if (variant === 'compact') {
+    if (why) return '';
+    return `<label class="fix-pick-compact" title="Select this vulnerability to be fixed"
+      onclick="event.stopPropagation()"><input type="checkbox" class="fix-check"
+      value="${esc(f.id)}" data-file="${esc(f.file_path || '')}"
+      onchange="refreshFixBar()" /> Fix</label>`;
+  }
   if (why) {
     return `<div class="fix-pick fix-pick-off" title="${esc(why)}">
       <label><input type="checkbox" disabled /> Cannot be fixed automatically</label>
@@ -2288,6 +2277,18 @@ function renderFixCheckbox(f) {
   </div>`;
 }
 
+/** Said once per screen rather than once per finding: the plan does not include Auto-Fix.
+ *
+ *  Rendered where the fix affordance would have been. Silence would leave a user who has
+ *  read about Apply Fixes hunting for a checkbox that was deliberately withheld. */
+function renderFixUnavailable() {
+  if (!_fixBlockedReason) return '';
+  return `<div class="source-panel fix-unavailable">
+    <div class="field-hint">${esc(_fixBlockedReason)} Findings can still be waived or
+      accepted below, and the report and SARIF export are unaffected.</div>
+  </div>`;
+}
+
 // ── The fix bar ───────────────────────────────────────────────────────────
 //
 // Appears once something is ticked. It states the file count as well as the finding count,
@@ -2295,13 +2296,79 @@ function renderFixCheckbox(f) {
 // call, and a bar that only counted findings would make the quote look wrong.
 
 let _fixReviewId = null;
-// Whether the review on screen has a source the fixer can read back. See `renderResult`.
+// Whether the review on screen has a source the fixer can read back. See `armResultActions`.
 let _fixCapable = false;
+// Why not, when not — so a screen can say so once instead of saying nothing.
+let _fixBlockedReason = '';
+
+/** Everything a freshly-painted result arms outside its own HTML: which screen owns it,
+ *  whether its findings can be fixed, and its file-by-file inventory.
+ *
+ *  Extracted from `renderResult` because `renderVAPTResult` needs the identical decision and
+ *  a second copy would drift. That is not hypothetical — the last three defects on this path
+ *  were all "the other renderer does it differently": the inventory painted into the wrong
+ *  screen, a reopened assessment rendered through the plain renderer, and the fix bar armed
+ *  where nothing could be patched.
+ *
+ *  Three facts decide whether a fix is possible, and all three have to hold:
+ *
+ *  1. **The review has a recorded source.** Applying a fix reads the file back -- from the
+ *     per-run store, or from GitHub at the sha the review recorded -- and only the review
+ *     pipeline records one (`review_source_store.record`, from `_record_sources`). Code
+ *     Review and VAPT do; the other nineteen screens do not, and there the checkbox was
+ *     tickable and guaranteed to fail at `fix_apply.plan`.
+ *  2. **There is a review id to act on.** A stale one patches another review's files, which
+ *     is the worst failure available here, so it is set from the result rather than read
+ *     back out of the DOM.
+ *  3. **This project's plan includes Auto-Fix.** A fix is entitlement-checked and metered
+ *     against the `auto-fix` product whatever review it started from, so without it the user
+ *     ticks findings, is quoted for free, and is refused at the run. Same rule as D-268:
+ *     an affordance that cannot work is worse than none.
+ */
+function armResultActions(result, targetId) {
+  const owner = screenForReview(result);
+  const spec = owner ? AGENT_SCREENS[owner] : null;
+  const hasInventory = !!(spec && spec.inventory);
+  const entitled = _entitledProducts === null || _entitledProducts.has('auto-fix');
+
+  _fixReviewId = result.review_id || null;
+  _fixCapable = hasInventory && !!result.review_id && entitled;
+  _fixBlockedReason = (hasInventory && result.review_id && !entitled)
+    ? 'Applying fixes is part of Auto-Fix, which this project\'s plan does not include.'
+    : '';
+
+  const staleBar = document.getElementById('fix-bar');
+  if (staleBar) staleBar.remove();
+  const stalePanel = document.getElementById('fix-panel');
+  if (stalePanel) stalePanel.remove();
+
+  // The file-by-file record. Fetched after the result paints rather than carried inside it:
+  // the inventory of a 1,500-file repository has no business travelling in `result_json`,
+  // which every list endpoint also reads (see `database.list_reviews`).
+  //
+  // Only when this result is being painted into the owning screen's *own* container. The
+  // Agent Hub renders a code review into `#_hub_inner_code`, and without this test the
+  // inventory was fetched into `#code-sources` on the Code Review screen -- correct data,
+  // wrong screen, and it then sits there disagreeing with the result area beside it.
+  if (hasInventory && result.review_id && targetId === spec.result
+      && document.getElementById(`${owner}-sources`)) {
+    setTimeout(() => loadReviewSources(owner, result.review_id), 0);
+  }
+  return { owner, spec };
+}
 
 function refreshFixBar() {
   const picked = [...document.querySelectorAll('.fix-check:checked')];
   let bar = document.getElementById('fix-bar');
   if (!picked.length) { if (bar) bar.remove(); return; }
+  // While the quote is on screen the bar is redundant -- and worse than redundant: it is
+  // fixed to the bottom of the viewport, and the quote's own "Fix them" and "Cancel"
+  // buttons came to rest underneath it, so a click on either landed on the bar. Two
+  // competing action rows was the real problem; papering over the overlap with padding only
+  // moved where it happened. Found by driving a real browser: both elements are correct in
+  // isolation and only their stacking is wrong, so nothing that reads back rendered HTML
+  // could see it.
+  if (document.getElementById('fix-panel')) { if (bar) bar.remove(); return; }
   const files = new Set(picked.map(c => c.dataset.file).filter(Boolean));
   if (!bar) {
     bar = document.createElement('div');
@@ -2326,6 +2393,17 @@ function clearFixSelection() {
   if (panel) panel.remove();
 }
 
+/** Put the quote away and hand the actions back to the bar.
+ *
+ *  The ticks are deliberately left alone: cancelling a quote means "not at this price", not
+ *  "forget which vulnerabilities I picked". Clearing them would make a reader who wanted to
+ *  narrow the selection start again from a twelve-finding list. */
+function closeFixPanel() {
+  const panel = document.getElementById('fix-panel');
+  if (panel) panel.remove();
+  refreshFixBar();
+}
+
 /** Price the fix. Free, calls no model — same contract as every other quote here. */
 async function planFix() {
   const picked = [...document.querySelectorAll('.fix-check:checked')].map(c => c.value);
@@ -2338,6 +2416,11 @@ async function planFix() {
     (document.querySelector('.page.active') || document.body).appendChild(panel);
   }
   panel.innerHTML = '<div class="source-panel">Working out what this would involve…</div>';
+  // The panel now owns the actions, so the bar stands down. Put away before the fetch, not
+  // after: the quote takes a round trip and a bar still offering "What would this cost?"
+  // over a panel already working it out invites a second click.
+  const openBar = document.getElementById('fix-bar');
+  if (openBar) openBar.remove();
   panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
   try {
     const d = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/fix/plan`, {
@@ -2385,7 +2468,7 @@ function renderFixPlan(reviewId, d, picked) {
         <button class="btn btn-primary" onclick="runFix('${esc(reviewId)}')">
           Fix them — up to $${Number(e.ceiling_usd || 0).toFixed(2)}
         </button>
-        <button class="btn btn-secondary" onclick="document.getElementById('fix-panel').remove()">Cancel</button>
+        <button class="btn btn-secondary" onclick="closeFixPanel()">Cancel</button>
       </div>
     </div>`;
 }
@@ -3171,6 +3254,12 @@ function renderArchitectureAlternative(a) {
 function renderVAPTResult(targetId, r) {
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
+  // The same arming `renderResult` does, from the same function. Before this, the VAPT
+  // screen had none of it: no fix affordance -- although a VAPT assessment records its
+  // source exactly as a code review does and `fix_apply` never looked at the review type --
+  // and `#vapt-sources` was a container nothing ever filled, so which files the assessment
+  // read and which it skipped were invisible on the screen that produced them.
+  armResultActions(r, targetId);
   const findings = r.findings || [];
   const crit = findings.filter(f => f.severity === 5).length;
   const high = findings.filter(f => f.severity === 4).length;
@@ -3192,8 +3281,15 @@ function renderVAPTResult(targetId, r) {
       <div class="vapt-summary-card">    <div class="count" style="color:var(--accent)">${findings.length}</div><div class="label">Total</div></div>
     </div>
     ${renderReviewTransparency(r)}
+    ${renderFixUnavailable()}
     ${r.attack_surface_summary ? `<div class="section-title">Attack Surface</div><div class="summary-box" style="margin-bottom:20px;">${esc(r.attack_surface_summary)}</div>` : ''}
     <div class="section-title">Vulnerabilities (${findings.length})</div>
+    ${_fixCapable && findings.some(f => f.id && !fixEligibility(f)) ? `<div class="field-hint"
+      style="margin-bottom:10px">Tick <b>Fix</b> on the vulnerabilities you want remediated.
+      You are shown the cost before anything runs, and the fix comes back in the shape your
+      source arrived in — a commit into the pull request under review, a new pull request, a
+      branch, a zip of the changed files, or just the diff. Nothing here compiles or runs the
+      patched code.</div>` : ''}
     ${sorted.map(f => renderVAPTFinding(f)).join('')}
     ${r.recommendations?.length ? `<div class="section-title" style="margin-top:20px;">Remediation Priorities</div><ul class="rec-list">${r.recommendations.map(rec => `<li>${esc(rec)}</li>`).join('')}</ul>` : ''}
     ${r.compliance_flags?.length ? `<div class="section-title">Compliance Flags</div><div class="compliance-chips">${r.compliance_flags.map(f => `<span class="compliance-chip">${esc(f)}</span>`).join('')}</div>` : ''}
@@ -3216,6 +3312,11 @@ function renderVAPTFinding(f) {
         <div class="vapt-finding-meta">
           <span class="vapt-vuln-id">${esc(f.vuln_id || '')}</span>
           ${owasp}${cwe}${blocking}
+          <!-- In the header, not the body: these cards are collapsed by default, and a
+               picker that needs twelve cards expanded to tick three is a picker nobody
+               uses. The label swallows its own click so ticking does not also collapse
+               the card being read. -->
+          ${renderFixCheckbox(f, 'compact')}
         </div>
       </div>
       <div class="vapt-finding-body" id="${uid}">
@@ -3229,14 +3330,26 @@ function renderVAPTFinding(f) {
           ${(f.file_path || f.line_start) ? `<div class="vapt-detail-block"><label>Location</label><code>${esc(f.file_path || '')}${f.line_start ? ':' + f.line_start : ''}</code></div>` : ''}
           ${f.evidence ? `<div class="vapt-detail-block"><label>Evidence${f.evidence_verified === true ? ' (verified against the source)' : f.evidence_verified === false ? ' (not verified)' : ''}</label><pre class="finding-evidence">${esc(String(f.evidence).slice(0, 400))}</pre></div>` : ''}
         </div>
-        ${f.proof_of_concept ? `<div style="margin-top:10px;"><label style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-muted);letter-spacing:.05em;display:block;margin-bottom:4px;">Proof of Concept</label><div class="vapt-poc">${esc(f.proof_of_concept)}</div></div>` : ''}
-        ${f.cvss_vector ? `<div style="margin-top:8px;font-size:11px;color:var(--text-muted);font-family:monospace;">${esc(f.cvss_vector)}</div>` : ''}
+        <!-- The proof of concept and the CVSS vector were each rendered TWICE in every card:
+             once in the detail grid above, and again here in an earlier inline-styled form
+             that predates the grid. Nobody spotted it because a duplicate reads as a long
+             card rather than as a bug, and the two copies were far enough apart in the
+             source to look like different fields. Found by deleting the grid copy and
+             watching a test that should have failed pass instead -- the second copy was
+             keeping it green. The grid versions are the ones kept: labelled, class-styled,
+             and beside the rest of the assessment. -->
+
         <!-- The screen's own subtitle said "Findings can be waived" and they could not:
              this renderer is bespoke, and the waiver control lived only inside the shared
              renderFinding. A VAPT finding could be waived from the Findings screen and
              nowhere near the assessment that produced it. Added here rather than by routing
              VAPT through the shared renderer, which would have traded the CVSS vector, the
              attack scenario and the proof of concept for a button. -->
+        <!-- The full block, whose job here is the *reason* a vulnerability cannot be fixed
+             automatically -- it names no file, its quote could not be found in the source,
+             it is already waived. The tickable box for the ones that can be fixed is in the
+             header above, so this variant never renders a second tickable box. -->
+        ${renderFixCheckbox(f, 'reasons')}
         ${f.id ? renderWaiveControl(f) : ''}
       </div>
     </div>`;
@@ -9658,6 +9771,17 @@ async function loadAgentRuns(agent) {
             ${r.critical_count ? `<span class="run-gate Red">${r.critical_count} critical</span>` : ''}
             ${r.high_count ? `<span class="run-gate Amber">${r.high_count} high</span>` : ''}` : ''}
             ${!r.product_id ? `<span class="run-gate" title="This run predates the record of which agent produced it, so it is matched on review type alone — another product writing the same review type could appear here">before agents were recorded</span>` : ''}
+            <!-- What the run cost, on the card, so "which of these was expensive" is
+                 answerable by looking rather than by opening eight runs. Rendered only
+                 when the ledger has a figure: a run from before the cost was linked to
+                 its review cost an unknown amount, and a confident "$0.00" beside it
+                 would be a lie about money. Four decimal places because a single-chunk
+                 review really does cost under a cent, and "$0.00" for a run that spent
+                 something reads as free. -->
+            ${r.spend ? `<span class="run-cost" title="${esc(r.spend.calls)} model call(s)
+              · ${esc(r.spend.model || 'model not recorded')}${r.spend.cost_estimated
+                ? ' · this model has no published price, so the figure is estimated' : ''}"
+              >$${Number(r.spend.cost_usd).toFixed(4)}</span>` : ''}
             <span class="run-when">${esc(String(r.created_at || '').slice(0, 16).replace('T', ' '))}</span>
           </div>
           <div class="run-card-meta">${esc(r.input_summary || 'No summary')}</div>
@@ -9707,6 +9831,27 @@ async function openAgentRun(agent, reviewId) {
     // guessing, and so a reopened run is attributed the same way a fresh one is.
     if (!result.review_type) result.review_type = row.review_type || spec.reviewType;
     if (!result.product_id) result.product_id = row.product_id || spec.product;
+    // What the run cost, so a reopened run says it as plainly as a live one does. The
+    // figure could never travel inside `result_json`: it is not known until the model calls
+    // finish, which is after the row has been written. It is read from the billing ledger
+    // instead, and folded into the same `_budget_stats` shape a live run carries so
+    // `renderReviewTransparency` draws it unchanged rather than gaining a second code path.
+    //
+    // Left absent when the server sends nothing. A run from before this link existed cost
+    // an unknown amount, not nothing, and a confident "$0.00" on it would be a lie about
+    // money.
+    if (row.spend && !result._budget_stats) {
+      result._budget_stats = {
+        cost_usd: row.spend.cost_usd,
+        calls: row.spend.calls,
+        input_tokens: row.spend.input_tokens,
+        output_tokens: row.spend.output_tokens,
+        model: row.spend.model,
+        provider: row.spend.provider,
+        billable: (row.spend.billable_cost_usd || 0) > 0,
+        cost_estimated: !!row.spend.cost_estimated,
+      };
+    }
     // A stored run renders through exactly the same function as a fresh one, so a reader is
     // never comparing two differently-shaped accounts of the same thing. That claim used to
     // be false for VAPT: a fresh assessment went through `renderVAPTResult` with its CVSS,
@@ -9716,8 +9861,12 @@ async function openAgentRun(agent, reviewId) {
     spec.render(spec.result, result);
     target.insertAdjacentHTML('afterbegin', `
       <div class="cost-note">Reopened from ${esc(String(row.created_at || '').slice(0, 16).replace('T', ' '))} UTC.
-        No model was called and nothing was billed — this is the stored result. The gate below
-        describes the code as it was then.</div>`);
+        <b>Opening it called no model and cost nothing.</b> ${row.spend
+          ? `The run itself cost $${Number(row.spend.cost_usd).toFixed(4)} when it ran, shown
+             below with the rest of what it recorded.`
+          : `What that run cost was not recorded against it, so the figures below do not
+             include a cost — your usage records are where that lives.`}
+        The gate below describes the code as it was then.</div>`);
     // The list is above the result now, so bring the answer up rather than leaving the
     // reader to guess that something appeared below the fold.
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -9968,6 +10117,10 @@ async function runReviewFromQuote(agent) {
     }
     if (agent === 'vapt') renderVAPTResult(target, result);
     else renderResult(target, result);
+    // The async path refreshes the history from `pollReviewJob`; this one never did, so a
+    // small synchronous run left its own screen's "Previous runs" list a run behind until
+    // you navigated away and back.
+    loadAgentRuns(agent);
     loadDashboard();
   } catch (e) {
     showError(target, e.message);

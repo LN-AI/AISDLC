@@ -136,7 +136,14 @@ def start_server(port, db_path, stub_llm):
 # Stub the gateway before the app imports it, so no review can reach a provider even by
 # accident. A stubbed reply is still a *shaped* reply, so the renderers get real work to do.
 from backend.services import llm_gateway
+from backend import config as _cfg
 def _stub(system_prompt, user_content, schema, override=None, max_tokens=None, **kw):
+    # Token usage is recorded as a real call would, because otherwise every run in this
+    # examination costs zero and nothing about the money reaching the screen can be
+    # checked at all -- not the spend strip, not the cost on a history card, not the
+    # figure on a reopened run. `_record_usage` lives inside the real `call_tool`, so
+    # replacing that function replaces the metering with it unless this is here.
+    llm_gateway._record_usage('anthropic', _cfg.MODEL, 1800, 420)
     name = schema.get('name', '')
     common = dict(risk_score=10.0, gate_status='Green', summary='Stubbed assessment.',
                   compliance_flags=[], recommendations=['Parameterize queries.'])
@@ -943,6 +950,160 @@ def main():
                           page.locator("#code-runs .run-card.selected").count() == 1,
                           "with two runs at the same gate an unmarked swap reads as a dead control")
                 shot(page, "run-list-persists")
+
+                # ── 13d. What the run cost, remembered ────────────────────
+                #
+                # The whole chain, and the only place it can be checked end to end: the
+                # gateway records tokens, the middleware prices them and names the review
+                # the handler wrote, the ledger keeps the row, and both read paths hand it
+                # back. Every link is invisible from the others.
+                section("13d. A stored run still knows what it cost")
+                # 13b clicked a card, so the panel already holds a *reopened* run by the
+                # time this section starts. Worth stating: a check called "a fresh run says
+                # what it cost" here would be reading the stored path and passing for the
+                # wrong reason -- which the breakage pass caught by failing it when the
+                # ledger link was cut, a link a fresh run does not depend on.
+                _cards = page.locator("#code-runs .run-cost")
+                check("every run in the history is priced on its own card",
+                      _cards.count() >= 1,
+                      "the ledger row named no review, so the card had nothing to show")
+                _card_cost = _cards.first.inner_text()
+                check("...as a real number, not a rounded-away zero",
+                      _card_cost.startswith("$") and float(_card_cost[1:]) > 0,
+                      f"card shows {_card_cost!r}")
+                # Reopen it: the figure has to survive the round trip, and the banner has to
+                # keep "opening this cost nothing" apart from "the run cost this".
+                page.locator("#code-runs .run-card").first.click()
+                page.wait_for_selector("#code-result .cost-note", timeout=30000)
+                page.wait_for_timeout(500)
+                _re = page.locator("#code-result").inner_text()
+                check("REOPENING A RUN STILL SHOWS WHAT THAT RUN COST",
+                      "$" in _re.split("Reopened from")[-1][:600], _re[:500])
+                check("...while saying that opening it was free",
+                      "called no model and cost nothing" in _re, _re[:300])
+                check("...and not claiming the cost was never recorded",
+                      "not recorded against it" not in _re,
+                      "the ledger has this run's cost, so the honest-ignorance branch is "
+                      "the wrong one to take here")
+                shot(page, "run-cost-remembered")
+                # ── 13c. The same, on the screen that never had it ──────
+                #
+                # `#vapt-sources` has existed since the panel was added and nothing ever
+                # filled it: `loadReviewSources` had two call sites and `renderVAPTResult`
+                # was neither of them. Nothing offline could see that -- the DOM-stubbed
+                # renderer test asserts on the HTML a renderer returns, and the panel is
+                # filled by a fetch that happens after it returns. Only a browser notices
+                # that a container stayed empty.
+                section("13c. A VAPT assessment shows its files and can be acted on")
+                goto_page(page, "VAPT")
+                pick_source(page, "vapt", "Upload zip")
+                page.set_input_files("#vapt-zip-input", zip_path)
+                v_ok, _ = estimate(page, "vapt", base=base)
+                check("the VAPT zip priced", v_ok)
+                page.click("#vapt-cost-preview button:has-text('Run the review')")
+                page.wait_for_selector(
+                    "#vapt-result .result-header, #vapt-result .summary-box",
+                    timeout=180000)
+                page.wait_for_timeout(400)
+                vres = page.locator("#vapt-result").inner_text()
+                check("a VAPT result rendered", "Gate" in vres or "Risk Score" in vres,
+                      vres[:300])
+                check("...keeping the CVSS score the assessment is for",
+                      "CVSS" in vres, vres[:400])
+
+                page.wait_for_selector("#vapt-sources .source-panel", timeout=30000)
+                vinv = page.locator("#vapt-sources").inner_text()
+                check("the assessment says which files it read, by name",
+                      "src/auth.py" in vinv, vinv[:400])
+                check("...and states its retention window, like Code Review does",
+                      "kept until" in vinv or "no longer kept" in vinv
+                      or "not kept" in vinv, vinv[:400])
+
+                check("a vulnerability can be selected for fixing",
+                      page.locator("#vapt-result input.fix-check").count() >= 1,
+                      "the assessment records its source and `fix_apply` never looked at "
+                      "the review type, so this was armed everywhere except the screen")
+                check("...from the card header, without expanding it first",
+                      page.locator("#vapt-result .vapt-finding-header .fix-pick-compact")
+                      .count() >= 1,
+                      "these cards are collapsed by default; a box in the body needs every "
+                      "card opened before anything can be ticked")
+                # The click is the point: a checkbox inside a header whose own onclick
+                # toggles the card would tick and collapse in one gesture.
+                _was_open = page.locator("#vapt-result .vapt-finding-body.open").count()
+                page.locator("#vapt-result input.fix-check").first.check()
+                page.wait_for_timeout(300)
+                check("ticking it does not also collapse the card being read",
+                      page.locator("#vapt-result .vapt-finding-body.open").count()
+                      == _was_open,
+                      "the label has to swallow its own click")
+                check("...and the fix bar appears, naming files as well as findings",
+                      page.locator("#fix-bar").count() == 1
+                      and "file(s)" in page.locator("#fix-bar").inner_text(),
+                      "cost is per file, and a bar that counted only findings would make "
+                      "the quote look wrong")
+                shot(page, "vapt-fix-selection")
+
+                # Free, and the only way to learn the price before paying it.
+                page.click("#fix-bar button:has-text('What would this cost?')")
+                page.wait_for_selector("#fix-panel .fix-plan", timeout=60000)
+                fplan = page.locator("#fix-panel").inner_text()
+                check("the fix is quoted before it runs",
+                      "$" in fplan and "files to change" in fplan.lower(), fplan[:400])
+                check("...saying who re-reviews the patch",
+                      "vulnerability assessor" in fplan, fplan[:600])
+                check("...and that nothing is compiled or run",
+                      "compiles" in fplan, fplan[:600])
+                check("...and offering the deliveries this source can actually take",
+                      "zip" in fplan.lower() and "diff" in fplan.lower(), fplan[:800])
+                check("...and not a pull request, which a zip has nowhere to open",
+                      "pull request" not in fplan.lower(),
+                      "offering a control that fails after the money is spent is the "
+                      "pattern this codebase refuses")
+                shot(page, "vapt-fix-plan")
+                # Found by this run, on the Code Review path as much as this one: the fix
+                # bar is fixed to the bottom of the viewport and the panel it opens is tall,
+                # so the panel's own buttons came to rest underneath it and a click on
+                # either hit the bar. Asserted by asking the document what is actually at
+                # the button's centre, which is the only way to see it -- both elements are
+                # correct in isolation and only their stacking is wrong.
+                check("the bar stands down once the quote it asked for is on screen",
+                      page.locator("#fix-bar").count() == 0,
+                      "two action rows at once, one of them fixed over the other")
+                _hit = page.evaluate("""() => {
+                    const btn = [...document.querySelectorAll(
+                        '#fix-panel .cost-actions button')].pop();
+                    if (!btn) return { ok: false, why: 'no action button in the panel' };
+                    btn.scrollIntoView({ block: 'center' });
+                    const r = btn.getBoundingClientRect();
+                    const hit = document.elementFromPoint(
+                        r.left + r.width / 2, r.top + r.height / 2);
+                    return {
+                        ok: !!hit && btn.contains(hit),
+                        why: hit ? `${hit.tagName.toLowerCase()}`
+                                 + `${hit.id ? '#' + hit.id : ''}`
+                                 + `${hit.className ? '.' + String(hit.className).split(' ').join('.') : ''}`
+                                 : 'nothing at that point',
+                        rect: [Math.round(r.top), Math.round(r.bottom)],
+                        vh: window.innerHeight,
+                    };
+                }""")
+                check("the panel's own action buttons can actually be clicked",
+                      _hit["ok"],
+                      f"a click at the button's centre lands on {_hit['why']} instead "
+                      f"(button y {_hit.get('rect')}, viewport {_hit.get('vh')})")
+                page.click("#fix-panel button:has-text('Cancel')")
+                page.wait_for_timeout(200)
+                check("...and cancelling puts the quote away",
+                      page.locator("#fix-panel").count() == 0,
+                      "a quote that cannot be dismissed reads as a committed decision")
+                check("...and hands the actions back, keeping what was ticked",
+                      page.locator("#fix-bar").count() == 1
+                      and page.locator("#vapt-result input.fix-check:checked").count() == 1,
+                      "cancelling a quote means 'not at this price', not 'forget which "
+                      "vulnerabilities I picked' -- and with no bar the selection is "
+                      "stranded, tickable but unactionable")
+
 
 
             section("14. The project field is a caption, not a form row")

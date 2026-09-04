@@ -228,9 +228,15 @@ it in `unfixed_finding_titles` with a short reason instead of guessing.
         what forced the agent to search the file for the problem instead of being pointed at
         it.
         """
+        # CWE and OWASP category go on the head line when present. They are only ever set by
+        # the vulnerability assessor, so a code-review finding is unaffected -- and for a
+        # VAPT finding they are the standard name for the class of bug, which is a better
+        # instruction to a fixer than the model's own prose title.
+        refs = " ".join(x for x in (f.get("cwe_id", ""), f.get("owasp_category", "")) if x)
         head = (
             f"- [{f.get('severity', '?')}/5 {f.get('risk_level', '')}] "
             f"{f.get('control_id', '')} {f.get('title', '')}"
+            + (f" [{refs}]" if refs else "")
         )
         parts = [head]
         line = f.get("line_start")
@@ -242,6 +248,19 @@ it in `unfixed_finding_titles` with a short reason instead of guessing.
             parts.append(f"  Offending code (verbatim):\n{quoted}")
         if f.get("description"):
             parts.append(f"  Why: {f['description']}")
+        # How the vulnerability is actually reached. Set by the vulnerability assessor and
+        # absent from a code-review finding. Worth the tokens: a patch that sanitises the
+        # wrong end of the path closes nothing, and the attack scenario is the only thing in
+        # the finding that says which end is which. Capped for the same reason `evidence` is
+        # -- a proof of concept can be a multi-step script, and this call already carries a
+        # whole file.
+        if f.get("attack_scenario"):
+            parts.append(f"  How it is exploited: {str(f['attack_scenario'])[:600]}")
+        if f.get("proof_of_concept"):
+            poc = "\n".join(
+                "    " + l for l in str(f["proof_of_concept"]).strip().splitlines()[:6]
+            )[:600]
+            parts.append(f"  Proof of concept:\n{poc}")
         if f.get("recommendation"):
             parts.append(f"  Recommended fix: {f['recommendation']}")
         if f.get("confidence") and f["confidence"] != "High":

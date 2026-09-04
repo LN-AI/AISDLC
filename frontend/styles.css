@@ -2470,6 +2470,17 @@ table.code-view tr:hover td.src { background: rgba(255,255,255,.04); }
   margin-left: auto; font-size: 11px; color: var(--text-muted);
   font-variant-numeric: tabular-nums; white-space: nowrap;
 }
+/* What the run cost, grouped with its timestamp at the right-hand end. The auto margin
+   moves from `.run-when` to this element when it is present, and the adjacent-sibling rule
+   below wins on specificity (three classes to two) so the timestamp does not get a second
+   auto margin and split the pair apart. Tabular numerals so a column of costs lines up on
+   the decimal point, which is the only way "which of these was expensive" is answerable at
+   a glance. */
+.run-card-head .run-cost {
+  margin-left: auto; font-size: 11px; color: var(--text-muted);
+  font-variant-numeric: tabular-nums; white-space: nowrap; cursor: help;
+}
+.run-card-head .run-cost + .run-when { margin-left: 8px; }
 .run-card-meta { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
 .run-gate {
   font-size: 10px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
@@ -2506,6 +2517,17 @@ table.code-view tr:hover td.src { background: rgba(255,255,255,.04); }
 .fix-pick label { display: inline-flex; gap: 7px; align-items: center; cursor: pointer; }
 .fix-pick-off label { cursor: not-allowed; color: var(--text-muted); }
 .fix-pick-off .field-hint { margin-top: 3px; }
+/* The header variant, for cards whose body is collapsed by default (VAPT). Sits with the
+   CVSS/CWE chips, so it is sized and spaced like one rather than like a form control. */
+.fix-pick-compact {
+  display: inline-flex; gap: 5px; align-items: center; cursor: pointer;
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+  padding: 2px 8px; border-radius: 10px; margin-left: 4px;
+  border: 1px solid var(--border); color: var(--text-muted);
+}
+.fix-pick-compact:hover { border-color: var(--accent); color: var(--accent); }
+.fix-pick-compact input { cursor: pointer; margin: 0; }
+.fix-unavailable { margin: 10px 0 16px; }
 
 /* Docked, because the findings list is long and the selection is made while scrolling
    through it -- a button at the bottom would be found only by accident. */
