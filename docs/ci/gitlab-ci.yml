@@ -1,0 +1,66 @@
+# Review every merge request, publish the findings, and block on a Red gate.
+#
+# Copy into `.gitlab-ci.yml`, or `include:` it. Set two masked CI/CD variables:
+#   LM_SDLC_URL      https://sdlc.example.com
+#   LM_SDLC_API_KEY  from the API Keys page — it carries the project, plan and budget
+#
+# There is no native GitLab integration in this platform (no webhook receiver, no merge
+# request comments, no commit statuses — those are GitHub-only). SARIF is the interop path,
+# and it is a good one: GitLab reads it as a SAST report and shows the findings on the merge
+# request's Security tab. Everything below is the client plus GitLab's own report handling.
+lm-sdlc-review:
+  stage: test
+  image: python:3.12-slim
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    # A ceiling per merge request. The monthly cap on the API key is enforced server-side
+    # regardless; this stops one enormous change spending it all in a single pipeline.
+    MAX_USD: "2.00"
+  before_script:
+    - pip install --quiet httpx
+  script:
+    # ── 1. Price it first. Calls no model, spends nothing. ────────────────
+    #
+    # The merge request has no GitHub URL to hand over, so the source is the diff GitLab
+    # already has: `base...head` computed locally and sent as a unified diff. `--repo`
+    # would need a GitHub URL, which is the shape this platform fetches.
+    - git fetch --quiet origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - git diff "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME...HEAD" > changes.diff
+    - |
+      if [ ! -s changes.diff ]; then
+        echo "No changes against $CI_MERGE_REQUEST_TARGET_BRANCH_NAME — nothing to review."
+        exit 0
+      fi
+    - python scripts/lmsdlc.py --json review --diff changes.diff --quote-only > quote.json
+    - cat quote.json
+    - |
+      python - <<'PY'
+      import json, os, sys
+      ceiling = float(json.load(open("quote.json"))["estimate"]["ceiling_usd"])
+      limit = float(os.environ["MAX_USD"])
+      print(f"Ceiling for this merge request: ${ceiling:.2f} (limit ${limit:.2f})")
+      if ceiling > limit:
+          sys.exit(f"Refusing: ${ceiling:.2f} is over the ${limit:.2f} per-MR limit set in "
+                   f".gitlab-ci.yml. Narrow the change, or raise MAX_USD deliberately.")
+      PY
+
+    # ── 2. Review. The exit code is what blocks the merge. ───────────────
+    #
+    # No `continue-on-error` equivalent is needed: `artifacts: when: always` below
+    # publishes the report whether this passes or fails, so a Red gate still shows the
+    # developer *why* they are blocked.
+    - python scripts/lmsdlc.py review --diff changes.diff
+        --sarif gl-sast-report.sarif --fail-on red
+  artifacts:
+    # `when: always` matters. A finding nobody can see is a finding nobody fixes, and a
+    # blocked merge request with no visible reason is how a check gets disabled.
+    when: always
+    reports:
+      # GitLab 15.3+ reads SARIF directly. On older versions, drop `reports:` and keep the
+      # file as a plain artifact — it is still readable, just not rendered in the MR.
+      sast: gl-sast-report.sarif
+    paths:
+      - gl-sast-report.sarif
+      - quote.json
+    expire_in: 30 days

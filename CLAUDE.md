@@ -72,7 +72,7 @@ python run.py
 
 ## Tests: smoke scripts, no framework
 
-There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These eight scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
+There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
 
 ```
 python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
@@ -81,6 +81,7 @@ python scripts/smoke_review_sources.py  # zip/repo/branch intake, cost preview, 
 python scripts/smoke_modernization.py   # run lifecycle, dependency order, crash/resume (much the longest)
 python scripts/smoke_governance.py      # Core SDLC Review stages, reports, gate fan-in, swarm
 python scripts/smoke_llm_providers.py   # admin LLM connections: key never returned, resolution order
+python scripts/smoke_cli.py             # scripts/lmsdlc.py driven as a subprocess against a real server
 node   scripts/smoke_render.js          # frontend result rendering (DOM-stubbed, no deps)
 node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans screen product picker
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
@@ -120,6 +121,19 @@ The Python ones drive the real app through FastAPI's `TestClient` against a thro
 
 - `smoke_llm_providers.py` stubs the *provider* functions (`_call_anthropic` / `_call_openai`) rather than `call_tool`, because the resolution logic under test lives inside `call_tool` — stubbing that would stub out the thing being tested.
 - `smoke_plan_picker.js` takes a `products.json` argument (a saved `GET /api/v1/products` response) and **there is no such file in the repo**, so it dies with `ENOENT` until you capture one from a running server. `smoke_render.js` needs no argument — it defaults to `frontend/app.js`.
+
+Two of the scripts are neither tests nor throwaway tooling, and both exist because a
+caveat asked for evidence rather than an edit:
+
+- **`scripts/measure_event_loop.py`** answers C-31. It starts a server whose model gateway
+  sleeps, fires one review, and times `GET /` alongside it — so "does a long review freeze
+  the server" has a number instead of an opinion. It found that it did (`GET /` blocked
+  5.45s of a 6s review) and confirmed the fix (0.30s). Offline, no key. Re-run it before
+  claiming anything about concurrency.
+- **`scripts/lmsdlc.py`** is the CLI, and the thing CI actually runs. `--fail-on red` is
+  what makes a review a build step; `--sarif` is how findings reach GitHub's Security tab
+  without a GitHub App. `docs/ci/` has ready workflows for GitHub Actions and GitLab CI.
+  `smoke_cli.py` drives it as a subprocess, which is the only way to check an exit code.
 
 Everything else under `scripts/` is tooling, not tests; don't run it expecting a free offline check. `eval_code_review.py` measures the agent against a labelled corpus and **spends real money**. `build_run.py` compiles a converted codebase with the local .NET SDK and posts the verdict back — the app itself prints that command into modernization checkpoints and the UI (`build_results.py`, `runtime.py`, `frontend/app.js`), so it has to keep working. `drive_modernization.py` walks a run through the live HTTP API as the browser does; `audit_source_analysis.py` reports what the deterministic layer concludes about a zip before any spend.
 

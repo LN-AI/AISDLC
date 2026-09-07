@@ -114,6 +114,14 @@ several agents in parallel behind one policy-enforced gate decision.
   OpenAI-compatible credentials (`PUT /api/v1/llm-config`, X-API-Key auth) instead of the
   platform's shared account, or override a single call via `llm_provider` / `llm_api_key` /
   `llm_base_url` / `llm_model` fields on any agent request.
+- **CLI and CI** — `scripts/lmsdlc.py` runs a review from a terminal or any pipeline.
+  `--fail-on red` exits non-zero on a Red gate, so the review *is* the build step rather
+  than a report beside it; `--sarif out.sarif` writes the format GitHub code scanning and
+  GitLab ingest, so findings land in the Security tab **without needing a GitHub App**; and
+  `--quote-only` prices the run without calling a model, so a pipeline can refuse to spend.
+  Ready workflows for GitHub Actions and GitLab CI are in [`docs/ci/`](docs/ci/README.md),
+  including a per-pull-request cost ceiling. What it deliberately does *not* do — inline
+  diff annotations, incremental review — is listed there too.
 - **No-code integration** — importable [n8n](https://n8n.io) workflow templates (PR gate, nightly
   compliance sweep, Jira requirement gate) are in [`docs/n8n-workflows/`](docs/n8n-workflows/) for
   teams who'd rather wire this up visually than write CI scripts.
