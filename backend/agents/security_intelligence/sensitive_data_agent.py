@@ -1,3 +1,4 @@
+from backend.agents import attest
 from backend.agents.base_agent import BaseAgent
 from backend.controls.control_library import ALL_CONTROLS
 from backend.services import llm_gateway
@@ -137,4 +138,33 @@ Available controls for reference:
 Identify every instance of PII, PHI, PCI, credentials, location data, or other regulated sensitive data.
 For each finding, provide the exact location, an obfuscated sample, and the regulation reference."""
 
-        return self._call_claude(prompt)
+        result = self._call_claude(prompt)
+        result["agent_name"] = self.agent_name
+        # This agent never went through `BaseAgent.review`, so it had none of the
+        # protections that method now applies: it overrides `_call_claude` and `scan`
+        # calls it directly. Two of them apply here and matter:
+        #
+        #  * **A truncated response is refused, not stored.** A scan that came back
+        #    cut off used to be saved with the schema's default gate, which reads as
+        #    "we looked for PHI and credentials and found none" — the most costly wrong
+        #    answer this particular agent can give.
+        #  * **The gate is a floor.** A hardcoded credential reported at severity 5
+        #    cannot come out Green.
+        #
+        # Evidence verification is off, and here the reason is stronger than elsewhere:
+        # this schema asks for `sample` to be an **obfuscated** sample with the real data
+        # replaced by `[REDACTED]`. A substring check against the source is therefore
+        # guaranteed to fail for every correctly-masked finding, so turning it on would
+        # discard exactly the findings that followed instructions. `location` is a
+        # "file, function, or line reference" — a description, not a quote — for the same
+        # reason it is elsewhere. See `backend/agents/attest.py`.
+        #
+        # No `claim_key`: this product takes one text artifact (`content` or
+        # `github_file_url`), never a file list, so there is no per-file coverage to
+        # reconcile.
+        #
+        # `artifact=content`, not `prompt`: the degeneracy threshold is about the size of
+        # the thing under review, and padding it with the control summary and preamble we
+        # wrote ourselves would let a one-line artifact clear the 200-character floor and
+        # escape the check.
+        return attest.attest(result, agent_name=self.agent_name, artifact=content)

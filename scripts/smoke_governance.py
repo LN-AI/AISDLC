@@ -708,6 +708,91 @@ def main_():
     check("...and reconciles the claim instead",
           'claim_key="files_scanned"' in _csrc11, _csrc11[-400:])
 
+    # -- 12. The attestation fires, not just appears in the source -----------
+    #
+    # Section 11 proves `attest.attest(` is written into each agent by reading its source.
+    # That is worth having, but it cannot tell you the call *works*: a wrong `gate_key`
+    # would leave a Part 11 verdict unfloored and the source grep would still pass, because
+    # the text is there either way. `SensitiveDataAgent` is the reason this matters -- it
+    # overrides `_call_claude`, so it was the one agent the shared `base_agent` edit did not
+    # reach (D-346), and only a behavioural check distinguishes "wired" from "written".
+    #
+    # So this drives the three regulated agents with a stubbed model and asserts the result.
+    section("12. ...and the attestation fires when the model answers")
+
+    from backend.agents.security_intelligence.cfr21_agent import CFR21VerificationAgent
+    from backend.agents.security_intelligence.gxp_document_agent import GxPDocumentAgent
+    from backend.agents.security_intelligence.sensitive_data_agent import SensitiveDataAgent
+
+    _CRIT12 = {"control_id": "SEC-003", "severity": 5, "risk_level": "Critical",
+               "title": "no audit trail", "description": "", "recommendation": "",
+               "is_blocking": True}
+    # Long enough to clear the 200-character degeneracy floor, which is about the size of
+    # the artifact under review rather than the prompt built around it.
+    _FILES12 = [{"path": "app/audit.py", "content": "def log_event(e):\n    pass\n" * 20},
+                {"path": "app/sign.py", "content": "def sign(u):\n    return True\n" * 20}]
+
+    _reply12 = {}
+
+    def _stub12(system_prompt, user_content, tool_schema, llm_override=None, max_tokens=None):
+        return dict(_reply12)
+
+    _real12, llm_gateway.call_tool = llm_gateway.call_tool, _stub12
+    try:
+        # A model that grades its own Critical as Green. The aliased-key case: this schema
+        # calls the verdict `overall_gate_status`, which `reconcile_gate` does not know.
+        _reply12 = {"findings": [dict(_CRIT12)], "overall_gate_status": "Green",
+                    "overall_risk_score": 0.0, "summary": "s", "files_scanned": []}
+        _out12 = CFR21VerificationAgent().verify(files=_FILES12, system_description="LIMS")
+        check("the Part 11 verifier really floors its own gate, not just imports the floor",
+              _out12.get("overall_gate_status") == "Red", str(_out12.get("overall_gate_status")))
+        check("...and under the plain key too, so screen and stored record agree",
+              _out12.get("gate_status") == "Red", str(_out12.get("gate_status")))
+        check("the Part 11 verifier leaves an unstated file list empty",
+              _out12.get("files_scanned") == [], str(_out12.get("files_scanned")))
+        check("...and reports the gap it did not fill",
+              (_out12.get("coverage_claim") or {}).get("files_supplied") == 2
+              and (_out12.get("coverage_claim") or {}).get("files_unclaimed") == 2,
+              str(_out12.get("coverage_claim")))
+
+        _reply12 = {"findings": [], "overall_gate_status": "Green", "overall_risk_score": 0.0,
+                    "summary": "", "files_scanned": []}
+        try:
+            CFR21VerificationAgent().verify(files=_FILES12, system_description="LIMS")
+            check("a truncated Part 11 response does not become a compliance report", False)
+        except RuntimeError:
+            check("a truncated Part 11 response does not become a compliance report", True)
+
+        _reply12 = {"findings": [dict(_CRIT12, title="unsigned SOP")],
+                    "overall_gate_status": "Green", "overall_risk_score": 0.0, "summary": "s"}
+        _out12 = GxPDocumentAgent().check(documents=[{"path": "SOP-1.md",
+                                                      "content": "text\n" * 60}])
+        check("the GxP document check really floors its own gate",
+              _out12.get("overall_gate_status") == "Red", str(_out12.get("overall_gate_status")))
+
+        # The agent D-346 is about. Its schema uses the plain keys, so nothing is aliased --
+        # what is being checked is that `scan` reaches `attest` at all.
+        _reply12 = {"findings": [dict(_CRIT12, title="hardcoded database password")],
+                    "gate_status": "Green", "risk_score": 0.0, "summary": "s"}
+        _out12 = SensitiveDataAgent().scan("PASSWORD = 'hunter2'\n" * 30)
+        check("the sensitive-data scan really floors its own gate",
+              _out12.get("gate_status") == "Red", str(_out12.get("gate_status")))
+
+        _reply12 = {"findings": [], "gate_status": "Green", "risk_score": 0.0, "summary": ""}
+        try:
+            SensitiveDataAgent().scan("PASSWORD = 'hunter2'\n" * 30)
+            check("a truncated sensitive-data scan is not stored as 'nothing found'", False)
+        except RuntimeError:
+            check("a truncated sensitive-data scan is not stored as 'nothing found'", True)
+    finally:
+        llm_gateway.call_tool = _real12
+
+    # Nothing here re-checks that the two regulated `/api/v1` responses carry
+    # `coverage_claim`/`attested`/`model_gate_status` (D-347): section 11 already does it
+    # with `inspect.getsource` on `run_cfr21_verification` and `run_gxp_document_check`,
+    # which is stricter than searching the file text.
+
+
     print("\n" + "-" * 60)
     if _failures:
         print(f"FAILED: {len(_failures)} of {_checks} checks")
