@@ -501,6 +501,213 @@ def main_():
 
     # ── done ───────────────────────────────────────────────────────────────
     stack.close()
+    # ── 11. What every assessment owes its reader ────────────────────────
+    #
+    # Code Review and VAPT go through `chunked_review`, which refuses a truncated response
+    # and floors the gate. Every other assessment returned whatever the model said. The
+    # worst instance was a regulated one: the 21 CFR Part 11 verifier back-filled
+    # `files_scanned` from its own input list when the model did not say what it read, so an
+    # FDA report could state that 400 files were verified when nobody knew whether they
+    # were.
+    #
+    # The judgement in `attest.py` is which protections are universal and which are not, so
+    # that is what most of this section is about.
+    section("11. Attestation — no assessment claims what nobody checked")
+
+    from backend.agents import attest as _at11
+    from backend.agents import base_agent as _ba11
+
+    _FILES11 = [{"path": "app/a.py", "content": "x = 1\n"},
+                {"path": "app/b.py", "content": "y = 2\n"},
+                {"path": "app/c.py", "content": "z = 3\n"}]
+
+    # ── The claim that started this ──────────────────────────────────────
+    _silent = _at11.coverage_claim({"files_scanned": []}, _FILES11)
+    check("a model that named no files is not credited with all of them",
+          _silent["files_claimed"] == 0 and _silent["files_supplied"] == 3,
+          str(_silent))
+    check("...and the report says so in words an auditor can act on",
+          "not the same as having examined all of them" in _silent["note"],
+          _silent["note"])
+    check("...and does not call the coverage complete",
+          _silent["complete"] is False)
+
+    _partial = _at11.coverage_claim({"files_scanned": ["app/a.py"]}, _FILES11)
+    check("a partial claim names the gap", _partial["files_unclaimed"] == 2
+          and set(_partial["unclaimed_sample"]) == {"app/b.py", "app/c.py"},
+          str(_partial))
+    check("...and says to treat the rest as unexamined",
+          "unexamined" in _partial["note"], _partial["note"])
+
+    _all = _at11.coverage_claim(
+        {"files_scanned": ["app/a.py", "app/b.py", "app/c.py"]}, _FILES11)
+    check("a complete claim is reported as complete", _all["complete"] is True, str(_all))
+
+    _invented = _at11.coverage_claim(
+        {"files_scanned": ["app/a.py", "app/nope.py"]}, _FILES11)
+    check("a file named but never supplied is surfaced",
+          _invented["files_not_supplied"] == 1
+          and _invented["not_supplied_sample"] == ["app/nope.py"], str(_invented))
+    check("...with a warning, because it usually means an invented filename",
+          "invented" in _invented["note"], _invented["note"])
+
+    _paste = _at11.coverage_claim({"files_scanned": []}, [])
+    check("a pasted artifact has no per-file coverage to report, and says that",
+          _paste["files_supplied"] == 0 and "pasted artifact" in _paste["note"],
+          str(_paste))
+
+    # ── Degeneracy: the failure that is hardest to notice ────────────────
+    _big11 = "x = 1\n" * 200
+    _raised = ""
+    try:
+        _at11.attest({"findings": [], "summary": "", "gate_status": "Green"},
+                     agent_name="Test Agent", artifact=_big11)
+    except RuntimeError as exc:
+        _raised = str(exc)
+    check("a response with no findings and no summary is refused, not stored",
+          "returned an empty result" in _raised, _raised[:200])
+    check("...naming the agent, so the error says which one",
+          "Test Agent" in _raised, _raised[:120])
+
+    _ok11 = _at11.attest({"findings": [], "summary": "Nothing found.",
+                          "gate_status": "Green"},
+                         agent_name="Test Agent", artifact=_big11)
+    check("a genuinely clean result with a summary is kept",
+          _ok11["gate_status"] == "Green")
+    _tiny = _at11.attest({"findings": [], "summary": "", "gate_status": "Green"},
+                         agent_name="Test Agent", artifact="x = 1")
+    check("a trivial artifact may legitimately produce nothing",
+          _tiny["gate_status"] == "Green",
+          "rejecting these would break every caller that probes an endpoint with a "
+          "one-liner")
+
+    # ── The gate floor, and the aliased key two schemas use ─────────────
+    _crit = {"findings": [{"severity": 5, "title": "Critical thing", "is_blocking": True}],
+             "summary": "One problem.", "gate_status": "Green", "risk_score": 5.0}
+    _floored = _at11.attest(_crit, agent_name="Test Agent", artifact=_big11)
+    check("a Critical cannot come out Green", _floored["gate_status"] == "Red",
+          _floored["gate_status"])
+    check("...and the model's own answer is kept, so the disagreement can be measured",
+          _floored["model_gate_status"] == "Green", str(_floored.get("model_gate_status")))
+
+    _overall = {"findings": [{"severity": 5, "title": "Critical", "is_blocking": True}],
+                "summary": "One problem.", "overall_gate_status": "Green",
+                "overall_risk_score": 5.0}
+    _fl2 = _at11.attest(_overall, agent_name="Part 11", artifact=_big11,
+                        gate_key="overall_gate_status", risk_key="overall_risk_score")
+    check("the aliased gate key is floored too", _fl2["overall_gate_status"] == "Red",
+          "the Part 11 verifier and the GxP document check name their verdict "
+          "`overall_gate_status`, so `reconcile_gate` would not have seen it at all")
+    check("...and written back under both names, so no screen can disagree with the record",
+          _fl2["gate_status"] == "Red" and _fl2["overall_gate_status"] == "Red",
+          f"gate_status={_fl2.get('gate_status')} "
+          f"overall={_fl2.get('overall_gate_status')}")
+
+    # ── Evidence verification is opt-in, and this is why ────────────────
+    _described = {
+        "findings": [{"severity": 4, "title": "No audit trail",
+                      "evidence": "app/a.py / save_record() / no audit call",
+                      "is_blocking": True}],
+        "summary": "A gap.", "gate_status": "Amber",
+    }
+    _off = _at11.attest(dict(_described), agent_name="Part 11", artifact=_big11)
+    check("a described (non-quoted) evidence field survives when verification is off",
+          len(_off["findings"]) == 1 and not _off["discarded_findings"],
+          "this schema asks for 'File path / function / code pattern', so a substring "
+          "check would discard a correct finding for being phrased as instructed")
+    check("...and no verification claim is made about it",
+          _off["findings"][0].get("evidence_verified") is None,
+          "False would mean 'we checked and could not confirm', which is untrue of a "
+          "finding nobody checked -- the same class of untruth as the back-filled file list")
+    check("...and the result records that quotes were not checked",
+          _off["attested"]["evidence_verified"] is False, str(_off["attested"]))
+
+    _on = _at11.attest(dict(_described), agent_name="Code", artifact=_big11,
+                       verify_evidence=True)
+    check("with verification on, the same finding is discarded",
+          not _on["findings"] and len(_on["discarded_findings"]) == 1,
+          "which is correct for a schema that demanded a verbatim quote, and wrong for one "
+          "that did not -- hence the flag")
+
+    _absent = _at11.attest(
+        {"findings": [{"severity": 3, "title": "There is no threat model",
+                       "is_blocking": False}],
+         "summary": "Design gap.", "gate_status": "Amber"},
+        agent_name="Architecture", artifact=_big11, verify_evidence=True)
+    check("a finding with no evidence at all is never discarded",
+          len(_absent["findings"]) == 1,
+          "a design-level finding has no line to quote, and dropping it would delete real "
+          "issues the moment a finding was about an absence")
+
+    # ── A generative result is not judged ───────────────────────────────
+    _gen = _at11.attest({"scaffold": "...", "files": ["a.py"]},
+                        agent_name="Codegen", artifact=_big11)
+    check("a result with no findings and no gate is left alone",
+          "gate_status" not in _gen and "discarded_findings" not in _gen,
+          "inventing a verdict for generated work would be judging something nobody asked "
+          "to have judged")
+
+    # ── And it is actually wired in, which is the part that matters ─────
+    import inspect as _i11
+    for _name11 in ("review", "review_architecture", "review_security"):
+        _owner = next(c for c in (_ba11.BaseAgent, _ba11.ArchitectureBaseAgent,
+                                  _ba11.SecurityReviewBaseAgent)
+                      if _name11 in c.__dict__)
+        _src11 = _i11.getsource(_owner.__dict__[_name11])
+        check(f"`{_name11}` attests its result", "attest.attest(" in _src11,
+              "this is the shared method for the requirement, prompt, compliance, "
+              "sensitive-data, provenance, triage, security and architecture products -- "
+              "one edit covers all of them")
+        check(f"...against the artifact, not the prompt we built around it",
+              "artifact=content" in _src11,
+              "padding the degeneracy threshold with our own context would let a one-line "
+              "artifact clear the 200-character floor and escape the check")
+        check(f"...and does not claim to have verified quotes it was never given",
+              "verify_evidence" not in _src11,
+              "no schema reached by these methods asks for a verbatim quote")
+
+    # Two products that the `base_agent` edit does **not** reach, each for its own reason.
+    # Both were found by looking for what the shared method misses rather than by assuming
+    # it covered everything.
+    from backend.agents.security_intelligence import sensitive_data_agent as _sd11
+    _sdsrc11 = _i11.getsource(_sd11.SensitiveDataAgent.scan)
+    check("the sensitive-data scan attests, even though it never calls `review`",
+          "attest.attest(" in _sdsrc11,
+          "it overrides `_call_claude` and `scan` calls it directly, so the protections "
+          "added to `BaseAgent.review` pass it by -- and a truncated 'no PHI found' is the "
+          "most costly wrong answer this particular agent can give")
+    check("...and does not verify evidence, because its sample is deliberately masked",
+          "verify_evidence" not in _sdsrc11,
+          "the schema asks for an 'Obfuscated sample (mask real data)', so a substring "
+          "check against the source is guaranteed to fail for every correctly-masked "
+          "finding -- it would discard exactly the findings that followed instructions")
+
+    # The API surface. These two endpoints build their response by hand rather than through
+    # `_wrap`'s passthrough, so a new field reaches the browser (which reads the stored
+    # result) and not the API -- and the API is what a compliance pipeline reads.
+    from backend.routes import v1_agents as _v11
+    for _fn11 in (_v11.run_cfr21_verification, _v11.run_gxp_document_check):
+        _src11 = _i11.getsource(_fn11)
+        check(f"`{_fn11.__name__}` returns the coverage claim to an API caller",
+              '"coverage_claim"' in _src11,
+              "an integrator seeing an empty `files_scanned` needs this to tell them it "
+              "means 'the assessment did not say' rather than 'nothing was scanned' -- "
+              "without it the honest answer looks like a bug and invites someone to "
+              "re-add the back-fill")
+        check(f"...and which checks were applied", '"attested"' in _src11)
+        check(f"...and the model's verdict before the floor",
+              '"model_gate_status"' in _src11,
+              "so a reader can see when the arithmetic and the model disagreed")
+
+    from backend.agents.security_intelligence import cfr21_agent as _c11
+    _csrc11 = _i11.getsource(_c11.CFR21VerificationAgent.verify)
+    check("the Part 11 verifier no longer back-fills its own coverage",
+          'result["files_scanned"] = [f.get("path"' not in _csrc11,
+          "this is the line that turned 'the model did not tell us' into '400 files were "
+          "verified' inside an FDA report")
+    check("...and reconciles the claim instead",
+          'claim_key="files_scanned"' in _csrc11, _csrc11[-400:])
+
     print("\n" + "-" * 60)
     if _failures:
         print(f"FAILED: {len(_failures)} of {_checks} checks")

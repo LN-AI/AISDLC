@@ -114,6 +114,14 @@ several agents in parallel behind one policy-enforced gate decision.
   OpenAI-compatible credentials (`PUT /api/v1/llm-config`, X-API-Key auth) instead of the
   platform's shared account, or override a single call via `llm_provider` / `llm_api_key` /
   `llm_base_url` / `llm_model` fields on any agent request.
+- **No assessment claims what nobody checked** — every agent's result now refuses a
+  truncated model response instead of storing it as a clean pass, and floors its gate
+  against its own findings so a Critical cannot come out Green. Previously only Code Review
+  and the vulnerability assessor did either. The compliance products also stop asserting
+  coverage: a 21 CFR Part 11 report used to fill in "files scanned" from its own input list
+  when the model didn't say what it read — so it could state that 400 files were verified
+  when nobody knew. It now states the gap, including any file the assessment named that was
+  never supplied.
 - **Findings on the lines they are about** — with a GitHub App configured, a
   pull-request review creates a **check run** with each finding annotated in the diff, in
   addition to the commit status (never instead of it, so branch protection that already

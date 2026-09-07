@@ -4273,7 +4273,12 @@ function renderCFR21Result(targetId, r) {
     ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
-    ${scanned.length ? `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">Files scanned (${scanned.length}): ${scanned.map(esc).join(', ')}</p>` : ''}
+    ${scanned.length
+      ? `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">Files the
+         assessment names (${scanned.length}): ${scanned.map(esc).join(', ')}</p>`
+      : `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">The assessment did
+         not name the files it examined. That is not the same as it having examined all of
+         them — see the coverage note above.</p>`}
 
     <div class="section-title" style="margin-top:20px">Assessments</div>
     ${renderAssessment('Audit Trail (§11.10(e))', r.audit_trail_assessment)}
@@ -10701,6 +10706,46 @@ function renderReviewTransparency(r) {
         it and where that rule lives. Nothing is deleted, so you can always overrule it.</div>
       ${r.suppressed_findings.map(f => renderFinding(f)).join('')}
     </details>`;
+  }
+
+  // How much of the input this assessment actually accounts for. The important case is a
+  // compliance report: this used to be filled in from our own input list when the model
+  // did not say what it read, so a Part 11 report could state that 400 files were verified
+  // when nobody knew whether they were. The gap is now stated instead.
+  const _cc = r.coverage_claim;
+  if (_cc && _cc.files_supplied) {
+    const short = _cc.complete;
+    html += `<div class="review-panel${short ? '' : ' panel-suppressed'}">
+      <b>${_cc.files_claimed} of ${_cc.files_supplied} supplied file(s) are named in this
+      assessment.</b>
+      <div class="field-hint">${esc(_cc.note || '')}</div>
+      ${_cc.unclaimed_sample?.length ? `<details><summary>Not named
+        (${_cc.files_unclaimed})</summary><div class="field-hint">
+        ${_cc.unclaimed_sample.map(p => `<code>${esc(p)}</code>`).join(' ')}
+        ${_cc.files_unclaimed > _cc.unclaimed_sample.length
+          ? ` …and ${_cc.files_unclaimed - _cc.unclaimed_sample.length} more` : ''}
+        </div></details>` : ''}
+      ${_cc.not_supplied_sample?.length ? `<details open><summary>Named but never supplied
+        (${_cc.files_not_supplied}) — treat findings against these with suspicion</summary>
+        <div class="field-hint">
+        ${_cc.not_supplied_sample.map(p => `<code>${esc(p)}</code>`).join(' ')}
+        </div></details>` : ''}
+    </div>`;
+  }
+
+  // Which protections this run got. A reader comparing two assessments needs to be able to
+  // tell them apart: "the gate was floored" and "every quote was checked" are different
+  // guarantees, and only two products on this platform have the second.
+  const _at = r.attested;
+  if (_at && typeof _at === 'object') {
+    const had = [];
+    if (_at.degeneracy_refused) had.push('a truncated response would have been refused');
+    if (_at.gate_floored) had.push('the gate was floored against the findings');
+    had.push(_at.evidence_verified
+      ? 'every quote was checked against the source'
+      : 'quotes were <b>not</b> checked — this agent\'s schema does not ask for verbatim evidence');
+    html += `<div class="field-hint" style="margin-top:8px">Checks applied to this result:
+      ${had.join('; ')}.</div>`;
   }
 
   // How much of the pull request this run read. Without it a Green gate on a stored

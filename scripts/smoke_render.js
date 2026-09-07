@@ -2012,6 +2012,71 @@ check('a result from before incremental review existed still renders', () => {
     throw new Error('an absent incremental block was rendered as an empty one');
 });
 
+check('an assessment that named no files says so instead of implying coverage', () => {
+  // The defect this replaces: the Part 11 verifier filled `files_scanned` in from its own
+  // input list, so a reader saw 400 paths with no way to know we wrote them.
+  const html = sandbox.renderReviewTransparency({
+    coverage_claim: { files_supplied: 400, files_claimed: 0, files_unclaimed: 400,
+                      files_not_supplied: 0, unclaimed_sample: ['a.py', 'b.py'],
+                      not_supplied_sample: [], complete: false,
+                      note: 'The assessment did not say which of the 400 supplied file(s) '
+                          + 'it examined. That is not the same as having examined all of '
+                          + 'them, and this report does not claim it did.' },
+  });
+  if (!html.includes('0 of 400'))
+    throw new Error('the gap between supplied and claimed is not stated');
+  if (!html.includes('not the same as having examined all of them'))
+    throw new Error('the sentence an auditor needs is missing');
+});
+
+check('...and a file it named but was never given is flagged loudly', () => {
+  const html = sandbox.renderReviewTransparency({
+    coverage_claim: { files_supplied: 3, files_claimed: 2, files_unclaimed: 1,
+                      files_not_supplied: 1, unclaimed_sample: ['b.py'],
+                      not_supplied_sample: ['invented.py'], complete: false,
+                      note: 'x invented y' },
+  });
+  if (!html.includes('invented.py'))
+    throw new Error('an invented filename is not surfaced');
+  if (!html.includes('treat findings against these with suspicion'))
+    throw new Error('nothing tells the reader what to do about it');
+});
+
+check('complete coverage is not dressed up as a warning', () => {
+  const html = sandbox.renderReviewTransparency({
+    coverage_claim: { files_supplied: 3, files_claimed: 3, files_unclaimed: 0,
+                      files_not_supplied: 0, unclaimed_sample: [],
+                      not_supplied_sample: [], complete: true,
+                      note: 'All 3 supplied file(s) are named in the assessment.' },
+  });
+  if (html.includes('panel-suppressed'))
+    throw new Error('a complete claim was styled as a problem');
+  if (!html.includes('3 of 3')) throw new Error('the count is not stated');
+});
+
+check('the checks a result actually got are stated, not implied', () => {
+  // "The gate was floored" and "every quote was checked" are different guarantees, and
+  // only two products on this platform have the second.
+  const off = sandbox.renderReviewTransparency({
+    attested: { degeneracy_refused: true, gate_floored: true, evidence_verified: false },
+  });
+  if (!/quotes were <b>not<\/b> checked/.test(off))
+    throw new Error('a result whose quotes were never checked implies that they were');
+  const on = sandbox.renderReviewTransparency({
+    attested: { degeneracy_refused: true, gate_floored: true, evidence_verified: true },
+  });
+  if (!on.includes('every quote was checked'))
+    throw new Error('a verified result does not say so');
+});
+
+check('a result from before attestation existed still renders', () => {
+  const html = sandbox.renderReviewTransparency({ gate_status: 'Green', findings: [] });
+  if (/Checks applied/.test(html))
+    throw new Error('an absent attestation block was rendered as an empty one');
+  if (/supplied file/.test(html))
+    throw new Error('an absent coverage claim was rendered as an empty one');
+});
+
 check('the source and what was filtered out of it is stated on the result', () => {
   const html = sandbox.renderReviewTransparency({
     source: { label: 'acme/app@main', source_type: 'github_repo',

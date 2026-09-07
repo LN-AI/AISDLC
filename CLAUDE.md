@@ -168,6 +168,30 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   Critical in it, and an absent finding otherwise reads as a fixed one. Read D-341 before
   changing any of it; the fallbacks are wide on purpose.
 
+  **Every other assessment gets `attest`, and the judgement is which protections are
+  universal.** `backend/agents/attest.py` gives a single-call agent the two things
+  `chunked_review` provided and nobody else had: a degenerate response (no findings, no
+  summary, non-trivial artifact) becomes an **error** rather than a stored clean result, and
+  the gate is floored against the findings the agent itself reported. Applied in the three
+  shared methods of `base_agent.py`, which between them cover the requirement, prompt,
+  compliance, sensitive-data, provenance, triage, security and architecture products.
+
+  **Evidence verification is opt-in and must stay that way.** Only
+  `CODE_REVIEW_TOOL_SCHEMA` and `VAPT_TOOL_SCHEMA` demand a verbatim quote, and both already
+  chunk. Every other schema asks for something else — `REVIEW_TOOL_SCHEMA` has no evidence
+  field at all (`_code_review_schema` says why in as many words), and the Part 11 verifier
+  asks for "File path / function / code pattern", a *description*. Running a substring check
+  over a description discards a correct finding for being phrased as instructed. Turning it
+  on for a product means changing that product's schema first, which changes what the model
+  answers — measure it, do not assume it (D-344).
+
+  **And no assessment may claim coverage it does not have.** `cfr21_agent` used to
+  back-fill `files_scanned` from its own input when the model did not say what it read, so
+  an FDA 21 CFR Part 11 report could state that 400 files were verified when nobody knew.
+  `attest.coverage_claim` reconciles the claim against the input and states the gap
+  instead — including paths the model named that were never supplied, which is usually an
+  invented filename.
+
   **One screen reviews everything, including pull requests.** The separate GitHub PR screen
   is retired (D-267); its nav item opens the review screen with the source pre-set, and the
   post-back options appear only for a pull-request source. The *products* are still two: a

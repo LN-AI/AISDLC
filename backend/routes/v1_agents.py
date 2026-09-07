@@ -1359,6 +1359,21 @@ def run_cfr21_verification(req: CFR21VerificationRequest, caller: dict = Depends
         "data_integrity_assessment": result.get("data_integrity_assessment"),
         "validation_readiness_notes": result.get("validation_readiness_notes", ""),
         "files_scanned": result.get("files_scanned", []),
+        # How much of this report is actually established, and by what checks. Both fields
+        # are on the stored result and both are drawn on screen by
+        # `renderReviewTransparency`, but this response is a hand-written allowlist rather
+        # than `_wrap`'s passthrough (`v1_agents._wrap`, the `k not in CORE` spread), so
+        # unnamed here they would reach the browser and not the API -- and the API is what
+        # a compliance pipeline reads. That matters most for exactly this pair of
+        # endpoints: `files_scanned` is no longer back-filled from our own input, so an
+        # integrator who sees an empty list needs `coverage_claim` to tell them it means
+        # "the assessment did not say" rather than "nothing was scanned". Without it the
+        # honest answer looks like a bug and invites someone to re-add the back-fill.
+        # `model_gate_status` is the verdict before the floor was applied, so a reader can
+        # see when the two disagreed.
+        "coverage_claim": result.get("coverage_claim"),
+        "attested": result.get("attested"),
+        "model_gate_status": result.get("model_gate_status"),
         "compliance_flags": result.get("compliance_flags", []),
         "recommendations": result.get("recommendations", []),
         "summary": result.get("summary", ""),
@@ -1431,6 +1446,21 @@ def run_gxp_document_check(req: GxPDocumentCheckRequest, caller: dict = Depends(
         "version_control_check": result.get("version_control_check"),
         "traceability_check": result.get("traceability_check"),
         "missing_sections": result.get("missing_sections", []),
+        # How much of this report is actually established, and by what checks. Both fields
+        # are on the stored result and both are drawn on screen by
+        # `renderReviewTransparency`, but this response is a hand-written allowlist rather
+        # than `_wrap`'s passthrough (`v1_agents._wrap`, the `k not in CORE` spread), so
+        # unnamed here they would reach the browser and not the API -- and the API is what
+        # a compliance pipeline reads. That matters most for exactly this pair of
+        # endpoints: `files_scanned` is no longer back-filled from our own input, so an
+        # integrator who sees an empty list needs `coverage_claim` to tell them it means
+        # "the assessment did not say" rather than "nothing was scanned". Without it the
+        # honest answer looks like a bug and invites someone to re-add the back-fill.
+        # `model_gate_status` is the verdict before the floor was applied, so a reader can
+        # see when the two disagreed.
+        "coverage_claim": result.get("coverage_claim"),
+        "attested": result.get("attested"),
+        "model_gate_status": result.get("model_gate_status"),
         "compliance_flags": result.get("compliance_flags", []),
         "recommendations": result.get("recommendations", []),
         "summary": result.get("summary", ""),

@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 
+from backend.agents import attest
 from backend.agents.base_agent import BaseAgent
 from backend.controls.control_library import GXP_CONTROLS
 from backend.services import llm_gateway
@@ -212,6 +213,38 @@ specific evidence. Note validation-readiness (process-level) gaps separately fro
 """
         result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, CFR21_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
-        if "files_scanned" not in result or not result["files_scanned"]:
-            result["files_scanned"] = [f.get("path", "unknown") for f in files]
-        return result
+
+        # `files_scanned` used to be back-filled from the input when the model did not say
+        # what it read:
+        #
+        #     if not result["files_scanned"]:
+        #         result["files_scanned"] = [every file we sent]
+        #
+        # which turns "the model did not tell us" into "all 400 files were verified" inside
+        # an FDA 21 CFR Part 11 report. That is the worst thing a compliance artifact can
+        # do, and it is worse than reporting nothing: an auditor reading a list of 400
+        # verified files has no way to know the list was written by us rather than by the
+        # assessment. `attest` reconciles the claim against the input instead and states
+        # the gap (`coverage_claim`), and never fills it in.
+        #
+        # The same pass adds the two protections only Code Review and VAPT had: a
+        # truncated response is refused rather than stored with whatever gate the schema
+        # defaulted to, and the gate is floored so a Critical cannot come out Green.
+        #
+        # Evidence verification is deliberately NOT on. This schema asks for evidence as
+        # "File path / function / code pattern that shows this gap" - a description, not a
+        # verbatim quote, and "not applicable / no code available" is an accepted answer
+        # for a process-level assessment. A substring check over that would discard a
+        # correct finding for being phrased exactly as it was asked to be. Turning it on
+        # means first changing this schema to demand a quote, which changes what the model
+        # is asked for and therefore what it answers - a change to measure, not to assume.
+        # See the docstring in `backend/agents/attest.py`.
+        return attest.attest(
+            result,
+            agent_name=self.agent_name,
+            artifact=artifact,
+            files=files,
+            claim_key="files_scanned",
+            gate_key="overall_gate_status",
+            risk_key="overall_risk_score",
+        )

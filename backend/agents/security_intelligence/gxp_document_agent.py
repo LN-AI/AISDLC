@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 
+from backend.agents import attest
 from backend.agents.base_agent import BaseAgent
 from backend.controls.control_library import GXP_CONTROLS
 from backend.services import llm_gateway
@@ -212,4 +213,18 @@ version control, and traceability. If multiple documents were given, check consi
 """
         result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, GXP_DOCUMENT_TOOL_SCHEMA, max_tokens=16000)
         result["agent_name"] = self.agent_name
-        return result
+        # Two protections Code Review and VAPT have always had and this did not: a
+        # truncated response is refused rather than stored with the schema's default gate,
+        # and the gate is floored so a Critical cannot come out Green.
+        #
+        # Evidence verification is off, for the same reason as the Part 11 verifier: this
+        # schema never asked for a verbatim quote, and judging a finding against a
+        # requirement it was not given is a bug rather than a check. No `claim_key` either
+        # — there is no per-document coverage field in this schema to reconcile.
+        return attest.attest(
+            result,
+            agent_name=self.agent_name,
+            artifact=artifact,
+            gate_key="overall_gate_status",
+            risk_key="overall_risk_score",
+        )
