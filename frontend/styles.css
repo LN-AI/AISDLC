@@ -1330,6 +1330,21 @@ button.not-entitled::after {
 .findings-toolbar select:focus { outline: none; border-color: var(--accent); }
 .findings-counts { color: var(--text-muted); font-size: 13px; margin-left: auto; }
 
+/* The text filters, matching the selects beside them. The toolbar already wraps, which it
+   needs to now that it carries nine controls rather than two.
+   `type="search"` and `type="text"` do not inherit the app's field styling the way a
+   <select> does, so they are named here rather than relying on a generic input rule. */
+.findings-toolbar input[type="search"],
+.findings-toolbar input[type="text"] {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 13px; padding: 6px 12px;
+}
+.findings-toolbar input:focus { outline: none; border-color: var(--accent); }
+.findings-toolbar input::placeholder { color: var(--text-dim, #7d8590); }
+/* The search box earns the room; a repository or control id does not. */
+.findings-toolbar .findings-search { flex: 1 1 260px; min-width: 220px; }
+.findings-toolbar .findings-narrow { width: 150px; }
+
 /* Which review a finding came from. On every other screen that is implied by the page
    you are on; here findings from different reviews and different agents sit together,
    so each one has to name its own origin. */
@@ -2584,4 +2599,75 @@ pre.fix-diff {
   border: 1px solid var(--amber, #d19a2f); border-left-width: 3px; border-radius: 6px;
   padding: 8px 11px; margin-bottom: 10px; font-size: 12.5px;
   background: rgba(209,154,47,.07);
+}
+
+
+/* ── A unified diff, and a finding's own line ───────────────────────────────
+ *
+ * The diff was a bare `<pre>` and a finding's `file:line` was plain text. Both are on the
+ * path a developer takes when deciding whether to trust a patch, which is the moment the
+ * platform most needs to be readable.
+ *
+ * Colours come from the existing severity tokens rather than new greens and reds, so a
+ * diff sits in the same palette as everything around it. */
+
+.diff-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.dl-stat { font-family: var(--mono, ui-monospace, monospace); font-weight: 600; }
+.dl-stat-add { color: var(--green, #3fb950); }
+.dl-stat-del { color: var(--red, #f85149); }
+
+.diff-view {
+  width: 100%; border-collapse: collapse;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12.5px; line-height: 1.55;
+}
+/* Two gutters: the old file's line and the new file's. An added line has no old number
+ * and a removed line has no new one, which is the information a reader cannot reconstruct
+ * from a flat listing. */
+.diff-view .dl-n {
+  width: 1%; min-width: 44px; padding: 0 8px;
+  text-align: right; vertical-align: top;
+  color: var(--text-dim, #7d8590); background: var(--bg-2, #161b22);
+  border-right: 1px solid var(--border);
+  user-select: none; white-space: nowrap;
+}
+.diff-view .dl-s {
+  padding: 0 10px; white-space: pre-wrap; word-break: break-word;
+  vertical-align: top;
+}
+.diff-view tr.dl-add .dl-s { background: color-mix(in srgb, var(--green, #3fb950) 14%, transparent); }
+.diff-view tr.dl-del .dl-s { background: color-mix(in srgb, var(--red, #f85149) 14%, transparent); }
+.diff-view tr.dl-hunk .dl-s {
+  background: var(--bg-2, #161b22); color: var(--accent, #a5a5ff);
+  font-weight: 600;
+}
+.diff-view tr.dl-meta .dl-s { color: var(--text-dim, #7d8590); }
+/* `color-mix` is recent enough to want a floor under it: without support the row keeps the
+ * table background, so the +/- prefix in the text is still there and nothing is lost. */
+@supports not (background: color-mix(in srgb, red 10%, transparent)) {
+  .diff-view tr.dl-add .dl-s { background: rgba(63, 185, 80, 0.14); }
+  .diff-view tr.dl-del .dl-s { background: rgba(248, 81, 73, 0.14); }
+}
+
+/* A finding's location, now a link into the file viewer at that line. Styled as a path
+ * rather than as a button: it reads as the thing it names, and the pointer says it acts. */
+.finding-loc-link {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: inherit; padding: 0; border: 0; background: none;
+  color: var(--accent, #a5a5ff); cursor: pointer; text-align: left;
+}
+.finding-loc-link:hover { text-decoration: underline; }
+
+/* The line a finding named, once its file is open. A left rule rather than a full-row wash
+ * so the code itself keeps its own syntax-free contrast. */
+.code-view tr.code-line-hit .src {
+  background: color-mix(in srgb, var(--amber, #d29922) 16%, transparent);
+  box-shadow: inset 3px 0 0 var(--amber, #d29922);
+}
+@supports not (background: color-mix(in srgb, red 10%, transparent)) {
+  .code-view tr.code-line-hit .src { background: rgba(210, 153, 34, 0.16); }
 }

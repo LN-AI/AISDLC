@@ -2053,7 +2053,14 @@ Examples:
           <p class="subtitle">Every finding this project's reviews have produced, in one place. Waive what you
             have accepted and it drops out of future reviews of this project.</p>
         </div>
+        <!-- Two dropdowns over a thousand findings is a screen people stop opening.
+             "The SQL injections in the payments service", "everything the vulnerability
+             assessor raised this month", "everything under SEC-004" are the questions a
+             security reviewer actually arrives with, and none of them could be asked. -->
         <div class="findings-toolbar">
+          <input type="search" id="findings-q" class="findings-search"
+                 placeholder="Search title, description or file path…"
+                 onkeydown="if(event.key==='Enter')loadFindings(0)" />
           <select id="findings-status">
             <option value="open">Open</option>
             <option value="">Any status</option>
@@ -2064,10 +2071,30 @@ Examples:
           </select>
           <select id="findings-severity">
             <option value="0">All severities</option>
-            <option value="4">High and Critical</option>
             <option value="5">Critical only</option>
+            <option value="4">High and Critical</option>
+            <option value="3">Moderate and above</option>
+            <option value="2">Minor and above</option>
+          </select>
+          <!-- Populated from GET /api/v1/products, so it lists the agents this plan has
+               rather than a hardcoded set that drifts. -->
+          <select id="findings-product"><option value="">Any agent</option></select>
+          <input type="text" id="findings-repo" class="findings-narrow"
+                 placeholder="owner/repo"
+                 title="A repository, or just its name — reviews now record which one they read"
+                 onkeydown="if(event.key==='Enter')loadFindings(0)" />
+          <input type="text" id="findings-control" class="findings-narrow"
+                 placeholder="Control, e.g. SEC"
+                 title="A prefix: SEC matches SEC-001 through SEC-016"
+                 onkeydown="if(event.key==='Enter')loadFindings(0)" />
+          <select id="findings-since">
+            <option value="">Any time</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
           </select>
           <button class="btn btn-primary" onclick="loadFindings(0)">Apply</button>
+          <button class="btn btn-secondary" onclick="clearFindingFilters()">Clear</button>
           <button class="btn btn-secondary" onclick="loadFindings(_findingsOffset)">↺ Refresh</button>
           <span id="findings-counts" class="findings-counts"></span>
         </div>

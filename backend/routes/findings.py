@@ -67,6 +67,16 @@ def list_findings(
     status: Optional[str] = Query(None, description="Filter by lifecycle status, e.g. 'open'."),
     min_severity: int = Query(0, ge=0, le=5, description="1 Info … 4 High, 5 Critical."),
     review_id: Optional[str] = Query(None, description="Only this review's findings."),
+    q: Optional[str] = Query(None, min_length=1, max_length=200,
+                             description="Free text over the title, description and file path."),
+    control_id: Optional[str] = Query(None, max_length=40,
+                                      description="Control id prefix — 'SEC' matches SEC-001…SEC-016."),
+    product_id: Optional[str] = Query(None, max_length=60,
+                                      description="Only findings from this agent, e.g. 'vapt'."),
+    repo: Optional[str] = Query(None, max_length=200,
+                                description="'owner/name', or just the repository name."),
+    since: Optional[str] = Query(None, max_length=32,
+                                 description="ISO date/time — only reviews at or after it."),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -76,16 +86,25 @@ def list_findings(
     from the first day the column existed, but the only way to *find* one was to open the
     review that produced it, so "what is still open in this project" was unanswerable.
 
-    `counts` describes the whole status-filtered set rather than the page, so a caller can
-    show "12 open, 3 critical" without paging through everything.
+    The filters beyond `status` and `min_severity` are what turn that from a list into a
+    working queue. "Show me the SQL injections in the payments service", "every finding the
+    vulnerability assessor raised this month", "everything under SEC-004" — each of those
+    was impossible, and a screen offering two dropdowns over a thousand findings is a
+    screen people stop opening.
+
+    `counts` describes the whole set the filters select, minus `min_severity`, so a caller
+    can show "12 open, 3 critical" without paging through everything.
     """
     visible = scope.visible_from_caller(caller)
+    filters = dict(status=status, review_id=review_id, q=q, control_id=control_id,
+                   product_id=product_id, repo=repo, since=since)
     findings = database.list_findings(
-        project_ids=visible, status=status, min_severity=min_severity,
-        review_id=review_id, limit=limit, offset=offset,
+        project_ids=visible, min_severity=min_severity, limit=limit, offset=offset,
+        **filters,
     )
+    # Same filters, one source of truth — the header and the body describe one set.
     counts = database.count_findings(
-        project_ids=visible, status=status, min_severity=min_severity, review_id=review_id)
+        project_ids=visible, min_severity=min_severity, **filters)
     return {
         "findings": findings,
         "count": len(findings),

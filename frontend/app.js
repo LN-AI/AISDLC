@@ -368,14 +368,98 @@ async function refreshApprovalBadge() {
 }
 
 // ── Navigation ────────────────────────────────────────────────────────────
+//
+// Every screen and every stored run now has an address: `#/code`, `#/findings`,
+// `#/code/run/<id>`. Before this the application had no URL state at all — no way to send
+// a colleague a finding, no way to bookmark a run, an inert Back button, and a reload that
+// always landed on the Dashboard however deep you were. For a tool meant to be used daily
+// by a team, "here, look at this" was impossible, which is a bigger gap than it sounds.
+//
+// Deliberately a hash and not the History API: the app is served as static files from
+// FastAPI with no server-side rewrite, so a real path (`/code/run/<id>`) would 404 on
+// reload. A hash never reaches the server.
+//
+// `showPage` is the one place a screen is activated. The click handler and the hash
+// listener both call it, so a click and a pasted link cannot diverge — which is the bug
+// that would otherwise appear the first time a screen gained a loader in one path only.
+
+/** Activate a screen and run its loader. `push` writes the address; the hash listener
+ *  passes false so answering a hash change does not re-enter itself. */
+function showPage(page, push = true) {
+  const item = document.querySelector(`.nav-item[data-page="${page}"]`);
+  const body = document.getElementById('page-' + page);
+  if (!item || !body) return false;
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  item.classList.add('active');
+  body.classList.add('active');
+  if (push) _setHash('#/' + page);
+  _runPageLoader(page);
+  return true;
+}
+
+/** Write the address without the hash listener treating it as a navigation. */
+let _suppressHashChange = false;
+function _setHash(hash) {
+  if (location.hash === hash) return;
+  _suppressHashChange = true;
+  location.hash = hash;
+  // Cleared on a timer rather than in the listener: assigning `location.hash` fires
+  // `hashchange` asynchronously, so clearing it synchronously here would be too early and
+  // clearing it only in the listener would leave it stuck if the browser coalesced two
+  // assignments into one event.
+  setTimeout(() => { _suppressHashChange = false; }, 0);
+}
+
+/** The address the current view should have, including an open run. */
+function _addressFor(page) {
+  const runId = _openRunId && _openRunId[page];
+  return runId ? `#/${page}/run/${runId}` : `#/${page}`;
+}
+
+/** Answer an address: `#/code`, `#/code/run/<id>`. Unknown pages fall back to the
+ *  dashboard rather than leaving a blank shell, and say nothing about it — a mistyped
+ *  fragment is not an error worth a dialog. */
+async function _applyHash() {
+  // The query has to come off before the path is split, or `#/findings?q=sql` yields a
+  // first segment of `findings?q=sql`, matches no nav item, and silently lands on the
+  // dashboard — which is how a shared filtered link would have looked broken.
+  const raw = (location.hash || '').split('?')[0];
+  const parts = raw.replace(/^#\/?/, '').split('/').filter(Boolean);
+  const page = parts[0] || 'dashboard';
+  if (!showPage(page, false)) { showPage('dashboard', false); return; }
+  // `#/<page>/run/<id>` reopens a stored run. Only meaningful for a screen in
+  // AGENT_SCREENS, which is what knows how to render one.
+  if (parts[1] === 'run' && parts[2] && AGENT_SCREENS[page]) {
+    try {
+      await openAgentRun(page, parts[2]);
+    } catch (e) {
+      feLog.warn(`Could not open run ${parts[2]} from the address bar`, { source: 'router' });
+    }
+  }
+}
+
+window.addEventListener('hashchange', () => {
+  if (_suppressHashChange) { _suppressHashChange = false; return; }
+  _applyHash();
+});
 
 document.querySelectorAll('.nav-item').forEach(item => {
   item.addEventListener('click', () => {
     const page = item.dataset.page;
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    item.classList.add('active');
-    document.getElementById('page-' + page).classList.add('active');
+    // A click on the screen you are already on clears any open run rather than doing
+    // nothing, so the nav item is also the way back out of one.
+    if (_openRunId && page in _openRunId && document.getElementById('page-' + page)
+        ?.classList.contains('active')) {
+      _openRunId[page] = null;
+    }
+    showPage(page);
+  });
+});
+
+/** Everything a screen needs when it becomes visible. Extracted from the click handler so
+ *  a pasted address gets exactly what a click gets. */
+function _runPageLoader(page) {
     if (page === 'dashboard') loadDashboard();
     // The source pickers are built on first visit rather than at load: they are two of
     // thirty-seven screens, and building every screen's controls up front is what makes a
@@ -402,7 +486,9 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'agent-hub') { loadAgentHub(); loadSwarmPolicies(); }
     if (page === 'gate') loadReviewPicker();
     if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
-    if (page === 'findings') loadFindings(0);
+    if (page === 'findings') {
+      _fillFindingProducts().then(() => { _applyFindingHashFilters(); loadFindings(0); });
+    }
     if (page === 'inventory') loadInventory();
     if (page === 'sensitive') { /* page ready, no auto-load */ }
     if (page === 'ai-provenance') { /* page ready, no auto-load */ }
@@ -420,8 +506,7 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'usage') loadUsage();
     if (page === 'projects') loadProjects();
     if (page === 'vertical') loadVerticalPage();
-  });
-});
+}
 
 // ── Code Generation ─────────────────────────────────────────────────────────
 
@@ -2166,8 +2251,24 @@ function renderFinding(f) {
   const age = f.is_new === false
     ? '<span class="compliance-chip" title="This project has seen this finding before">Pre-existing</span>'
     : (f.is_new === true ? '<span class="compliance-chip">New</span>' : '');
+  // `file:line` was plain text, and the file viewer that could show it — with a line
+  // gutter, and a chip saying whether the bytes are the ones reviewed or a refetch at the
+  // same commit — had nothing anywhere linking into it. Reading a finding in its context
+  // meant finding the path in the inventory table by eye and clicking that instead.
+  //
+  // Linked only where it can actually work: `_fixCapable`-style capability, but for
+  // reading. `_openFileAgent` is set by whichever screen rendered this result, because
+  // `renderFinding` is shared by fourteen renderers and has no idea which one it is in.
+  const canOpen = f.file_path && _openFileAgent && _openFileRunId;
   const where = f.file_path
-    ? `<div class="finding-loc">${esc(f.file_path)}${f.line_start ? ':' + f.line_start : ''}</div>` : '';
+    ? `<div class="finding-loc">${canOpen
+        ? `<button class="btn-link finding-loc-link" title="Open this file at line ${
+            f.line_start || 1}, exactly as the review read it"
+            onclick="openReviewFile('${esc(_openFileAgent)}','${esc(_openFileRunId)}','${
+              esc(f.file_path)}',${Number(f.line_start) || 0})">${esc(f.file_path)}${
+            f.line_start ? ':' + f.line_start : ''}</button>`
+        : `${esc(f.file_path)}${f.line_start ? ':' + f.line_start : ''}`}</div>`
+    : '';
   const evidence = f.evidence
     ? `<pre class="finding-evidence">${esc(String(f.evidence).slice(0, 400))}</pre>` : '';
   // How much to trust this one. A reader who cannot tell a proven finding from an inferred
@@ -2301,6 +2402,14 @@ let _fixCapable = false;
 // Why not, when not — so a screen can say so once instead of saying nothing.
 let _fixBlockedReason = '';
 
+// Which screen and which run a finding's `file:line` should open. `renderFinding` is
+// called by fourteen renderers and cannot know which one it is inside, so the screen that
+// painted the result publishes it here — the same shape and the same reason as
+// `_fixCapable` above. Reading a file needs neither an entitlement nor a write, so the
+// only condition is that the run recorded a source at all (`AGENT_SCREENS[...].inventory`).
+let _openFileAgent = '';
+let _openFileRunId = '';
+
 /** Everything a freshly-painted result arms outside its own HTML: which screen owns it,
  *  whether its findings can be fixed, and its file-by-file inventory.
  *
@@ -2333,6 +2442,11 @@ function armResultActions(result, targetId) {
 
   _fixReviewId = result.review_id || null;
   _fixCapable = hasInventory && !!result.review_id && entitled;
+  // Deliberately not gated on `entitled`: opening a file the review already read is a
+  // read of the customer's own source, not a use of the Auto-Fix product. A plan without
+  // Auto-Fix still gets to see its findings in context.
+  _openFileAgent = hasInventory && result.review_id ? owner : '';
+  _openFileRunId = hasInventory && result.review_id ? result.review_id : '';
   _fixBlockedReason = (hasInventory && result.review_id && !entitled)
     ? 'Applying fixes is part of Auto-Fix, which this project\'s plan does not include.'
     : '';
@@ -2539,9 +2653,57 @@ function renderFixResult(d) {
         </details>` : ''}
       ${d.diff ? `<details class="review-panel" open>
         <summary>The diff — read this before applying any of it</summary>
-        <div class="file-view-body"><pre class="fix-diff">${esc(d.diff)}</pre></div>
+        ${renderUnifiedDiff(d.diff)}
       </details>` : ''}
     </div>`;
+}
+
+/** A unified diff, line-coloured.
+ *
+ *  This was one escaped `<pre>`: the only diff in the application, on the screen that asks
+ *  you to read a patch before it reaches your repository, rendered as undifferentiated
+ *  monospace. An uncoloured diff of any size is a diff nobody reads, which makes the
+ *  "read this first" instruction above it decorative.
+ *
+ *  Deliberately not side-by-side. A unified diff is what `git` shows, what the patch
+ *  actually is, and what fits a 220px-sidebar layout without a horizontal scroller of its
+ *  own; two panes would be a second reading experience to keep consistent with this one.
+ *
+ *  Line numbers come from the `@@` hunk headers rather than from counting, because a diff's
+ *  own numbering is the only one that maps back to the file — and the old-file and new-file
+ *  numbers advance at different rates, which is exactly the thing a reader cannot do in
+ *  their head. */
+function renderUnifiedDiff(diff) {
+  const rows = [];
+  let oldNo = 0, newNo = 0;
+  for (const raw of String(diff || '').split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    let cls = 'dl-ctx', left = '', right = '';
+    if (line.startsWith('@@')) {
+      // @@ -12,7 +12,9 @@ — restart both counters from what the hunk declares.
+      const m = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { oldNo = Number(m[1]); newNo = Number(m[2]); }
+      cls = 'dl-hunk';
+    } else if (/^(diff |index |--- |\+\+\+ |new file|deleted file|similarity |rename )/.test(line)) {
+      cls = 'dl-meta';
+    } else if (line.startsWith('+')) {
+      cls = 'dl-add'; right = newNo++;
+    } else if (line.startsWith('-')) {
+      cls = 'dl-del'; left = oldNo++;
+    } else if (line.startsWith('\\')) {
+      cls = 'dl-meta';                       // "\ No newline at end of file"
+    } else {
+      left = oldNo++; right = newNo++;
+    }
+    rows.push(`<tr class="${cls}"><td class="dl-n">${left}</td><td class="dl-n">${right}</td>`
+      + `<td class="dl-s">${esc(line) || '&nbsp;'}</td></tr>`);
+  }
+  const added = (String(diff || '').match(/^\+(?!\+\+)/gm) || []).length;
+  const removed = (String(diff || '').match(/^-(?!--)/gm) || []).length;
+  return `<div class="diff-head"><span class="dl-stat dl-stat-add">+${added}</span>
+      <span class="dl-stat dl-stat-del">-${removed}</span>
+      <span class="field-hint">line numbers are the file's own, taken from the hunk headers</span></div>
+    <div class="file-view-body"><table class="diff-view"><tbody>${rows.join('')}</tbody></table></div>`;
 }
 
 /** Same reason `downloadSarif` exists: a link sends no auth header and 401s. */
@@ -2575,6 +2737,63 @@ async function downloadFixZip(url) {
 const FINDINGS_PAGE_SIZE = 25;
 let _findingsOffset = 0;
 
+/** Reset every filter to the state the screen opens in. Without this the only way back
+ *  from a four-filter search that returned nothing was to clear four controls by hand,
+ *  which is where a user concludes the screen is broken. */
+function clearFindingFilters() {
+  ['findings-q', 'findings-repo', 'findings-control'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const status = document.getElementById('findings-status');
+  if (status) status.value = 'open';
+  ['findings-severity', 'findings-since', 'findings-product'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = id === 'findings-severity' ? '0' : '';
+  });
+  loadFindings(0);
+}
+
+/** Fill the agent filter from the product catalogue rather than a hardcoded list.
+ *
+ *  `GET /api/v1/products` is already fetched for entitlements, and it is the only list
+ *  that cannot drift from what the backend actually runs — a hardcoded set here would be
+ *  a third place agent names live, after the registry and `AGENT_SCREENS`. */
+async function _fillFindingProducts() {
+  const sel = document.getElementById('findings-product');
+  if (!sel || sel.dataset.filled) return;
+  try {
+    const data = await apiFetch('/api/v1/products', { _silent: true });
+    const rows = (data.products || [])
+      .filter(p => p.review_type)   // only products that write findings can be filtered on
+      .sort((a, b) => String(a.title).localeCompare(String(b.title)));
+    sel.innerHTML = '<option value="">Any agent</option>'
+      + rows.map(p => `<option value="${esc(p.id)}">${esc(p.title)}</option>`).join('');
+    sel.dataset.filled = '1';
+  } catch (e) {
+    // A filter that could not be populated is left as "Any agent" rather than blocking the
+    // screen: the rest of the queue still works without it.
+    feLog.warn('Could not fill the agent filter', { source: 'findings' });
+  }
+}
+
+/** Apply `#/findings?q=…&repo=…` to the controls, so a shared link opens the same queue. */
+function _applyFindingHashFilters() {
+  const raw = (location.hash || '').split('?')[1];
+  if (!raw) return false;
+  const qs = new URLSearchParams(raw);
+  const put = (id, key) => {
+    const el = document.getElementById(id);
+    if (el && qs.has(key)) el.value = qs.get(key);
+  };
+  put('findings-q', 'q');
+  put('findings-repo', 'repo');
+  put('findings-control', 'control_id');
+  put('findings-product', 'product_id');
+  put('findings-severity', 'min_severity');
+  const status = document.getElementById('findings-status');
+  if (status) status.value = qs.get('status') || '';
+  return true;
+}
+
 async function loadFindings(offset) {
   _findingsOffset = Math.max(0, offset || 0);
   const wrap = document.getElementById('findings-list');
@@ -2582,12 +2801,31 @@ async function loadFindings(offset) {
   if (!wrap) return;
   wrap.innerHTML = '<div class="empty-state">Loading…</div>';
 
-  const status = document.getElementById('findings-status').value;
-  const minSeverity = document.getElementById('findings-severity').value;
+  const val = id => (document.getElementById(id) || {}).value || '';
   const params = new URLSearchParams({
-    limit: FINDINGS_PAGE_SIZE, offset: _findingsOffset, min_severity: minSeverity,
+    limit: FINDINGS_PAGE_SIZE, offset: _findingsOffset,
+    min_severity: val('findings-severity') || '0',
   });
+  const status = val('findings-status');
   if (status) params.set('status', status);
+  if (val('findings-q').trim()) params.set('q', val('findings-q').trim());
+  if (val('findings-product')) params.set('product_id', val('findings-product'));
+  if (val('findings-repo').trim()) params.set('repo', val('findings-repo').trim());
+  if (val('findings-control').trim()) params.set('control_id', val('findings-control').trim());
+  // "Last 30 days" is a day count in the control and an ISO instant on the wire: the
+  // server filters on `reviews.created_at`, and a relative window resolved in the browser
+  // is the only place the user's own clock is the right one to use.
+  const days = Number(val('findings-since'));
+  if (days > 0) {
+    params.set('since', new Date(Date.now() - days * 86400000).toISOString());
+  }
+  // The address carries the filter, so a filtered queue is a link — "here are the open
+  // Criticals in payments" is the message somebody actually wants to send.
+  _setHash('#/findings' + (params.get('q') || params.get('repo') || params.get('control_id')
+    || params.get('product_id') || params.get('since') || status !== 'open'
+    ? '?' + new URLSearchParams([...params].filter(([k]) =>
+        !['limit', 'offset'].includes(k))).toString()
+    : ''));
 
   try {
     const data = await apiFetch(`/api/v1/findings?${params}`);
@@ -6388,7 +6626,12 @@ async function downloadUsageCsv() {
 
 _restoreNavSectionState();
 _loadAuthState();
-loadDashboard();
+// Routing is kicked off at the *end of the file*, not here. This init block sits in the
+// middle of a 10,000-line script, and `_applyHash` reaches `AGENT_SCREENS` and
+// `_openRunId` — both `const`, both declared ~3,000 lines below. Calling it from here
+// works for `#/dashboard` and throws a temporal-dead-zone `ReferenceError` for every
+// agent address, which is the half of the feature worth having. Search for
+// "Routing, last" at the bottom.
 
 // ── Legacy Modernization ───────────────────────────────────────────────────
 //
@@ -9451,7 +9694,7 @@ function renderReviewSources(agent, d) {
     </div>`;
 }
 
-async function openReviewFile(agent, reviewId, path) {
+async function openReviewFile(agent, reviewId, path, line = 0) {
   const box = document.getElementById(`${agent}-file-view`);
   if (!box) return;
   box.innerHTML = `<div class="mod-panel">Reading <code>${esc(path)}</code>…</div>`;
@@ -9478,8 +9721,16 @@ async function openReviewFile(agent, reviewId, path) {
           <button class="btn-link" onclick="document.getElementById('${agent}-file-view').innerHTML=''">Close</button>
         </div>
         <div class="file-view-body"><table class="code-view"><tbody>${lines.map((l, i) =>
-          `<tr><td class="ln">${i + 1}</td><td class="src">${esc(l) || '&nbsp;'}</td></tr>`).join('')}</tbody></table></div>
+          `<tr${i + 1 === Number(line) ? ' class="code-line-hit" id="code-line-hit"' : ''}><td class="ln">${
+            i + 1}</td><td class="src">${esc(l) || '&nbsp;'}</td></tr>`).join('')}</tbody></table></div>
       </div>`;
+    // Bring the finding's own line into view inside the file's scroller. A 900-line file
+    // opened at the top, with the line that mattered somewhere below the fold, is the
+    // reason reading a finding in context was a manual search.
+    if (Number(line) > 0) {
+      document.getElementById('code-line-hit')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   } catch (e) {
     box.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not read
       ${esc(path)} — ${esc(e.message)}</div></div>`;
@@ -9810,6 +10061,9 @@ async function openAgentRun(agent, reviewId) {
   const spec = AGENT_SCREENS[agent];
   if (!spec) return;
   _openRunId[agent] = reviewId;
+  // The run is now addressable: `#/code/run/<id>`. This is what makes a finding sendable
+  // to somebody — before it, the only way to show a colleague a result was to describe it.
+  _setHash(`#/${agent}/run/${reviewId}`);
   await loadAgentRuns(agent);
   // Keep the run you just clicked in view inside its own scroller. Without this, repainting
   // the list resets its scroll to the top, so opening the eighth run scrolled your place in
@@ -10660,3 +10914,13 @@ function renderDependencyNote(dep) {
   }
   return html;
 }
+
+
+// ── Routing, last ─────────────────────────────────────────────────────────
+//
+// Deliberately the final statement in this file. `_applyHash` reads `AGENT_SCREENS` and
+// `_openRunId`, which are `const` and therefore unreachable — a `ReferenceError`, not
+// `undefined` — from anywhere above their declarations. The `// ── Init ──` block sits at
+// roughly line 6,400 for historical reasons, so anything there that touches the later
+// half of the file has to be moved down here instead of read as safe.
+_applyHash();

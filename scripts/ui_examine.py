@@ -1165,6 +1165,81 @@ def main():
                 check("another screen shows the same project",
                       "Caption check" in (vcap.text_content() or ""), vcap.text_content())
 
+            # ── 15. Every screen has an address ───────────────────────────
+            #
+            # Checked in a real browser rather than in `smoke_render.js`, because the whole
+            # question is whether `data-page` in index.html, `#page-<name>` in index.html
+            # and the router in app.js agree — and a DOM stub whose `querySelector` returns
+            # null cannot tell. This is the gap `ui_examine.py` exists for.
+            section("15. Every screen has an address, and a link opens it")
+
+            pages = page.eval_on_selector_all(
+                ".nav-item[data-page]", "els => els.map(e => e.dataset.page)")
+            # `github` is the retired PR-review screen (D-267): its loader deliberately
+            # redirects to Code Review with the source pre-set, so it is the one nav item
+            # that must NOT end on its own page. Named rather than filtered out, so if it
+            # ever stops redirecting this says so.
+            REDIRECTS = {"github"}
+            broken = []
+            for name in pages:
+                page.evaluate(f"showPage({name!r})")
+                ok = page.evaluate(
+                    f"document.getElementById('page-{name}')?.classList.contains('active') === true")
+                if (name in REDIRECTS) == ok:
+                    broken.append(name if name not in REDIRECTS
+                                  else f"{name} (stopped redirecting)")
+            check(f"all {len(pages)} nav items reach their own screen, "
+                  f"bar the {len(REDIRECTS)} that redirect", not broken,
+                  "these did not: " + ", ".join(broken))
+            check("the retired PR-review item still lands on Code Review instead",
+                  page.evaluate("showPage('github'); "
+                                "document.getElementById('page-code').classList.contains('active')"),
+                  "D-267 merged PR review into the review screen; the nav item is a shortcut")
+            page.evaluate("showPage('dashboard')")
+            check("...and the address bar says which screen you are on",
+                  page.evaluate("location.hash") == "#/dashboard",
+                  page.evaluate("location.hash"))
+
+            # The case that matters: a pasted address, not a click.
+            page.evaluate("location.hash = '#/findings'")
+            page.wait_for_timeout(250)
+            check("a pasted address opens that screen",
+                  page.evaluate(
+                      "document.getElementById('page-findings').classList.contains('active')"),
+                  page.evaluate("location.hash"))
+            page.evaluate("location.hash = '#/no-such-screen'")
+            page.wait_for_timeout(250)
+            check("an address naming no screen falls back to the dashboard, not a blank shell",
+                  page.evaluate(
+                      "document.getElementById('page-dashboard').classList.contains('active')"),
+                  page.evaluate(
+                      "[...document.querySelectorAll('.page.active')].map(p => p.id).join(',')"))
+
+            # A filtered queue is a link — the message somebody actually wants to send.
+            page.evaluate("location.hash = '#/findings?q=injection&repo=acme%2Fshop'")
+            page.wait_for_timeout(400)
+            check("a filtered findings link opens the findings screen, not the dashboard",
+                  page.evaluate(
+                      "document.getElementById('page-findings').classList.contains('active')"),
+                  page.evaluate(
+                      "[...document.querySelectorAll('.page.active')].map(p => p.id).join(',')"))
+            check("...with the filters it carried already in the controls",
+                  page.evaluate("document.getElementById('findings-q').value") == "injection"
+                  and page.evaluate("document.getElementById('findings-repo').value") == "acme/shop",
+                  page.evaluate(
+                      "document.getElementById('findings-q').value + ' | ' + "
+                      "document.getElementById('findings-repo').value"))
+
+            # Reloading a deep address has to land in the same place. This is the whole
+            # point: before it, a reload always went back to the Dashboard.
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(600)
+            check("reloading a deep address stays where it was, rather than resetting",
+                  page.evaluate(
+                      "document.getElementById('page-findings')?.classList.contains('active')"),
+                  page.evaluate("location.hash + ' -> ' + "
+                                "[...document.querySelectorAll('.page.active')].map(p=>p.id).join(',')"))
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.

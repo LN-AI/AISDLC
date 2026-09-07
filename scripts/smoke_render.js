@@ -88,9 +88,24 @@ const fetchLog = [];
 let nextFetchBody = {};
 let nextFetchHeaders = {};
 
+const sharedLocation = { href: '', hash: '' };
+
 const sandbox = {
   document,
-  window: { location: { href: '' } },
+  // `addEventListener` and `location.hash` are both real now: app.js registers a
+  // `hashchange` listener at module scope for deep links (`#/code/run/<id>`), so a
+  // window without either stops the file loading at all rather than failing a check.
+  // `location` is a global in a browser and `window.location` is the same object, so the
+  // stub shares one rather than holding two that can drift. app.js reads bare `location`
+  // (`_applyHash`, `_setHash`) now that screens and runs have addresses.
+  location: sharedLocation,
+  // A browser global. app.js has used it since paging existed, but no check ever called a
+  // function that reached it; `_applyFindingHashFilters` does.
+  URLSearchParams,
+  window: {
+    location: sharedLocation,
+    addEventListener() {}, removeEventListener() {},
+  },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   console,
   // logger.js is a separate script tag in index.html, so it isn't in `source`; the
@@ -2888,8 +2903,119 @@ check('a generative agent is offered no SARIF export, having no findings', () =>
 });
 }
 
+// ── Addresses, diffs, and a finding you can click ────────────────────────────
+//
+// All three are on the path a developer takes when deciding whether to trust a patch, and
+// none of them existed: no URL state at all, the only diff in the app was an escaped
+// `<pre>`, and a finding's `file:line` was plain text beside a file viewer nothing linked
+// into.
+function runNavigationChecks() {
+  section('Addresses, diffs, and a clickable finding location');
+
+  // `showPage` itself is not checked here: this stub's `document.querySelector` always
+  // returns null, so it could never resolve a nav item, and faking one would make the
+  // "unknown page falls back" case pass for the wrong reason too. Routing against the real
+  // nav is `ui_examine.py`'s job — it drives an actual browser precisely because a
+  // DOM-stubbed check cannot tell whether an id in index.html matches what app.js reads.
+
+  check('a stored run is addressable, which is what makes it shareable', () => {
+    const setHash = vm.runInContext('_setHash', sandbox);
+    setHash('#/code/run/rv-42');
+    assert(sharedLocation.hash === '#/code/run/rv-42', sharedLocation.hash);
+    const addressFor = vm.runInContext('_addressFor', sandbox);
+    const openIds = vm.runInContext('_openRunId', sandbox);
+    openIds.code = 'rv-42';
+    assert(addressFor('code') === '#/code/run/rv-42', addressFor('code'));
+    openIds.code = null;
+    assert(addressFor('code') === '#/code', addressFor('code'));
+  });
+
+  check('a filtered findings address survives the page segment being parsed', () => {
+    // `#/findings?q=sql` must resolve to the `findings` screen. Splitting the path before
+    // stripping the query yields a first segment of `findings?q=sql`, which matches no nav
+    // item -- so a shared filter link would have landed on the dashboard.
+    sharedLocation.hash = '#/findings?q=sql&repo=acme/shop';
+    const raw = sharedLocation.hash.split('?')[0];
+    const page = raw.replace(/^#\/?/, '').split('/').filter(Boolean)[0];
+    assert(page === 'findings', `parsed page was ${page}`);
+    const applyFilters = vm.runInContext('_applyFindingHashFilters', sandbox);
+    assert(applyFilters() === true, 'a hash carrying a query should report that it applied');
+    assert(document.getElementById('findings-q').value === 'sql',
+      `search box got ${document.getElementById('findings-q').value}`);
+    assert(document.getElementById('findings-repo').value === 'acme/shop',
+      `repo box got ${document.getElementById('findings-repo').value}`);
+  });
+
+  check('clearing the filters puts every control back, not just the text ones', () => {
+    document.getElementById('findings-q').value = 'sql';
+    document.getElementById('findings-repo').value = 'acme/shop';
+    document.getElementById('findings-control').value = 'SEC';
+    document.getElementById('findings-severity').value = '5';
+    vm.runInContext('clearFindingFilters', sandbox)();
+    const val = id => document.getElementById(id).value;
+    assert(val('findings-q') === '' && val('findings-repo') === ''
+      && val('findings-control') === '', 'the text filters should be empty');
+    assert(val('findings-severity') === '0', `severity went back to ${val('findings-severity')}`);
+    assert(val('findings-status') === 'open',
+      `status should return to the screen's default, got ${val('findings-status')}`);
+  });
+
+  check('a unified diff is coloured, counted, and numbered from its own hunk headers', () => {
+    const render = vm.runInContext('renderUnifiedDiff', sandbox);
+    const html = render([
+      'diff --git a/src/auth.py b/src/auth.py',
+      '--- a/src/auth.py',
+      '+++ b/src/auth.py',
+      '@@ -10,4 +10,5 @@ def login(u, p):',
+      '     cur = db.cursor()',
+      '-    cur.execute("SELECT * FROM users WHERE u=" + u)',
+      '+    cur.execute("SELECT * FROM users WHERE u=?", (u,))',
+      '+    log.info("login attempt")',
+      '     return cur.fetchone()',
+    ].join('\n'));
+    assert((html.match(/class="dl-add"/g) || []).length === 2, 'two added lines');
+    assert((html.match(/class="dl-del"/g) || []).length === 1, 'one removed line');
+    assert(html.includes('dl-hunk'), 'the @@ header is marked, not treated as context');
+    assert(html.includes('>+2<') && html.includes('>-1<'),
+      'the +/- tally is what a reader checks first');
+    // The line numbers have to be the file's own. Counting from one is the failure that
+    // makes a diff unusable for finding the code it describes.
+    assert(html.includes('<td class="dl-n">10</td><td class="dl-n">10</td>'),
+      'the first context line after "@@ -10,4 +10,5 @@" is line 10 in both files');
+    assert(!html.includes('<script'), 'diff content is escaped');
+  });
+
+  check('a diff of an added file does not invent old-file line numbers', () => {
+    const render = vm.runInContext('renderUnifiedDiff', sandbox);
+    const html = render(['new file mode 100644', '@@ -0,0 +1,2 @@', '+one', '+two'].join('\n'));
+    // An added line has no counterpart in the old file, so its left gutter is empty
+    // rather than showing a number that does not exist.
+    assert(html.includes('<tr class="dl-add"><td class="dl-n"></td><td class="dl-n">1</td>'),
+      'an added line has no old-file number');
+  });
+
+  check('a finding links into the file viewer only when there is a source to read', () => {
+    const renderFinding = vm.runInContext('renderFinding', sandbox);
+    const f = { id: 'f1', title: 'SQL injection', severity: 5, file_path: 'src/auth.py',
+                line_start: 12, control_id: 'SEC-001' };
+
+    vm.runInContext('_openFileAgent = ""; _openFileRunId = "";', sandbox);
+    const plain = renderFinding(f);
+    assert(plain.includes('src/auth.py:12'), 'the location is always shown');
+    assert(!plain.includes('finding-loc-link'),
+      'with no recorded source there is nothing to open, so it must not look clickable');
+
+    vm.runInContext('_openFileAgent = "code"; _openFileRunId = "rv-9";', sandbox);
+    const linked = renderFinding(f);
+    assert(linked.includes('finding-loc-link'), 'a run with a source gets a link');
+    assert(linked.includes("openReviewFile('code','rv-9','src/auth.py',12)"),
+      `the link must carry the line: ${linked.match(/openReviewFile\([^)]*\)/)}`);
+  });
+}
+
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
-  .then(runReviewSourceChecks).then(runScreenIsolationChecks).then(() => {
+  .then(runReviewSourceChecks).then(runScreenIsolationChecks)
+  .then(runNavigationChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

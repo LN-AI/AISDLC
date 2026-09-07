@@ -3040,11 +3040,72 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
     return out
 
 
+def _finding_filter_sql(status: Optional[str] = None, min_severity: int = 0,
+                        review_id: Optional[str] = None, q: Optional[str] = None,
+                        control_id: Optional[str] = None, product_id: Optional[str] = None,
+                        repo: Optional[str] = None,
+                        since: Optional[str] = None) -> tuple:
+    """The WHERE fragment for a findings query, built once.
+
+    Shared by `list_findings` and `count_findings` deliberately: they answer "which rows"
+    and "how many rows" about the *same* set, and the counts are shown beside the list.
+    Two copies of this logic is two chances for the header to disagree with the body, which
+    is worse than either being wrong on its own.
+
+    `q` searches the title, the description and the file path. `LIKE` with a leading
+    wildcard cannot use an index — accepted rather than worked around: this table is
+    bounded by how much a team has reviewed, and the alternative is an FTS5 virtual table
+    to maintain for a screen someone opens a few times a day.
+    """
+    clauses = ""
+    extra: tuple = ()
+    if status:
+        clauses += " AND f.status = ?"
+        extra += (status,)
+    if min_severity:
+        clauses += " AND f.severity >= ?"
+        extra += (min_severity,)
+    if review_id:
+        clauses += " AND f.review_id = ?"
+        extra += (review_id,)
+    if q:
+        needle = f"%{q.strip()}%"
+        clauses += (" AND (f.title LIKE ? OR f.description LIKE ? OR f.file_path LIKE ?)")
+        extra += (needle, needle, needle)
+    if control_id:
+        # A prefix, so `SEC` matches SEC-001..SEC-016 and `SEC-004` matches just that one.
+        # Which is what a security reviewer means by "show me the access-control ones".
+        clauses += " AND f.control_id LIKE ?"
+        extra += (f"{control_id.strip()}%",)
+    if product_id:
+        clauses += " AND r.product_id = ?"
+        extra += (product_id,)
+    if repo:
+        # `owner/name`, or just the name. The repository dimension exists on `reviews` now,
+        # so "every open Critical in the payments service" is finally a query.
+        owner, _, name = repo.strip().partition("/")
+        if name:
+            clauses += " AND r.repo_owner = ? AND r.repo_name = ?"
+            extra += (owner, name)
+        else:
+            clauses += " AND r.repo_name = ?"
+            extra += (owner,)
+    if since:
+        clauses += " AND r.created_at >= ?"
+        extra += (since,)
+    return clauses, extra
+
+
 def list_findings(
     project_ids: Optional[List[str]] = None,
     status: Optional[str] = None,
     min_severity: int = 0,
     review_id: Optional[str] = None,
+    q: Optional[str] = None,
+    control_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    repo: Optional[str] = None,
+    since: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
@@ -3059,21 +3120,14 @@ def list_findings(
     type, when. Scoped on `findings.project_id`, which `save_review` stamps.
     """
     scope, params = _project_scope_sql(project_ids, alias="f")
-    clauses = ""
-    extra: tuple = ()
-    if status:
-        clauses += " AND f.status = ?"
-        extra += (status,)
-    if min_severity:
-        clauses += " AND f.severity >= ?"
-        extra += (min_severity,)
-    if review_id:
-        clauses += " AND f.review_id = ?"
-        extra += (review_id,)
+    clauses, extra = _finding_filter_sql(
+        status=status, min_severity=min_severity, review_id=review_id, q=q,
+        control_id=control_id, product_id=product_id, repo=repo, since=since)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        f"""SELECT f.*, r.review_type, r.project_name, r.created_at AS review_created_at
+        f"""SELECT f.*, r.review_type, r.project_name, r.created_at AS review_created_at,
+                   r.repo_owner, r.repo_name, r.product_id
             FROM findings f
             LEFT JOIN reviews r ON r.id = f.review_id
             WHERE 1 = 1{scope}{clauses}
@@ -3090,26 +3144,32 @@ def count_findings(
     status: Optional[str] = None,
     min_severity: int = 0,
     review_id: Optional[str] = None,
+    q: Optional[str] = None,
+    control_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    repo: Optional[str] = None,
+    since: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Totals for the same filter `list_findings` applies, plus a severity breakdown.
 
     The breakdown ignores `min_severity` deliberately: it is what the filter buttons are
     counting, so it has to describe the whole filtered-by-status set rather than the slice
-    currently on screen.
+    currently on screen. Every *other* filter is applied, through the same builder the list
+    uses — a header that counted a different set from the body would be worse than no
+    header, and that is exactly what happens when these two grow apart.
     """
     scope, params = _project_scope_sql(project_ids, alias="f")
-    clauses = ""
-    extra: tuple = ()
-    if status:
-        clauses += " AND f.status = ?"
-        extra += (status,)
-    if review_id:
-        clauses += " AND f.review_id = ?"
-        extra += (review_id,)
+    # `min_severity=0` on purpose, per the docstring. The join is needed because the
+    # repository, product and date filters live on `reviews`.
+    clauses, extra = _finding_filter_sql(
+        status=status, min_severity=0, review_id=review_id, q=q,
+        control_id=control_id, product_id=product_id, repo=repo, since=since)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        f"SELECT severity, COUNT(*) AS cnt FROM findings f WHERE 1 = 1{scope}{clauses} GROUP BY severity",
+        f"""SELECT f.severity, COUNT(*) AS cnt FROM findings f
+            LEFT JOIN reviews r ON r.id = f.review_id
+            WHERE 1 = 1{scope}{clauses} GROUP BY f.severity""",
         params + extra,
     )
     by_severity = {int(row["severity"] or 0): row["cnt"] for row in cursor.fetchall()}
