@@ -612,6 +612,207 @@ check("resolved findings come back worst-first",
       [r["severity"] for r in finding_pipeline.resolved_since(
           [], prior, files_read=ALL_READ)["resolved_findings"]] == [5, 4])
 
+# ── 13. Suppression as code ────────────────────────────────────────────────
+#
+# `.lmignore` and inline `lm-ignore`. Two properties are load-bearing and everything else
+# is detail: a rule must **not delete** the finding it matches (only stop it gating), and a
+# rule that matched nothing must **say so** — a misspelled pattern is otherwise invisible
+# and the developer blames the tool for still failing their build.
+section("13. Suppression as code -- .lmignore and inline lm-ignore")
+
+from backend.services import suppression  # noqa: E402
+
+
+def _f(path, control="SEC-001", ls=None, le=None, ev="", sev=5, title="Issue"):
+    return {"file_path": path, "control_id": control, "line_start": ls, "line_end": le,
+            "evidence": ev, "severity": sev, "title": title}
+
+
+_IGN = """
+# comment
+legacy/**
+fixtures
+*.generated.ts
+src/parser.py: SEC-003 known, admin-only tool
+infra/**: SEC-003, SEC-010  tracked in JIRA-4412
+!legacy/payments/**
+src/*.py: CWE-89
+"""
+_sup = suppression.parse(_IGN)
+check("comments and blanks are skipped", len(_sup.rules) == 7, str(len(_sup.rules)))
+check("a well-formed file parses with no errors", not _sup.errors, str(_sup.errors))
+
+check("** crosses directories", bool(_sup.match(_f("legacy/a/b.py"))))
+check("a pattern is not a prefix match", _sup.match(_f("legacyx/a.py")) is None,
+      "'legacy/**' must not cover a sibling directory whose name starts the same")
+check("a bare name matches any whole path segment", bool(_sup.match(_f("a/fixtures/x.py"))))
+check("a basename glob matches anywhere in the tree",
+      bool(_sup.match(_f("web/src/api.generated.ts"))))
+check("...and is anchored at the end", _sup.match(_f("web/api.generated.ts.bak")) is None)
+check("a single * does not cross a slash", _sup.match(_f("src/a/b.py", "CWE-89")) is None,
+      "otherwise a rule written for one directory silently covers a subtree")
+check("a control-scoped rule fires only for its control",
+      bool(_sup.match(_f("src/parser.py", "SEC-003")))
+      and _sup.match(_f("src/parser.py", "SEC-999")) is None)
+check("a comma-separated control list is honoured",
+      bool(_sup.match(_f("infra/main.tf", "SEC-010"))))
+check("the last matching rule wins, so ! carves an exception",
+      _sup.match(_f("legacy/payments/card.py")) is None
+      and bool(_sup.match(_f("legacy/other/x.py"))))
+check("the justification names the file and the line the rule lives on",
+      ".lmignore:6" in str(_sup.match(_f("src/parser.py", "SEC-003"))),
+      "a reader has to be able to go and change the rule")
+check("a rule with no reason still names itself",
+      "legacy/**" in str(_sup.match(_f("legacy/a.py"))))
+
+# A dotfile is the case this feature cannot afford to get wrong: the ignore file is itself
+# a dotfile, so a path normalizer that ate the leading dot broke the whole feature.
+check("a rule about a dotfile path matches",
+      bool(suppression.parse(".github/**").match(_f(".github/workflows/ci.yml"))),
+      "`lstrip('./')` strips a character set, not a prefix -- it turns `.lmignore` into "
+      "`lmignore` and `.github/...` into `github/...`")
+check("a ./ prefix on a finding's path is normalized away",
+      bool(suppression.parse("src/**").match(_f("./src/a.py"))))
+
+# The unused report. This is the point of the feature's honesty, not a nicety.
+_fresh = suppression.parse(_IGN)
+_fresh.match(_f("legacy/a/b.py"))
+_rep = _fresh.report()
+check("a rule that matched nothing is reported", _rep["unused_count"] == 5, str(_rep["unused"]))
+check("...with the line number to go and fix",
+      any(u["line"] == 4 and u["rule"] == "fixtures" for u in _rep["unused"]))
+check("a negation is never reported as unused",
+      not any("payments" in u["rule"] for u in _rep["unused"]),
+      "a ! rule exists to *not* suppress, so it has nothing to match")
+check("rules with no stated reason are counted for the record",
+      _rep["rules_without_reason"] == 4, str(_rep["rules_without_reason"]))
+_fresh.reset()
+check("reset zeroes the counters, so a retry reports this run",
+      _fresh.report()["findings_suppressed"] == 0)
+
+# A malformed file degrades, it does not refuse: a review of a repository with one bad
+# line must not behave as though the file were absent, with no explanation.
+_bad = suppression.parse(": SEC-003 nothing before the colon\ngood/**\n")
+check("a bad line is named and the good lines still work",
+      len(_bad.rules) == 1 and len(_bad.errors) == 1, str((len(_bad.rules), _bad.errors)))
+_big = suppression.parse("\n".join("p%d/**" % i for i in range(suppression.MAX_RULES + 5)))
+check("the rule cap is enforced and announced",
+      len(_big.rules) == suppression.MAX_RULES and len(_big.errors) == 1)
+
+# ── Inline directives ─────────────────────────────────────────────────────
+_FILES = [
+    {"path": "app/db.py", "content": (
+        "import x\n"
+        "q = 'SELECT'  # lm-ignore: SEC-001 admin tool\n"
+        "# lm-ignore-next-line CWE-79\n"
+        "render(user)\n"
+        "plain = 1\n"
+    )},
+    {"path": "vendor/lib.js", "content": "// lm-ignore-file  upstream's problem\nvar a=1;\n"},
+    {"path": "deep/late.py", "content": ("\n" * 40) + "# lm-ignore-file too far down\n"},
+]
+_inline = {(d.path, d.line): d for d in suppression.scan_inline(_FILES)}
+check("a same-line directive is found with its line number",
+      _inline[("app/db.py", 2)].kind == "line")
+check("a next-line directive is distinguished",
+      _inline[("app/db.py", 3)].kind == "next-line")
+check("a whole-file directive is distinguished",
+      _inline[("vendor/lib.js", 1)].kind == "file")
+check("a file directive buried past the header is demoted to a line directive",
+      _inline[("deep/late.py", 41)].kind == "line",
+      "a directive nobody reading the top of the file can see must not exempt the file")
+check("the control and the reason are parsed off the directive",
+      _inline[("app/db.py", 2)].controls == frozenset({"SEC-001"})
+      and _inline[("app/db.py", 2)].reason == "admin tool")
+
+_both = suppression.from_files(_FILES + [{"path": ".lmignore", "content": "legacy/**\n"}])
+check("the ignore file is found by name in a raw file list", len(_both.rules) == 1,
+      "it has no reviewable extension, so it is only in the list before filtering")
+check("a same-line directive suppresses that line",
+      bool(_both.match(_f("app/db.py", "SEC-001", 2, 2))))
+check("...and not a different control on the same line",
+      _both.match(_f("app/db.py", "SEC-999", 2, 2)) is None)
+check("a next-line directive suppresses the line below, not its own",
+      bool(_both.match(_f("app/db.py", "CWE-79", 4, 4)))
+      and _both.match(_f("app/db.py", "CWE-79", 3, 3)) is None)
+check("a file directive covers any line in that file",
+      bool(_both.match(_f("vendor/lib.js", "SEC-001", 99, 99))))
+check("a line directive cannot suppress a finding that names no line",
+      _both.match(_f("app/db.py", "SEC-001", None, None)) is None,
+      "otherwise one comment silently exempts a whole file, which is what "
+      "lm-ignore-file is for and has to be asked for")
+check("an unrelated line in the same file is untouched",
+      _both.match(_f("app/db.py", "SEC-001", 5, 5)) is None)
+
+_none = suppression.from_files([{"path": "a.py", "content": "x = 1\n"}])
+check("a repository with no ignore file yields no rules", not bool(_none))
+check("...but records that it was looked for", _none.report()["checked"] is True,
+      "'no rules' and 'never checked' are different facts")
+
+# The diff fallback: a pull request has no file list, so the only place a directive can be
+# seen is inside the finding's own evidence quote.
+_ev = suppression.Suppressions()
+check("a directive inside the evidence quote is honoured for a diff source",
+      bool(_ev.match_evidence(_f("x.py", "SEC-001", ev="q = 1  # lm-ignore: SEC-001 fine"))))
+check("...still narrowed by control",
+      _ev.match_evidence(_f("x.py", "SEC-9", ev="q = 1  # lm-ignore: SEC-001 fine")) is None)
+check("...and silent when there is no directive",
+      _ev.match_evidence(_f("x.py", "SEC-001", ev="q = 1")) is None)
+
+# ── The property that makes any of this safe ──────────────────────────────
+_HAY = "line one\nsecret = 'abc'\nline three\n"
+_hit = {"title": "Hardcoded secret", "severity": 5, "control_id": "SEC-003",
+        "file_path": "legacy/old.py", "evidence": "secret = 'abc'", "line_start": 2}
+_out = finding_pipeline.process([dict(_hit)], _HAY,
+                                suppression=suppression.parse("legacy/**  agreed\n"))
+check("a suppressed finding leaves the gating list",
+      not _out["findings"], str(_out["findings"]))
+check("...and is still reported, not deleted",
+      len(_out["suppressed_findings"]) == 1,
+      "anyone with commit access could otherwise turn a Red release Green by adding two "
+      "lines, and the review would agree with them in writing")
+check("...carrying the rule that did it",
+      ".lmignore" in (_out["suppressed_findings"][0].get("suppressed_reason") or ""))
+check("...and marked non-blocking",
+      _out["suppressed_findings"][0].get("is_blocking") is False)
+
+_kept = finding_pipeline.process([dict(_hit)], _HAY,
+                                 suppression=suppression.parse("other/**\n"))
+check("a non-matching rule changes nothing", len(_kept["findings"]) == 1)
+check("no suppression object at all changes nothing",
+      len(finding_pipeline.process([dict(_hit)], _HAY)["findings"]) == 1)
+
+# The built-in path rules must still win where they always did, and must not need a
+# `.lmignore` to be present.
+_test_hit = dict(_hit, file_path="tests/test_old.py")
+_tp = finding_pipeline.process([_test_hit], _HAY, suppression=suppression.parse(""))
+check("the built-in test/vendor filter still applies with an empty ignore file",
+      len(_tp["suppressed_findings"]) == 1
+      and "test, vendored" in _tp["suppressed_findings"][0]["suppressed_reason"])
+
+# ── The waiver export ─────────────────────────────────────────────────────
+#
+# The migration path, and the reason this is worth building: a project that has been
+# clicking waivers for months can export them once instead of re-entering them.
+_exported = suppression.to_ignore_file([
+    {"file_path": "src/a.py", "control_id": "SEC-003", "reason": "accepted 2026-01"},
+    {"file_path": "src/a.py", "control_id": "SEC-003", "reason": "a duplicate row"},
+    {"file_path": "", "title": "design finding", "fingerprint": "abc123"},
+])
+check("one rule per path and control, duplicates collapsed",
+      _exported.count("src/a.py: SEC-003") == 1, _exported)
+check("a waiver with no file path is named in the output, not dropped",
+      "SKIPPED (no file path)" in _exported,
+      "a waiver that vanishes on export is one somebody still has to re-enter by hand")
+_round = suppression.parse(_exported)
+check("the export round-trips through its own parser",
+      len(_round.rules) == 1 and not _round.errors, str(_round.errors))
+check("...keeping the control narrow",
+      bool(_round.match(_f("src/a.py", "SEC-003")))
+      and _round.match(_f("src/a.py", "SEC-001")) is None,
+      "an export that widened to every control would grant what nobody approved")
+
+
 # ── Through the real database, against a real repository ──────────────────
 from backend import context as _ctx12  # noqa: E402
 

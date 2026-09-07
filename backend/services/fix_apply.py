@@ -90,7 +90,7 @@ def eligible(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             why = ("The code this finding quotes could not be found in your source, so a fix "
                    "for it would be a change to code that may not exist.")
         elif f.get("suppressed_reason"):
-            why = (f"In a path that is reported but not counted — {f['suppressed_reason']}. "
+            why = (f"Reported but not counted — {f['suppressed_reason']}. "
                    f"Fix it by hand if you disagree.")
         elif not f.get("file_path"):
             why = ("This finding names no file. It is about the design rather than a line of "

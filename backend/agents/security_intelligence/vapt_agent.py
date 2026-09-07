@@ -143,6 +143,7 @@ class VAPTAgent(VAPTBaseAgent):
         coverage_reason: str = "",
         is_diff: Optional[bool] = None,
         extra_findings: Optional[List[Dict[str, Any]]] = None,
+        suppression: Any = None,
         llm_override: Optional[Dict[str, Any]] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> Dict[str, Any]:
@@ -173,6 +174,7 @@ class VAPTAgent(VAPTBaseAgent):
             extra_findings=extra_findings,
             baseline_lookup=chunked_review.default_baseline,
             resolved_lookup=chunked_review.default_resolved,
+            suppression=suppression,
             on_progress=on_progress,
         )
         # Counts the UI and the dashboard read. Computed here rather than in the

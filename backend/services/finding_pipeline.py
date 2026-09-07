@@ -316,16 +316,42 @@ def sort_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(findings or [], key=key)
 
 
-def apply_path_suppression(findings: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Move findings in test/vendor/generated paths out of the main list.
+def apply_path_suppression(
+    findings: List[Dict[str, Any]],
+    suppression: Any = None,
+    use_evidence_fallback: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Move findings the team has already accepted out of the main list.
 
-    They are returned, not deleted — a hardcoded secret in a test fixture is still worth
-    seeing — but they no longer carry severity into the gate.
+    Two sources, in this order:
+
+    1. **The built-in path rules** — test, fixture, vendored, generated and build output.
+       Always on, and not configurable, because they are about what is not shipped rather
+       than about what a team has decided.
+    2. **The repository's own rules** — `.lmignore` and inline `lm-ignore` comments, if a
+       `suppression.Suppressions` was passed. See `backend/services/suppression.py`; the
+       rule that matters is that these lower the gate and never hide the evidence.
+
+    Nothing is deleted — a hardcoded secret in a test fixture is still worth seeing — but a
+    suppressed finding no longer carries severity into the gate. `suppressed_reason` names
+    which rule did it and where that rule lives, so a reader can go and change it.
+
+    `use_evidence_fallback` is for a **diff** source, where there is no per-file text to
+    scan for inline comments and so a directive can only be read out of the finding's own
+    evidence quote. Off by default: with real file text the precise line match is available
+    and strictly better.
     """
     kept, suppressed = [], []
     for f in findings or []:
+        reason = ""
         if is_suppressed_path(str(f.get("file_path", ""))):
-            f["suppressed_reason"] = "path is test, vendored, generated or build output"
+            reason = "path is test, vendored, generated or build output"
+        elif suppression is not None:
+            reason = suppression.match(f) or ""
+            if not reason and use_evidence_fallback:
+                reason = suppression.match_evidence(f) or ""
+        if reason:
+            f["suppressed_reason"] = reason
             f["is_blocking"] = False
             suppressed.append(f)
         else:
@@ -433,6 +459,7 @@ def process(
     findings: List[Dict[str, Any]],
     artifact: str,
     correct_lines: bool = True,
+    suppression: Any = None,
 ) -> Dict[str, Any]:
     """Verify, suppress, merge, sort and fingerprint. Returns the trustworthy list plus
     what was removed and why.
@@ -442,7 +469,11 @@ def process(
     this first, look the fingerprints up, and then apply what it found.
     """
     verified, discarded = verify_evidence(findings, artifact, correct_lines)
-    kept, suppressed = apply_path_suppression(verified)
+    # `use_evidence_fallback` because this is the single-haystack path, which is where a
+    # diff arrives: there is no file list to scan for inline directives, so the only place
+    # one can be seen is inside the finding's own quote.
+    kept, suppressed = apply_path_suppression(
+        verified, suppression, use_evidence_fallback=True)
     merged = sort_findings(merge_findings(kept))
     for f in merged:
         f["fingerprint"] = fingerprint(f)
@@ -628,10 +659,14 @@ def process_files(
     findings: List[Dict[str, Any]],
     files: List[Dict[str, Any]],
     correct_lines: bool = True,
+    suppression: Any = None,
 ) -> Dict[str, Any]:
     """`process`, for a multi-file artifact. Same three passes, per-file verification."""
     verified, discarded = verify_evidence_per_file(findings, files, correct_lines)
-    kept, suppressed = apply_path_suppression(verified)
+    # No evidence fallback here: the inline directives were scanned out of the real files
+    # with their real line numbers, so the precise match is available and the loose one
+    # would only add false suppressions.
+    kept, suppressed = apply_path_suppression(verified, suppression)
     merged = sort_findings(merge_findings(kept))
     for f in merged:
         f["fingerprint"] = fingerprint(f)

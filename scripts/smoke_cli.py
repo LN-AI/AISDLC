@@ -118,6 +118,9 @@ try:
             cwd=REPO, env=cli_env, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=300)
 
+    sys.path.insert(0, REPO)
+    from backend.services import suppression as _suppression
+
     print("\nlmsdlc against a real server\n" + "-" * 62)
 
     r = run("review", "--files", REL, "--quote-only")
@@ -172,6 +175,27 @@ try:
     r = run("findings", "--severity", "5", "--repo", "no-such-repo")
     check("...and a repository filter matching nothing says zero, not everything",
           r.returncode == 0 and "0 matching" in r.stdout, r.stdout + r.stderr)
+
+    # `--lmignore` writes a file. Only a subprocess can tell you that it landed on disk
+    # with the right content, which is the same reason this whole script exists.
+    ign = os.path.join(src_dir, "exported.lmignore")
+    r = run("findings", "--lmignore", ign)
+    check("--lmignore reports what it wrote",
+          r.returncode == 0 and "Wrote" in r.stdout and "rule(s)" in r.stdout,
+          r.stdout + r.stderr)
+    check("...and the file is really on disk", os.path.exists(ign), ign)
+    body = io.open(ign, encoding="utf-8").read() if os.path.exists(ign) else ""
+    check("...carrying the warning that a rule is wider than the waiver",
+          "wider than" in body, body[:300])
+    check("...and parses as an ignore file with no errors",
+          not _suppression.parse(body).errors,
+          str(_suppression.parse(body).errors))
+    check("...and it warns the reader before they commit it",
+          "Read it before committing" in r.stdout, r.stdout)
+    r = run("findings", "--lmignore", "-")
+    check("'-' writes the file to stdout instead",
+          r.returncode == 0 and "wider than" in r.stdout and "Wrote" not in r.stdout,
+          r.stdout[:300] + r.stderr[:200])
 
     # Both of these were real client defects, found here and nowhere else.
     outside = os.path.join(tempfile.gettempdir(), "lmsdlc_outside.py")

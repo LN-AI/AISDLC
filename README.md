@@ -114,6 +114,15 @@ several agents in parallel behind one policy-enforced gate decision.
   OpenAI-compatible credentials (`PUT /api/v1/llm-config`, X-API-Key auth) instead of the
   platform's shared account, or override a single call via `llm_provider` / `llm_api_key` /
   `llm_base_url` / `llm_model` fields on any agent request.
+- **Suppression as code** — a team's accepted risks live in their repository, not in this
+  database. A `.lmignore` at the root takes path globs optionally narrowed to a control
+  (`legacy/**: SEC-003 deleted in Q3`), and an inline `# lm-ignore: SEC-001 admin only`
+  covers one line. An ignore rule **lowers the gate and never hides the evidence** — a
+  suppressed finding is still reported and still exported, marked with the rule that did
+  it, because otherwise anyone with commit access could turn a Red release Green by adding
+  two lines. Rules that matched nothing are reported, because the way this fails is a typo.
+  Existing waivers export as a file with `lmsdlc findings --lmignore`. See
+  [`docs/suppression.md`](docs/suppression.md).
 - **CLI and CI** — `scripts/lmsdlc.py` runs a review from a terminal or any pipeline.
   `--fail-on red` exits non-zero on a Red gate, so the review *is* the build step rather
   than a report beside it; `--sarif out.sarif` writes the format GitHub code scanning and

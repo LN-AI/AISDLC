@@ -2916,6 +2916,195 @@ def main():
         check("an unsupported algorithm is refused",
               _wh._verify(WEBHOOK_SECRET, body, "sha1=" + "0" * 40) is False)
         check("a missing header is refused", _wh._verify(WEBHOOK_SECRET, body, None) is False)
+        # ── 32. Suppression as code, end to end ──────────────────────────
+        #
+        # Section 13 of `smoke_code_review.py` covers the rules themselves. What only
+        # exists end to end is the *plumbing*: the ignore file has no reviewable extension,
+        # so it is dropped by `repo_ingest.normalize_files` and can only be found in the
+        # raw list — a wiring mistake there means the feature silently never fires, and
+        # every unit test still passes.
+        section("32. Suppression as code reaches a real review")
+
+        from backend.services import suppression as _sup32
+
+        # Deliberately not a hardcoded credential. `repo_ingest` redacts those at ingest
+        # (D-04), so a finding quoting the literal is *discarded* by evidence verification
+        # before suppression is reached -- which is correct, and would have made this
+        # section pass or fail for a reason unrelated to what it is testing.
+        _IGNORED_HIT = dict(
+            control_id="SEC-001", severity=5, risk_level="Critical",
+            title="Unsafe eval in the legacy parser", description="Evaluates input.",
+            recommendation="Parse it instead.", is_blocking=True,
+            file_path="legacy/parser.py", line_start=2, confidence="High",
+            evidence="return eval(payload)",
+        )
+        _KEPT_HIT = dict(
+            control_id="SEC-001", severity=5, risk_level="Critical",
+            title="Command injection in the runner", description="Shell out of user input.",
+            recommendation="Use a list argv.", is_blocking=True,
+            file_path="app/runner.py", line_start=4, confidence="High",
+            evidence="os.system(cmd)",
+        )
+        _SRC32 = {
+            "legacy/parser.py": "def parse(payload):\n    return eval(payload)\n",
+            "app/runner.py": "import os\n\ndef run(cmd):\n    os.system(cmd)\n",
+            ".lmignore": (
+                "# legacy/ is deleted in Q3, tracked in JIRA-4412\n"
+                "legacy/**: SEC-001 scheduled for deletion\n"
+                "this/pattern/matches/nothing/**\n"
+            ),
+        }
+
+        # The parse, straight off a zip, before any review. This is the wiring check.
+        _b32 = source_bundle.from_zip_bytes(make_zip(_SRC32), label="ignore-demo")
+        check("the ignore file is found in a zip even though it is never reviewed",
+              _b32.suppression is not None and len(_b32.suppression.rules) == 2,
+              str(getattr(_b32.suppression, "rules", None)))
+        check("...and is itself excluded from the files sent to the model",
+              all(f["path"] != ".lmignore" for f in _b32.files),
+              "a rules file in the prompt is tokens spent on instructions to ourselves")
+        check("the source summary states how many rules the repository brought",
+              _b32.summary()["ignore_rules"] == 2, str(_b32.summary().get("ignore_rules")))
+
+        scripted["code"] = code_response([dict(_IGNORED_HIT), dict(_KEPT_HIT)], gate="Red")
+        _run32 = client.post(
+            "/api/review/code/upload-zip",
+            files={"file": ("ignore-demo.zip", make_zip(_SRC32), "application/zip")},
+            data={"project_name": "Sources"}, headers=UI,
+        )
+        check("a zip carrying a .lmignore reviews normally",
+              _run32.status_code == 200, _run32.text[:240])
+        _r32 = _run32.json()
+        _titles32 = [f.get("title") for f in (_r32.get("findings") or [])]
+        _sup_titles32 = [f.get("title") for f in (_r32.get("suppressed_findings") or [])]
+        check("the finding the repository asked us to ignore leaves the gating list",
+              "Unsafe eval in the legacy parser" not in _titles32, str(_titles32))
+        check("...and is still reported, so nobody can hide a Critical by committing a file",
+              "Unsafe eval in the legacy parser" in _sup_titles32, str(_sup_titles32))
+        check("...naming the rule and the line it lives on",
+              ".lmignore:2" in str([f.get("suppressed_reason")
+                                    for f in _r32.get("suppressed_findings") or []]),
+              str([f.get("suppressed_reason") for f in _r32.get("suppressed_findings") or []]))
+        check("a finding the rules do not cover is untouched",
+              "Command injection in the runner" in _titles32, str(_titles32))
+        check("...so the gate is still Red on what is left",
+              _r32.get("gate_status") == "Red", str(_r32.get("gate_status")))
+
+        _rep32 = _r32.get("suppression") or {}
+        check("the run reports the rules it was given", _rep32.get("rules") == 2, str(_rep32))
+        check("...and how many findings they took out",
+              _rep32.get("findings_suppressed") == 1, str(_rep32))
+        check("...and names the rule that matched nothing",
+              _rep32.get("unused_count") == 1
+              and "this/pattern/matches/nothing" in str(_rep32.get("unused")),
+              str(_rep32.get("unused")))
+
+        # An inline comment, on the source that would otherwise have been reported.
+        _INLINE32 = {
+            "app/runner.py": ("import os\n"
+                              "def run(cmd):\n"
+                              "    os.system(cmd)  # lm-ignore: SEC-001 admin CLI only\n"),
+        }
+        _inline_hit = dict(_KEPT_HIT, line_start=3,
+                           evidence="os.system(cmd)  # lm-ignore: SEC-001 admin CLI only")
+        scripted["code"] = code_response([dict(_inline_hit)], gate="Red")
+        _run33 = client.post(
+            "/api/review/code/upload-zip",
+            files={"file": ("inline.zip", make_zip(_INLINE32), "application/zip")},
+            data={"project_name": "Sources"}, headers=UI,
+        )
+        check("an inline lm-ignore comment reaches a real review",
+              _run33.status_code == 200, _run33.text[:240])
+        _r33 = _run33.json()
+        check("...and takes its own line out of the gating list",
+              not (_r33.get("findings") or []),
+              str([f.get("title") for f in _r33.get("findings") or []]))
+        check("...while still reporting it with the comment as the reason",
+              len(_r33.get("suppressed_findings") or []) == 1
+              and "lm-ignore at app/runner.py:3"
+              in (_r33["suppressed_findings"][0].get("suppressed_reason") or ""),
+              str([f.get("suppressed_reason") for f in _r33.get("suppressed_findings") or []]))
+        check("...and the gate still cannot be talked down from the model's own verdict",
+              _r33.get("gate_status") == "Red", str(_r33.get("gate_status")),)
+        # The other direction, so the pairing is not an accident: with the model reporting
+        # Green, an ignored finding leaves nothing to floor the gate up from.
+        scripted["code"] = code_response([dict(_inline_hit)], gate="Green", risk=1.0)
+        _run34 = client.post(
+            "/api/review/code/upload-zip",
+            files={"file": ("inline2.zip", make_zip(_INLINE32), "application/zip")},
+            data={"project_name": "Sources"}, headers=UI,
+        )
+        check("an ignored finding does not floor the gate upward either",
+              _run34.status_code == 200
+              and _run34.json().get("gate_status") in ("Green", "Amber"),
+              str(_run34.json().get("gate_status")))
+        check("...and it is still on the record in that run too",
+              len(_run34.json().get("suppressed_findings") or []) == 1,
+              "a rule lowers the gate; it never removes the evidence")
+
+        # A pull request has no file list, so `.lmignore` has to be fetched. The fetch must
+        # fail open: a repository without one answers 404, which is the common case.
+        class _NoIgnoreGH:
+            def get_file_content_at_ref(self, owner, repo, path, ref):
+                raise RuntimeError("404 Not Found")
+
+        _pr32 = source_bundle.pr_bundle(
+            {"diff": "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "title": "t",
+             "head_sha": "d" * 40, "files_changed": ["x.py"]},
+            "https://github.com/acme/portal/pull/7", github=_NoIgnoreGH(),
+        )
+        check("a repository with no ignore file still yields a reviewable pull request",
+              _pr32.suppression is not None and not _pr32.suppression.rules,
+              "a 404 for .lmignore must not fail the review")
+
+        class _IgnoreGH:
+            def __init__(self):
+                self.asked = []
+
+            def get_file_content_at_ref(self, owner, repo, path, ref):
+                self.asked.append((owner, repo, path, ref))
+                return {"content": "docs/**  prose, not code\n"}
+
+        _gh32 = _IgnoreGH()
+        _pr33 = source_bundle.pr_bundle(
+            {"diff": "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "title": "t",
+             "head_sha": "e" * 40, "files_changed": ["x.py"]},
+            "https://github.com/acme/portal/pull/9", github=_gh32,
+        )
+        check("a pull request reads the ignore file out of the repository",
+              len(_pr33.suppression.rules) == 1, str(_gh32.asked))
+        check("...at the commit the review is about, not the branch tip",
+              _gh32.asked and _gh32.asked[0][3] == "e" * 40, str(_gh32.asked))
+        check("...from the right repository", _gh32.asked[0][:3] == ("acme", "portal", ".lmignore"),
+              str(_gh32.asked))
+        _pr34 = source_bundle.pr_bundle(
+            {"diff": "d", "title": "t", "head_sha": "f" * 40}, "https://x/pull/1")
+        check("a caller that passes no client gets no rules rather than an error",
+              _pr34.suppression is None)
+
+        # ── The migration path off click-by-click waivers ────────────────
+        #
+        # The friction this feature exists to remove: a team that has been waiving the same
+        # findings for months has those decisions in the database only.
+        _w32 = client.get("/api/v1/findings/lmignore", headers=H)
+        check("the waiver export answers", _w32.status_code == 200, _w32.text[:200])
+        check("...as a file, not as JSON",
+              "text/plain" in _w32.headers.get("content-type", ""),
+              _w32.headers.get("content-type", ""))
+        check("...offered as a download named .lmignore",
+              ".lmignore" in _w32.headers.get("content-disposition", ""),
+              _w32.headers.get("content-disposition", ""))
+        check("...warning that a rule is wider than the waiver it came from",
+              "wider than" in _w32.text,
+              "an exported rule covers the control and the path; the waiver covered one "
+              "finding, matched on its title and evidence too")
+        _parsed32 = _sup32.parse(_w32.text)
+        check("...and whatever it produces parses as a valid ignore file",
+              not _parsed32.errors, str(_parsed32.errors))
+        check("the export requires a credential",
+              client.get("/api/v1/findings/lmignore").status_code in (401, 403),
+              "it lists what a team has decided not to fix, which is a map of known holes")
+
 
 
 

@@ -513,6 +513,10 @@ def _run_bundle_review(bundle, agent: str, project_name: str, context: str = "",
     deterministic = source_bundle.deterministic_findings(bundle)
     args["extra_findings"] = deterministic["findings"]
     args["source"] = {**args["source"], "dependency": deterministic["dependency"]}
+    # What the repository itself says not to gate on. Passed even when empty, so the agent
+    # can report "checked, no rules" rather than leaving a reader unable to tell that from
+    # "never looked".
+    args["suppression"] = bundle.suppression
     single = len(bundle.files) == 1 and not bundle.files[0].get("path")
     if single:
         text = bundle.files[0].get("content") or ""

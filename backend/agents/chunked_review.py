@@ -194,6 +194,7 @@ def run(
     extra_findings: Optional[List[Dict[str, Any]]] = None,
     baseline_lookup: Optional[Callable[[List[Dict[str, Any]]], Dict[str, Any]]] = None,
     resolved_lookup: Optional[Callable[[], Dict[str, Any]]] = None,
+    suppression: Any = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, Any]:
     """Review one artifact — a string or a file list — and return a gated result.
@@ -210,6 +211,13 @@ def run(
     de-duplication against the model's version of the same finding, path suppression when
     they are in a fixture, a fingerprint so they can be waived, and a vote in the gate.
     Appending them afterwards would have made them second-class in all five ways.
+
+    `suppression` is what the repository itself says not to gate on — its `.lmignore` and
+    its inline `lm-ignore` comments, parsed by `backend/services/suppression.py` and
+    carried on the Bundle. It is applied at the same stage as the built-in test/vendor path
+    rules, which means a suppressed finding is still reported and still exported; it just
+    stops voting in the gate. Passed in rather than looked up here for the same reason
+    `baseline_lookup` is: this module does not know what a source is.
     """
     multi_file = bool(files) and not (len(files) == 1 and not files[0].get("path"))
     if multi_file:
@@ -258,12 +266,19 @@ def run(
         result["findings"] = list(extra_findings) + list(result["findings"])
         result["deterministic_findings_count"] = len(extra_findings)
 
+    # Zeroed first, so the report below names the rules that fired on *this* run rather
+    # than accumulating across a retry of the same Bundle.
+    if suppression is not None:
+        suppression.reset()
+
     if multi_file:
-        processed = finding_pipeline.process_files(result["findings"], files, correct_lines=True)
+        processed = finding_pipeline.process_files(
+            result["findings"], files, correct_lines=True, suppression=suppression)
     else:
         # Line correction is off for diffs — see verify_evidence's docstring.
         processed = finding_pipeline.process(
-            result["findings"], haystack, correct_lines=not diff_mode
+            result["findings"], haystack, correct_lines=not diff_mode,
+            suppression=suppression,
         )
 
     # Baseline comparison has to follow `process`, because fingerprints only exist after
@@ -291,6 +306,13 @@ def run(
             result.update(closed)
         except Exception:
             logger.exception("Resolved-since comparison failed — reporting none as fixed")
+
+    # What the repository asked not to be gated on, and — the part that matters — which of
+    # its rules matched nothing. A misspelled pattern is otherwise invisible: the developer
+    # believes they suppressed something, the gate still fails, and the tool takes the
+    # blame.
+    if suppression is not None:
+        result["suppression"] = suppression.report()
 
     result["coverage"] = {
         "chunks_total": len(chunks),

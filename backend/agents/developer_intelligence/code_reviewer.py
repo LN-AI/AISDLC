@@ -203,6 +203,7 @@ class CodeReviewAgent(BaseAgent):
         files: Optional[List[Dict[str, Any]]] = None,
         is_diff: Optional[bool] = None,
         extra_findings: Optional[List[Dict[str, Any]]] = None,
+        suppression: Any = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> Dict[str, Any]:
         """Review one code artifact and return a gated result.
@@ -242,6 +243,7 @@ class CodeReviewAgent(BaseAgent):
             extra_findings=extra_findings,
             baseline_lookup=chunked_review.default_baseline,
             resolved_lookup=chunked_review.default_resolved,
+            suppression=suppression,
             on_progress=on_progress,
         )
 

@@ -802,7 +802,8 @@ class GitHubService:
         if review_result.get("waived_count"):
             tally.append(f"{review_result['waived_count']} waived")
         if review_result.get("suppressed_findings"):
-            tally.append(f"{len(review_result['suppressed_findings'])} in test/vendor paths")
+            tally.append(f"{len(review_result['suppressed_findings'])} not counted "
+                         f"(filtered paths or this repo's ignore rules)")
         if review_result.get("discarded_findings"):
             tally.append(
                 f"{len(review_result['discarded_findings'])} discarded (quoted code not "

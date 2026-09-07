@@ -137,6 +137,7 @@ class SDLCOrchestrator:
                     coverage_incomplete: bool = False, coverage_reason: str = "",
                     source: Optional[Dict[str, Any]] = None,
                     extra_findings: Optional[List[Dict[str, Any]]] = None,
+                    suppression: Any = None,
                     on_progress=None) -> Dict[str, Any]:
         """Review a paste, a diff, or a whole file list (a zip or a repository).
 
@@ -158,7 +159,8 @@ class SDLCOrchestrator:
             result = self.code_agent.review_code(
                 language=language, context=context, files=files,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                extra_findings=extra_findings, on_progress=on_progress,
+                extra_findings=extra_findings, suppression=suppression,
+                on_progress=on_progress,
             )
             label = (source or {}).get("label", "")
             input_summary = f"Code review over {len(files)} file(s)" + (f" — {label}" if label else "")
@@ -168,7 +170,7 @@ class SDLCOrchestrator:
             result = self.code_agent.review_code(
                 code=compressed_code, language=language, context=context,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                on_progress=on_progress,
+                suppression=suppression, on_progress=on_progress,
             )
             input_summary = f"Code review{f' for PR: {pr_url}' if pr_url else ''} ({len(code)} chars)"
             input_content = code[:5000]
@@ -277,6 +279,7 @@ class SDLCOrchestrator:
         coverage_reason: str = "",
         source: Optional[Dict[str, Any]] = None,
         extra_findings: Optional[List[Dict[str, Any]]] = None,
+        suppression: Any = None,
         on_progress=None,
     ) -> Dict[str, Any]:
         """Assess a paste, a diff, or a whole file list, and persist a gated result.
@@ -300,7 +303,8 @@ class SDLCOrchestrator:
             result = self.vapt_agent.run_vapt(
                 context=context, scope=scope, files=files,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                extra_findings=extra_findings, on_progress=on_progress,
+                extra_findings=extra_findings, suppression=suppression,
+                on_progress=on_progress,
             )
             label = (source or {}).get("label", "")
             input_summary = f"VAPT over {len(files)} file(s)" + (f" — {label}" if label else "")
@@ -310,7 +314,7 @@ class SDLCOrchestrator:
             result = self.vapt_agent.run_vapt(
                 artifact=compressed_artifact, context=context, scope=scope,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                on_progress=on_progress,
+                suppression=suppression, on_progress=on_progress,
             )
             input_summary = f"VAPT — {artifact[:150]}{'...' if len(artifact) > 150 else ''}"
             input_content = artifact[:5000]

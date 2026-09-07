@@ -2293,6 +2293,14 @@ function renderFinding(f) {
   if (f.occurrences > 1) {
     marks.push(`<span class="mark-chip" title="Reported ${f.occurrences} times and merged into one">×${f.occurrences}</span>`);
   }
+  // Which rule took this finding out of the gate. It used to be enough for the panel's
+  // heading to say "test/vendor paths", because that was the only possible answer. Now a
+  // finding can be here because of a line in this repository's own `.lmignore` or a
+  // comment on the line itself, and a reader who cannot see *which* has no way to go and
+  // change it.
+  if (f.suppressed_reason) {
+    marks.push(`<span class="mark-chip" title="Not counted toward the gate. This is the rule that did it -- change the rule to get the finding back.">not counted: ${esc(f.suppressed_reason)}</span>`);
+  }
   const markRow = marks.length ? `<div class="mark-row">${marks.join('')}</div>` : '';
 
   return `
@@ -2334,7 +2342,7 @@ function fixEligibility(f) {
       + 'would be a change to code that may not exist.';
   }
   if (f.suppressed_reason) {
-    return `In a path that is reported but not counted — ${f.suppressed_reason}.`;
+    return `Reported but not counted — ${f.suppressed_reason}.`;
   }
   if (!f.file_path) {
     return 'This finding names no file. It is about the design rather than a line of code, '
@@ -10641,7 +10649,19 @@ function renderReviewTransparency(r) {
   if (r.pre_existing_count) chips.push(`<span class="tally-chip">${r.pre_existing_count} pre-existing</span>`);
   if (r.deterministic_findings_count) chips.push(`<span class="tally-chip tally-scanner" title="Found by a pattern scanner before any model ran — no model was asked, so there is nothing to hallucinate">${r.deterministic_findings_count} from the scanner</span>`);
   if (r.waived_count) chips.push(`<span class="tally-chip">${r.waived_count} waived</span>`);
-  if (r.suppressed_findings?.length) chips.push(`<span class="tally-chip">${r.suppressed_findings.length} in test/vendor paths</span>`);
+  if (r.suppressed_findings?.length) {
+    // Split by origin. "In test/vendor paths" is our filter; "ignored by .lmignore" is the
+    // team's own written decision, and reporting the second as the first would credit us
+    // with a judgement somebody else made.
+    const _byRepo = r.suppressed_findings.filter(f => /lmignore|lm-ignore/.test(f.suppressed_reason || '')).length;
+    const _byPath = r.suppressed_findings.length - _byRepo;
+    if (_byPath) chips.push(`<span class="tally-chip">${_byPath} in test/vendor paths</span>`);
+    if (_byRepo) chips.push(`<span class="tally-chip" title="Suppressed by this repository's own .lmignore or an inline lm-ignore comment">${_byRepo} ignored by the repo</span>`);
+  }
+  // The rule that matched nothing. This is the whole reason the report exists: a misspelled
+  // pattern is otherwise invisible — the developer believes they suppressed something, the
+  // gate still fails, and the tool takes the blame.
+  if (r.suppression?.unused_count) chips.push(`<span class="tally-chip tally-discarded" title="An ignore rule that matched no finding in this run — usually a typo in the pattern">${r.suppression.unused_count} ignore rule(s) matched nothing</span>`);
   if (r.discarded_findings?.length) chips.push(`<span class="tally-chip tally-discarded">${r.discarded_findings.length} discarded</span>`);
   if (chips.length) html += `<div class="tally-row">${chips.join('')}</div>`;
 
@@ -10664,11 +10684,39 @@ function renderReviewTransparency(r) {
   // The suppressed panel, with the findings themselves so a reader can overrule the filter.
   if (r.suppressed_findings?.length) {
     html += `<details class="review-panel panel-suppressed">
-      <summary>${r.suppressed_findings.length} finding(s) hidden — test, fixture, vendored or generated code</summary>
-      <div class="field-hint">Still reported here, but not counted toward the gate: a fake key in a
-        test fixture is not a production risk, and flagging it is the fastest way to teach a team
-        to ignore this tool. Read them if you want to overrule that.</div>
+      <summary>${r.suppressed_findings.length} finding(s) not counted — filtered paths, or this repository's own ignore rules</summary>
+      <div class="field-hint">Still reported here, but not counted toward the gate. Two things land
+        in this list: a path we filter (test, fixture, vendored, generated — a fake key in a
+        fixture is not a production risk, and flagging it is the fastest way to teach a team to
+        ignore this tool), and anything the repository's own <code>.lmignore</code> or an inline
+        <code>lm-ignore</code> comment asked us not to gate on. Each finding says which rule did
+        it and where that rule lives. Nothing is deleted, so you can always overrule it.</div>
       ${r.suppressed_findings.map(f => renderFinding(f)).join('')}
+    </details>`;
+  }
+
+  // What the repository asked for, and — the part worth surfacing — what it asked for and
+  // did not get. Shown whenever a rule exists or a rule missed, and skipped entirely for a
+  // repository with no ignore file, which is most of them.
+  const _sup = r.suppression;
+  if (_sup && (_sup.rules || _sup.inline_directives || _sup.unused_count)) {
+    const bits = [];
+    if (_sup.rules) bits.push(`${_sup.rules} rule(s) in <code>${esc(_sup.source || '.lmignore')}</code>`);
+    if (_sup.inline_directives) bits.push(`${_sup.inline_directives} inline <code>lm-ignore</code> comment(s)`);
+    html += `<details class="review-panel"${_sup.unused_count ? ' open' : ''}>
+      <summary>${_sup.findings_suppressed || 0} finding(s) ignored by this repository's own rules${_sup.unused_count ? ` — ${_sup.unused_count} rule(s) matched nothing` : ''}</summary>
+      <div class="field-hint">${bits.join(', ') || 'No ignore rules in this repository.'}
+        An ignore rule lowers the gate; it never hides the evidence — every finding it
+        touched is in the list above, marked with the rule that did it.</div>
+      ${_sup.unused_count ? `<div class="field-hint"><b>Matched nothing in this run.</b> Usually a
+        typo in the pattern, or a rule left behind after the code moved. Harmless, but it is
+        not suppressing what whoever wrote it thinks it is.</div>
+      <ul>${(_sup.unused || []).map(u => `<li><code>${esc(u.rule || '')}</code>${u.path ? ` in <code>${esc(u.path)}</code>` : ''}${u.line ? ` (line ${u.line})` : ''}</li>`).join('')}</ul>` : ''}
+      ${_sup.rules_without_reason ? `<div class="field-hint">${_sup.rules_without_reason} rule(s)
+        give no reason. Honoured anyway, but an auditor reading this later has nothing to go
+        on — a few words after the pattern is enough.</div>` : ''}
+      ${(_sup.errors || []).length ? `<div class="field-hint"><b>Lines that could not be read:</b>
+        <ul>${_sup.errors.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
     </details>`;
   }
 

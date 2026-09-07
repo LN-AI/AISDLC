@@ -3040,6 +3040,13 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
     return out
 
 
+# The three statuses that all mean "do not gate on this". A list, not the set in
+# `finding_pipeline.WAIVED_STATUSES`, because a parameterized `IN (?, ?, ?)` needs a stable
+# order — and declared here rather than imported because the data layer does not otherwise
+# depend on the services layer.
+WAIVED_STATUS_LIST = ["waived", "false_positive", "accepted_risk"]
+
+
 def _finding_filter_sql(status: Optional[str] = None, min_severity: int = 0,
                         review_id: Optional[str] = None, q: Optional[str] = None,
                         control_id: Optional[str] = None, product_id: Optional[str] = None,
@@ -3133,6 +3140,53 @@ def list_findings(
             WHERE 1 = 1{scope}{clauses}
             ORDER BY r.created_at DESC, f.severity DESC LIMIT ? OFFSET ?""",
         params + extra + (limit, offset),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_waived_findings(
+    project_ids: Optional[List[str]] = None,
+    repo: Optional[str] = None,
+    limit: int = 2000,
+) -> List[Dict[str, Any]]:
+    """Every finding a team has decided not to act on, for export as a `.lmignore`.
+
+    A separate function rather than `list_findings(status=...)` because a waiver is three
+    statuses, not one — waived, false_positive and accepted_risk are different decisions
+    that all mean "do not gate on this" — and `_finding_filter_sql` takes a single status
+    on purpose, because everywhere else in the UI a status filter means exactly one.
+
+    `waiver_lapsed_at IS NULL` matters: an acceptance that ran out is *not* a waiver any
+    more (`lapse_expired_waivers` reopens it), and exporting it into a file with no expiry
+    would silently make a lapsed acceptance permanent — the one thing the expiry exists to
+    prevent.
+
+    Newest first, and `repo` narrows to one repository so a team exports the rules for the
+    repository they are about to commit the file into rather than every project they own.
+    """
+    scope, params = _project_scope_sql(project_ids, alias="f")
+    clauses, extra = "", ()
+    if repo:
+        owner, _, name = repo.strip().partition("/")
+        if name:
+            clauses += " AND r.repo_owner = ? AND r.repo_name = ?"
+            extra += (owner, name)
+        else:
+            clauses += " AND r.repo_name = ?"
+            extra += (owner,)
+    placeholders = ", ".join("?" for _ in WAIVED_STATUS_LIST)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""SELECT f.*, r.repo_owner, r.repo_name, r.created_at AS review_created_at
+            FROM findings f
+            LEFT JOIN reviews r ON r.id = f.review_id
+            WHERE f.status IN ({placeholders})
+              AND f.waiver_lapsed_at IS NULL{scope}{clauses}
+            ORDER BY r.created_at DESC LIMIT ?""",
+        tuple(WAIVED_STATUS_LIST) + params + extra + (limit,),
     )
     rows = cursor.fetchall()
     conn.close()

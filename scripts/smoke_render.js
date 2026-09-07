@@ -1893,6 +1893,74 @@ check('suppressed findings are readable, so the filter can be overruled', () => 
   if (!html.includes('Fixture key')) throw new Error('the suppressed finding is not rendered');
 });
 
+check('a finding suppressed by the repository is labelled as the repo\'s decision', () => {
+  // Two different facts. "In test/vendor paths" is our filter; ".lmignore" is a decision
+  // somebody on the team wrote down. Reporting the second as the first would credit us
+  // with a judgement we did not make.
+  const html = sandbox.renderReviewTransparency({
+    suppressed_findings: [
+      { title: 'Fixture key', file_path: 'tests/conftest.py', severity: 5,
+        suppressed_reason: 'path is test, vendored, generated or build output' },
+      { title: 'Legacy eval', file_path: 'legacy/p.py', severity: 5,
+        suppressed_reason: '.lmignore:2 — scheduled for deletion' },
+    ],
+    suppression: { source: '.lmignore', rules: 2, findings_suppressed: 1,
+                   inline_directives: 0, unused_count: 0, unused: [] },
+  });
+  if (!html.includes('1 in test/vendor paths'))
+    throw new Error('the built-in filter count is not stated separately');
+  if (!html.includes('1 ignored by the repo'))
+    throw new Error("the repository's own suppressions are not distinguished");
+  if (!html.includes('.lmignore:2'))
+    throw new Error('the rule that did it is not shown, so nobody can go and change it');
+});
+
+check('an ignore rule that matched nothing is reported, not swallowed', () => {
+  // The failure this feature invites: a misspelled pattern. The developer believes they
+  // suppressed something, the gate still fails, and the tool takes the blame.
+  const html = sandbox.renderReviewTransparency({
+    suppression: { source: '.lmignore', rules: 3, findings_suppressed: 1,
+                   inline_directives: 1, inline_fired: 0, unused_count: 2,
+                   unused: [{ rule: 'legcy/**', line: 4 },
+                            { rule: 'lm-ignore', path: 'app/x.py', line: 12 }],
+                   rules_without_reason: 1, errors: [] },
+  });
+  if (!html.includes('matched nothing'))
+    throw new Error('an unused rule is not surfaced at all');
+  if (!html.includes('legcy/**'))
+    throw new Error('the misspelled pattern itself is not shown');
+  if (!html.includes('line 4'))
+    throw new Error('the line to go and fix is not given');
+  if (!html.includes('app/x.py'))
+    throw new Error('an unused inline directive does not name its file');
+  if (!html.includes('give no reason'))
+    throw new Error('a rule with no stated reason is not counted for the record');
+});
+
+check('a repository with no ignore rules gets no panel about them', () => {
+  // Most repositories have no `.lmignore`. A panel saying "0 rules" on every result is
+  // noise that teaches a reader to skip the whole transparency block.
+  const html = sandbox.renderReviewTransparency({
+    findings: [{ title: 'SQLi', severity: 5, file_path: 'a.py' }],
+    suppression: { source: '', checked: true, rules: 0, inline_directives: 0,
+                   findings_suppressed: 0, unused_count: 0, unused: [] },
+  });
+  if (/lmignore/i.test(html))
+    throw new Error('an empty ignore report still painted a panel');
+});
+
+check('a result from before suppression existed still renders', () => {
+  // Every stored review predates this field. A renderer that needed it would break the
+  // history rather than degrade.
+  const html = sandbox.renderReviewTransparency({
+    suppressed_findings: [{ title: 'fixture', file_path: 'tests/x.py', severity: 5 }],
+  });
+  if (!html.includes('panel-suppressed'))
+    throw new Error('an older result lost its suppressed panel');
+  if (/matched nothing/.test(html))
+    throw new Error('an absent report was rendered as an empty one');
+});
+
 check('the source and what was filtered out of it is stated on the result', () => {
   const html = sandbox.renderReviewTransparency({
     source: { label: 'acme/app@main', source_type: 'github_repo',

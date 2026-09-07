@@ -29,6 +29,7 @@ Only the standard library plus `httpx`, which the server already depends on.
     lmsdlc findings --repo acme/shop --severity 4
 """
 import argparse
+import io
 import json
 import os
 import sys
@@ -303,6 +304,30 @@ def _write_sarif(args, result: Dict[str, Any]) -> None:
 
 
 def cmd_findings(args) -> int:
+    # `--lmignore` is a different endpoint and a different output — a file to commit, not a
+    # queue to read — so it short-circuits before the query below rather than adding a mode
+    # to it. It is the migration path off click-by-click waivers: export once, commit, and
+    # every future review of that repository honours the file.
+    if getattr(args, "lmignore", None):
+        params: Dict[str, Any] = {}
+        if getattr(args, "repo", None):
+            params["repo"] = args.repo
+        with _client(args) as http:
+            r = http.get("/api/v1/findings/lmignore", params=params)
+            _raise_for(r)
+            body = r.text
+        if args.lmignore == "-":
+            print(body, end="")
+            return 0
+        with io.open(args.lmignore, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body)
+        rules = sum(1 for ln in body.splitlines()
+                    if ln.strip() and not ln.startswith("#"))
+        print(f"\n  Wrote {rules} rule(s) to {args.lmignore}")
+        print("  Read it before committing: a rule covers a path and a control, which is "
+              "wider\n  than the one finding each waiver was granted for.\n")
+        return 0
+
     params: Dict[str, Any] = {"limit": args.limit, "min_severity": args.severity}
     if args.status:
         params["status"] = args.status
@@ -408,6 +433,9 @@ def build_parser() -> argparse.ArgumentParser:
     fd.add_argument("--control-id", dest="control_id", help="Prefix, e.g. SEC.")
     fd.add_argument("--product-id", dest="product_id", help="Only this agent's findings.")
     fd.add_argument("--limit", type=int, default=50)
+    fd.add_argument("--lmignore", metavar="PATH",
+                    help="Instead of listing: write this project's existing waivers out as "
+                         "a .lmignore file to commit. '-' for stdout. Narrow it with --repo.")
     fd.set_defaults(func=cmd_findings)
     return ap
 

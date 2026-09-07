@@ -149,7 +149,11 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   `backend/agents/chunked_review.py` fans the chunks out and assembles the result;
   `finding_pipeline.py` verifies each finding's quote against the file it names, de-duplicates,
   suppresses test/vendor paths and fingerprints; `finding_gate.py` floors the gate so a model's
-  own verdict can only ever be tightened. `review_estimate.py` prices a run before it happens,
+  own verdict can only ever be tightened; `suppression.py` reads the repository's own
+  `.lmignore` and inline `lm-ignore` comments, which is carried on the `Bundle` and applied
+  at the same stage as the built-in test/vendor path filter — **an ignore rule lowers the
+  gate and never removes the finding**, because otherwise a commit could turn a Red release
+  Green and the audit trail would agree with it (`docs/suppression.md`). `review_estimate.py` prices a run before it happens,
   reusing `modernization/estimate.py`'s arithmetic so a quote and an invoice come from one
   price table. `sarif.py` exports a finished review in the format GitHub code scanning and
   most security dashboards read.
