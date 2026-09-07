@@ -436,7 +436,8 @@ def guarded_call(
         # when the registry has no record for it (an internal stage), which is the
         # better fallback: a labelled row beats a NULL one.
         with context.bind_project(project_id, project_name,
-                                  product_id=getattr(product, "id", None) or agent_name), \
+                                  product_id=getattr(product, "id", None) or agent_name,
+                                  actor=caller_ref or caller_type), \
                 hold_budget_reservation(subject, model_for_reservation, _expected_calls(product)), \
                 llm_gateway.track_usage():
             try:

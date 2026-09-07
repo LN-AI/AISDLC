@@ -546,6 +546,29 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_product "
                    "ON reviews(product_id, created_at DESC)")
 
+    # Which project an audit event and an AI-inventory row belong to.
+    #
+    # Both tables predate project scoping and had no column to express it, which is why
+    # `GET /api/audit` and `/api/inventory/*` were the two governance surfaces `scope.py`
+    # was never applied to -- there was nothing to filter on. NULL on every pre-existing
+    # row, and `_project_scope_sql` renders `project_id IN (...)`, which never matches
+    # NULL: historical rows therefore stay super-admin-only, exactly as `reviews`,
+    # `reports` and `approvals` already do. Deployment-wide events belonging to no project
+    # (`user_login`, `plan_created`) are NULL deliberately and stay super-admin-only for
+    # the same reason.
+    for _table in ("audit_trail", "ai_systems"):
+        try:
+            cursor.execute(f"ALTER TABLE {_table} ADD COLUMN project_id TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    # `audit_trail` carried no index at all, on a table that only grows and is always read
+    # newest-first with an offset.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_project "
+                   "ON audit_trail(project_id, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_trail(created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ai_systems_project "
+                   "ON ai_systems(project_id, created_at DESC)")
+
     cursor.executescript("""
         -- What a user told us we got wrong. The only free signal about our own accuracy,
         -- and until now it died in a `resolution_comment`. Each row is a candidate for
@@ -697,9 +720,18 @@ def save_review(
         # offered and nothing ever emitted, so that filter always came back empty — which
         # on a compliance product reads as "no approvals were ever raised".
         log_audit(cursor, "approval_created", "approval", approval_id,
+                  actor=context.current_actor() or "system",
                   details=f"review={review_id} priority={priority}")
 
-    log_audit(cursor, "review_created", "review", review_id, details=f"type={review_type}")
+    # Named, not defaulted. This row said `actor='system'` for every review ever run,
+    # because `log_audit`'s default was the only thing available here -- so the Audit
+    # Trail could not answer "who ran this", which is the question it exists for. The
+    # actor comes from the request boundary via `context`, the same route `project_id`
+    # above already travels. Still falls back to "system" for a review saved outside any
+    # request (the smoke suites, `scripts/`), which is honest: nobody ran those.
+    log_audit(cursor, "review_created", "review", review_id,
+              actor=context.current_actor() or "system",
+              details=f"type={review_type}")
 
     conn.commit()
     conn.close()
@@ -719,19 +751,26 @@ def get_review(review_id: str) -> Optional[Dict[str, Any]]:
     return data
 
 
-def list_reviews_by_type(review_type: str, project_name: Optional[str] = None, limit: int = 25) -> List[Dict[str, Any]]:
+def list_reviews_by_type(review_type: str, project_name: Optional[str] = None, limit: int = 25,
+                         project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Whole review rows of one type, newest first, scoped to what the caller may read.
+
+    `project_name` is free text a user typed into a form: it is a *filter*, not a
+    permission. Omitting it used to mean "every project in the deployment", which is how
+    the Issue Triage dashboard came to aggregate every customer's triage reviews for any
+    signed-in user. `project_ids` is the permission, and applies whether or not a name
+    was given.
+    """
+    scope_sql, scope_params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
+    where = "WHERE review_type = ?" + scope_sql
+    params = [review_type, *scope_params]
     if project_name:
-        cursor.execute(
-            "SELECT * FROM reviews WHERE review_type = ? AND project_name = ? ORDER BY created_at DESC LIMIT ?",
-            (review_type, project_name, limit),
-        )
-    else:
-        cursor.execute(
-            "SELECT * FROM reviews WHERE review_type = ? ORDER BY created_at DESC LIMIT ?",
-            (review_type, limit),
-        )
+        where += " AND project_name = ?"
+        params.append(project_name)
+    params.append(limit)
+    cursor.execute(f"SELECT * FROM reviews {where} ORDER BY created_at DESC LIMIT ?", params)
     rows = cursor.fetchall()
     conn.close()
     results = []
@@ -758,7 +797,7 @@ def get_latest_review(project_name: str, review_type: str) -> Optional[Dict[str,
     return data
 
 
-# ── Scoping reviews to what a caller may see ──────────────────────────────
+# ── Scoping rows to what a caller may see ─────────────────────────────────
 #
 # `project_ids=None` means "no restriction" and is for super admins only. An empty list
 # means "restricted to nothing" and must return nothing — the distinction matters, because
@@ -767,8 +806,13 @@ def get_latest_review(project_name: str, review_type: str) -> Optional[Dict[str,
 # Rows with a NULL project_id are everything reviewed before reviews were attributed, plus
 # anything run without a project selected. There is no way to know retrospectively whose
 # they were, so they are visible to super admins and to nobody else.
+#
+# Named for the column, not for one table: `reviews`, `reports`, `approvals`, `findings`,
+# `audit_trail` and `ai_systems` all carry `project_id` and all scope through this. It was
+# `_review_scope_sql` while only reviews used it, which read as though the other tables
+# needed their own — they do not.
 
-def _review_scope_sql(project_ids: Optional[List[str]], alias: str = "") -> tuple:
+def _project_scope_sql(project_ids: Optional[List[str]], alias: str = "") -> tuple:
     prefix = f"{alias}." if alias else ""
     if project_ids is None:
         return "", ()
@@ -808,7 +852,7 @@ def list_reviews(limit: int = 20, offset: int = 0,
     `review_type` — otherwise every existing customer's history would read as empty, which
     looks exactly like data loss.
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     if product_id and review_type:
         scope += " AND (product_id = ? OR (product_id IS NULL AND review_type = ?))"
         params = params + (product_id, review_type)
@@ -884,13 +928,13 @@ def count_reviews(project_ids: Optional[List[str]] = None,
                   product_id: Optional[str] = None) -> int:
     """How many reviews the caller may see — the denominator a pager needs.
 
-    Scoped through the same `_review_scope_sql` as `list_reviews` and taking the same two
+    Scoped through the same `_project_scope_sql` as `list_reviews` and taking the same two
     filters *with the same fallback*, so the count and the page it describes can never
     disagree about which projects or which agent are in view. Duplicating the predicate here
     is the bug this docstring exists to prevent: a count that forgot the NULL fallback would
     say "3 of 0".
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     if product_id and review_type:
         scope += " AND (product_id = ? OR (product_id IS NULL AND review_type = ?))"
         params = params + (product_id, review_type)
@@ -1059,14 +1103,14 @@ def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, An
     finding belongs to a review, and a review now belongs to a project, so an unscoped
     count would leak how much critical work another customer has open.
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute(f"SELECT COUNT(*) as total FROM reviews WHERE 1 = 1{scope}", params)
     total = cursor.fetchone()["total"]
 
-    finding_scope, finding_params = _review_scope_sql(project_ids, alias="r")
+    finding_scope, finding_params = _project_scope_sql(project_ids, alias="r")
     cursor.execute(
         "SELECT COUNT(*) as cnt FROM findings f JOIN reviews r ON r.id = f.review_id "
         f"WHERE f.severity = 5 AND f.status = 'open'{finding_scope}",
@@ -1144,7 +1188,7 @@ def list_reports(limit: int = 25, offset: int = 0,
     rather than the whole document, so a listing screen doesn't transfer every report in
     full. Use `get_report` for the document itself.
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -1171,10 +1215,23 @@ def list_reports(limit: int = 25, offset: int = 0,
     return reports
 
 
-def log_audit(cursor, event_type: str, entity_type: str, entity_id: str, actor: str = "system", details: str = ""):
+def log_audit(cursor, event_type: str, entity_type: str, entity_id: str, actor: str = "system",
+              details: str = "", project_id: Optional[str] = None):
+    """Append one audit row on the caller's own transaction.
+
+    `project_id` defaults to whichever project the request is bound to, the same source
+    `save_review` reads, so a caller that already opened `context.bind_project` gets a
+    scoped row without passing anything. Pass it explicitly for an event about a project
+    other than the bound one, and pass `""` for a deployment-wide event that belongs to no
+    project — that stores NULL and stays super-admin-only.
+    """
+    if project_id is None:
+        project_id = context.current_project_id()
     cursor.execute(
-        "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details, datetime.utcnow().isoformat()),
+        "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, project_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details,
+         project_id or None, datetime.utcnow().isoformat()),
     )
 
 
@@ -1183,17 +1240,31 @@ def list_audit_events(
     event_type: Optional[str] = None,
     entity_type: Optional[str] = None,
     actor: Optional[str] = None,
+    project_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
+    """One page of audit events, newest first, scoped to what the caller may read.
+
+    `project_ids` is not optional in practice — every caller passes
+    `scope.visible_from_caller(...)`. It defaults to `None` only because that is what a
+    super admin resolves to, and because the signature has to stay compatible with
+    `count_audit_events` beside it.
+    """
+    scope_sql, scope_params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
-    conditions, params = [], []
+    conditions, params = [], list(scope_params)
     if event_type:
         conditions.append("event_type = ?"); params.append(event_type)
     if entity_type:
         conditions.append("entity_type = ?"); params.append(entity_type)
     if actor:
         conditions.append("actor LIKE ?"); params.append(f"%{actor}%")
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    # `_project_scope_sql` returns a fragment that already begins with " AND ", so the
+    # WHERE has to open on something. `1 = 1` rather than reordering the fragment, which
+    # is what every other caller of that helper does.
+    where = "WHERE 1 = 1" + scope_sql
+    if conditions:
+        where += " AND " + " AND ".join(conditions)
     params.extend([limit, offset])
     cursor.execute(
         f"SELECT * FROM audit_trail {where} ORDER BY created_at DESC LIMIT ? OFFSET ?", params
@@ -1332,11 +1403,11 @@ def list_approvals(status: Optional[str] = None, limit: int = 50,
                    project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """The approval queue, newest first. `project_ids=None` means every project.
 
-    Scoped through the same `_review_scope_sql` as `list_reviews`, on `approvals.project_id`
+    Scoped through the same `_project_scope_sql` as `list_reviews`, on `approvals.project_id`
     — before this, the queue was the one governance surface that showed every customer's
     rows to every caller.
     """
-    scope, params = _review_scope_sql(project_ids, alias="a")
+    scope, params = _project_scope_sql(project_ids, alias="a")
     status_sql = " AND a.status = ?" if status else ""
     status_params = (status,) if status else ()
     conn = get_connection()
@@ -1370,7 +1441,7 @@ def decide_approval(approval_id: str, status: str, decision_by: str, comment: st
 def get_approval_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """Counts behind the sidebar badge. Scoped like `list_approvals`, so the number on the
     badge and the rows on the page can never disagree about which projects are in view."""
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -1394,21 +1465,30 @@ def create_ai_system(
 ) -> Dict[str, Any]:
     system_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
+    # Whose register this row belongs to, taken from the request boundary exactly as
+    # `save_review` takes it. The AI inventory holds `owner`, `team`,
+    # `data_classification` and `compliance_frameworks` -- a customer's own account of
+    # which of their systems touch regulated data -- and until this column existed there
+    # was no way to keep one customer's register out of another's.
+    project_id = context.current_project_id()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO ai_systems
            (id, name, description, use_case_type, risk_level, model_name, model_provider,
             owner, team, status, data_classification, compliance_frameworks,
-            jira_project, github_repo, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            jira_project, github_repo, project_id, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (system_id, name, description, use_case_type, risk_level, model_name,
          model_provider, owner, team, status, data_classification,
-         compliance_frameworks, jira_project, github_repo, now, now),
+         compliance_frameworks, jira_project, github_repo, project_id, now, now),
     )
     conn.commit()
     conn.close()
-    return {"id": system_id, "name": name, "risk_level": risk_level, "status": status, "created_at": now}
+    _audit("ai_system_registered", "ai_system", system_id,
+           context.current_actor() or "system", f"{name} ({risk_level})")
+    return {"id": system_id, "name": name, "risk_level": risk_level, "status": status,
+            "created_at": now}
 
 
 def get_ai_system(system_id: str) -> Optional[Dict[str, Any]]:
@@ -1420,15 +1500,19 @@ def get_ai_system(system_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def list_ai_systems(status: Optional[str] = None, risk_level: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_ai_systems(status: Optional[str] = None, risk_level: Optional[str] = None,
+                    project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    scope_sql, scope_params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
-    conditions, params = [], []
+    conditions, params = [], list(scope_params)
     if status:
         conditions.append("status = ?"); params.append(status)
     if risk_level:
         conditions.append("risk_level = ?"); params.append(risk_level)
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    where = "WHERE 1 = 1" + scope_sql
+    if conditions:
+        where += " AND " + " AND ".join(conditions)
     cursor.execute(f"SELECT * FROM ai_systems {where} ORDER BY created_at DESC", params)
     rows = cursor.fetchall()
     conn.close()
@@ -1449,14 +1533,19 @@ def update_ai_system(system_id: str, fields: Dict[str, Any]) -> Optional[Dict[st
     return get_ai_system(system_id)
 
 
-def get_inventory_stats() -> Dict[str, Any]:
+def get_inventory_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    scope_sql, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) as total FROM ai_systems")
+    cursor.execute(f"SELECT COUNT(*) as total FROM ai_systems WHERE 1 = 1{scope_sql}", params)
     total = cursor.fetchone()["total"]
-    cursor.execute("SELECT risk_level, COUNT(*) as cnt FROM ai_systems GROUP BY risk_level")
+    cursor.execute(
+        f"SELECT risk_level, COUNT(*) as cnt FROM ai_systems WHERE 1 = 1{scope_sql} "
+        "GROUP BY risk_level", params)
     by_risk = {r["risk_level"]: r["cnt"] for r in cursor.fetchall()}
-    cursor.execute("SELECT status, COUNT(*) as cnt FROM ai_systems GROUP BY status")
+    cursor.execute(
+        f"SELECT status, COUNT(*) as cnt FROM ai_systems WHERE 1 = 1{scope_sql} "
+        "GROUP BY status", params)
     by_status = {r["status"]: r["cnt"] for r in cursor.fetchall()}
     conn.close()
     return {"total": total, "by_risk": by_risk, "by_status": by_status}
@@ -2574,18 +2663,47 @@ def get_usage_breakdown(key_id: str, since_iso: str) -> List[Dict[str, Any]]:
     return get_usage_summary(key_id=key_id, start=since_iso)["by_product"]
 
 
-def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, details: str = ""):
+def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, details: str = "",
+           project_id: Optional[str] = None):
+    """Append one audit row on its own connection, for a caller that has no transaction.
+
+    Still deliberately non-fatal — a governance write must not fail because its audit row
+    could not be stored — but no longer *silent*. `except Exception: pass` meant a locked
+    database, a full disk or a schema drift produced an audit trail with holes in it and
+    nothing anywhere saying so, which is the one failure an audit trail must not have.
+    """
+    if project_id is None:
+        project_id = context.current_project_id()
     try:
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, created_at) VALUES (?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details, datetime.utcnow().isoformat()),
+            "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, project_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details,
+             project_id or None, datetime.utcnow().isoformat()),
         )
         conn.commit()
         conn.close()
     except Exception:
-        pass
+        logger.exception("Audit row not stored: %s on %s %s by %s",
+                         event_type, entity_type, entity_id, actor)
+
+
+def record_audit_event(event_type: str, entity_type: str, entity_id: str, actor: str,
+                      details: str = "", project_id: Optional[str] = None) -> None:
+    """Append one audit row from outside this module.
+
+    The public face of `_audit`, which every function in here already uses. A router
+    reaching for `_audit` directly reads as though it were breaking a boundary, and the
+    audit trail is about to gain rows from several routers (applying a fix, writing to a
+    repository, rotating a credential), so it needs a name that says it is meant to be
+    called.
+
+    `project_id=None` means "take the project this request is bound to"; pass `""` for a
+    deployment-wide event, which stores NULL and stays super-admin-only.
+    """
+    _audit(event_type, entity_type, entity_id, actor, details, project_id=project_id)
 
 
 # ── Agent jobs (async/progress-pollable long-running agent runs) ───────────
@@ -2714,7 +2832,7 @@ def list_findings(
     Joined to `reviews` for the context a row is meaningless without: which review, of what
     type, when. Scoped on `findings.project_id`, which `save_review` stamps.
     """
-    scope, params = _review_scope_sql(project_ids, alias="f")
+    scope, params = _project_scope_sql(project_ids, alias="f")
     clauses = ""
     extra: tuple = ()
     if status:
@@ -2753,7 +2871,7 @@ def count_findings(
     counting, so it has to describe the whole filtered-by-status set rather than the slice
     currently on screen.
     """
-    scope, params = _review_scope_sql(project_ids, alias="f")
+    scope, params = _project_scope_sql(project_ids, alias="f")
     clauses = ""
     extra: tuple = ()
     if status:

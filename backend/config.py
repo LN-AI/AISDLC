@@ -7,6 +7,8 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "sdlc_agent.db")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-this-in-production-32chars!!")
+_DEFAULT_SECRET_KEY = "change-this-in-production-32chars!!"
+_DEFAULT_ADMIN_PASSWORD = "Admin@1234"
 MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 # The response budget for an agent that names none of its own. A floor, not a ceiling:
 # most agents pass an explicit `max_tokens` (see base_agent.py and the per-agent modules),
@@ -16,7 +18,12 @@ MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "16000"))
 APP_ENV = os.getenv("APP_ENV", "development")
 JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
-DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "Admin@1234")
+# `or`, not a getenv default: `DEFAULT_ADMIN_PASSWORD=` present-but-empty in a .env is
+# a real and likely state (someone copies .env.example and fills in only the API key),
+# and `os.getenv(name, default)` returns "" for that, not the default — which would
+# create the bootstrap admin with a **blank** password. Worse than the weak default it
+# was meant to replace, and it would pass every check in this file.
+DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD") or "Admin@1234"
 JIRA_URL = os.getenv("JIRA_URL", "")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN", "")
@@ -43,6 +50,14 @@ LEGACY_ROUTES_REQUIRE_AUTH = os.getenv("LEGACY_ROUTES_REQUIRE_AUTH", "true").low
 # and no budget — i.e. unrestricted — which is the right default for an internal console
 # but a hole once customers get logins. Set this to true to reject UI agent calls that
 # aren't bound to a project, so nothing can be run outside a governed allowance.
+#
+# Still `false`, and that is now a recorded choice rather than an unexamined one. Flipping
+# it was considered as part of closing the unauthenticated-endpoint set and deliberately
+# left alone: `smoke_products.py` section 14 pins this default with the reasoning "opt in,
+# so no one is locked out on upgrade", and turning it on refuses every agent run from a
+# session that has not picked a project — which is a change to what existing users can do,
+# not a security fix. The endpoints that had no authorization at all were the actual hole,
+# and they are closed regardless of this flag. See C-80.
 UI_REQUIRE_PROJECT = os.getenv("UI_REQUIRE_PROJECT", "false").lower() == "true"
 
 # Where *other systems* reach this deployment — specifically a GitHub Actions runner posting
@@ -90,3 +105,59 @@ SQLITE_BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
 # orphans every in-flight job as status='running' forever. On startup we reap jobs
 # that belong to a dead process. See database.recover_orphaned_jobs().
 JOB_STALE_MINUTES = int(os.getenv("JOB_STALE_MINUTES", "30"))
+
+
+
+# ── Who may call this API from a browser ──────────────────────────────────
+#
+# Was `allow_origins=["*"]` with `allow_credentials=True`. Starlette echoes the requesting
+# origin back when both are set, so *any* web page could make credentialed calls to this
+# API — which mattered most for the routes that needed no credential at all (the Knowledge
+# Base, the AI inventory and the audit trail, all now fixed): those turned a network-local
+# problem into one a malicious page could trigger from a colleague's browser.
+#
+# The bundled SPA is served from this same origin and needs nothing here, so the default is
+# empty — no cross-origin browser access. Set `CORS_ALLOW_ORIGINS` to a comma-separated
+# list of exact origins (scheme, host and port, no trailing slash) for a separately hosted
+# front end. Server-to-server callers using `X-API-Key` are unaffected: CORS is a browser
+# mechanism and never applied to them.
+CORS_ALLOW_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+
+def assert_production_secrets() -> None:
+    """Refuse to boot a production deployment on the shipped default credentials.
+
+    `SECRET_KEY` signs every JWT *and* derives the one key that encrypts every stored
+    secret — LLM keys, GitHub tokens, webhook secrets and retained review source. On the
+    default value all of those are decryptable by anyone holding a copy of this repository,
+    and any JWT can be forged. `DEFAULT_ADMIN_PASSWORD` creates the bootstrap admin.
+
+    Both had hardcoded fallbacks and nothing anywhere checked them, so a deployment could
+    reach production still using both and look completely healthy. Enforced only when
+    `APP_ENV=production`, so development, the smoke suites and `ui_examine.py` are
+    untouched — they all rely on those defaults deliberately.
+    """
+    if APP_ENV != "production":
+        return
+    problems = []
+    if SECRET_KEY == _DEFAULT_SECRET_KEY:
+        problems.append(
+            "SECRET_KEY is still the shipped default. It signs every session token and "
+            "derives the encryption key for every stored credential. Set it to a random "
+            "32+ character value. Note that changing it later makes already-stored "
+            "credentials unreadable, so set it before storing any."
+        )
+    if DEFAULT_ADMIN_PASSWORD == _DEFAULT_ADMIN_PASSWORD:
+        problems.append(
+            "DEFAULT_ADMIN_PASSWORD is still the shipped default, which is published in "
+            "this repository's own scripts. Set it, or create the first admin by hand."
+        )
+    if problems:
+        raise RuntimeError(
+            "Refusing to start with APP_ENV=production and default credentials:\n  - "
+            + "\n  - ".join(problems)
+        )

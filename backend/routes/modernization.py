@@ -883,13 +883,29 @@ def set_charter(run_id: str, req: CharterRequest, caller: dict = Depends(get_cal
 @router.post("/checkpoints/{checkpoint_id}/answer", summary="Answer a checkpoint")
 def answer_checkpoint(checkpoint_id: str, req: CheckpointAnswerRequest,
                       caller: dict = Depends(get_caller)):
+    """Answer one checkpoint — which, for a blocking one, is how a gate gets waived.
+
+    **The scope check has to happen before the write, and it did not.**
+    `store.answer_checkpoint` was called first and commits; `_require_run` ran after it and
+    raised 404. So any caller holding any valid credential could answer a checkpoint in
+    *any* project's run given only its id: they got a 404 back, and the row was already
+    changed with their name in `answered_by`. Since answering `build_required` or
+    `parity_divergence` is what lets a run finish without ever being compiled or replayed
+    (`runner.py:3664`), that was a cross-tenant write against a governance gate.
+
+    Reading the checkpoint first costs one extra SELECT. Every other route in this module
+    authorizes before it acts (`:858`, `:864`, `:873`); this one now does too.
+    """
+    existing = store.get_checkpoint(checkpoint_id)
+    if not existing:
+        raise HTTPException(404, f"No checkpoint with id '{checkpoint_id}'.")
+    _require_run(existing["run_id"], caller)
     answer = dict(req.answer)
     if req.decision:
         answer["decision"] = req.decision
     updated = store.answer_checkpoint(checkpoint_id, answer, _actor(caller))
     if not updated:
         raise HTTPException(404, f"No checkpoint with id '{checkpoint_id}'.")
-    _require_run(updated["run_id"], caller)
     return {"checkpoint_id": checkpoint_id, "status": "answered",
             "run": _run_view(store.get_run(updated["run_id"]))}
 

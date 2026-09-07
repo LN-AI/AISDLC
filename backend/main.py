@@ -105,6 +105,12 @@ def _init_default_admin():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up - env=%s model=%s", config.APP_ENV, config.MODEL)
+    # Before anything else, and deliberately fatal: a production deployment must not run on
+    # the shipped default SECRET_KEY or admin password. Raising here rather than warning
+    # because a warning in a startup log is a warning nobody reads — and on the default
+    # SECRET_KEY every stored credential in the database is decryptable by anyone with a
+    # copy of this repository. No-ops unless APP_ENV=production.
+    config.assert_production_secrets()
     database.init_db()
     # Background jobs live in this process only, so anything still marked running
     # belongs to a process that no longer exists. Without this they stay 'running'
@@ -146,7 +152,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Not "*" — see config.CORS_ALLOW_ORIGINS for why a wildcard here was a real hole
+    # rather than a convenience. Empty by default: the bundled SPA is same-origin.
+    allow_origins=config.CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2259,25 +2267,135 @@ async def get_agents_info():
 # Every agent has its own KB category (see knowledge_base.KB_CATEGORIES). Docs are
 # either global/shared (used as context for every project) or scoped to one
 # project_name (used only when that same project is reviewed/generated for).
+#
+# **Every route here was unauthenticated — read, upload, overwrite and delete.** That was
+# the most serious authorization gap in the platform, because a knowledge-base document is
+# not passive data: `SDLCOrchestrator._kb()` folds it into the prompt of every subsequent
+# review in its category, and several agents call `knowledge_base.get_context` directly.
+# So an anonymous caller could upload a Markdown file instructing the reviewer to ignore a
+# class of vulnerability, or to report a Green gate, and every later run in that project
+# would read it and look entirely normal. Uploading with `project_name=""` writes a
+# *global* doc, which reaches every project at once.
+#
+# Three rules, and the asymmetry between them is the point:
+#
+#   * **Reading** needs a signed-in caller, and returns global docs plus the docs of
+#     projects they belong to.
+#   * **Writing a project's doc** needs an admin *of that project*. It is not ordinary
+#     work: it changes the standing instructions every future review in that project is
+#     given, which is closer to setting a budget than to running a review.
+#   * **Writing a global doc** needs a super admin, because it changes the instructions
+#     given to every project in the deployment. This is the one bar that could not be
+#     relaxed without recreating the hole.
+#
+# `project_name` is free text and KB paths are keyed by its slug, so the check maps the
+# caller's project *ids* to slugs rather than trusting the string it was handed.
+
+def _kb_slugs_for(project_ids: Optional[List[str]]) -> Optional[set]:
+    """Project slugs a caller may touch. `None` (from `scope`) stays None — unrestricted."""
+    from backend.services.knowledge_base import slugify_project
+    if project_ids is None:
+        return None
+    slugs = set()
+    for pid in project_ids:
+        project = database.get_project(pid)
+        if project and project.get("name"):
+            slugs.add(slugify_project(project["name"]))
+    return slugs
+
+
+def _kb_readable(reader: dict, request: Request) -> Optional[set]:
+    return _kb_slugs_for(scope.visible_project_ids(reader, request))
+
+
+def _kb_require_writable(reader: dict, project_name: str) -> None:
+    """Refuse a KB write the caller is not entitled to make.
+
+    A global doc (`project_name` empty) is super-admin-only. A project doc requires a row
+    in `project_admins` for that project — membership alone is not enough, for the reason
+    in the section comment above.
+    """
+    from backend.services.knowledge_base import slugify_project
+    user = reader.get("_user") or {}
+    if is_super_admin(user):
+        return
+    if reader.get("type") != "jwt":
+        # An API key has no notion of "admin of a project"; it carries one project and a
+        # scope list of agents it may *call*. Editing standing review instructions is not
+        # one of those, and silently allowing it would let a CI credential rewrite the
+        # rules its own reviews are judged by.
+        raise HTTPException(
+            status_code=403,
+            detail="Knowledge Base documents can only be changed by a signed-in project "
+                   "admin, not by an API key.",
+        )
+    if not (project_name or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail="Only a super admin can add or change a shared Knowledge Base document "
+                   "— a shared document is used as context for every project in this "
+                   "deployment. Set a project name to scope it to one project instead.",
+        )
+    target = slugify_project(project_name)
+    admin_slugs = _kb_slugs_for(database.list_admin_project_ids(user.get("sub") or "")) or set()
+    if target not in admin_slugs:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You are not an admin of '{project_name}'. A Knowledge Base document "
+                   "sets the standing instructions every review in that project is given, "
+                   "so changing one requires project admin.",
+        )
+
+
+def _kb_audit(event: str, reader: dict, category: str, name: str, project_name: str) -> None:
+    """Record a Knowledge Base change in the audit trail.
+
+    These changes were previously invisible: nothing anywhere recorded that the standing
+    instructions given to an agent had been edited, so a review whose behaviour changed
+    because somebody rewrote its knowledge base looked identical to one that changed
+    because the code did. A shared document is stored with a NULL project (super-admin
+    visible only), which is the right scope for a change that affects every project.
+    """
+    user = reader.get("_user") or {}
+    actor = user.get("username") or reader.get("team") or "unknown"
+    project = database.get_project_by_name(project_name) if project_name else None
+    database.record_audit_event(
+        event, "kb_document", f"{category}/{name}", actor,
+        details=f"project={project_name or 'shared (all projects)'}",
+        project_id=(project or {}).get("id") or "",
+    )
+
 
 @app.get("/api/knowledge-base/categories")
-async def list_kb_categories():
+async def list_kb_categories(reader: dict = Depends(require_reader)):
     from backend.services.knowledge_base import KB_CATEGORIES
     return {"categories": KB_CATEGORIES}
 
 
 @app.get("/api/knowledge-base")
-async def list_kb_docs(project_name: Optional[str] = None, category: Optional[str] = None):
-    """Without project_name: every document (admin view).
-    With project_name: global docs + that project's docs only. Optionally filter by category."""
+async def list_kb_docs(request: Request, project_name: Optional[str] = None,
+                       category: Optional[str] = None,
+                       reader: dict = Depends(require_reader)):
+    """Global docs plus the docs of projects this caller may see.
+
+    `project_name` narrows further, to one project. It used to be the *only* filter, and
+    omitting it returned every project's documents to anyone.
+    """
     docs = knowledge_base.list_docs(project_name=project_name, category=category)
+    allowed = _kb_readable(reader, request)
+    if allowed is not None:
+        docs = [d for d in docs if not d["project_name"] or d["project_name"] in allowed]
     return {"docs": docs, "total": len(docs)}
 
 
 @app.get("/api/knowledge-base/{name}")
-async def get_kb_doc(name: str, category: str, project_name: str = ""):
+async def get_kb_doc(name: str, category: str, request: Request, project_name: str = "",
+                     reader: dict = Depends(require_reader)):
     doc = knowledge_base.get_doc(name, category=category, project_name=project_name)
-    if not doc:
+    allowed = _kb_readable(reader, request)
+    # 404 rather than 403 on another project's document, as everywhere else: whether a
+    # named document exists in someone else's project is itself information.
+    if not doc or (doc.project_name and allowed is not None and doc.project_name not in allowed):
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found in category '{category}'")
     return {
         "name": doc.name, "title": doc.title, "path": doc.path, "content": doc.content,
@@ -2290,8 +2408,10 @@ async def upload_kb_doc(
     file: UploadFile = File(...),
     category: str = Form(...),
     project_name: str = Form(""),
+    reader: dict = Depends(require_reader),
 ):
     from backend.services.knowledge_base import VALID_KB_CATEGORIES
+    _kb_require_writable(reader, project_name)
     if category not in VALID_KB_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"category must be one of {VALID_KB_CATEGORIES}")
     content_bytes = await file.read()
@@ -2302,6 +2422,7 @@ async def upload_kb_doc(
         raise HTTPException(status_code=400, detail="Only .md files are accepted")
     name = (file.filename or "doc").replace(".md", "")
     doc = knowledge_base.add_doc(name, text, category, project_name=project_name)
+    _kb_audit("kb_document_uploaded", reader, doc.category, doc.name, project_name)
     return {
         "message": "Document uploaded", "name": doc.name, "title": doc.title,
         "category": doc.category, "path": doc.path, "project_name": doc.project_name,
@@ -2309,19 +2430,25 @@ async def upload_kb_doc(
 
 
 @app.put("/api/knowledge-base/{name}")
-async def update_kb_doc(name: str, req: ReviewRequest, category: str, project_name: str = ""):
+async def update_kb_doc(name: str, req: ReviewRequest, category: str, project_name: str = "",
+                        reader: dict = Depends(require_reader)):
+    _kb_require_writable(reader, project_name)
     doc = knowledge_base.get_doc(name, category=category, project_name=project_name)
     if not doc:
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found in category '{category}'")
     updated = knowledge_base.add_doc(name, req.content, doc.category, project_name=doc.project_name)
+    _kb_audit("kb_document_updated", reader, doc.category, updated.name, project_name)
     return {"message": "Document updated", "name": updated.name, "title": updated.title}
 
 
 @app.delete("/api/knowledge-base/{name}")
-async def delete_kb_doc(name: str, category: str, project_name: str = ""):
+async def delete_kb_doc(name: str, category: str, project_name: str = "",
+                        reader: dict = Depends(require_reader)):
+    _kb_require_writable(reader, project_name)
     deleted = knowledge_base.delete_doc(name, category=category, project_name=project_name)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found in category '{category}'")
+    _kb_audit("kb_document_deleted", reader, category, name, project_name)
     return {"message": f"Document '{name}' deleted"}
 
 

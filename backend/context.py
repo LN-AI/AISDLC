@@ -24,8 +24,8 @@ from contextvars import ContextVar
 from typing import Optional
 
 __all__ = ["bind_project", "current_project_id", "current_project_name",
-           "current_product_id", "collect_saved_reviews", "note_review_saved",
-           "saved_review_ids"]
+           "current_product_id", "current_actor", "collect_saved_reviews",
+           "note_review_saved", "saved_review_ids"]
 
 _project_id: ContextVar[Optional[str]] = ContextVar("current_project_id", default=None)
 _project_name: ContextVar[str] = ContextVar("current_project_name", default="")
@@ -40,25 +40,39 @@ _project_name: ContextVar[str] = ContextVar("current_project_name", default="")
 # contextvar and no new call sites.
 _product_id: ContextVar[Optional[str]] = ContextVar("current_product_id", default=None)
 
+# *Who* is doing this, for the audit trail, by the same route and for the same reason.
+#
+# `save_review` writes a `review_created` audit row and had no actor to name, so it took
+# the column default and every review in the trail was attributed to "system". On a
+# governance product that is the one question the trail exists to answer, and it could not
+# be answered from the trail at all -- only by joining `usage_events.caller_ref`, which no
+# endpoint does. The boundary already knows the caller (`agent_guard._caller_identity`
+# computes exactly this string), so publishing it here costs one contextvar and changes no
+# call site of `save_review`.
+_actor: ContextVar[str] = ContextVar("current_actor", default="")
+
 
 @contextmanager
 def bind_project(project_id: Optional[str], project_name: str = "",
-                 product_id: Optional[str] = None):
+                 product_id: Optional[str] = None, actor: str = ""):
     """Mark everything done inside this block as belonging to `project_id`.
 
     Binding None is meaningful and must still be done: it says "this work has no project",
     which stops a previous request's value leaking into one that isn't bound to anything.
-    The same applies to `product_id`.
+    The same applies to `product_id` and to `actor` -- an empty actor means "we do not
+    know who", which must not inherit the previous request's answer.
     """
     id_token = _project_id.set(project_id or None)
     name_token = _project_name.set(project_name or "")
     product_token = _product_id.set(product_id or None)
+    actor_token = _actor.set(actor or "")
     try:
         yield
     finally:
         _project_id.reset(id_token)
         _project_name.reset(name_token)
         _product_id.reset(product_token)
+        _actor.reset(actor_token)
 
 
 def current_project_id() -> Optional[str]:
@@ -71,6 +85,11 @@ def current_project_name() -> str:
 
 def current_product_id() -> Optional[str]:
     return _product_id.get()
+
+
+def current_actor() -> str:
+    """Who the enclosing request belongs to, or "" when nothing bound one."""
+    return _actor.get()
 
 
 # ── Which reviews this request produced, reported back up ────────────────────

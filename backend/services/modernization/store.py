@@ -2560,6 +2560,23 @@ def list_checkpoints(run_id: str, status: str = "") -> List[Dict[str, Any]]:
     return out
 
 
+def get_checkpoint(checkpoint_id: str) -> Optional[Dict[str, Any]]:
+    """One checkpoint by id, or None.
+
+    Exists so `routes/modernization.answer_checkpoint` can find out which run a checkpoint
+    belongs to *before* answering it. It used to answer first and check the caller's scope
+    afterwards, which let any valid credential waive a blocking gate on any project's run.
+    Returns the raw row — the caller needs `run_id` and nothing else, so the JSON columns
+    are left alone rather than decoded as `list_checkpoints` does.
+    """
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM modernization_checkpoints WHERE id = ?", (checkpoint_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def answer_checkpoint(checkpoint_id: str, answer: Dict[str, Any], actor: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()

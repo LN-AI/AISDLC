@@ -230,6 +230,19 @@ async def _expected_calls(request, product_id: str) -> int:
 _UNKNOWN_REMOTE_SOURCE_CALLS = 4
 
 
+def _actor_for(subject) -> str:
+    """Who to name in an audit row written while this request runs.
+
+    The same string `agent_guard._caller_identity` produces, derived from the same two
+    sources -- a signed-in user's username, or an API key's team name. Written here rather
+    than imported because `agent_guard` reads a `caller` dict and this middleware only ever
+    holds a resolved `Subject`.
+    """
+    user = getattr(subject, "user", None) or {}
+    key = getattr(subject, "key_record", None) or {}
+    return user.get("username") or key.get("team_name") or ""
+
+
 async def legacy_product_guard(request, call_next):
     product_id = product_for_request(request.method, request.url.path)
     if not product_id:
@@ -283,7 +296,7 @@ async def legacy_product_guard(request, call_next):
     # link all along; on these routes it was always NULL, because this middleware never
     # learned which review the handler wrote.
     with context.bind_project(subject.project_id, subject.project_name,
-                              product_id=product_id), \
+                              product_id=product_id, actor=_actor_for(subject)), \
             agent_guard.hold_budget_reservation(subject), \
             llm_gateway.track_usage(), \
             context.collect_saved_reviews():
