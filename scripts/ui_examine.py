@@ -1240,6 +1240,180 @@ def main():
                   page.evaluate("location.hash + ' -> ' + "
                                 "[...document.querySelectorAll('.page.active')].map(p=>p.id).join(',')"))
 
+            # ── 16. The notifications screen, driven ──────────────────────
+            #
+            # Section 15 proves the nav item reaches its own page. That is not the same as
+            # the page *working*: the first version of this screen called a `showToast`
+            # that does not exist in this app, which is a ReferenceError on the first
+            # successful save and is invisible to any check that only navigates. So this
+            # section calls the handlers.
+            section("16. Notifications — the handlers run, and the URL never comes back")
+
+            page.evaluate("location.hash = '#/notifications'")
+            page.wait_for_timeout(700)
+            check("the notifications screen opens from its address",
+                  page.evaluate(
+                      "document.getElementById('page-notifications').classList.contains('active')"),
+                  page.evaluate("location.hash"))
+            check("...and says something rather than staying blank",
+                  len((page.text_content("#notifier-list") or "").strip()) > 10,
+                  repr(page.text_content("#notifier-list"))[:200])
+
+            page.evaluate("openCreateNotifier()")
+            check("the add-a-channel form opens",
+                  page.evaluate(
+                      "!document.getElementById('notifier-panel').classList.contains('hidden')"))
+
+            # An empty submit must be refused in the browser rather than posting nothing.
+            page.evaluate("createNotifier()")
+            page.wait_for_timeout(300)
+            check("submitting an empty form is refused with a sentence",
+                  (page.text_content("#notifier-error") or "").strip() != "",
+                  "an empty submit that posts anyway teaches people the form is broken")
+
+            # An http:// URL. The server refuses it; what is checked here is that the
+            # refusal reaches the screen instead of vanishing into a rejected promise.
+            page.fill("#notifier-name", "Console check")
+            page.fill("#notifier-url", "http://hooks.example/services/x")
+            page.evaluate("createNotifier()")
+            page.wait_for_timeout(700)
+            _err16 = (page.text_content("#notifier-error") or "")
+            check("the server's own refusal is shown, not swallowed",
+                  len(_err16.strip()) > 20, repr(_err16)[:240])
+
+            # The renderer, with a row shaped as the API returns one. This is where a typo
+            # in the template or a missing helper shows up.
+            _html16 = page.evaluate(
+                """renderNotifier({ id: 't1', name: 'Platform alerts', kind: 'slack',
+                                    host: 'hooks.slack.com', url_tail: 'bC9d', signed: true,
+                                    active: true, events: 'review_gated', min_severity: 5,
+                                    last_status: 'ok' })""")
+            check("a channel renders with where it points",
+                  "hooks.slack.com" in _html16 and "bC9d" in _html16, _html16[:200])
+            check("...and never with a usable URL",
+                  "/services/" not in _html16 and "https://" not in _html16,
+                  "the list is the one place a stored webhook URL could leak back out")
+            check("...and says whether it is actually delivering",
+                  "delivering" in _html16, _html16[:300])
+            _paused16 = page.evaluate(
+                """renderNotifier({ id: 't2', name: 'Paused', kind: 'webhook', host: 'x.example',
+                                    url_tail: 'aaaa', active: false, events: 'review_gated',
+                                    min_severity: 5, last_status: 'failed',
+                                    last_error: 'HTTP 404' })""")
+            check("a broken channel says so on the channel itself",
+                  "failing" in _paused16 and "paused" in _paused16 and "HTTP 404" in _paused16,
+                  "otherwise the only way to find out is a delivery log nobody opens")
+
+            # The success branch, which is where the ReferenceError actually was: the
+            # error path and the render both worked, and the one line that ran only after a
+            # save succeeded called a function that does not exist. Reached here by
+            # answering the save from a stub rather than by needing a real webhook host —
+            # `apiFetch` is the single seam every screen goes through, and a dialog is
+            # auto-dismissed by the driver, so this runs the branch end to end.
+            page.evaluate(
+                """() => {
+                    window.__realApiFetch = window.apiFetch;
+                    // Every call, not the last: a successful save reloads the list and
+                    // the delivery log, so a single slot would hold whichever of those
+                    // ran last and the POST would be invisible.
+                    window.__calls = [];
+                    window.apiFetch = async (url, opts) => {
+                      window.__calls.push({ url, body: (opts || {}).body || '',
+                                            method: (opts || {}).method || 'GET' });
+                      return { target: { id: 'x1', name: 'stub', kind: 'webhook',
+                                         host: 'hooks.example', url_tail: 'aaaa',
+                                         active: true, events: 'review_gated',
+                                         min_severity: 5 },
+                               targets: [], deliveries: [], count: 0,
+                               note: 'Stored.' };
+                    };
+                }""")
+            page.evaluate("openCreateNotifier()")
+            page.fill("#notifier-name", "Success path")
+            page.fill("#notifier-url", "https://hooks.example/services/ok")
+            page.evaluate("createNotifier()")
+            page.wait_for_timeout(500)
+            _calls16 = page.evaluate("window.__calls") or []
+            _post16 = next((c for c in _calls16
+                            if c["url"] == "/api/v1/notifications/targets"
+                            and c["method"] == "POST"), None)
+            check("a successful save posts the form to the targets endpoint",
+                  _post16 is not None, str(_calls16)[:300])
+            check("...carrying the name, the URL, the events and the threshold",
+                  _post16 and all(k in (_post16.get("body") or "")
+                                  for k in ("Success path", "hooks.example",
+                                            "review_gated", "min_severity")),
+                  str(_post16.get("body") if _post16 else None)[:240])
+            check("...and then reloads the list, so the new channel is on screen",
+                  any(c["url"] == "/api/v1/notifications/targets" and c["method"] == "GET"
+                      for c in _calls16),
+                  "a save that leaves the old list up reads as a save that did not happen")
+            check("...and the save path itself raises nothing",
+                  not [e for e in console_errors if "ReferenceError" in e],
+                  " | ".join(e for e in console_errors if "ReferenceError" in e))
+            check("...and the URL field is cleared, since it can never be read back",
+                  page.evaluate("document.getElementById('notifier-url').value") == "",
+                  "leaving a credential in a form field after it has been stored "
+                  "encrypted is the one place it stays readable")
+            # Wrapped in a void arrow on purpose: Playwright *calls* the result of an
+            # expression when that result is a function, so a bare assignment here would
+            # hand back `apiFetch` and the driver would invoke it with no arguments.
+            page.evaluate("() => { window.apiFetch = window.__realApiFetch; }")
+
+            page.evaluate("closeCreateNotifier()")
+            check("the form closes again",
+                  page.evaluate(
+                      "document.getElementById('notifier-panel').classList.contains('hidden')"))
+            page.evaluate("loadNotifierDeliveries()")
+            page.wait_for_timeout(600)
+            check("the delivery log renders with nothing in it",
+                  len((page.text_content("#notifier-deliveries") or "").strip()) > 5,
+                  repr(page.text_content("#notifier-deliveries"))[:200])
+
+            # ── 17. Every wired-up name exists ────────────────────────────
+            #
+            # The general form of the defect section 16 found. `showToast` was called on
+            # the *success* path of a save, so navigating the screen, rendering it and
+            # failing a save all pass while the one path that matters throws a
+            # ReferenceError. There is no build step and no linter here, so nothing
+            # otherwise checks that a name in an `onclick` — or a name a handler calls —
+            # is a function that exists.
+            #
+            # Handled in the browser rather than by parsing app.js, because the question is
+            # whether the name resolves *at runtime*, which is exactly what a text search
+            # cannot answer.
+            section("17. Every onclick in the HTML names a function that exists")
+
+            _wired = page.evaluate(
+                """() => {
+                    const names = new Set();
+                    for (const el of document.querySelectorAll('[onclick]')) {
+                      // `[^.\w$]` before the name, so `document.getElementById(` is a
+                      // method call and not a global that must exist on `window`.
+                      for (const m of (el.getAttribute('onclick') || '')
+                            .matchAll(/(?:^|[^.\w$])([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) {
+                        names.add(m[1]);
+                      }
+                    }
+                    // Language constructs and built-ins that appear inside a handler body.
+                    const builtin = new Set(['if', 'for', 'while', 'switch', 'return',
+                                             'typeof', 'catch', 'function', 'Number',
+                                             'String', 'Boolean', 'Array', 'Object',
+                                             'parseInt', 'parseFloat', 'alert', 'confirm',
+                                             'prompt', 'encodeURIComponent', 'JSON']);
+                    return [...names].filter(n => !builtin.has(n))
+                                     .filter(n => typeof window[n] !== 'function');
+                }""")
+            check(f"no onclick names a function that does not exist",
+                  not _wired,
+                  "these are wired to nothing and throw a ReferenceError on click: "
+                  + ", ".join(_wired))
+
+            # A name called from *inside* a handler — `showToast`'s shape — is not caught
+            # by the sweep above, because it is nowhere in the HTML. Nothing short of
+            # running that branch catches it, which is why section 16 now stubs `apiFetch`
+            # and runs the save rather than only the refusal.
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.

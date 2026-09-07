@@ -1218,6 +1218,362 @@ def main_():
           "C-31 asks for measuring rather than a blind edit, so the measurement is part "
           "of the answer and not scaffolding to delete")
 
+    # ── 20. Notifications ────────────────────────────────────────────────
+    #
+    # A user-supplied URL that this *server* then requests is server-side request forgery,
+    # so the guard gets more checks here than the feature does. The rest is the property
+    # that makes the whole design defensible: a notification is a durable row written
+    # inside the review's own transaction, so it cannot describe a review that failed to
+    # save and cannot be lost to a crash.
+    section("20. Notifications — the SSRF guard, the scoping, and the durable row")
+
+    from backend.services import notify as _n20
+
+    # A resolver we control, so the guard can be tested with no network. Every case below
+    # is about what an address *is*, not about whether this machine can reach it.
+    _real_getaddrinfo = _n20.socket.getaddrinfo
+    _resolve20 = {"1.2.3.4"}
+
+    def _fake_getaddrinfo(host, *a, **k):
+        if host in ("blocked.example", "meta.example", "private.example", "mixed.example"):
+            addrs = {"blocked.example": ["127.0.0.1"],
+                     "meta.example": ["169.254.169.254"],
+                     "private.example": ["10.1.2.3"],
+                     # One public answer and one loopback. Checking only the first would
+                     # pass this and then connect to whichever the client picked.
+                     "mixed.example": ["93.184.216.34", "127.0.0.1"]}[host]
+        elif host == "nxdomain.example":
+            raise _n20.socket.gaierror("Name or service not known")
+        else:
+            addrs = sorted(_resolve20)
+        return [(2, 1, 6, "", (addr, 0)) for addr in addrs]
+
+    _n20.socket.getaddrinfo = _fake_getaddrinfo
+    try:
+        def _refused(url):
+            try:
+                _n20.validate_url(url)
+                return ""
+            except _n20.NotifyError as exc:
+                return str(exc)
+
+        check("an http:// notification URL is refused",
+              "https://" in _refused("http://hooks.example/x"),
+              "the payload names a project and the shape of its findings, and travels to "
+              "a third party")
+        check("...and the message says what to do rather than naming a rule",
+              "must start with https" in _refused("http://hooks.example/x"))
+        check("a loopback host is refused",
+              "inside this network" in _refused("https://blocked.example/x"))
+        check("the cloud metadata address is refused",
+              "169.254.169.254" in _refused("https://meta.example/latest/meta-data/"),
+              "this is the address SSRF is usually aimed at")
+        check("a private range is refused", "10.1.2.3" in _refused("https://private.example/x"))
+        check("every resolved address is checked, not just the first",
+              "127.0.0.1" in _refused("https://mixed.example/x"),
+              "a name with one public and one loopback answer would otherwise pass the "
+              "check and then connect to whichever the client chose")
+        check("a name that does not resolve is refused with that reason",
+              "does not resolve" in _refused("https://nxdomain.example/x"))
+        check("a public https URL is accepted", not _refused("https://hooks.example/services/x"))
+
+        check("a Slack URL is recognized without being told",
+              _n20.kind_for_url("https://hooks.slack.com/services/T/B/x") == "slack")
+        check("a Teams URL is recognized too",
+              _n20.kind_for_url("https://acme.webhook.office.com/webhookb2/x") == "teams")
+        check("anything else is a generic webhook",
+              _n20.kind_for_url("https://ops.acme.com/hook") == "webhook")
+
+        # ── Payload shaping ──────────────────────────────────────────────
+        _p20 = {"gate_status": "Red", "project_name": "Acme", "critical_count": 2,
+                "high_count": 1, "repo": "acme/portal", "review_type": "code",
+                "url": "https://sdlc.example/x"}
+        check("a chat line leads with the gate and the count, not with our vocabulary",
+              _n20.summarize(_p20).startswith("*Red* — 2 Critical, 1 High in acme/portal"),
+              _n20.summarize(_p20))
+        check("Slack gets a text field", set(_n20.shape("slack", _p20)) == {"text"})
+        check("Teams gets the card shape its connector accepts",
+              _n20.shape("teams", _p20).get("@type") == "MessageCard")
+        check("...coloured by the gate",
+              _n20.shape("teams", _p20).get("themeColor") == "D93F3F")
+        check("a generic webhook gets the event itself, not our prose",
+              _n20.shape("webhook", _p20) is _p20,
+              "a receiver wants the fields; shaping them into a sentence throws away the "
+              "only thing it can act on")
+
+        # ── The target API ───────────────────────────────────────────────
+        _URL20 = "https://hooks.example/services/T000/B000/XyZsecret9"
+        _bad = client.post("/api/v1/notifications/targets",
+                           json={"name": "n", "url": "http://hooks.example/x"},
+                           headers=as_member(mem_id))
+        check("the API refuses an http target with the sentence, not a 500",
+              _bad.status_code == 400 and "https" in _bad.text, _bad.text[:200])
+
+        _unbound = client.post("/api/v1/notifications/targets",
+                               json={"name": "n", "url": _URL20}, headers=admin)
+        check("a channel cannot be created without a project bound",
+              _unbound.status_code == 400 and "one project" in _unbound.text,
+              _unbound.text[:200])
+
+        _made = client.post("/api/v1/notifications/targets",
+                            json={"name": "Team channel", "url": _URL20,
+                                  "events": "review_gated", "min_severity": 5},
+                            headers=as_member(mem_id))
+        check("a channel can be created in a project", _made.status_code == 201,
+              _made.text[:240])
+        _t20 = _made.json()["target"]
+        check("...and its kind is guessed from nothing but the host",
+              _t20["kind"] == "webhook", str(_t20.get("kind")))
+
+        # The property that matters most about this endpoint.
+        check("the URL is not in the create response",
+              "XyZsecret9" not in _made.text and "/services/" not in _made.text,
+              "a Slack webhook URL authenticates by possession, so echoing it back means "
+              "any reader of these settings can post to that channel")
+        _listed = client.get("/api/v1/notifications/targets", headers=as_member(mem_id))
+        check("...nor in the list", "XyZsecret9" not in _listed.text, _listed.text[:300])
+        check("the list still says where it points, so two channels can be told apart",
+              _listed.json()["targets"][0]["host"] == "hooks.example",
+              str(_listed.json()["targets"][0]))
+        check("...by a tail short enough to be useless on its own",
+              _listed.json()["targets"][0]["url_tail"] == "ret9",
+              str(_listed.json()["targets"][0].get("url_tail")))
+
+        _unknown = client.post("/api/v1/notifications/targets",
+                               json={"name": "x", "url": _URL20, "events": "review_gated,typo"},
+                               headers=as_member(mem_id))
+        check("an unknown event name is refused rather than silently dropped",
+              _unknown.status_code == 400 and "typo" in _unknown.text,
+              "a discarded typo is a channel that never fires and nobody knows why")
+
+        # ── Scoping ──────────────────────────────────────────────────────
+        _other = client.post("/api/v1/projects", json={"name": "Notif Other"},
+                             headers=admin).json()["project"]["id"]
+        # A genuinely separate person, not `memberdev` with a different header:
+        # `subject_service` refuses a binding to a project you are not a member of, with a
+        # 403 in the middleware, so the route never runs and the check would be testing the
+        # membership guard again. Adding memberdev to this project instead would make both
+        # projects visible and destroy the isolation being checked.
+        client.post("/api/auth/users", headers=admin, json={
+            "username": "notifdev", "email": "notifdev@example.com",
+            "password": "notif-dev-pass-123", "role": "developer"})
+        client.post(f"/api/v1/projects/{_other}/members",
+                    json={"username": "notifdev"}, headers=admin)
+        _olog = client.post("/api/auth/login",
+                            json={"username": "notifdev", "password": "notif-dev-pass-123"})
+        _oh = {"Authorization": f"Bearer {_olog.json()['token']}", "X-Project-Id": _other}
+
+        _oview = client.get("/api/v1/notifications/targets", headers=_oh)
+        check("another project cannot see this channel",
+              _oview.status_code == 200 and _oview.json().get("count") == 0,
+              f"{_oview.status_code} {_oview.text[:300]}")
+        check("...and addressing it by id 404s rather than 403s",
+              client.patch(f"/api/v1/notifications/targets/{_t20['id']}",
+                           json={"active": False},
+                           headers=_oh).status_code == 404,
+              "whether another project has a channel configured is itself information")
+        check("a channel needs a credential at all",
+              client.get("/api/v1/notifications/targets").status_code in (401, 403))
+
+        # ── The durable row, written with the review ─────────────────────
+        _sent20 = []
+        _real_post = _n20.post
+
+        def _fake_post(url, kind, payload, secret=""):
+            _sent20.append({"url": url, "kind": kind, "payload": payload, "secret": secret})
+            return {"ok": True, "status": 200, "error": "", "body": ""}
+
+        # The suite-wide stub answers Amber with one severity-3 finding, so no review would
+        # ever be gated and every delivery assertion below would pass for want of an event.
+        # A Critical here, restored at the end of the section.
+        _real_stub20 = llm_gateway.call_tool
+
+        def _red_stub20(*a, **k):
+            out = _stub_call_tool(*a, **k)
+            out["findings"] = [{
+                "control_id": "SEC-003", "severity": 5, "risk_level": "Critical",
+                "title": "Notification fixture finding", "description": "for section 20",
+                "recommendation": "none", "is_blocking": True,
+            }]
+            out["gate_status"] = "Red"
+            return out
+
+        _n20.post = _fake_post
+        llm_gateway.call_tool = _red_stub20
+        try:
+            _red = client.post("/api/review/code",
+                               json={"code": "q = 'SELECT ' + u", "project_name": "Acme"},
+                               headers=as_member(mem_id))
+            _rid20 = _red.json().get("review_id")
+            _delivered = _deliveries(_rid20)
+            check("a review writes its notification as a row",
+                  len(_delivered) == 1, str(_delivered))
+            check("...for the event the channel subscribed to",
+                  _delivered and _delivered[0]["event_type"] == "review_gated",
+                  str([d.get("event_type") for d in _delivered]))
+            check("...naming the review, so the log can be read against history",
+                  _delivered and _delivered[0]["review_id"] == _rid20)
+            # The dispatcher runs on a thread. Rather than sleep, drain it here — the
+            # thread and this call take the same code path and only one of them is
+            # deterministic.
+            _n20.dispatch_pending()
+            _after = _deliveries(_rid20)
+            check("the dispatcher marks it sent", _after and _after[0]["status"] == "sent",
+                  str(_after))
+            check("...and it went to the channel's real URL, decrypted at send time",
+                  _sent20 and _sent20[-1]["url"] == _URL20,
+                  "the stored ciphertext is the only copy; a dispatcher that could not "
+                  "decrypt would post nothing")
+            check("...carrying the gate and the project a reader needs",
+                  _sent20 and _sent20[-1]["payload"].get("gate_status") == "Red"
+                  and _sent20[-1]["payload"].get("critical_count") == 1
+                  and _sent20[-1]["payload"].get("project_id") == mem_id,
+                  str(_sent20[-1]["payload"] if _sent20 else None),)
+            check("...and an address a person can open, not just an id",
+                  _sent20 and _rid20 in (_sent20[-1]["payload"].get("url") or ""),
+                  str(_sent20[-1]["payload"].get("url") if _sent20 else None))
+
+            # A second project's review must not reach the first project's channel.
+            _before = len(_sent20)
+            client.post("/api/review/code", json={"code": "q = 'SELECT ' + u"},
+                        headers=_oh)
+            _n20.dispatch_pending()
+            check("another project's Red gate does not reach this channel",
+                  len(_sent20) == _before,
+                  "a deployment-wide notification would carry one customer's findings to "
+                  "another customer's channel")
+
+            # A review with nothing blocking must not fire a `review_gated` channel. Back
+            # on the suite's own Amber stub for this one, or it is asserted against a Red.
+            llm_gateway.call_tool = _real_stub20
+            _before = len(_sent20)
+            client.post("/api/review/code", json={"code": "clean = 1"},
+                        headers=as_member(mem_id))
+            _n20.dispatch_pending()
+            check("a review with nothing to block on does not notify",
+                  len(_sent20) == _before,
+                  "an event nobody can act on is noise, and noise is how a channel gets "
+                  "muted")
+            llm_gateway.call_tool = _red_stub20
+        finally:
+            _n20.post = _real_post
+
+        # ── Failure, retry, and giving up ────────────────────────────────
+        def _failing_post(url, kind, payload, secret=""):
+            return {"ok": False, "status": 503, "error": "HTTP 503", "body": "busy"}
+
+        _n20.post = _failing_post
+        try:
+            # Enqueued directly rather than through a review, so the attempt count is
+            # deterministic: `save_review` kicks a dispatcher of its own, so a row created
+            # by a review has already been attempted once by the time this pass runs and
+            # "exactly one attempt" would be asserting against a race.
+            _frid = "notif-retry-fixture"
+            _conn20 = database.get_connection()
+            _n20.enqueue(_conn20.cursor(), "review_gated", mem_id,
+                         {"gate_status": "Red", "critical_count": 1, "project_name": "Acme"},
+                         _frid)
+            _conn20.commit()
+            _conn20.close()
+            check("a delivery can be enqueued for an event that is not a review save",
+                  len(_deliveries(_frid)) == 1, str(_deliveries(_frid)))
+            _n20.dispatch_pending()
+            _row = _deliveries(_frid)[0]
+            check("a failed delivery stays pending with the attempt counted",
+                  _row["status"] == "pending" and _row["attempts"] == 1,
+                  str(_row) + " -- one pass, one attempt: `_claim` owns the counter")
+            check("...and records what the destination said",
+                  "503" in (_row.get("last_error") or ""), str(_row.get("last_error")))
+            for _ in range(_n20.MAX_ATTEMPTS):
+                _n20.dispatch_pending()
+            _row = _deliveries(_frid)[0]
+            check("...and is abandoned rather than retried forever",
+                  _row["status"] == "abandoned"
+                  and _row["attempts"] == _n20.MAX_ATTEMPTS, str(_row))
+            check("...saying it gave up, and after how many tries",
+                  "gave up after" in (_row.get("last_error") or ""),
+                  str(_row.get("last_error")))
+            _claimable = _deliveries(_frid)[0]["id"]
+            _reset20 = database.get_connection()
+            _reset20.execute("UPDATE notification_deliveries SET status = 'pending' "
+                             "WHERE id = ?", (_claimable,))
+            _reset20.commit()
+            _reset20.close()
+            check("a delivery can be claimed exactly once",
+                  _n20._claim(_claimable) is True and _n20._claim(_claimable) is False,
+                  "two dispatchers -- two uvicorn workers, or a kicked thread and a read-"
+                  "path retry -- would otherwise both post the same notification, and the "
+                  "row would read `sent` either way with no trace that it went twice")
+            check("a delivery stranded mid-flight is queued again, not lost",
+                  _n20.recover_sending() >= 1
+                  and _deliveries(_frid)[0]["status"] == "pending",
+                  "a `sending` row belongs to a process that no longer exists")
+            for _ in range(_n20.MAX_ATTEMPTS):
+                _n20.dispatch_pending()
+
+            _tgt = client.get("/api/v1/notifications/targets",
+                              headers=as_member(mem_id)).json()["targets"][0]
+            check("the channel itself reports that it is broken",
+                  _tgt["last_status"] == "failed" and "503" in (_tgt.get("last_error") or ""),
+                  "otherwise finding out means reading a delivery log nobody opens")
+        finally:
+            _n20.post = _real_post
+
+        # ── The test endpoint ────────────────────────────────────────────
+        _n20.post = _failing_post
+        try:
+            _test = client.post(f"/api/v1/notifications/targets/{_t20['id']}/test",
+                                headers=as_member(mem_id))
+            check("a failing test is a 200 with ok:false, not an error status",
+                  _test.status_code == 200 and _test.json()["ok"] is False,
+                  f"{_test.status_code} {_test.text[:200]}")
+            check("...reporting the destination's own status",
+                  _test.json()["status"] == 503, _test.text[:200])
+            check("...and attributing the reply to the destination, not to us",
+                  "from the destination" in _test.json().get("note", ""),
+                  _test.json().get("note", ""))
+        finally:
+            _n20.post = _real_post
+
+        # ── Deactivating, and deleting ───────────────────────────────────
+        client.patch(f"/api/v1/notifications/targets/{_t20['id']}",
+                     json={"active": False}, headers=as_member(mem_id))
+        _n20.post = _fake_post
+        try:
+            _before = len(_sent20)
+            client.post("/api/review/code", json={"code": "q = 'SELECT ' + u"},
+                        headers=as_member(mem_id))
+            _n20.dispatch_pending()
+            check("a paused channel gets nothing", len(_sent20) == _before)
+        finally:
+            _n20.post = _real_post
+
+        _url_change = client.patch(f"/api/v1/notifications/targets/{_t20['id']}",
+                                   json={"name": "renamed"}, headers=as_member(mem_id))
+        check("a channel can be renamed without re-entering its URL",
+              _url_change.status_code == 200
+              and _url_change.json()["target"]["name"] == "renamed", _url_change.text[:200])
+        _tampered = database.update_notification_target(
+            _t20["id"], {"url_encrypted": "attacker", "project_id": _other})
+        check("the update path cannot move a channel or repoint it",
+              _tampered is not None
+              and database.get_notification_target(_t20["id"])["project_id"] == mem_id,
+              "these build SQL from the keys, so the column list has to be a whitelist "
+              "rather than whatever the caller sent")
+
+        _kept = len(_deliveries())
+        client.delete(f"/api/v1/notifications/targets/{_t20['id']}", headers=as_member(mem_id))
+        check("deleting a channel leaves its delivery history",
+              len(_deliveries()) == _kept,
+              "the log is the record of what left this deployment and where it went; "
+              "deleting a channel must not be a way to erase that")
+        check("...and the channel is gone",
+              client.get("/api/v1/notifications/targets",
+                         headers=as_member(mem_id)).json()["count"] == 0)
+    finally:
+        _n20.socket.getaddrinfo = _real_getaddrinfo
+        llm_gateway.call_tool = _stub_call_tool
+
     stack.close()
 
     print(f"\n{'-' * 60}")
@@ -1228,6 +1584,21 @@ def main_():
         return 1
     print(f"OK: all {_checks} checks passed")
     return 0
+
+
+def _deliveries(review_id=None):
+    """Notification delivery rows, oldest first. A test about a durable row has to be able
+    to read the row — the API redacts and orders for a screen, not for an assertion."""
+    conn = database.get_connection()
+    sql = "SELECT * FROM notification_deliveries"
+    args = ()
+    if review_id:
+        sql += " WHERE review_id = ?"
+        args = (review_id,)
+    sql += " ORDER BY created_at, rowid"
+    rows = conn.execute(sql, args).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def _usage_events():

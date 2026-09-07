@@ -114,6 +114,14 @@ several agents in parallel behind one policy-enforced gate decision.
   OpenAI-compatible credentials (`PUT /api/v1/llm-config`, X-API-Key auth) instead of the
   platform's shared account, or override a single call via `llm_provider` / `llm_api_key` /
   `llm_base_url` / `llm_model` fields on any agent request.
+- **Notifications** — a blocked review can reach a Slack, Teams or your own webhook
+  instead of waiting for somebody to open a tab. One https URL per channel, per project,
+  encrypted and never shown again. Delivery is a **durable row written inside the review's
+  own transaction**, then attempted on a background thread and retried at startup — there
+  is no job runner here, so a notification written seconds before a restart is *late*
+  rather than lost, and the delivery log says which. The URL is checked against private
+  and link-local address space before anything is stored or sent, because a webhook this
+  server requests on a user's behalf is server-side request forgery if it is not.
 - **Suppression as code** — a team's accepted risks live in their repository, not in this
   database. A `.lmignore` at the root takes path globs optionally narrowed to a control
   (`legacy/**: SEC-003 deleted in Q3`), and an inline `# lm-ignore: SEC-001 admin only`

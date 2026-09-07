@@ -500,6 +500,7 @@ function _runPageLoader(page) {
     if (page === 'cfr21') { /* page ready, no auto-load */ }
     if (page === 'gxp-docs') { /* page ready, no auto-load */ }
     if (page === 'gxp-generate') { /* page ready, no auto-load */ }
+    if (page === 'notifications') loadNotifiers();
     if (page === 'api-keys') loadApiKeys();
     if (page === 'llm-providers') loadLlmProviders();
     if (page === 'plans') loadPlans();
@@ -11039,6 +11040,173 @@ function renderDependencyNote(dep) {
   return html;
 }
 
+
+// ── Notifications ────────────────────────────────────────────────────────
+//
+// A channel is a per-project setting, and the URL is a credential: it goes in once and is
+// never shown again, so everything on this screen is built around that. The list shows a
+// host and four characters, the test button exists because a URL you cannot verify is a
+// URL nobody trusts, and the delivery log is how a failure becomes visible instead of
+// being a message that quietly never arrived.
+
+function openCreateNotifier() {
+  document.getElementById('notifier-panel')?.classList.remove('hidden');
+  document.getElementById('notifier-error').textContent = '';
+}
+function closeCreateNotifier() {
+  document.getElementById('notifier-panel')?.classList.add('hidden');
+}
+
+async function loadNotifiers() {
+  const list = document.getElementById('notifier-list');
+  if (!list) return;
+  list.innerHTML = '<div class="field-hint">Loading…</div>';
+  try {
+    const d = await apiFetch('/api/v1/notifications/targets');
+    const rows = d.targets || [];
+    if (!rows.length) {
+      list.innerHTML = `<div class="empty-state">No channels in this project yet.
+        A Red gate is discovered by whoever next opens this screen.</div>`;
+    } else {
+      list.innerHTML = rows.map(t => renderNotifier(t)).join('');
+    }
+  } catch (e) {
+    // The most likely failure by far, and it has a specific answer.
+    list.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not load channels.')}
+      ${/project/i.test(e.message || '') ? '<br>Pick a project in the sidebar first — a channel belongs to one project.' : ''}</div>`;
+  }
+  loadNotifierDeliveries();
+}
+
+function renderNotifier(t) {
+  const when = t.events === 'review_gated'
+    ? 'when a review is blocked'
+    : (t.events || '').split(',').join(', ');
+  const sev = { 5: 'Critical', 4: 'High or worse', 0: 'anything' }[t.min_severity] ?? t.min_severity;
+  // The last outcome, on the channel itself. Otherwise the only way to find out a channel
+  // is broken is to read the delivery log, which nobody opens until they notice silence.
+  const health = t.last_status === 'ok'
+    ? '<span class="mark-chip mark-verified">delivering</span>'
+    : (t.last_status === 'failed'
+        ? `<span class="mark-chip mark-unverified" title="${esc(t.last_error || '')}">failing</span>`
+        : '<span class="mark-chip">never used</span>');
+  return `
+    <div class="finding-card" style="border-left-color:var(--border)">
+      <div class="finding-header">
+        <strong>${esc(t.name || 'channel')}</strong>
+        <span class="compliance-chip">${esc(t.kind || 'webhook')}</span>
+        ${health}
+        ${t.active ? '' : '<span class="mark-chip">paused</span>'}
+        ${t.signed ? '<span class="mark-chip" title="Deliveries carry an X-LMSDLC-Signature HMAC">signed</span>' : ''}
+      </div>
+      <div class="field-hint">
+        Sends ${esc(when)}, ${t.events === 'review_gated' ? `if a finding is ${esc(String(sev))}` : 'every time'}.
+        → <code>${esc(t.host || '?')}</code>…<code>${esc(t.url_tail || '')}</code>
+      </div>
+      ${t.unreadable ? `<div class="field-hint" style="color:var(--danger)">${esc(t.unreadable)}</div>` : ''}
+      ${t.last_error ? `<div class="field-hint">Last attempt: ${esc(t.last_error)}</div>` : ''}
+      <div class="finding-actions">
+        <button class="btn btn-secondary" onclick="testNotifier('${esc(t.id)}')">Send a test</button>
+        <button class="btn btn-secondary" onclick="toggleNotifier('${esc(t.id)}',${t.active ? 'false' : 'true'})">
+          ${t.active ? 'Pause' : 'Resume'}</button>
+        <button class="btn btn-secondary" onclick="deleteNotifier('${esc(t.id)}','${esc(t.name || '')}')">Delete</button>
+      </div>
+      <div id="notifier-test-${esc(t.id)}" class="field-hint"></div>
+    </div>`;
+}
+
+async function createNotifier() {
+  const err = document.getElementById('notifier-error');
+  err.textContent = '';
+  const body = {
+    name: document.getElementById('notifier-name').value.trim(),
+    url: document.getElementById('notifier-url').value.trim(),
+    events: document.getElementById('notifier-events').value,
+    min_severity: Number(document.getElementById('notifier-severity').value),
+    secret: document.getElementById('notifier-secret').value.trim(),
+  };
+  if (!body.name || !body.url) { err.textContent = 'A name and a URL, both.'; return; }
+  try {
+    const d = await apiFetch('/api/v1/notifications/targets',
+                             { method: 'POST', body: JSON.stringify(body) });
+    closeCreateNotifier();
+    document.getElementById('notifier-url').value = '';
+    document.getElementById('notifier-secret').value = '';
+    alert(d.note || 'Channel added.');
+    loadNotifiers();
+  } catch (e) {
+    // The server's message is written for a person — an https requirement, a host inside
+    // the network, a name that does not resolve — so it is shown rather than restated.
+    err.textContent = e.message || 'Could not add that channel.';
+  }
+}
+
+async function testNotifier(id) {
+  const out = document.getElementById(`notifier-test-${id}`);
+  if (out) out.textContent = 'Sending…';
+  try {
+    const d = await apiFetch(`/api/v1/notifications/targets/${id}/test`, { method: 'POST' });
+    if (out) {
+      out.innerHTML = d.ok
+        ? `<span style="color:var(--success)">Delivered (HTTP ${d.status}). ${esc(d.note || '')}</span>`
+        // The destination's own words. Attributed to it, because "403 invalid_token" is
+        // Slack's answer and reading it as ours sends somebody debugging the wrong system.
+        : `<span style="color:var(--danger)">Nothing was delivered — HTTP ${d.status}
+             ${d.destination_said ? `· the destination said: <code>${esc(d.destination_said)}</code>` : ''}
+           </span>`;
+    }
+  } catch (e) {
+    if (out) out.textContent = e.message || 'The test could not be sent.';
+  }
+  loadNotifierDeliveries();
+}
+
+async function toggleNotifier(id, active) {
+  try {
+    await apiFetch(`/api/v1/notifications/targets/${id}`,
+                   { method: 'PATCH', body: JSON.stringify({ active }) });
+    loadNotifiers();
+  } catch (e) { alert(e.message || 'Could not change that channel.'); }
+}
+
+async function deleteNotifier(id, name) {
+  if (!confirm(`Delete "${name}"? Its delivery history is kept.`)) return;
+  try {
+    const d = await apiFetch(`/api/v1/notifications/targets/${id}`, { method: 'DELETE' });
+    alert(d.note || 'Channel deleted.');
+    loadNotifiers();
+  } catch (e) { alert(e.message || 'Could not delete that channel.'); }
+}
+
+async function loadNotifierDeliveries() {
+  const box = document.getElementById('notifier-deliveries');
+  if (!box) return;
+  try {
+    // Reading this list also retries anything pending — see the route. So the refresh
+    // button on this screen is not only a refresh, and the note below says so.
+    const d = await apiFetch('/api/v1/notifications/deliveries?limit=25');
+    const rows = d.deliveries || [];
+    if (!rows.length) { box.innerHTML = '<div class="field-hint">Nothing sent yet.</div>'; return; }
+    const label = { sent: 'mark-verified', pending: 'mark-conf', sending: 'mark-conf',
+                    abandoned: 'mark-unverified', failed: 'mark-unverified' };
+    box.innerHTML = `
+      ${d.note ? `<div class="field-hint">${esc(d.note)}</div>` : ''}
+      <table class="data-table"><thead><tr>
+        <th>When</th><th>Channel</th><th>Event</th><th>Status</th><th>Tries</th><th>Detail</th>
+      </tr></thead><tbody>
+      ${rows.map(r => `<tr>
+        <td>${esc((r.created_at || '').replace('T', ' ').slice(0, 19))}</td>
+        <td>${esc(r.target_name || '(deleted channel)')}</td>
+        <td>${esc(r.event_type || '')}</td>
+        <td><span class="mark-chip ${label[r.status] || ''}">${esc(r.status || '')}</span></td>
+        <td>${r.attempts ?? 0}</td>
+        <td class="field-hint">${esc(r.last_error || '')}</td>
+      </tr>`).join('')}
+      </tbody></table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="field-hint">${esc(e.message || 'Could not load deliveries.')}</div>`;
+  }
+}
 
 // ── Routing, last ─────────────────────────────────────────────────────────
 //

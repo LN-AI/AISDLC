@@ -110,6 +110,49 @@ def init_db():
             last_login TEXT
         );
 
+        -- Where a notification goes. The URL is encrypted because a Slack or Teams
+        -- incoming-webhook URL *is* its own authentication -- anyone holding it can post
+        -- to that channel -- so it is stored like the keys in `llm_connections` and never
+        -- returned by the API. `project_id` is NOT NULL in effect: a target belonging to
+        -- no project would be matched by no project's review, and a deployment-wide one
+        -- would carry one customer's findings to another customer's channel.
+        CREATE TABLE IF NOT EXISTS notification_targets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'webhook',
+            url_encrypted TEXT NOT NULL,
+            secret_encrypted TEXT,
+            events TEXT NOT NULL DEFAULT 'review_gated',
+            min_severity INTEGER NOT NULL DEFAULT 5,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT,
+            created_by TEXT,
+            last_status TEXT,
+            last_error TEXT,
+            last_attempt_at TEXT
+        );
+
+        -- One row per notification that should go out. Written inside the same
+        -- transaction as the review, so a notification can never describe a review that
+        -- failed to save and a saved review can never lose its notification to a crash.
+        -- The row is the durability: there is no queue in this deployment, so `pending`
+        -- rows are retried at startup and on the deliveries read path -- the same pattern
+        -- `lapse_expired_waivers` and `sweep_expired` use for the same reason.
+        CREATE TABLE IF NOT EXISTS notification_deliveries (
+            id TEXT PRIMARY KEY,
+            target_id TEXT NOT NULL,
+            project_id TEXT,
+            event_type TEXT NOT NULL,
+            review_id TEXT,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT,
+            sent_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS approvals (
             id TEXT PRIMARY KEY,
             review_id TEXT NOT NULL,
@@ -518,6 +561,13 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # column already exists
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_project ON approvals(project_id, status, created_at)")
+    # The dispatcher's only query: pending, oldest first.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_notif_pending "
+                   "ON notification_deliveries(status, created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_notif_target "
+                   "ON notification_deliveries(target_id, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_notif_targets_project "
+                   "ON notification_targets(project_id, active)")
 
     # A risk accepted with no end date is not accepted, it is forgotten. `waiver_expires_at`
     # is set only for `accepted_risk`: "waived" (by design, not applicable) and
@@ -770,8 +820,37 @@ def save_review(
               actor=context.current_actor() or "system",
               details=f"type={review_type}")
 
+    # Tell whoever asked to be told. Written on **this** cursor so the delivery rows are
+    # part of the same transaction as the review: a notification about a review that then
+    # failed to save would be a message about something that did not happen, and a review
+    # saved without its notification is exactly the silent drop the design avoids.
+    #
+    # `notify` is imported here rather than at module scope because it imports this module
+    # back (for `get_connection`), and the pair at top level is a cycle. Failure is
+    # swallowed inside `enqueue` — a misconfigured Slack URL must not stop a review from
+    # being saved.
+    from backend.services import notify as _notify
+    _queued = _notify.enqueue_for_review(
+        cursor, review_id=review_id, review_type=review_type, project_id=project_id,
+        project_name=project_name or "", gate_status=gate_status,
+        critical_count=critical_count, high_count=high_count,
+        repo="/".join(x for x in (source_ref.get("repo_owner"),
+                                  source_ref.get("repo_name")) if x),
+    )
+
     conn.commit()
     conn.close()
+
+    # After the commit, never before: the dispatcher thread opens its own connection and
+    # would not see an uncommitted row. Fire-and-forget on purpose — the review's caller is
+    # waiting on this function and must not wait on somebody's chat service, which is the
+    # defect D-334 was about.
+    if _queued:
+        try:
+            _notify.kick()
+        except Exception:                                        # noqa: BLE001
+            logger.exception("Could not start the notification dispatcher — the rows stay "
+                             "pending and are retried at startup")
     return review_id
 
 
@@ -3140,6 +3219,171 @@ def list_findings(
             WHERE 1 = 1{scope}{clauses}
             ORDER BY r.created_at DESC, f.severity DESC LIMIT ? OFFSET ?""",
         params + extra + (limit, offset),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── Notification targets ─────────────────────────────────────────────────
+#
+# The URL is the credential. A Slack or Teams incoming-webhook URL authenticates by
+# possession — anyone holding it can post to that channel — so it is encrypted at rest and
+# **never** read back out of any of these functions. `_redact_target` is the only shape
+# that leaves this layer, and it carries a host and four characters, which is enough to
+# tell two channels apart and not enough to use one. Same rule as `llm_connections`.
+
+def _redact_target(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A target as the API may show it: no URL, just where it points."""
+    from urllib.parse import urlparse
+
+    from backend.services import crypto_service
+
+    out = {k: v for k, v in row.items() if k not in ("url_encrypted", "secret_encrypted")}
+    host, tail = "", ""
+    try:
+        url = crypto_service.decrypt(row["url_encrypted"])
+        host = urlparse(url).hostname or ""
+        tail = url[-4:]
+    except Exception:                                            # noqa: BLE001
+        # An undecryptable URL means `SECRET_KEY` changed. Reported on the row rather than
+        # raised: the list must still render, and this is the only place a user would ever
+        # find out why that channel stopped working.
+        out["unreadable"] = ("This channel's URL cannot be decrypted — SECRET_KEY changed "
+                             "since it was added. Delete it and add it again.")
+    out["host"] = host
+    out["url_tail"] = tail
+    out["signed"] = bool(row.get("secret_encrypted"))
+    out["active"] = bool(row.get("active"))
+    return out
+
+
+def create_notification_target(*, project_id: str, name: str, kind: str, url: str,
+                               secret: str = "", events: str = "review_gated",
+                               min_severity: int = 5,
+                               created_by: str = "unknown") -> Dict[str, Any]:
+    """Store a channel. The URL is encrypted here and cannot be read back."""
+    from backend.services import crypto_service
+
+    target_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO notification_targets (id, project_id, name, kind, url_encrypted, "
+        "secret_encrypted, events, min_severity, active, created_at, created_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        (target_id, project_id, name, kind, crypto_service.encrypt(url),
+         crypto_service.encrypt(secret) if secret else None,
+         events, int(min_severity), now, created_by),
+    )
+    log_audit(cursor, "notification_target_created", "notification_target", target_id,
+              actor=created_by, details=f"kind={kind} events={events}",
+              project_id=project_id)
+    conn.commit()
+    conn.close()
+    return get_notification_target(target_id, redacted=True)
+
+
+def get_notification_target(target_id: str, redacted: bool = False) -> Optional[Dict[str, Any]]:
+    """One target. Raw by default — the dispatcher and the test endpoint need the
+    ciphertext to decrypt; pass `redacted=True` for anything a caller will see.
+
+    Joined to `projects` for the name, because a notification body says which project it is
+    about and the target row only carries an id.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT t.*, p.name AS project_name FROM notification_targets t "
+        "LEFT JOIN projects p ON p.id = t.project_id WHERE t.id = ?",
+        (target_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _redact_target(dict(row)) if redacted else dict(row)
+
+
+def list_notification_targets(project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Every channel in the caller's projects, redacted. Newest first."""
+    scope, params = _project_scope_sql(project_ids, alias="t")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT t.*, p.name AS project_name FROM notification_targets t "
+        f"LEFT JOIN projects p ON p.id = t.project_id "
+        f"WHERE 1 = 1{scope} ORDER BY t.created_at DESC",
+        params,
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [_redact_target(dict(r)) for r in rows]
+
+
+def update_notification_target(target_id: str, fields: Dict[str, Any],
+                               actor: str = "unknown") -> Optional[Dict[str, Any]]:
+    """Update the named columns only.
+
+    The column list is a fixed whitelist rather than whatever the caller sent, because this
+    builds SQL from the keys: `url_encrypted` must not be reachable this way (see the route
+    for why a channel's destination is not editable), and neither must `project_id`, which
+    would move a channel between customers.
+    """
+    allowed = {"name", "events", "min_severity", "active"}
+    sets = {k: v for k, v in (fields or {}).items() if k in allowed}
+    if not sets:
+        return get_notification_target(target_id, redacted=True)
+    assignments = ", ".join(f"{k} = ?" for k in sets)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE notification_targets SET {assignments} WHERE id = ?",
+        tuple(sets.values()) + (target_id,),
+    )
+    log_audit(cursor, "notification_target_updated", "notification_target", target_id,
+              actor=actor, details=", ".join(f"{k}={v}" for k, v in sets.items()))
+    conn.commit()
+    conn.close()
+    return get_notification_target(target_id, redacted=True)
+
+
+def delete_notification_target(target_id: str, actor: str = "unknown") -> bool:
+    """Remove a channel. Its deliveries are deliberately left behind — they are the record
+    of what left this deployment and where it went, and deleting a channel must not be a
+    way to erase that."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM notification_targets WHERE id = ?", (target_id,))
+    removed = cursor.rowcount > 0
+    log_audit(cursor, "notification_target_deleted", "notification_target", target_id,
+              actor=actor, details="deliveries retained")
+    conn.commit()
+    conn.close()
+    return removed
+
+
+def list_notification_deliveries(project_ids: Optional[List[str]] = None,
+                                 status: Optional[str] = None,
+                                 limit: int = 50) -> List[Dict[str, Any]]:
+    """The delivery log. `payload_json` is not returned — it is what we sent, and the
+    fields that matter are already columns."""
+    scope, params = _project_scope_sql(project_ids, alias="d")
+    clause, extra = "", ()
+    if status:
+        clause = " AND d.status = ?"
+        extra = (status,)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT d.id, d.target_id, d.project_id, d.event_type, d.review_id, d.status, "
+        f"       d.attempts, d.last_error, d.created_at, d.sent_at, "
+        f"       t.name AS target_name, t.kind AS target_kind "
+        f"FROM notification_deliveries d "
+        f"LEFT JOIN notification_targets t ON t.id = d.target_id "
+        f"WHERE 1 = 1{scope}{clause} ORDER BY d.created_at DESC LIMIT ?",
+        params + extra + (limit,),
     )
     rows = cursor.fetchall()
     conn.close()

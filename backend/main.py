@@ -33,6 +33,7 @@ from backend.routes.audit_trail import router as audit_router
 from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
 from backend.routes.findings import router as findings_router
+from backend.routes.notifications import router as notifications_router
 from backend.routes.github_credentials import router as github_credentials_router
 from backend.routes.github_webhook import router as github_webhook_router
 from backend.routes.modernization import router as modernization_router
@@ -80,6 +81,7 @@ from backend.models.api_models import (
 )
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services import job_service
+from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
 from backend.services import (fix_apply, guardrail_service, review_estimate,
@@ -140,6 +142,22 @@ async def lifespan(app: FastAPI):
         # Never allowed to stop the app coming up. A missed sweep is a stale row; a failed
         # startup is an outage.
         logger.exception("Startup housekeeping failed — continuing")
+    # A third sweep, for the same missing scheduler. A notification is written as a row
+    # inside the review's own transaction and then attempted on a thread, so anything the
+    # last process was holding when it stopped is still `pending`. This is where it gets
+    # picked up — on a thread, so a slow chat service cannot delay the app coming up.
+    # Also retried whenever somebody reads the delivery log.
+    try:
+        # Put anything left mid-flight back in the queue first. A `sending` row belongs to
+        # a process that no longer exists, exactly like the job rows above.
+        stranded = notify.recover_sending()
+        if stranded:
+            logger.info("Notifications: %d delivery(ies) were mid-flight at shutdown and "
+                        "are queued again", stranded)
+        notify.kick()
+    except Exception:
+        logger.exception("Could not start the notification dispatcher — pending "
+                         "deliveries wait for the next read of the delivery log")
     knowledge_base.load()  # preload all docs/ markdown files into memory
     logger.info("Startup complete")
     yield
@@ -285,6 +303,7 @@ app.include_router(agents_router)
 app.include_router(inventory_router)
 app.include_router(v1_agents_router)
 app.include_router(findings_router)
+app.include_router(notifications_router)
 app.include_router(github_credentials_router)
 app.include_router(github_webhook_router)
 app.include_router(modernization_router)

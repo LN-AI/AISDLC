@@ -209,7 +209,15 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   already exists, so a column added to the DDL alone is missing on every existing database.
   There is also **no scheduler in this deployment**, so anything time-based runs at startup
   *and* on the read path that depends on it: `lapse_expired_waivers` (before every baseline
-  lookup) and `review_source_store.sweep_expired` (on every inventory read).
+  lookup), `review_source_store.sweep_expired` (on every inventory read), and
+  `notify.dispatch_pending` (at startup, kicked after a review saves, and on every read of
+  the delivery log). Notifications are the clearest case of what that costs:
+  `save_review` writes the delivery row on **its own cursor**, so it commits with the
+  review and cannot be lost, and a background thread then attempts it — a row in flight is
+  `sending` and `notify.recover_sending()` puts it back at startup, the same way
+  `recover_orphaned_jobs` reaps job rows. What none of that buys is promptness after a
+  crash, and `backend/services/notify.py` says so at the top rather than leaving it to be
+  discovered.
 - `backend/config.py` — env var loading (see below).
 - **What a run cost reaches the browser two different ways, and you need to know which.**
   `agent_guard.guarded_call` attaches `_budget_stats` to the response *body* — that covers
