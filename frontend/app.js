@@ -2568,42 +2568,118 @@ function renderFixPlan(reviewId, d, picked) {
           <summary>${d.unavailable_files.length} file(s) cannot be patched</summary>
           <ul>${d.unavailable_files.map(u => `<li><code>${esc(u.path)}</code> — ${esc(u.reason)}</li>`).join('')}</ul>
         </details>` : ''}
-      <div class="form-group">
-        <label>Where the fix goes</label>
-        <div class="radio-stack">
-          ${outs.map((o, i) => `<label class="${o.unavailable ? 'radio-off' : ''}">
-            <input type="radio" name="fix-output" value="${esc(o.id)}"${i === 0 ? ' checked' : ''}${o.unavailable ? ' disabled' : ''} />
-            <b>${esc(o.label)}</b>${o.unavailable
-              ? ` — <span class="radio-why">cannot be used: ${esc(o.unavailable)}</span>`
-              : (o.note ? ` — ${esc(o.note)}` : '')}</label>`).join('')}
-        </div>
-      </div>
+      ${outs.length ? `<div class="cost-note">Where it can go once you have read it:
+        ${outs.filter(o => !o.unavailable).map(o => esc(o.label)).join(' · ') || 'nowhere — this review has no writable source'}.</div>` : ''}
       <div class="cost-actions">
         <button class="btn btn-primary" onclick="runFix('${esc(reviewId)}')">
-          Fix them — up to $${Number(e.ceiling_usd || 0).toFixed(2)}
+          Write the fix — up to $${Number(e.ceiling_usd || 0).toFixed(2)}
         </button>
         <button class="btn btn-secondary" onclick="closeFixPanel()">Cancel</button>
       </div>
+      <div class="field-hint">You will see the diff before anything is delivered, and
+        choosing where it goes then costs nothing more.</div>
     </div>`;
 }
 
+/** Generate the patch and show it. Delivers nothing.
+ *
+ *  This used to take the destination with it, so one click generated the patch *and*
+ *  opened the pull request — and the diff appeared in the result, after the branch already
+ *  existed. On a platform whose argument is that a human approves what an agent proposes,
+ *  remediation was the one place with no such step. The quote came before the spend and
+ *  nothing came before the write. */
 async function runFix(reviewId) {
   const picked = [...document.querySelectorAll('.fix-check:checked')].map(c => c.value);
-  const output = document.querySelector('input[name="fix-output"]:checked')?.value || 'diff';
   const panel = document.getElementById('fix-panel');
-  if (panel) panel.innerHTML = `<div class="source-panel">Fixing, then re-reviewing every
-    patch before offering it. This is the slow part and it is the point — a patch nobody
-    re-read is how a fix introduces a worse problem.</div>`;
+  if (panel) panel.innerHTML = `<div class="source-panel">Writing the fix, then re-reviewing
+    every patch before showing it. This is the slow part and it is the point — a patch
+    nobody re-read is how a fix introduces a worse problem.</div>`;
   try {
     const d = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/fix`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ finding_ids: picked, output }),
+      body: JSON.stringify({ finding_ids: picked, output: 'preview' }),
+    });
+    if (panel) panel.innerHTML = d.deliver_token ? renderFixPreview(reviewId, d) : renderFixResult(d);
+  } catch (e) {
+    if (panel) panel.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not
+      write the fixes — ${esc(e.message)}</div></div>`;
+  }
+}
+
+/** The patch, before it goes anywhere. */
+function renderFixPreview(reviewId, d) {
+  const outs = (d.available_outputs || []).filter(o => !o.unavailable);
+  const blockedOuts = (d.available_outputs || []).filter(o => o.unavailable);
+  return `
+    <div class="source-panel fix-preview">
+      <div class="section-title" style="margin-top:0">
+        ${d.files_patched.length} file(s) written — nothing delivered yet
+      </div>
+      <div class="cost-warn">${esc(d.verification_note || '')}</div>
+      ${(d.carried_over_criticals || []).length ? `
+        <div class="cost-warn">Still Critical after the fix, and reported before:
+          ${d.carried_over_criticals.map(t => esc(t)).join('; ')}. The patch was not
+          rejected for these — they were already known — but they are still in the file.</div>` : ''}
+      <ul>${d.files_patched.map(f =>
+        `<li><code>${esc(f.path)}</code> — ${esc(f.explanation || 'patched')}</li>`).join('')}</ul>
+      ${(d.blocked_patches || []).length ? `
+        <details class="review-panel panel-discarded" open>
+          <summary>${d.blocked_patches.length} patch(es) rejected before you saw them</summary>
+          <div class="field-hint">The guardrail working: a patch that introduced a secret,
+            or one whose re-review still found a Critical the original review had not
+            reported. These are not in the diff below and will not be delivered.</div>
+          <ul>${d.blocked_patches.map(b =>
+            `<li><code>${esc(b.path)}</code> — ${esc(b.reason)}</li>`).join('')}</ul>
+        </details>` : ''}
+      ${(d.unfixed_finding_titles || []).length ? `
+        <details class="cost-skipped">
+          <summary>${d.unfixed_finding_titles.length} finding(s) deliberately not fixed</summary>
+          <ul>${d.unfixed_finding_titles.map(u => `<li>${esc(u)}</li>`).join('')}</ul>
+        </details>` : ''}
+      ${d.diff ? `<details class="review-panel" open>
+        <summary>The diff — this is what will be delivered</summary>
+        ${renderUnifiedDiff(d.diff)}
+      </details>` : ''}
+      <div class="form-group">
+        <label>Where it goes</label>
+        <div class="radio-stack">
+          ${outs.map((o, i) => `<label>
+            <input type="radio" name="fix-deliver" value="${esc(o.id)}"${i === 0 ? ' checked' : ''} />
+            <b>${esc(o.label)}</b>${o.note ? ` — ${esc(o.note)}` : ''}</label>`).join('')}
+          ${blockedOuts.map(o => `<label class="radio-off">
+            <input type="radio" disabled />
+            <b>${esc(o.label)}</b> — <span class="radio-why">cannot be used: ${
+              esc(o.unavailable)}</span></label>`).join('')}
+        </div>
+      </div>
+      <div class="cost-actions">
+        <button class="btn btn-primary" onclick="deliverFix('${esc(reviewId)}','${esc(d.deliver_token)}')"
+          ${outs.length ? '' : 'disabled'}>Deliver it</button>
+        <button class="btn btn-secondary" onclick="closeFixPanel()">Discard the patch</button>
+      </div>
+      <div class="field-hint">Delivering calls no model and costs nothing — the diff above
+        is the one that ships. Discarding it writes nothing anywhere.</div>
+    </div>`;
+}
+
+/** Put the previewed patch where the reader chose. No model, no further cost. */
+async function deliverFix(reviewId, token) {
+  const output = document.querySelector('input[name="fix-deliver"]:checked')?.value || 'diff';
+  const panel = document.getElementById('fix-panel');
+  if (panel) panel.innerHTML = `<div class="source-panel">Delivering the patch you read…</div>`;
+  try {
+    const d = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/fix/deliver`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deliver_token: token, output }),
     });
     if (panel) panel.innerHTML = renderFixResult(d);
   } catch (e) {
     if (panel) panel.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not
-      apply the fixes — ${esc(e.message)}</div></div>`;
+      deliver the patch — ${esc(e.message)}</div>
+      <div class="cost-actions"><button class="btn btn-secondary"
+        onclick="runFix('${esc(reviewId)}')">Write it again</button></div></div>`;
   }
 }
 

@@ -2665,8 +2665,11 @@ def main():
               hasattr(_GH31, "create_branch_at_sha"),
               "branching off the commit a review read is the whole reason Apply Fixes does "
               "not just branch off the tip")
+        # `_write31` is the write path. `apply` generates, guards and stops at the preview;
+        # `_deliver` is what touches a repository, and every check below is about writing.
+        _write31 = _i31.getsource(fix_apply._deliver)
         check("...and it is the one Apply Fixes calls",
-              "create_branch_at_sha(" in _i31.getsource(fix_apply.apply),
+              "create_branch_at_sha(" in _write31,
               "create_branch resolves its fourth argument as a branch NAME; a sha there is "
               "a request for /git/ref/heads/<sha>, which 404s every time")
         check("...and it refuses a branch name, rather than asking GitHub about a bad ref",
@@ -2688,7 +2691,7 @@ def main():
         # `owner/repo@ref`, so that works. A **pull request's** label is its title, so the
         # fix pull request was opened with `base="CB-104: AI visit summary endpoint"` and
         # GitHub answered 422 with nothing naming the branch.
-        _src31 = _i31.getsource(fix_apply.apply)
+        _src31 = _write31
         check("a fix from a pull request targets a branch, not the review's label",
               'source.get("source_type") == "github_pr"' in _src31
               and 'source.get("head_branch")' in _src31,
@@ -2723,7 +2726,16 @@ def main():
         # comments. The first version of this check compared string offsets over the raw
         # source and passed/failed on a comment that happened to mention the function it
         # was looking for -- which is the same class of mistake it exists to catch.
-        _code31 = _ast31.unparse(_ast31.parse(_tw31.dedent(_i31.getsource(fix_apply.apply))))
+        _code31 = _ast31.unparse(_ast31.parse(_tw31.dedent(_i31.getsource(fix_apply._deliver))))
+        # Guard against this check quietly emptying out. If the block it watches moves
+        # again, the names disappear from the function and the ordering check below starts
+        # passing because there is nothing left to order — the failure mode that made this
+        # comment necessary the first time.
+        check("...and the check is looking at the function that actually writes",
+              all(n in _code31 for n in ("gh", "owner", "repo", "get_default_branch")),
+              "the owner/repo/client resolution is no longer in `_deliver`, so the "
+              "ordering check below would pass vacuously -- point it at wherever the "
+              "write path went")
 
         def _read_before_bound(code: str, names):
             """Names read on a line above the line that first binds them.
@@ -2746,7 +2758,7 @@ def main():
             return sorted(set(offenders))
 
         _offenders31 = _read_before_bound(_code31, {"gh", "owner", "repo"})
-        check("apply() never reads owner/repo/gh before assigning them",
+        check("the write path never reads owner/repo/gh before assigning them",
               not _offenders31,
               "read before assignment: " + ", ".join(_offenders31)
               + " -- function-locals, so a read above the assignment is an "
@@ -2754,6 +2766,40 @@ def main():
         check("...and the repository client is resolved before the default branch is asked for",
               _code31.index("gh = orch.github") < _code31.index("get_default_branch("),
               "the default-branch lookup takes the client and the owner/repo it names")
+
+        # ── The patch is shown before it is delivered ─────────────────────
+        #
+        # `apply` used to take the destination with it, so one call generated the patch and
+        # opened the pull request; the diff was in the result, after the branch existed. On
+        # a platform whose argument is that a human approves what an agent proposes, this
+        # was the one write with no approval step.
+        check("a fix can be generated without being delivered",
+              fix_apply.PREVIEW not in fix_apply.OUTPUTS,
+              "preview is the step before a delivery, not one of them -- in OUTPUTS it "
+              "would appear in the destination list as somewhere a patch can go")
+        check("...and there is a separate call that only delivers",
+              callable(getattr(fix_apply, "deliver", None)))
+        _dsrc = _i31.getsource(fix_apply.deliver)
+        check("...which never generates, so the diff approved is the diff that ships",
+              "_fix_one_file" not in _dsrc and "_guard_patches" not in _dsrc
+              and "call_tool" not in _dsrc,
+              "regenerating to change the destination would pay twice and could produce a "
+              "different patch, so the approval would refer to something else")
+        check("...and takes the patched contents from the held preview, not from its caller",
+              'held.get("patches")' in _dsrc,
+              "a caller that could post file contents here could commit anything it liked "
+              "to the customer's repository under a fix's name")
+        check("...and refuses a destination this review cannot use",
+              "_available_outputs(" in _dsrc and "not in available" in _dsrc)
+        _main_src = io.open(_i31.getsourcefile(main), encoding="utf-8").read()
+        check("the preview route holds the contents server-side, not in the response",
+              all(frag in _main_src
+                  for frag in ('result.pop("patches", None)', "_FIX_PENDING")),
+              "the patched source must not travel to the browser and back")
+        check("...and delivery is still entitlement-checked, having no model call to meter",
+              'agent_guard.preflight(caller, "auto-fix")' in _main_src,
+              "D-307: writing to a repository is the auto-fix product whichever review the "
+              "findings came from, and no model call does not mean no governance")
 
         # The delivery options are unchanged by any of this -- checked because the fix
         # touched the function that reads them.

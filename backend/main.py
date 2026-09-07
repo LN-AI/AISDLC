@@ -1063,7 +1063,106 @@ async def fix_run(review_id: str, req: FixRequest, request: Request,
         _FIX_ZIPS[token] = (blob, review_id)
         result["download_url"] = f"/api/reviews/{review_id}/fix/download/{token}"
         result["download_bytes"] = len(blob)
+
+    # A preview holds the patched file contents server-side and hands back a token.
+    #
+    # They must not travel to the browser and back: a client that could post file contents
+    # to the delivery route would be able to commit anything it liked to the customer's
+    # repository under a fix's name. The token is the only thing that crosses, and the
+    # contents it names never leave this process.
+    if result.pop("preview", False):
+        token = uuid.uuid4().hex
+        _hold_pending_fix(token, review_id, result)
+        result["deliver_token"] = token
+        # The diff and the per-file explanations stay in the response — that is what there
+        # is to read. `patches` and `before` are the raw contents and are stripped.
+        result.pop("patches", None)
+        result.pop("before", None)
     return result
+
+
+# One generated-but-undelivered patch per token. Same shape and same reasoning as
+# `_FIX_ZIPS` below: in memory rather than on disk because it is a copy of the customer's
+# patched source, single use because a token that keeps working is a token that ends up in
+# a chat log, and capped because a long-lived process must not accumulate patches nobody
+# came back for. Losing one to a restart costs a re-run of the generation step, which is
+# the same trade already accepted for the archive.
+_FIX_PENDING: dict = {}
+_MAX_PENDING_FIXES = 8
+
+
+def _hold_pending_fix(token: str, review_id: str, result: dict) -> None:
+    while len(_FIX_PENDING) >= _MAX_PENDING_FIXES:
+        _FIX_PENDING.pop(next(iter(_FIX_PENDING)), None)
+    _FIX_PENDING[token] = {
+        "review_id": review_id,
+        "patches": result.get("patches") or [],
+        "before": result.get("before") or {},
+        "diff": result.get("diff") or "",
+        "blocked_patches": result.get("blocked_patches") or [],
+        "files_patched": result.get("files_patched") or [],
+        "unfixed_finding_titles": result.get("unfixed_finding_titles") or [],
+        "fixed_finding_titles": result.get("fixed_finding_titles") or [],
+        "commit_message": result.get("commit_message") or "",
+        "pr_title": result.get("pr_title") or "",
+        "pr_description": result.get("pr_description") or "",
+        "reviewed_by": result.get("reviewed_by") or "",
+        "verification_note": result.get("verification_note") or "",
+        "carried_over_criticals": result.get("carried_over_criticals") or [],
+        "unreadable_files": result.get("unreadable_files") or [],
+    }
+
+
+class FixDeliverRequest(BaseModel):
+    deliver_token: str = Field(..., description="The token the preview returned.")
+    output: str = Field(..., description="Where the patch should go: "
+                                        "pr | same_pr | branch | zip | diff")
+
+
+@app.post("/api/reviews/{review_id}/fix/deliver",
+          summary="Deliver a patch that was generated and previewed")
+async def fix_deliver(review_id: str, req: FixDeliverRequest, request: Request,
+                      reader: dict = Depends(require_reader)):
+    """Put a previewed patch where the person who read it chose.
+
+    **Calls no model.** That is the whole point of splitting this from `POST .../fix`: the
+    diff somebody approved is the diff that ships. Re-generating to change the destination
+    would pay for the same work twice and could produce a *different* patch the second
+    time, so the approval would refer to something that no longer exists.
+
+    Still entitlement-checked against `auto-fix` (D-307), because this is the step that
+    writes to a real repository — no model call does not mean no governance. `preflight`
+    rather than `guarded_call`: there is nothing to meter, and a zero-cost ledger row for
+    every delivery would make the usage export harder to read, not easier.
+    """
+    review = _review_in_scope(review_id, request, reader)
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    caller["_subject"] = subject_service.resolve_subject(caller, request.headers)
+    try:
+        agent_guard.preflight(caller, "auto-fix")
+    except agent_guard.ScopeDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    held = _FIX_PENDING.pop(req.deliver_token, None)
+    if not held or held.get("review_id") != review_id:
+        raise HTTPException(
+            status_code=404,
+            detail="That patch has already been delivered, belongs to another review, or "
+                   "was generated before the server restarted. Generate it again — the "
+                   "quote and the diff both come back before anything is written.")
+    try:
+        return fix_apply.deliver(orchestrator, review_id, held, req.output,
+                                 project_id=review.get("project_id"))
+    except fix_apply.FixError as exc:
+        # Put it back: a refused delivery has spent nothing and the patch is still good,
+        # so the person can choose a different destination rather than pay to regenerate.
+        _FIX_PENDING[req.deliver_token] = held
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Fix delivery failed for review %s", review_id)
+        raise HTTPException(status_code=502, detail=f"Could not deliver the patch: {exc}")
 
 
 # One pending archive per download, keyed by a single-use token. Capped so a long-lived

@@ -2994,6 +2994,56 @@ function runNavigationChecks() {
       'an added line has no old-file number');
   });
 
+  check('the preview shows the patch, the guardrail, and where it may go — and delivers nothing', () => {
+    const render = vm.runInContext('renderFixPreview', sandbox);
+    const html = render('rv-1', {
+      deliver_token: 'tok-1',
+      files_patched: [{ path: 'src/auth.py', explanation: 'Parameterised the lookup.' }],
+      blocked_patches: [{ path: 'src/legacy.py', reason: 'still Critical after the patch' }],
+      unfixed_finding_titles: ['No threat model on record'],
+      carried_over_criticals: ['Broken object-level authorization'],
+      diff: '@@ -1,2 +1,2 @@\n-old\n+new',
+      verification_note: 'no build ran and no test ran',
+      available_outputs: [
+        { id: 'pr', label: 'A new pull request' },
+        { id: 'diff', label: 'Just the diff', note: 'nothing is written' },
+        { id: 'same_pr', label: 'Into the pull request', unavailable: 'it comes from a fork' },
+      ],
+    });
+    assert(/nothing delivered yet/i.test(html),
+      'the heading has to say the patch has not gone anywhere');
+    assert(html.includes('no build ran and no test ran'),
+      'the verification note is the honest half of the offer');
+    assert(html.includes('diff-view'), 'the diff is rendered, not described');
+    assert(html.includes('Broken object-level authorization'),
+      'a Critical the patch did not close, that the original review already knew about, '
+      + 'has to be visible at the moment of approval');
+    assert(html.includes('still Critical after the patch'),
+      'a rejected patch is named, so "2 files" is not read as "everything"');
+    // The destinations are here rather than in the quote panel, because this is the first
+    // point at which the reader has seen what they are approving.
+    assert((html.match(/name="fix-deliver"/g) || []).length === 2,
+      'two available destinations get a radio; the unavailable one must not');
+    assert(/radio-off[\s\S]*it comes from a fork/.test(html),
+      'an unavailable destination is shown with its reason, not hidden -- a missing option '
+      + 'reads as a broken screen');
+    assert(html.includes("deliverFix('rv-1','tok-1')"),
+      'delivering goes through the token, never through posted file contents');
+    assert(/costs nothing/.test(html),
+      'if reading the diff looked like it cost money it would be a tax, not a gate');
+  });
+
+  check('a preview with nowhere to deliver still shows the diff, and cannot deliver', () => {
+    const render = vm.runInContext('renderFixPreview', sandbox);
+    const html = render('rv-2', {
+      deliver_token: 'tok-2', files_patched: [{ path: 'a.py' }],
+      diff: '@@ -1 +1 @@\n-a\n+b', available_outputs: [],
+    });
+    // A pasted snippet has no repository. The patch is still worth reading.
+    assert(html.includes('diff-view'), 'the diff is the point, repository or not');
+    assert(html.includes('disabled'), 'the deliver button must be disabled, not absent');
+  });
+
   check('a finding links into the file viewer only when there is a source to read', () => {
     const renderFinding = vm.runInContext('renderFinding', sandbox);
     const f = { id: 'f1', title: 'SQL injection', severity: 5, file_path: 'src/auth.py',

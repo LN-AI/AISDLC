@@ -51,6 +51,12 @@ logger = logging.getLogger(__name__)
 # `diff` need neither and write nothing anywhere.
 OUTPUTS = ("pr", "same_pr", "branch", "zip", "diff")
 
+# Not a delivery — the step before one. `apply(output=PREVIEW)` generates and guards the
+# patch and writes nothing, and `deliver()` then puts it where a person chose, with no
+# further model call. Kept out of `OUTPUTS` so nothing that enumerates deliveries (the
+# radio list, the availability check, `_available_outputs`) has to special-case it.
+PREVIEW = "preview"
+
 # Most files one request may fix. Not a technical limit — each file is an independent call, so
 # fifty files would work and cost fifty calls. It is a guard against a click that spends more
 # than the person meant: the quote names the number, and above this they have to say so again.
@@ -393,8 +399,10 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     """
     from backend.services import review_source_store
 
-    if output not in OUTPUTS:
-        raise FixError(f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}.")
+    if output not in OUTPUTS and output != PREVIEW:
+        raise FixError(
+            f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}, or "
+            f"'{PREVIEW}' to generate the patch without delivering it.")
 
     loaded = _load(review_id, project_id)
     review_agent = _review_agent(loaded["review"])
@@ -409,6 +417,9 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
             f"than you meant.")
 
     source = review_source_store.summarize(review_id)
+    # A preview writes nothing, so it is not held to the delivery preconditions below — a
+    # pasted snippet can still have its patch generated and read, even though there is no
+    # repository to push it to. Which delivery *is* possible is reported back instead.
     if output in ("pr", "branch", "same_pr") and not (
             source.get("ref") and source.get("commit_sha")):
         raise FixError(
@@ -507,6 +518,80 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
         }),
     }
 
+    # ── The preview gate ──────────────────────────────────────────────────
+    #
+    # Everything above has happened: the patch is generated, the secret scan has passed,
+    # and every file has been re-reviewed by the agent that found the original problem.
+    # Nothing has been written. This is the moment a person should decide.
+    #
+    # It exists because the delivery choice used to be made *before* any of that ran: one
+    # click generated the patch and opened the pull request, and the diff appeared only in
+    # the result — after the branch existed. For a platform whose whole argument is that a
+    # human approves what an agent proposes, remediation was the one place with no such
+    # step. `plan` quotes the cost beforehand and this shows the change beforehand; between
+    # them there is no longer a point where money or a repository is committed unseen.
+    #
+    # The patches are handed back to the caller to hold, and delivering them later calls no
+    # model — so reading the diff first costs nothing, which is what makes it a gate rather
+    # than a tax.
+    if output == PREVIEW:
+        result["applied"] = False
+        result["preview"] = True
+        result["available_outputs"] = _available_outputs(source, loaded["review"])
+        result["patches"] = [{"path": p["path"], "fixed_content": p.get("fixed_content", ""),
+                              "explanation": p.get("explanation", "")} for p in safe]
+        result["before"] = before
+        return result
+
+    return _deliver(orch, review_id, output, safe, before, result, blocked, source,
+                    diff_text, project_id)
+
+
+def deliver(orch, review_id: str, held: Dict[str, Any], output: str,
+            project_id: Optional[str] = None) -> Dict[str, Any]:
+    """Deliver a patch that was already generated, guarded and previewed.
+
+    The second half of `apply`, callable on its own. **No model runs here**, which is the
+    point: a person reads the diff, chooses where it goes, and the choice costs nothing
+    beyond the write itself. Re-running `apply` to change the destination would pay for
+    the same patch twice and could produce a *different* patch the second time, so the
+    diff somebody approved would not be the diff that shipped.
+
+    `held` is what `apply(output=PREVIEW)` returned. The patched contents come from it
+    rather than from the caller: a client that could post file contents here would be able
+    to commit anything it liked to the customer's repository under a fix's name.
+    """
+    from backend.services import review_source_store
+
+    if output not in OUTPUTS:
+        raise FixError(f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}.")
+    loaded = _load(review_id, project_id)
+    source = review_source_store.summarize(review_id)
+    available = {o["id"] for o in _available_outputs(source, loaded["review"])
+                 if not o.get("unavailable")}
+    if output not in available:
+        raise FixError(
+            f"'{output}' is not available for this review. Available: "
+            f"{', '.join(sorted(available)) or 'none'}.")
+
+    safe = [dict(p) for p in (held.get("patches") or [])]
+    if not safe:
+        raise FixError("There is no held patch to deliver. Generate one first.")
+    before = held.get("before") or {}
+    result = {k: v for k, v in held.items()
+              if k not in ("patches", "before", "available_outputs", "preview")}
+    result["output"] = output
+    result["applied"] = True
+    return _deliver(orch, review_id, output, safe, before, result,
+                    held.get("blocked_patches") or [], source,
+                    held.get("diff") or "", project_id)
+
+
+def _deliver(orch, review_id: str, output: str, safe: List[Dict[str, Any]],
+             before: Dict[str, str], result: Dict[str, Any],
+             blocked: List[Dict[str, Any]], source: Dict[str, Any],
+             diff_text: str, project_id: Optional[str]) -> Dict[str, Any]:
+    """Put a guarded patch where the caller asked for it. Writes; never generates."""
     if output == "diff":
         return result
 
@@ -616,5 +701,5 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     return result
 
 
-__all__ = ["OUTPUTS", "MAX_FILES_PER_RUN", "FixError", "eligible", "plan", "apply",
-           "make_diff", "make_zip"]
+__all__ = ["OUTPUTS", "PREVIEW", "MAX_FILES_PER_RUN", "FixError", "eligible", "plan",
+           "apply", "deliver", "make_diff", "make_zip"]
