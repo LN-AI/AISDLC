@@ -177,6 +177,39 @@ def main():
                      + ("  -- this blocks the merge button under branch protection"
                         if st.get("state") == "failure" else ""))
 
+                # The check run. This is the *only* place it can be verified: GitHub
+                # refuses the endpoint for a personal access token, so no offline test can
+                # reach it, and D-314/D-315 are two GitHub write paths that shipped broken
+                # for exactly that reason.
+                from backend.services import github_app
+                cr = result.get("check_run") or {}
+                if not github_app.is_configured():
+                    note("no GitHub App configured, so no check run was attempted -- the "
+                         "commit status above is the whole report. Set GITHUB_APP_ID and "
+                         "GITHUB_APP_PRIVATE_KEY (see docs/github-app.md) and run this "
+                         "again to verify the one path nothing offline can reach.")
+                    check("...and the result says so rather than staying silent",
+                          bool(cr.get("reason")), json.dumps(cr)[:200])
+                else:
+                    check("a check run was created", cr.get("created") is True,
+                          json.dumps(cr)[:300])
+                    if cr.get("url"):
+                        ARTEFACTS.append(("check run", cr["url"]))
+                        note(cr["url"])
+                    note(f"conclusion={cr.get('conclusion')} · "
+                         f"{cr.get('annotations_sent', 0)} annotation(s) placed, "
+                         f"{cr.get('annotations_omitted', 0)} over the cap, "
+                         f"{cr.get('unplaceable', 0)} unplaceable")
+                    check("at least one finding was annotated on its own line",
+                          (cr.get("annotations_sent") or 0) > 0 if located else True,
+                          "the whole point of an App is placement; a check run with no "
+                          "annotations is a commit status with extra steps")
+                    check("the conclusion matches the gate",
+                          cr.get("conclusion") == {"Red": "failure", "Amber": "neutral",
+                                                   "Green": "success"}.get(
+                              r.get("gate_status")),
+                          f"gate={r.get('gate_status')} conclusion={cr.get('conclusion')}")
+
         # ── upsert ────────────────────────────────────────────────────────
         if "upsert" in stages and not args.dry_run:
             section("upsert -- the same review again must EDIT, not add a second comment")

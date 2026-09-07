@@ -60,6 +60,17 @@ logger = logging.getLogger(__name__)
 
 WORKFLOW_ID = "github-pr-review"
 
+
+def _review_url(review_id: str) -> str:
+    """The address of the stored run, for a check run's "Details" link.
+
+    Empty when `PUBLIC_BASE_URL` is unset. A link to `localhost` works only on the server
+    and is worse than none — the same reason `notify._link` is written this way.
+    """
+    from backend import config
+    base = (getattr(config, "PUBLIC_BASE_URL", "") or "").rstrip("/")
+    return f"{base}/static/index.html#/code/run/{review_id}" if base and review_id else ""
+
 POST_MODES = ("summary", "inline", "none")
 
 
@@ -398,6 +409,33 @@ def run(orch, pr_url: str, jira_ticket: str = "", post_mode: str = "summary",
                     + (f", {blocking} blocking" if blocking else "")
                 ),
             )
+
+            # And a check run, which is the only thing that can put a finding on the line
+            # it is about. **In addition to** the commit status, never instead of it: a
+            # team's branch protection may already require the status by name, and quietly
+            # replacing it with a differently-named check would stop protecting the branch
+            # while appearing to work. The extra call is one request.
+            #
+            # Needs a GitHub App installation token — GitHub refuses this endpoint for a
+            # PAT — so with no App configured this is a no-op and the commit status above
+            # is the whole report.
+            from backend.services import github_app
+            app_token = github_app.token_for(owner, repo)
+            if app_token:
+                result["check_run"] = orch.github.create_check_run(
+                    owner, repo, sha, code_result, app_token,
+                    details_url=_review_url(review_id),
+                )
+            else:
+                result["check_run"] = {
+                    "created": False,
+                    "reason": ("no GitHub App is configured for this deployment, so "
+                               "findings cannot be annotated on the diff — the commit "
+                               "status above is the report"
+                               if not github_app.is_configured() else
+                               "the GitHub App is configured but could not be used for "
+                               "this repository; see the log"),
+                }
         except Exception as exc:
             logger.exception("Could not set the commit status for %s", pr_url)
             result["status_check"] = {"posted": False, "reason": str(exc)[:200]}

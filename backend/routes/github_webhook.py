@@ -233,6 +233,46 @@ async def github_webhook(request: Request):
     }
 
 
+@router.get("/app/status", summary="Whether a GitHub App is configured, and what it buys")
+def github_app_status():
+    """Report whether findings can be annotated on the diff, and what to do if not.
+
+    Unauthenticated on purpose, and safe: it returns whether two environment variables are
+    set and whether the key parses. It never returns the key, a token, an installation id
+    or a repository name, and it makes no network call — so there is nothing here an
+    attacker learns beyond "this deployment is or is not set up", which the presence of
+    check runs on public pull requests already says.
+
+    Sits beside `/webhook/setup` because it answers the same kind of question — "what do I
+    have to do in GitHub for this to work" — and because a person setting up the webhook is
+    the person who will next ask why findings are not on the lines.
+    """
+    from backend.services import github_app
+    info = github_app.status()
+    return {
+        **info,
+        "what_it_enables": [
+            "A check run on the pull request, with each finding annotated on its own line "
+            "in the diff — which a personal access token cannot do at all.",
+            "A 'Details' link back to the stored run (needs PUBLIC_BASE_URL as well).",
+        ],
+        "what_works_without_it": [
+            "A commit status from the gate, which branch protection can require.",
+            "A summary comment on the pull request, upserted rather than repeated.",
+            "SARIF into the Security tab via `scripts/lmsdlc.py --sarif` — which is the "
+            "cheap route to roughly where a check run would put things, and needs only the "
+            "token this deployment already has.",
+        ],
+        "permissions_needed": {
+            "Checks": "Read and write",
+            "Pull requests": "Read and write",
+            "Contents": "Read",
+            "Metadata": "Read (GitHub requires it)",
+        },
+        "docs": "docs/github-app.md",
+    }
+
+
 @router.get("/webhook/setup", summary="What to paste into GitHub to enable this")
 def webhook_setup():
     """The exact values a person needs, rather than a documentation page they have to find.

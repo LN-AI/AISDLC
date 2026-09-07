@@ -1062,6 +1062,145 @@ class GitHubService:
             "fetch_type": "compare",
         }
 
+    # ── Check runs ────────────────────────────────────────────────────────
+    #
+    # GitHub caps a check run at 50 annotations per request. More can be added by updating
+    # the run, which is deliberately not done here: the fiftieth annotation on a pull
+    # request is not read, and the count of what was omitted is more useful than the rows.
+    MAX_ANNOTATIONS = 50
+
+    # Gate to conclusion. `failure` is the only one that blocks a merge under branch
+    # protection, and Amber is `neutral` on purpose — whether an Amber gate should stop a
+    # merge is the open policy question C-38 records, and answering it here by choosing
+    # `action_required` would decide it silently for every customer.
+    _CHECK_CONCLUSION = {"Red": "failure", "Amber": "neutral", "Green": "success"}
+
+    # Severity to annotation level. `failure` for Critical and High, so the annotation is
+    # visually distinct from advice; anything below Moderate is a `notice`, because a diff
+    # with forty orange warnings is a diff nobody reads.
+    _ANNOTATION_LEVEL = {5: "failure", 4: "failure", 3: "warning"}
+
+    def create_check_run(self, owner: str, repo: str, head_sha: str,
+                         review_result: Dict[str, Any], token: str,
+                         details_url: str = "",
+                         name: str = "LM AI-SDLC review") -> Dict[str, Any]:
+        """Create a check run with the findings annotated on their own lines.
+
+        `token` must be a **GitHub App installation token**. A PAT is refused by GitHub for
+        this endpoint — that is the whole reason `github_app.py` exists — so this takes the
+        token as an argument rather than using `self.headers`, and a caller with no App
+        should not be calling it at all.
+
+        Only findings that can be placed are annotated: a path, a line, and evidence that
+        was verified against the file that names it. An annotation on the wrong line is
+        worse than no annotation — it sends a reviewer to code that is fine and teaches
+        them the tool is unreliable — so an unplaceable finding stays in the summary text,
+        where it is still read.
+
+        Returns `{"created": bool, ...}` and never raises. The commit status has already
+        been set by the time this runs, so a failure here loses richness, not the report.
+        """
+        gate = review_result.get("gate_status") or "Green"
+        findings = review_result.get("findings") or []
+        annotations, unplaceable = [], 0
+        for f in findings:
+            path = str(f.get("file_path") or "")
+            line = f.get("line_start")
+            if not path or not isinstance(line, int) or line < 1:
+                unplaceable += 1
+                continue
+            if f.get("evidence_verified") is False:
+                # Its quote was not found in the file it names, so its line number is a
+                # guess. Counted rather than placed.
+                unplaceable += 1
+                continue
+            end = f.get("line_end")
+            annotations.append({
+                "path": path,
+                "start_line": line,
+                "end_line": end if isinstance(end, int) and end >= line else line,
+                "annotation_level": self._ANNOTATION_LEVEL.get(
+                    f.get("severity"), "notice"),
+                "title": f"{f.get('control_id', '')} {f.get('title', '')}".strip()[:255],
+                "message": (
+                    (f.get("description") or "")
+                    + (f"\n\nFix: {f.get('recommendation')}"
+                       if f.get("recommendation") else "")
+                    + ("\n\nCarried from an earlier review of this pull request; this "
+                       "run did not re-read the file."
+                       if f.get("carried_forward") else "")
+                )[:64000],
+                "raw_details": (f.get("evidence") or "")[:64000] or None,
+            })
+
+        shown = annotations[:self.MAX_ANNOTATIONS]
+        blocking = sum(1 for f in findings if f.get("is_blocking"))
+        summary_lines = [
+            f"**Gate: {gate}** · {len(findings)} finding(s)"
+            + (f", {blocking} blocking" if blocking else ""),
+        ]
+        if len(annotations) > len(shown):
+            summary_lines.append(
+                f"\n{len(annotations) - len(shown)} further finding(s) are in the review "
+                f"comment; GitHub shows at most {self.MAX_ANNOTATIONS} annotations on a "
+                f"check run."
+            )
+        if unplaceable:
+            summary_lines.append(
+                f"\n{unplaceable} finding(s) could not be placed on a line — they name no "
+                f"file, or their quoted code was not found in the file they name. They are "
+                f"in the review comment."
+            )
+        if review_result.get("summary"):
+            summary_lines.append("\n" + str(review_result["summary"]))
+
+        body: Dict[str, Any] = {
+            "name": name,
+            "head_sha": head_sha,
+            "status": "completed",
+            "conclusion": self._CHECK_CONCLUSION.get(gate, "neutral"),
+            "output": {
+                "title": f"Gate {gate} — {len(findings)} finding(s)",
+                "summary": "\n".join(summary_lines)[:65535],
+                "annotations": shown,
+            },
+        }
+        if details_url:
+            body["details_url"] = details_url
+
+        try:
+            with httpx.Client(timeout=60) as client:
+                resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/check-runs",
+                    headers={"Authorization": f"Bearer {token}",
+                             "Accept": "application/vnd.github+json",
+                             "X-GitHub-Api-Version": "2022-11-28"},
+                    json=body,
+                )
+        except Exception as exc:                                 # noqa: BLE001
+            logger.warning("Check run for %s/%s@%s could not be sent: %s",
+                           owner, repo, head_sha[:12], exc)
+            return {"created": False, "error": f"{type(exc).__name__}: {exc}"}
+        if resp.status_code >= 400:
+            logger.warning("GitHub refused a check run for %s/%s@%s: HTTP %s %s",
+                           owner, repo, head_sha[:12], resp.status_code,
+                           (resp.text or "")[:200])
+            return {"created": False, "status": resp.status_code,
+                    "error": (resp.text or "")[:300],
+                    "hint": ("A 403 here almost always means the App lacks 'Checks: Read "
+                             "and write'. A 404 means it is not installed on this "
+                             "repository." if resp.status_code in (403, 404) else "")}
+        data = resp.json() or {}
+        return {
+            "created": True,
+            "id": data.get("id"),
+            "url": data.get("html_url") or "",
+            "conclusion": body["conclusion"],
+            "annotations_sent": len(shown),
+            "annotations_omitted": len(annotations) - len(shown),
+            "unplaceable": unplaceable,
+        }
+
     # An HTML comment carrying our identity. Invisible in the rendered comment, and the only
     # reliable way to find our own previous comment again: matching on the visible heading
     # would also match a human who quoted us.

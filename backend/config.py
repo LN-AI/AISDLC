@@ -117,6 +117,18 @@ JOB_STALE_MINUTES = int(os.getenv("JOB_STALE_MINUTES", "30"))
 # problem into one a malicious page could trigger from a colleague's browser.
 #
 # The bundled SPA is served from this same origin and needs nothing here, so the default is
+# A GitHub App, which is the only credential GitHub will accept for a **check run** — the
+# thing that puts a finding on the line it is about, inside the diff. A personal access
+# token can only set a commit status: a coloured dot with a description. That is an API
+# restriction, not a gap here.
+#
+# Unset means the commit-status path, unchanged. See `backend/services/github_app.py` for
+# what the App needs (Checks: write, Pull requests: write, Contents: read) and
+# `docs/github-app.md` for how to create one.
+GITHUB_APP_ID = os.getenv("GITHUB_APP_ID", "")
+GITHUB_APP_PRIVATE_KEY = os.getenv("GITHUB_APP_PRIVATE_KEY", "")
+GITHUB_APP_PRIVATE_KEY_PATH = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH", "")
+
 # Whether a push to an open pull request re-reviews the whole diff or only the commits
 # that have arrived since the last review. On by default, and the reasoning is a trade
 # rather than a free win:

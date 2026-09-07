@@ -44,6 +44,17 @@ from backend.services import (  # noqa: E402
 )
 from backend.services import sarif as sarif_mod  # noqa: E402
 
+import base64 as _b64mod34  # noqa: E402
+import json as _json34  # noqa: E402
+import os as _os34  # noqa: E402
+import time as _time34  # noqa: E402
+
+
+def _b64d34(segment: str) -> bytes:
+    """Decode one base64url JWS segment, restoring the padding JWS strips."""
+    return _b64mod34.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+
+
 PASSED = 0
 FAILED = 0
 
@@ -3001,6 +3012,292 @@ def main():
         check("an unsupported algorithm is refused",
               _wh._verify(WEBHOOK_SECRET, body, "sha1=" + "0" * 40) is False)
         check("a missing header is refused", _wh._verify(WEBHOOK_SECRET, body, None) is False)
+        # ── 34. GitHub App and the check run ─────────────────────────────
+        #
+        # A check run is the only way a finding lands on the line it is about, and GitHub
+        # refuses the endpoint for a personal access token — so this needs an App, and an
+        # App means an RS256 JWT and a minted installation token.
+        #
+        # **Two of these calls have never reached GitHub.** What is checked here is
+        # everything that does not need the network: the JWT's structure and claims, the
+        # token cache, the annotation mapping, the conclusion mapping, the cap, which
+        # findings are deliberately not placed, and the fallback when no App is configured.
+        # D-314 and D-315 are two GitHub write paths that shipped broken because nothing
+        # offline could reach them, so the boundary is drawn explicitly rather than left to
+        # be assumed.
+        section("34. GitHub App auth and check-run assembly")
+
+        from backend.services import github_app as _ga34
+        from backend.services.github_service import GitHubService as _GHS34
+
+        check("with nothing configured, the App is not configured",
+              _ga34.is_configured() is False)
+        check("...and says which variables are missing rather than just 'no'",
+              "GITHUB_APP_ID" in (_ga34.status().get("note") or ""),
+              str(_ga34.status()))
+        check("...and explains what still works without one",
+              "commit status" in (_ga34.status().get("note") or ""),
+              "a person reading this needs to know the review is not broken")
+        check("a token is not attempted when nothing is configured",
+              _ga34.token_for("acme", "portal") == "",
+              "every caller's fallback is the commit status, so this must return empty "
+              "rather than raise")
+
+        # An id with no key cannot mint anything, and reporting it as configured would mean
+        # every review tried, failed and fell back, once per review.
+        _ga34.config.GITHUB_APP_ID = "123456"
+        try:
+            check("an App id with no private key is not 'configured'",
+                  _ga34.is_configured() is False,
+                  "half-configured would mean a failed attempt on every single review")
+        finally:
+            _ga34.config.GITHUB_APP_ID = ""
+
+        # A real RSA key, generated here. `cryptography` is a declared dependency and is
+        # what signs the JWT — PyJWT is importable in this environment but is not in
+        # requirements.txt, and building an auth path on a transitive dependency is how it
+        # disappears in the next upgrade.
+        from cryptography.hazmat.primitives import serialization as _ser34
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa34
+        _key34 = _rsa34.generate_private_key(public_exponent=65537, key_size=2048)
+        _pem34 = _key34.private_bytes(
+            encoding=_ser34.Encoding.PEM,
+            format=_ser34.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=_ser34.NoEncryption(),
+        ).decode("ascii")
+
+        _ga34.config.GITHUB_APP_ID = "123456"
+        _ga34.config.GITHUB_APP_PRIVATE_KEY = _pem34
+        try:
+            check("an id and a key together are 'configured'", _ga34.is_configured() is True)
+            check("...and the status reports it without returning the key",
+                  _ga34.status()["configured"] is True
+                  and "BEGIN" not in _json34.dumps(_ga34.status()),
+                  "a private key echoed by a status endpoint is a private key in a log")
+
+            _jwt34 = _ga34.app_jwt()
+            _parts34 = _jwt34.split(".")
+            check("the App assertion is a three-part JWS", len(_parts34) == 3, _jwt34[:40])
+            _hdr34 = _json34.loads(_b64d34(_parts34[0]))
+            _pay34 = _json34.loads(_b64d34(_parts34[1]))
+            check("...signed RS256, which is the only algorithm GitHub accepts here",
+                  _hdr34.get("alg") == "RS256", str(_hdr34))
+            check("...issued by the App id", _pay34.get("iss") == "123456", str(_pay34))
+            check("...backdated, so a fast clock does not produce a future token",
+                  _pay34["iat"] < _time34.time(),
+                  "GitHub rejects an assertion issued in the future, which a server a few "
+                  "seconds fast otherwise sends every time")
+            check("...and expiring inside GitHub's ten-minute ceiling",
+                  0 < _pay34["exp"] - _time34.time() <= 600, str(_pay34["exp"]))
+            check("...with no padding on the base64, which JWS forbids",
+                  "=" not in _jwt34, _jwt34[:60])
+
+            # And it really verifies, which is the only thing that makes the rest of it
+            # meaningful — a signature over the wrong bytes is a well-formed useless token.
+            from cryptography.hazmat.primitives import hashes as _h34
+            from cryptography.hazmat.primitives.asymmetric import padding as _pad34
+            _sig34 = _b64d34(_parts34[2])
+            _key34.public_key().verify(
+                _sig34, (_parts34[0] + "." + _parts34[1]).encode("ascii"),
+                _pad34.PKCS1v15(), _h34.SHA256())
+            check("...and the signature verifies against the key that made it", True)
+
+            # A PEM whose newlines were flattened by a deployment tool. This is the single
+            # most common way this is misconfigured, and the raw error says nothing.
+            _ga34.config.GITHUB_APP_PRIVATE_KEY = _pem34.replace("\n", "\\n")
+            check("a PEM with escaped newlines still works",
+                  bool(_ga34.app_jwt()),
+                  "every deployment tool flattens a PEM into one line, and the "
+                  "'could not deserialize key' that follows says nothing about the cause")
+
+            _ga34.config.GITHUB_APP_PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nnope\n"
+            _err34 = ""
+            try:
+                _ga34.app_jwt()
+            except _ga34.AppAuthError as exc:
+                _err34 = str(exc)
+            check("an unreadable key is refused with a sentence, not a stack trace",
+                  "starting with '-----BEGIN'" in _err34, _err34[:200])
+            check("...and `token_for` swallows it so the review still reports",
+                  _ga34.token_for("acme", "portal") == "",
+                  "an App problem must degrade the richness of the report, never lose it")
+        finally:
+            _ga34.config.GITHUB_APP_ID = ""
+            _ga34.config.GITHUB_APP_PRIVATE_KEY = ""
+            _ga34._token_cache.clear()
+
+        # ── The check run's body, which is where the judgement is ────────
+        class _Check34(_GHS34):
+            """`create_check_run` with the HTTP call replaced, so the body can be read."""
+
+            def __init__(self):
+                self.token = "unused"
+                self.sent = None
+
+        def _capture34(self, url, headers=None, json=None, **kw):
+            self.sent = {"url": url, "headers": headers, "body": json}
+            class _R:
+                status_code = 201
+                text = ""
+                @staticmethod
+                def json():
+                    return {"id": 9, "html_url": "https://github.com/acme/portal/runs/9"}
+            return _R()
+
+        def _run_check34(result, **kw):
+            svc = _Check34()
+            import httpx as _hx34
+            _real_client = _hx34.Client
+
+            class _StubClient:
+                def __init__(self, *a, **k):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+                def post(self, url, headers=None, json=None, **k):
+                    return _capture34(svc, url, headers=headers, json=json)
+
+            _hx34.Client = _StubClient
+            try:
+                out = svc.create_check_run("acme", "portal", "b" * 40, result,
+                                           "ghs_installationtoken", **kw)
+            finally:
+                _hx34.Client = _real_client
+            return out, svc.sent
+
+        _placeable34 = dict(SQLI, fingerprint="fp-1")
+        _noline34 = dict(control_id="GOV-001", severity=3, risk_level="Moderate",
+                         title="No threat model", description="Design level.",
+                         recommendation="Write one.", is_blocking=False)
+        _unverified34 = dict(SQLI, title="Invented", file_path="app/auth.py",
+                             line_start=9, evidence_verified=False)
+        _out34, _sent34 = _run_check34({
+            "gate_status": "Red", "risk_score": 90.0, "summary": "One real problem.",
+            "findings": [dict(_placeable34, evidence_verified=True), _noline34, _unverified34],
+        }, details_url="https://sdlc.example/x")
+
+        check("the check run goes to the check-runs endpoint",
+              _sent34["url"].endswith("/repos/acme/portal/check-runs"), _sent34["url"])
+        check("...with the installation token, not this service's own credential",
+              _sent34["headers"]["Authorization"] == "Bearer ghs_installationtoken",
+              "GitHub refuses this endpoint for a PAT, which is the entire reason "
+              "github_app.py exists")
+        check("...and an explicit API version, so a default change cannot break it",
+              _sent34["headers"].get("X-GitHub-Api-Version") == "2022-11-28")
+        check("a Red gate concludes as a failure, which is what blocks a merge",
+              _sent34["body"]["conclusion"] == "failure", str(_sent34["body"]["conclusion"]))
+        check("only the placeable finding is annotated",
+              len(_sent34["body"]["output"]["annotations"]) == 1,
+              str(_sent34["body"]["output"]["annotations"]))
+        check("...on the file and line it names",
+              _sent34["body"]["output"]["annotations"][0]["path"] == "app/auth.py"
+              and _sent34["body"]["output"]["annotations"][0]["start_line"] == 1,
+              str(_sent34["body"]["output"]["annotations"][0]))
+        check("...at failure level for a Critical",
+              _sent34["body"]["output"]["annotations"][0]["annotation_level"] == "failure")
+        check("a finding whose quote was not found is not placed on a guessed line",
+              _out34["unplaceable"] == 2,
+              "an annotation on the wrong line sends a reviewer to code that is fine and "
+              "teaches them the tool is unreliable")
+        check("...and the summary says how many could not be placed",
+              "2 finding(s) could not be placed"
+              in _sent34["body"]["output"]["summary"],
+              _sent34["body"]["output"]["summary"][:300])
+        check("the Details link is passed through when there is one",
+              _sent34["body"].get("details_url") == "https://sdlc.example/x")
+        check("the result carries the check run's own URL back",
+              _out34["created"] is True and "runs/9" in _out34["url"], str(_out34))
+
+        for _gate34, _concl34 in (("Green", "success"), ("Amber", "neutral"),
+                                  ("Red", "failure")):
+            _o34, _s34 = _run_check34({"gate_status": _gate34, "findings": []})
+            check(f"a {_gate34} gate concludes as {_concl34}",
+                  _s34["body"]["conclusion"] == _concl34, str(_s34["body"]["conclusion"]))
+        check("Amber deliberately does not block a merge",
+              _GHS34._CHECK_CONCLUSION["Amber"] == "neutral",
+              "whether an Amber gate should stop a merge is the open policy question C-38 "
+              "records; choosing action_required here would answer it for every customer")
+
+        _many34 = [dict(_placeable34, title=f"Finding {i}", line_start=i + 1,
+                        evidence_verified=True, fingerprint=f"fp-{i}")
+                   for i in range(_GHS34.MAX_ANNOTATIONS + 7)]
+        _o34, _s34 = _run_check34({"gate_status": "Red", "findings": _many34})
+        check("GitHub's fifty-annotation cap is respected",
+              len(_s34["body"]["output"]["annotations"]) == _GHS34.MAX_ANNOTATIONS,
+              str(len(_s34["body"]["output"]["annotations"])))
+        check("...and the overflow is counted rather than dropped silently",
+              _o34["annotations_omitted"] == 7
+              and "7 further finding(s)" in _s34["body"]["output"]["summary"],
+              _s34["body"]["output"]["summary"][:200])
+
+        _o34, _s34 = _run_check34({
+            "gate_status": "Red",
+            "findings": [dict(_placeable34, evidence_verified=True, carried_forward=True)],
+        })
+        check("a carried finding says so in its annotation",
+              "did not re-read" in _s34["body"]["output"]["annotations"][0]["message"],
+              "otherwise an annotation on a line this run never read looks like one it did")
+
+        # A refusal has to be a sentence with a cause, not a status code.
+        def _refuse34(status):
+            svc = _Check34()
+            import httpx as _hx34
+            _real = _hx34.Client
+
+            class _Deny:
+                def __init__(self, *a, **k):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+                def post(self, *a, **k):
+                    class _R:
+                        status_code = status
+                        text = '{"message":"nope"}'
+                        @staticmethod
+                        def json():
+                            return {}
+                    return _R()
+
+            _hx34.Client = _Deny
+            try:
+                return svc.create_check_run("acme", "portal", "b" * 40,
+                                            {"gate_status": "Red", "findings": []}, "t")
+            finally:
+                _hx34.Client = _real
+
+        check("a 403 names the permission that is missing",
+              "Checks: Read and write" in (_refuse34(403).get("hint") or ""),
+              str(_refuse34(403)))
+        check("a 404 names the thing people actually forget",
+              "not installed" in (_refuse34(404).get("hint") or ""),
+              "an App that exists is not an App with access")
+        check("a refusal is reported, never raised",
+              _refuse34(500)["created"] is False,
+              "the review is stored and paid for by the time this runs")
+
+        # ── The setup endpoint ───────────────────────────────────────────
+        _st34 = client.get("/api/github/app/status")
+        check("the App status endpoint answers", _st34.status_code == 200, _st34.text[:200])
+        check("...saying what an App enables that a token cannot",
+              "annotated on its own line" in _st34.text, _st34.text[:300])
+        check("...and what already works without one",
+              "SARIF" in _st34.text and "commit status" in _st34.text)
+        check("...and the exact permissions to set",
+              _st34.json()["permissions_needed"]["Checks"] == "Read and write",
+              str(_st34.json().get("permissions_needed")))
+        check("...without returning anything secret",
+              "BEGIN" not in _st34.text and "ghs_" not in _st34.text, _st34.text[:200])
+        check("the written instructions exist, since the status points at them",
+              _os34.path.exists(_os34.path.join(
+                  _os34.path.dirname(_os34.path.dirname(_os34.path.abspath(__file__))),
+                  "docs", "github-app.md")),
+              "a status that names a document that is not there is worse than one that "
+              "names nothing")
+
         # ── 33. Incremental review of a pull request ─────────────────────
         #
         # `synchronize` fires on every push, so an active pull request cost a full review

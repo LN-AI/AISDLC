@@ -72,13 +72,18 @@ sh 'python scripts/lmsdlc.py review --repo "$GIT_URL" --ref "$GIT_COMMIT" --fail
 Stated plainly, because a CI integration that overpromises gets removed after the first
 surprise:
 
-* **No inline annotations on the diff.** SARIF puts findings in the Security tab, not next
-  to the lines in Files-changed. Line annotations need the GitHub Checks API, which needs a
-  GitHub App installation token — this platform authenticates with a PAT
-  (`github_service.py:1201`). The commit-status route (`--post-back`, server-side) is what
-  greys out the merge button today.
-* **No incremental review.** A re-run reviews the whole diff again, not just the new
-  commits. On a long-lived branch that is the same cost each push.
+* **No inline annotations from the CLI.** SARIF puts findings in the Security tab, not
+  next to the lines in Files-changed. Line annotations need the GitHub Checks API, which
+  GitHub refuses for a personal access token — so they come from a **server-side
+  pull-request review with a GitHub App configured** (`docs/github-app.md`), not from this
+  client. If you want annotations, point the platform's webhook at your repository and set
+  up the App; if you want a build step with an exit code, this is it. The commit-status
+  route (`--post-back`, server-side) greys out the merge button either way.
+* **No incremental review from the CLI.** A re-run reviews whatever source you hand it. A
+  *webhook* review of a push does review only the new commits (`INCREMENTAL_PR_REVIEW`),
+  because it knows which commit it last looked at; a pipeline invocation carries no such
+  memory, so on a long-lived branch each run costs the same. Use `--quote-only` with a
+  ceiling if that matters — the workflows here do.
 * **No caching between runs.** Each invocation is a fresh review. The findings *baseline*
   is per project, so a repeat run still reports "new" versus "pre-existing" correctly — but
   the model work is done again.

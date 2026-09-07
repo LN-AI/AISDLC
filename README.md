@@ -114,6 +114,15 @@ several agents in parallel behind one policy-enforced gate decision.
   OpenAI-compatible credentials (`PUT /api/v1/llm-config`, X-API-Key auth) instead of the
   platform's shared account, or override a single call via `llm_provider` / `llm_api_key` /
   `llm_base_url` / `llm_model` fields on any agent request.
+- **Findings on the lines they are about** — with a GitHub App configured, a
+  pull-request review creates a **check run** with each finding annotated in the diff, in
+  addition to the commit status (never instead of it, so branch protection that already
+  requires the status keeps working). A personal access token cannot do this at all —
+  GitHub refuses the check-runs endpoint for one — so `docs/github-app.md` is the five-step
+  setup, and `GET /api/github/app/status` says whether it is done. Unconfigured is the
+  commit-status path, unchanged. A finding with no line, or whose quoted code was not found
+  in the file it names, is deliberately **not** annotated: a marker on the wrong line sends
+  a reviewer to code that is fine.
 - **Incremental review on a push** — `synchronize` fires every time somebody pushes, so an
   active 40-file pull request used to cost a full review per push. A push now reviews only
   the commits that have arrived since the last look. The gate stays correct because
