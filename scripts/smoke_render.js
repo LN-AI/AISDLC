@@ -3254,9 +3254,64 @@ function runNavigationChecks() {
   });
 }
 
+// An ungoverned run says so, on both paths it can arrive by
+//
+// `UI_PROJECT_MODE=warn` is the middle state that makes enforcing a project shippable: the
+// run goes through and the result says it was not attributed to one. It reaches the browser
+// two different ways, and the legacy one is the one a real user actually hits.
+
+async function runProjectWarningChecks() {
+  console.log('\nUngoverned-run warning');
+
+  await checkAsync('apiFetch folds the legacy route header into the body', async () => {
+    // `/api/review/*` is metered by `legacy_guard`, which runs *around* the handler -- by
+    // the time it knows, the body is already serialized, so a header is the only channel
+    // left. Same reason the X-Spend-* figures travel that way.
+    nextFetchBody = { gate_status: 'Green', findings: [] };
+    nextFetchHeaders = { 'X-Project-Warning': 'This run was not attributed to a project.' };
+    const body = await sandbox.apiFetch('/api/review/code', { method: 'POST' });
+    assert(body._project_warning === 'This run was not attributed to a project.',
+      `header was not folded: ${JSON.stringify(body._project_warning)}`);
+    nextFetchHeaders = {};
+  });
+
+  await checkAsync('...and does not fold it when the body already said it', async () => {
+    // The /api/v1 surface goes through `guarded_call`, which can reach the body. If both
+    // arrive the body must win, exactly like `_budget_stats`.
+    nextFetchBody = { gate_status: 'Green', _project_warning: 'from the body' };
+    nextFetchHeaders = { 'X-Project-Warning': 'from the header' };
+    const body = await sandbox.apiFetch('/api/v1/agents/code', { method: 'POST' });
+    assert(body._project_warning === 'from the body',
+      `body should win: ${body._project_warning}`);
+    nextFetchHeaders = {};
+  });
+
+  await checkAsync('a run with no warning gains no key', async () => {
+    nextFetchBody = { gate_status: 'Green' };
+    nextFetchHeaders = {};
+    const body = await sandbox.apiFetch('/api/review/code', { method: 'POST' });
+    assert(!('_project_warning' in body), 'a governed run must stay silent');
+  });
+
+  check('the transparency block renders the warning', () => {
+    const render = vm.runInContext('renderReviewTransparency', sandbox);
+    const html = render({ _project_warning: 'no plan, quota or budget cap applied' });
+    assert(html.includes('not governed'),
+      'a reader skimming a result has to be able to see that it was ungoverned');
+    assert(html.includes('no plan, quota or budget cap applied'),
+      'the consequence itself must be shown, not just a label');
+  });
+
+  check('...and stays silent for a governed run', () => {
+    const render = vm.runInContext('renderReviewTransparency', sandbox);
+    const html = render({ coverage: {}, source: {} });
+    assert(!html.includes('not governed'), 'nothing to say about a governed run');
+  });
+}
+
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
   .then(runReviewSourceChecks).then(runScreenIsolationChecks)
-  .then(runNavigationChecks).then(() => {
+  .then(runNavigationChecks).then(runProjectWarningChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

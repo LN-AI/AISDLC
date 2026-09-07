@@ -48,7 +48,7 @@ PROJECT_HEADER = "x-project-id"
 
 __all__ = [
     "Subject", "ProjectBindingError", "resolve_subject", "require_project",
-    "subject_from_caller",
+    "project_warning", "subject_from_caller",
 ]
 
 
@@ -148,12 +148,38 @@ def resolve_subject(caller: Optional[dict], headers: Optional[Any] = None) -> Su
     return Subject(project_id=project["id"], project_name=project.get("name", ""), user=user)
 
 
+def project_warning(subject: Subject) -> Optional[str]:
+    """The sentence to put on a result that ran without a project, or None.
+
+    Only speaks in `UI_PROJECT_MODE=warn` -- the middle state that makes enforcement
+    shippable (C-80). `off` says nothing by design, and `enforce` never gets here because
+    `require_project` has already refused the call.
+
+    Deliberately states the consequence rather than suggesting a project. A grace period
+    only ends if somebody acts during it, and "select a project" reads as a preference
+    while "this run was not counted against any budget" reads as a problem.
+    """
+    if config.UI_PROJECT_MODE != "warn":
+        return None
+    if subject.project_id or subject.key_record:
+        return None
+    return (
+        "This run was not attributed to a project, so no plan, quota or budget cap applied "
+        "to it and its cost is recorded against nothing. Select a project in the sidebar. "
+        "A future release will refuse unattributed runs."
+    )
+
+
 def require_project(subject: Subject) -> None:
-    """Enforce `UI_REQUIRE_PROJECT`, if set, for calls that actually spend money.
+    """Refuse an unbound session when `UI_PROJECT_MODE=enforce`, for calls that spend money.
 
     Deliberately separate from `resolve_subject`: resolution is pure and runs on read-only
     endpoints too (the product catalogue, key entitlements), where refusing an unbound UI
     session would break the very screens that let a user pick a project.
+
+    In `warn` mode this returns normally and `project_warning` supplies the sentence that
+    goes on the result instead. Enforcement stays here, and the warning stays out of it, so
+    a caller cannot accidentally satisfy the check by rendering the warning.
     """
     if not config.UI_REQUIRE_PROJECT:
         return

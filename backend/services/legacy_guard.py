@@ -39,6 +39,7 @@ from starlette.responses import JSONResponse
 from backend import config, context, database
 from backend.products import registry
 from backend.services import agent_guard, code_chunker, llm_gateway
+from backend.services.subject_service import project_warning
 from backend.services.agent_guard import (
     BudgetExceededError,
     QuotaExceededError,
@@ -311,6 +312,20 @@ async def legacy_product_guard(request, call_next):
         response.headers["X-RateLimit-Remaining-Minute"] = str(rate["remaining_per_minute"])
         response.headers["X-RateLimit-Limit-Day"] = str(rate["limit_per_day"])
         response.headers["X-RateLimit-Remaining-Day"] = str(rate["remaining_per_day"])
+
+    # Set here rather than with the spend headers below, because this is deliberately
+    # *above* the `not usage["calls"]` return: whether the run was governed has nothing to
+    # do with whether a model was reached, and a free preflight that will run ungoverned is
+    # exactly when a person still has time to pick a project.
+    #
+    # These routes are the ones the browser actually uses, so without this the warning would
+    # exist only on the `/api/v1` surface and no real user would ever see it. Same channel
+    # and same reason as the spend headers: this middleware runs *around* the handler, so by
+    # the time it can act, `call_next` has already serialized the body. `apiFetch` folds it
+    # back into `_project_warning`.
+    _pw = project_warning(subject)
+    if _pw:
+        response.headers["X-Project-Warning"] = _pw
 
     if not usage["calls"]:
         return response  # nothing reached an LLM (validation error, cache hit, 4xx)

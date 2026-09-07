@@ -3396,6 +3396,15 @@ function _foldSpendHeaders(res, body) {
   // A response without a readable header bag is not an error worth raising from inside a
   // successful request: cross-origin without `expose_headers`, or a test double.
   if (!res || !res.headers || typeof res.headers.get !== 'function') return body;
+  // Read before the two early returns below. A run that reached no model still ran without
+  // a project, and a free preflight is the moment a person can still fix that -- gating the
+  // warning on spend would hide it exactly when it is most actionable. The body wins if the
+  // route already put one there (`guarded_call` does, on the /api/v1 surface).
+  const projWarn = res.headers.get('X-Project-Warning');
+  if (projWarn && body && typeof body === 'object' && !body._project_warning) {
+    body._project_warning = projWarn;
+  }
+
   const cost = res.headers.get('X-Spend-Cost-USD');
   const calls = res.headers.get('X-Spend-Calls');
   // No header at all means the route is not metered this way (a v1 route, a static file, a
@@ -10607,6 +10616,19 @@ function renderReviewTransparency(r) {
   const cov = r.coverage || {};
   const src = r.source || {};
   let html = '';
+
+  // First, above the coverage block, because it is about whether this run was governed at
+  // all rather than about what it found. `UI_PROJECT_MODE=warn` is the middle state that
+  // makes enforcement shippable: the run goes through and says it was not attributed to a
+  // project, so no plan, quota or budget cap applied and its cost is recorded against
+  // nothing. Deliberately worded as a consequence, not a suggestion -- a grace period only
+  // ends if somebody acts during it, and "select a project" reads as a preference.
+  if (r._project_warning) {
+    html += `<div class="review-panel panel-suppressed">
+      <b>This run was not governed.</b>
+      <div class="field-hint">${esc(r._project_warning)}</div>
+    </div>`;
+  }
 
   // Coverage first. A gate over part of a codebase is a different claim from a gate over all
   // of it, and this is the only place the reader can tell them apart.

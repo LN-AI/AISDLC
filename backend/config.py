@@ -58,7 +58,49 @@ LEGACY_ROUTES_REQUIRE_AUTH = os.getenv("LEGACY_ROUTES_REQUIRE_AUTH", "true").low
 # session that has not picked a project — which is a change to what existing users can do,
 # not a security fix. The endpoints that had no authorization at all were the actual hole,
 # and they are closed regardless of this flag. See C-80.
-UI_REQUIRE_PROJECT = os.getenv("UI_REQUIRE_PROJECT", "false").lower() == "true"
+# **Three states, not two** (C-80, decided 2026-09-07: warn first, then enforce). A
+# boolean only offered "anything goes" or "refused", and flipping between them interrupts
+# every user who has not picked a project on the day it ships -- which is why the flip kept
+# being deferred. The middle state is what makes it shippable:
+#
+#   off      no project needed, nothing said. What every deployment did before.
+#   warn     the run proceeds and the result says it was ungoverned -- no plan, no quota,
+#            no budget cap, and nothing to attribute the spend to.
+#   enforce  an unbound browser session is refused (403). The end state.
+#
+# Default is `warn`: a user is told, not blocked. **This still needs somebody to flip it to
+# `enforce` later** -- that is the known failure mode of a grace period, and the reason the
+# warning names the consequence rather than politely suggesting a project.
+#
+# `UI_REQUIRE_PROJECT=true` continues to mean enforce, so a deployment that already set it
+# behaves exactly as it did; `UI_PROJECT_MODE` wins when both are set.
+UI_PROJECT_MODES = ("off", "warn", "enforce")
+
+
+def resolve_project_mode(mode_env: str, legacy_env: str) -> str:
+    """The mode a given environment means. A function so it can be tested without env games.
+
+    `smoke_products.py` section 14 asserts what a fresh install ships with by reading
+    `config.py` as *source*, because `load_dotenv()` means a reload reports this
+    developer's own `.env` instead — it would happily call a bypass closed while it is open
+    on their machine. A derived value cannot be read that way, so the rule lives here and
+    the test calls it directly.
+
+    An unrecognised mode falls back to the default rather than to `off`: a typo is not
+    evidence that governance was meant to be disabled.
+    """
+    mode = (mode_env or "").strip().lower()
+    if mode in UI_PROJECT_MODES:
+        return mode
+    return "enforce" if (legacy_env or "").strip().lower() == "true" else "warn"
+
+
+UI_PROJECT_MODE = resolve_project_mode(
+    os.getenv("UI_PROJECT_MODE", ""), os.getenv("UI_REQUIRE_PROJECT", "false"))
+
+# Kept as the enforcement predicate so every existing reader and test stays correct: it has
+# always meant "refuse an unbound session", and only `enforce` does that.
+UI_REQUIRE_PROJECT = UI_PROJECT_MODE == "enforce"
 
 # Where *other systems* reach this deployment — specifically a GitHub Actions runner posting
 # build diagnostics back to POST /api/v1/modernization/runs/{id}/build-results.

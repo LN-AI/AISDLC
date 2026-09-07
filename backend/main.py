@@ -188,6 +188,7 @@ app.add_middleware(
     expose_headers=[
         "X-Spend-Cost-USD", "X-Spend-Calls", "X-Spend-Tokens-In", "X-Spend-Tokens-Out",
         "X-Spend-Model", "X-Spend-Provider", "X-Spend-Billable", "X-Spend-Cost-Estimated",
+        "X-Project-Warning",
         "X-RateLimit-Limit-Minute", "X-RateLimit-Remaining-Minute",
         "X-RateLimit-Limit-Day", "X-RateLimit-Remaining-Day",
     ],

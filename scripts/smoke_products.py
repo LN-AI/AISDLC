@@ -34,6 +34,10 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-smoke-test-placeholder")
 # to assert what a fresh install actually ships with.
 os.environ["LEGACY_ROUTES_REQUIRE_AUTH"] = "false"
 os.environ["UI_REQUIRE_PROJECT"] = "false"
+# Explicit, because `UI_REQUIRE_PROJECT=false` no longer means "say nothing": it now
+# resolves to `warn`, which attaches `_project_warning` to every unbound result. The
+# bulk of this suite wants the old silent posture; section 13 flips to warn on purpose.
+os.environ["UI_PROJECT_MODE"] = "off"
 
 from backend import config  # noqa: E402
 
@@ -658,6 +662,57 @@ def main_():
     finally:
         config.UI_REQUIRE_PROJECT = False
 
+    # -- warn mode: the middle state that makes enforcement shippable (C-80)
+    #
+    # Going straight from "anything goes" to "refused" interrupts every user who has not
+    # picked a project on the day it ships, which is why the flip kept being deferred. In
+    # `warn` the run goes through and the result says it was not governed.
+    config.UI_PROJECT_MODE = "warn"
+    try:
+        r = client.post("/api/review/code", json={"code": "x = 1"}, headers=ui())
+        check("warn mode admits an unbound browser call (200)",
+              r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+        # A header, not a body key, and the distinction is the whole reason this route
+        # needed separate work: `legacy_guard` meters `/api/review/*` *around* the handler,
+        # so by the time it can act `call_next` has already serialized the body. These are
+        # the routes the browser actually uses, so a warning that existed only on the
+        # `/api/v1` surface would never be seen by a real user. `apiFetch` folds the header
+        # back into `_project_warning`, which is asserted in `smoke_render.js`.
+        warn = r.headers.get("X-Project-Warning")
+        check("...and the response says the run was not attributed to a project",
+              bool(warn), str(dict(r.headers))[:200])
+        check("...naming the consequence, not suggesting a preference",
+              "no plan, quota or budget cap" in (warn or ""),
+              "a grace period only ends if somebody acts during it, and 'select a "
+              "project' reads as optional")
+        check("...and saying the grace period will end",
+              "will refuse" in (warn or ""), str(warn))
+        check("...in a header a browser is allowed to read",
+              '"X-Project-Warning"' in (ROOT / "backend" / "main.py").read_text(
+                  encoding="utf-8"),
+              "without naming it in the CORS expose_headers list a cross-origin caller "
+              "cannot read it -- the header would be set and invisible")
+
+        r = client.post("/api/review/code", json={"code": "x = 1"}, headers=ui(gov_id))
+        check("a bound call in warn mode carries no warning",
+              r.headers.get("X-Project-Warning") is None,
+              "there is nothing to warn about")
+
+        # The other surface. `/api/v1` goes through `guarded_call`, which can reach the body.
+        r = client.post("/api/v1/agents/code", json={"code": "x = 1"}, headers=ui())
+        if r.status_code == 200:
+            check("the v1 surface carries the same warning in the body",
+                  "_project_warning" in r.json(), str(list(r.json())[:14]))
+
+        config.UI_PROJECT_MODE = "off"
+        r = client.post("/api/review/code", json={"code": "x = 1"}, headers=ui())
+        check("off mode admits the same call and says nothing",
+              r.status_code == 200 and r.headers.get("X-Project-Warning") is None,
+              f"{r.status_code} {r.headers.get('X-Project-Warning')!r}")
+    finally:
+        config.UI_PROJECT_MODE = "off"
+        config.UI_REQUIRE_PROJECT = False
+
     # -- the shipped defaults, which is what a fresh install actually gets
     #
     # Read from source rather than from the loaded module: config.py calls load_dotenv(),
@@ -683,10 +738,26 @@ def main_():
     check(".env.example agrees with the code default",
           example_value("LEGACY_ROUTES_REQUIRE_AUTH") == "true",
           f".env.example says {example_value('LEGACY_ROUTES_REQUIRE_AUTH')!r}")
-    check("UI_REQUIRE_PROJECT defaults to false — opt in, so no one is locked out on upgrade",
-          code_default("UI_REQUIRE_PROJECT") == "false",
-          f"config.py default is {code_default('UI_REQUIRE_PROJECT')!r}")
-    check("UI_REQUIRE_PROJECT is documented in .env.example",
+    # `UI_REQUIRE_PROJECT` is no longer read from the environment directly -- it is derived
+    # from `UI_PROJECT_MODE`, which has three states because a boolean could only offer
+    # "anything goes" or "refused" (C-80). A derived value cannot be read out of the source
+    # by regex, so the rule is a function and these assert the function.
+    _rpm = config.resolve_project_mode
+    check("a fresh install warns rather than refusing — nobody is locked out on upgrade",
+          _rpm("", "false") == "warn", _rpm("", "false"))
+    check("...and warning is not the same as saying nothing",
+          _rpm("", "false") != "off",
+          "the whole point of the middle state is that the user is told")
+    check("UI_REQUIRE_PROJECT=true still means enforce — an existing deployment is unchanged",
+          _rpm("", "true") == "enforce", _rpm("", "true"))
+    check("an explicit mode beats the legacy flag", _rpm("off", "true") == "off")
+    check("a typo falls back to the default, not to off",
+          _rpm("bogus", "false") == "warn",
+          "a misspelling is not evidence that governance was meant to be disabled")
+    check("UI_PROJECT_MODE is documented in .env.example",
+          example_value("UI_PROJECT_MODE") == "warn",
+          f".env.example says {example_value('UI_PROJECT_MODE')!r}")
+    check("...and the legacy flag is still documented",
           example_value("UI_REQUIRE_PROJECT") is not None, "missing from .env.example")
 
     # A live warning, not a check: an override here beats the shipped default, and this

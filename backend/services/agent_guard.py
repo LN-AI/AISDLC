@@ -63,6 +63,7 @@ from backend.services.entitlement_service import (
 from backend.services.subject_service import (
     ProjectBindingError,
     Subject,
+    project_warning,
     require_project,
     subject_from_caller,
 )
@@ -539,6 +540,14 @@ def guarded_call(
         cost_estimated=bool(usage["calls"]) and _is_estimated(model),
         project_id=project_id, project_name=project_name, result=result, status=status,
     )
+    # Why derived here rather than threaded out of `preflight`: the async job endpoints call
+    # `preflight` on the HTTP request and `guarded_call(skip_preflight=True)` in the job
+    # thread, so a warning produced during preflight would never reach the result. The
+    # subject is available on both paths and cannot go stale.
+    if isinstance(result, dict):
+        _pw = project_warning(subject)
+        if _pw:
+            result["_project_warning"] = _pw
     return result
 
 
