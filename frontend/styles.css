@@ -1325,7 +1325,12 @@ button.not-entitled::after {
    does not inherit one, so the options would paint light-on-white (see D-32). */
 .findings-toolbar select {
   background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
-  color: var(--text); font-size: 13px; padding: 6px 12px; min-width: 160px;
+  color: var(--text); font-size: 13px; padding: 6px 12px;
+  /* `width: auto` overrides the global `select { width: 100% }` (line ~918). In a flex row
+     that global makes every select demand the whole line, so each one wrapped onto its
+     own — a six-row toolbar for six filters. Survivable with the two controls this screen
+     used to have, which is why it was never noticed; not survivable now. */
+  width: auto; flex: 0 0 auto; min-width: 150px; max-width: 220px;
 }
 .findings-toolbar select:focus { outline: none; border-color: var(--accent); }
 .findings-counts { color: var(--text-muted); font-size: 13px; margin-left: auto; }
@@ -1341,9 +1346,12 @@ button.not-entitled::after {
 }
 .findings-toolbar input:focus { outline: none; border-color: var(--accent); }
 .findings-toolbar input::placeholder { color: var(--text-dim, #7d8590); }
-/* The search box earns the room; a repository or control id does not. */
-.findings-toolbar .findings-search { flex: 1 1 260px; min-width: 220px; }
-.findings-toolbar .findings-narrow { width: 150px; }
+/* The search box earns the room; a repository or control id does not. Both need an
+   explicit width for the same reason the selects do. */
+.findings-toolbar .findings-search { flex: 1 1 240px; min-width: 200px; max-width: 420px; }
+.findings-toolbar .findings-narrow { flex: 0 0 auto; width: 140px; }
+/* The buttons and the counts end the row rather than wrapping alone under it. */
+.findings-toolbar .btn { flex: 0 0 auto; }
 
 /* Which review a finding came from. On every other screen that is implied by the page
    you are on; here findings from different reviews and different agents sit together,
