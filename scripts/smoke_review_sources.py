@@ -2704,6 +2704,57 @@ def main():
         check("the default branch is a real lookup with a safe fallback",
               hasattr(_GH31, "get_default_branch"))
 
+        # ── The fallback above was itself a crash ─────────────────────────
+        #
+        # `base_ref = gh.get_default_branch(owner, repo)` sat *above* the lines assigning
+        # `owner`, `repo` and `gh`. All three are assigned somewhere in `apply`, so Python
+        # treats them as locals throughout it and that call raised `UnboundLocalError`
+        # instead of reaching GitHub — the sentence written to replace an opaque 422 was a
+        # traceback. Third defect in the same twenty lines (D-314, D-315), and invisible to
+        # every test here because they all stop at `plan`, which writes nothing.
+        #
+        # Checked structurally rather than by string, because the failure is an *ordering*
+        # property: walk the function body and require the first binding of each name to
+        # come before its first read. This catches the whole class, not the one instance.
+        import ast as _ast31
+        import textwrap as _tw31
+
+        # `ast.unparse(ast.parse(...))` first, so every check below reads *code* and not
+        # comments. The first version of this check compared string offsets over the raw
+        # source and passed/failed on a comment that happened to mention the function it
+        # was looking for -- which is the same class of mistake it exists to catch.
+        _code31 = _ast31.unparse(_ast31.parse(_tw31.dedent(_i31.getsource(fix_apply.apply))))
+
+        def _read_before_bound(code: str, names):
+            """Names read on a line above the line that first binds them.
+
+            These are function-locals, so such a read is an `UnboundLocalError` at runtime
+            rather than a fall-through to a module global -- which is exactly what the
+            default-branch fallback did.
+            """
+            bound, offenders = {}, []
+            for node in _ast31.walk(_ast31.parse(code)):
+                if isinstance(node, _ast31.Name) and node.id in names:
+                    if isinstance(node.ctx, _ast31.Store):
+                        bound[node.id] = min(bound.get(node.id, node.lineno), node.lineno)
+            for node in _ast31.walk(_ast31.parse(code)):
+                if (isinstance(node, _ast31.Name) and node.id in names
+                        and isinstance(node.ctx, _ast31.Load)):
+                    first = bound.get(node.id)
+                    if first is not None and node.lineno < first:
+                        offenders.append(f"{node.id}@line{node.lineno}")
+            return sorted(set(offenders))
+
+        _offenders31 = _read_before_bound(_code31, {"gh", "owner", "repo"})
+        check("apply() never reads owner/repo/gh before assigning them",
+              not _offenders31,
+              "read before assignment: " + ", ".join(_offenders31)
+              + " -- function-locals, so a read above the assignment is an "
+                "UnboundLocalError and not a fall-through to a global")
+        check("...and the repository client is resolved before the default branch is asked for",
+              _code31.index("gh = orch.github") < _code31.index("get_default_branch("),
+              "the default-branch lookup takes the client and the owner/repo it names")
+
         # The delivery options are unchanged by any of this -- checked because the fix
         # touched the function that reads them.
         _pr_outs31 = {o["id"] for o in fix_apply.plan(

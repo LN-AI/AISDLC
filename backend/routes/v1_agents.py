@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from backend import config, database
+from backend import context as request_context
 from backend.products import registry
 from backend.workflows import full_review as full_review_workflow
 from backend.workflows.base import count_steps
@@ -609,7 +610,11 @@ def run_code(req: CodeReviewRequest, caller: dict = Depends(get_caller)):
     # A large artifact is reviewed as N parallel calls, not one, so the reservation has to
     # be sized from N. Without this a 40-chunk review reserved for a single call and could
     # spend far past a budget cap that had already been checked.
-    with agent_guard.expect_calls(_expected_calls(bundle)):
+    # Which repository this is about, for `save_review` to store — the same binding the
+    # UI surface opens in `main._run_bundle_review`, so a review recorded through the API
+    # is placed the same way as one recorded through the browser.
+    with request_context.bind_source(bundle.source_ref()), \
+            agent_guard.expect_calls(_expected_calls(bundle)):
         result = agent_guard.guarded_call(
             caller, "code", override,
             lambda: _orch.review_code(
@@ -741,7 +746,8 @@ def run_vapt(req: VAPTRequest, caller: dict = Depends(get_caller)):
     override = _effective_llm_override(req, caller, "vapt")
     # VAPT is chunked now (C-73), so it reserves like Code Review does. Before, a
     # repository-sized assessment reserved for one call.
-    with agent_guard.expect_calls(_expected_calls(bundle)):
+    with request_context.bind_source(bundle.source_ref()), \
+            agent_guard.expect_calls(_expected_calls(bundle)):
         result = agent_guard.guarded_call(
             caller, "vapt", override,
             lambda: _orch.review_vapt(

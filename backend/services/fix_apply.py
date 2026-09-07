@@ -520,6 +520,23 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     # From here on the repository is written to, and none of it can be rolled back by
     # returning an error — so it is last, after both guards have passed on every patch.
     repo_url = source.get("ref") or ""
+    # Resolve the repository and a client for it *first*. This block used to sit below the
+    # `base_ref` block, which called `gh.get_default_branch(owner, repo)` — and because
+    # `owner`, `repo` and `gh` are all assigned here, in the same function scope, Python
+    # treated them as locals and that call raised `UnboundLocalError` rather than reaching
+    # GitHub. The fallback written to turn an opaque 422 into a sentence was therefore a
+    # crash, on the write path, in the same twenty lines as D-314 and D-315. Nothing
+    # offline could see it: every fix test stops at `plan`, which writes nothing (D-317).
+    owner_repo = repo_url.rstrip("/").split("github.com/")[-1].strip("/")
+    owner, _, repo = owner_repo.partition("/")
+    repo = repo.split("/")[0]
+    gh = orch.github
+    try:
+        from backend.services import source_bundle
+        gh = source_bundle.github_for_repo(repo_url, project_id)
+    except Exception:
+        logger.warning("Falling back to the shared GitHub client for %s", repo_url)
+
     # Which branch a fix pull request should target.
     #
     # This was `label.split("@")[-1]` for every source. That is right for a repository,
@@ -535,16 +552,9 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     if not base_ref:
         # Asked, not assumed. "main" is a guess that fails on every repository still using
         # master, or develop, and fails as another opaque 422 rather than as a sentence.
+        # Only needed for the `pr` delivery, but resolved here so the failure is one
+        # sentence about a default branch rather than a 422 thirty lines later.
         base_ref = gh.get_default_branch(owner, repo)
-    owner_repo = repo_url.rstrip("/").split("github.com/")[-1].strip("/")
-    owner, _, repo = owner_repo.partition("/")
-    repo = repo.split("/")[0]
-    gh = orch.github
-    try:
-        from backend.services import source_bundle
-        gh = source_bundle.github_for_repo(repo_url, project_id)
-    except Exception:
-        logger.warning("Falling back to the shared GitHub client for %s", repo_url)
 
     if output == "same_pr":
         # No new branch: the fix is committed onto the pull request's own head branch, which

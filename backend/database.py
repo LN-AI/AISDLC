@@ -569,6 +569,30 @@ def init_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_ai_systems_project "
                    "ON ai_systems(project_id, created_at DESC)")
 
+    # Which repository, branch, commit and pull request a review was about.
+    #
+    # `reviews` could say what a run found and what it cost and never *where*, so every
+    # question about a place was unanswerable by query: is this repository improving, what
+    # has it cost us, which of ours is worst, did this pull request make things better. The
+    # facts were always present at run time (`Bundle.source_ref`) and thrown away.
+    #
+    # Denormalized here rather than joined from `review_sources`: those rows exist only for
+    # the two products that keep a re-readable source, while `github_repo_url` is a declared
+    # source for eight. NULL for a paste or an upload, which is the honest answer and not a
+    # missing value — the index below is on (owner, name) so those rows simply never appear
+    # in a repository view.
+    for column, ddl_type in (
+        ("repo_host", "TEXT"), ("repo_owner", "TEXT"), ("repo_name", "TEXT"),
+        ("branch", "TEXT"), ("commit_sha", "TEXT"), ("pr_number", "INTEGER"),
+    ):
+        try:
+            cursor.execute(f"ALTER TABLE reviews ADD COLUMN {column} {ddl_type} DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_repo "
+                   "ON reviews(repo_owner, repo_name, created_at DESC)")
+    _backfill_review_repo(cursor)
+
     cursor.executescript("""
         -- What a user told us we got wrong. The only free signal about our own accuracy,
         -- and until now it died in a `resolution_comment`. Each row is a candidate for
@@ -634,6 +658,9 @@ def save_review(
     # published by the API boundary (see backend/context.py). Taking it from the context
     # rather than from a parameter keeps all 19 call sites of this function unchanged.
     project_id = context.current_project_id()
+    # Where this work was, by the same route and for the same reason as `project_id`. An
+    # empty dict for a paste or an upload, which stores NULL in all six columns.
+    source_ref = context.current_source_ref()
 
     findings = result.get("findings", [])
     # Stamp the row id onto each finding *before* the result is serialized, so the id
@@ -656,8 +683,9 @@ def save_review(
         INSERT INTO reviews
             (id, review_type, project_name, input_summary, input_content,
              result_json, findings_count, critical_count, high_count,
-             risk_score, gate_status, created_at, project_id, product_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             risk_score, gate_status, created_at, project_id, product_id,
+             repo_host, repo_owner, repo_name, branch, commit_sha, pr_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             review_id, review_type, project_name, input_summary, input_content,
@@ -667,6 +695,15 @@ def save_review(
             # `review_type` cannot answer it: "code" is written by Code Review, the GitHub PR
             # review and Auto-Fix, so a screen filtering on it showed all three histories.
             context.current_product_id(),
+            # And where it was. `or None` rather than the empty string these arrive as, so
+            # "no repository" is NULL in the column and the repository index never has to
+            # hold a row for a pasted snippet.
+            source_ref.get("repo_host") or None,
+            source_ref.get("repo_owner") or None,
+            source_ref.get("repo_name") or None,
+            source_ref.get("branch") or None,
+            source_ref.get("commit_sha") or None,
+            source_ref.get("pr_number"),
         ),
     )
 
@@ -830,7 +867,10 @@ def _project_scope_sql(project_ids: Optional[List[str]], alias: str = "") -> tup
 # was the cheap half of adding a second caller for this query.
 _REVIEW_LIST_COLUMNS = (
     "id, review_type, product_id, project_name, project_id, input_summary, findings_count, "
-    "critical_count, high_count, risk_score, gate_status, created_at, created_by"
+    "critical_count, high_count, risk_score, gate_status, created_at, created_by, "
+    # Six small columns rather than a join: a run-history row wants to say which repository
+    # and branch it was, and the alternative is a second query per row.
+    "repo_host, repo_owner, repo_name, branch, commit_sha, pr_number"
 )
 
 
@@ -1094,6 +1134,112 @@ def get_active_llm_connection() -> Optional[Dict[str, Any]]:
 
 def set_active_llm_connection(connection_id: Optional[str], updated_by: str = "admin") -> None:
     set_platform_setting(ACTIVE_LLM_CONNECTION_KEY, connection_id or "", updated_by)
+
+
+def list_repositories(project_ids: Optional[List[str]] = None,
+                      limit: int = 100) -> List[Dict[str, Any]]:
+    """Every repository this caller has reviewed, worst first.
+
+    The query the repository columns exist for. One row per `owner/name`, carrying what a
+    lead actually asks: how many runs, when the last one was, what its gate said, how many
+    Critical and High findings are open, and what the whole repository has cost. Ordered by
+    open Critical then High then recency, because a list of repositories sorted by name is
+    a list nobody reads twice.
+
+    `open_critical`/`open_high` count *findings* through their review, so a waived finding
+    stops counting the moment it is waived (`findings.status`), and `spend_usd` comes from
+    `usage_events` rather than from the review rows, so it agrees with the invoice for the
+    same reason D-310 gives.
+    """
+    scope_sql, params = _project_scope_sql(project_ids, alias="r")
+    conn = get_connection()
+    rows = conn.execute(
+        f"""
+        SELECT r.repo_host, r.repo_owner, r.repo_name,
+               COUNT(DISTINCT r.id)                                   AS runs,
+               MAX(r.created_at)                                      AS last_reviewed_at,
+               SUM(CASE WHEN f.severity = 5 AND f.status = 'open' THEN 1 ELSE 0 END)
+                                                                      AS open_critical,
+               SUM(CASE WHEN f.severity = 4 AND f.status = 'open' THEN 1 ELSE 0 END)
+                                                                      AS open_high
+        FROM reviews r
+        LEFT JOIN findings f ON f.review_id = r.id
+        WHERE r.repo_name IS NOT NULL{scope_sql}
+        GROUP BY r.repo_host, r.repo_owner, r.repo_name
+        ORDER BY open_critical DESC, open_high DESC, last_reviewed_at DESC
+        LIMIT ?
+        """,
+        params + (limit,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        repo = dict(row)
+        # The gate of the most recent run, which is what "how is it doing" means to a
+        # reader. Separate from the aggregate above because `MAX(created_at)` and the gate
+        # on that same row cannot both come out of one GROUP BY without a self-join.
+        latest = conn.execute(
+            f"SELECT gate_status, created_at, branch, commit_sha, id FROM reviews r "
+            f"WHERE r.repo_owner = ? AND r.repo_name = ?{scope_sql} "
+            f"ORDER BY created_at DESC LIMIT 1",
+            (repo["repo_owner"], repo["repo_name"]) + params,
+        ).fetchone()
+        repo["latest"] = dict(latest) if latest else None
+        spend = conn.execute(
+            """SELECT COALESCE(SUM(u.cost_usd), 0) AS spend
+               FROM usage_events u JOIN reviews r ON r.id = u.review_id
+               WHERE r.repo_owner = ? AND r.repo_name = ?""",
+            (repo["repo_owner"], repo["repo_name"]),
+        ).fetchone()
+        repo["spend_usd"] = round(spend["spend"] or 0.0, 6)
+        out.append(repo)
+    conn.close()
+    return out
+
+
+def _backfill_review_repo(cursor) -> int:
+    """Fill the new repository columns for reviews that already have a recorded source.
+
+    `review_sources` has carried `ref` (the repository or pull-request URL) and
+    `commit_sha` since it shipped, so every code and VAPT review over a GitHub source can
+    be placed retrospectively — which matters because a repository view whose history
+    starts today cannot show a trend, and a trend is the entire point of having the column.
+
+    Runs inside `init_db`'s own transaction, once: the `WHERE repo_name IS NULL` guard makes
+    it idempotent and cheap after the first pass. Rows whose `ref` is not a GitHub URL (a
+    zip, a paste) are left NULL deliberately and will not be revisited, because
+    `repo_name IS NULL` is also the state of a review that genuinely has no repository —
+    re-scanning them costs one indexed scan of a table that is already being read.
+    """
+    try:
+        rows = cursor.execute(
+            "SELECT r.id, s.ref, s.commit_sha, s.head_branch, s.source_type "
+            "FROM reviews r JOIN review_sources s ON s.review_id = r.id "
+            "WHERE r.repo_name IS NULL AND s.ref LIKE '%github.com/%'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0  # review_sources not created yet — its own init_schema runs after this
+    filled = 0
+    for row in rows:
+        ref = (row["ref"] or "").rstrip("/")
+        owner_repo = ref.split("github.com/")[-1].strip("/")
+        owner, _, rest = owner_repo.partition("/")
+        name = rest.split("/")[0].removesuffix(".git")
+        if not (owner and name):
+            continue
+        pr_number = None
+        if "/pull/" in ref:
+            tail = ref.split("/pull/")[-1].split("/")[0]
+            pr_number = int(tail) if tail.isdigit() else None
+        cursor.execute(
+            "UPDATE reviews SET repo_host = 'github.com', repo_owner = ?, repo_name = ?, "
+            "branch = ?, commit_sha = ?, pr_number = ? WHERE id = ?",
+            (owner, name, row["head_branch"] or "", row["commit_sha"] or "",
+             pr_number, row["id"]),
+        )
+        filled += 1
+    if filled:
+        logger.info("Backfilled the repository of %d review(s) from review_sources", filled)
+    return filled
 
 
 def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -2767,6 +2913,86 @@ def update_job(
     cursor.execute(f"UPDATE agent_jobs SET {cols} WHERE id = ?", vals)
     conn.commit()
     conn.close()
+
+
+def previously_open_findings(project_id: Optional[str], repo_owner: str = "",
+                             repo_name: str = "",
+                             product_id: str = "") -> Dict[str, Dict[str, Any]]:
+    """What the last review of this same thing left open.
+
+    The missing half of the baseline. `get_finding_baseline` answers "have we seen this
+    before"; nothing answered "what did we see last time that is gone now" — so there was
+    no burn-down, no fix rate, and no time-to-remediate, and a run could not say "this
+    change fixed four and introduced one", which is the number a lead actually wants.
+
+    Scoped to **the previous review of the same repository**, not to the whole project. A
+    project-wide diff would be wrong in the one direction that matters: reviewing file A
+    would report every open finding in file B as resolved. Where there is no repository (a
+    paste, a zip upload) it falls back to the same product within the project, which is the
+    closest honest equivalent — the same screen reviewing the same kind of thing.
+
+    Returns {fingerprint: {file_path, title, severity, control_id, review_id, last_seen}}
+    for findings still `open` at that point. The caller decides which of them this run
+    actually covered; this function deliberately does not guess.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    where, params = ["f.status = 'open'", "f.fingerprint IS NOT NULL"], []
+    if project_id:
+        where.append("f.project_id = ?")
+        params.append(project_id)
+    else:
+        where.append("f.project_id IS NULL")
+    if repo_owner and repo_name:
+        where.append("r.repo_owner = ? AND r.repo_name = ?")
+        params += [repo_owner, repo_name]
+    elif product_id:
+        where.append("r.product_id = ?")
+        params.append(product_id)
+    else:
+        conn.close()
+        return {}
+    rows = cursor.execute(
+        f"""SELECT f.fingerprint, f.file_path, f.title, f.severity, f.control_id,
+                   f.review_id, MAX(r.created_at) AS last_seen
+            FROM findings f JOIN reviews r ON r.id = f.review_id
+            WHERE {' AND '.join(where)}
+            GROUP BY f.fingerprint""",
+        params,
+    ).fetchall()
+    conn.close()
+    return {r["fingerprint"]: dict(r) for r in rows}
+
+
+def mark_findings_resolved(fingerprints: List[str], project_id: Optional[str],
+                           actor: str = "system") -> int:
+    """Close findings a later review of the same code no longer reports.
+
+    Sets `status='resolved'`, which is deliberately *not* one of `WAIVED_STATUSES` — a
+    resolved finding does not suppress a future report of the same fingerprint. If it comes
+    back, it comes back as a regression rather than being silently muted, which is the
+    difference between "we fixed it" and "we stopped looking".
+    """
+    if not fingerprints:
+        return 0
+    now = datetime.utcnow().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    changed = 0
+    for i in range(0, len(fingerprints), 400):
+        batch = fingerprints[i:i + 400]
+        placeholders = ",".join("?" * len(batch))
+        sql = (f"UPDATE findings SET status = 'resolved', resolved_by = ?, resolved_at = ? "
+               f"WHERE fingerprint IN ({placeholders}) AND status = 'open'")
+        args = [actor, now, *batch]
+        if project_id:
+            sql += " AND project_id = ?"
+            args.append(project_id)
+        cursor.execute(sql, args)
+        changed += cursor.rowcount
+    conn.commit()
+    conn.close()
+    return changed
 
 
 def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> Dict[str, Dict[str, Any]]:

@@ -384,6 +384,51 @@ def apply_baseline(
     }
 
 
+def resolved_since(findings: List[Dict[str, Any]],
+                   previously_open: Dict[str, Dict[str, Any]],
+                   files_read: Optional[set] = None) -> Dict[str, Any]:
+    """What the last review of this code reported and this one does not.
+
+    `apply_baseline` above labels what is *here*. This labels what is *gone*, which is the
+    half that was missing — and without it there is no burn-down, no fix rate and no
+    time-to-remediate, because "still open" and "fixed" were the same absence.
+
+    **Only files this run actually read can be credited.** Without that restriction a
+    narrower review — one file instead of the whole repository — would report every finding
+    in every file it did not open as fixed, which is worse than reporting nothing: it is a
+    false all-clear that looks like progress. `files_read` comes from the coverage record,
+    so a file in a *failed* chunk is correctly not in it. When it is None (a single pasted
+    artifact, where there are no paths to compare) nothing is credited and
+    `scope_limited` says so, rather than guessing.
+
+    A finding with no `file_path` is never credited either: it is about the design rather
+    than a line, so its absence from one run is not evidence anybody changed anything.
+    """
+    still_here = {f.get("fingerprint") for f in (findings or []) if f.get("fingerprint")}
+    resolved, skipped = [], 0
+    for fingerprint, prior in (previously_open or {}).items():
+        if fingerprint in still_here:
+            continue
+        path = prior.get("file_path") or ""
+        if not path:
+            skipped += 1
+            continue
+        if files_read is None or path not in files_read:
+            skipped += 1
+            continue
+        resolved.append({**prior, "fingerprint": fingerprint})
+    resolved.sort(key=lambda r: (-(r.get("severity") or 0), r.get("file_path") or ""))
+    return {
+        "resolved_findings": resolved,
+        "resolved_count": len(resolved),
+        # How many previously-open findings this run could not speak to, because the file
+        # was not read or the finding names no file. Reported rather than hidden: "2 fixed"
+        # means something different when 40 were out of scope.
+        "unverifiable_count": skipped,
+        "scope_limited": files_read is None,
+    }
+
+
 def process(
     findings: List[Dict[str, Any]],
     artifact: str,

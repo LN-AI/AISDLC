@@ -544,6 +544,133 @@ check("the waive endpoint is actually registered on the app",
       "a router that is imported but never included is invisible until someone calls it")
 check("it is a PATCH", "patch" in _paths.get("/api/v1/findings/{finding_id}", {}))
 
+# ── 12. The other half of the baseline ─────────────────────────────────────
+#
+# Section 11 asks "what is new". Nothing asked "what is gone", so a fix and a still-open
+# finding were the same absence: no burn-down, no fix rate, no time-to-remediate, and no
+# way for a run to say "this change closed four and introduced one".
+section("12. A later run says what got fixed, and refuses to guess")
+
+# Titles and paths deliberately unlike section 11's: `fingerprint` is a hash of
+# control_id + path + title + evidence, and `cf()` defaults the path to `src/auth.py` and
+# the title to "SQL injection" -- so a finding that only overrides `severity` here would
+# share section 11's fingerprint and inherit the waiver it set.
+GONE = cf(severity=5, control_id="SEC-003", title="Secret in settings loader",
+          file_path="src/settings.py")
+GONE["fingerprint"] = finding_pipeline.fingerprint(GONE)
+STAYS = cf(severity=4, control_id="SEC-001", title="Unparameterised order lookup",
+           file_path="src/orders.py")
+STAYS["fingerprint"] = finding_pipeline.fingerprint(STAYS)
+NO_FILE = cf(severity=3, control_id="GOV-001", title="No threat model on record",
+             file_path="")
+NO_FILE["fingerprint"] = finding_pipeline.fingerprint(NO_FILE)
+check("this section's fingerprints do not collide with section 11's",
+      len({GONE["fingerprint"], STAYS["fingerprint"], NO_FILE["fingerprint"],
+           BASE[0]["fingerprint"]}) == 4,
+      "a colliding fingerprint would make this section assert against the waiver "
+      "section 11 set, which is how the first version of it passed for the wrong reason")
+
+prior = {
+    GONE["fingerprint"]: {"file_path": "src/settings.py", "title": GONE["title"], "severity": 5},
+    STAYS["fingerprint"]: {"file_path": "src/orders.py", "title": STAYS["title"], "severity": 4},
+    NO_FILE["fingerprint"]: {"file_path": "", "title": NO_FILE["title"], "severity": 3},
+}
+ALL_READ = {"src/settings.py", "src/orders.py"}
+
+out = finding_pipeline.resolved_since([dict(STAYS)], prior, files_read=ALL_READ)
+check("a finding the previous run reported and this one does not is resolved",
+      out["resolved_count"] == 1, str(out))
+check("...and it is the right one",
+      out["resolved_findings"][0]["fingerprint"] == GONE["fingerprint"])
+check("a finding still being reported is not resolved",
+      all(r["fingerprint"] != STAYS["fingerprint"] for r in out["resolved_findings"]))
+check("a finding that names no file is never credited as fixed",
+      all(r["fingerprint"] != NO_FILE["fingerprint"] for r in out["resolved_findings"]),
+      "it is about the design, not a line -- its absence from one run is not evidence "
+      "anybody changed anything")
+check("...and is counted as unverifiable rather than dropped silently",
+      out["unverifiable_count"] == 1, str(out))
+
+# The check that matters most: a narrower review must not report the rest of the
+# repository as fixed. Reviewing only `src/orders.py` says nothing about `src/settings.py`.
+narrow = finding_pipeline.resolved_since([], prior, files_read={"src/orders.py"})
+_credited = {r["file_path"] for r in narrow["resolved_findings"]}
+check("a run that did not read a file cannot claim its finding was fixed",
+      "src/settings.py" not in _credited, str(narrow))
+check("...while the file it did read is credited normally",
+      _credited == {"src/orders.py"}, str(sorted(_credited)))
+check("...and the two it could not speak to are counted, not dropped",
+      narrow["unverifiable_count"] == 2,
+      f"{narrow['unverifiable_count']} -- src/settings.py (not read) and the finding "
+      "with no file at all")
+
+blind = finding_pipeline.resolved_since([], prior, files_read=None)
+check("a single pasted artifact credits nothing, having no paths to compare",
+      blind["resolved_count"] == 0 and blind["scope_limited"] is True, str(blind))
+
+check("resolved findings come back worst-first",
+      [r["severity"] for r in finding_pipeline.resolved_since(
+          [], prior, files_read=ALL_READ)["resolved_findings"]] == [5, 4])
+
+# ── Through the real database, against a real repository ──────────────────
+from backend import context as _ctx12  # noqa: E402
+
+_first = None
+with _ctx12.bind_source({"repo_host": "github.com", "repo_owner": "acme",
+                         "repo_name": "shop", "branch": "main",
+                         "commit_sha": "a" * 40, "pr_number": None}):
+    _first = database.save_review(
+        review_type="code", project_name="p", input_summary="s", input_content="c",
+        result={"findings": [GONE, STAYS], "risk_score": 90.0, "gate_status": "Red",
+                "summary": "s"},
+    )
+_row12 = database.get_review(_first)
+check("a review stores the repository it was about",
+      (_row12["repo_owner"], _row12["repo_name"]) == ("acme", "shop"),
+      f"{_row12['repo_owner']}/{_row12['repo_name']}")
+check("...and the commit, so a later run compares like with like",
+      _row12["commit_sha"] == "a" * 40)
+check("a review with no repository stores NULL, not an empty string",
+      database.get_review(database.save_review(
+          review_type="code", project_name="p", input_summary="s", input_content="c",
+          result={"findings": [], "gate_status": "Green", "summary": "s"},
+      ))["repo_name"] is None,
+      "a paste has no repository; NULL keeps it out of the repository index entirely")
+
+_open12 = database.previously_open_findings(None, repo_owner="acme", repo_name="shop")
+check("the previous run's open findings are found by repository",
+      {GONE["fingerprint"], STAYS["fingerprint"]} <= set(_open12), str(sorted(_open12)))
+_other = database.previously_open_findings(None, repo_owner="acme", repo_name="other-repo")
+check("...and another repository's are not",
+      _other == {}, str(_other))
+
+_closed = database.mark_findings_resolved([GONE["fingerprint"]], None, actor="second-run")
+check("a resolved finding is closed in the database", _closed == 1, str(_closed))
+_after12 = database.get_finding_baseline(None, [GONE["fingerprint"]])
+check("...with status 'resolved'",
+      _after12[GONE["fingerprint"]]["status"] == "resolved", str(_after12))
+check("...naming what closed it",
+      _after12[GONE["fingerprint"]]["resolved_by"] == "second-run", str(_after12))
+check("only open findings are closed -- a waiver is not overwritten by a later run",
+      database.mark_findings_resolved([BASE[0]["fingerprint"]], None, actor="second-run") == 0,
+      "section 11 waived that fingerprint; a run that stops reporting it must not "
+      "silently convert a deliberate acceptance into 'fixed'")
+check("'resolved' does NOT suppress a future report of the same finding",
+      "resolved" not in finding_pipeline.WAIVED_STATUSES,
+      "if it comes back it must come back as a regression, not be silently muted -- that "
+      "is the difference between 'we fixed it' and 'we stopped looking'")
+_reported = finding_pipeline.apply_baseline([dict(GONE)], _after12)
+check("...so a returning finding is reported again", len(_reported["findings"]) == 1)
+
+check("a repository view can be built from the column",
+      any(r["repo_name"] == "shop" for r in database.list_repositories(None)),
+      str([r.get("repo_name") for r in database.list_repositories(None)]))
+_repo12 = [r for r in database.list_repositories(None) if r["repo_name"] == "shop"][0]
+check("...and it counts what is still open, not what was ever found",
+      _repo12["open_critical"] == 0 and _repo12["open_high"] == 1,
+      f"critical={_repo12['open_critical']} high={_repo12['open_high']} "
+      "-- the Critical was resolved above, the High is still open")
+
 section("Control mapping -- every id the prompt offers has to exist")
 
 # The prompt hands the model a list of control ids and the model returns one per finding.

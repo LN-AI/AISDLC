@@ -22,6 +22,9 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 from backend import database, config, scope
+# Aliased: `_run_bundle_review` and several review handlers take a parameter named
+# `context` (the free-text hint a user types), so the module cannot be `context` here.
+from backend import context as request_context
 from backend.workflows import full_review as full_review_workflow
 from backend.workflows.base import count_steps
 from backend.routes.auth import router as auth_router
@@ -518,14 +521,18 @@ def _run_bundle_review(bundle, agent: str, project_name: str, context: str = "",
     else:
         args["files"] = bundle.files
 
-    if agent == "vapt":
-        if single:
-            args["artifact"] = text
-        result = orchestrator.review_vapt(scope=scope, **args)
-    else:
-        if single:
-            args["code"] = text
-        result = orchestrator.review_code(language=language, **args)
+    # Which repository this review is about, published for `save_review` to store. Opened
+    # around the agent call rather than at the route, because this is the one function both
+    # Code Review and VAPT go through and the bundle is already in hand here.
+    with request_context.bind_source(bundle.source_ref()):
+        if agent == "vapt":
+            if single:
+                args["artifact"] = text
+            result = orchestrator.review_vapt(scope=scope, **args)
+        else:
+            if single:
+                args["code"] = text
+            result = orchestrator.review_code(language=language, **args)
 
     # Recorded here rather than inside the orchestrator for two reasons: `review_id` does not
     # exist until the result is saved, and the retention choice belongs to the surface the
@@ -887,6 +894,20 @@ async def review_job_status(job_id: str, reader: dict = Depends(require_reader))
     return job
 
 # ── Dashboard ──────────────────────────────────────────────────────────────
+
+@app.get("/api/repositories", summary="Every repository this caller has reviewed, worst first")
+async def list_repositories(request: Request, limit: int = Query(100, ge=1, le=500),
+                            reader: dict = Depends(require_reader)):
+    """What no screen could ask before: how is each of our repositories doing.
+
+    `reviews` gained a repository dimension, so this is a query rather than a subsystem —
+    runs, last reviewed, the latest gate, open Critical and High, and what the repository
+    has cost. Reviews with no repository (a paste, a zip upload) are absent by design
+    rather than grouped under a blank name.
+    """
+    return {"repositories": database.list_repositories(
+        project_ids=_visible_project_ids(reader, request), limit=limit)}
+
 
 @app.get("/api/dashboard")
 async def get_dashboard(request: Request, reader: dict = Depends(require_reader)):

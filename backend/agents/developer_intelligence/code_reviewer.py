@@ -241,6 +241,7 @@ class CodeReviewAgent(BaseAgent):
             coverage_reason=coverage_reason,
             extra_findings=extra_findings,
             baseline_lookup=chunked_review.default_baseline,
+            resolved_lookup=chunked_review.default_resolved,
             on_progress=on_progress,
         )
 

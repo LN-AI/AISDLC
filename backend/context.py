@@ -24,8 +24,8 @@ from contextvars import ContextVar
 from typing import Optional
 
 __all__ = ["bind_project", "current_project_id", "current_project_name",
-           "current_product_id", "current_actor", "collect_saved_reviews",
-           "note_review_saved", "saved_review_ids"]
+           "current_product_id", "current_actor", "bind_source", "current_source_ref",
+           "collect_saved_reviews", "note_review_saved", "saved_review_ids"]
 
 _project_id: ContextVar[Optional[str]] = ContextVar("current_project_id", default=None)
 _project_name: ContextVar[str] = ContextVar("current_project_name", default="")
@@ -90,6 +90,44 @@ def current_product_id() -> Optional[str]:
 def current_actor() -> str:
     """Who the enclosing request belongs to, or "" when nothing bound one."""
     return _actor.get()
+
+
+# ── Which repository this work is about ──────────────────────────────────────
+#
+# `reviews` had no repository, branch, commit or pull-request column, so no question about
+# a *place* could be answered by a query: is this repo improving, what has it cost us, which
+# of our repositories is worst. The facts were all present per run — `Bundle.meta` carries
+# them and `review_sources.ref` stores one of them — and never promoted to a dimension.
+#
+# Denormalized onto `reviews` rather than joined from `review_sources`, deliberately:
+# `review_sources` rows exist only for the two products that record a re-readable source
+# (code and vapt), while `github_repo_url` is a declared source for eight products. Putting
+# it on the row every product writes means a repository view covers whatever reviews a repo
+# later, without a second migration.
+#
+# Same route as the project and the actor above: resolved at the boundary where the bundle
+# exists, read inside `save_review`, so none of the 19 call sites change.
+_source_ref: ContextVar[Optional[dict]] = ContextVar("current_source_ref", default=None)
+
+
+@contextmanager
+def bind_source(source_ref: Optional[dict]):
+    """Mark everything inside this block as being about one repository/commit.
+
+    Takes `Bundle.source_ref()` verbatim. Binding None is meaningful and must still be
+    done — it says "this work is not about a repository", which stops the previous
+    request's repository leaking onto a pasted snippet.
+    """
+    token = _source_ref.set(dict(source_ref) if source_ref else None)
+    try:
+        yield
+    finally:
+        _source_ref.reset(token)
+
+
+def current_source_ref() -> dict:
+    """The bound repository facts, or an empty dict when nothing bound any."""
+    return dict(_source_ref.get() or {})
 
 
 # ── Which reviews this request produced, reported back up ────────────────────

@@ -109,6 +109,39 @@ class Bundle:
     def untrusted_label(self) -> Optional[str]:
         return UNTRUSTED_LABELS.get(self.source_type)
 
+    def source_ref(self) -> Dict[str, Any]:
+        """Which repository, branch, commit and pull request this bundle came from.
+
+        Every fact here is already in `meta` — but each GitHub constructor spells it
+        slightly differently (`ref` on a repo, `head_branch` on a pull request, `head` on a
+        compare), so a caller that wanted "which repo was this" had to know which of the
+        three shapes it was holding. One method rather than that knowledge at every call
+        site, which is the same reason `commit_sha` is normalized in `from_github_pr`.
+
+        Empty strings, not None, for a source that has no repository (a paste, an upload) —
+        `save_review` stores them as NULL, and a caller can treat the whole dict as absent
+        by testing `repo_name`.
+        """
+        meta = self.meta or {}
+        repo_url = (meta.get("repo_url") or "").rstrip("/")
+        owner, name = "", ""
+        if "github.com/" in repo_url:
+            owner_repo = repo_url.split("github.com/")[-1].strip("/")
+            owner, _, name = owner_repo.partition("/")
+            name = name.split("/")[0].removesuffix(".git")
+        # The branch a human would name this review by. A pull request is its head branch,
+        # a compare is its head, a repository is whatever ref was asked for.
+        branch = (meta.get("head_branch") or meta.get("head") or meta.get("ref") or "")
+        pr_number = meta.get("pr_number")
+        return {
+            "repo_host": "github.com" if repo_url else "",
+            "repo_owner": owner,
+            "repo_name": name,
+            "branch": branch or "",
+            "commit_sha": meta.get("commit_sha") or "",
+            "pr_number": int(pr_number) if str(pr_number or "").isdigit() else None,
+        }
+
     def text(self) -> str:
         """One document, for the evidence verifier to search.
 

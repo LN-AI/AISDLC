@@ -193,6 +193,7 @@ def run(
     coverage_reason: str = "",
     extra_findings: Optional[List[Dict[str, Any]]] = None,
     baseline_lookup: Optional[Callable[[List[Dict[str, Any]]], Dict[str, Any]]] = None,
+    resolved_lookup: Optional[Callable[[], Dict[str, Any]]] = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> Dict[str, Any]:
     """Review one artifact — a string or a file list — and return a gated result.
@@ -273,6 +274,24 @@ def run(
     processed.update(finding_pipeline.apply_baseline(processed["findings"], baseline))
     result.update(processed)
 
+    # And the other direction: what the last review of this same code reported that this
+    # one does not. Computed here rather than in the pipeline because this is the only
+    # place that knows which files were actually read -- a file in a failed chunk was never
+    # opened, so nothing in it may be credited as fixed.
+    if resolved_lookup:
+        files_read = None
+        if multi_file:
+            files_read = {f.get("path") for f in files if f.get("path")}
+            for failure in failures:
+                for path in (failure.get("files") or []):
+                    files_read.discard(path)
+        try:
+            closed = finding_pipeline.resolved_since(
+                result["findings"], resolved_lookup(), files_read)
+            result.update(closed)
+        except Exception:
+            logger.exception("Resolved-since comparison failed — reporting none as fixed")
+
     result["coverage"] = {
         "chunks_total": len(chunks),
         "chunks_succeeded": len(chunks) - len(failures),
@@ -324,4 +343,27 @@ def default_baseline(findings: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
         return database.get_finding_baseline(context.current_project_id(), fingerprints)
     except Exception:
         logger.exception("Finding baseline lookup failed — treating every finding as new")
+        return {}
+
+
+def default_resolved() -> Dict[str, Dict[str, Any]]:
+    """What the last review of this same repository left open.
+
+    Lazily imported and failure-tolerant for the same reasons as `default_baseline`: a
+    lookup that cannot run degrades to "nothing was fixed", which understates progress and
+    never invents it. Reads the repository from the request context — the same binding
+    `save_review` uses to store it, so the comparison is against the same repository the
+    row will be filed under.
+    """
+    try:
+        from backend import context, database
+        ref = context.current_source_ref()
+        return database.previously_open_findings(
+            context.current_project_id(),
+            repo_owner=ref.get("repo_owner") or "",
+            repo_name=ref.get("repo_name") or "",
+            product_id=context.current_product_id() or "",
+        )
+    except Exception:
+        logger.exception("Previously-open lookup failed — reporting nothing as fixed")
         return {}

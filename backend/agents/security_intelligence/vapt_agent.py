@@ -172,6 +172,7 @@ class VAPTAgent(VAPTBaseAgent):
             coverage_reason=coverage_reason,
             extra_findings=extra_findings,
             baseline_lookup=chunked_review.default_baseline,
+            resolved_lookup=chunked_review.default_resolved,
             on_progress=on_progress,
         )
         # Counts the UI and the dashboard read. Computed here rather than in the
