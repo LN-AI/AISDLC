@@ -1163,6 +1163,61 @@ def main_():
     check("and cannot read a triage report belonging to a project they are not in (404)",
           r.status_code == 404, f"{r.status_code} {r.text[:150]}")
 
+    # ── 19. No handler holds the event loop for a whole review ─────────────
+    #
+    # FastAPI runs an `async def` handler on the event loop and a plain `def` handler on a
+    # threadpool. So a handler that does blocking work is fine declared `def` and freezes
+    # the entire process declared `async def` — the same body, opposite behaviour, and
+    # nothing in the code reads differently.
+    #
+    # C-31 measured the consequence during a UI demo: while a ten-minute VAPT ran, `GET /`
+    # did not return. `scripts/measure_event_loop.py` reproduces it on demand — before the
+    # fix `GET /` blocked for 5.45s of a 6s review, after it answered in 0.30s. This check
+    # is the cheap offline half: it cannot measure concurrency, but it catches the
+    # declaration drifting back, which is the only way the defect returns.
+    section("19. No review handler holds the event loop")
+
+    import ast as _ast19
+    import inspect as _i19
+    import backend.main as _main19
+
+    _tree19 = _ast19.parse(_i19.getsource(_main19))
+    # Routes that must stay `async def`: they schedule with `asyncio.create_task`, which
+    # needs a running loop, and a threadpool worker has none. Named rather than inferred,
+    # so adding a job route is a deliberate edit here.
+    _JOB_ROUTES = {"full_review", "review_github_pr_async",
+                   "review_issue_triage_batch_github_async"}
+    _holders, _jobs = [], {}
+    for _node in _tree19.body:
+        if not isinstance(_node, (_ast19.AsyncFunctionDef, _ast19.FunctionDef)):
+            continue
+        if not any(_ast19.unparse(d).startswith("app.") for d in _node.decorator_list):
+            continue
+        _is_async = isinstance(_node, _ast19.AsyncFunctionDef)
+        _awaits = any(isinstance(n, _ast19.Await) for n in _ast19.walk(_node))
+        _body = _ast19.unparse(_node)
+        _runs_agent = "orchestrator." in _body or "workflow" in _body
+        if _node.name in _JOB_ROUTES:
+            _jobs[_node.name] = _is_async
+            continue
+        # An async handler that never awaits and runs an agent is one that blocks.
+        if _is_async and not _awaits and _runs_agent:
+            _holders.append(_node.name)
+
+    check("no agent route is `async def` without awaiting anything", not _holders,
+          "these hold the event loop for the whole call: " + ", ".join(_holders)
+          + " -- remove `async` so FastAPI runs them on the threadpool (D-228)")
+    check("every 202 job route is still `async def`",
+          _jobs and set(_jobs) == _JOB_ROUTES and all(_jobs.values()),
+          f"{_jobs} vs expected {sorted(_JOB_ROUTES)} -- these schedule with "
+          "asyncio.create_task and need a running loop; a sync handler runs on a "
+          "threadpool where there is none, so flipping one breaks it silently")
+    check("the measurement that proves any of this is still in the repository",
+          os.path.exists(os.path.join(os.path.dirname(os.path.dirname(
+              os.path.abspath(__file__))), "scripts", "measure_event_loop.py")),
+          "C-31 asks for measuring rather than a blind edit, so the measurement is part "
+          "of the answer and not scaffolding to delete")
+
     stack.close()
 
     print(f"\n{'-' * 60}")

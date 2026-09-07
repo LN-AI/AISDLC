@@ -1323,7 +1323,7 @@ async def get_report(report_id: str, request: Request, reader: dict = Depends(re
 # ── Requirement Review ─────────────────────────────────────────────────────
 
 @app.post("/api/review/requirement")
-async def review_requirement(req: ReviewRequest, project_name: str = ""):
+def review_requirement(req: ReviewRequest, project_name: str = ""):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
@@ -1366,7 +1366,7 @@ async def review_requirement_file(
 # ── Code Review ────────────────────────────────────────────────────────────
 
 @app.post("/api/review/code")
-async def review_code(req: CodeReviewRequest, project_name: str = ""):
+def review_code(req: CodeReviewRequest, project_name: str = ""):
     if not req.code.strip():
         raise HTTPException(status_code=400, detail="Code is required")
     _require_llm()
@@ -1388,7 +1388,7 @@ async def review_code(req: CodeReviewRequest, project_name: str = ""):
 # ── Prompt Safety Review ───────────────────────────────────────────────────
 
 @app.post("/api/review/prompt")
-async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
+def review_prompt(req: PromptReviewRequest, project_name: str = ""):
     if not any([req.system_prompt, req.user_prompt, req.tool_definitions, req.rag_config]):
         raise HTTPException(status_code=400, detail="At least one prompt field is required")
     _require_llm()
@@ -1491,7 +1491,7 @@ async def full_review_job_status(job_id: str, reader: dict = Depends(require_rea
 # ── GitHub PR Review ───────────────────────────────────────────────────────
 
 @app.post("/api/github/pr")
-async def review_github_pr(req: GithubPRRequest):
+def review_github_pr(req: GithubPRRequest):
     if not req.pr_url:
         raise HTTPException(status_code=400, detail="PR URL is required")
     _require_llm()
@@ -1581,7 +1581,7 @@ async def review_github_pr_async(req: GithubPRRequest, request: Request):
 
 
 @app.post("/api/github/pr/auto-fix")
-async def auto_fix_github_pr(req: GithubAutoFixRequest):
+def auto_fix_github_pr(req: GithubAutoFixRequest):
     if not req.pr_url:
         raise HTTPException(status_code=400, detail="PR URL is required")
     if not config.GITHUB_TOKEN:
@@ -1605,7 +1605,7 @@ async def auto_fix_github_pr(req: GithubAutoFixRequest):
 # ── Release Gate ───────────────────────────────────────────────────────────
 
 @app.post("/api/release-gate")
-async def release_gate(req: ReleaseGateRequest):
+def release_gate(req: ReleaseGateRequest):
     _require_llm()
 
     # Routed through the workflow rather than calling `gate_agent` inline. The inline
@@ -1631,7 +1631,7 @@ async def release_gate(req: ReleaseGateRequest):
 # ── Architecture Review ────────────────────────────────────────────────────
 
 @app.post("/api/review/architecture")
-async def review_architecture(req: ArchitectureReviewRequest):
+def review_architecture(req: ArchitectureReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Architecture description is required")
     _require_llm()
@@ -1683,7 +1683,7 @@ async def review_architecture_file(
 # ── VAPT ──────────────────────────────────────────────────────────────────
 
 @app.post("/api/review/vapt")
-async def review_vapt(req: VAPTReviewRequest):
+def review_vapt(req: VAPTReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Artifact content is required")
     _require_llm()
@@ -1730,7 +1730,7 @@ async def review_vapt_file(
 # ── Security Review ────────────────────────────────────────────────────────
 
 @app.post("/api/review/security")
-async def review_security(req: SecurityReviewRequest):
+def review_security(req: SecurityReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Artifact content is required")
     _require_llm()
@@ -1777,7 +1777,7 @@ async def review_security_file(
 # ── Code Generation ─────────────────────────────────────────────────────────
 
 @app.post("/api/codegen/advisory")
-async def codegen_advisory(req: CodeGenAdvisoryRequest):
+def codegen_advisory(req: CodeGenAdvisoryRequest):
     if not req.requirement.strip():
         raise HTTPException(status_code=400, detail="Requirement is required")
     _require_llm()
@@ -1804,7 +1804,7 @@ async def codegen_advisory(req: CodeGenAdvisoryRequest):
 
 
 @app.post("/api/codegen/scaffold")
-async def codegen_scaffold(req: CodeGenScaffoldRequest):
+def codegen_scaffold(req: CodeGenScaffoldRequest):
     _require_llm()
     try:
         result = orchestrator.generate_codegen_scaffold(
@@ -1861,7 +1861,7 @@ async def codegen_scaffold_download(review_id: str, request: Request,
 # ── AI Code Provenance & Risk ────────────────────────────────────────────────
 
 @app.post("/api/review/ai-provenance")
-async def review_ai_provenance(req: AIProvenanceRequest):
+def review_ai_provenance(req: AIProvenanceRequest):
     if not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Code is required")
     _require_llm()
@@ -1891,7 +1891,7 @@ async def review_ai_provenance(req: AIProvenanceRequest):
 # ── Code Migration ─────────────────────────────────────────────────────────
 
 @app.post("/api/review/migration-assessment")
-async def review_migration_assessment(req: MigrationAssessmentRequest):
+def review_migration_assessment(req: MigrationAssessmentRequest):
     if not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Code is required")
     if not req.migration_target.strip():
@@ -1913,7 +1913,7 @@ async def review_migration_assessment(req: MigrationAssessmentRequest):
 
 
 @app.post("/api/review/migration-execute")
-async def review_migration_execute(req: MigrationExecutionRequest):
+def review_migration_execute(req: MigrationExecutionRequest):
     if not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Code is required")
     if not req.migration_target.strip():
@@ -1979,7 +1979,7 @@ def _extract_zip_files(content: bytes) -> list:
 
 
 @app.post("/api/review/cfr21-verification")
-async def review_cfr21_verification(req: CFR21VerificationRequest):
+def review_cfr21_verification(req: CFR21VerificationRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
@@ -2034,7 +2034,7 @@ async def review_cfr21_verification_upload_zip(
 # ── GxP Document Check ────────────────────────────────────────────────────────
 
 @app.post("/api/review/gxp-document-check")
-async def review_gxp_document_check(req: GxPDocumentCheckRequest):
+def review_gxp_document_check(req: GxPDocumentCheckRequest):
     documents = [{"name": d.name, "content": d.content} for d in (req.documents or [])]
     if not documents and not (req.content or "").strip():
         raise HTTPException(status_code=400, detail="Provide `documents` or `content`")
@@ -2088,7 +2088,7 @@ async def review_gxp_document_check_upload(
 # ── GxP Validation Document Generation ───────────────────────────────────────
 
 @app.post("/api/review/gxp-generate-plan")
-async def review_gxp_generate_plan(req: GxPValidationPlanRequest):
+def review_gxp_generate_plan(req: GxPValidationPlanRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
@@ -2143,7 +2143,7 @@ async def review_gxp_generate_plan_upload_zip(
 
 
 @app.post("/api/review/gxp-generate-document")
-async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
+def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
@@ -2171,7 +2171,7 @@ async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
 # ── Issue Triaging Agent ─────────────────────────────────────────────────────
 
 @app.post("/api/review/issue-triage")
-async def review_issue_triage(req: IssueTriageRequest):
+def review_issue_triage(req: IssueTriageRequest):
     title, description = req.title or "", req.description or ""
     if req.github_issue_url and not (title.strip() or description.strip()):
         from backend.services.github_service import GitHubService
@@ -2201,7 +2201,7 @@ async def review_issue_triage(req: IssueTriageRequest):
 
 
 @app.post("/api/review/issue-triage/batch-github")
-async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
+def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
     if not req.github_repo_url.strip():
         raise HTTPException(status_code=400, detail="github_repo_url is required")
     _require_llm()
@@ -2283,7 +2283,7 @@ async def review_issue_triage_batch_github_async(req: IssueTriageBatchGitHubRequ
 # ── QA Intelligence — Test Scenario / Test Case Generation ──────────────────
 
 @app.post("/api/review/test-scenario")
-async def review_test_scenario(req: ReviewRequest, project_name: str = ""):
+def review_test_scenario(req: ReviewRequest, project_name: str = ""):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
@@ -2306,7 +2306,7 @@ class TestCaseInternalRequest(BaseModel):
 
 
 @app.post("/api/review/test-case")
-async def review_test_case(req: TestCaseInternalRequest):
+def review_test_case(req: TestCaseInternalRequest):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
@@ -2331,7 +2331,7 @@ class SensitiveDataRequest(BaseModel):
 
 
 @app.post("/api/review/sensitive-data")
-async def review_sensitive_data(req: SensitiveDataRequest):
+def review_sensitive_data(req: SensitiveDataRequest):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
