@@ -9,7 +9,9 @@ from backend import config, context
 from backend.config import DATABASE_PATH, JOB_STALE_MINUTES, SQLITE_BUSY_TIMEOUT_MS
 # Imported here rather than lazily: `crypto_service` depends only on `config`, so there
 # is no cycle, and a lazy import inside the credential helpers would run on every call.
-from backend.services import crypto_service
+# `finding_gate` is import-free by design (its own module docstring says so), so it is
+# safe at this layer too.
+from backend.services import crypto_service, finding_gate
 
 logger = logging.getLogger(__name__)
 
@@ -795,7 +797,10 @@ def save_review(
     # it every approval was unattributed, so the queue could not be scoped and showed one
     # customer's blocked releases to anyone holding a token. Rows written before this
     # column stay NULL and remain super-admin-only, exactly like pre-existing reviews.
-    if gate_status == "Red" or critical_count > 0:
+    # `finding_gate.requires_human_signoff` is the single definition of this rule --
+    # the governance report reads the same function, so the report can never claim a
+    # sign-off the queue was never asked for. See that docstring and C-38.
+    if finding_gate.requires_human_signoff(gate_status, critical_count):
         priority = "urgent" if gate_status == "Red" else "high"
         approval_id = str(uuid.uuid4())
         cursor.execute(

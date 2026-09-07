@@ -233,6 +233,8 @@ check('renders a stored report document', () => {
   assert(html.includes('Executive Summary'), 'summary section missing');
   assert(html.includes('Hardcoded key'), 'finding missing');
   assert(html.includes('Security Lead'), 'approver missing');
+  assert(html.includes('approval queue') || html.includes('Approval required'),
+    'a required sign-off must say so, and why');
   assert(html.includes('HIPAA'), 'compliance flag missing');
   assert(!html.includes('Governance (0)'), 'empty category should be skipped');
 });
@@ -250,6 +252,11 @@ check('accepts the report-generate response shape (compliance_mapping, no review
   const html = document.getElementById('report-result').innerHTML;
   assert(html.includes('GDPR'), 'compliance_mapping fallback failed');
   assert(html.includes('OWASP-LLM'), 'second flag missing');
+  // The Amber case. This block used to render nothing at all when no sign-off was
+  // required, so an auditor reading an Amber report could not tell 'never asked' from
+  // 'asked and granted' -- and the report itself used to claim the latter.
+  assert(html.includes('No human sign-off was requested'),
+    'an Amber report must state that no sign-off was requested');
 });
 
 check('survives a sparse report', () => {

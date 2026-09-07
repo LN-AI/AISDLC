@@ -1962,11 +1962,27 @@ function renderGovernanceReport(targetId, report) {
       <div class="summary-box">${esc(report.executive_summary)}</div></div>`;
   }
 
+  // Say something either way. This block used to render only when a sign-off was required,
+  // and the report only claimed one for an Amber gate that never actually reached a human --
+  // so an auditor read an Amber report, saw no banner, and had nothing telling them whether
+  // sign-off had been requested and given or never asked for at all. Those are very
+  // different facts and they looked identical. `approval_basis` states which it is; the
+  // gate_status fallback keeps an older stored report readable.
+  const _ab = report.approval_basis
+    || (report.approval_required
+      ? 'This release was placed in the approval queue and cannot proceed without a recorded human sign-off.'
+      : 'No human sign-off was requested: this platform requires one for a Red gate or any Critical finding.');
   if (report.approval_required) {
     const approvers = report.approvers_needed || [];
     html += `<div class="info-box" style="margin-top:12px">
       <strong>Approval required before release.</strong>
+      <div class="field-hint">${esc(_ab)}</div>
       ${approvers.length ? `<ul class="recs-list">${approvers.map(a => `<li>${esc(a)}</li>`).join('')}</ul>` : ''}
+    </div>`;
+  } else {
+    html += `<div class="info-box" style="margin-top:12px">
+      <strong>No human sign-off was requested for this release.</strong>
+      <div class="field-hint">${esc(_ab)}</div>
     </div>`;
   }
   if (report.human_oversight_required) {

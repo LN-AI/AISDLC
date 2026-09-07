@@ -793,6 +793,84 @@ def main_():
     # which is stricter than searching the file text.
 
 
+    # -- 13. The report cannot claim a sign-off nobody was asked for ---------
+    #
+    # `save_review` enqueues an approval on a Red gate or any Critical finding
+    # (`database.py`). The governance report re-derived its own answer as
+    # `gate_status in ("Amber", "Red")` -- so every Amber report told its reader a sign-off
+    # had been required when nobody was ever asked for one. That is an assertion about a
+    # control that did not run, inside the document whose entire purpose is to evidence
+    # that controls did run: the same class of defect as back-filling a compliance file
+    # list (D-345).
+    #
+    # C-38 decided 2026-09-07: fix the report, do not extend the queue. Extending it would
+    # raise approval volume for every existing customer at once and Amber is common.
+    section("13. Amber does not reach a human, and the report says so")
+
+    from backend.agents.governance_intelligence import report_generator as _rg13
+    from backend.services import finding_gate
+
+    check("an Amber gate with no Critical does not require sign-off",
+          finding_gate.requires_human_signoff("Amber", 0) is False)
+    check("a Red gate does", finding_gate.requires_human_signoff("Red", 0) is True)
+    check("...and so does a Critical under any gate",
+          finding_gate.requires_human_signoff("Amber", 1) is True)
+    check("a Green gate does not", finding_gate.requires_human_signoff("Green", 0) is False)
+
+    # The drift guard, and the check that would have caught the original defect: both
+    # readers must call the one function rather than spelling the rule out again.
+    _dbsrc13 = _i11.getsource(database.save_review)
+    check("`save_review` reads the shared rule rather than re-deriving it",
+          "requires_human_signoff" in _dbsrc13,
+          "two copies of this rule is how the report and the queue came to disagree")
+    _rgsrc13 = _i11.getsource(_rg13.ReportGeneratorAgent._build_report_document)
+    check("the governance report reads the same rule",
+          "requires_human_signoff" in _rgsrc13)
+    # Comments stripped first: the fix deliberately quotes the old predicate verbatim to
+    # record what it was, so searching the raw source would match the very comment
+    # explaining the removal. Naive splitting on `#` is fine here -- there is no `#` inside
+    # a string literal in that method.
+    _rgcode13 = "\n".join(ln.split("#", 1)[0] for ln in _rgsrc13.split("\n"))
+    check("...and no longer derives approval from the gate alone",
+          'gate_status in ("Amber", "Red")' not in _rgcode13,
+          "that predicate is what made an Amber report claim a sign-off")
+
+    _agent13 = _rg13.ReportGeneratorAgent()
+    _amber13 = _agent13._build_report_document(
+        project_name="P", all_findings=[{"control_id": "SEC-001", "severity": 4,
+                                         "title": "High but not critical", "description": "",
+                                         "recommendation": ""}],
+        review_results=[], gate_status="Amber", overall_risk_score=45.0,
+        llm_result={"summary": "s", "findings": [], "recommendations": []})
+    check("an Amber report does not claim an approval was required",
+          _amber13["approval_required"] is False, str(_amber13["approval_required"]))
+    check("...and states in words that none was requested",
+          "No human sign-off was requested" in _amber13.get("approval_basis", ""),
+          "silence is unreadable: 'never asked' and 'asked and granted' look identical")
+
+    _red13 = _agent13._build_report_document(
+        project_name="P", all_findings=[{"control_id": "SEC-003", "severity": 5,
+                                         "title": "Critical", "description": "",
+                                         "recommendation": ""}],
+        review_results=[], gate_status="Red", overall_risk_score=90.0,
+        llm_result={"summary": "s", "findings": [], "recommendations": []})
+    check("a Red report does claim one", _red13["approval_required"] is True)
+    check("...and says it is queued and blocking",
+          "approval queue" in _red13.get("approval_basis", ""),
+          str(_red13.get("approval_basis")))
+
+    # End to end: the queue itself must agree with the report. An Amber review with no
+    # Critical enqueues nothing, which is precisely what the old report denied.
+    _rid13 = database.save_review(
+        review_type="code", project_name="AmberProj", input_summary="amber",
+        input_content="x", result={"findings": [{"control_id": "SEC-001", "severity": 4,
+                                                 "title": "h", "description": "",
+                                                 "recommendation": ""}],
+                                   "gate_status": "Amber", "risk_score": 45.0,
+                                   "summary": "s"})
+    check("an Amber review really enqueues no approval",
+          database.get_pending_approval_for_review(_rid13) is None)
+
     print("\n" + "-" * 60)
     if _failures:
         print(f"FAILED: {len(_failures)} of {_checks} checks")

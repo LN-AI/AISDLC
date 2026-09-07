@@ -116,6 +116,27 @@ def reconcile_gate(
     return result
 
 
+def requires_human_signoff(gate_status: str, critical_count: int) -> bool:
+    """Whether this verdict actually puts a release in someone's approval queue.
+
+    **The one definition, because there used to be two and they disagreed.**
+    `database.save_review` enqueues on `gate_status == "Red" or critical_count > 0`; the
+    governance report re-derived its own answer as `gate_status in ("Amber", "Red")`. So a
+    report handed to an auditor stated that an Amber release had required sign-off when the
+    platform never asked anyone for it — a claim about a control that did not run, in the
+    document whose whole purpose is to evidence that controls did run. Same class of defect
+    as back-filling a compliance file list (D-345): the artifact asserting something nobody
+    established.
+
+    Amber deliberately does **not** reach a human (C-38, decided 2026-09-07: fix the report
+    rather than extend the queue, because extending it raises approval volume for every
+    existing customer at once and Amber is common). If that is ever revisited, this function
+    is the only place to change — `save_review` and the report both read it, so they cannot
+    drift apart again.
+    """
+    return gate_status == "Red" or (critical_count or 0) > 0
+
+
 def looks_degenerate(result: Dict[str, Any], input_text: str, min_input_chars: int = 200) -> Optional[str]:
     """Return a reason string if this result looks like a failed call dressed as a clean
     one, else None.
