@@ -173,6 +173,24 @@ async def github_webhook(request: Request):
         logger.warning("Webhook review refused for %s: %s", repo, detail)
         raise HTTPException(status, detail)
 
+    # ── How much of the pull request this push has to be reviewed against ──
+    #
+    # `synchronize` fires on every push, so an active 40-file pull request costs a full
+    # review per push — and that is the number that gets an integration switched off rather
+    # than fixed. On a push, review only the commits that have arrived since the last look.
+    #
+    # Never for `opened`, `reopened` or `ready_for_review`: those are the moments where
+    # scope matters more than cost, and for `opened` there is nothing earlier to compare
+    # against anyway.
+    #
+    # `before_sha=head_sha` excludes this push's own row. The webhook records its row after
+    # queueing, but a redelivery or a retry can mean it is already there, and comparing a
+    # sha with itself is a review of nothing.
+    since_sha = ""
+    if action == "synchronize" and config.INCREMENTAL_PR_REVIEW:
+        since_sha = database.last_reviewed_sha_for_pr(
+            repo, pr_url, before_sha=head_sha) or ""
+
     from backend.services.orchestrator import SDLCOrchestrator
 
     def _run(on_progress):
@@ -188,6 +206,11 @@ async def github_webhook(request: Request):
                 # integration turned off.
                 post_mode="summary",
                 set_status=True,
+                # Empty for anything but a push, and empty for the first push after the
+                # pull request opened. The workflow falls back to the whole diff on its own
+                # if the comparison is not a clean fast-forward — a force-push, a rebase —
+                # and says so on the result.
+                since_sha=since_sha,
                 on_progress=lambda done, total: on_progress(
                     done, total, f"Reviewed {done} of {total} piece(s)"),
             ),
@@ -202,6 +225,10 @@ async def github_webhook(request: Request):
         "job_id": job_id,
         "pull_request": pr_url,
         "commit": head_sha[:12],
+        # What this run will actually read. In GitHub's delivery log, which is where
+        # somebody looks when they want to know why a push cost what it cost.
+        "scope": (f"the commits since {since_sha[:12]}" if since_sha
+                  else "the whole pull request"),
         "poll_url": f"/api/review/jobs/{job_id}",
     }
 

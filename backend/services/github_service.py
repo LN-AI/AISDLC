@@ -787,10 +787,36 @@ class GitHubService:
         gate_emoji = {"Green": "✅", "Amber": "⚠️", "Red": "🔴"}.get(gate, "❓")
         severity_map = {5: "🔴 Critical", 4: "🟠 High", 3: "🟡 Moderate", 2: "🔵 Minor", 1: "⚪ Low"}
 
+        def _carried_note(f: Dict[str, Any]) -> str:
+            """The label on a finding this run did not find itself."""
+            return (" _(carried from an earlier review of this pull request; this run did "
+                    "not re-read the file)_" if f.get("carried_forward") else "")
+
         lines = [
             f"## {gate_emoji} LM AI-SDLC Review — Gate: **{gate}** · Risk **{score:.0f}/100**",
             "",
         ]
+
+        # What this run actually read. A Green gate on a comment that does not say it only
+        # looked at the last two commits is a comment that says something untrue by
+        # omission — and it is the same sentence that explains why the carried findings
+        # below were not found by this run.
+        inc = review_result.get("incremental") or {}
+        if inc.get("since_sha"):
+            lines += [
+                f"> Reviewed the **{inc.get('commits', 0)} commit(s) pushed since "
+                f"`{str(inc['since_sha'])[:12]}`** — {inc.get('files_reviewed', 0)} of the "
+                f"{inc.get('files_in_pr', 0)} file(s) this pull request changes. Findings "
+                f"still open from earlier reviews of this pull request are listed below and "
+                f"still count toward the gate."
+                + (f" [Compare]({inc['compare_url']})" if inc.get("compare_url") else ""),
+                "",
+            ]
+        elif inc.get("attempted") and not inc.get("used"):
+            lines += [
+                f"> Reviewed the **whole pull request**: {inc.get('reason', 'unknown')}.",
+                "",
+            ]
 
         # The counts row. "3 new, 41 already seen" is the difference between a comment a team
         # acts on and the tenth identical comment they mute.
@@ -846,7 +872,7 @@ class GitHubService:
                 new_tag = " 🆕" if f.get("is_new") else ""
                 lines.append(
                     f"**{sev_label}{blocking}{new_tag}** — `{f.get('control_id', 'N/A')}` "
-                    f"{f.get('title', '')}"
+                    f"{f.get('title', '')}{_carried_note(f)}"
                 )
                 # The location. The single most important thing this comment was missing.
                 where = self._format_location(f)
@@ -1015,6 +1041,16 @@ class GitHubService:
         return {
             "base": base, "head": head, "diff": text,
             "head_sha": head_sha,
+            # GitHub's own verdict on the relationship: `ahead` (head has commits base does
+            # not, and none the other way), `behind`, `diverged`, `identical`. An
+            # incremental review is only sound when it is `ahead` — after a force-push or a
+            # rebase the old sha is no longer an ancestor, so `old...new` is not "what
+            # changed since we last looked" and reviewing it would miss code and mislabel
+            # the rest. Reported rather than inferred from the diff, because a diverged
+            # compare still returns a perfectly plausible-looking one.
+            "status": meta.get("status") or "",
+            "ahead_by": meta.get("ahead_by") or 0,
+            "behind_by": meta.get("behind_by") or 0,
             "diff_truncated": truncated, "diff_full_chars": full,
             "truncation_reason": (
                 f"The {base}...{head} diff was truncated to {self.MAX_DIFF_CHARS:,} of "

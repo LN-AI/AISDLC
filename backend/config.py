@@ -117,6 +117,24 @@ JOB_STALE_MINUTES = int(os.getenv("JOB_STALE_MINUTES", "30"))
 # problem into one a malicious page could trigger from a colleague's browser.
 #
 # The bundled SPA is served from this same origin and needs nothing here, so the default is
+# Whether a push to an open pull request re-reviews the whole diff or only the commits
+# that have arrived since the last review. On by default, and the reasoning is a trade
+# rather than a free win:
+#
+#   * **For:** `synchronize` fires on every push, so an active 40-file pull request costs a
+#     full review per push. That is the number that gets an integration switched off, and
+#     the gate stays correct because still-open findings from earlier pushes are carried
+#     into the new result and still vote (see `workflows/review_pr.py`).
+#   * **Against:** files changed two pushes ago are not re-read, so a problem that only
+#     appears in the interaction between old and new code is not seen until the next full
+#     review. That is a genuine reduction in what a single run covers.
+#
+# `opened`, `reopened` and `ready_for_review` are always full reviews — those are the
+# moments where scope matters more than cost. Set to 0/false for a full review on every
+# push.
+INCREMENTAL_PR_REVIEW = os.getenv("INCREMENTAL_PR_REVIEW", "true").strip().lower() not in (
+    "0", "false", "no", "off")
+
 # empty — no cross-origin browser access. Set `CORS_ALLOW_ORIGINS` to a comma-separated
 # list of exact origins (scheme, host and port, no trailing slash) for a separately hosted
 # front end. Server-to-server callers using `X-API-Key` are unaffected: CORS is a browser

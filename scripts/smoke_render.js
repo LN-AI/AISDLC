@@ -1961,6 +1961,57 @@ check('a result from before suppression existed still renders', () => {
     throw new Error('an absent report was rendered as an empty one');
 });
 
+check('an incremental review says how much of the pull request it read', () => {
+  // A Green gate on a stored incremental review is otherwise indistinguishable from a
+  // Green gate over the whole change, which is a claim the run did not make.
+  const html = sandbox.renderReviewTransparency({
+    gate_status: 'Red',
+    incremental: { since_sha: 'abcdef0123456789', head_sha: 'b'.repeat(40), commits: 3,
+                   files_reviewed: 1, files_in_pr: 12, carried_findings: 2 },
+  });
+  if (!html.includes('3 commit(s)')) throw new Error('the commit count is not stated');
+  if (!html.includes('abcdef012345')) throw new Error('the commit it read from is not named');
+  if (!html.includes('12')) throw new Error('the size of the whole pull request is not stated');
+  if (!/cannot\s+turn a blocked pull request Green/.test(html.replace(/\s+/g, ' ')))
+    throw new Error('nothing explains why a narrower run is still a trustworthy gate');
+});
+
+check('...and says so differently when nothing was left open', () => {
+  const html = sandbox.renderReviewTransparency({
+    incremental: { since_sha: 'abcdef0123456789', commits: 1, files_reviewed: 1,
+                   files_in_pr: 4, carried_findings: 0 },
+  });
+  if (!html.includes('left nothing open'))
+    throw new Error('a reader cannot tell "nothing carried" from "nothing checked"');
+});
+
+check('an incremental review that was not possible says why', () => {
+  const html = sandbox.renderReviewTransparency({
+    incremental: { attempted: true, used: false,
+                   reason: 'the branch was rewritten since the last review' },
+  });
+  if (!html.includes('whole pull request'))
+    throw new Error('it does not say what it did instead');
+  if (!html.includes('rewritten'))
+    throw new Error('"why did this push cost a full review" has no answer');
+});
+
+check('a carried finding is labelled as one', () => {
+  const html = sandbox.renderFinding({
+    title: 'SQL injection', severity: 5, file_path: 'app/old.py', line_start: 2,
+    carried_forward: true, carried_from_review: 'r-1',
+    evidence_verified: null,
+  });
+  if (!html.includes('carried forward'))
+    throw new Error('a finding this run never verified is presented as one it did');
+});
+
+check('a result from before incremental review existed still renders', () => {
+  const html = sandbox.renderReviewTransparency({ gate_status: 'Green', findings: [] });
+  if (/commit\(s\)/.test(html))
+    throw new Error('an absent incremental block was rendered as an empty one');
+});
+
 check('the source and what was filtered out of it is stated on the result', () => {
   const html = sandbox.renderReviewTransparency({
     source: { label: 'acme/app@main', source_type: 'github_repo',

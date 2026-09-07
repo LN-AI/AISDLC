@@ -114,6 +114,15 @@ several agents in parallel behind one policy-enforced gate decision.
   OpenAI-compatible credentials (`PUT /api/v1/llm-config`, X-API-Key auth) instead of the
   platform's shared account, or override a single call via `llm_provider` / `llm_api_key` /
   `llm_base_url` / `llm_model` fields on any agent request.
+- **Incremental review on a push** — `synchronize` fires every time somebody pushes, so an
+  active 40-file pull request used to cost a full review per push. A push now reviews only
+  the commits that have arrived since the last look. The gate stays correct because
+  still-open findings from earlier reviews of the same pull request are **carried into the
+  new result and still vote** — a clean push cannot turn a blocked pull request Green — and
+  the comment names the commit range it read. Anything but a clean fast-forward (a
+  force-push, a rebase, a comparison GitHub will not answer) falls back to the whole diff
+  and says why. `INCREMENTAL_PR_REVIEW=0` turns it off; the trade it makes is that files
+  changed two pushes ago are not re-read.
 - **Notifications** — a blocked review can reach a Slack, Teams or your own webhook
   instead of waiting for somebody to open a tab. One https URL per channel, per project,
   encrypted and never shown again. Delivery is a **durable row written inside the review's

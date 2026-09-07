@@ -3889,6 +3889,84 @@ def resolve_github_token(project_id: Optional[str], owner_repo: str = "") -> Dic
     }
 
 
+def last_reviewed_sha_for_pr(repo: str, pr_url: str,
+                             before_sha: str = "") -> Optional[str]:
+    """The commit this pull request was last reviewed at, or None.
+
+    What makes an incremental review possible: `<that sha>...<the new head>` is the code
+    that has arrived since anybody looked. Read from `webhook_reviews` because that table
+    already records exactly one row per (repo, reviewed sha) and is the same bookkeeping
+    that stops a redelivered event being paid for twice.
+
+    `before_sha` excludes the row for the push being handled right now — the webhook
+    records its own row *after* queueing, but a redelivery or a retry can mean it is
+    already there, and comparing a sha against itself yields an empty diff and a review of
+    nothing.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    params: tuple = (repo, pr_url)
+    clause = ""
+    if before_sha:
+        clause = " AND head_sha != ?"
+        params += (before_sha,)
+    row = cursor.execute(
+        f"SELECT head_sha FROM webhook_reviews WHERE repo = ? AND pr_url = ?{clause} "
+        f"ORDER BY created_at DESC LIMIT 1",
+        params,
+    ).fetchone()
+    conn.close()
+    return (dict(row).get("head_sha") or None) if row else None
+
+
+def open_findings_for_pr(project_id: Optional[str], repo_owner: str, repo_name: str,
+                         pr_number: int, exclude_review_id: str = "") -> List[Dict[str, Any]]:
+    """Findings still open from earlier reviews of this same pull request.
+
+    An incremental review reads only the newest commits, so a Critical raised two pushes
+    ago in a file this run never opened would simply be absent — and absent reads as fixed.
+    These are carried into the new result so the gate still blocks and the comment still
+    lists them, labelled as carried rather than found again.
+
+    Keyed on the pull request, not the repository: another open pull request's findings are
+    not this one's problem, and flooring this gate with them would make a branch
+    unmergeable for somebody else's work.
+
+    One row per fingerprint, newest review first. `MAX(r.created_at)` is deliberately not
+    used — this needs the *whole* row, and mixing an aggregate with bare columns is the
+    defect C-81 records; the window function picks a specific row instead.
+    """
+    if not (repo_owner and repo_name and pr_number):
+        return []
+    where = ["f.status = 'open'", "f.fingerprint IS NOT NULL",
+             "r.repo_owner = ?", "r.repo_name = ?", "r.pr_number = ?"]
+    params: List[Any] = [repo_owner, repo_name, int(pr_number)]
+    if project_id:
+        where.append("f.project_id = ?")
+        params.append(project_id)
+    else:
+        where.append("f.project_id IS NULL")
+    if exclude_review_id:
+        where.append("f.review_id != ?")
+        params.append(exclude_review_id)
+    conn = get_connection()
+    cursor = conn.cursor()
+    rows = cursor.execute(
+        f"""SELECT * FROM (
+                SELECT f.*, r.created_at AS review_created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.fingerprint ORDER BY r.created_at DESC
+                       ) AS rn
+                FROM findings f JOIN reviews r ON r.id = f.review_id
+                WHERE {' AND '.join(where)}
+            ) WHERE rn = 1
+            ORDER BY severity DESC, review_created_at DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def record_webhook_review(repo: str, head_sha: str, pr_url: str, job_id: str,
                           delivery_id: str = "") -> None:
     """Remember that this commit has been reviewed. Idempotent by (repo, head_sha)."""

@@ -39,7 +39,8 @@ os.environ.setdefault("SECRET_KEY", "smoke-secret-key-not-for-production")
 
 from backend import config, database  # noqa: E402
 from backend.services import (  # noqa: E402
-    code_chunker, finding_pipeline, llm_gateway, review_estimate, source_bundle,
+    code_chunker, finding_gate, finding_pipeline, llm_gateway, review_estimate,
+    source_bundle,
 )
 from backend.services import sarif as sarif_mod  # noqa: E402
 
@@ -100,6 +101,90 @@ DIFF = (
     '+    query = "SELECT * FROM users WHERE name=" + u\n'
     "     return conn.execute(query)\n"
 )
+
+
+# ── Fixtures for the incremental pull-request review (section 33) ─────────
+#
+# Two diffs: the whole pull request, and the slice one push added. The point of the pair is
+# that a check can tell which of them reached the model — `app/old.py` appears only in the
+# full one.
+_PR33 = "https://github.com/acme/portal/pull/42"
+
+_FULL_DIFF33 = (
+    "diff --git a/app/old.py b/app/old.py\n"
+    "--- a/app/old.py\n"
+    "+++ b/app/old.py\n"
+    "@@ -1,2 +1,3 @@\n"
+    " import os\n"
+    "+query = \"SELECT * FROM t WHERE u=\" + u\n"
+    " return query\n"
+    "diff --git a/app/new.py b/app/new.py\n"
+    "--- /dev/null\n"
+    "+++ b/app/new.py\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+def run(cmd):\n"
+    "+    os.system(cmd)\n"
+)
+
+_SLICE_DIFF33 = (
+    "diff --git a/app/new.py b/app/new.py\n"
+    "--- /dev/null\n"
+    "+++ b/app/new.py\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+def run(cmd):\n"
+    "+    os.system(cmd)\n"
+)
+
+_PRIOR_FINDING33 = dict(
+    control_id="SEC-003", severity=5, risk_level="Critical",
+    title="SQL injection in the old handler",
+    description="User input concatenated into a query.",
+    recommendation="Parameterize it.", is_blocking=True,
+    file_path="app/old.py", line_start=2, confidence="High",
+    evidence='query = "SELECT * FROM t WHERE u=" + u',
+)
+_PRIOR_FINGERPRINT33 = finding_pipeline.fingerprint(_PRIOR_FINDING33)
+_PRIOR_FINDING33["fingerprint"] = _PRIOR_FINGERPRINT33
+
+
+def _seed_pr_review33(project_id=None, pr_number=42):
+    """A previous review of the same pull request, with one Critical left open.
+
+    Written directly rather than run through the workflow, because what is under test is
+    the *lookup*: a wrong repository, a wrong pull-request number, or a `pr_number` column
+    nothing ever populated all produce an empty carry-forward list and a wrongly Green
+    gate, and every one of those failures is silent.
+    """
+    import uuid as _u33
+    from datetime import datetime as _dt33
+    rid = str(_u33.uuid4())
+    conn = database.get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO reviews (id, review_type, project_name, project_id, input_summary, "
+        "input_content, result_json, findings_count, critical_count, high_count, "
+        "risk_score, gate_status, created_at, repo_host, repo_owner, repo_name, branch, "
+        "commit_sha, pr_number) VALUES (?, 'code', 'Add the thing', ?, 'PR #42', '', '{}', "
+        "1, 1, 0, 90.0, 'Red', ?, 'github.com', 'acme', 'portal', 'feature', ?, ?)",
+        (rid, project_id, _dt33.utcnow().isoformat(), "a" * 40, pr_number),
+    )
+    # No `created_at` on `findings`: a finding takes its date from the review it belongs
+    # to, which is why `open_findings_for_pr` orders on the joined `reviews.created_at`.
+    cur.execute(
+        "INSERT INTO findings (id, review_id, control_id, severity, risk_level, title, "
+        "description, recommendation, is_blocking, status, fingerprint, file_path, "
+        "line_start, evidence, project_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?, ?, ?, ?)",
+        (str(_u33.uuid4()), rid, _PRIOR_FINDING33["control_id"],
+         _PRIOR_FINDING33["severity"], _PRIOR_FINDING33["risk_level"],
+         _PRIOR_FINDING33["title"], _PRIOR_FINDING33["description"],
+         _PRIOR_FINDING33["recommendation"], _PRIOR_FINGERPRINT33,
+         _PRIOR_FINDING33["file_path"], _PRIOR_FINDING33["line_start"],
+         _PRIOR_FINDING33["evidence"], project_id),
+    )
+    conn.commit()
+    conn.close()
+    return rid
 
 
 def make_zip(files):
@@ -2916,6 +3001,314 @@ def main():
         check("an unsupported algorithm is refused",
               _wh._verify(WEBHOOK_SECRET, body, "sha1=" + "0" * 40) is False)
         check("a missing header is refused", _wh._verify(WEBHOOK_SECRET, body, None) is False)
+        # ── 33. Incremental review of a pull request ─────────────────────
+        #
+        # `synchronize` fires on every push, so an active pull request cost a full review
+        # per push. The saving is obvious; the danger is the whole of the work. A run that
+        # reads only the newest commits does not see a Critical raised two pushes ago in a
+        # file it never opened — **and an absent finding reads as a fixed one**, so the
+        # stored gate goes Green and `set_commit_status` clears the merge button.
+        #
+        # Everything below is about that one property.
+        section("33. An incremental review cannot turn a blocked pull request Green")
+
+        from backend.workflows import review_pr as _rp33
+
+        class _GH33:
+            """A GitHub stub that records what was asked of it.
+
+            Two calls matter: `get_pr_diff` (the whole pull request) and `get_compare_diff`
+            (the slice). Which of them the diff came from is the question.
+            """
+
+            def __init__(self, compare=None, compare_error=None):
+                self.compare = compare
+                self.compare_error = compare_error
+                self.asked = []
+                self.comments = []
+
+            def get_pr_diff(self, pr_url):
+                self.asked.append(("pr", pr_url))
+                return {
+                    "pr_number": 42, "title": "Add the thing", "description": "",
+                    "author": "dev", "base_branch": "main", "head_branch": "feature",
+                    "head_sha": "b" * 40, "base_sha": "a" * 40,
+                    "head_repo": "acme/portal", "base_repo": "acme/portal",
+                    "from_fork": False, "maintainer_can_modify": True,
+                    "diff": _FULL_DIFF33, "diff_truncated": False,
+                    "diff_full_chars": len(_FULL_DIFF33),
+                    "files_changed": ["app/old.py", "app/new.py"],
+                    "additions": 4, "deletions": 0, "url": pr_url,
+                }
+
+            def get_compare_diff(self, repo_url, base, head):
+                self.asked.append(("compare", base, head))
+                if self.compare_error:
+                    raise RuntimeError(self.compare_error)
+                return dict(self.compare, base=base, head=head)
+
+            def get_file_content_at_ref(self, owner, repo, path, ref):
+                raise RuntimeError("404 Not Found")
+
+            def parse_pr_url(self, pr_url):
+                return ("acme", "portal", 42)
+
+            def get_pr_head_sha(self, pr_url):
+                return "b" * 40
+
+            def format_pr_review_comment(self, result, result_url=""):
+                from backend.services.github_service import GitHubService
+                return GitHubService.format_pr_review_comment(self, result, result_url)
+
+            def _format_location(self, f):
+                return f"`{f.get('file_path', '')}`"
+
+            MAX_COMMENT_FINDINGS = 20
+            COMMENT_MARKER = "<!-- lm-ai-sdlc:review -->"
+
+            def upsert_pr_comment(self, pr_url, body):
+                self.comments.append(body)
+                return {"posted": True}
+
+            def set_commit_status(self, owner, repo, sha, gate, description=""):
+                return {"set": True, "gate": gate}
+
+        class _Orch33:
+            def __init__(self, gh, agent):
+                self.github = gh
+                self.code_agent = agent
+
+        class _Agent33:
+            """Records the diff it was shown, and answers with whatever is scripted."""
+
+            def __init__(self):
+                self.seen = []
+                self.answer = None
+                self.suppression = "unset"
+
+            def review_code(self, code="", language="", context="", files=None,
+                            is_diff=None, coverage_incomplete=False, coverage_reason="",
+                            extra_findings=None, suppression=None, on_progress=None,
+                            **kw):
+                self.seen.append({"code": code, "context": context,
+                                  "coverage_incomplete": coverage_incomplete})
+                self.suppression = suppression
+                out = dict(self.answer or {"findings": [], "gate_status": "Green",
+                                           "risk_score": 0.0, "summary": "Clean."})
+                finding_gate.reconcile_gate(out)
+                return out
+
+        _NEW33 = dict(
+            control_id="SEC-001", severity=5, risk_level="Critical",
+            title="Command injection in the new helper", description="Shell out.",
+            recommendation="Use argv.", is_blocking=True, file_path="app/new.py",
+            line_start=2, evidence="os.system(cmd)", confidence="High",
+        )
+
+        # ── The saving: only the new commits reach the model ─────────────
+        _gh33 = _GH33(compare={
+            "diff": _SLICE_DIFF33, "status": "ahead", "ahead_by": 2, "behind_by": 0,
+            "head_sha": "b" * 40, "diff_truncated": False,
+            "diff_full_chars": len(_SLICE_DIFF33),
+            "files_changed": ["app/new.py"],
+            "url": "https://github.com/acme/portal/compare/aaa...bbb",
+        })
+        _ag33 = _Agent33()
+        _ag33.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                        "summary": "The new commits are clean."}
+        _out33 = _rp33.run(_Orch33(_gh33, _ag33), pr_url=_PR33,
+                           post_mode="none", set_status=False, since_sha="a" * 40)
+        check("a push reviews only the commits since the last review",
+              "app/new.py" in _ag33.seen[0]["code"]
+              and "app/old.py" not in _ag33.seen[0]["code"],
+              "the model was shown: " + _ag33.seen[0]["code"][:120])
+        check("...asked for as a compare of the two commits",
+              ("compare", "a" * 40, "b" * 40) in _gh33.asked, str(_gh33.asked))
+        check("...and the reviewer is told it is seeing part of a pull request",
+              "INCREMENTAL review" in _ag33.seen[0]["context"],
+              "otherwise it reports a control missing when the file that implements it "
+              "simply was not in this push")
+        check("...and told the whole pull request's file list anyway",
+              "app/old.py" in _ag33.seen[0]["context"], _ag33.seen[0]["context"][:300])
+        check("a narrowed scope does not clamp the gate to Amber",
+              _out33["review_result"]["gate_status"] == "Green",
+              "the coverage clamp is for code nobody chose to skip; clamping a deliberate "
+              "narrowing would mean a clean push could never be Green, which is the point")
+        check("the result says what it read",
+              _out33["incremental"].get("commits") == 2
+              and _out33["incremental"].get("files_reviewed") == 1
+              and _out33["incremental"].get("files_in_pr") == 2,
+              str(_out33["incremental"]))
+        check("...and the comment says so too, before the gate is believed",
+              "commit(s) pushed since" in (_out33.get("comment_preview") or ""),
+              (_out33.get("comment_preview") or "")[:300])
+
+        # ── The danger: an earlier Critical must still block ─────────────
+        #
+        # Written straight into the database as a previous review of the same pull request,
+        # because what is under test is the *lookup* — a wrong repository, a wrong PR
+        # number or a missing `pr_number` column all produce an empty list and a wrongly
+        # Green gate, and each of those is a silent failure.
+        _prior33 = _seed_pr_review33(project_id=None, pr_number=42)
+        _gh33b = _GH33(compare={
+            "diff": _SLICE_DIFF33, "status": "ahead", "ahead_by": 1, "behind_by": 0,
+            "head_sha": "b" * 40, "diff_truncated": False,
+            "diff_full_chars": len(_SLICE_DIFF33),
+            "files_changed": ["app/new.py"],
+            "url": "https://github.com/acme/portal/compare/aaa...bbb",
+        })
+        _ag33b = _Agent33()
+        _ag33b.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                         "summary": "The new commits are clean."}
+        _out33b = _rp33.run(_Orch33(_gh33b, _ag33b), pr_url=_PR33,
+                            post_mode="none", set_status=False, since_sha="a" * 40)
+        _res33b = _out33b["review_result"]
+        _carried33 = [f for f in _res33b["findings"] if f.get("carried_forward")]
+        check("a still-open finding from an earlier push is carried into this run",
+              len(_carried33) == 1, str([f.get("title") for f in _res33b["findings"]]))
+        check("...so a clean push cannot turn a blocked pull request Green",
+              _res33b["gate_status"] == "Red", _res33b["gate_status"])
+        check("...and it is labelled as carried, not as found",
+              _carried33 and _carried33[0]["carried_from_review"] == _prior33,
+              str(_carried33[0] if _carried33 else None)[:200])
+        check("...with its evidence neither claimed nor denied",
+              _carried33 and _carried33[0]["evidence_verified"] is None
+              and "did not re-read" in (_carried33[0].get("evidence_note") or ""),
+              "it was verified against the file *then*; this run never opened the file, so "
+              "asserting either answer would be a claim about code nobody read")
+        check("...and the comment says which findings this run did not find",
+              "carried from an earlier review" in (_out33b.get("comment_preview") or ""),
+              (_out33b.get("comment_preview") or "")[:400])
+        check("the model's own verdict is still recorded, not overwritten by the re-floor",
+              _res33b.get("model_gate_status") == "Green",
+              str(_res33b.get("model_gate_status"))
+              + " -- reconcile_gate reads gate_status as the model's answer, so a second "
+                "call would replace it with the already-floored value and the suite could "
+                "no longer measure model-versus-arithmetic disagreement")
+
+        # A finding this run *did* find again must not appear twice.
+        _ag33c = _Agent33()
+        _ag33c.answer = {"findings": [dict(_PRIOR_FINDING33)], "gate_status": "Red",
+                         "risk_score": 90.0, "summary": "Still there."}
+        _out33c = _rp33.run(_Orch33(_GH33(compare=dict(_gh33b.compare)), _ag33c),
+                            pr_url=_PR33, post_mode="none", set_status=False,
+                            since_sha="a" * 40)
+        _same33 = [f for f in _out33c["review_result"]["findings"]
+                   if f.get("fingerprint") == _PRIOR_FINGERPRINT33]
+        check("a finding found again is not also carried",
+              len(_same33) == 1, f"{len(_same33)} copies of the same fingerprint")
+        check("...and the one that survives is the one this run actually verified",
+              _same33 and not _same33[0].get("carried_forward"), str(_same33[0])[:200])
+
+        # ── The fallbacks, all of which review the whole thing ───────────
+        for _label, _kwargs, _reason in (
+            ("a force-push or a rebase",
+             {"compare": {"diff": _SLICE_DIFF33, "status": "diverged", "ahead_by": 1,
+                          "behind_by": 3, "head_sha": "b" * 40, "diff_truncated": False,
+                          "diff_full_chars": 10, "files_changed": [], "url": ""}},
+             "rewritten"),
+            ("a comparison GitHub will not answer",
+             {"compare_error": "422 no common ancestor"}, "could not be fetched"),
+            ("a push that changes no reviewable code",
+             {"compare": {"diff": "   ", "status": "ahead", "ahead_by": 1, "behind_by": 0,
+                          "head_sha": "b" * 40, "diff_truncated": False,
+                          "diff_full_chars": 3, "files_changed": [], "url": ""}},
+             "no reviewable code"),
+        ):
+            _ghx = _GH33(**_kwargs)
+            _agx = _Agent33()
+            _agx.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                           "summary": "Clean."}
+            _outx = _rp33.run(_Orch33(_ghx, _agx), pr_url=_PR33, post_mode="none",
+                              set_status=False, since_sha="a" * 40)
+            check(f"{_label} falls back to the whole pull request",
+                  "app/old.py" in _agx.seen[0]["code"],
+                  "the model was shown: " + _agx.seen[0]["code"][:120])
+            check(f"...and the result says why, rather than silently costing more",
+                  _reason in (_outx["incremental"].get("reason") or ""),
+                  str(_outx["incremental"]))
+
+        # Comparing a commit with itself is a review of nothing, so it must not happen.
+        _ghs = _GH33(compare=dict(_gh33b.compare))
+        _ags = _Agent33()
+        _ags.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                       "summary": "Clean."}
+        _rp33.run(_Orch33(_ghs, _ags), pr_url=_PR33, post_mode="none", set_status=False,
+                  since_sha="b" * 40)
+        check("a sha equal to the head is not compared with itself",
+              not any(a[0] == "compare" for a in _ghs.asked), str(_ghs.asked))
+
+        # With no `since_sha` at all — every non-push event — nothing changes.
+        _ghn = _GH33()
+        _agn = _Agent33()
+        _agn.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                       "summary": "Clean."}
+        _outn = _rp33.run(_Orch33(_ghn, _agn), pr_url=_PR33, post_mode="none",
+                          set_status=False)
+        check("without a previous review the whole pull request is read, and nothing is said",
+              "app/old.py" in _agn.seen[0]["code"] and not _outn["incremental"],
+              str(_outn["incremental"]))
+
+        # ── The bookkeeping the webhook reads ────────────────────────────
+        database.record_webhook_review("acme/portal", "c" * 40, _PR33, "job-1", "d1")
+        database.record_webhook_review("acme/portal", "d" * 40, _PR33, "job-2", "d2")
+        check("the last reviewed commit for a pull request is the newest one",
+              database.last_reviewed_sha_for_pr("acme/portal", _PR33) == "d" * 40,
+              str(database.last_reviewed_sha_for_pr("acme/portal", _PR33)))
+        check("...excluding the push being handled right now",
+              database.last_reviewed_sha_for_pr(
+                  "acme/portal", _PR33, before_sha="d" * 40) == "c" * 40,
+              "the webhook records its own row after queueing, and a redelivery would "
+              "otherwise compare a sha with itself")
+        check("another pull request in the same repository is not confused with this one",
+              database.last_reviewed_sha_for_pr(
+                  "acme/portal", "https://github.com/acme/portal/pull/99") is None)
+        check("a repository with no reviewed pushes yields nothing rather than an error",
+              database.last_reviewed_sha_for_pr("acme/other", _PR33) is None)
+
+        # And the repository dimension, which pull-request reviews never recorded at all.
+        _stored33 = database.get_review(_out33b["review_id"])
+        check("a pull-request review now records which repository it was of",
+              _stored33.get("repo_owner") == "acme" and _stored33.get("repo_name") == "portal",
+              f"owner={_stored33.get('repo_owner')!r} name={_stored33.get('repo_name')!r} "
+              f"-- every PR review ever stored had NULL here, so `GET /api/repositories`, "
+              f"the findings repo filter and the carry-forward lookup were all blind to "
+              f"the one source where the repository is least ambiguous")
+        check("...and which pull request", _stored33.get("pr_number") == 42,
+              str(_stored33.get("pr_number")))
+        check("...and at which commit", _stored33.get("commit_sha") == "b" * 40,
+              str(_stored33.get("commit_sha")))
+        check("the repository's ignore rules are offered to a pull-request review",
+              _ag33b.suppression is not None,
+              "a `.lmignore` in the repository has to reach the review that reads its diff, "
+              "and the fetch fails open -- this stub answers 404, which is the common case")
+
+        # Which scope the *webhook* asks for. Checked on the source rather than by firing a
+        # delivery, because the decision is three lines of policy — only a push, only when
+        # the switch is on, never against this push's own sha — and each of them is a
+        # different way to get a review of nothing or a review of everything.
+        import inspect as _i33
+        from backend.routes import github_webhook as _wh33
+        _whsrc33 = _i33.getsource(_wh33.github_webhook)
+        check("only a push asks for an incremental review",
+              'action == "synchronize"' in _whsrc33,
+              "opened, reopened and ready_for_review are the moments where scope matters "
+              "more than cost, and `opened` has nothing earlier to compare against")
+        check("...and only when the switch is on",
+              "config.INCREMENTAL_PR_REVIEW" in _whsrc33)
+        check("...and never against the sha being reviewed right now",
+              "before_sha=head_sha" in _whsrc33,
+              "the webhook records its own row after queueing, so a redelivery would "
+              "compare a commit with itself and review nothing")
+        check("the switch defaults to on, and can be turned off",
+              config.INCREMENTAL_PR_REVIEW is True
+              and "INCREMENTAL_PR_REVIEW" in _i33.getsource(config),
+              str(config.INCREMENTAL_PR_REVIEW))
+        check("the delivery response says which scope was chosen",
+              '"scope"' in _whsrc33,
+              "GitHub's delivery log is where somebody looks to find out why a push cost "
+              "what it cost")
+
         # ── 32. Suppression as code, end to end ──────────────────────────
         #
         # Section 13 of `smoke_code_review.py` covers the rules themselves. What only

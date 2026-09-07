@@ -158,6 +158,16 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   price table. `sarif.py` exports a finished review in the format GitHub code scanning and
   most security dashboards read.
 
+  **A push reviews only what the push added.** `workflows/review_pr.py` takes a
+  `since_sha`, and `routes/github_webhook.py` supplies it on `synchronize` only — so an
+  active pull request costs one slice per push rather than a full review per push. The
+  property that makes it safe is `_carry_forward`: still-open findings from earlier reviews
+  of **the same pull request** (`database.open_findings_for_pr`, keyed on `pr_number`) are
+  appended to this run's findings, labelled `carried_forward`, and re-floored through
+  `finding_gate.reconcile_gate` — because a run that never opened a file cannot see the
+  Critical in it, and an absent finding otherwise reads as a fixed one. Read D-341 before
+  changing any of it; the fallbacks are wide on purpose.
+
   **One screen reviews everything, including pull requests.** The separate GitHub PR screen
   is retired (D-267); its nav item opens the review screen with the source pre-set, and the
   post-back options appear only for a pull-request source. The *products* are still two: a
@@ -258,7 +268,7 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
 Required: `ANTHROPIC_API_KEY`. **`GITHUB_TOKEN` is now a fallback, not the only option** —
 per-project credentials live in the `github_credentials` table (encrypted, managed at
 `/api/v1/github-credentials`, settable from the review screens) and take precedence over it;
-see D-236. Optional: `GITHUB_TOKEN` (fine-grained PAT, "Pull requests: Read and Write" — needed for GitHub PR/Auto-Fix features; public repos/PRs/issues work without it. **Also "Contents: Read and Write"** if you use the modernization PR workflow, which pushes a converted tree to a branch rather than only commenting), `DATABASE_PATH` (default `sdlc_agent.db`), `CLAUDE_MODEL` (default `claude-sonnet-4-6`), `MAX_TOKENS`, `APP_ENV`, `SECRET_KEY` (JWT/crypto — must be changed for production). Also present in `backend/config.py` but not in `.env.example`: `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`/`JIRA_PROJECT` (optional Jira integration), `DEFAULT_ADMIN_PASSWORD` (defaults to a hardcoded value — flag this if touching real deployment config), `COST_OPTIMIZATION_ENABLED`, `MAX_AGENT_INPUT_CHARS`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `PUBLIC_BASE_URL` (only for the modernization build loop — the address a GitHub Actions runner posts diagnostics back to; it cannot be derived from the request behind a proxy).
+see D-236. Optional: `GITHUB_TOKEN` (fine-grained PAT, "Pull requests: Read and Write" — needed for GitHub PR/Auto-Fix features; public repos/PRs/issues work without it. **Also "Contents: Read and Write"** if you use the modernization PR workflow, which pushes a converted tree to a branch rather than only commenting), `DATABASE_PATH` (default `sdlc_agent.db`), `CLAUDE_MODEL` (default `claude-sonnet-4-6`), `MAX_TOKENS`, `APP_ENV`, `SECRET_KEY` (JWT/crypto — must be changed for production). Also present in `backend/config.py` but not in `.env.example`: `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`/`JIRA_PROJECT` (optional Jira integration), `DEFAULT_ADMIN_PASSWORD` (defaults to a hardcoded value — flag this if touching real deployment config), `INCREMENTAL_PR_REVIEW` (default **true** — a push to an open pull request reviews only the commits since the last review; see D-341 for the trade it makes and why the gate stays correct), `COST_OPTIMIZATION_ENABLED`, `MAX_AGENT_INPUT_CHARS`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `PUBLIC_BASE_URL` (only for the modernization build loop — the address a GitHub Actions runner posts diagnostics back to; it cannot be derived from the request behind a proxy).
 
 ## Windows-specific note
 

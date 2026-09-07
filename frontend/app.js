@@ -2302,6 +2302,13 @@ function renderFinding(f) {
   if (f.suppressed_reason) {
     marks.push(`<span class="mark-chip" title="Not counted toward the gate. This is the rule that did it -- change the rule to get the finding back.">not counted: ${esc(f.suppressed_reason)}</span>`);
   }
+  // A finding this run did not find. It is here because an earlier review of the same pull
+  // request raised it and it is still open, so it still blocks — but the file was not
+  // re-read, and presenting it as though it had been would be a claim about code nobody
+  // looked at.
+  if (f.carried_forward) {
+    marks.push('<span class="mark-chip" title="Reported by an earlier review of this pull request and still open. This run reviewed only the newest commits and did not re-read this file.">carried forward</span>');
+  }
   const markRow = marks.length ? `<div class="mark-row">${marks.join('')}</div>` : '';
 
   return `
@@ -10694,6 +10701,28 @@ function renderReviewTransparency(r) {
         it and where that rule lives. Nothing is deleted, so you can always overrule it.</div>
       ${r.suppressed_findings.map(f => renderFinding(f)).join('')}
     </details>`;
+  }
+
+  // How much of the pull request this run read. Without it a Green gate on a stored
+  // incremental review is indistinguishable from a Green gate over the whole change, which
+  // is a claim the run did not make.
+  const _inc = r.incremental;
+  if (_inc?.since_sha) {
+    html += `<div class="review-panel">
+      <b>This run reviewed ${_inc.commits || 0} commit(s)</b>, not the whole pull request —
+      ${_inc.files_reviewed || 0} of the ${_inc.files_in_pr || 0} file(s) it changes, pushed
+      since <code>${esc(String(_inc.since_sha).slice(0, 12))}</code>.
+      <div class="field-hint">${_inc.carried_findings
+        ? `${_inc.carried_findings} finding(s) still open from earlier reviews of this pull
+           request are included below and still count toward the gate — a clean push cannot
+           turn a blocked pull request Green.`
+        : `Earlier reviews of this pull request left nothing open, so the gate covers the
+           whole change.`}</div>
+    </div>`;
+  } else if (_inc?.attempted && !_inc.used) {
+    html += `<div class="review-panel"><b>Reviewed the whole pull request.</b>
+      <div class="field-hint">An incremental review was possible in principle but not here:
+        ${esc(_inc.reason || 'unknown')}.</div></div>`;
   }
 
   // What the repository asked for, and — the part worth surfacing — what it asked for and
