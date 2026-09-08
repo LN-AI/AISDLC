@@ -958,6 +958,61 @@ def main_():
     check("...and the refusal says what to do instead",
           "admin assignment" in r.text, r.text[:300])
 
+    # -- The person who owns a budget can now read it
+    #
+    # The ledger was super-admin only, so a project admin could see their cap enforced but
+    # never the spend against it: "why was I refused?" had no answer they could look up.
+    # There are now two surfaces, and the scope of the project one is the URL -- the server
+    # overrides the `project_id` query parameter with the path segment, so there is nothing
+    # to fiddle with. That override is the security property, not a convenience.
+    r = client.get("/api/v1/usage/summary", headers=proj_admin)
+    check("a project admin still cannot read the cross-customer ledger (403)",
+          r.status_code == 403, f"{r.status_code} {r.text[:200]}")
+
+    r = client.get(f"/api/v1/usage/projects/{mem_id}/summary", headers=proj_admin)
+    check("...but can read their own project's spend (200)",
+          r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+    check("...and the answer says which project it is about",
+          r.status_code == 200 and r.json().get("project_id") == mem_id,
+          str(r.json())[:200] if r.status_code == 200 else r.text[:200])
+    check("...with the period it was measured over, so it can be read against the cap",
+          r.status_code == 200 and bool(r.json().get("period_start")),
+          str(r.json())[:200] if r.status_code == 200 else r.text[:200])
+
+    r = client.get(f"/api/v1/usage/projects/{other_id}/summary", headers=proj_admin)
+    check("a project they do not administer is refused (403)",
+          r.status_code == 403, f"{r.status_code} {r.text[:200]}")
+
+    # The parameter-fiddling case. `?project_id=` is a real query parameter on the
+    # super-admin routes, so a caller who found it might reasonably try it here.
+    r = client.get(f"/api/v1/usage/projects/{mem_id}/summary?project_id={other_id}",
+                   headers=proj_admin)
+    check("a query parameter cannot widen the scope past the path",
+          r.status_code == 200 and r.json().get("project_id") == mem_id,
+          "the path segment must win, or this is a cross-tenant read with extra steps")
+
+    r = client.get("/api/v1/usage/projects/does-not-exist/summary", headers=proj_admin)
+    check("an unknown project is 404, not 403",
+          r.status_code == 404, f"{r.status_code} {r.text[:200]}")
+
+    r = client.get(f"/api/v1/usage/projects/{mem_id}/events?limit=5", headers=proj_admin)
+    check("the ledger rows are readable too (200)",
+          r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+    r = client.get(f"/api/v1/usage/projects/{mem_id}/events.csv", headers=proj_admin)
+    check("...and exportable, which is what reconciling a bill actually needs",
+          r.status_code == 200 and "created_at" in r.text[:200],
+          f"{r.status_code} {r.text[:120]}")
+
+    # A plain member is not a budget owner. The membership/admin split exists so a developer
+    # can work in a project without being handed its keys; spend is the same category.
+    r = client.get(f"/api/v1/usage/projects/{mem_id}/summary", headers=member)
+    check("a plain member cannot read the project's spend (403)",
+          r.status_code == 403, f"{r.status_code} {r.text[:200]}")
+
+    r = client.get(f"/api/v1/usage/projects/{other_id}/summary", headers=admin)
+    check("a super admin can read any project's spend through the same route",
+          r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+
     r = client.delete(f"/api/v1/projects/{mem_id}/members/{by_name['memberdev']['user_id']}",
                       headers=admin)
     check("removing a member succeeds", r.status_code == 200, r.text[:200])

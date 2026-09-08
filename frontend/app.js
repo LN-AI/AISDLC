@@ -29,8 +29,11 @@ function updateAuthUI() {
   const navKeys = document.getElementById('nav-api-keys');
   const navProjects = document.getElementById('nav-projects');
   const navVertical = document.getElementById('nav-vertical');
-  // Plans define what customers can reach and the usage ledger spans every project, so
-  // both are super-admin only — matching /api/v1/plans and /api/v1/usage on the server.
+  // Plans define what customers can reach, so they stay super-admin only. Usage is now two
+  // surfaces: the cross-customer ledger (super admin) and one project's own spend, which an
+  // admin of that project may read. Before that split, the person who owned a budget could
+  // not see it — their only reading of their own spend was the one-line cap under the
+  // sidebar picker, so "why was I refused?" had no answer they could look up.
   const navPlans = document.getElementById('nav-plans');
   const navUsage = document.getElementById('nav-usage');
   if (_authUser) {
@@ -55,7 +58,7 @@ function updateAuthUI() {
     if (navKeys) navKeys.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navVertical) navVertical.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navPlans) navPlans.style.display = isSuperAdmin() ? '' : 'none';
-    if (navUsage) navUsage.style.display = isSuperAdmin() ? '' : 'none';
+    if (navUsage) navUsage.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     // Credentials, so super admin only — but the badge below it is for everyone.
     const navLlm = document.getElementById('nav-llm-providers');
     if (navLlm) navLlm.style.display = isSuperAdmin() ? '' : 'none';
@@ -6632,23 +6635,49 @@ async function loadUsage() {
     } catch { productSelect.innerHTML = '<option value="">All products</option>'; }
   }
 
-  // Same, for projects. This page is super-admin only, so the list is every project —
-  // which is the point: it is the one screen that spans customers.
+  // Same, for projects. `/api/v1/projects` already returns only what the caller may see, so
+  // a project admin gets their own and a super admin gets every one — which is the point of
+  // this screen for a super admin: it is the one view that spans customers.
+  //
+  // The difference is "All projects". A super admin may leave it blank and read the whole
+  // ledger; a project admin may not, because there is no cross-customer endpoint for them
+  // to call. So for them the blank option is dropped and one project is always selected.
   const projectSelect = document.getElementById('usage-filter-project');
+  const crossCustomer = isSuperAdmin();
   if (projectSelect && !projectSelect.options.length) {
     try {
       const data = await apiFetch('/api/v1/projects', { _silent: true });
-      projectSelect.innerHTML = '<option value="">All projects</option>' +
-        (data.projects || []).map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
-    } catch { projectSelect.innerHTML = '<option value="">All projects</option>'; }
+      const opts = (data.projects || [])
+        .map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+      projectSelect.innerHTML = (crossCustomer ? '<option value="">All projects</option>' : '') + opts;
+      if (!crossCustomer && !projectSelect.value && projectSelect.options.length) {
+        projectSelect.selectedIndex = 0;
+      }
+    } catch {
+      projectSelect.innerHTML = crossCustomer
+        ? '<option value="">All projects</option>'
+        : '<option value="">No projects you administer</option>';
+    }
   }
 
   stats.innerHTML = '<div class="empty-state">Loading…</div>';
   const query = _usageQuery();
+  // Which surface. A project admin reads `/usage/projects/<id>/…`, where the project is the
+  // URL and not a parameter — the server overrides any `project_id` query value with the
+  // path, so there is nothing to fiddle with. A super admin keeps the cross-customer routes.
+  const scopeId = crossCustomer ? '' : (projectSelect?.value || '');
+  if (!crossCustomer && !scopeId) {
+    stats.innerHTML = `<div class="empty-state">You do not administer any project, so there
+      is no spend to show you. Ask a super admin to make you an admin of one.</div>`;
+    return;
+  }
+  const base = crossCustomer
+    ? '/api/v1/usage'
+    : `/api/v1/usage/projects/${encodeURIComponent(scopeId)}`;
   try {
     const [summary, recent] = await Promise.all([
-      apiFetch(`/api/v1/usage/summary?${query}`, { _silent: true }),
-      apiFetch(`/api/v1/usage/events?limit=50&${query}`, { _silent: true }),
+      apiFetch(`${base}/summary?${query}`, { _silent: true }),
+      apiFetch(`${base}/events?limit=50&${query}`, { _silent: true }),
     ]);
     _renderUsageStats(summary);
     _renderUsageByProduct(summary.by_product || []);
