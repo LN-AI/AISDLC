@@ -962,6 +962,163 @@ check("an explicit limit is honoured over the configured one",
 check("empty content is never refused", _refusal(0) == "")
 
 
+# -- 16. The eval's own scoring (C-85) -------------------------------------
+section("16. The eval's scoring -- a coin flip must not read as a regression")
+
+# `eval_code_review.py` costs money to run, so its arithmetic had no test of any kind --
+# and that arithmetic is what decides whether a change to the review pipeline gets called
+# a regression. These checks drive the pure `score`/`thresholds` pair with the real data
+# from D-358, so no model is called and nothing is spent.
+import importlib.util as _ilu
+import inspect as _i16
+
+_espec = _ilu.spec_from_file_location(
+    "_eval_cr", os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_code_review.py"))
+_ev = _ilu.module_from_spec(_espec)
+_espec.loader.exec_module(_ev)
+
+
+def _erun(case, gate_ok, gate="Green", fps=(), must=(0, 0), traps=(0, 0), error=""):
+    """One run of one case, in the shape `run_case` returns."""
+    if error:
+        return {"case": case, "error": error, "usage": {}}
+    return {
+        "case": case, "gate": gate, "gate_ok": gate_ok,
+        "must_find_total": must[0], "must_find_hit": must[1],
+        "trap_total": traps[0], "traps_tripped": traps[1],
+        "discarded_hallucinated": 0, "findings_unverified": 0,
+        "fingerprints": list(fps), "usage": {},
+    }
+
+
+def _nine_good(repeat=3):
+    """Nine cases that answer correctly and identically every time."""
+    return {f"case-{i}": [_erun(f"case-{i}", True, "Red", ("fp-a",)) for _ in range(repeat)]
+            for i in range(9)}
+
+
+# The measurement that opened C-85: the same 10-line file returned Amber, Amber, Green with
+# no finding in common. Pooled, that one case dragged a 10-case corpus to exactly 90.0% --
+# the floor -- and was indistinguishable from a real regression.
+_flaky = _nine_good()
+_flaky["fp-framework-csrf"] = [
+    _erun("fp-framework-csrf", False, "Amber", ("fp-x",)),
+    _erun("fp-framework-csrf", False, "Amber", ("fp-y",)),
+    _erun("fp-framework-csrf", True, "Green", ("fp-z",)),
+]
+_sf = _ev.score(_flaky)
+
+check("a case that answers Amber/Amber/Green is excluded from the gate floor",
+      _sf["gate_accuracy"] == 1.0 and _sf["gate_cases_stable"] == 9,
+      f"gate_accuracy={_sf['gate_accuracy']} over {_sf['gate_cases_stable']} cases -- a case "
+      "whose verdict changes run to run is not evidence of a pass or of a regression, and "
+      "averaging it in is what made the 2026-09-08 run report exactly the 90% floor")
+check("...and is named instead of silently averaged",
+      _sf["unstable_gate_cases"] == ["fp-framework-csrf"],
+      f"{_sf['unstable_gate_cases']} -- which case is unstable is the actionable half; "
+      "a mean hides it")
+check("...and the run still passes, because nothing actually regressed",
+      _ev.thresholds(_sf) == [], _ev.thresholds(_sf))
+check("...while the old pooled figure is still recorded for comparison",
+      _sf["gate_accuracy_pooled"] == round(28 / 30, 3),
+      f"{_sf['gate_accuracy_pooled']} -- result files written before 2026-09-08 used this "
+      "definition, and comparing 90% against 100% across the change would conclude "
+      "something false")
+check("...and the 0% finding overlap that proved it is reported per case",
+      any(c["case"] == "fp-framework-csrf" and c["finding_overlap"] == 0.0
+          for c in _sf["case_stability"]),
+      "not one finding fingerprint recurred across the three runs; that number is the "
+      "evidence the exclusion rests on, so it has to survive into the result file")
+
+# The other direction, and the one that matters more: a case that is *consistently* wrong is
+# a real regression and must not be excused as noise.
+_broken = _nine_good()
+_broken["fp-framework-csrf"] = [_erun("fp-framework-csrf", False, "Amber") for _ in range(3)]
+_sb = _ev.score(_broken)
+check("a case that is wrong every time counts against the floor, not as noise",
+      _sb["gate_accuracy"] == 0.9 and _sb["gate_cases_unstable"] == 0,
+      f"gate_accuracy={_sb['gate_accuracy']} unstable={_sb['gate_cases_unstable']} -- "
+      "excluding this would turn the fix for C-85 into a way of hiding regressions")
+
+# Unanimity is about *correctness*, not about the gate letter. Two runs can be wrong in two
+# different ways, and that is a stably broken case rather than an unstable one.
+_wrong_two_ways = _nine_good()
+_wrong_two_ways["odd"] = [_erun("odd", False, "Red"), _erun("odd", False, "Amber"),
+                          _erun("odd", False, "Green")]
+_sw = _ev.score(_wrong_two_ways)
+check("wrong three different ways is still stably wrong, not unstable",
+      _sw["gate_cases_unstable"] == 0 and _sw["gate_accuracy"] == 0.9,
+      f"unstable={_sw['gate_cases_unstable']} accuracy={_sw['gate_accuracy']} -- keying "
+      "stability on the gate letter would let a case that is never right hide in the "
+      "excluded set")
+
+# A growing set of coin-flip cases is its own regression: the pipeline is becoming less
+# reproducible, and no accuracy number will show it.
+_two_flaky = _nine_good()
+for _n in ("flip-a", "flip-b"):
+    _two_flaky[_n] = [_erun(_n, True, "Green"), _erun(_n, False, "Amber")]
+_s2 = _ev.score(_two_flaky)
+_t2 = _ev.thresholds(_s2)
+check("two inconsistent cases breach the ceiling and fail the run",
+      len(_t2) == 1 and "inconsistent gates" in _t2[0],
+      f"{_t2} -- one coin flip is tolerated because one was measured; a second means "
+      "reproducibility itself has regressed")
+check("...and the failure names them, so it is actionable",
+      "flip-a" in _t2[0] and "flip-b" in _t2[0], _t2)
+
+# Recall stays pooled across runs -- it was stable in every measured run, so more samples
+# only tighten the estimate. Majority-voting it would hide a real loss of detection.
+_recall_slip = {"c": [_erun("c", True, "Red", must=(1, 1)), _erun("c", True, "Red", must=(1, 1)),
+                      _erun("c", True, "Red", must=(1, 0))]}
+_sr = _ev.score(_recall_slip)
+check("recall is pooled over runs, not majority-voted per case",
+      _sr["recall"] == round(2 / 3, 3),
+      f"recall={_sr['recall']} -- a real finding missed in one run of three is a third of a "
+      "miss, and rounding it away to 'the case passed' is how a detection regression "
+      "becomes invisible")
+check("...and a pooled recall below the floor is reported as a failure",
+      any("recall" in f for f in _ev.thresholds(_sr)), _ev.thresholds(_sr))
+
+# Traps likewise.
+_trap = {"t": [_erun("t", True, "Green", traps=(4, 0)), _erun("t", True, "Green", traps=(4, 2))]}
+check("a trap tripped in only one run still raises the false-positive rate",
+      _ev.score(_trap)["false_positive_rate"] == 0.25,
+      "the 'xss' trap on fp-framework-csrf fired in one run of three; a per-case vote would "
+      "report it as never firing")
+
+# --repeat 1 has to keep working, and has to stop short of claiming confidence.
+_single = {f"case-{i}": [_erun(f"case-{i}", True, "Red")] for i in range(9)}
+_single["bad"] = [_erun("bad", False, "Amber")]
+_s1 = _ev.score(_single)
+check("one run per case reduces exactly to the old pooled scoring",
+      _s1["gate_accuracy"] == _s1["gate_accuracy_pooled"] == 0.9,
+      f"{_s1['gate_accuracy']} vs {_s1['gate_accuracy_pooled']} -- with a single sample "
+      "every case is trivially consistent, so --repeat 1 must not silently change what the "
+      "number means")
+check("...and no case is called unstable on the strength of one sample",
+      _s1["gate_cases_unstable"] == 0, _s1["unstable_gate_cases"])
+
+# Errors must not be scored as correct answers.
+_errored = _nine_good()
+_errored["dead"] = [_erun("dead", False, error="TimeoutError: x") for _ in range(3)]
+_se = _ev.score(_errored)
+check("a case that errored every run is skipped, not counted as a correct gate",
+      _se["gate_cases_stable"] == 9 and _se["errors"] == 3,
+      f"stable={_se['gate_cases_stable']} errors={_se['errors']} -- counting an error as a "
+      "pass is how an outage reads as a green run")
+
+check("the scoring definition is recorded in the result",
+      _sf["scoring"] == _ev.SCORING and _ev.SCORING == "stable-cases-v2",
+      "two result files with the same key and different definitions of it is a trap for "
+      "whoever compares them next")
+_repeat_default = _ev.build_parser().parse_args([]).repeat
+check("a decision run defaults to three repeats",
+      _repeat_default == 3,
+      f"--repeat defaults to {_repeat_default}; one sample cannot separate a regression "
+      "from variance (D-358), and the default is what a person actually runs")
+check("...and one repeat is still available for a cheap look",
+      _ev.build_parser().parse_args(["--repeat", "1"]).repeat == 1)
+
 print()
 print("-" * 60)
 if _failures:
