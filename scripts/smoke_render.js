@@ -3273,6 +3273,102 @@ function runNavigationChecks() {
 // being served to nobody. What can break silently is the arithmetic in the bars and the
 // empty states, which is what a reader sees on day one.
 
+// The command palette
+//
+// 37 sidebar items grouped by the builder's taxonomy, and one keyboard shortcut in the
+// whole application. What matters in a test is the property that keeps it honest: the list
+// comes out of the sidebar, not a second table somebody has to remember to update.
+
+function runCommandPaletteChecks() {
+  console.log('\nCommand palette');
+
+  // The DOM stub returns a fresh element for any id, so `querySelectorAll` has to be given
+  // something to find. A small fake sidebar is enough to exercise the real functions.
+  function fakeNav(items) {
+    const nodes = items.map(it => ({
+      textContent: it.label,
+      style: { display: it.hidden ? 'none' : '' },
+      getAttribute: name => (name === 'data-page' ? it.page : null),
+      closest: sel => (sel === '.nav-section' && it.group
+        ? { querySelector: () => ({ textContent: it.group }) } : null),
+    }));
+    sandbox.document.querySelectorAll = sel =>
+      (sel === '.nav-item[data-page]' ? nodes : []);
+  }
+
+  check('the palette reads the sidebar rather than its own list of screens', () => {
+    fakeNav([
+      { page: 'code', label: '🔍 Code Review', group: 'Developer Intelligence' },
+      { page: 'cfr21', label: '💊 21 CFR Part 11', group: 'Security Intelligence' },
+    ]);
+    const items = vm.runInContext('collectCommandItems', sandbox)();
+    assert(items.length === 2, `read ${items.length}`);
+    assert(items[0].page === 'code' && items[0].group === 'Developer Intelligence',
+      `page and group must both come from the nav: ${JSON.stringify(items[0])}`);
+  });
+
+  check('a screen hidden by role is not offered', () => {
+    // `updateAuthUI` hides the admin nav items with `display:none`. Offering one here would
+    // send a developer to a screen the server will refuse.
+    fakeNav([
+      { page: 'code', label: 'Code Review', group: '' },
+      { page: 'users', label: 'Users', group: '', hidden: true },
+    ]);
+    const items = vm.runInContext('collectCommandItems', sandbox)();
+    assert(items.length === 1 && items[0].page === 'code',
+      `hidden items must be absent: ${JSON.stringify(items)}`);
+  });
+
+  check('typing filters by subsequence, so "gxpdoc" finds "GxP Document Check"', () => {
+    fakeNav([
+      { page: 'gxp-doc', label: 'GxP Document Check', group: 'Security Intelligence' },
+      { page: 'code', label: 'Code Review', group: 'Developer Intelligence' },
+    ]);
+    vm.runInContext('_cmdItems = collectCommandItems(); _cmdIndex = 0;', sandbox);
+    const matches = vm.runInContext('_cmdMatches', sandbox);
+    assert(matches('gxpdoc').length === 1, 'a subsequence should match');
+    assert(matches('gxpdoc')[0].page === 'gxp-doc', 'and match the right one');
+    assert(matches('').length === 2, 'an empty query lists everything');
+    assert(matches('zzz').length === 0, 'a query matching nothing matches nothing');
+  });
+
+  check('...and by the group name, since that is how the sidebar is organised', () => {
+    const matches = vm.runInContext('_cmdMatches', sandbox);
+    assert(matches('developer').some(m => m.page === 'code'),
+      'searching the module name has to work -- it is the only label some people know');
+  });
+
+  check('nothing matching says so rather than rendering an empty list', () => {
+    vm.runInContext('renderCommandPalette', sandbox)('zzz');
+    const html = document.getElementById('cmd-palette-list').innerHTML;
+    assert(html.includes('No screen'), `expected a sentence: ${html.slice(0, 120)}`);
+  });
+
+  check('a match renders with its group and is clickable', () => {
+    vm.runInContext('renderCommandPalette', sandbox)('code');
+    const html = document.getElementById('cmd-palette-list').innerHTML;
+    assert(html.includes('Code Review'), 'the label');
+    assert(html.includes('Developer Intelligence'), 'the group, so duplicates are separable');
+    assert(html.includes("runCommandPalette('code')"), 'and a way to open it');
+  });
+
+  // Restored before leaving. These checks swap `document.querySelectorAll` for a fake
+  // sidebar, and leaving it swapped would be a trap for whoever adds the next check --
+  // the same reason the paging section guards against a leftover `fetch`.
+  const _realQSA = sandbox.document.querySelectorAll;
+
+  check('opening a screen goes through the hash router, so it stays addressable', () => {
+    let hash = '';
+    vm.runInContext('_setHash = h => { globalThis.__lastHash = h; };', sandbox);
+    vm.runInContext('runCommandPalette("architecture")', sandbox);
+    hash = vm.runInContext('__lastHash', sandbox);
+    assert(hash === '#/architecture',
+      `a palette jump must be a real address, not a silent page swap: ${hash}`);
+  });
+
+  sandbox.document.querySelectorAll = _realQSA;
+}
+
 async function runDashboardChecks() {
   console.log('\nDashboard trend and repository health');
 
@@ -3462,7 +3558,8 @@ async function runProjectWarningChecks() {
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
   .then(runReviewSourceChecks).then(runScreenIsolationChecks)
   .then(runNavigationChecks).then(runProjectWarningChecks)
-  .then(runApprovalCardChecks).then(runDashboardChecks).then(() => {
+  .then(runApprovalCardChecks).then(runDashboardChecks)
+  .then(runCommandPaletteChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

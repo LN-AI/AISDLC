@@ -233,6 +233,29 @@
     <!-- Main content -->
     <main class="main">
       <!-- Dashboard Page -->
+      <!-- Command palette. 37 sidebar items grouped by the builder's taxonomy is a lot to
+           scan, and the application had exactly one keyboard shortcut (Escape) -- so the
+           fastest way to reach a screen was to remember which "Intelligence" its author
+           filed it under. Ctrl/Cmd-K searches the nav itself, so it cannot drift from what
+           is actually there. -->
+      <div id="cmd-palette" class="hidden" role="dialog" aria-modal="true"
+           aria-label="Command palette"
+           style="position:fixed;inset:0;z-index:9000;background:rgba(0,0,0,.55);
+                  display:flex;align-items:flex-start;justify-content:center;padding-top:12vh">
+        <div style="width:min(560px,92vw);background:var(--bg-card,#1b1d22);
+                    border:1px solid var(--border,#333);border-radius:10px;overflow:hidden;
+                    box-shadow:0 20px 60px rgba(0,0,0,.5)">
+          <input id="cmd-palette-input" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Go to… (type to filter, Enter to open, Esc to close)"
+                 aria-label="Search screens"
+                 style="width:100%;box-sizing:border-box;padding:14px 16px;border:0;
+                        border-bottom:1px solid var(--border,#333);background:transparent;
+                        color:inherit;font-size:15px;outline:none" />
+          <ul id="cmd-palette-list" role="listbox"
+              style="list-style:none;margin:0;padding:6px;max-height:52vh;overflow-y:auto"></ul>
+        </div>
+      </div>
+
       <div id="page-dashboard" class="page active">
         <div class="page-header">
           <h1>Risk Overview</h1>

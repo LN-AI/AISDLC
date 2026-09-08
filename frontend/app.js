@@ -92,9 +92,155 @@ function closeLogin() {
   document.getElementById('login-error').classList.add('hidden');
 }
 
+// ── Command palette ──────────────────────────────────────────────────────
+//
+// 37 sidebar items grouped by the *builder's* taxonomy -- "Requirement Intelligence",
+// "Developer Intelligence" -- so reaching a screen meant remembering which module its
+// author filed it under. And the whole application had one keyboard shortcut, Escape.
+//
+// The list is read out of the sidebar at open time rather than kept as its own table.
+// That is the point: a table would be a second place to add every new screen, and it would
+// be wrong the first time somebody forgot -- exactly the drift `AGENT_SCREENS` already has
+// a smoke check for. Reading the DOM also means a nav item hidden by role (the admin ones)
+// is absent here too, for free, instead of offering somebody a screen they will be refused.
+
+let _cmdItems = [];
+let _cmdIndex = 0;
+
+/** Every reachable screen, as {page, label, group}. Read from the sidebar, not a list. */
+function collectCommandItems() {
+  const out = [];
+  document.querySelectorAll('.nav-item[data-page]').forEach(el => {
+    // `offsetParent === null` catches both the item's own `display:none` (the admin gating
+    // in `updateAuthUI`) and a collapsed section. A screen you cannot click should not be
+    // offered here either.
+    const hiddenByRole = el.style.display === 'none';
+    if (hiddenByRole) return;
+    const section = el.closest('.nav-section');
+    const group = section
+      ? (section.querySelector('.nav-section-label')?.textContent || '').trim()
+      : '';
+    out.push({
+      page: el.getAttribute('data-page'),
+      label: (el.textContent || '').trim(),
+      group,
+    });
+  });
+  return out;
+}
+
+function openCommandPalette() {
+  const modal = document.getElementById('cmd-palette');
+  if (!modal) return;
+  _cmdItems = collectCommandItems();
+  _cmdIndex = 0;
+  modal.classList.remove('hidden');
+  const input = document.getElementById('cmd-palette-input');
+  if (input) {
+    input.value = '';
+    input.focus();
+  }
+  renderCommandPalette('');
+}
+
+function closeCommandPalette() {
+  const modal = document.getElementById('cmd-palette');
+  if (modal) modal.classList.add('hidden');
+}
+
+/** Subsequence match, so "gxpdoc" finds "GxP Document Check" without exact substrings. */
+function _cmdMatches(query) {
+  const q = (query || '').toLowerCase().replace(/\s+/g, '');
+  if (!q) return _cmdItems;
+  return _cmdItems.filter(item => {
+    const hay = (item.label + ' ' + item.group).toLowerCase().replace(/\s+/g, '');
+    let i = 0;
+    for (const ch of q) {
+      i = hay.indexOf(ch, i);
+      if (i === -1) return false;
+      i += 1;
+    }
+    return true;
+  });
+}
+
+function renderCommandPalette(query) {
+  const list = document.getElementById('cmd-palette-list');
+  if (!list) return;
+  const matches = _cmdMatches(query);
+  if (_cmdIndex >= matches.length) _cmdIndex = Math.max(0, matches.length - 1);
+  if (!matches.length) {
+    list.innerHTML = `<li style="padding:14px 12px;color:var(--text-muted)">No screen
+      matches “${esc(query)}”.</li>`;
+    return;
+  }
+  list.innerHTML = matches.map((item, i) => `
+    <li role="option" aria-selected="${i === _cmdIndex}"
+        data-cmd-page="${esc(item.page)}"
+        onmousedown="runCommandPalette('${esc(item.page)}')"
+        style="padding:9px 12px;border-radius:6px;cursor:pointer;display:flex;
+               justify-content:space-between;gap:12px;
+               background:${i === _cmdIndex ? 'var(--bg-hover,#2a2d34)' : 'transparent'}">
+      <span>${esc(item.label)}</span>
+      ${item.group ? `<span style="color:var(--text-muted);font-size:12px">${esc(item.group)}</span>` : ''}
+    </li>`).join('');
+}
+
+function runCommandPalette(page) {
+  closeCommandPalette();
+  // Through the hash router, so a screen opened from here is addressable and the Back button
+  // works -- the same path a nav click takes.
+  _setHash(`#/${page}`);
+}
+
+function _cmdKeydown(e) {
+  const modal = document.getElementById('cmd-palette');
+  if (!modal || modal.classList.contains('hidden')) return false;
+  const matches = _cmdMatches(document.getElementById('cmd-palette-input')?.value || '');
+  if (e.key === 'ArrowDown') {
+    _cmdIndex = Math.min(_cmdIndex + 1, matches.length - 1);
+    renderCommandPalette(document.getElementById('cmd-palette-input').value);
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === 'ArrowUp') {
+    _cmdIndex = Math.max(_cmdIndex - 1, 0);
+    renderCommandPalette(document.getElementById('cmd-palette-input').value);
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === 'Enter') {
+    if (matches[_cmdIndex]) runCommandPalette(matches[_cmdIndex].page);
+    e.preventDefault();
+    return true;
+  }
+  return false;
+}
+
+document.addEventListener('keydown', e => {
+  // Ctrl-K and Cmd-K. Not plain "k": the palette must not open while somebody is typing a
+  // requirement into a textarea.
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    const modal = document.getElementById('cmd-palette');
+    if (modal && modal.classList.contains('hidden')) openCommandPalette();
+    else closeCommandPalette();
+    return;
+  }
+  if (_cmdKeydown(e)) return;
+});
+
+document.addEventListener('input', e => {
+  if (e.target && e.target.id === 'cmd-palette-input') {
+    _cmdIndex = 0;
+    renderCommandPalette(e.target.value);
+  }
+});
+
 // Global Escape key handler for modals
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
+    closeCommandPalette();
     const gate = document.getElementById('login-gate');
     if (gate && !gate.classList.contains('hidden')) closeLogin();
     const llmModal = document.getElementById('llm-config-modal');
