@@ -3260,6 +3260,80 @@ function runNavigationChecks() {
 // run goes through and the result says it was not attributed to one. It reaches the browser
 // two different ways, and the legacy one is the one a real user actually hits.
 
+// The approval queue shows a release, not a finding-event
+//
+// One Core SDLC Review used to put three items in a reviewer's queue -- the code review,
+// the VAPT and the aggregate -- all of them the same question. They are now one decision
+// covering several runs, and the card has to say so, or a reviewer approves three runs
+// believing they approved one.
+
+function runApprovalCardChecks() {
+  console.log('\nApproval card');
+  const render = () => vm.runInContext('renderApprovalCard', sandbox);
+
+  check('a release decision says how many runs it covers, and lists them', () => {
+    const html = render()({
+      id: 'ap-1', status: 'pending', priority: 'urgent', created_at: '2026-09-08T10:00:00',
+      project_name: 'CareBrief', review_id: 'rv-1', review_type: 'code', review_gate: 'Amber',
+      release_gate: 'Red', release_findings: 7, release_critical: 2, release_risk_score: 88,
+      covered_count: 3,
+      covered_reviews: [
+        { review_id: 'rv-1', review_type: 'code', gate_status: 'Amber', findings_count: 3, critical_count: 0 },
+        { review_id: 'rv-2', review_type: 'vapt', gate_status: 'Red', findings_count: 4, critical_count: 2 },
+        { review_id: 'rv-3', review_type: 'full', gate_status: 'Red', findings_count: 0, critical_count: 0 },
+      ],
+    });
+    assert(html.includes('Covers 3 runs'), 'the card must say it is one decision over three runs');
+    assert(html.includes('approving it releases all of them'),
+      'a reviewer has to know the scope of the button they are pressing');
+    // The release gate, not the raising review's own -- this one was raised by an Amber run
+    // and the release holds a Red.
+    assert(html.includes('Gate: <strong>Red'), `showed the wrong gate: ${html.match(/Gate: <strong>[^<]*/)}`);
+    assert(html.includes('7') && html.includes('2 critical'), 'release totals missing');
+  });
+
+  check('...and each covered run links to its own findings', () => {
+    const html = render()({
+      id: 'ap-2', status: 'pending', priority: 'high', created_at: '2026-09-08T10:00:00',
+      project_name: 'P', review_id: 'rv-1', covered_count: 2,
+      release_gate: 'Red', release_findings: 2, release_critical: 1,
+      covered_reviews: [
+        { review_id: 'rv-1', review_type: 'code', gate_status: 'Red', findings_count: 2, critical_count: 1 },
+        { review_id: 'rv-9', review_type: 'modernization', gate_status: 'Red', findings_count: 0, critical_count: 0 },
+      ],
+    });
+    assert(html.includes('href="#/code/run/rv-1"'),
+      `a run with a screen must be reachable: ${html.match(/href="[^"]*"/g)}`);
+    // Modernization is deliberately absent from AGENT_SCREENS -- it has its own, richer
+    // history page -- so it must render as text rather than a link that goes nowhere.
+    assert(!html.includes('run/rv-9'), 'modernization has no per-agent run page to link to');
+  });
+
+  check('a single-run approval still reads the old way', () => {
+    const html = render()({
+      id: 'ap-3', status: 'pending', priority: 'high', created_at: '2026-09-08T10:00:00',
+      project_name: 'P', review_id: 'rv-abcdef123', review_type: 'code', review_gate: 'Red',
+      risk_score: 70, findings_count: 1, critical_count: 1, covered_count: 1,
+      covered_reviews: [{ review_id: 'rv-abcdef123', review_type: 'code', gate_status: 'Red',
+                          findings_count: 1, critical_count: 1 }],
+    });
+    assert(html.includes('Review ID: rv-abcde'), 'one run should still name its review');
+    assert(!html.includes('Covers'), 'nothing to say about covering one run');
+  });
+
+  check('a row raised outside any request falls back rather than showing zeros', () => {
+    // No covered_reviews at all: a review saved by a script, or a row from before the link
+    // table existed. Reporting 0 findings on a blocked release would read as "clean".
+    const html = render()({
+      id: 'ap-4', status: 'pending', priority: 'urgent', created_at: '2026-09-08T10:00:00',
+      project_name: 'P', review_id: 'rv-x', review_type: 'code', review_gate: 'Red',
+      risk_score: 90, findings_count: 5, critical_count: 3,
+    });
+    assert(html.includes('Gate: <strong>Red'), 'must fall back to the review gate');
+    assert(html.includes('5') && html.includes('3 critical'), 'must fall back to its counts');
+  });
+}
+
 async function runProjectWarningChecks() {
   console.log('\nUngoverned-run warning');
 
@@ -3311,7 +3385,8 @@ async function runProjectWarningChecks() {
 
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
   .then(runReviewSourceChecks).then(runScreenIsolationChecks)
-  .then(runNavigationChecks).then(runProjectWarningChecks).then(() => {
+  .then(runNavigationChecks).then(runProjectWarningChecks)
+  .then(runApprovalCardChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

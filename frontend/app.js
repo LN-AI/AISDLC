@@ -5547,11 +5547,39 @@ function filterApprovals(status, btn) {
   loadApprovals(status);
 }
 
+/** The screen key for a stored `reviews.review_type`, or '' when no screen owns it.
+ *
+ *  An approval covers runs, and a reviewer being asked "ship this or not" needs to read the
+ *  findings behind them -- there was no link from an approval to anything at all (C-39).
+ *  `openAgentRun` and the hash router are keyed on the *screen*, not the review type, so
+ *  this is the join between them.
+ *
+ *  Returns '' for a review type no screen owns -- modernization and the governance report
+ *  are deliberately absent from AGENT_SCREENS because they have their own, richer histories
+ *  (see that table's own comment). Those render as plain text rather than as a link that
+ *  would go nowhere. `full` *is* in the table, so a Core SDLC Review does link.
+ */
+function _screenForReviewType(reviewType) {
+  if (!reviewType) return '';
+  for (const [screen, spec] of Object.entries(AGENT_SCREENS)) {
+    if (spec.reviewType === reviewType) return screen;
+  }
+  return '';
+}
+
 function renderApprovalCard(a) {
   const statusCls = a.status || 'pending';
   const priCls = a.priority || 'normal';
-  const gateIcon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[a.review_gate] || '❓';
+  // The *release* gate, not the raising review's own. One sign-off now covers every run in
+  // the API call that produced it, so a Core SDLC Review is one decision instead of three
+  // queue items -- and a release holding one Red is Red even if the run that happened to
+  // raise the request was Amber. Falls back to the old field for a row raised outside a
+  // request, which covers nothing but itself.
+  const gate = a.release_gate || a.review_gate;
+  const gateIcon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[gate] || '❓';
   const dateStr = (a.created_at || '').slice(0, 16).replace('T', ' ');
+  const covered = a.covered_reviews || [];
+  const nCovered = a.covered_count || covered.length;
   const pendingActions = a.status === 'pending' ? `
     <textarea class="approval-comment-input" id="comment-${a.id}" placeholder="Decision comment (optional)…" rows="2"></textarea>
     <div class="approval-actions">
@@ -5570,18 +5598,35 @@ function renderApprovalCard(a) {
         <div class="approval-card-meta">
           <div class="approval-project-name">${esc(a.project_name || 'Unnamed Project')}</div>
           <div class="approval-sub-meta">
-            Review ID: ${(a.review_id || '').slice(0, 8)}… · Requested by: ${esc(a.requested_by || 'system')} · ${dateStr}
+            ${nCovered > 1
+              ? `Covers ${nCovered} runs in one release`
+              : `Review ID: ${(a.review_id || '').slice(0, 8)}…`} ·
+            Requested by: ${esc(a.requested_by || 'system')} · ${dateStr}
           </div>
         </div>
         <span class="approval-status-badge ${statusCls}">${statusCls}</span>
         <span class="approval-priority-badge ${priCls}">${priCls}</span>
       </div>
       <div class="approval-review-info">
-        <span>${gateIcon} Gate: <strong>${esc(a.review_gate || '—')}</strong></span>
-        <span>Type: <strong>${esc(a.review_type || '—')}</strong></span>
-        <span>Risk: <strong>${a.risk_score ?? '—'}/100</strong></span>
-        <span>Findings: <strong>${a.findings_count ?? 0}</strong> (${a.critical_count ?? 0} critical)</span>
+        <span>${gateIcon} Gate: <strong>${esc(gate || '—')}</strong></span>
+        <span>Type: <strong>${nCovered > 1
+          ? esc(covered.map(c => c.review_type).join(', '))
+          : esc(a.review_type || '—')}</strong></span>
+        <span>Risk: <strong>${a.release_risk_score ?? a.risk_score ?? '—'}/100</strong></span>
+        <span>Findings: <strong>${a.release_findings ?? a.findings_count ?? 0}</strong>
+          (${a.release_critical ?? a.critical_count ?? 0} critical)</span>
       </div>
+      ${nCovered > 1 ? `<div class="field-hint">You are approving the release, not one run.
+        This decision covers every run below; approving it releases all of them.
+        <ul class="recs-list">${covered.map(c => {
+          const screen = _screenForReviewType(c.review_type);
+          const label = `${esc(c.review_type || 'review')} — gate
+            <b>${esc(c.gate_status || '—')}</b>, ${c.findings_count ?? 0} finding(s),
+            ${c.critical_count ?? 0} critical`;
+          return `<li>${screen
+            ? `<a href="#/${screen}/run/${esc(c.review_id)}">${label}</a>`
+            : label}</li>`;
+        }).join('')}</ul></div>` : ''}
       ${pendingActions}
     </div>`;
 }

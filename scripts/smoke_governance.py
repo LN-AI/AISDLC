@@ -808,6 +808,7 @@ def main_():
     section("13. Amber does not reach a human, and the report says so")
 
     from backend.agents.governance_intelligence import report_generator as _rg13
+    from backend import context as _ctx14
     from backend.services import finding_gate
 
     check("an Amber gate with no Critical does not require sign-off",
@@ -870,6 +871,91 @@ def main_():
                                    "summary": "s"})
     check("an Amber review really enqueues no approval",
           database.get_pending_approval_for_review(_rid13) is None)
+
+    # -- 14. One decision per release, not one per finding-event -------------
+    #
+    # `save_review` enqueues a sign-off for a Red gate or any Critical, and a Core SDLC
+    # Review calls it several times -- the code review, the VAPT and the aggregate. So one
+    # run put three items in a reviewer's queue, all of them the same question ("ship this
+    # or not"), and the screen could not say which release any of them belonged to (C-37,
+    # C-39).
+    #
+    # The release is the API call: both guards open `context.bind_project` exactly once per
+    # call, so binding an id there groups every review the call saves and costs no new call
+    # sites. Outside a request there is no release and the old one-per-review behaviour
+    # stands, which is honest -- nothing grouped those.
+    section("14. A reviewer is asked about a release, not about each finding")
+
+    _CRIT14 = {"control_id": "SEC-003", "severity": 5, "risk_level": "Critical",
+               "title": "hardcoded key", "description": "", "recommendation": ""}
+
+    def _save14(rt, gate):
+        return database.save_review(
+            review_type=rt, project_name="Rel", input_summary="s", input_content="x",
+            result={"findings": [dict(_CRIT14)], "gate_status": gate,
+                    "risk_score": 90.0, "summary": "s"})
+
+    def _pending14():
+        conn = database.get_connection()
+        rows = conn.execute(
+            "SELECT id, priority, release_id FROM approvals WHERE status = 'pending'"
+            " AND project_name = 'Rel'").fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    with _ctx14.bind_project("proj-rel", "Rel", product_id="full"):
+        _a14 = _save14("code", "Amber")   # a Critical under Amber -> "high"
+        _b14 = _save14("vapt", "Red")     # a Red -> must escalate the whole release
+        _c14 = _save14("full", "Red")
+
+    _rows14 = _pending14()
+    check("three reviews in one run raise one sign-off request, not three",
+          len(_rows14) == 1, f"{len(_rows14)} pending")
+    check("...escalated to urgent by the Red, not left at the first review's priority",
+          _rows14 and _rows14[0]["priority"] == "urgent",
+          "a release containing a Red is urgent even if the run that raised it was Amber")
+
+    _found14 = [database.get_pending_approval_for_review(r) for r in (_a14, _b14, _c14)]
+    check("every review in the release can still say it is waiting on a human",
+          all(_found14), "`workflows.shared.attach_approval` asks this per review")
+    check("...and they all name the same decision",
+          len({f["id"] for f in _found14 if f}) == 1,
+          "otherwise the caller links a release to the wrong sign-off")
+
+    _q14 = [a for a in database.list_approvals(status="pending")
+            if a.get("project_name") == "Rel"]
+    check("the queue says how many runs the decision covers",
+          _q14 and _q14[0]["covered_count"] == 3, str(_q14 and _q14[0].get("covered_count")))
+    check("...and names them, so 'ship or not' is answerable",
+          _q14 and {c["review_type"] for c in _q14[0]["covered_reviews"]}
+          == {"code", "vapt", "full"},
+          str(_q14 and [c["review_type"] for c in _q14[0]["covered_reviews"]]))
+    check("the release gate is the strictest of the runs, not the raising one's",
+          _q14 and _q14[0]["release_gate"] == "Red",
+          "the run that raised this was Amber; the release holds a Red")
+    check("...and the finding counts are the release's total",
+          _q14 and _q14[0]["release_findings"] == 3 and _q14[0]["release_critical"] == 3,
+          str(_q14 and (_q14[0].get("release_findings"), _q14[0].get("release_critical"))))
+
+    with _ctx14.bind_project("proj-rel", "Rel", product_id="code"):
+        _save14("code", "Red")
+    check("a separate call is a separate release", len(_pending14()) == 2)
+
+    # Nesting must not split a run in two: an inner `bind_project` inherits the outer id.
+    with _ctx14.bind_project("proj-rel", "Rel", product_id="full"):
+        _save14("code", "Red")
+        with _ctx14.bind_project("proj-rel", "Rel", product_id="code"):
+            _save14("vapt", "Red")
+    _rows14 = _pending14()
+    check("a nested call stays inside the same release",
+          len(_rows14) == 3, f"{len(_rows14)} pending -- nesting must not start a new one")
+
+    # Outside any request there is no release, and pretending otherwise would merge two
+    # unrelated reviews into one decision.
+    _save14("code", "Red")
+    _save14("code", "Red")
+    check("outside a request each review still raises its own",
+          len(_pending14()) == 5, str(len(_pending14())))
 
     print("\n" + "-" * 60)
     if _failures:

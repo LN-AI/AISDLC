@@ -169,6 +169,18 @@ def init_db():
             FOREIGN KEY (review_id) REFERENCES reviews(id)
         );
 
+        -- Which reviews one release decision covers. A Core SDLC Review saves the code
+        -- review, the VAPT and the aggregate; all three belong to one "ship it or not",
+        -- and before this each queued its own request (C-37). `approvals.review_id` stays
+        -- as the review that *raised* it, so every existing reader keeps working.
+        CREATE TABLE IF NOT EXISTS approval_reviews (
+            approval_id TEXT NOT NULL,
+            review_id TEXT NOT NULL,
+            PRIMARY KEY (approval_id, review_id),
+            FOREIGN KEY (approval_id) REFERENCES approvals(id),
+            FOREIGN KEY (review_id) REFERENCES reviews(id)
+        );
+
         CREATE TABLE IF NOT EXISTS agent_jobs (
             id TEXT PRIMARY KEY,
             agent_name TEXT NOT NULL,
@@ -563,6 +575,16 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # column already exists
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_project ON approvals(project_id, status, created_at)")
+    # One API call is one release, so all the reviews it saves share this and queue a single
+    # sign-off request instead of one each (C-37). NULL on pre-existing rows and on any
+    # review saved outside a request -- a smoke script, a `scripts/` driver -- which then
+    # falls back to the old one-per-review behaviour, honestly, because nothing grouped them.
+    try:
+        cursor.execute("ALTER TABLE approvals ADD COLUMN release_id TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_release "
+                   "ON approvals(release_id, status)")
     # The dispatcher's only query: pending, oldest first.
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_notif_pending "
                    "ON notification_deliveries(status, created_at)")
@@ -802,18 +824,60 @@ def save_review(
     # sign-off the queue was never asked for. See that docstring and C-38.
     if finding_gate.requires_human_signoff(gate_status, critical_count):
         priority = "urgent" if gate_status == "Red" else "high"
-        approval_id = str(uuid.uuid4())
+        # **One decision per release, not one per review** (C-37). A Core SDLC Review saves
+        # the code review, the VAPT and the aggregate; all three used to satisfy the rule
+        # above and each queued its own request, so a reviewer opened three items that were
+        # one question -- "ship this or not" -- and the screen could not say which release
+        # any of them was about.
+        #
+        # The release is the API call (`context.current_release_id`, set by both guards via
+        # `bind_project`). Outside a request there is none, and then this falls back to one
+        # approval per review: nothing grouped them, so claiming otherwise would be worse.
+        release_id = context.current_release_id()
+        existing = None
+        if release_id:
+            cursor.execute(
+                "SELECT id, priority FROM approvals"
+                " WHERE release_id = ? AND status = 'pending' ORDER BY created_at LIMIT 1",
+                (release_id,),
+            )
+            existing = cursor.fetchone()
+
+        if existing:
+            approval_id = existing["id"]
+            # Escalate, never relax: a release carrying one Red is urgent even if a later
+            # review in the same run only reported a Critical under an Amber gate. Same
+            # floor-not-ceiling rule the gate itself follows.
+            if priority == "urgent" and existing["priority"] != "urgent":
+                cursor.execute("UPDATE approvals SET priority = 'urgent' WHERE id = ?",
+                               (approval_id,))
+            log_audit(cursor, "approval_extended", "approval", approval_id,
+                      actor=context.current_actor() or "system",
+                      details=f"review={review_id} release={release_id}")
+        else:
+            approval_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO approvals (id, review_id, project_id, project_name, requested_by,"
+                " priority, status, created_at, release_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (approval_id, review_id, project_id, project_name or "", "system", priority,
+                 created_at, release_id),
+            )
+            # `approval_created` is one of the event types the Audit Trail filter has always
+            # offered and nothing ever emitted, so that filter always came back empty — which
+            # on a compliance product reads as "no approvals were ever raised".
+            log_audit(cursor, "approval_created", "approval", approval_id,
+                      actor=context.current_actor() or "system",
+                      details=f"review={review_id} priority={priority}")
+
+        # What this decision actually covers. `approvals.review_id` stays the review that
+        # raised it so every existing reader keeps working; this is how the queue can say
+        # "3 reviews" and how `get_pending_approval_for_review` finds the release's request
+        # from any member.
         cursor.execute(
-            "INSERT INTO approvals (id, review_id, project_id, project_name, requested_by,"
-            " priority, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (approval_id, review_id, project_id, project_name or "", "system", priority, created_at),
+            "INSERT OR IGNORE INTO approval_reviews (approval_id, review_id) VALUES (?, ?)",
+            (approval_id, review_id),
         )
-        # `approval_created` is one of the event types the Audit Trail filter has always
-        # offered and nothing ever emitted, so that filter always came back empty — which
-        # on a compliance product reads as "no approvals were ever raised".
-        log_audit(cursor, "approval_created", "approval", approval_id,
-                  actor=context.current_actor() or "system",
-                  details=f"review={review_id} priority={priority}")
 
     # Named, not defaulted. This row said `actor='system'` for every review ever run,
     # because `log_audit`'s default was the only thing available here -- so the Audit
@@ -1604,13 +1668,75 @@ def get_pending_approval_for_review(review_id: str) -> Optional[Dict[str, Any]]:
     """
     conn = get_connection()
     cursor = conn.cursor()
+    # Matches on the link table as well as `review_id`, because one release decision now
+    # covers several reviews and only the first of them is named on the approval row. A
+    # sub-review of a Core SDLC Review has to be able to report "yes, this is waiting on a
+    # human" -- `workflows/shared.attach_approval` asks exactly that, per review.
     cursor.execute(
-        "SELECT * FROM approvals WHERE review_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
-        (review_id,),
+        """SELECT a.* FROM approvals a
+           LEFT JOIN approval_reviews ar ON ar.approval_id = a.id
+           WHERE (a.review_id = ? OR ar.review_id = ?) AND a.status = 'pending'
+           ORDER BY a.created_at DESC LIMIT 1""",
+        (review_id, review_id),
     )
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def _attach_covered_reviews(cursor, approvals: List[Dict[str, Any]]) -> None:
+    """Fill in what each release decision actually covers, in one query for the page.
+
+    A reviewer is being asked "ship this release or not", and the only thing that makes that
+    answerable is seeing the runs behind it. Kept as a rollup plus a short list rather than
+    the findings themselves: the queue is for deciding, and the run pages already render
+    findings properly.
+
+    `release_gate` is the **strictest** across the covered reviews, for the same reason
+    `finding_gate.stricter` exists -- a release containing one Red is Red, and showing the
+    raising review's own gate would let an Amber row stand for a Red release.
+    """
+    if not approvals:
+        return
+    ids = [a["id"] for a in approvals]
+    marks = ",".join("?" for _ in ids)
+    cursor.execute(
+        f"""SELECT ar.approval_id, r.id AS rid, r.review_type, r.gate_status, r.risk_score,
+                   r.findings_count, r.critical_count
+            FROM approval_reviews ar
+            JOIN reviews r ON r.id = ar.review_id
+            WHERE ar.approval_id IN ({marks})
+            ORDER BY r.created_at""",
+        ids,
+    )
+    by_approval: Dict[str, List[Dict[str, Any]]] = {}
+    for row in cursor.fetchall():
+        by_approval.setdefault(row["approval_id"], []).append({
+            "review_id": row["rid"], "review_type": row["review_type"],
+            "gate_status": row["gate_status"], "risk_score": row["risk_score"],
+            "findings_count": row["findings_count"], "critical_count": row["critical_count"],
+        })
+
+    for a in approvals:
+        covered = by_approval.get(a["id"], [])
+        a["covered_reviews"] = covered
+        a["covered_count"] = len(covered)
+        if covered:
+            gate = "Green"
+            for c in covered:
+                gate = finding_gate.stricter(gate, c.get("gate_status") or "Green")
+            a["release_gate"] = gate
+            a["release_findings"] = sum(c.get("findings_count") or 0 for c in covered)
+            a["release_critical"] = sum(c.get("critical_count") or 0 for c in covered)
+            a["release_risk_score"] = max((c.get("risk_score") or 0) for c in covered)
+        else:
+            # A row raised outside any request, or written before the link table existed.
+            # Falls back to the raising review's own figures rather than reporting zeros,
+            # which would read as "this release is clean" on a blocked release.
+            a["release_gate"] = a.get("review_gate")
+            a["release_findings"] = a.get("findings_count")
+            a["release_critical"] = a.get("critical_count")
+            a["release_risk_score"] = a.get("risk_score")
 
 
 def get_approval(approval_id: str) -> Optional[Dict[str, Any]]:
@@ -1625,8 +1751,10 @@ def get_approval(approval_id: str) -> Optional[Dict[str, Any]]:
         (approval_id,),
     )
     row = cursor.fetchone()
+    out = [dict(row)] if row else []
+    _attach_covered_reviews(cursor, out)
     conn.close()
-    return dict(row) if row else None
+    return out[0] if out else None
 
 
 def list_approvals(status: Optional[str] = None, limit: int = 50,
@@ -1651,9 +1779,11 @@ def list_approvals(status: Optional[str] = None, limit: int = 50,
             ORDER BY a.created_at DESC LIMIT ?""",
         params + status_params + (limit,),
     )
-    rows = cursor.fetchall()
+    out = [dict(r) for r in cursor.fetchall()]
+    # One extra query for the whole page, not one per row.
+    _attach_covered_reviews(cursor, out)
     conn.close()
-    return [dict(r) for r in rows]
+    return out
 
 
 def decide_approval(approval_id: str, status: str, decision_by: str, comment: str = "") -> None:

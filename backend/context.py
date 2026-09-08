@@ -19,13 +19,15 @@ Context propagation is already handled everywhere this needs to reach:
 `asyncio.to_thread` (background jobs) and `contextvars.copy_context()` (the swarm's
 ThreadPoolExecutor) both carry the calling context into their worker threads.
 """
+import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Optional
 
 __all__ = ["bind_project", "current_project_id", "current_project_name",
            "current_product_id", "current_actor", "bind_source", "current_source_ref",
-           "collect_saved_reviews", "note_review_saved", "saved_review_ids"]
+           "collect_saved_reviews", "note_review_saved", "saved_review_ids",
+           "current_release_id"]
 
 _project_id: ContextVar[Optional[str]] = ContextVar("current_project_id", default=None)
 _project_name: ContextVar[str] = ContextVar("current_project_name", default="")
@@ -51,6 +53,25 @@ _product_id: ContextVar[Optional[str]] = ContextVar("current_product_id", defaul
 # call site of `save_review`.
 _actor: ContextVar[str] = ContextVar("current_actor", default="")
 
+# **Which release decision this work belongs to**, so a reviewer's queue is a list of
+# releases rather than a list of findings-events.
+#
+# An approval used to be raised per *review*, and one Core SDLC Review saves several: the
+# code review, the VAPT and the aggregate each hit `save_review`, each satisfied
+# `requires_human_signoff`, and each queued its own sign-off request. A reviewer opened
+# three items that were one decision -- "ship this or not" -- and the screen could not say
+# which release any of them was about (C-37, C-39).
+#
+# **One API call is the release.** Both guards already open `bind_project` exactly once per
+# call (`agent_guard.guarded_call` and `legacy_guard`), so binding the id here costs no new
+# call sites and no threading through the 19 places that call `save_review` -- the same
+# reasoning that put `project_id` here in the first place.
+#
+# Inherited rather than replaced when a block nests: an inner `bind_project` inside an
+# outer one is still the same release, and minting a fresh id there would split one run
+# back into the several rows this exists to merge.
+_release_id: ContextVar[Optional[str]] = ContextVar("current_release_id", default=None)
+
 
 @contextmanager
 def bind_project(project_id: Optional[str], project_name: str = "",
@@ -66,6 +87,10 @@ def bind_project(project_id: Optional[str], project_name: str = "",
     name_token = _project_name.set(project_name or "")
     product_token = _product_id.set(product_id or None)
     actor_token = _actor.set(actor or "")
+    # Note the `or`: an already-bound release wins. See the comment on `_release_id` --
+    # nesting must not start a second release, or one run's reviews split across two
+    # queue items again.
+    release_token = _release_id.set(_release_id.get() or str(uuid.uuid4()))
     try:
         yield
     finally:
@@ -73,10 +98,21 @@ def bind_project(project_id: Optional[str], project_name: str = "",
         _project_name.reset(name_token)
         _product_id.reset(product_token)
         _actor.reset(actor_token)
+        _release_id.reset(release_token)
 
 
 def current_project_id() -> Optional[str]:
     return _project_id.get()
+
+
+def current_release_id() -> Optional[str]:
+    """The release this work belongs to, or None outside any bound request.
+
+    None is not an error: a review saved by a smoke script or a `scripts/` driver has no
+    release, and `save_review` falls back to one-approval-per-review there, which is the
+    old behaviour and the honest one -- nothing grouped them.
+    """
+    return _release_id.get()
 
 
 def current_project_name() -> str:
