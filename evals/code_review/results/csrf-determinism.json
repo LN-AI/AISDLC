@@ -1,0 +1,186 @@
+{
+  "prompt_version": "2026-09-03.1",
+  "generated_at": "2026-09-08T09:32:26.045785+00:00",
+  "cases": 1,
+  "repeat": 3,
+  "errors": 0,
+  "recall": 1.0,
+  "false_positive_rate": 0.083,
+  "gate_accuracy": 0.333,
+  "hallucinated_findings_discarded": 0,
+  "unverified_findings": 0,
+  "determinism_jaccard": 0.0,
+  "tokens_in": 1836,
+  "tokens_out": 3979,
+  "cache_read_tokens": 10503,
+  "estimated_cost_usd": 0.065193,
+  "runs": [
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Amber",
+      "model_gate": "Amber",
+      "gate_ok": false,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 1,
+      "tripped": [
+        {
+          "match": "xss",
+          "note": "Django templates auto-escape by default, so rendering `bio` is not XSS"
+        }
+      ],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "062a311f91d9dfe46bf6aeae28cf8c13",
+        "559c888206de4bbec1a7c0f33570bb5a",
+        "60b9afe3af142518d73ebe5fa83f342e"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-009",
+          "title": "Stored user-supplied bio value could become an XSS vector if rendered unsafely",
+          "line_start": 8,
+          "description": "The raw, unsanitized `bio` value from `request.POST` is saved to the database. Django templates auto-escape by default, so rendering `{{ user.bio }}` is safe \u2014 however, if any current or future template renders this field using `|safe`, `ma",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "No error handling for missing POST key \u2014 unhandled KeyError exposed to user",
+          "line_start": 8,
+          "description": "Accessing `request.POST[\"bio\"]` with bracket notation raises an unhandled `KeyError` if the `bio` key is absent from the POST body (e.g., a malformed or manually crafted request). Django will propagate this as a 500 error, potentially expos",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Unvalidated/unsanitized user input written directly to user model",
+          "line_start": 8,
+          "description": "The `bio` field is taken directly from POST data and saved to the user model without any validation, sanitization, or length limiting. While this is not a classic injection vector (Django's ORM handles SQL safely), the value is stored raw a",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1450,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 29.9
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Amber",
+      "model_gate": "Amber",
+      "gate_ok": false,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "18eb4cb705830720a3ed69808ae4732d",
+        "728b395330e7c1fa2c01c64c5e3cca99"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "Unvalidated user input written directly to model field",
+          "line_start": 8,
+          "description": "The 'bio' field is taken directly from POST data without any sanitization, length limiting, or type validation before being written to the user model. While Django's ORM prevents SQL injection here, the absence of input validation means arb",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "KeyError on missing POST field exposed to caller",
+          "line_start": 8,
+          "description": "Accessing request.POST[\"bio\"] with direct dictionary indexing will raise an unhandled KeyError if the 'bio' field is absent from the POST body (e.g., a malformed or crafted request). Django will respond with an unhandled 500 error, which \u2014 ",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1160,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 23.2
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "6b449c0141bf381ba4aaa680c46f3544",
+        "cbce0af1b458eeeeeb22f445b680cee0",
+        "e72453cdc7b95d308c3f236575e667c2"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-005",
+          "title": "No rate limiting on profile update endpoint",
+          "line_start": 6,
+          "description": "The profile POST endpoint has no rate limiting applied. An attacker authenticated as a legitimate user (or with a stolen session) could spam this endpoint with repeated save operations, causing excessive database writes. While this is lower",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "Missing KeyError handling for POST parameter access",
+          "line_start": 8,
+          "description": "Accessing `request.POST[\"bio\"]` with square-bracket notation will raise an unhandled `KeyError` (resulting in a 500 error) if the `bio` key is absent from the POST body \u2014 for example, if the request is crafted without that field. This expos",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Unvalidated/unsanitized user input written directly to user model",
+          "line_start": 8,
+          "description": "The `bio` field is taken directly from POST data without any validation, length-limiting, or sanitization before being saved to the database. While Django's ORM prevents SQL injection here, there is no enforcement of expected field constrai",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1369,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 24.4
+    }
+  ]
+}
