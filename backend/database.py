@@ -667,6 +667,20 @@ def init_db():
                    "ON reviews(repo_owner, repo_name, created_at DESC)")
     _backfill_review_repo(cursor)
 
+    # Which earlier reviews this one was built from — a JSON array of review ids, NULL when
+    # the artifact was pasted or uploaded rather than carried over from another run.
+    #
+    # A Security Review built from an Architecture Review's output is a different artefact
+    # from one somebody typed, and the record could not tell them apart. On a platform whose
+    # product is evidence, a chain of assessments that leaves no trace of being a chain is
+    # weaker evidence than it should be. Nothing is backfilled: an existing row genuinely
+    # does not know where its input came from, and inventing a parent would be the same
+    # class of untruth as back-filling a scanned-file list (D-345).
+    try:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN derived_from TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+
     cursor.executescript("""
         -- What a user told us we got wrong. The only free signal about our own accuracy,
         -- and until now it died in a `resolution_comment`. Each row is a candidate for
@@ -715,6 +729,33 @@ def init_db():
     logger.info("Database ready")
 
 
+def _verified_parent_reviews(cursor, claimed, project_id: Optional[str]) -> List[str]:
+    """The claimed parent reviews that actually exist and are in reach of this project.
+
+    Order is preserved and duplicates dropped, because the list is read back as prose ("built
+    from these two runs") and a repeated id would read as two sources.
+
+    The project rule matches how a review is read back: `GET /api/reviews/{id}` answers 404
+    across a project boundary, so recording a parent the reader can never open would produce
+    a dead link in an audit trail. A review with no project (a smoke script, a `scripts/`
+    driver) can only ever cite another review with no project, which is the same rule
+    applied to the same value rather than a special case.
+    """
+    ids, seen = [], set()
+    for claim in claimed or []:
+        if claim in seen:
+            continue
+        seen.add(claim)
+        row = cursor.execute(
+            "SELECT project_id FROM reviews WHERE id = ?", (claim,)).fetchone()
+        if row is None:
+            continue
+        if (row["project_id"] or None) != (project_id or None):
+            continue
+        ids.append(claim)
+    return ids
+
+
 def save_review(
     review_type: str,
     project_name: Optional[str],
@@ -752,14 +793,24 @@ def save_review(
     conn = get_connection()
     cursor = conn.cursor()
 
+    # What this run was built from, published by the API boundary (see backend/context.py).
+    # The ids arrive on the request body, so they are a *claim* by the caller — only those
+    # that exist and belong to the same project are kept, so a chain in the audit trail can
+    # never point at a review the reader is unable to open. Filtering down is the safe
+    # direction to be wrong in: it under-claims provenance rather than asserting a link
+    # that nothing supports.
+    derived_from = _verified_parent_reviews(
+        cursor, context.current_derived_from(), project_id)
+
     cursor.execute(
         """
         INSERT INTO reviews
             (id, review_type, project_name, input_summary, input_content,
              result_json, findings_count, critical_count, high_count,
              risk_score, gate_status, created_at, project_id, product_id,
-             repo_host, repo_owner, repo_name, branch, commit_sha, pr_number)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             repo_host, repo_owner, repo_name, branch, commit_sha, pr_number,
+             derived_from)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             review_id, review_type, project_name, input_summary, input_content,
@@ -778,6 +829,7 @@ def save_review(
             source_ref.get("branch") or None,
             source_ref.get("commit_sha") or None,
             source_ref.get("pr_number"),
+            json.dumps(derived_from) if derived_from else None,
         ),
     )
 
@@ -887,7 +939,11 @@ def save_review(
     # request (the smoke suites, `scripts/`), which is honest: nobody ran those.
     log_audit(cursor, "review_created", "review", review_id,
               actor=context.current_actor() or "system",
-              details=f"type={review_type}")
+              # The chain is part of what happened, so it belongs in the trail and not only
+              # in the row: an auditor asking "where did this assessment's input come from"
+              # should be able to answer it from the audit log alone.
+              details=f"type={review_type}"
+                      + (f" derived_from={','.join(derived_from)}" if derived_from else ""))
 
     # Tell whoever asked to be told. Written on **this** cursor so the delivery rows are
     # part of the same transaction as the review: a notification about a review that then
@@ -923,6 +979,26 @@ def save_review(
     return review_id
 
 
+def get_review_parents(review_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Enough about each parent review to render it as a link rather than an id.
+
+    Separate from `get_review` on purpose: every caller of that wants the row, and only the
+    one endpoint that renders provenance wants a second query per parent. Missing ids are
+    simply absent from the result — a review can be deleted after something cited it, and
+    the citing row is still true about what it was built from.
+    """
+    if not review_ids:
+        return {}
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in review_ids)
+    rows = conn.execute(
+        f"SELECT id, review_type, product_id, project_name, gate_status, findings_count, "
+        f"created_at FROM reviews WHERE id IN ({placeholders})", tuple(review_ids)
+    ).fetchall()
+    conn.close()
+    return {r["id"]: dict(r) for r in rows}
+
+
 def get_review(review_id: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
@@ -933,6 +1009,10 @@ def get_review(review_id: str) -> Optional[Dict[str, Any]]:
         return None
     data = dict(row)
     data["result"] = json.loads(data["result_json"]) if data["result_json"] else {}
+    # Decoded here rather than left as a JSON string, the same way `result` is: every
+    # reader wants the list, and a caller that has to remember which of two adjacent
+    # columns is still encoded is a caller that will forget.
+    data["derived_from"] = json.loads(data["derived_from"]) if data.get("derived_from") else []
     return data
 
 

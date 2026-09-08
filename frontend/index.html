@@ -2845,6 +2845,20 @@ Examples:
   </div>
 
   <!-- Review Detail Modal -->
+  <!-- ── What a compliance chip means / what this agent does ───────────────
+       One container for both panels. Every modal here has to be registered by hand in the
+       global Escape handler in app.js, so a second one would be a second thing to forget. -->
+  <div id="agent-info-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeAgentInfo()">
+    <div class="modal-box" style="width:720px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
+      <button class="modal-close-btn" onclick="closeAgentInfo()" title="Dismiss (Esc)">&#10005;</button>
+      <div class="modal-header" style="text-align:left">
+        <h2 id="agent-info-title" style="margin-bottom:2px">&mdash;</h2>
+        <p id="agent-info-subtitle">&mdash;</p>
+      </div>
+      <div id="agent-info-body"></div>
+    </div>
+  </div>
+
   <div id="review-detail-modal" class="modal-backdrop hidden" onclick="if(event.target===this)closeReviewDetail()">
     <div class="modal-box" style="width:720px;max-width:calc(100vw - 32px);text-align:left;max-height:85vh;overflow-y:auto">
       <button class="modal-close-btn" onclick="closeReviewDetail()" title="Dismiss (Esc)">✕</button>

@@ -1414,6 +1414,123 @@ def main():
             # running that branch catches it, which is why section 16 now stubs `apiFetch`
             # and runs the save rather than only the refusal.
 
+            # ── 18. The screen explains itself ────────────────────────────
+            #
+            # Both panels are built by JavaScript into a modal that is empty in the markup,
+            # and both chips are `onclick`s generated at render time — so neither is
+            # reachable by the sweep above, and `smoke_render.js` cannot see whether a
+            # click opens anything. This is the only check that presses them.
+            #
+            # The assertions are about the two things that would make the feature worse
+            # than absent: a chip that opens a blank box, and a panel that shows the
+            # reader the API's field names rather than the screen's (D-291).
+            section("18. A compliance chip and the About link explain themselves")
+
+            goto_page(page, "Architecture Review")
+            page.wait_for_timeout(400)
+            _chips = page.query_selector_all("#architecture-about .about-chip-btn")
+            check("the framework chips on an agent screen are buttons",
+                  len(_chips) >= 1, f"{len(_chips)} found in #architecture-about")
+
+            if _chips:
+                _chips[0].click()
+                page.wait_for_timeout(700)
+                check("clicking one opens the panel",
+                      not page.evaluate(
+                          "document.getElementById('agent-info-modal')"
+                          ".classList.contains('hidden')"))
+                _body = (page.text_content("#agent-info-body") or "").strip()
+                check("...with a plain-language explanation rather than an empty box",
+                      len(_body) > 200, f"{len(_body)} chars: {_body[:120]!r}")
+                check("...saying what kind of thing it is",
+                      (page.text_content("#agent-info-subtitle") or "").strip() != "",
+                      "a law, an audit report and a threat-modelling method must not read "
+                      "as the same badge")
+                check("...and that a mapping is not a certification",
+                      "not a certification" in _body,
+                      "a chip reading SOC2 above a Green gate invites exactly the wrong "
+                      "conclusion unless the panel says otherwise")
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+                check("...and Escape closes it, like every other modal here",
+                      page.evaluate("document.getElementById('agent-info-modal')"
+                                    ".classList.contains('hidden')"),
+                      "the global Escape handler names each modal by id, so a new one has "
+                      "to be added to it by hand")
+
+            _about = page.query_selector("#architecture-about .about-link")
+            check("the screen offers an 'About this agent' link", _about is not None)
+            if _about:
+                _about.click()
+                page.wait_for_timeout(900)
+                _doc = (page.text_content("#agent-info-body") or "")
+                check("...which opens this agent's reference document",
+                      len(_doc.strip()) > 500, f"{len(_doc.strip())} chars")
+                check("...including what makes its verdict Red",
+                      "Gate logic" in _doc,
+                      "the gate rule lives inside the dropped Response section and is "
+                      "lifted out on purpose -- it is what a reader facing an Amber wants")
+                check("...and never the API field reference the screen does not use",
+                      "curl -X POST" not in _doc and "X-API-Key: lmsdlc" not in _doc,
+                      "Request/Response/Example document the /api/v1 endpoint's own field "
+                      "names, and this screen sends different ones (D-291)")
+                page.evaluate("closeAgentInfo()")
+
+            # ── 19. Starting one agent from another's output ──────────────
+            #
+            # The control is injected by JavaScript above a field, and the runs it offers
+            # come from a second API call — so nothing in the markup proves it exists and
+            # `smoke_render.js` cannot see whether choosing a run fills anything in.
+            #
+            # No model is called here: the picker reads stored reviews and writes into a
+            # textarea, and the run button is never pressed. What is being checked is the
+            # wiring and the honesty of the empty state — a project with no requirement
+            # reviews must say so rather than offering a dropdown that does nothing.
+            section("19. One agent's output can start the next")
+
+            goto_page(page, "Architecture Review")
+            page.wait_for_timeout(700)
+            check("the architecture screen offers a previous requirement review",
+                  page.query_selector("#architecture-handoff") is not None,
+                  "the handoff control is injected above the requirements field")
+            _pick = page.query_selector("#architecture-handoff-pick")
+            check("...as a chooser rather than a free-text id",
+                  _pick is not None and _pick.evaluate("el => el.tagName") == "SELECT")
+            if _pick:
+                _opts = page.eval_on_selector_all(
+                    "#architecture-handoff-pick option", "els => els.map(e => e.textContent)")
+                # This examination's database is fresh, so the honest answer is "none yet".
+                # Asserting the empty state is the point: it is what most projects see first.
+                check("...which says so plainly when the project has none yet",
+                      any("No " in o or "choose a run" in o for o in _opts),
+                      str(_opts)[:200])
+                check("...and is not preselected, so nothing is seeded without being chosen",
+                      (_pick.input_value() or "") == "",
+                      "seeding a textarea from a run nobody picked is the charter form's "
+                      "mistake (C-54)")
+
+            check("pressing Use with nothing chosen is refused, not a silent no-op",
+                  page.evaluate("""() => {
+                      let said = null;
+                      const real = window.alert;
+                      window.alert = m => { said = m; };
+                      try { useRunAsInput('architecture'); } finally { window.alert = real; }
+                      return !!said;
+                  }"""),
+                  "the button has to say why nothing happened")
+
+            # The other four screens declare the same wiring; a row that names a field id
+            # that does not exist would inject the control into nothing.
+            _bad_wiring = page.evaluate(
+                """() => Object.entries(RUN_HANDOFFS)
+                     .filter(([screen, w]) => !document.getElementById(w.field)
+                                           || !AGENT_SCREENS[w.from])
+                     .map(([screen]) => screen)""")
+            check("every declared handoff names a field and a source screen that exist",
+                  not _bad_wiring,
+                  f"{_bad_wiring} -- a bad row injects the control above nothing, or reads "
+                  "a source product that is not in AGENT_SCREENS")
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.

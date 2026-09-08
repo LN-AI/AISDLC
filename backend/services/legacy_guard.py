@@ -231,6 +231,60 @@ async def _expected_calls(request, product_id: str) -> int:
 _UNKNOWN_REMOTE_SOURCE_CALLS = 4
 
 
+async def _claimed_parents(request) -> list:
+    """The earlier reviews the caller says this run was built from, off the request body.
+
+    Read here for the same reason `_expected_calls` sizes here: this is the one place on the
+    browser path that sees the request body before the handler, and threading a
+    `derived_from` parameter through the nineteen callers of `save_review` is exactly the
+    cost `backend/context.py` exists to avoid.
+
+    The same three guards as the sizing read, and for the same reasons — JSON only (a
+    multipart zip must never be buffered into memory to look for a field that cannot be in
+    it), a size cap, and **fail open to no claim**: a provenance link is worth having and
+    never worth turning a working review into a 500 for.
+    """
+    try:
+        if "application/json" not in (request.headers.get("content-type") or "").lower():
+            return []
+        if int(request.headers.get("content-length") or 0) > _MAX_SIZING_BODY_BYTES:
+            return []
+        body = await request.body()
+        if not body:
+            return []
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            return []
+        claimed = payload.get("derived_from")
+        # The Release Gate's provenance *is* its `review_ids` — that is the whole input —
+        # so it needs no second field saying the same thing. This closes the other half of
+        # the gap: the gate stored `aggregated_reviews` as a count, so reopening a decision
+        # could not say what it covered.
+        #
+        # But only when it actually gated on them. Pasted `findings` win outright over
+        # `review_ids` in `workflows/release_gate.py`, deliberately, so that a gate can
+        # never be issued over a set nobody saw — and recording the ignored ids as
+        # provenance would assert exactly the link that code exists to prevent.
+        if claimed is None and not payload.get("findings"):
+            claimed = payload.get("review_ids")
+        if isinstance(claimed, str):
+            claimed = [claimed]
+        if not isinstance(claimed, list):
+            return []
+        # Bounded: a caller could otherwise post ten thousand ids and make `save_review`
+        # run ten thousand lookups inside its write transaction.
+        return [str(x) for x in claimed[:_MAX_CLAIMED_PARENTS] if x]
+    except Exception:                                                     # noqa: BLE001
+        logger.exception("Could not read `derived_from` for %s — recording no provenance "
+                         "rather than failing the run", request.url.path)
+        return []
+
+
+# More than this many parents is not a chain, it is a mistake or an attack. The Release Gate
+# is the widest real case and it aggregates whatever a person ticked on one screen.
+_MAX_CLAIMED_PARENTS = 100
+
+
 def _actor_for(subject) -> str:
     """Who to name in an audit row written while this request runs.
 
@@ -298,6 +352,7 @@ async def legacy_product_guard(request, call_next):
     # learned which review the handler wrote.
     with context.bind_project(subject.project_id, subject.project_name,
                               product_id=product_id, actor=_actor_for(subject)), \
+            context.bind_derived_from(await _claimed_parents(request)), \
             agent_guard.hold_budget_reservation(subject), \
             llm_gateway.track_usage(), \
             context.collect_saved_reviews():

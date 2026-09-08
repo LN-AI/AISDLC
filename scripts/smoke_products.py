@@ -1957,6 +1957,271 @@ def main_():
           + " -- each of these is a guaranteed TypeError the moment that line runs, and a "
             "line that only runs on a write path can survive for months (D-364)")
 
+    # ── 22. The documented agent endpoint is the endpoint that runs ────────
+    #
+    # `POST /api/v1/agents/cfr21-verification` was registered against the wrong function
+    # for its whole life. The decorator sat on the private helper `_cfr21_files`, and the
+    # real handler `run_cfr21_verification` had no decorator at all -- so the endpoint the
+    # published docs tell a compliance pipeline to call took an unannotated `req` (which
+    # FastAPI reads as a *query* parameter), carried no `Depends(get_caller)`, and returned
+    # a list of file dicts. Measured before the fix: `operationId` was
+    # `_cfr21_files_...`, the operation had no `requestBody`, and an anonymous POST
+    # answered **422, not 401** -- no authentication, no entitlement, no budget ran.
+    #
+    # Nothing caught it, and the reason is worth keeping. `smoke_governance.py` section 11
+    # asserts against that handler with `inspect.getsource`, which reads the function's
+    # *text* and never calls the route, so it passed while the route was dead -- the same
+    # lesson as D-317: a test that does not exercise the wiring cannot report on it.
+    #
+    # This is the general form, and it is cheap because the registry already declares each
+    # product's canonical endpoint. Three questions of the running app -- does that path
+    # exist, does it take a body, does it refuse an anonymous caller -- and between them
+    # they catch a decorator on the wrong function, an untyped request model and a missing
+    # auth dependency. It reports zero across all 25 endpoints today, so a single hit is
+    # real.
+    section("22. The documented agent endpoint is the endpoint that runs")
+
+    _spec22 = main.app.openapi()["paths"]
+    _missing22, _nobody22, _private22, _open22 = [], [], [], []
+    for _p22 in registry.PRODUCTS:
+        if not _p22.endpoint.startswith("POST /api/v1/agents"):
+            continue
+        _path22 = _p22.endpoint.split(" ", 1)[1]
+        _op22 = (_spec22.get(_path22) or {}).get("post")
+        if not _op22:
+            _missing22.append(f"{_p22.id} -> {_path22}")
+            continue
+        if "requestBody" not in _op22:
+            _nobody22.append(f"{_p22.id} -> {_path22}")
+        # FastAPI derives `operationId` from the decorated function's own name, so a
+        # decorator that landed on a private helper announces itself here.
+        if (_op22.get("operationId") or "").startswith("_"):
+            _private22.append(f"{_p22.id} -> {_op22['operationId']}")
+        if client.post(_path22, json={}).status_code != 401:
+            _open22.append(f"{_p22.id} -> {_path22}")
+
+    check("every product's documented v1 endpoint is registered", not _missing22,
+          "; ".join(_missing22) + " -- the registry publishes this path and `docs/agents/` "
+          "tells integrators to call it, so an unregistered one is a 404 for a customer "
+          "following our own documentation")
+    check("...and none is bound to a private helper", not _private22,
+          "; ".join(_private22) + " -- a leading underscore here means the @router.post "
+          "decorator sits on the helper above the real handler, which then never registers")
+    check("...and each declares a request body", not _nobody22,
+          "; ".join(_nobody22) + " -- an unannotated request parameter is read by FastAPI "
+          "as a query string, so the agent can never receive the artifact it is meant to "
+          "assess")
+    check("...and each refuses an anonymous caller with 401", not _open22,
+          "; ".join(_open22) + " -- anything else means `Depends(get_caller)` is missing, "
+          "so scope, entitlement and budget are all skipped")
+
+    # ── 23. A screen can explain itself ────────────────────────────────────
+    #
+    # Two things the agent screens now show, and two ways they can silently rot.
+    #
+    # The compliance chips resolve against `products/frameworks.py`. A product that gains a
+    # framework token with no glossary entry renders a chip that opens an empty panel, and
+    # nothing about adding the token would tell you that -- so the check is that the two
+    # sets match exactly, in both directions. An orphaned glossary entry is milder but
+    # still worth reporting: it usually means a product's tuple was edited and the
+    # glossary was not.
+    #
+    # The About panel serves `docs/agents/<id>.md` with the API-reference sections removed.
+    # Two failure modes matter. A renamed or deleted document turns the panel into a 404
+    # with no warning, and the whole point of the removal is that a screen must not show a
+    # user field names the screen does not send (D-291) -- so if `## Request` or a curl
+    # example ever survives the filter, the page starts documenting a different interface
+    # than the one in front of the reader.
+    section("23. A screen can explain itself")
+
+    from backend.controls import control_library as _cl23
+    from backend.products import agent_docs as _docs23, frameworks as _fw23
+
+    _tokens23 = {t for p in registry.PRODUCTS for t in p.frameworks}
+    check("every framework a product maps to has a glossary entry",
+          not _fw23.unknown_tokens(_tokens23),
+          f"{_fw23.unknown_tokens(_tokens23)} -- the chip renders and the panel is empty; "
+          "add the entry to backend/products/frameworks.py")
+    check("...and no glossary entry is orphaned",
+          not sorted(set(_fw23.FRAMEWORKS) - _tokens23),
+          f"{sorted(set(_fw23.FRAMEWORKS) - _tokens23)} -- no product maps to these, which "
+          "usually means a product's `frameworks` tuple was edited and this was not")
+    check("...and every entry says what kind of thing it is",
+          all(f.kind in _fw23.KIND_LABELS for f in _fw23.FRAMEWORKS.values()),
+          "a law, an audit report, a weakness catalogue and a threat-modelling method must "
+          "not render as the same badge -- STRIDE is not an obligation and HIPAA is")
+    # Alias resolution is the whole reason `controls_for` exists rather than a bare
+    # `get_controls_by_framework`: `control_library` tags Part 11 controls with both
+    # `21CFR11` and `21-CFR-Part-11`, and looking up only the registry token under-reports.
+    check("...and an alias resolves to more controls than the bare token",
+          len(_fw23.controls_for("21CFR11"))
+          > len(_cl23.get_controls_by_framework("21CFR11")),
+          f"{len(_fw23.controls_for('21CFR11'))} vs "
+          f"{len(_cl23.get_controls_by_framework('21CFR11'))} -- if these are "
+          "equal the alias map has stopped being applied and the Part 11 panel is silently "
+          "missing its audit-trail controls")
+
+    r = client.get("/api/v1/frameworks", headers=admin)
+    check("GET /api/v1/frameworks serves the glossary (200)",
+          r.status_code == 200 and r.json().get("count") == len(_fw23.FRAMEWORKS),
+          f"{r.status_code} {r.text[:200]}")
+    check("...with the caveat that a mapping is not a certification",
+          bool((r.json() if r.status_code == 200 else {}).get("mapping_caveat")),
+          "a chip reading SOC2 on a Green result invites exactly the wrong conclusion; the "
+          "screen has to be able to say what a mapping does and does not mean")
+    check("...and refuses an anonymous caller",
+          client.get("/api/v1/frameworks").status_code == 401)
+
+    check("every product either has a reference document or declares why not",
+          not _docs23.missing_docs(),
+          f"{_docs23.missing_docs()} -- the About panel 404s for these; either add "
+          "docs/agents/<id>.md or record the reason in agent_docs.NO_DOC")
+
+    _leaks23, _nogate23 = [], []
+    for _p23 in registry.PRODUCTS:
+        if _p23.id in _docs23.NO_DOC:
+            continue
+        _d23 = _docs23.render(_p23.id)
+        _md23 = _d23["markdown"]
+        if ("curl -X POST" in _md23 or "X-API-Key: lmsdlc" in _md23
+                or "## Request" in _md23 or "## Response" in _md23):
+            _leaks23.append(_p23.id)
+        if _d23["title"] and not _d23["sections"]:
+            _nogate23.append(_p23.id)
+    check("no About panel shows the API reference the screen does not use", not _leaks23,
+          f"{_leaks23} -- Request/Response/Example document the /api/v1 field names, and a "
+          "screen sends different ones; showing them tells the reader about an interface "
+          "that is not in front of them (D-291)")
+    check("...and none renders as an empty document", not _nogate23,
+          f"{_nogate23} -- every section was filtered out, so the panel would open blank")
+
+    r = client.get("/api/v1/products/architecture/doc", headers=admin)
+    check("GET /api/v1/products/{id}/doc serves one (200)",
+          r.status_code == 200 and "Gate logic" in (r.json().get("sections") or []),
+          f"{r.status_code} {r.text[:200]} -- `Gate logic` is lifted out of the dropped "
+          "Response section on purpose: it is what a reader facing an Amber most wants")
+    check("...names what it dropped rather than quietly serving less",
+          sorted((r.json() if r.status_code == 200 else {}).get("omitted_sections") or [])
+          == ["Authentication", "Example", "Request", "Response"],
+          str((r.json() if r.status_code == 200 else {}).get("omitted_sections")))
+    check("...404s on a product that declares no document, saying why",
+          client.get("/api/v1/products/swarm/doc", headers=admin).status_code == 404
+          and "Agent Hub" in client.get("/api/v1/products/swarm/doc",
+                                        headers=admin).json()["detail"])
+    check("...and no caller-supplied path reaches the filesystem",
+          all(client.get(f"/api/v1/products/{bad}/doc", headers=admin).status_code == 404
+              for bad in ("nope", "../../CLAUDE", "..%2F..%2FCLAUDE")),
+          "the filename is derived from a registry id, which is a closed set -- if one of "
+          "these returns 200 that has stopped being true")
+
+    # ── 24. A run remembers what it was built from ─────────────────────────
+    #
+    # An assessment produced from another assessment's output is a different artefact from
+    # one somebody typed, and the record could not tell them apart. The Release Gate had the
+    # same hole from the other side: it stored `aggregated_reviews` as a *count*, so
+    # reopening a gate decision could not say which reviews it covered.
+    #
+    # Three properties are worth holding onto, and each is a way this could be worse than
+    # having no provenance at all. **A claim is not a fact**: the ids arrive on the request
+    # body, so `save_review` keeps only those that exist and share the project — a chain
+    # that pointed at a review the reader gets a 404 for would be a dead citation in an
+    # audit trail. **Absent is not empty**: a review nobody chained stores nothing, rather
+    # than a link to itself or an invented parent. And **the gate only claims what it
+    # actually gated on** — pasted `findings` override `review_ids` in
+    # `workflows/release_gate.py`, deliberately, so recording the ignored ids as provenance
+    # would assert exactly the link that code exists to prevent.
+    section("24. A run remembers what it was built from")
+
+    _chain_hdr = ui(project_id)
+    _req24 = client.post("/api/review/requirement",
+                         json={"content": "The system shall log every access."},
+                         headers=_chain_hdr)
+    _rid24 = _req24.json().get("review_id")
+    check("a requirement review runs", _req24.status_code == 200 and _rid24,
+          _req24.text[:200])
+
+    _arch24 = client.post("/api/review/architecture",
+                          json={"artifact": "One service, one database.",
+                                "derived_from": [_rid24]}, headers=_chain_hdr)
+    _aid24 = _arch24.json().get("review_id")
+    check("...and an architecture review can be run from it",
+          _arch24.status_code == 200 and _aid24, _arch24.text[:200])
+
+    _row24 = client.get(f"/api/reviews/{_aid24}", headers=_chain_hdr).json()
+    check("the chain is recorded on the derived run",
+          _row24.get("derived_from") == [_rid24],
+          f"{_row24.get('derived_from')} -- the ids travel by contextvar from "
+          "`legacy_guard`, which is the only place on the browser path that sees the "
+          "request body before the handler")
+    check("...with enough about the parent to link to it, not just an id",
+          (_row24.get("derived_from_detail") or {}).get(_rid24, {}).get("review_type")
+          == "requirement",
+          str(_row24.get("derived_from_detail"))[:200])
+    check("...and a run nobody chained records nothing rather than an empty claim",
+          client.get(f"/api/reviews/{_rid24}", headers=_chain_hdr).json().get("derived_from")
+          == [],
+          "absent is the honest answer for a review whose input was typed")
+
+    # A claim is only kept when it survives checking.
+    _bogus24 = client.post("/api/review/architecture",
+                           json={"artifact": "x",
+                                 "derived_from": [_rid24, "no-such-review", _rid24]},
+                           headers=_chain_hdr).json().get("review_id")
+    check("an id that does not exist is dropped, and a duplicate is not repeated",
+          client.get(f"/api/reviews/{_bogus24}", headers=_chain_hdr).json().get("derived_from")
+          == [_rid24],
+          "a chain must never cite something a reader cannot open")
+
+    _other24 = client.post("/api/v1/projects", json={"name": "Other Project"},
+                           headers=admin).json()["project"]["id"]
+    _cross24 = client.post("/api/review/architecture",
+                           json={"artifact": "x", "derived_from": [_rid24]},
+                           headers=ui(_other24))
+    if _cross24.status_code == 200:
+        check("a parent in another project is dropped",
+              client.get(f"/api/reviews/{_cross24.json()['review_id']}",
+                         headers=ui(_other24)).json().get("derived_from") == [],
+              "reading it back across a project boundary is a 404, so recording it would "
+              "produce a citation that cannot be followed")
+    else:
+        check("a parent in another project is dropped",
+              _cross24.status_code in (402, 403),
+              f"the cross-project run was refused ({_cross24.status_code}) before it could "
+              "be checked -- rework this to use a project that can run an architecture review")
+
+    _gate24 = client.post("/api/release-gate",
+                          json={"project_name": "Smoke Project", "review_ids": [_rid24]},
+                          headers=_chain_hdr)
+    check("the release gate records the reviews it gated on",
+          _gate24.status_code == 200
+          and client.get(f"/api/reviews/{_gate24.json()['review_id']}",
+                         headers=_chain_hdr).json().get("derived_from") == [_rid24],
+          f"{_gate24.status_code} {_gate24.text[:200]} -- it stored only a count before, so "
+          "reopening a decision could not say what it covered")
+
+    _paste24 = client.post(
+        "/api/release-gate",
+        json={"project_name": "Smoke Project", "review_ids": [_rid24],
+              "findings": [{"control_id": "SEC-001", "severity": 4, "risk_level": "High",
+                            "title": "t", "description": "d", "recommendation": "r",
+                            "is_blocking": True}]},
+        headers=_chain_hdr)
+    check("...but not the ones it was told to ignore",
+          _paste24.status_code == 200
+          and client.get(f"/api/reviews/{_paste24.json()['review_id']}",
+                         headers=_chain_hdr).json().get("derived_from") == [],
+          f"{_paste24.status_code} {_paste24.text[:200]} -- pasted findings win over "
+          "`review_ids` so the gate cannot judge a set nobody saw; claiming those ids as "
+          "provenance would assert the link that rule exists to prevent")
+
+    _audit24 = [row for row in _audit_rows("review_created")
+                if row["entity_id"] == _aid24]
+    check("the audit trail names the chain, not just the review",
+          _audit24 and "derived_from=" in (_audit24[0]["details"] or ""),
+          str([r["details"] for r in _audit24])[:200]
+          + " -- an auditor asking where an assessment's input came from should be able to "
+            "answer it from the trail alone")
+
     stack.close()
 
     print(f"\n{'-' * 60}")

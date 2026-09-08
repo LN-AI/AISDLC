@@ -39,6 +39,7 @@ from backend.routes.github_credentials import router as github_credentials_route
 from backend.routes.github_webhook import router as github_webhook_router
 from backend.routes.modernization import router as modernization_router
 from backend.routes.v1_agents import router as v1_agents_router
+from backend.routes.frameworks import router as frameworks_router
 from backend.routes.api_keys import router as api_keys_router
 from backend.routes.plans import router as plans_router
 from backend.routes.products import router as products_router
@@ -312,6 +313,7 @@ app.include_router(modernization_router)
 app.include_router(api_keys_router)
 app.include_router(plans_router)
 app.include_router(products_router)
+app.include_router(frameworks_router)
 app.include_router(usage_router)
 app.include_router(swarm_router)
 app.include_router(llm_config_router)
@@ -1325,6 +1327,11 @@ async def get_review(review_id: str, request: Request, reader: dict = Depends(re
     # for a run that predates the link: "$0.00" would be a claim about a run whose cost
     # nobody recorded. See `database.get_review_spend`.
     review["spend"] = database.get_review_spend([review_id]).get(review_id)
+    # Enough about each parent to render it as a link to the screen that owns it rather
+    # than as an eight-character id nobody can act on. A parent that has since been deleted
+    # is simply absent here; the id stays in `derived_from`, because what this run was built
+    # from does not stop being true when the source is removed.
+    review["derived_from_detail"] = database.get_review_parents(review.get("derived_from") or [])
     return review
 
 
@@ -1498,7 +1505,15 @@ async def full_review(req: FullReviewRequest, request: Request):
         agent_guard.preflight(caller["_subject"], "full")
 
     def _run(on_progress):
-        with agent_guard.expect_calls(total_steps):
+        # Bound here rather than at the boundary, unlike every other browser route. This
+        # one is a 202 job and so is deliberately absent from `legacy_guard`'s product map
+        # (the work happens after the response is sent), which means the middleware that
+        # normally reads `derived_from` off the request body never sees this call. Bound
+        # *inside* `_run` because the body runs on a background thread that does not
+        # inherit the request's context -- the same reason `caller["_subject"]` is stashed
+        # above rather than resolved here.
+        with request_context.bind_derived_from(req.derived_from), \
+                agent_guard.expect_calls(total_steps):
             return agent_guard.guarded_call(
                 caller, "full", None, skip_preflight=True,
                 project_name=req.project_name or "Unnamed Project",

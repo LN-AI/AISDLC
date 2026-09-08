@@ -53,7 +53,31 @@ class AgentReviewResult(BaseModel):
     recommendations: List[str]
 
 
-class ReviewRequest(BaseModel):
+class DerivedFromMixin(BaseModel):
+    """Declares `derived_from` on the request models the browser posts to.
+
+    The field is **not read by any handler**, which is deliberate and worth knowing before
+    you go looking for the reader. `save_review` is called from nineteen places that know
+    nothing about where their artifact came from, so the ids travel by contextvar the same
+    way `project_id` and the actor do (`backend/context.py`) — and the one place on this
+    path that sees the request body before the handler is `legacy_guard`, which already
+    reads it to size the budget reservation. It binds the claim; `database.save_review`
+    keeps only the ids that exist and belong to the same project, then writes them.
+
+    Declared here anyway, rather than left as an undocumented extra field Pydantic happens
+    to ignore, so that it appears in `/docs` and so a field that changes what gets stored
+    is part of the published contract rather than a coupling somebody has to discover.
+    """
+
+    derived_from: Optional[List[str]] = Field(
+        None,
+        description="Ids of earlier reviews this run was built from — recorded on the "
+                    "stored review as provenance and shown when the run is reopened. Ids "
+                    "that do not exist, or belong to another project, are dropped.",
+    )
+
+
+class ReviewRequest(DerivedFromMixin):
     content: str
     context: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -75,7 +99,7 @@ class PromptReviewRequest(BaseModel):
     context: Optional[str] = None
 
 
-class FullReviewRequest(BaseModel):
+class FullReviewRequest(DerivedFromMixin):
     requirement: Optional[str] = None
     compliance_artifact: Optional[str] = None
     architecture: Optional[str] = None
@@ -94,7 +118,7 @@ class FullReviewRequest(BaseModel):
     include_sensitive_data: bool = False
 
 
-class ReleaseGateRequest(BaseModel):
+class ReleaseGateRequest(DerivedFromMixin):
     review_ids: Optional[List[str]] = None
     findings: Optional[List[Finding]] = None
     project_name: Optional[str] = None
@@ -232,7 +256,7 @@ class TrustBoundary(BaseModel):
     gaps: List[str]
 
 
-class SecurityReviewRequest(BaseModel):
+class SecurityReviewRequest(DerivedFromMixin):
     artifact: str = Field(description="Architecture diagram description, system design doc, or component description")
     system_type: Optional[str] = None
     context: Optional[str] = None
@@ -289,7 +313,7 @@ class ArchitectureAlternative(BaseModel):
     when_to_choose:       Optional[str] = None
 
 
-class ArchitectureReviewRequest(BaseModel):
+class ArchitectureReviewRequest(DerivedFromMixin):
     artifact: str = Field(description="Architecture description, system design doc, or diagram description")
     requirements: Optional[str] = Field(None, description="Functional and non-functional requirements")
     review_mode: Optional[str] = Field("review", description="review | recommend | compare")

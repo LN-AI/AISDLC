@@ -1301,23 +1301,6 @@ def run_migration_execute(req: MigrationExecutionRequest, caller: dict = Depends
 
 # ── 17. 21 CFR Part 11 Verification ─────────────────────────────────────────
 
-@router.post(
-    "/cfr21-verification",
-    summary="Verify a codebase against FDA 21 CFR Part 11",
-    description="""Verifies a codebase against FDA 21 CFR Part 11 (Electronic Records; Electronic Signatures)
-across four assessments — audit trail, electronic signatures, access control, and data integrity (ALCOA+) —
-plus an exhaustive findings list, each with cited evidence (file/function/pattern), never a bare claim.
-
-Pass `files` (an array of `{path, content}`) for a real multi-file codebase scan — this is the primary way to
-use this agent, since audit trails and signature workflows are usually cross-cutting concerns a single file
-rarely fully reveals. `code` / `github_pr_url` / `github_file_url` remain available as single-source fallbacks.
-
-Process-only controls (§11.10(i)/(j)/(k): training, written policies, documentation control) are reported
-separately in `validation_readiness_notes` — the agent will never claim a code-only pass/fail on those.
-
-**Sources:** `files` (recommended) · `code` · `github_pr_url` · `github_file_url`
-""",
-)
 def _cfr21_files(req) -> list:
     """The file list a Part 11 verification will actually assess, from either shape.
 
@@ -1372,6 +1355,23 @@ def preflight_cfr21(req: CFR21VerificationRequest, caller: dict = Depends(get_ca
     }
 
 
+@router.post(
+    "/cfr21-verification",
+    summary="Verify a codebase against FDA 21 CFR Part 11",
+    description="""Verifies a codebase against FDA 21 CFR Part 11 (Electronic Records; Electronic Signatures)
+across four assessments — audit trail, electronic signatures, access control, and data integrity (ALCOA+) —
+plus an exhaustive findings list, each with cited evidence (file/function/pattern), never a bare claim.
+
+Pass `files` (an array of `{path, content}`) for a real multi-file codebase scan — this is the primary way to
+use this agent, since audit trails and signature workflows are usually cross-cutting concerns a single file
+rarely fully reveals. `code` / `github_pr_url` / `github_file_url` remain available as single-source fallbacks.
+
+Process-only controls (§11.10(i)/(j)/(k): training, written policies, documentation control) are reported
+separately in `validation_readiness_notes` — the agent will never claim a code-only pass/fail on those.
+
+**Sources:** `files` (recommended) · `code` · `github_pr_url` · `github_file_url`
+""",
+)
 def run_cfr21_verification(req: CFR21VerificationRequest, caller: dict = Depends(get_caller)):
     if req.files:
         artifact = "\n\n".join(f"--- FILE: {f.path} ---\n{f.content}" for f in req.files)

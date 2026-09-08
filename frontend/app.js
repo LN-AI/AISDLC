@@ -253,6 +253,8 @@ document.addEventListener('keydown', e => {
     if (keyModal && !keyModal.classList.contains('hidden')) closeKeyEditor();
     const projectModal = document.getElementById('project-edit-modal');
     if (projectModal && !projectModal.classList.contains('hidden')) closeProjectEditor();
+    const infoModal = document.getElementById('agent-info-modal');
+    if (infoModal && !infoModal.classList.contains('hidden')) closeAgentInfo();
   }
 });
 
@@ -622,6 +624,10 @@ function _runPageLoader(page) {
     // than no history list. Screens absent from `AGENT_SCREENS` -- modernization and the
     // governance report -- keep the richer lists they already had.
     if (AGENT_SCREENS[page]) { loadAgentRuns(page); renderAgentAbout(page); }
+    // The "start from a previous run" control, on the five screens whose input is another
+    // agent's output. Rebuilt per visit for the same reason the history list is: the run
+    // it offers must belong to the project selected now, not the one selected last time.
+    if (RUN_HANDOFFS[page]) renderRunHandoff(page);
     // The GitHub PR screen is retired -- the nav item lands on the review screen with
     // the source already set, so there is one implementation of reviewing a pull
     // request rather than two that drift apart.
@@ -719,9 +725,9 @@ async function runCodegenAdvisory() {
         pin_frontend_framework: document.getElementById('cg-pin-frontend').value.trim() || null,
         pin_database: document.getElementById('cg-pin-database').value.trim() || null,
         pin_architecture_pattern: document.getElementById('cg-pin-pattern').value.trim() || null,
+        derived_from: chainedFrom('codegen'),
       }),
     });
-    _lastCodegenAdvisory = result;
     renderCodegenAdvisory('codegen-advisory-result', result);
     loadDashboard();
   } catch (e) { showError('codegen-advisory-result', e.message); }
@@ -729,6 +735,11 @@ async function runCodegenAdvisory() {
 }
 
 function renderCodegenAdvisory(targetId, result) {
+  // Armed here rather than in `runCodegenAdvisory`, because the buttons this result draws
+  // ("Use this stack for the scaffold") are only usable if the variable they read is set --
+  // and reopening a stored run from history renders those buttons through this same
+  // function while setting nothing. They were dead on every reopened run (C-36).
+  _lastCodegenAdvisory = result;
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const r = result.recommendation || {};
@@ -962,7 +973,6 @@ async function runMigrationAssessment() {
         project_name: document.getElementById('mg-project').value.trim(),
       }),
     });
-    _lastMigrationAssessment = result;
     renderMigrationAssessment('migration-assessment-result', result);
     loadDashboard();
   } catch (e) { showError('migration-assessment-result', e.message); }
@@ -970,6 +980,7 @@ async function runMigrationAssessment() {
 }
 
 function renderMigrationAssessment(targetId, r) {
+  _lastMigrationAssessment = r;                    // see renderCodegenAdvisory
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const breaking = r.breaking_changes || [];
@@ -1040,11 +1051,62 @@ function renderMigrationAssessment(targetId, r) {
   `;
 }
 
+// What the assessment concluded, carried into the execution that follows it.
+let _migrationGuidance = '';
+
+// This used to guard on `_lastMigrationAssessment` and then never read it: it copied the
+// *assessment form's own* target and source fields across to the execution form, so the
+// assessment's actual output — the recommended approach, the breaking changes, the
+// rollback strategy — reached the migration call nowhere. The button said "Use this for
+// Execution" and used none of it.
+//
+// `execute_migration` has taken a `requirement` since it was written (`main.py`,
+// `/api/review/migration-execute`) and the browser has never sent one, so carrying the
+// guidance forward needs no backend change. It is shown rather than hidden, because a
+// person about to spend money on a migration should see what is being sent with it.
 function applyMigrationAssessment() {
   if (!_lastMigrationAssessment) return;
+  const a = _lastMigrationAssessment;
   document.getElementById('mg-e-target').value = document.getElementById('mg-target').value.trim();
   document.getElementById('mg-e-source').value = document.getElementById('mg-source').value.trim();
+
+  const parts = [];
+  if (a.recommended_approach) parts.push(`Approach: ${a.recommended_approach}`);
+  (a.breaking_changes || []).slice(0, 12).forEach(b => parts.push(
+    `Breaking change: ${typeof b === 'string' ? b : (b.description || b.title || JSON.stringify(b))}`));
+  (a.risk_areas || []).slice(0, 12).forEach(r => parts.push(
+    `Risk: ${typeof r === 'string' ? r : (r.description || r.title || JSON.stringify(r))}`));
+  if (a.rollback_strategy) parts.push(`Rollback: ${a.rollback_strategy}`);
+  _migrationGuidance = parts.join('\n');
+
+  renderMigrationGuidance();
   document.getElementById('mg-execute-card')?.scrollIntoView({ behavior: 'smooth' });
+}
+
+function renderMigrationGuidance() {
+  const card = document.getElementById('mg-execute-card');
+  if (!card) return;
+  let box = document.getElementById('mg-guidance');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'mg-guidance';
+    box.className = 'run-handoff run-handoff-stacked';
+    const first = card.querySelector('.form-group');
+    if (first) first.insertAdjacentElement('beforebegin', box);
+    else card.appendChild(box);
+  }
+  if (!_migrationGuidance) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <span class="run-handoff-label">Carrying the assessment forward</span>
+    <span class="run-handoff-note">Sent with the migration so the converter knows what the
+      assessment already found. Clear it to migrate on the code alone.
+      <button type="button" class="about-link" onclick="clearMigrationGuidance()">Clear</button></span>
+    <pre class="run-handoff-carry">${esc(_migrationGuidance)}</pre>`;
+}
+
+function clearMigrationGuidance() {
+  _migrationGuidance = '';
+  renderMigrationGuidance();
 }
 
 async function runMigrationExecution() {
@@ -1064,6 +1126,9 @@ async function runMigrationExecution() {
         file_path: document.getElementById('mg-e-filepath').value.trim(),
         project_name: document.getElementById('mg-project').value.trim(),
         auto_review: document.getElementById('mg-e-review').checked,
+        // What the assessment concluded, if one was carried over. The endpoint has always
+        // taken this and the browser has never sent it.
+        requirement: _migrationGuidance || undefined,
       }),
     });
     renderMigrationExecution('migration-execution-result', result);
@@ -1718,9 +1783,9 @@ async function runTestScenarioGeneration() {
     const result = await apiFetch(`/api/review/test-scenario?project_name=${encodeURIComponent(project)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, context }),
+      body: JSON.stringify({ content, context,
+                             derived_from: chainedFrom('test-scenario') }),
     });
-    _lastTestScenarioResult = result;
     renderTestScenarios('test-scenario-result', result);
     loadDashboard();
   } catch (e) {
@@ -1731,6 +1796,7 @@ async function runTestScenarioGeneration() {
 }
 
 function renderTestScenarios(targetId, r) {
+  _lastTestScenarioResult = r;                     // see renderCodegenAdvisory
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const scenarios = r.scenarios || [];
@@ -1791,7 +1857,11 @@ function renderTestScenarios(targetId, r) {
 // ── QA Intelligence — Test Case Generation ─────────────────────────────────
 
 function useLastTestScenarioResult() {
-  if (!_lastTestScenarioResult) { alert('Run Test Scenario Generation first.'); return; }
+  if (!_lastTestScenarioResult) {
+    // Reopening a stored run now arms this too, so the instruction says both ways.
+    alert('Run Test Scenario Generation first, or open one of its previous runs.');
+    return;
+  }
   document.getElementById('tc-scenarios-context').value = JSON.stringify(_lastTestScenarioResult.scenarios || [], null, 2);
 }
 
@@ -1956,6 +2026,7 @@ async function runFullReview() {
       body: JSON.stringify({
         project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence,
         include_security, include_vapt, include_sensitive_data,
+        derived_from: chainedFrom('full'),
       }),
     });
     const result = await pollFullReviewJob(submitResp.job_id);
@@ -3716,6 +3787,7 @@ async function runArchitectureReview() {
         review_mode:  mode,
         context:      document.getElementById('arch-context').value.trim(),
         project_name: document.getElementById('arch-project').value.trim(),
+        derived_from: chainedFrom('architecture'),
       }),
     });
     renderArchitectureResult('arch-result', result);
@@ -3999,6 +4071,7 @@ async function runSecurityReview() {
         system_type:  document.getElementById('sec-type').value.trim(),
         context:      document.getElementById('sec-context').value.trim(),
         project_name: document.getElementById('sec-project').value.trim(),
+        derived_from: chainedFrom('security'),
       }),
     });
     renderSecurityResult('security-result', result);
@@ -10351,6 +10424,322 @@ function screenForReview(result) {
 // `("code", "github_pr_url", "github_file_url")` while the screen visibly offers a zip
 // upload, a repository at a ref and a branch comparison as well — so rendering it as
 // "Accepts" would contradict the tabs directly above it, which is worse than saying nothing.
+// ── Carrying one agent's output into the next agent's input ───────────────
+//
+// The SDLC is a chain — requirements inform an architecture, an architecture informs a
+// threat model — and until now the browser could not carry a step forward. Three handoffs
+// existed as module-level variables (`_lastCodegenAdvisory`, `_lastTestScenarioResult`,
+// `_lastMigrationAssessment`), which meant they were lost on a page refresh, could only
+// ever offer the run you had *just* done in this tab, and left no record that a chain had
+// happened at all (C-36).
+//
+// Everything this needs already existed and had two callers each: `GET /api/reviews`
+// filtered by product and type is exactly what `loadAgentRuns` asks for, and fetching one
+// review's full stored result is exactly what `openAgentRun` does. This is a third caller,
+// not new plumbing.
+//
+// Declared as a table rather than wired per screen, for the reason `AGENT_SCREENS` is: the
+// alternative is five near-identical blocks of markup and five chances for one to drift.
+// `from` is a key in `AGENT_SCREENS`, so the product id, the `review_type` and the noun for
+// the empty state all come from there.
+const RUN_HANDOFFS = {
+  architecture: {
+    from: 'requirement', field: 'arch-requirements',
+    why: 'The requirements a review already established, as the constraints this '
+       + 'architecture has to satisfy.',
+  },
+  security: {
+    from: 'architecture', field: 'sec-artifact',
+    why: 'Threat-model the architecture that was already reviewed, rather than describing '
+       + 'it again from memory.',
+  },
+  full: {
+    from: 'architecture', field: 'full-arch',
+    why: 'Reuse a reviewed architecture as this run\'s architecture stage.',
+  },
+  'test-scenario': {
+    from: 'requirement', field: 'ts-requirement',
+    why: 'Generate scenarios against requirements that have already been risk-reviewed.',
+  },
+  codegen: {
+    from: 'requirement', field: 'cg-requirement',
+    why: 'Recommend a stack for requirements that have already been reviewed.',
+  },
+};
+
+// Which run each screen's input was carried from, so the run can record it. Cleared when
+// the field is emptied — at that point the text it was seeded with is gone and the claim
+// would be false. Editing the text is *not* clearing it: "built from" does not mean
+// "identical to", and a person trimming a summary before running is still working from it.
+const _chainedFrom = {};
+
+function chainedFrom(screen) {
+  const claim = _chainedFrom[screen];
+  if (!claim) return null;
+  const field = document.getElementById(RUN_HANDOFFS[screen].field);
+  if (field && !field.value.trim()) { delete _chainedFrom[screen]; return null; }
+  return claim;
+}
+
+// A stored result is structured JSON with no single prose field, so the handoff has to
+// decide what "the output" is. Markdown rather than `JSON.stringify`, because this text
+// lands in a textarea a person reads and edits before running, and because it becomes part
+// of the *next* agent's prompt — a wall of JSON spends tokens on punctuation and buries the
+// findings. (`useLastTestScenarioResult` keeps its JSON: `#tc-scenarios-context` is parsed
+// by the next agent rather than read by a person.)
+function summariseResultForHandoff(result, sourceLabel) {
+  const lines = [];
+  if (sourceLabel) lines.push(`## From ${sourceLabel}`, '');
+  if (result.summary) lines.push(result.summary, '');
+
+  const findings = result.findings || [];
+  if (findings.length) {
+    lines.push(`### Findings raised (${findings.length})`, '');
+    findings.forEach(f => {
+      const sev = f.risk_level || severityName(f.severity) || '';
+      const head = [sev && `**${sev}**`, f.control_id, f.title].filter(Boolean).join(' — ');
+      lines.push(`- ${head}`);
+      if (f.description) lines.push(`  ${f.description}`);
+      if (f.recommendation) lines.push(`  _Recommended:_ ${f.recommendation}`);
+    });
+    lines.push('');
+  }
+
+  const recs = result.recommendations || [];
+  if (recs.length) {
+    lines.push('### Recommendations', '');
+    recs.forEach(r => lines.push(`- ${typeof r === 'string' ? r : (r.title || JSON.stringify(r))}`));
+    lines.push('');
+  }
+  if (result.gate_status) {
+    lines.push(`Gate at the time: **${result.gate_status}**`
+             + (result.risk_score != null ? ` (risk ${result.risk_score})` : ''));
+  }
+  return lines.join('\n').trim();
+}
+
+// Injected above the target field rather than added to five pages of markup, the same
+// approach `renderAgentAbout` takes and for the same reason.
+function renderRunHandoff(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  if (!wiring) return;
+  const field = document.getElementById(wiring.field);
+  const source = AGENT_SCREENS[wiring.from];
+  if (!field || !source) return;
+  const group = field.closest('.form-group') || field.parentElement;
+  if (!group) return;
+
+  let box = document.getElementById(`${screen}-handoff`);
+  if (!box) {
+    box = document.createElement('div');
+    box.id = `${screen}-handoff`;
+    box.className = 'run-handoff';
+    // Inside the field's own group and below its label, not above the group. Placed above,
+    // it sits in the gap between two fields and reads as belonging to the one before it —
+    // which on the Architecture screen is the description box it does not fill.
+    const label = group.querySelector('label');
+    if (label) label.insertAdjacentElement('afterend', box);
+    else group.insertAdjacentElement('afterbegin', box);
+  }
+  box.innerHTML = `
+    <span class="run-handoff-label">Start from a previous
+      ${esc(source.noun.replace(/s$/, ''))}</span>
+    <select id="${screen}-handoff-pick" class="run-handoff-select">
+      <option value="">Loading…</option>
+    </select>
+    <button type="button" class="btn btn-secondary run-handoff-btn"
+      onclick="useRunAsInput('${jsArg(screen)}')">Use its output</button>
+    <span class="run-handoff-note" id="${screen}-handoff-note">${esc(wiring.why)}</span>`;
+  loadRunHandoffOptions(screen);
+}
+
+async function loadRunHandoffOptions(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  const source = AGENT_SCREENS[wiring.from];
+  const pick = document.getElementById(`${screen}-handoff-pick`);
+  if (!pick) return;
+  try {
+    const d = await apiFetch(
+      `/api/reviews?product_id=${source.product}&review_type=${source.reviewType}`
+      + `&limit=${RUNS_PAGE_SIZE}&offset=0`, { _silent: true });
+    const runs = d.reviews || [];
+    if (!runs.length) {
+      pick.innerHTML = `<option value="">No ${esc(source.noun)} in this project yet</option>`;
+      pick.disabled = true;
+      return;
+    }
+    pick.disabled = false;
+    // The newest is not preselected. Seeding a textarea from a run nobody chose, on a
+    // screen somebody opened to type into, would be the charter form's mistake (C-54).
+    pick.innerHTML = '<option value="">— choose a run —</option>'
+      + runs.map(r => `<option value="${esc(r.id)}">${esc(
+          `${new Date(r.created_at + 'Z').toLocaleString()} · `
+          + `${r.gate_status || '—'} · ${r.findings_count ?? 0} finding(s) · `
+          + `${(r.input_summary || 'no summary').slice(0, 70)}`)}</option>`).join('');
+  } catch (e) {
+    pick.innerHTML = `<option value="">Could not load: ${esc(e.message)}</option>`;
+    pick.disabled = true;
+  }
+}
+
+async function useRunAsInput(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  const source = AGENT_SCREENS[wiring.from];
+  const pick = document.getElementById(`${screen}-handoff-pick`);
+  const note = document.getElementById(`${screen}-handoff-note`);
+  const field = document.getElementById(wiring.field);
+  const reviewId = pick && pick.value;
+  if (!reviewId) { alert('Choose a run to start from first.'); return; }
+
+  if (field.value.trim()
+      && !confirm('Replace what is already in that box with this run\'s output?')) return;
+
+  if (note) note.textContent = 'Loading that run…';
+  try {
+    const row = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}`, { _silent: true });
+    const result = typeof row.result_json === 'string'
+      ? JSON.parse(row.result_json || '{}') : (row.result_json || row.result || {});
+    field.value = summariseResultForHandoff(
+      result, `${source.product} run of ${new Date(row.created_at + 'Z').toLocaleString()}`);
+    _chainedFrom[screen] = reviewId;
+    if (note) {
+      note.innerHTML = `Carried over. Edit it freely — this run will be recorded as
+        derived from that one either way.
+        <button type="button" class="about-link" onclick="clearRunHandoff('${jsArg(screen)}')"
+          >Undo</button>`;
+    }
+  } catch (e) {
+    if (note) note.textContent = `Could not load that run: ${e.message}`;
+  }
+}
+
+function clearRunHandoff(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  delete _chainedFrom[screen];
+  const field = document.getElementById(wiring.field);
+  if (field) field.value = '';
+  const note = document.getElementById(`${screen}-handoff-note`);
+  if (note) note.textContent = wiring.why;
+  const pick = document.getElementById(`${screen}-handoff-pick`);
+  if (pick) pick.value = '';
+}
+
+// ── What a chip means, and what this agent does ───────────────────────────
+//
+// The strip below has always rendered `SOC2` and `21CFR11` as inert text. To anyone who
+// does not already know what 21 CFR Part 11 is that conveys nothing; to anyone who does, a
+// chip reading `SOC2` above a Green gate can convey something worse — that running this
+// agent produced an audit result. So the chips became buttons, and the panel they open
+// carries the one sentence that settles it (`mapping_caveat`, served with the glossary).
+//
+// Both panels share one modal. Five copy-pasted `.modal-backdrop` blocks already exist and
+// each one has to be added by hand to the global Escape handler; a sixth and a seventh
+// would be two more. The content differs, the container does not.
+//
+// Two caches, both filled once per session and neither invalidated: the glossary is static
+// reference data, and a product's document changes only when the repository does.
+let _frameworkGlossary = null;
+let _frameworkCaveat = '';
+const _agentDocCache = {};
+
+async function _ensureFrameworkGlossary() {
+  if (_frameworkGlossary) return _frameworkGlossary;
+  const data = await apiFetch('/api/v1/frameworks', { _silent: true });
+  _frameworkGlossary = {};
+  (data.frameworks || []).forEach(f => { _frameworkGlossary[f.id] = f; });
+  _frameworkCaveat = data.mapping_caveat || '';
+  return _frameworkGlossary;
+}
+
+function _openInfoModal(title, subtitle, bodyHtml) {
+  const modal = document.getElementById('agent-info-modal');
+  if (!modal) return;
+  document.getElementById('agent-info-title').textContent = title;
+  document.getElementById('agent-info-subtitle').textContent = subtitle || '';
+  document.getElementById('agent-info-body').innerHTML = bodyHtml;
+  modal.classList.remove('hidden');
+}
+
+function closeAgentInfo() {
+  const modal = document.getElementById('agent-info-modal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function openFrameworkInfo(token) {
+  _openInfoModal(token, 'Loading…', '<p class="subtitle">Loading…</p>');
+  let entry;
+  try {
+    entry = (await _ensureFrameworkGlossary())[token];
+  } catch (e) {
+    _openInfoModal(token, '', `<p class="error-text">${esc(e.message)}</p>`);
+    return;
+  }
+  if (!entry) {
+    // Reachable only if a product gains a framework token with no glossary entry, which
+    // `smoke_products.py` section 23 fails on. Says so rather than opening blank.
+    _openInfoModal(token, 'Not in the glossary',
+      `<p class="subtitle">This agent maps to <code>${esc(token)}</code>, but the platform
+       has no description for it. That is a gap on our side, not a property of the
+       framework.</p>`);
+    return;
+  }
+
+  // 45 controls for SOC 2 is a list, not a paragraph — scrolled rather than truncated,
+  // because "and 37 more" is the half that a person checking coverage actually wants.
+  const controls = (entry.controls || []).length
+    ? `<div class="section-title" style="margin-top:18px">Controls a finding can cite
+         (${entry.controls.length})</div>
+       <div class="info-control-list">
+         ${entry.controls.map(c => `
+           <div class="info-control">
+             <code>${esc(c.id)}</code>
+             <span class="info-control-title">${esc(c.title)}</span>
+             ${c.blocking ? '<span class="info-blocking" title="Violating this blocks a release by default">blocking</span>' : ''}
+           </div>`).join('')}
+       </div>`
+    : `<p class="subtitle" style="margin-top:16px">${esc(entry.controls_note || '')}</p>`;
+
+  _openInfoModal(entry.name, entry.kind_label || entry.kind, `
+    <p>${esc(entry.summary)}</p>
+    <div class="section-title" style="margin-top:16px">Who it applies to</div>
+    <p class="subtitle" style="margin-top:-4px">${esc(entry.applies_to)}</p>
+    ${controls}
+    <div class="info-caveat">${esc(_frameworkCaveat)}</div>
+    ${entry.url ? `<p style="margin-top:12px"><a href="${esc(entry.url)}" target="_blank"
+       rel="noopener noreferrer">Read the source →</a></p>` : ''}
+  `);
+}
+
+async function openAgentDoc(page) {
+  const spec = AGENT_SCREENS[page];
+  if (!spec) return;
+  const product = _productCatalogue.find(x => x.id === spec.product);
+  const title = (product && product.title) || spec.product;
+  _openInfoModal(title, 'Loading…', '<p class="subtitle">Loading…</p>');
+
+  let doc = _agentDocCache[spec.product];
+  if (!doc) {
+    try {
+      doc = await apiFetch(`/api/v1/products/${encodeURIComponent(spec.product)}/doc`,
+                           { _silent: true });
+      _agentDocCache[spec.product] = doc;
+    } catch (e) {
+      // The 404 body explains *why* for the two products that deliberately have none, so
+      // it is shown rather than replaced with a generic failure.
+      _openInfoModal(title, '', `<p class="subtitle">${esc(e.message)}</p>`);
+      return;
+    }
+  }
+
+  // Named, not hidden: someone integrating against the API should know the field
+  // reference exists and where it is, rather than concluding this is the whole document.
+  const omitted = (doc.omitted_sections || []).length
+    ? `<div class="info-caveat" style="margin-top:18px">${esc(doc.omitted_note)}</div>`
+    : '';
+  _openInfoModal(doc.title || title, 'What this agent does',
+                 `${md(doc.markdown, 'info-doc')}${omitted}`);
+}
+
 function renderAgentAbout(page) {
   const spec = AGENT_SCREENS[page];
   if (!spec) return;
@@ -10373,7 +10762,18 @@ function renderAgentAbout(page) {
   if ((p.frameworks || []).length) {
     bits.push(`<span class="about-item" title="Findings from this agent carry control ids from these frameworks, so a compliance report can cite them">
       <span class="about-label">Maps to</span>
-      ${p.frameworks.map(f => `<span class="about-chip">${esc(f)}</span>`).join('')}</span>`);
+      ${p.frameworks.map(f => `<button type="button" class="about-chip about-chip-btn"
+          onclick="openFrameworkInfo('${jsArg(f)}')"
+          title="What ${esc(f)} is, and which controls a finding can cite">${esc(f)}</button>`).join('')}</span>`);
+  }
+
+  // `has_doc` is false for the two products that deliberately have no reference document
+  // (`agent_docs.NO_DOC`), and a link that always 404s teaches people not to click links.
+  if (p.has_doc) {
+    bits.push(`<span class="about-item">
+      <button type="button" class="about-link" onclick="openAgentDoc('${jsArg(page)}')"
+        title="What this agent looks for, what makes its verdict Red, and what guards the run">
+        About this agent</button></span>`);
   }
 
   // Quota. `used_*` come back null when there is no project or no entitlement, and a null
@@ -10519,6 +10919,35 @@ function pageAgentRuns(agent, direction) {
 }
 
 /** Reopen a stored run in the result panel, with its file inventory beneath it. */
+// Where this run's input came from, when it came from another run. Absent — not "derived
+// from nothing" — for every review saved before the column existed and for every one whose
+// input was typed: the record genuinely does not know, and a line saying "no parents" would
+// dress that up as a finding.
+//
+// Each parent is a link, resolved through `_screenForReviewType` the same way the approval
+// card resolves its covered runs, so a reader can follow the chain backwards rather than
+// being told an id.
+function renderRunProvenance(row) {
+  const parents = row.derived_from || [];
+  if (!parents.length) return '';
+  const detail = row.derived_from_detail || {};
+  const links = parents.map(id => {
+    const parent = detail[id];
+    // A parent that has been deleted since is named, not hidden: what this run was built
+    // from does not stop being true when the source row goes away.
+    if (!parent) return `<code title="${esc(id)}">${esc(id.slice(0, 8))}</code> (deleted)`;
+    const screen = _screenForReviewType(parent.review_type);
+    const label = `${esc(parent.review_type || 'review')} ·
+      ${esc(String(parent.created_at || '').slice(0, 10))}`;
+    return screen
+      ? `<a href="#/${esc(screen)}/run/${esc(id)}" title="${esc(id)}">${label}</a>`
+      : `<code title="${esc(id)}">${label}</code>`;
+  }).join(', ');
+  return `<div class="cost-note">Built from ${parents.length === 1 ? 'an earlier run' :
+    `${parents.length} earlier runs`}: ${links}. That input was carried over rather than
+    written here, so this assessment is only as good as the one it came from.</div>`;
+}
+
 async function openAgentRun(agent, reviewId) {
   const spec = AGENT_SCREENS[agent];
   if (!spec) return;
@@ -10582,7 +11011,8 @@ async function openAgentRun(agent, reviewId) {
              below with the rest of what it recorded.`
           : `What that run cost was not recorded against it, so the figures below do not
              include a cost — your usage records are where that lives.`}
-        The gate below describes the code as it was then.</div>`);
+        The gate below describes the code as it was then.</div>
+      ${renderRunProvenance(row)}`);
     // The list is above the result now, so bring the answer up rather than leaving the
     // reader to guess that something appeared below the fold.
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });

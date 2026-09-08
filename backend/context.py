@@ -27,7 +27,7 @@ from typing import Optional
 __all__ = ["bind_project", "current_project_id", "current_project_name",
            "current_product_id", "current_actor", "bind_source", "current_source_ref",
            "collect_saved_reviews", "note_review_saved", "saved_review_ids",
-           "current_release_id"]
+           "current_release_id", "bind_derived_from", "current_derived_from"]
 
 _project_id: ContextVar[Optional[str]] = ContextVar("current_project_id", default=None)
 _project_name: ContextVar[str] = ContextVar("current_project_name", default="")
@@ -164,6 +164,48 @@ def bind_source(source_ref: Optional[dict]):
 def current_source_ref() -> dict:
     """The bound repository facts, or an empty dict when nothing bound any."""
     return dict(_source_ref.get() or {})
+
+
+# ── Which earlier reviews this one was built from ────────────────────────────
+#
+# A Security Review run from an Architecture Review's output is a different artefact from
+# one somebody pasted, and until now the record could not tell them apart. That matters
+# here more than it would elsewhere: this platform's output is evidence, and evidence whose
+# provenance is unrecorded is weaker evidence. The Release Gate had the same hole from the
+# other end — it stored `aggregated_reviews` as a *count*, so reopening a gate decision
+# could not say which reviews it gated on.
+#
+# Same route as everything above, and for the same reason: the ids arrive on the request
+# body at the API boundary, and `save_review` is called from 19 places that know nothing
+# about where their artifact came from. `legacy_guard` already reads and caches the request
+# body for its budget sizing, so binding this costs one more read of an object it is
+# holding anyway and changes no call site.
+#
+# Binding is a *claim*, not a fact — the ids come from the caller. `save_review` keeps only
+# those that exist and belong to the same project before writing them, so a chain in the
+# audit trail always points at reviews the reader can actually open.
+_derived_from: ContextVar[Optional[list]] = ContextVar("current_derived_from", default=None)
+
+
+@contextmanager
+def bind_derived_from(review_ids):
+    """Mark everything inside this block as derived from these earlier reviews.
+
+    Binding an empty list or None is meaningful and must still be done: it says "this work
+    stands on its own", which stops the previous request's chain being attributed to a
+    review that was simply pasted in.
+    """
+    cleaned = [str(r) for r in (review_ids or []) if r]
+    token = _derived_from.set(cleaned or None)
+    try:
+        yield
+    finally:
+        _derived_from.reset(token)
+
+
+def current_derived_from() -> list:
+    """The claimed parent reviews, or an empty list when nothing bound any."""
+    return list(_derived_from.get() or [])
 
 
 # ── Which reviews this request produced, reported back up ────────────────────

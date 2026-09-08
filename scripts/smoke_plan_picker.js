@@ -84,9 +84,18 @@ const doc = {
   body: { appendChild() {}, remove() {} },
 };
 const store = { sdlc_token: 'faketoken' };
+// `location` is a global in a browser and `window.location` is the same object, so one is
+// shared rather than two that can drift -- the same stub `smoke_render.js` arrived at.
+// Without the *bare* global this script printed every check and then died on the
+// `_applyHash()` call at the foot of app.js, so it exited 1 no matter what it found.
+// Nobody saw it, because it also needs a `products.json` that is not in the repository and
+// so is only ever run deliberately.
+const sharedLocation = { origin: 'http://localhost:8000', hash: '', href: 'http://localhost:8000/' };
 const sandbox = {
   document: doc,
-  window: { location: { origin: 'http://localhost:8000' }, addEventListener() {} },
+  location: sharedLocation,
+  URLSearchParams,
+  window: { location: sharedLocation, addEventListener() {}, removeEventListener() {} },
   localStorage: {
     getItem: k => (k in store ? store[k] : null),
     setItem: (k, v) => { store[k] = String(v); },
@@ -109,8 +118,16 @@ const sandbox = {
     if (sandbox._nextError) {
       const err = sandbox._nextError;
       sandbox._nextError = null;
-      return { ok: false, status: err.status, json: async () => ({ detail: err.detail }),
-               text: async () => err.detail };
+      // `clone()` is not optional. `apiFetch` reads a failed response twice -- once via
+      // `res.clone().json()` to lift the server's own `detail` out, once as text -- and a
+      // stub without it throws inside the error path, so the check that a failure reports
+      // inline instead of as an alert failed for the harness's reason rather than the
+      // page's. A Response is single-use in a browser, which is why the real code clones.
+      const fail = { ok: false, status: err.status,
+                     json: async () => ({ detail: err.detail }),
+                     text: async () => err.detail };
+      fail.clone = () => ({ ...fail, clone: fail.clone });
+      return fail;
     }
     if (u.includes('/api/v1/products')) body = sandbox._productsResponse || payload;
     else if (u.includes('/api/v1/plans')) body = { plans: FAKE_PLANS };
@@ -207,11 +224,30 @@ try {
      bar.slice(0, 160));
 
   // search
-  els['plan-filter-text'].value = 'sensitive';
+  //
+  // The expected set is derived from the payload rather than named, because naming it is
+  // how this check spent its life red without anyone noticing. It asserted that searching
+  // "sensitive" excluded `full` -- true when it was written, and false ever since `full`
+  // gained its opt-in sensitive-data stage (D-26) and said so in its own description. The
+  // filter matches id, title *and* description, so `full` matching is correct behaviour
+  // and the assertion was the stale half. Nobody caught it because this script needs a
+  // `products.json` that is not in the repository, so it is only ever run deliberately.
+  const TERM = 'sensitive';
+  const matches = payload.products.filter(
+    p => [p.id, p.title, p.description].join(' ').toLowerCase().includes(TERM));
+  const excluded = payload.products.filter(p => !matches.includes(p));
+  els['plan-filter-text'].value = TERM;
   sandbox.renderProductCatalogue();
   const searched = els['plan-product-catalogue'].innerHTML;
-  ok('search narrows the list', searched.includes('sensitive-data') && !searched.includes('<code>full</code>'),
-     'search did not filter');
+  ok('search narrows the list',
+     matches.length > 0 && excluded.length > 0
+     && matches.every(p => searched.includes(`<code>${p.id}</code>`))
+     && excluded.every(p => !searched.includes(`<code>${p.id}</code>`)),
+     `searching "${TERM}" should show exactly the ${matches.length} products whose id, `
+     + `title or description contains it; shown but should not be: `
+     + `${excluded.filter(p => searched.includes(`<code>${p.id}</code>`)).map(p => p.id).join(', ') || 'none'}`
+     + `; missing but should be: `
+     + `${matches.filter(p => !searched.includes(`<code>${p.id}</code>`)).map(p => p.id).join(', ') || 'none'}`);
 
   // module filter
   els['plan-filter-text'].value = '';
