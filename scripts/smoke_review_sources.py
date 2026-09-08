@@ -3642,6 +3642,40 @@ def main():
               "GitHub's delivery log is where somebody looks to find out why a push cost "
               "what it cost")
 
+        # ── The live driver, which is the only thing that can reach any of this ──
+        #
+        # D-317's landmine stands: every check in this section is *structural*. It reads
+        # the source of `_deliver` and asserts the shape of the code, because the offline
+        # suite stops at `plan` and `plan` writes nothing. Structure caught D-314, D-315
+        # and D-325 only after a person had already found them by reading.
+        #
+        # `scripts/verify_fix_apply.py` is the counterpart that actually writes, and the
+        # property guarded here is that it does not fall behind: a sixth delivery mode
+        # added to `fix_apply.OUTPUTS` with no stage in the driver is a write path back to
+        # having no coverage at all, which is exactly how this subsystem got three bugs.
+        _driver31 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "verify_fix_apply.py")
+        check("a live driver for fix delivery exists at all",
+              os.path.exists(_driver31),
+              "`verify_pr_review.py` covers pull-request *review* writes; fix delivery had "
+              "no equivalent, and three defects lived in twenty lines because of it")
+        _dsrc31 = io.open(_driver31, encoding="utf-8").read() if os.path.exists(_driver31) else ""
+        _uncovered31 = [o for o in fix_apply.OUTPUTS if f'"{o}"' not in _dsrc31]
+        check("...and it drives EVERY delivery `fix_apply` offers",
+              not _uncovered31,
+              f"no stage for: {_uncovered31} -- a delivery nothing exercises is a delivery "
+              "nobody knows is broken, which is the D-314 story exactly")
+        check("...including the preview, which must write nothing",
+              fix_apply.PREVIEW in _dsrc31 and "NOTHING WAS WRITTEN" in _dsrc31)
+        check("...and it can be run without writing, and can undo what it wrote",
+              "--dry-run" in _dsrc31 and "--cleanup" in _dsrc31,
+              "a driver that can only be run destructively is a driver nobody runs")
+        # The three defects are named in it, so a failure points at the history rather than
+        # leaving the next person to rediscover why the check is there.
+        _named31 = [d for d in ("D-314", "D-315", "D-325") if d not in _dsrc31]
+        check("...and cites the defects each write-path check exists for", not _named31,
+              f"missing: {_named31}")
+
         # ── 32. Suppression as code, end to end ──────────────────────────
         #
         # Section 13 of `smoke_code_review.py` covers the rules themselves. What only

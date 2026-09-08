@@ -87,19 +87,27 @@ node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans scr
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
-Two live drivers sit beside these. They are **not** part of the offline net: both spend real
-money, and `verify_pr_review.py` writes to a real repository.
+Three live drivers sit beside these. They are **not** part of the offline net: all three
+spend real money, and two of them write to a real repository — use a scratch one.
 
 ```
-python scripts/eval_code_review.py                       # accuracy against the labelled corpus (~$0.20)
+python scripts/eval_code_review.py                       # accuracy, 3 runs per case (~$0.55)
+python scripts/eval_code_review.py --repeat 1            # cheaper; cannot measure variance
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
 python scripts/verify_pr_review.py <pr-url> --dry-run    # ...the same, writing nothing
 python scripts/verify_pr_review.py <pr-url> --cleanup    # remove what it posted
+python scripts/verify_fix_apply.py <repo-or-pr-url>      # every Apply Fixes delivery, for real
+python scripts/verify_fix_apply.py <url> --dry-run       # ...stopping at the preview
+python scripts/verify_fix_apply.py <url> --cleanup --review-id <id>
 ```
 
 `eval_code_review.py` is the only thing that can tell an accuracy improvement from a
 regression — the floors in it are measured, not guessed (D-245), so a prompt change that
-looks better and scores worse gets caught. `verify_pr_review.py` exists because the offline
+looks better and scores worse gets caught. **A decision run is three runs per case**, and
+the gate floor is applied only to cases that answered the same way every time: one case
+returns Amber, Amber, Green on the same ten-line file, so pooling every run let a single
+coin flip read as a regression (D-358, D-359). `--repeat 1` still works and says what it
+cannot answer. `verify_pr_review.py` exists because the offline
 suites stub the model and never touch GitHub: they cannot tell you that an inline comment
 landed on the line intended, and the worst defect of the session was invisible until a real
 diff went through it (D-244).
@@ -247,8 +255,12 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   invents the helper it needs rather than using the one already in the project (D-316). Read
   that row before changing the fixer's prompt. Relatedly, Apply Fixes' `pr` and `branch`
   deliveries were broken from the day they shipped (D-314, D-315) and no offline test could
-  see it: every fix test stops at `plan`, which writes nothing. `verify_pr_review.py` covers
-  PR *review* writes and there is still no equivalent for fixes.
+  see it: every fix test stops at `plan`, which writes nothing. **`verify_fix_apply.py` is
+  the equivalent for fixes** — it drives all five deliveries plus the preview against a real
+  repository, and `smoke_review_sources.py` §31 fails if a delivery is added to
+  `fix_apply.OUTPUTS` without a stage in it, because a delivery nothing exercises is how
+  this subsystem collected three defects in twenty lines (D-362). `same_pr` is opt in: it
+  commits onto a branch somebody may have checked out.
 - `backend/services/modernization/` — the one subsystem with its own schema and its own durable
   execution model: whole-codebase conversion runs (ingest → dependency graph → charter → claim-and-lease
   worker loop → Tier-0 validation). Its DDL lives in `store.py` and is called from `database.init_db()`.
