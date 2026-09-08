@@ -113,6 +113,15 @@ def save_credential(req: CredentialRequest, caller: dict = Depends(get_caller)):
                       if c["id"] == saved["id"]), saved)
     logger.info("GitHub credential %s added by %s for project %s",
                 saved.get("id"), actor, project_id)
+    # This is the credential that lets the platform write to a customer's repository, so
+    # who added one and whether it can write are exactly what an auditor asks. The label and
+    # the scope, never the token.
+    database.audit_event(
+        "github_credential_created", "github_credential", saved.get("id", ""),
+        actor=actor, project_id=project_id,
+        details=f"label={req.label} scope={req.scope_pattern or '*'} "
+                f"can_write={bool(req.can_write)}"
+                + (" webhook_secret_set" if req.webhook_secret.strip() else ""))
     return {"credential": saved}
 
 
@@ -134,6 +143,15 @@ def update_credential(credential_id: str, req: CredentialRequest,
         database.set_github_webhook_secret(credential_id, req.webhook_secret.strip())
         saved = next((c for c in database.list_github_credentials(None)
                       if c["id"] == credential_id), saved)
+    # A replacement is as interesting as a creation: the token changed, and the row cannot
+    # say what it changed to.
+    database.audit_event(
+        "github_credential_updated", "github_credential", credential_id,
+        actor=(caller.get("username") or caller.get("team") or "unknown"),
+        project_id=existing.get("project_id"),
+        details=f"label={req.label} scope={req.scope_pattern or '*'} "
+                f"can_write={bool(req.can_write)} token_replaced=1"
+                + (" webhook_secret_set" if req.webhook_secret.strip() else ""))
     return {"credential": saved}
 
 
@@ -148,6 +166,11 @@ def delete_credential(credential_id: str, caller: dict = Depends(get_caller)):
     database.delete_github_credential(credential_id)
     logger.info("GitHub credential %s deleted by %s",
                 credential_id, caller.get("username") or caller.get("team"))
+    database.audit_event(
+        "github_credential_deleted", "github_credential", credential_id,
+        actor=(caller.get("username") or caller.get("team") or "unknown"),
+        project_id=existing.get("project_id"),
+        details=f"label={existing.get('label', '')}")
     return {"deleted": True, "id": credential_id}
 
 

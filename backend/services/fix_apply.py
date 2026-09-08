@@ -592,6 +592,27 @@ def _deliver(orch, review_id: str, output: str, safe: List[Dict[str, Any]],
              blocked: List[Dict[str, Any]], source: Dict[str, Any],
              diff_text: str, project_id: Optional[str]) -> Dict[str, Any]:
     """Put a guarded patch where the caller asked for it. Writes; never generates."""
+    # Recorded here, at the single funnel both `apply` and `deliver` pass through, and
+    # *before* the write rather than after it. Deliberate: `_deliver` has several exits and
+    # an event added to each would be one refactor away from missing one -- and for an audit
+    # trail an *attempted* write to a customer's repository is itself the event. A failure
+    # still reaches the caller as an exception; what must not happen is a write nobody can
+    # find a record of.
+    #
+    # `diff` and `zip` are recorded too, because "somebody took the patch out of the
+    # platform" is a governance event even though nothing was pushed. The output name says
+    # which it was.
+    # Both imported locally, as everything in this module is -- it is reached from the
+    # orchestrator and a module-level `database` import would be a cycle.
+    from backend import context as _context
+    from backend import database
+    _writes = output in ("pr", "branch", "same_pr")
+    database.audit_event(
+        "fix_delivered" if _writes else "fix_exported", "review", review_id,
+        actor=_context.current_actor() or "system", project_id=project_id,
+        details=(f"output={output} files={len(safe)} blocked={len(blocked)} "
+                 f"repo={source.get('ref') or source.get('label') or 'n/a'}"))
+
     if output == "diff":
         return result
 

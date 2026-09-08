@@ -81,9 +81,26 @@ def login(req: LoginRequest):
     user = database.get_user_by_username(req.username)
     if not user or not verify_password(req.password, user["password_hash"]):
         logger.warning("Login failed for username=%s", req.username)
+        # A failed sign-in went to stdout and nowhere else, so the Audit Trail -- the one
+        # surface that exists to answer "who did what" -- could not show an attempt at all,
+        # let alone a run of them. Recorded deployment-wide (project_id=""), because a login
+        # belongs to no project and one customer's admin has no business reading another's
+        # sign-in attempts.
+        #
+        # The reason is recorded but never the password. "unknown username" and "wrong
+        # password" are separated on purpose: an auditor chasing a spray of attempts needs
+        # to tell someone guessing names from someone attacking one account, and this table
+        # is admin-only. The 401 the caller sees stays identical either way.
+        database.audit_event(
+            "user_login_failed", "user", req.username,
+            actor=req.username, project_id="",
+            details="unknown username" if not user else "wrong password")
         raise HTTPException(status_code=401, detail="Invalid username or password")
     if not user.get("is_active"):
         logger.warning("Login rejected for deactivated account username=%s", req.username)
+        database.audit_event("user_login_rejected", "user", user["id"],
+                             actor=user["username"], project_id="",
+                             details="account is deactivated")
         raise HTTPException(status_code=403, detail="Account is deactivated")
     database.update_last_login(user["id"])
     token = create_token(user["id"], user["username"], user["role"])
@@ -129,6 +146,13 @@ def create_user(req: CreateUserRequest, user=Depends(require_admin)):
     pw_hash = hash_password(req.password)
     new_user = database.create_user(req.username, req.email, pw_hash, req.role, req.full_name)
     logger.info("User created: username=%s role=%s by=%s", req.username, req.role, user["username"])
+    # Who was granted what, and by whom. `role` is the interesting half: `"admin"` is a
+    # legacy super-admin alias that is still in VALID_ROLES, so user creation can mint a
+    # second super admin under a name that reads like a lesser role -- and nothing recorded
+    # that it had happened.
+    database.audit_event("user_created", "user", new_user.get("id") or req.username,
+                         actor=user.get("username", "admin"), project_id="",
+                         details=f"username={req.username} role={req.role}")
     return {"message": "User created", "user": new_user}
 
 
@@ -140,4 +164,6 @@ def deactivate_user(user_id: str, user=Depends(require_admin)):
         raise HTTPException(status_code=404, detail="User not found")
     database.deactivate_user(user_id)
     logger.info("User deactivated: user_id=%s by=%s", user_id, user["username"])
+    database.audit_event("user_deactivated", "user", user_id,
+                         actor=user.get("username", "admin"), project_id="")
     return {"message": "User deactivated"}

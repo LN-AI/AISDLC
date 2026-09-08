@@ -2158,7 +2158,16 @@ def create_api_key(
     )
     conn.commit()
     conn.close()
-    _audit("api_key_created", "api_key", key_id, created_by, f"Team: {team_name}")
+    # `project_id` explicitly, not from `context`: key creation is a super-admin route that
+    # opens no `bind_project`, so the row would land deployment-wide (NULL) and be invisible
+    # to the project admin whose budget the key spends. And the details now carry what the
+    # key may do -- its scopes and its cap -- because "a key was created" without them does
+    # not answer the question an auditor is asking. Never the key itself: these rows are
+    # admin-readable and exported as CSV, and the raw key is shown exactly once for a reason.
+    _audit("api_key_created", "api_key", key_id, created_by,
+           f"team={team_name} scopes={scopes} budget={monthly_budget_usd} "
+           f"rate={rate_limit_per_minute}/min",
+           project_id=project_id)
     return {
         "id": key_id, "prefix": prefix, "team_name": team_name,
         "description": description, "scopes": scopes, "created_by": created_by,
@@ -2197,15 +2206,30 @@ def get_api_key_by_id(key_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def revoke_api_key(key_id: str) -> bool:
+def revoke_api_key(key_id: str, revoked_by: str = "") -> bool:
+    """Deactivate a key. `revoked_by` is who did it, for the trail.
+
+    It used to record `actor="admin"` unconditionally -- the same defect `review_created`
+    had with `'system'`, and on the same table: revoking a key is one of the events an
+    auditor most wants attributed, and the trail could only ever say "admin". Defaults to
+    the request's actor from `context` so a caller that forgets still records something
+    true, and falls back to "system" only where there genuinely is no request.
+    """
     conn = get_connection()
     cursor = conn.cursor()
+    # Read the project before the update so the audit row can be scoped to it -- otherwise
+    # the row is deployment-wide and the project admin whose key it was cannot see it.
+    cursor.execute("SELECT project_id FROM api_keys WHERE id = ?", (key_id,))
+    row = cursor.fetchone()
+    project_id = row["project_id"] if row else None
     cursor.execute("UPDATE api_keys SET is_active = 0 WHERE id = ?", (key_id,))
     changed = cursor.rowcount > 0
     conn.commit()
     conn.close()
     if changed:
-        _audit("api_key_revoked", "api_key", key_id, "admin", "Key revoked")
+        _audit("api_key_revoked", "api_key", key_id,
+               revoked_by or context.current_actor() or "system", "Key revoked",
+               project_id=project_id)
     return changed
 
 
@@ -3021,6 +3045,25 @@ def get_usage_breakdown(key_id: str, since_iso: str) -> List[Dict[str, Any]]:
     """Per-product usage for one key. Thin wrapper over get_usage_summary so there is only
     one place where the aggregate columns are defined."""
     return get_usage_summary(key_id=key_id, start=since_iso)["by_product"]
+
+
+def audit_event(event_type: str, entity_type: str, entity_id: str, actor: str,
+                details: str = "", project_id: Optional[str] = None):
+    """Record one governance event from a caller that has no transaction of its own.
+
+    The public name for `_audit`. It exists because the events an auditor actually asks
+    about — who changed a credential, who applied a fix to a repository, who failed to log
+    in, who deleted retained source — happen in routes and services, and none of them
+    should be reaching into this module for an underscore-prefixed function.
+
+    Pass `project_id=""` for a deployment-wide event that belongs to no project (a login, a
+    user record): that stores NULL and stays super-admin-only, which is correct — one
+    customer's admin has no business reading another customer's sign-in attempts.
+
+    **Never pass a secret in `details`.** These rows are readable by an admin and exported
+    as CSV; the event is "a credential was replaced", not what it was replaced with.
+    """
+    _audit(event_type, entity_type, entity_id, actor, details, project_id)
 
 
 def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, details: str = "",

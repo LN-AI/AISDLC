@@ -1013,6 +1013,136 @@ def main_():
     check("a super admin can read any project's spend through the same route",
           r.status_code == 200, f"{r.status_code} {r.text[:200]}")
 
+    # -- The events an auditor actually asks about
+    #
+    # The trail recorded reviews, approvals, logins and notification targets. It did not
+    # record any of: a failed sign-in, a user being created or deactivated, an API key
+    # created or revoked, a GitHub credential added, replaced or deleted, a fix reaching a
+    # repository, or retained source being deleted on request. Those are precisely the
+    # questions an auditor opens the trail to answer, so every one of them was unanswerable
+    # from it -- and a failed login went to stdout and nowhere else.
+
+    def _audit_types(**kw):
+        rows = database.list_audit_events(limit=500, offset=0, project_ids=None, **kw)
+        return {r["event_type"] for r in rows}
+
+    def _audit_rows(event_type):
+        return database.list_audit_events(limit=50, offset=0, project_ids=None,
+                                          event_type=event_type)
+
+    client.post("/api/auth/login", json={"username": "projadmin", "password": "wrong-pass"})
+    client.post("/api/auth/login", json={"username": "no-such-person", "password": "x"})
+    _failed = _audit_rows("user_login_failed")
+    check("a failed sign-in is recorded, not only logged to stdout", len(_failed) >= 2,
+          str(len(_failed)))
+    _reasons = {r["details"] for r in _failed}
+    check("...and says whether the username or the password was wrong",
+          {"wrong password", "unknown username"} <= _reasons, str(_reasons))
+    check("...without ever storing what was typed",
+          not any("wrong-pass" in (r["details"] or "") for r in _failed),
+          "the reason belongs in the trail; the password never does")
+    check("a failed sign-in belongs to no project, so it stays super-admin-only",
+          all(r.get("project_id") in (None, "") for r in _failed),
+          "one customer's admin has no business reading another's sign-in attempts")
+
+    _types = _audit_types()
+    check("creating a user is recorded", "user_created" in _types, str(sorted(_types)))
+    check("...naming the role granted, because 'admin' is a legacy super-admin alias",
+          any("role=" in (r["details"] or "") for r in _audit_rows("user_created")),
+          str([r["details"] for r in _audit_rows("user_created")][:3]))
+    # Deactivate one on purpose, rather than asserting `x or True` -- a check that cannot
+    # fail reads as coverage and is worse than no check at all.
+    client.post("/api/auth/users", headers=admin, json={
+        "username": "audit-doomed", "email": "doomed@example.com",
+        "password": "doomed-pass-123", "role": "developer"})
+    _doomed = next((u for u in client.get("/api/auth/users", headers=admin).json()["users"]
+                    if u["username"] == "audit-doomed"), None)
+    check("the throwaway user exists to deactivate", _doomed is not None)
+    if _doomed:
+        client.delete(f"/api/auth/users/{_doomed['id']}", headers=admin)
+        check("deactivating a user is recorded",
+              "user_deactivated" in _audit_types(), str(sorted(_audit_types())))
+        # The actor is the point. `review_created` recorded 'system' for every review ever
+        # run, which is the one question a trail exists to answer -- so "a named person, not
+        # 'system'" is the property, rather than one hardcoded username.
+        _dr = [x for x in _audit_rows("user_deactivated") if x["entity_id"] == _doomed["id"]]
+        check("...against that user", bool(_dr),
+              str([(x["entity_id"], x["actor"]) for x in _audit_rows("user_deactivated")][:3]))
+        check("...naming the person who did it, not 'system'",
+              bool(_dr) and _dr[0]["actor"] not in ("", "system", None),
+              str([x["actor"] for x in _dr]))
+
+    # `api_key_created` and `api_key_revoked` already existed, written inside `database`.
+    # What they lacked was the detail an auditor needs and, for a revocation, the actor --
+    # it recorded "admin" unconditionally, the same defect `review_created` had with
+    # 'system'. So these assert the *content*, not merely the presence.
+    check("creating an API key is recorded", "api_key_created" in _types, str(sorted(_types)))
+    _keyrows = _audit_rows("api_key_created")
+    check("...exactly once, not twice",
+          len({r["entity_id"] for r in _keyrows}) == len(_keyrows),
+          "a second row written from the route layer would double every creation")
+    check("...saying what the key may do and what it may spend",
+          any("scopes=" in (r["details"] or "") and "budget=" in (r["details"] or "")
+              for r in _keyrows),
+          str([r["details"] for r in _keyrows][:2]))
+    check("...scoped to the project whose budget it spends",
+          any(r.get("project_id") for r in _keyrows),
+          "otherwise the row is deployment-wide and the project's own admin cannot see it")
+    check("...without the key itself, which is shown exactly once for a reason",
+          not any("sk-" in (r["details"] or "") or "raw" in (r["details"] or "")
+                  for r in _keyrows),
+          str([r["details"] for r in _keyrows][:2]))
+
+    _victim = client.post("/api/v1/keys", headers=admin, json={
+        "team_name": "audit-revoke", "project_id": mem_id}).json().get("key", {})
+    if _victim.get("id"):
+        client.delete(f"/api/v1/keys/{_victim['id']}", headers=admin)
+        _rev = [r for r in _audit_rows("api_key_revoked") if r["entity_id"] == _victim["id"]]
+        check("revoking a key is recorded", bool(_rev), str(len(_audit_rows("api_key_revoked"))))
+        check("...naming who revoked it, not a hardcoded 'admin'",
+              bool(_rev) and _rev[0]["actor"] not in ("", "system", None),
+              str([r["actor"] for r in _rev]))
+
+    # A GitHub credential is the token that writes to a customer's repository.
+    r = client.post("/api/v1/github-credentials", headers=admin, json={
+        "label": "audit-probe", "token": "ghp_auditprobe_not_real",
+        "project_id": mem_id, "can_write": True})
+    check("the credential probe was accepted, so the checks below actually run",
+          r.status_code in (200, 201), f"{r.status_code} {r.text[:200]}")
+    if r.status_code in (200, 201):
+        _cred = r.json()["credential"]["id"]
+        check("adding a GitHub credential is recorded",
+              "github_credential_created" in _audit_types(), str(sorted(_audit_types())))
+        _cr = _audit_rows("github_credential_created")
+        check("...saying whether it can write, which is the part that matters",
+              any("can_write=True" in (x["details"] or "") for x in _cr),
+              str([x["details"] for x in _cr][:2]))
+        check("...and never the token",
+              not any("ghp_auditprobe" in (x["details"] or "") for x in _cr),
+              "these rows are admin-readable and exported as CSV")
+        client.delete(f"/api/v1/github-credentials/{_cred}", headers=admin)
+        check("deleting one is recorded too",
+              "github_credential_deleted" in _audit_types(), str(sorted(_audit_types())))
+
+    # The export. A trail nobody can get out of the product is not much of a trail.
+    r = client.get("/api/audit/export.csv", headers=admin)
+    check("the trail can be exported as a file (200)", r.status_code == 200,
+          f"{r.status_code} {r.text[:120]}")
+    check("...with a header row and the columns an auditor needs",
+          r.status_code == 200 and r.text.splitlines()[0].startswith(
+              "created_at,event_type,entity_type,entity_id,actor"),
+          r.text.splitlines()[0] if r.status_code == 200 else r.text[:120])
+    check("...and it is a download, not a page",
+          "attachment" in r.headers.get("content-disposition", ""),
+          str(r.headers.get("content-disposition")))
+
+    # Scoped by the same function as the page, so an export can never contain a row the
+    # page would have hidden.
+    r_pa = client.get("/api/audit/export.csv", headers=proj_admin)
+    check("a project admin's export is scoped like their page",
+          r_pa.status_code == 200 and "unknown username" not in r_pa.text,
+          "deployment-wide rows are super-admin-only and must not leak through the export")
+
     r = client.delete(f"/api/v1/projects/{mem_id}/members/{by_name['memberdev']['user_id']}",
                       headers=admin)
     check("removing a member succeeds", r.status_code == 200, r.text[:200])
