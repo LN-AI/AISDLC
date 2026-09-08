@@ -35,9 +35,21 @@ def enforce_input_limit(content: str, max_chars: int = None) -> None:
     limit = max_chars if max_chars is not None else config.MAX_AGENT_INPUT_CHARS
     if content and len(content) > limit:
         logger.warning("Input limit exceeded: %d chars > %d limit", len(content), limit)
+        # Say how many parts, not just "too large".
+        #
+        # "Split the artifact into smaller pieces" is true and unactionable: it does not
+        # tell you whether you are 5% over or 4x over, so the only way to find out is to
+        # keep resubmitting. The size of the problem is the one thing this function knows
+        # for certain, and stating it turns a rejection into an instruction.
+        #
+        # Ceiling division: 1.1x the limit is two runs, not one.
+        parts = -(-len(content) // limit)
         raise GuardrailViolation(
-            f"Input too large: {len(content):,} characters exceeds the {limit:,} character limit "
-            f"for a single agent call. Split the artifact into smaller pieces."
+            f"Input too large: {len(content):,} characters exceeds the {limit:,} character "
+            f"limit for a single agent call — roughly {parts} runs' worth. Submit it in "
+            f"about {parts} parts (a folder at a time is usually the natural split). "
+            f"Nothing was spent: this is refused before the model is called. Code Review "
+            f"and VAPT split a large source automatically; the other agents do not yet."
         )
 
 

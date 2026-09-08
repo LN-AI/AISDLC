@@ -919,6 +919,49 @@ check("HIPAA-003 is now reachable -- it is what the mis-filed finding actually w
       "HIPAA-003" in _CODE_PROMPT and _CATALOGUE["HIPAA-003"].title.startswith("Audit Logging"))
 
 
+# -- An artifact too big for one call says how big ------------------------
+section("15. Too large to review says how much too large")
+
+# Code Review and VAPT chunk; every other agent gets one call and this hard stop. The old
+# message ("split the artifact into smaller pieces") was true and unactionable -- it did not
+# say whether you were 5% over or four times over, so the only way to find out was to keep
+# resubmitting. The size of the problem is the one thing this function knows for certain.
+
+_LIM = guardrail_service.config.MAX_AGENT_INPUT_CHARS
+
+guardrail_service.enforce_input_limit("x" * (_LIM - 1))
+check("an artifact inside the limit passes", True)
+
+
+def _refusal(n, limit=None):
+    try:
+        guardrail_service.enforce_input_limit("x" * n, limit)
+        return ""
+    except guardrail_service.GuardrailViolation as exc:
+        return str(exc)
+
+
+_msg = _refusal(_LIM + 1)
+check("one character over is refused", bool(_msg))
+check("...as two runs' worth, not one -- 1.01x the limit still needs a second call",
+      "roughly 2 runs" in _msg, _msg[:160])
+check("...and says nothing was spent, because it is refused before the model call",
+      "Nothing was spent" in _msg,
+      "otherwise a refusal on a large codebase reads as a charge for nothing")
+check("...and points at the two agents that do not have this problem",
+      "Code Review" in _msg and "VAPT" in _msg,
+      "the honest next step is 'use the one that chunks', where that is an option")
+
+check("four times the limit asks for four parts",
+      "roughly 4 runs" in _refusal(_LIM * 4), _refusal(_LIM * 4)[:160])
+check("...and a fraction over four rounds up to five",
+      "roughly 5 runs" in _refusal(_LIM * 4 + 1), _refusal(_LIM * 4 + 1)[:160])
+
+check("an explicit limit is honoured over the configured one",
+      "roughly 3 runs" in _refusal(2500, 1000), _refusal(2500, 1000)[:160])
+check("empty content is never refused", _refusal(0) == "")
+
+
 print()
 print("-" * 60)
 if _failures:
