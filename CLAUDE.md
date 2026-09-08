@@ -258,9 +258,18 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   see it: every fix test stops at `plan`, which writes nothing. **`verify_fix_apply.py` is
   the equivalent for fixes** — it drives all five deliveries plus the preview against a real
   repository, and `smoke_review_sources.py` §31 fails if a delivery is added to
-  `fix_apply.OUTPUTS` without a stage in it, because a delivery nothing exercises is how
-  this subsystem collected three defects in twenty lines (D-362). `same_pr` is opt in: it
-  commits onto a branch somebody may have checked out.
+  `fix_apply.OUTPUTS` without a stage in it (D-362). `same_pr` is opt in: it commits onto a
+  branch somebody may have checked out.
+
+  **Its first live run found three more, and one of them had left the whole feature
+  non-functional for eight commits** — `_available_outputs` called with two arguments
+  against a one-argument definition, so every `apply` and `deliver` raised `TypeError`
+  before reaching a delivery; a GitHub zipball carrying only **7 characters** of the commit
+  sha, which `POST /git/refs` rejects with a bare 422; and a base branch derived by
+  splitting a label on `@` that isn't there, which returns the repository name. All three
+  are fixed and re-verified against a real repository, `smoke_products.py` §21 now guards
+  the cheapest class of the first, and D-364 has the detail. The lesson is the one D-317
+  recorded: **read that row before trusting an offline test about a write path.**
 - `backend/services/modernization/` — the one subsystem with its own schema and its own durable
   execution model: whole-codebase conversion runs (ingest → dependency graph → charter → claim-and-lease
   worker loop → Tier-0 validation). Its DDL lives in `store.py` and is called from `database.init_db()`.

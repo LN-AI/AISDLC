@@ -537,7 +537,7 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     if output == PREVIEW:
         result["applied"] = False
         result["preview"] = True
-        result["available_outputs"] = _available_outputs(source, loaded["review"])
+        result["available_outputs"] = _available_outputs(source)
         result["patches"] = [{"path": p["path"], "fixed_content": p.get("fixed_content", ""),
                               "explanation": p.get("explanation", "")} for p in safe]
         result["before"] = before
@@ -567,7 +567,7 @@ def deliver(orch, review_id: str, held: Dict[str, Any], output: str,
         raise FixError(f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}.")
     loaded = _load(review_id, project_id)
     source = review_source_store.summarize(review_id)
-    available = {o["id"] for o in _available_outputs(source, loaded["review"])
+    available = {o["id"] for o in _available_outputs(source)
                  if not o.get("unavailable")}
     if output not in available:
         raise FixError(
@@ -654,12 +654,25 @@ def _deliver(orch, review_id: str, output: str, safe: List[Dict[str, Any]],
     if source.get("source_type") == "github_pr":
         base_ref = source.get("head_branch") or ""
     else:
-        base_ref = (source.get("label") or "").split("@")[-1] or ""
-    if not base_ref:
-        # Asked, not assumed. "main" is a guess that fails on every repository still using
-        # master, or develop, and fails as another opaque 422 rather than as a sentence.
-        # Only needed for the `pr` delivery, but resolved here so the failure is one
-        # sentence about a default branch rather than a 422 thirty lines later.
+        # **Only when the label actually carries an `@`.** A repository reviewed at its
+        # default branch is labelled `scratch-repo` with no `@` at all, and `split("@")[-1]`
+        # then returns the *repository name* — a non-empty, entirely plausible-looking
+        # string that is not a branch. `POST /pulls` answered a bare 422 and the emptiness
+        # guard below could not see it, because the value was not empty. Same family as
+        # D-315: a branch name must never be derived from a human label without being
+        # checked. Found by `scripts/verify_fix_apply.py` on its first real run (D-364).
+        label = source.get("label") or ""
+        base_ref = label.split("@")[-1] if "@" in label else ""
+    # Asked, not assumed. "main" is a guess that fails on every repository still using
+    # master, or develop, and fails as another opaque 422 rather than as a sentence.
+    # Only needed for the `pr` delivery, but resolved here so the failure is one
+    # sentence about a default branch rather than a 422 thirty lines later.
+    #
+    # The `branch_exists` half matters as much as the emptiness half: what the label
+    # carried after its `@` may be a tag, a sha, or a branch that has since been deleted,
+    # and all three fail identically to a wrong name. One request to find out, against a
+    # delivery that is about to push.
+    if not base_ref or not gh.branch_exists(owner, repo, base_ref):
         base_ref = gh.get_default_branch(owner, repo)
 
     if output == "same_pr":

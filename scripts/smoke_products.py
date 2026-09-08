@@ -1891,6 +1891,72 @@ def main_():
         _n20.socket.getaddrinfo = _real_getaddrinfo
         llm_gateway.call_tool = _stub_call_tool
 
+
+    # ── 21. Every in-module call matches the function it calls ───────────
+    #
+    # `fix_apply.apply` called `_available_outputs(source, loaded["review"])` against a
+    # one-argument definition, so **every** Apply Fixes call — all five deliveries and the
+    # preview — raised `TypeError` before reaching a delivery. It shipped in the commit that
+    # added the preview and survived eight commits, because the offline fix tests all stop
+    # at `plan`, which never reaches that line (D-317). A live run found it in 40 seconds.
+    #
+    # This is the cheap, general form of that whole class: a call to a function defined at
+    # module level in the *same* file, with more positional arguments than it accepts.
+    # Deliberately narrow — bare-name calls only, within one module, skipping `*args`
+    # splats — because a broader "does every name resolve" sweep was tried earlier in this
+    # programme and abandoned: it found 87 call sites against 516 declarations and would
+    # have given false confidence rather than coverage. This one is worth having precisely
+    # because it reports **zero** across `backend/` today, so a single hit is real.
+    section("21. No call passes more arguments than its function takes")
+
+    import ast as _ast21
+
+    def _module_arities21(tree):
+        out = {}
+        for node in tree.body:
+            if not isinstance(node, (_ast21.FunctionDef, _ast21.AsyncFunctionDef)):
+                continue
+            a = node.args
+            positional = len(a.posonlyargs) + len(a.args)
+            out[node.name] = (positional - len(a.defaults),
+                              None if a.vararg else positional)
+        return out
+
+    _bad21 = []
+    for _dirpath, _dirnames, _files in os.walk("backend"):
+        if "__pycache__" in _dirpath:
+            continue
+        for _f in sorted(_files):
+            if not _f.endswith(".py"):
+                continue
+            _path = os.path.join(_dirpath, _f)
+            try:
+                _tree21 = _ast21.parse(io.open(_path, encoding="utf-8").read())
+            except (OSError, SyntaxError):
+                continue
+            _arities = _module_arities21(_tree21)
+            for _n in _ast21.walk(_tree21):
+                if not (isinstance(_n, _ast21.Call)
+                        and isinstance(_n.func, _ast21.Name)):
+                    continue
+                _sig = _arities.get(_n.func.id)
+                if not _sig:
+                    continue
+                # `f(*args)` hides the count, and a keyword-only mismatch is a different
+                # bug this check does not claim to find.
+                if any(isinstance(_x, _ast21.Starred) for _x in _n.args):
+                    continue
+                _required, _most = _sig
+                _given = len(_n.args)
+                if _most is not None and _given > _most:
+                    _bad21.append(f"{_path.replace(os.sep, '/')}:{_n.lineno} "
+                                  f"{_n.func.id}() given {_given}, takes at most {_most}")
+
+    check("NO FUNCTION IS CALLED WITH MORE ARGUMENTS THAN IT ACCEPTS", not _bad21,
+          "; ".join(_bad21)
+          + " -- each of these is a guaranteed TypeError the moment that line runs, and a "
+            "line that only runs on a write path can survive for months (D-364)")
+
     stack.close()
 
     print(f"\n{'-' * 60}")

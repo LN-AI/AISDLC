@@ -362,6 +362,19 @@ def from_github_repo(github, repo_url: str, ref: str = "",
     except Exception as exc:
         raise SourceError(f"Could not download {repo_url}: {exc}") from exc
     commit_sha = sha_from_zipball(archive)
+    # A zipball's root directory carries only **7** characters of the sha, and
+    # `POST /git/refs` rejects an abbreviated sha with a bare 422 — so every `branch` and
+    # `pr` fix delivery from a repository review failed, after the patch had been generated
+    # and paid for. Expanded here rather than at the write, because the recorded provenance
+    # should be the full commit too: a 7-character sha on an audit record is ambiguous by
+    # construction. This asks GitHub to name the *same* commit in full and never re-resolves
+    # the branch, so the reason `sha_from_zipball` reads the archive still holds. Found by
+    # `scripts/verify_fix_apply.py` on its first real run; see D-364.
+    if commit_sha and len(commit_sha) < 40 and hasattr(github, "expand_commit_sha"):
+        owner_repo = repo_url.rstrip("/").split("github.com/")[-1].strip("/")
+        _owner, _, _repo = owner_repo.partition("/")
+        commit_sha = (github.expand_commit_sha(_owner, _repo.split("/")[0], commit_sha)
+                      or commit_sha)
     bundle = from_zip_bytes(archive, label=repo_url, extensions=extensions)
     bundle.source_type = "github_repo"
     bundle.label = repo_url.rstrip("/").split("/")[-1] + (f"@{ref}" if ref else "")

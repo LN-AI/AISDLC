@@ -269,6 +269,53 @@ class GitHubService:
             logger.info("Created branch %s/%s:%s from %s", owner, repo, new_branch, from_branch)
         return result
 
+    def branch_exists(self, owner: str, repo: str, branch: str) -> bool:
+        """Whether this is a real branch. Never raises, unlike `get_branch_head_sha`.
+
+        Exists so a *derived* branch name can be checked before it is used. The base of a
+        pull request has to be a branch — a tag, a sha or a plausible-looking string that
+        happens not to be one all fail as an identical bare 422 from `POST /pulls`, thirty
+        lines away from whatever produced the name.
+        """
+        if not branch:
+            return False
+        try:
+            with httpx.Client(headers=self.headers, timeout=20) as client:
+                return client.get(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/git/ref/heads/{branch}"
+                ).is_success
+        except Exception:  # noqa: BLE001
+            return False
+
+    def expand_commit_sha(self, owner: str, repo: str, sha: str) -> str:
+        """Turn an abbreviated commit sha into its full 40 characters.
+
+        Needed because `POST /git/refs` — the only way to create a branch — **rejects an
+        abbreviated sha with a bare 422**, and a GitHub zipball only carries 7 characters:
+        the archive's root directory is `{owner}-{repo}-{short_sha}`, which is where
+        `source_bundle.sha_from_zipball` correctly reads the commit from.
+
+        This names the *same* commit rather than re-resolving a branch, so it keeps the
+        property that made reading the sha out of the archive right in the first place: a
+        busy branch cannot move underneath us between the download and this call.
+
+        Returns "" on any failure. The caller keeps the short sha in that case, which still
+        works for reading a file back through the contents API — only ref creation needs the
+        full form, and that failure is then GitHub's to report rather than ours to invent.
+        """
+        if not sha:
+            return ""
+        try:
+            with httpx.Client(headers=self.headers, timeout=20) as client:
+                resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/commits/{sha}")
+                if resp.is_success:
+                    return (resp.json() or {}).get("sha") or ""
+                logger.warning("Could not expand %s in %s/%s: HTTP %s",
+                               sha[:8], owner, repo, resp.status_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not expand %s in %s/%s: %s", sha[:8], owner, repo, exc)
+        return ""
+
     def get_default_branch(self, owner: str, repo: str) -> str:
         """The repository's own default branch.
 
