@@ -1,3 +1,4 @@
+import asyncio
 import os
 import io
 import json
@@ -1389,11 +1390,12 @@ async def review_requirement_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     try:
-        result = orchestrator.review_requirement(
+        result = await asyncio.to_thread(
+            orchestrator.review_requirement,
             content=text,
             context=context,
             project_name=project_name or file.filename,
@@ -1703,12 +1705,13 @@ async def review_architecture_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.review_architecture(
+        result = await asyncio.to_thread(
+            orchestrator.review_architecture,
             artifact=text,
             requirements=requirements,
             review_mode=review_mode or "review",
@@ -1751,12 +1754,13 @@ async def review_vapt_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.review_vapt(
+        result = await asyncio.to_thread(
+            orchestrator.review_vapt,
             artifact=text,
             scope=scope,
             context=context,
@@ -1798,12 +1802,13 @@ async def review_security_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.review_security(
+        result = await asyncio.to_thread(
+            orchestrator.review_security,
             artifact=text,
             system_type=system_type,
             context=context,
@@ -2053,7 +2058,7 @@ async def preflight_cfr21_upload_zip(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
     content = await file.read()
     try:
-        files = _extract_zip_files(content)
+        files = await asyncio.to_thread(_extract_zip_files, content)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
     if not files:
@@ -2083,13 +2088,14 @@ async def review_cfr21_verification_upload_zip(
     _require_llm()
     content = await file.read()
     try:
-        files = _extract_zip_files(content)
+        files = await asyncio.to_thread(_extract_zip_files, content)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
     if not files:
         raise HTTPException(status_code=400, detail="No scannable source files found in the zip (check extensions / excluded dirs)")
     try:
-        result = orchestrator.verify_cfr21(
+        result = await asyncio.to_thread(
+            orchestrator.verify_cfr21,
             files=files,
             system_description=system_description,
             context=context,
@@ -2137,13 +2143,14 @@ async def review_gxp_document_check_upload(
     documents = []
     for f in files:
         content_bytes = await f.read()
-        text = _extract_text(content_bytes, f.filename or "")
+        text = await asyncio.to_thread(_extract_text, content_bytes, f.filename or "")
         if text.strip():
             documents.append({"name": f.filename or "document", "content": text})
     if not documents:
         raise HTTPException(status_code=400, detail="Could not extract text from any uploaded file")
     try:
-        result = orchestrator.check_gxp_documents(
+        result = await asyncio.to_thread(
+            orchestrator.check_gxp_documents,
             documents=documents,
             document_type_hint=document_type_hint,
             context=context,
@@ -2192,13 +2199,14 @@ async def review_gxp_generate_plan_upload_zip(
     _require_llm()
     content = await file.read()
     try:
-        files = _extract_zip_files(content)
+        files = await asyncio.to_thread(_extract_zip_files, content)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
     if not files:
         raise HTTPException(status_code=400, detail="No scannable source files found in the zip (check extensions / excluded dirs)")
     try:
-        result = orchestrator.plan_gxp_validation_package(
+        result = await asyncio.to_thread(
+            orchestrator.plan_gxp_validation_package,
             files=files,
             system_description=system_description,
             context=context,
@@ -2425,12 +2433,13 @@ async def review_sensitive_data_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.scan_sensitive_data(
+        result = await asyncio.to_thread(
+            orchestrator.scan_sensitive_data,
             content=text, context=context, project_name=project_name or file.filename or "Unnamed Project",
         )
         return result

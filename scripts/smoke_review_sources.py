@@ -2088,6 +2088,42 @@ def main():
                   int(_pf.headers.get("X-Spend-Calls", 0)) == 0,
                   f"a free preflight claimed {_pf.headers.get('X-Spend-Calls')} call(s)")
 
+            # ── The upload variants, which nothing had ever exercised (C-83) ──
+            #
+            # These ten routes had no test of any kind, and they are the only agent routes
+            # that are legitimately `async def` -- they must `await file.read()`. C-83 moved
+            # their model call and their PDF/zip parsing onto a thread with
+            # `asyncio.to_thread`, and that is not a free change: `to_thread` runs the
+            # function in a **copy** of the context, so anything a contextvar is supposed to
+            # report *back up* could have started silently returning nothing.
+            #
+            # `context.collect_saved_reviews()` is exactly that mechanism, and it is how
+            # `legacy_guard` learns which review to bill (D-311). It holds a mutable list
+            # for this reason -- the thread appends to the same object the middleware is
+            # holding -- so it should survive. "Should" is why this is a test: the same
+            # reasoning applied to a plain value would be wrong, and no existing check
+            # would have noticed.
+            _up = client.post(
+                "/api/review/requirement/upload",
+                files={"file": ("requirement.txt",
+                                b"The system shall log every access to a patient record.",
+                                "text/plain")},
+                data={"project_name": "Sources", "context": ""},
+                headers=H)
+            check("an upload route answers 200 with its model call off the event loop",
+                  _up.status_code == 200, _up.text[:200])
+            _up_missing = [h for h in _METERED if h not in _up.headers]
+            check("...and the spend still reaches the browser through the context copy",
+                  not _up_missing,
+                  f"absent: {_up_missing} -- `asyncio.to_thread` gives the call a *copy* of "
+                  f"the context, so if attribution rode on a plain contextvar rather than "
+                  f"the mutable list of D-311, moving the call off the loop would have "
+                  f"silently unbilled every upload")
+            check("...priced by the same arithmetic as the JSON route",
+                  int(_up.headers.get("X-Spend-Tokens-In", 0)) >= 1200,
+                  f"{_up.headers.get('X-Spend-Tokens-In')} in -- the figure must come from "
+                  f"the gateway's own record, not from a re-estimate")
+
             # Iterate the map rather than spot-checking one route, so a product that
             # reports its spend by no mechanism at all is named by the test instead of
             # passing quietly. There are exactly three mechanisms and every product must

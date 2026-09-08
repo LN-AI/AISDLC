@@ -45,6 +45,16 @@ PROBES = [
     ("/api/review/requirement", {"content": "The system shall log every access to a patient record."}),
     ("/api/review/code", {"code": "q = 'SELECT * FROM users WHERE u=' + u"}),
     ("/api/review/prompt", {"system_prompt": "You are a helpful assistant.", "tools": []}),
+    # C-83, and the reason it needed its own probe. The upload variants are *correctly*
+    # `async def` — they have to `await file.read()` — so they could not be flipped to plain
+    # `def` with the 23 in D-334, and `smoke_products.py` §19 cannot see them either: its
+    # rule is "async but never awaits", and these do await. They then called the orchestrator
+    # synchronously, so the block was merely deferred until after the read. A probe is the
+    # only thing that tells the difference between "awaits something" and "does not block".
+    ("/api/review/requirement/upload",
+     {"__file__": ("requirement.txt",
+                   b"The system shall log every access to a patient record.",
+                   "text/plain")}),
 ]
 
 
@@ -152,9 +162,15 @@ def main() -> int:
             t = threading.Thread(target=hammer, daemon=True)
             t.start()
             started = time.perf_counter()
+            filespec = payload.get("__file__") if isinstance(payload, dict) else None
             try:
-                r = httpx.post(base + path, json=payload, headers=hdr,
-                               timeout=args.sleep + 60)
+                if filespec:
+                    r = httpx.post(base + path, files={"file": filespec},
+                                   data={"project_name": "loop-measure"}, headers=hdr,
+                                   timeout=args.sleep + 60)
+                else:
+                    r = httpx.post(base + path, json=payload, headers=hdr,
+                                   timeout=args.sleep + 60)
                 status = r.status_code
             except Exception as exc:
                 status = f"err {type(exc).__name__}"

@@ -14,6 +14,7 @@ free and deterministic while still exercising the real routing, auth, entitlemen
 and metering paths — everything except the model itself.
 """
 import contextlib
+import io
 import os
 import sys
 import shutil
@@ -1468,6 +1469,66 @@ def main_():
           f"{_jobs} vs expected {sorted(_JOB_ROUTES)} -- these schedule with "
           "asyncio.create_task and need a running loop; a sync handler runs on a "
           "threadpool where there is none, so flipping one breaks it silently")
+    # C-83. The check above asks "is it async and never awaits", which is the D-334 defect.
+    # It cannot see the upload handlers: they *must* `await file.read()`, so they await
+    # something and pass -- and then called the orchestrator synchronously anyway, which
+    # blocks the loop just as completely, only later. Measured at 5.30s of a 6s review before
+    # the fix and 0.28s after (`measure_event_loop.py`, now with an upload probe).
+    #
+    # The property is exact: inside an `async def` route, an agent call must be *passed to*
+    # `asyncio.to_thread`, never *called*. Bodies of nested functions are excluded because a
+    # background task defined inside a 202 job route runs on its own.
+    def _own_nodes19(fn):
+        stack = list(_ast19.iter_child_nodes(fn))
+        while stack:
+            n = stack.pop()
+            if isinstance(n, (_ast19.FunctionDef, _ast19.AsyncFunctionDef, _ast19.Lambda)):
+                continue
+            yield n
+            stack.extend(_ast19.iter_child_nodes(n))
+
+    def _sync_calls19(fn, prefixes):
+        out = []
+        for n in _own_nodes19(fn):
+            if not isinstance(n, _ast19.Call):
+                continue
+            try:
+                target = _ast19.unparse(n.func)
+            except Exception:
+                continue
+            if any(target.startswith(pre) or target == pre for pre in prefixes):
+                out.append(f"{fn.name} -> {target}")
+        return out
+
+    _sync_agents, _sync_parsers = [], []
+    for _node in _tree19.body:
+        if not isinstance(_node, _ast19.AsyncFunctionDef):
+            continue
+        if not any(_ast19.unparse(d).startswith("app.") for d in _node.decorator_list):
+            continue
+        _sync_agents += _sync_calls19(_node, ("orchestrator.",))
+        # PyPDF2 walks a PDF page by page and `zipfile` decompresses up to the CFR21 char
+        # cap. Both are pure CPU, both ran on the loop, and both happen *before* the model
+        # call -- so a large upload froze the server even on a route that was about to be
+        # refused.
+        _sync_parsers += _sync_calls19(_node, ("_extract_text", "_extract_zip_files"))
+
+    check("no `async def` route calls an agent on the event loop", not _sync_agents,
+          "these block every other request for the whole model call: "
+          + ", ".join(_sync_agents)
+          + " -- pass the function to `asyncio.to_thread` instead of calling it (C-83). "
+            "The handler cannot simply drop `async`, because it awaits the upload.")
+    check("...nor parses an uploaded PDF or zip on it", not _sync_parsers,
+          "these decompress or parse on the event loop: " + ", ".join(_sync_parsers)
+          + " -- a 300-page PDF is seconds of CPU before the model is even reached")
+    _probe_src19 = io.open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "measure_event_loop.py"), encoding="utf-8").read()
+    check("...and an upload route is actually probed, not just reasoned about",
+          "requirement/upload" in _probe_src19,
+          "C-83 was invisible to the structural check above, which only knows about `async` "
+          "without `await`. The probe is what caught it -- 5.30s blocked of a 6s review -- "
+          "and is what would catch the next variant of the same mistake")
+
     check("the measurement that proves any of this is still in the repository",
           os.path.exists(os.path.join(os.path.dirname(os.path.dirname(
               os.path.abspath(__file__))), "scripts", "measure_event_loop.py")),
