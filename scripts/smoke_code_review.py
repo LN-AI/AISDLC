@@ -544,6 +544,89 @@ check("the waive endpoint is actually registered on the app",
       "a router that is imported but never included is invisible until someone calls it")
 check("it is a PATCH", "patch" in _paths.get("/api/v1/findings/{finding_id}", {}))
 
+# ── The case above has one review. The real one has several (C-81) ─────────
+#
+# One fingerprint gets one findings row per review that reported it, and those rows
+# disagree: review 1 saw it open, somebody waived it from review 2's list. The old query
+# grouped by fingerprint with bare columns and a single `MIN(r.created_at)`, which triggers
+# SQLite's documented min/max special case -- the bare columns come from the row with the
+# **minimum**, the *oldest* review. So a waiver set on any review after the first was
+# invisible for ever and the finding was gated on again after a team had accepted it.
+#
+# Rows are inserted directly because the point is two reviews with controlled timestamps
+# sharing a fingerprint, which `save_review` cannot express.
+_C81_COLS = ("id, review_id, fingerprint, status, severity, project_id, control_id, "
+             "risk_level, title, resolved_by, resolved_at, resolution_comment, "
+             "waiver_expires_at")
+_C81_Q = f"INSERT INTO findings ({_C81_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+
+
+def _c81_seed(fp, project, *, expires=None, reverse=False):
+    """Two reviews of one project; the older row open, the newer row waived."""
+    conn = database.get_connection()
+    cur = conn.cursor()
+    old_id, new_id = f"{fp}-rev-old", f"{fp}-rev-new"
+    for rid, when in ((old_id, "2026-01-01T00:00:00"), (new_id, "2026-06-01T00:00:00")):
+        cur.execute("INSERT INTO reviews (id, review_type, gate_status, created_at, "
+                    "project_id) VALUES (?,?,?,?,?)", (rid, "code", "Red", when, project))
+    rows = [
+        (f"{fp}-old", old_id, fp, "open", 5, project, "SEC-001", "Critical", "t",
+         None, None, None, None),
+        (f"{fp}-new", new_id, fp, "accepted_risk", 5, project, "SEC-001", "Critical", "t",
+         "alice", "2026-06-02T00:00:00", "accepted for this release", expires),
+    ]
+    # Insertion order must not change the answer -- that is the whole point of replacing
+    # bare columns with a window function.
+    for row in (reversed(rows) if reverse else rows):
+        cur.execute(_C81_Q, row)
+    conn.commit()
+    conn.close()
+
+
+_c81_seed("c81-fp-1", "c81-proj")
+_b81 = database.get_finding_baseline("c81-proj", ["c81-fp-1"])["c81-fp-1"]
+check("A WAIVER SET ON A LATER REVIEW IS STILL A WAIVER",
+      _b81["status"] == "accepted_risk",
+      f"the baseline reports {_b81['status']!r} -- with bare columns SQLite returned the "
+      "OLDEST row, so a finding a team had explicitly accepted was reported and gated on "
+      "again by every run afterwards, which is how people stop reading reviews")
+check("...and the decision is attributed to whoever made it",
+      _b81["resolved_by"] == "alice" and "accepted for this release" in
+      (_b81["resolution_comment"] or ""),
+      f"{_b81['resolved_by']!r} / {_b81['resolution_comment']!r} -- the oldest row has no "
+      "resolver, so the status and its attribution came from different rows")
+check("...while first_seen is still the oldest sighting, not the waiver's date",
+      _b81["first_seen"] == "2026-01-01T00:00:00",
+      f"{_b81['first_seen']} -- 'how long have we had this' must not reset when someone "
+      "accepts it")
+
+_c81_seed("c81-fp-2", "c81-proj", reverse=True)
+check("...and the answer does not depend on the order rows were written",
+      database.get_finding_baseline("c81-proj", ["c81-fp-2"])["c81-fp-2"]["status"]
+      == "accepted_risk",
+      "a query whose result depends on physical row order is one that passes in a test and "
+      "fails on a customer's database")
+
+# The unscoped branch is a separate SQL string in the same function, so it is checked
+# separately -- fixing one and not the other is the obvious way to half-fix this.
+_c81_seed("c81-fp-3", None)
+check("...on the project-less path too, which is a second copy of the query",
+      database.get_finding_baseline(None, ["c81-fp-3"])["c81-fp-3"]["status"]
+      == "accepted_risk",
+      "`get_finding_baseline` builds one SQL string for a bound project and another for "
+      "none; they have to agree")
+
+# "Any live waiver wins" is bounded by expiry, which is why the rule is defensible: the
+# cost of being wrong is one finding hidden for at most the acceptance window, and
+# `lapse_expired_waivers` runs before every baseline lookup (D-259).
+_c81_seed("c81-fp-4", "c81-proj", expires="2026-09-01T00:00:00")
+check("an acceptance that ran out stops winning",
+      database.lapse_expired_waivers() >= 1
+      and database.get_finding_baseline("c81-proj", ["c81-fp-4"])["c81-fp-4"]["status"]
+      == "open",
+      "otherwise 'any waiver wins' would mean 'any waiver wins for ever', and an expiry "
+      "date that changes nothing is worse than no expiry date")
+
 # ── 12. The other half of the baseline ─────────────────────────────────────
 #
 # Section 11 asks "what is new". Nothing asked "what is gone", so a fix and a still-open

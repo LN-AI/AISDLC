@@ -3354,6 +3354,27 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
 
     Scoped to the project, so one team's decision to waive something never silently
     suppresses it for another.
+
+    **A live waiver wins over every other row for the same fingerprint** (C-81). One
+    fingerprint has one row per review that reported it, and they disagree: review 1 saw it
+    open, someone waived it from review 2's list, so there is an `open` row and an
+    `accepted_risk` row. The old query grouped by fingerprint with bare columns and one
+    `MIN(r.created_at)`, which triggers SQLite's documented min/max special case: the bare
+    columns come from the row with the **minimum**, i.e. the *oldest* review. So a waiver
+    set on any review after the first was invisible for ever, and the finding was reported
+    and gated on again after a team had explicitly accepted it — which is precisely how
+    people stop reading reviews. Verified against SQLite 3.45.3 rather than assumed.
+
+    The rule is "any live waiver wins", not "newest row wins", because the two fail
+    differently: a stale waiver hides one finding, and its blast radius is already bounded
+    (`accepted_risk` expires after 90 days and `lapse_expired_waivers` runs before every
+    baseline lookup, which is why `waiver_lapsed_at IS NULL` is part of the test — a lapsed
+    acceptance is not a waiver, per D-259). Re-reporting a decided finding, by contrast,
+    devalues every review after it.
+
+    Ties break on the most recent decision and then on `f.id`, so the answer is fully
+    deterministic — a window function rather than bare columns, so there is no
+    implementation-defined behaviour left to depend on.
     """
     if not fingerprints:
         return {}
@@ -3367,20 +3388,30 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
         placeholders = ",".join("?" * len(batch))
         if project_id:
             sql = (
-                f"SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
-                f"f.resolution_comment, MIN(r.created_at) AS first_seen "
-                f"FROM findings f JOIN reviews r ON r.id = f.review_id "
-                f"WHERE f.fingerprint IN ({placeholders}) AND f.project_id = ? "
-                f"GROUP BY f.fingerprint"
+                f"SELECT fingerprint, status, resolved_by, resolved_at, resolution_comment, "
+                f"       first_seen FROM ("
+                f"  SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
+                f"         f.resolution_comment, "
+                f"         MIN(r.created_at) OVER (PARTITION BY f.fingerprint) AS first_seen, "
+                f"         ROW_NUMBER() OVER (PARTITION BY f.fingerprint "
+                f"                            ORDER BY {_BASELINE_ROW_PICK}) AS rn "
+                f"  FROM findings f JOIN reviews r ON r.id = f.review_id "
+                f"  WHERE f.fingerprint IN ({placeholders}) AND f.project_id = ? "
+                f") WHERE rn = 1"
             )
             params = batch + [project_id]
         else:
             sql = (
-                f"SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
-                f"f.resolution_comment, MIN(r.created_at) AS first_seen "
-                f"FROM findings f JOIN reviews r ON r.id = f.review_id "
-                f"WHERE f.fingerprint IN ({placeholders}) AND f.project_id IS NULL "
-                f"GROUP BY f.fingerprint"
+                f"SELECT fingerprint, status, resolved_by, resolved_at, resolution_comment, "
+                f"       first_seen FROM ("
+                f"  SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
+                f"         f.resolution_comment, "
+                f"         MIN(r.created_at) OVER (PARTITION BY f.fingerprint) AS first_seen, "
+                f"         ROW_NUMBER() OVER (PARTITION BY f.fingerprint "
+                f"                            ORDER BY {_BASELINE_ROW_PICK}) AS rn "
+                f"  FROM findings f JOIN reviews r ON r.id = f.review_id "
+                f"  WHERE f.fingerprint IN ({placeholders}) AND f.project_id IS NULL "
+                f") WHERE rn = 1"
             )
             params = batch
         for row in cursor.execute(sql, params):
@@ -3394,6 +3425,15 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
 # order — and declared here rather than imported because the data layer does not otherwise
 # depend on the services layer.
 WAIVED_STATUS_LIST = ["waived", "false_positive", "accepted_risk"]
+
+
+# Which row speaks for a fingerprint when several disagree. See `get_finding_baseline`
+# for why a live waiver outranks recency, and C-81 for what the bare-column version did.
+_BASELINE_ROW_PICK = (
+    "CASE WHEN f.status IN ('" + "', '".join(WAIVED_STATUS_LIST) + "') "
+    "          AND f.waiver_lapsed_at IS NULL THEN 0 ELSE 1 END, "
+    "COALESCE(f.resolved_at, r.created_at) DESC, f.id DESC"
+)
 
 
 def _finding_filter_sql(status: Optional[str] = None, min_severity: int = 0,
