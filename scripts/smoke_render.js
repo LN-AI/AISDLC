@@ -3267,6 +3267,82 @@ function runNavigationChecks() {
 // covering several runs, and the card has to say so, or a reviewer approves three runs
 // believing they approved one.
 
+// The leadership half of the Dashboard
+//
+// Both panels are new screens over data that already existed -- `/api/repositories` was
+// being served to nobody. What can break silently is the arithmetic in the bars and the
+// empty states, which is what a reader sees on day one.
+
+async function runDashboardChecks() {
+  console.log('\nDashboard trend and repository health');
+
+  await checkAsync('the trend says which direction the backlog moved', async () => {
+    nextFetchBody = {
+      findings: [
+        { week: '2026-30', new: 10, resolved: 2, net: 8, open_at_end: 8 },
+        { week: '2026-31', new: 1, resolved: 6, net: -5, open_at_end: 3 },
+      ],
+      gates: [{ week: '2026-31', Green: 4, Amber: 1, Red: 2, total: 7 }],
+    };
+    await sandbox.loadDashboardTrend();
+    const html = document.getElementById('dashboard-trend').innerHTML;
+    assert(html.includes('3 open'), 'the latest open total is the headline');
+    assert(html.includes('down 5'), `the direction over the period: ${html.slice(0, 200)}`);
+    assert(html.includes('4/1/2'), 'the gate mix for the week should be shown');
+  });
+
+  await checkAsync('...and says "up" when it got worse', async () => {
+    nextFetchBody = {
+      findings: [
+        { week: '2026-30', new: 2, resolved: 0, net: 2, open_at_end: 2 },
+        { week: '2026-31', new: 9, resolved: 1, net: 8, open_at_end: 10 },
+      ],
+      gates: [],
+    };
+    await sandbox.loadDashboardTrend();
+    const html = document.getElementById('dashboard-trend').innerHTML;
+    assert(html.includes('up 8'), `expected a rise: ${html.slice(0, 200)}`);
+  });
+
+  await checkAsync('an empty trend explains itself rather than showing an empty table', async () => {
+    nextFetchBody = { findings: [], gates: [] };
+    await sandbox.loadDashboardTrend();
+    const html = document.getElementById('dashboard-trend').innerHTML;
+    assert(/no trend to\s+show/.test(html), `bare empty state: ${html.slice(0, 160)}`);
+    assert(!html.includes('<table'), 'an empty table is worse than a sentence');
+  });
+
+  await checkAsync('repository health lists worst first and shows the latest gate', async () => {
+    nextFetchBody = {
+      repositories: [
+        { repo_owner: 'acme', repo_name: 'payments', open_critical: 3, open_high: 5,
+          runs: 12, last_reviewed_at: '2026-09-07T10:00:00', spend_usd: 1.234,
+          latest: { gate_status: 'Red', branch: 'main' } },
+        { repo_owner: 'acme', repo_name: 'docs', open_critical: 0, open_high: 0,
+          runs: 2, last_reviewed_at: '2026-09-01T10:00:00', spend_usd: 0,
+          latest: { gate_status: 'Green', branch: 'main' } },
+      ],
+    };
+    await sandbox.loadDashboardRepos();
+    const html = document.getElementById('dashboard-repos').innerHTML;
+    assert(html.indexOf('payments') < html.indexOf('docs'),
+      'the server orders worst-first and the table must not resort it');
+    assert(html.includes('acme/payments'), 'the repository has to be nameable');
+    assert(html.includes('Red'), 'the latest gate is the "how is it doing" column');
+    // A repository with no recorded spend shows a dash, not $0.00 -- the same judgement
+    // the run-history spend chip already makes about an unknown cost.
+    assert(html.includes('—'), 'zero spend should read as unknown, not as free');
+  });
+
+  await checkAsync('...and says why it is empty when nothing has a repository', async () => {
+    nextFetchBody = { repositories: [] };
+    await sandbox.loadDashboardRepos();
+    const html = document.getElementById('dashboard-repos').innerHTML;
+    assert(html.includes('paste or a zip upload has no repository'),
+      `the reason matters -- it is not a bug: ${html.slice(0, 180)}`);
+  });
+}
+
 function runApprovalCardChecks() {
   console.log('\nApproval card');
   const render = () => vm.runInContext('renderApprovalCard', sandbox);
@@ -3386,7 +3462,7 @@ async function runProjectWarningChecks() {
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
   .then(runReviewSourceChecks).then(runScreenIsolationChecks)
   .then(runNavigationChecks).then(runProjectWarningChecks)
-  .then(runApprovalCardChecks).then(() => {
+  .then(runApprovalCardChecks).then(runDashboardChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

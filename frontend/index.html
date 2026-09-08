@@ -264,6 +264,22 @@
             <div class="stat-label">Red Gates</div>
           </div>
         </div>
+        <!-- Trend before the lists. Six lifetime totals cannot say whether this is
+             getting better: "44 open" reads the same in a month where thirty were fixed
+             and one where thirty were introduced. -->
+        <div class="section-title">Last 8 weeks</div>
+        <div id="dashboard-trend" class="reviews-table-wrap">
+          <div class="empty-state">Loading...</div>
+        </div>
+
+        <!-- The question a lead opens this screen to ask. `/api/repositories` has existed
+             since `reviews` gained its repository columns and nothing in the browser
+             called it, so the answer was on the server and unreachable. -->
+        <div class="section-title">Repository health</div>
+        <div id="dashboard-repos" class="reviews-table-wrap reviews-table-scroll">
+          <div class="empty-state">Loading...</div>
+        </div>
+
         <div class="section-title">Recent Reviews</div>
         <div id="recent-reviews" class="reviews-table-wrap reviews-table-scroll">
           <div class="empty-state">Loading...</div>

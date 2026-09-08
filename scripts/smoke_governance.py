@@ -1093,6 +1093,79 @@ def main_():
     check("a small one quotes a single call", _q15small["calls"] == 1
           and _q15small["assessed_in_parts"] is False, str(_q15small["calls"]))
 
+    # -- 16. Whether this is getting better --------------------------------
+    #
+    # `get_dashboard_stats` is six lifetime scalars plus the last five reviews, so the
+    # Dashboard could say "44 open" and not whether that was thirty fixed or thirty
+    # introduced. Both series are queries now that findings carry a resolution date --
+    # no new subsystem, no rollup table.
+    section("16. The dashboard can say whether this is getting better")
+
+    _F16 = lambda sev, t: {"control_id": "SEC-001", "severity": sev, "risk_level": "High",
+                           "title": t, "description": "", "recommendation": ""}
+
+    _r16 = database.save_review(
+        review_type="code", project_name="Trend16", input_summary="s", input_content="x",
+        result={"findings": [_F16(5, "t-a"), _F16(4, "t-b"), _F16(4, "t-c")],
+                "gate_status": "Red", "risk_score": 90.0, "summary": "s"})
+    database.save_review(
+        review_type="code", project_name="Trend16", input_summary="s", input_content="x",
+        result={"findings": [_F16(3, "t-d")], "gate_status": "Amber", "risk_score": 40.0,
+                "summary": "s"})
+
+    # Deltas, not absolutes: this suite shares one database and earlier sections have
+    # already created and resolved findings of their own, so "resolved == 0" would be
+    # asserting something about them rather than about this.
+    _trend16 = database.get_findings_trend()
+    check("the trend has a week in it once a review has run", bool(_trend16), str(_trend16))
+    _wk16 = _trend16[-1]
+    check("...counting what was introduced", _wk16["new"] >= 4, str(_wk16))
+    check("...with an open total no larger than what was ever reported",
+          _wk16["open_at_end"] <= _wk16["new"],
+          "open is reported-minus-resolved; it cannot exceed reported")
+
+    _conn16 = database.get_connection()
+    _fid16 = _conn16.execute(
+        "SELECT id FROM findings WHERE review_id = ? AND status = 'open' LIMIT 1",
+        (_r16,)).fetchone()["id"]
+    _conn16.execute("UPDATE findings SET status='resolved', resolved_at=datetime('now') "
+                    "WHERE id = ?", (_fid16,))
+    _conn16.commit()
+    _conn16.close()
+
+    _after16 = database.get_findings_trend()[-1]
+    check("resolving one is counted as resolved that week",
+          _after16["resolved"] == _wk16["resolved"] + 1,
+          f'{_wk16["resolved"]} -> {_after16["resolved"]}')
+    check("...and moves it out of the open total",
+          _after16["open_at_end"] == _wk16["open_at_end"] - 1,
+          f'{_wk16["open_at_end"]} -> {_after16["open_at_end"]}')
+    check("...so the net is introduced minus resolved, which is the direction",
+          _after16["net"] == _after16["new"] - _after16["resolved"], str(_after16))
+
+    _gates16 = database.get_gate_trend()
+    check("the gate mix is a separate series", bool(_gates16), str(_gates16))
+    check("...counting a Red and an Amber run rather than averaging them",
+          _gates16[-1]["Red"] >= 1 and _gates16[-1]["Amber"] >= 1, str(_gates16[-1]))
+    check("...and a total that includes gates outside the three",
+          _gates16[-1]["total"] >= _gates16[-1]["Red"] + _gates16[-1]["Amber"],
+          "an unknown gate must still be counted, not silently dropped")
+
+    check("the window keeps the most recent weeks",
+          len(database.get_findings_trend(weeks=1)) <= 1,
+          "a one-week window must not return the whole history")
+
+    _resp16 = client.get("/api/dashboard/trend?weeks=8", headers=admin)
+    check("the endpoint serves both series (200)", _resp16.status_code == 200,
+          f"{_resp16.status_code} {_resp16.text[:160]}")
+    check("...as findings and gates",
+          _resp16.status_code == 200 and "findings" in _resp16.json()
+          and "gates" in _resp16.json(),
+          str(list(_resp16.json()))[:120] if _resp16.status_code == 200 else "")
+    _un16 = client.get("/api/dashboard/trend")
+    check("...and refuses a caller with no credential",
+          _un16.status_code in (401, 403), str(_un16.status_code))
+
     print("\n" + "-" * 60)
     if _failures:
         print(f"FAILED: {len(_failures)} of {_checks} checks")

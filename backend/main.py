@@ -938,6 +938,24 @@ async def get_dashboard(request: Request, reader: dict = Depends(require_reader)
     return database.get_dashboard_stats(project_ids=_visible_project_ids(reader, request))
 
 
+@app.get("/api/dashboard/trend", summary="New vs resolved findings, and gate mix, per week")
+async def get_dashboard_trend(request: Request, weeks: int = Query(8, ge=1, le=52),
+                              reader: dict = Depends(require_reader)):
+    """Whether this is getting better, which six lifetime totals cannot say.
+
+    "44 open" reads the same in a month where thirty were fixed and one where thirty were
+    introduced. `findings` and `gates` are separate series on purpose: one Red release can
+    carry forty findings and forty Green ones carry none, so the two answer different
+    questions and averaging them would answer neither.
+    """
+    visible = _visible_project_ids(reader, request)
+    return {
+        "findings": database.get_findings_trend(project_ids=visible, weeks=weeks),
+        "gates": database.get_gate_trend(project_ids=visible, weeks=weeks),
+        "weeks": weeks,
+    }
+
+
 @app.get("/api/reviews")
 async def list_reviews(request: Request, limit: int = Query(20, ge=1, le=200),
                        offset: int = Query(0, ge=0),

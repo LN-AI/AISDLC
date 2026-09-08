@@ -1390,6 +1390,98 @@ def _backfill_review_repo(cursor) -> int:
     return filled
 
 
+def get_findings_trend(project_ids: Optional[List[str]] = None,
+                       weeks: int = 8) -> List[Dict[str, Any]]:
+    """New and resolved findings per week, oldest first, plus the running open total.
+
+    The number a lead actually asks for, and the one thing six lifetime totals cannot show:
+    whether this is getting better. "44 open" is the same sentence in a month where 30 were
+    fixed and one where 30 were introduced.
+
+    `findings` has no date of its own — it inherits its review's `created_at` through the
+    join — so "new in this week" means "reported by a review run this week", which is the
+    honest reading: a finding did not exist for us before the run that found it. `resolved`
+    counts `resolved_at`, which `apply_baseline` writes when a later run over the same
+    repository stops reporting a finding it can see is gone.
+
+    `open_at_end` is a running total rather than a per-week count, because "open" is a
+    state, not an event: it is every finding reported up to that week and not yet resolved.
+    Computed in Python from the two event columns rather than with a correlated subquery
+    per week, which on SQLite is the difference between one scan and `weeks` of them.
+    """
+    scope_sql, params = _project_scope_sql(project_ids, alias="r")
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # `%Y-%W` buckets by week starting Monday. Grouped in SQL so the whole history is one
+    # scan; the window is applied after, so `open_at_end` can carry everything before it.
+    cursor.execute(
+        f"""SELECT strftime('%Y-%W', r.created_at) AS wk, COUNT(*) AS n
+            FROM findings f JOIN reviews r ON r.id = f.review_id
+            WHERE r.created_at IS NOT NULL{scope_sql}
+            GROUP BY wk ORDER BY wk""",
+        params,
+    )
+    new_by_week = {row["wk"]: row["n"] for row in cursor.fetchall()}
+
+    cursor.execute(
+        f"""SELECT strftime('%Y-%W', f.resolved_at) AS wk, COUNT(*) AS n
+            FROM findings f JOIN reviews r ON r.id = f.review_id
+            WHERE f.resolved_at IS NOT NULL{scope_sql}
+            GROUP BY wk ORDER BY wk""",
+        params,
+    )
+    resolved_by_week = {row["wk"]: row["n"] for row in cursor.fetchall()}
+    conn.close()
+
+    every_week = sorted(set(new_by_week) | set(resolved_by_week))
+    running, series = 0, []
+    for wk in every_week:
+        added = new_by_week.get(wk, 0)
+        closed = resolved_by_week.get(wk, 0)
+        running += added - closed
+        series.append({
+            "week": wk,
+            "new": added,
+            "resolved": closed,
+            "net": added - closed,
+            # Cannot go below zero: a finding resolved in a week whose review predates the
+            # window would otherwise drive the running total negative and read as nonsense.
+            "open_at_end": max(running, 0),
+        })
+    return series[-weeks:] if weeks else series
+
+
+def get_gate_trend(project_ids: Optional[List[str]] = None,
+                   weeks: int = 8) -> List[Dict[str, Any]]:
+    """Green / Amber / Red counts per week, oldest first.
+
+    Gate mix over time answers "are we shipping more blocked releases than we were", which
+    is a different question from the finding count: one Red release can carry forty findings
+    and forty Green ones carry none.
+    """
+    scope_sql, params = _project_scope_sql(project_ids, alias="r")
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT strftime('%Y-%W', r.created_at) AS wk,
+                   COALESCE(r.gate_status, 'Unknown') AS gate, COUNT(*) AS n
+            FROM reviews r WHERE r.created_at IS NOT NULL{scope_sql}
+            GROUP BY wk, gate ORDER BY wk""",
+        params,
+    ).fetchall()
+    conn.close()
+
+    by_week: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        bucket = by_week.setdefault(
+            row["wk"], {"week": row["wk"], "Green": 0, "Amber": 0, "Red": 0, "total": 0})
+        if row["gate"] in ("Green", "Amber", "Red"):
+            bucket[row["gate"]] += row["n"]
+        bucket["total"] += row["n"]
+    series = [by_week[k] for k in sorted(by_week)]
+    return series[-weeks:] if weeks else series
+
+
 def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """Headline numbers, scoped to the projects the caller may see.
 

@@ -1259,7 +1259,127 @@ async function loadDashboard() {
   // Reset to the newest page: switching project or re-entering the dashboard should not
   // land the reader deep in a history that may no longer be that long.
   recentReviewsOffset = 0;
-  await loadRecentReviews();
+  // In parallel, and each guarded on its own: a trend query that fails must not leave the
+  // reader without their repository grid, and neither is worth blocking the review list on.
+  await Promise.all([loadRecentReviews(), loadDashboardTrend(), loadDashboardRepos()]);
+}
+
+// ── The leadership half of the Dashboard ─────────────────────────────────
+//
+// Two questions six lifetime totals cannot answer: is this getting better, and which of
+// our repositories is in trouble. Both are queries now that `reviews` carries a repository
+// and findings carry a resolution date -- no new subsystem, and `/api/repositories` was
+// already serving the second one to nobody.
+//
+// Drawn with CSS width bars rather than a charting library, matching how every other
+// bar-like widget here is built. Picking a charting library is a real decision with a
+// bundle cost and this project has no build step; it should not be made as a side effect
+// of adding one panel.
+
+/** New vs resolved per week, with the open total as the line that matters. */
+async function loadDashboardTrend() {
+  const wrap = document.getElementById('dashboard-trend');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/api/dashboard/trend?weeks=8', { _silent: true });
+    const findings = data.findings || [];
+    const gates = data.gates || [];
+    if (!findings.length && !gates.length) {
+      wrap.innerHTML = `<div class="empty-state">No reviews yet, so there is no trend to
+        show. This fills in from the second week you run reviews.</div>`;
+      return;
+    }
+    // Scale to the busiest week so a quiet week is visibly quiet rather than rescaled to
+    // look the same as a busy one.
+    const peak = Math.max(1, ...findings.map(w => Math.max(w.new || 0, w.resolved || 0)));
+    const gateByWeek = Object.fromEntries(gates.map(g => [g.week, g]));
+    const last = findings[findings.length - 1] || {};
+    const first = findings[0] || {};
+    const direction = (last.open_at_end ?? 0) - (first.open_at_end ?? 0);
+
+    wrap.innerHTML = `
+      <div class="field-hint" style="margin-bottom:10px">
+        <b>${last.open_at_end ?? 0} open</b> at the end of the most recent week —
+        ${direction === 0
+          ? 'unchanged over the period.'
+          : direction < 0
+            ? `<span style="color:var(--green)">down ${Math.abs(direction)}</span> over the period.`
+            : `<span style="color:var(--red)">up ${direction}</span> over the period.`}
+        A week where more were resolved than introduced is a week the backlog shrank.
+      </div>
+      <table class="users-table">
+        <thead><tr><th>Week</th><th>New</th><th>Resolved</th><th style="width:40%"></th>
+          <th>Open</th><th>Gates</th></tr></thead>
+        <tbody>
+          ${findings.map(w => {
+            const g = gateByWeek[w.week] || {};
+            const bar = (n, colour) => `<div style="height:8px;border-radius:2px;
+              width:${Math.round((n / peak) * 100)}%;background:${colour};min-width:${n ? 2 : 0}px"></div>`;
+            return `<tr>
+              <td style="font-size:12px;color:var(--text-muted)">${esc(w.week)}</td>
+              <td>${w.new || 0}</td>
+              <td>${w.resolved || 0}</td>
+              <td>${bar(w.new || 0, 'var(--red)')}${bar(w.resolved || 0, 'var(--green)')}</td>
+              <td><strong>${w.open_at_end ?? 0}</strong></td>
+              <td style="font-size:12px;color:var(--text-muted)">
+                ${g.total ? `${g.Green || 0}/${g.Amber || 0}/${g.Red || 0}` : '—'}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      <div class="field-hint">Red bar: introduced. Green bar: resolved. Gates column is
+        Green/Amber/Red runs that week. A finding counts as introduced by the run that
+        found it — it did not exist for us before that.</div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load the
+      trend: ${esc(e.message)}</div>`;
+  }
+}
+
+/** One row per repository, worst first — which is how the server already orders it. */
+async function loadDashboardRepos() {
+  const wrap = document.getElementById('dashboard-repos');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/api/repositories?limit=50', { _silent: true });
+    const repos = data.repositories || [];
+    if (!repos.length) {
+      wrap.innerHTML = `<div class="empty-state">No repository has been reviewed yet.
+        A paste or a zip upload has no repository to group under, so only reviews of a
+        GitHub source appear here.</div>`;
+      return;
+    }
+    const icon = g => ({ Green: '✅', Amber: '⚠️', Red: '🔴' }[g] || '❓');
+    wrap.innerHTML = `
+      <table class="users-table">
+        <thead><tr><th>Repository</th><th>Latest gate</th><th>Open critical</th>
+          <th>Open high</th><th>Runs</th><th>Last reviewed</th><th>Spend</th></tr></thead>
+        <tbody>
+          ${repos.map(r => {
+            const latest = r.latest || {};
+            const name = `${r.repo_owner || ''}/${r.repo_name || ''}`;
+            return `<tr>
+              <td><strong>${esc(name)}</strong>
+                ${latest.branch ? `<div style="font-size:11px;color:var(--text-muted)">${esc(latest.branch)}</div>` : ''}</td>
+              <td>${icon(latest.gate_status)} ${esc(latest.gate_status || '—')}</td>
+              <td>${r.open_critical
+                ? `<span style="color:var(--red);font-weight:600">${r.open_critical}</span>`
+                : '0'}</td>
+              <td>${r.open_high || 0}</td>
+              <td>${r.runs || 0}</td>
+              <td style="font-size:12px;color:var(--text-muted)">${esc((r.last_reviewed_at || '').slice(0, 10))}</td>
+              <td>${r.spend_usd ? _money(r.spend_usd) : '—'}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      <div class="field-hint">Worst first: open Critical, then High, then how recently it
+        was reviewed. Spend comes from the billing ledger, so it agrees with the invoice.
+        A waived finding stops counting the moment it is waived.</div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load
+      repository health: ${esc(e.message)}</div>`;
+  }
 }
 
 async function loadRecentReviews() {
