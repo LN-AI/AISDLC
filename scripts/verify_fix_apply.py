@@ -331,6 +331,13 @@ def main():
                 check("...onto the pull request's own branch, not a new one",
                       branch == src.get("head_branch") and r.get("same_pr") is True,
                       f"committed to {branch!r}, PR head is {src.get('head_branch')!r}")
+                # Recorded as an artefact even though `--cleanup` will not touch it. The
+                # first run of this stage printed "Nothing was written to GitHub" directly
+                # after committing to a live branch, which is the same class of false report
+                # this whole script exists to catch.
+                ARTEFACTS.append(
+                    ("commit on PR branch (NOT removed by --cleanup)",
+                     f"https://github.com/{owner}/{repo}/tree/{branch}"))
             else:
                 # D-314. `create_branch` 404'd on a sha, so this had never succeeded.
                 check("THE BRANCH EXISTS ON GITHUB",
