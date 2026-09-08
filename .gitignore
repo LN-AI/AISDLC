@@ -51,3 +51,7 @@ parity-tools.json
 parity-results.json
 local_*_testing.py
 .commandcode/
+# Conversion and UI-examination output directories: screenshots, converted trees and
+# run logs from driving the real thing. 36MB of it accumulated untracked, which is one
+# `git add -A` away from being in history for ever.
+out-*/
