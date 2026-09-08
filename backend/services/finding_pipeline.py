@@ -460,6 +460,7 @@ def process(
     artifact: str,
     correct_lines: bool = True,
     suppression: Any = None,
+    verify: bool = True,
 ) -> Dict[str, Any]:
     """Verify, suppress, merge, sort and fingerprint. Returns the trustworthy list plus
     what was removed and why.
@@ -467,8 +468,23 @@ def process(
     Baseline comparison is a separate step (`apply_baseline`) rather than a parameter here,
     because fingerprints only exist once merging has happened — so the caller has to run
     this first, look the fingerprints up, and then apply what it found.
+
+    `verify` exists for a schema whose evidence field is not a verbatim quote. The 21 CFR
+    Part 11 verifier asks for "File path / function / code pattern that shows this gap", and
+    accepts "not applicable / no code available" — descriptions, and describing something
+    accurately is not the same as quoting it. Running a substring check over a description
+    discards a **correct** finding for being phrased exactly as it was asked to be, so the
+    check must be opt-in per agent, not per pipeline (D-344).
+
+    With `verify=False` nothing is discarded and `evidence_verified` is left **absent**
+    rather than set False: False means "we checked and could not confirm it", and claiming
+    that about a finding nobody checked is the same class of untruth as a back-filled file
+    list. Every renderer already treats an absent flag as "no claim either way".
     """
-    verified, discarded = verify_evidence(findings, artifact, correct_lines)
+    if verify:
+        verified, discarded = verify_evidence(findings, artifact, correct_lines)
+    else:
+        verified, discarded = list(findings), []
     # `use_evidence_fallback` because this is the single-haystack path, which is where a
     # diff arrives: there is no file list to scan for inline directives, so the only place
     # one can be seen is inside the finding's own quote.
@@ -660,9 +676,26 @@ def process_files(
     files: List[Dict[str, Any]],
     correct_lines: bool = True,
     suppression: Any = None,
+    verify: bool = True,
 ) -> Dict[str, Any]:
-    """`process`, for a multi-file artifact. Same three passes, per-file verification."""
-    verified, discarded = verify_evidence_per_file(findings, files, correct_lines)
+    """`process`, for a multi-file artifact. Same three passes, per-file verification.
+
+    `verify` exists for a schema whose evidence field is not a verbatim quote. The 21 CFR
+    Part 11 verifier asks for "File path / function / code pattern that shows this gap", and
+    accepts "not applicable / no code available" — descriptions, and describing something
+    accurately is not the same as quoting it. Running a substring check over a description
+    discards a **correct** finding for being phrased exactly as it was asked to be, so the
+    check must be opt-in per agent, not per pipeline (D-344).
+
+    With `verify=False` nothing is discarded and `evidence_verified` is left **absent**
+    rather than set False: False means "we checked and could not confirm it", and claiming
+    that about a finding nobody checked is the same class of untruth as a back-filled file
+    list. Every renderer already treats an absent flag as "no claim either way".
+    """
+    if verify:
+        verified, discarded = verify_evidence_per_file(findings, files, correct_lines)
+    else:
+        verified, discarded = list(findings), []
     # No evidence fallback here: the inline directives were scanned out of the real files
     # with their real line numbers, so the precise match is available and the loose one
     # would only add false suppressions.

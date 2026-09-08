@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Optional
 
-from backend.agents import attest
+from backend import config
+from backend.agents import attest, chunked_review
 from backend.agents.base_agent import BaseAgent
 from backend.controls.control_library import GXP_CONTROLS
 from backend.services import llm_gateway
@@ -162,6 +163,78 @@ Electronic Signatures) and identify every gap, not just the obvious ones.
 """
 
 
+# The four assessments a Part 11 report is made of, and how two of them combine.
+_ASSESSMENTS = ("audit_trail_assessment", "esignature_assessment",
+                "access_control_assessment", "data_integrity_assessment")
+
+
+def _merge_assessments(parts):
+    """Combine one assessment object per part into one, taking the strictest reading.
+
+    A part only saw a slice of the codebase, so its verdict is a verdict about that slice.
+    Three rules, and each is the conservative direction:
+
+    * **applicable** if *any* part found it applicable. A part containing no signature code
+      says "not applicable" truthfully about itself; letting that outvote a part that found
+      a signature workflow would erase the finding.
+    * **compliant** only if every part that found it applicable said so. One gap anywhere
+      is a gap — the same floor-not-ceiling rule `finding_gate` applies to the gate, for the
+      same reason: a report assembled from parts must not be looser than its worst part.
+    * **gaps and strengths** are the union, de-duplicated, and `findings_summary` keeps each
+      part's prose under its own heading rather than being re-summarised by another model
+      call. A summarising call would cost more and could assert something no part
+      established, which is the failure this whole area exists to prevent.
+
+    Returns only the keys it was given, so an agent adding a fifth assessment gets it merged
+    without touching this.
+    """
+    merged = {}
+    for key, values in parts.items():
+        if key not in _ASSESSMENTS:
+            continue
+        objs = [v for v in values if isinstance(v, dict)]
+        if not objs:
+            continue
+        applicable = [o for o in objs if o.get("applicable", True)]
+        gaps, strengths, notes = [], [], []
+        for i, o in enumerate(objs, start=1):
+            gaps.extend(o.get("gaps") or [])
+            strengths.extend(o.get("strengths") or [])
+            text = (o.get("findings_summary") or "").strip()
+            if text:
+                notes.append(f"Part {i} of {len(objs)}: {text}" if len(objs) > 1 else text)
+        out = {
+            "applicable": bool(applicable),
+            # No applicable part means nothing to be compliant *with*, so False would read
+            # as a failure where there was nothing to assess.
+            "compliant": bool(applicable) and all(o.get("compliant") for o in applicable),
+            "findings_summary": "\n\n".join(notes),
+            "gaps": list(dict.fromkeys(gaps)),
+            "strengths": list(dict.fromkeys(strengths)),
+        }
+        if len(objs) > 1:
+            out["assembled_from_parts"] = len(objs)
+        merged[key] = out
+
+    # Anything else structured that this schema carries and this function does not know
+    # about — keep the first rather than dropping it, and say so.
+    for key, values in parts.items():
+        if key in merged:
+            continue
+        merged[key] = values[0]
+    return merged
+
+
+def _merge_files_scanned(parts):
+    """The union of what each part said it read, order preserved, duplicates dropped."""
+    seen = []
+    for value in parts.get("files_scanned", []) or []:
+        for path in (value if isinstance(value, list) else [value]):
+            if isinstance(path, str) and path.strip() and path not in seen:
+                seen.append(path)
+    return seen
+
+
 class CFR21VerificationAgent(BaseAgent):
     def __init__(self):
         super().__init__(
@@ -211,8 +284,67 @@ Verify this codebase against FDA 21 CFR Part 11. Cover audit trail, electronic s
 access control, and data integrity (ALCOA+) as four distinct assessments, plus a full findings list with
 specific evidence. Note validation-readiness (process-level) gaps separately from code findings. Be exhaustive.
 """
-        result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, CFR21_TOOL_SCHEMA, max_tokens=16000)
+        # **One call, or as many as the codebase needs.**
+        #
+        # This used to be a single call and nothing else, which meant a regulated system
+        # larger than `MAX_AGENT_INPUT_CHARS` was refused outright — the product could not
+        # produce a report for the size of application that actually buys it, and the
+        # refusal arrived only after the button was pressed.
+        #
+        # Anything that fits still takes exactly one call: identical prompt, identical
+        # output, no behaviour change and no extra cost for the common case. Only a codebase
+        # that cannot fit is split, and then `chunked_review` does the fanning out, the
+        # halve-and-retry on truncation, the per-chunk failure isolation and the coverage
+        # clamp — the machinery Code Review and VAPT have had all along.
+        #
+        # Two things are deliberately different from a code review:
+        #
+        #  * **`verify_evidence=False`.** This schema asks for evidence as "File path /
+        #    function / code pattern", and accepts "not applicable / no code available" — a
+        #    description, not a quote. A substring check over a description discards a
+        #    correct finding for being phrased exactly as instructed (D-344). Everything
+        #    else in the pipeline still runs: de-duplication, path suppression,
+        #    fingerprints, the baseline and the gate.
+        #  * **`merge_extra`.** The four §11 assessments are objects, and `chunked_review`
+        #    can join prose but cannot combine a compliance verdict — only this agent knows
+        #    that an assessment is applicable if *any* part found it applicable and
+        #    compliant only if *every* applicable part said so. See `_merge_assessments`.
+        fits = len(prompt) <= config.MAX_AGENT_INPUT_CHARS
+
+        def _call_chunk(chunk_text: str) -> Dict[str, Any]:
+            chunk_prompt = prompt.replace(artifact, chunk_text, 1) if artifact in prompt \
+                else f"{prompt}\n\n## Codebase to Verify (part)\n{chunk_text}"
+            return llm_gateway.call_tool(SYSTEM_PROMPT, chunk_prompt, CFR21_TOOL_SCHEMA,
+                                         max_tokens=16000)
+
+        if fits:
+            result = llm_gateway.call_tool(SYSTEM_PROMPT, prompt, CFR21_TOOL_SCHEMA,
+                                           max_tokens=16000)
+        else:
+            def _merge(parts):
+                merged = _merge_assessments(parts)
+                scanned = _merge_files_scanned(parts)
+                if scanned:
+                    merged["files_scanned"] = scanned
+                return merged
+
+            result = chunked_review.run(
+                agent_name=self.agent_name,
+                review_type="cfr21_verification",
+                call_chunk=_call_chunk,
+                files=files or None,
+                artifact=None if files else artifact,
+                verify_evidence=False,
+                merge_extra=_merge,
+            )
+            # `chunked_review` speaks `gate_status`/`risk_score`; this schema's own names are
+            # `overall_*`, and `attest` below aliases them. Seeded here so the floor it
+            # applies starts from what the parts actually said rather than from a default.
+            result.setdefault("overall_gate_status", result.get("gate_status", "Green"))
+            result.setdefault("overall_risk_score", result.get("risk_score", 0.0))
+
         result["agent_name"] = self.agent_name
+        result["assessed_in_parts"] = not fits
 
         # `files_scanned` used to be back-filled from the input when the model did not say
         # what it read:

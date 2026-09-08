@@ -174,7 +174,11 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   summary, non-trivial artifact) becomes an **error** rather than a stored clean result, and
   the gate is floored against the findings the agent itself reported. Applied in the three
   shared methods of `base_agent.py`, which between them cover the requirement, prompt,
-  compliance, sensitive-data, provenance, triage, security and architecture products.
+  compliance, security and architecture products, plus the three regulated ones wired
+  directly. **A subclass that overrides `_call_claude` is not reached by that edit** —
+  `sensitive_data_agent` was exactly that case and needed its own (D-346); check before
+  assuming a new agent is covered. `ai_provenance`, `issue_triage` and `migration` return
+  no findings and no gate, so `attest` is a genuine no-op for them and they are left alone.
 
   **Evidence verification is opt-in and must stay that way.** Only
   `CODE_REVIEW_TOOL_SCHEMA` and `VAPT_TOOL_SCHEMA` demand a verbatim quote, and both already
@@ -184,6 +188,18 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   over a description discards a correct finding for being phrased as instructed. Turning it
   on for a product means changing that product's schema first, which changes what the model
   answers — measure it, do not assume it (D-344).
+
+  **A regulated system too large for one call is now assessed in parts, not refused.**
+  `cfr21_agent.verify` takes one call when the prompt fits — identical output, no extra
+  cost for the common case — and otherwise goes through `chunked_review` with two things
+  set differently from a code review: `verify_evidence=False`, because this schema asks for
+  a *description* of evidence and a substring check over one discards correct findings
+  (D-344); and `merge_extra`, because the four §11 assessments are objects and only this
+  agent knows that one is applicable if **any** part found it applicable and compliant only
+  if **every** applicable part said so. `review_estimate.for_regulated_files` prices it
+  first, and both intake shapes have a free preflight — `/api/v1/agents/cfr21-verification/preflight`
+  and `POST /api/review/cfr21-verification/preflight-zip`, the second because the browser
+  uploads a zip and a quote only on the JSON API is a quote nobody sees. See D-354.
 
   **And no assessment may claim coverage it does not have.** `cfr21_agent` used to
   back-fill `files_scanned` from its own input when the model did not say what it read, so

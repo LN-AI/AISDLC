@@ -2023,6 +2023,36 @@ def review_cfr21_verification(req: CFR21VerificationRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/cfr21-verification/preflight-zip")
+async def preflight_cfr21_upload_zip(file: UploadFile = File(...)):
+    """What a Part 11 verification of this zip will cost. **Free — no model call.**
+
+    The browser's Part 11 screen uploads a zip, so a quote that existed only on the JSON
+    API would be a quote no actual user ever saw. Reads and splits the archive exactly as
+    the run will, and stops.
+    """
+    if not (file.filename or "").endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    content = await file.read()
+    try:
+        files = _extract_zip_files(content)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid zip file")
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail="No scannable source files found in the zip (check extensions / excluded dirs)")
+    from backend.services import review_estimate
+    quote = review_estimate.for_regulated_files(files, agent="cfr21-verification")
+    return {
+        "agent": "cfr21-verification",
+        "source": {"files": len(files),
+                   "chars": sum(len(f.get("content") or "") for f in files)},
+        "estimate": quote,
+        "explanation": review_estimate.describe(quote),
+    }
+
+
 @app.post("/api/review/cfr21-verification/upload-zip")
 async def review_cfr21_verification_upload_zip(
     file: UploadFile = File(...),

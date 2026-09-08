@@ -1318,6 +1318,60 @@ separately in `validation_readiness_notes` — the agent will never claim a code
 **Sources:** `files` (recommended) · `code` · `github_pr_url` · `github_file_url`
 """,
 )
+def _cfr21_files(req) -> list:
+    """The file list a Part 11 verification will actually assess, from either shape.
+
+    Shared by the run and its quote so the two cannot disagree about what is being priced —
+    a quote that splits a different artifact from the one the run splits is worse than no
+    quote, because it will be believed.
+    """
+    if req.files:
+        return [{"path": f.path, "content": f.content} for f in req.files]
+    artifact, _t, _r, _p = _resolve(req)
+    return [{"path": "", "content": artifact}]
+
+
+@router.post(
+    "/cfr21-verification/preflight",
+    summary="Cost estimate for a 21 CFR Part 11 verification (free, no model call)",
+    description="""Price a Part 11 verification before running it. **Free — no model call, nothing metered.**
+
+These products had no quote at all, so the first anyone knew about the cost of assessing a
+large regulated system was the invoice — and the first they knew it was too large for a
+single call was the refusal, after pressing the button. A system that does not fit is now
+assessed in parts, and this says how many parts and what they will cost.
+
+- `estimate.calls` — how many model calls the assessment will make
+- `estimate.assessed_in_parts` — true when one report will be assembled from several
+- `estimate.ceiling_usd` — a hard upper bound the run button can name
+- `budget` — what this caller has left, so the price can be read against it
+""",
+)
+def preflight_cfr21(req: CFR21VerificationRequest, caller: dict = Depends(get_caller)):
+    subject = subject_from_caller(caller)
+    # Entitlement is checked; the budget deliberately is not. Showing someone their
+    # remaining headroom beside a price is the point, and a 402 in its place says less.
+    agent_guard.check_scope(subject, "cfr21-verification")
+    files = _cfr21_files(req)
+    override = _effective_llm_override(req, caller, "cfr21-verification")
+    quote = review_estimate.for_regulated_files(
+        files, agent="cfr21-verification", model=(override or {}).get("model") or "")
+    headroom = review_estimate.budget_headroom(subject)
+    return {
+        "agent": "cfr21-verification",
+        "source": {"files": len(files),
+                   "chars": sum(len(f.get("content") or "") for f in files)},
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (None if headroom is None
+                          else quote["expected_usd"] <= headroom["remaining_usd"]),
+        "ceiling_within_budget": (None if headroom is None
+                                  else quote["ceiling_usd"] <= headroom["remaining_usd"]),
+    }
+
+
 def run_cfr21_verification(req: CFR21VerificationRequest, caller: dict = Depends(get_caller)):
     if req.files:
         artifact = "\n\n".join(f"--- FILE: {f.path} ---\n{f.content}" for f in req.files)

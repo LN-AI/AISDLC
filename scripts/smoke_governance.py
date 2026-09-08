@@ -957,6 +957,142 @@ def main_():
     check("outside a request each review still raises its own",
           len(_pending14()) == 5, str(len(_pending14())))
 
+    # -- 15. A regulated system too big for one call ------------------------
+    #
+    # `cfr21-verification` was one model call and nothing else, so a system over
+    # MAX_AGENT_INPUT_CHARS was refused outright -- the product could not produce a report
+    # for the size of application that actually buys it, and the refusal arrived only after
+    # the button was pressed. It now splits, and the four §11 assessments are merged with
+    # the strictest reading rather than the last part winning.
+    section("15. A regulated system is assessed in parts, strictly")
+
+    from backend.agents.security_intelligence import cfr21_agent as _c15
+    from backend.services import review_estimate as _re15
+
+    def _assess15(compliant, gaps=(), applicable=None, text="t"):
+        out = {"compliant": compliant, "findings_summary": text,
+               "gaps": list(gaps), "strengths": []}
+        if applicable is not None:
+            out["applicable"] = applicable
+        return out
+
+    # -- the merge rule on its own, where each direction can be seen
+    _m = _c15._merge_assessments({"audit_trail_assessment": [
+        _assess15(True, text="part one"), _assess15(False, ["no timestamps"], text="part two")]})
+    _at = _m["audit_trail_assessment"]
+    check("one part finding a gap makes the whole assessment non-compliant",
+          _at["compliant"] is False,
+          "a report assembled from parts must not be looser than its worst part")
+    check("...and the gap survives into the merged assessment",
+          _at["gaps"] == ["no timestamps"], str(_at["gaps"]))
+    check("...with each part's prose kept under its own heading",
+          "Part 1 of 2" in _at["findings_summary"] and "part two" in _at["findings_summary"],
+          "re-summarising would cost another call and could assert what no part established")
+    check("...and it says how many parts it was assembled from",
+          _at.get("assembled_from_parts") == 2, str(_at.get("assembled_from_parts")))
+
+    _m = _c15._merge_assessments({"esignature_assessment": [
+        _assess15(True, applicable=False), _assess15(True, applicable=True)]})
+    check("a part with no signature workflow does not outvote one that found it",
+          _m["esignature_assessment"]["applicable"] is True,
+          "'not applicable' is true about that slice only; it must not erase the finding")
+
+    _m = _c15._merge_assessments({"esignature_assessment": [
+        _assess15(True, applicable=False), _assess15(False, ["weak"], applicable=True)]})
+    check("...and an applicable part's gap still lands",
+          _m["esignature_assessment"]["compliant"] is False)
+
+    _m = _c15._merge_assessments({"esignature_assessment": [
+        _assess15(True, applicable=False), _assess15(True, applicable=False)]})
+    check("nothing applicable is not reported as non-compliant",
+          _m["esignature_assessment"]["compliant"] is False
+          and _m["esignature_assessment"]["applicable"] is False,
+          "there was nothing to be compliant with; the `applicable` flag is what says so")
+
+    check("a field the merger does not know is kept, not dropped",
+          _c15._merge_assessments({"something_new": [{"a": 1}, {"a": 2}]})["something_new"]
+          == {"a": 1})
+
+    check("the files each part named are unioned, not overwritten",
+          _c15._merge_files_scanned({"files_scanned": [["a.py", "b.py"], ["b.py", "c.py"]]})
+          == ["a.py", "b.py", "c.py"])
+
+    # -- the whole path, with the model stubbed
+    _n15 = {"calls": 0}
+
+    def _stub15(system_prompt, user_content, tool_schema, llm_override=None, max_tokens=None):
+        _n15["calls"] += 1
+        first = _n15["calls"] == 1
+        return {
+            "findings": [{
+                "control_id": "GXP-001", "cfr_section": "§11.10(e)",
+                "title": f"gap {_n15['calls']}", "severity": 5 if first else 3,
+                "risk_level": "Critical" if first else "Moderate", "description": "",
+                # A *description*, which is what this schema asks for -- and exactly what
+                # evidence verification would discard if it were on.
+                "evidence": "not applicable / no code available",
+                "recommendation": "", "is_blocking": True}],
+            "audit_trail_assessment": _assess15(not first,
+                                                ["no timestamps"] if first else []),
+            "esignature_assessment": _assess15(True, applicable=not first),
+            "access_control_assessment": _assess15(True),
+            "data_integrity_assessment": _assess15(True),
+            "overall_gate_status": "Green", "overall_risk_score": 0.0,
+            "summary": f"part {_n15['calls']}", "files_scanned": ["app/f1.py"]}
+
+    _real15, llm_gateway.call_tool = llm_gateway.call_tool, _stub15
+    try:
+        _small15 = [{"path": "app/one.py", "content": "def f():\n    pass\n" * 20}]
+        _n15["calls"] = 0
+        _out15 = _c15.CFR21VerificationAgent().verify(files=_small15, system_description="LIMS")
+        check("a system that fits still takes exactly one call",
+              _n15["calls"] == 1, str(_n15["calls"]))
+        check("...and is not reported as assembled from parts",
+              _out15.get("assessed_in_parts") is False, str(_out15.get("assessed_in_parts")))
+
+        _big15 = [{"path": f"app/f{i}.py",
+                   "content": "x = 1\n" * (config.MAX_AGENT_INPUT_CHARS // 6)}
+                  for i in (1, 2)]
+        _n15["calls"] = 0
+        _out15 = _c15.CFR21VerificationAgent().verify(files=_big15, system_description="LIMS")
+        check("a system too big for one call is assessed rather than refused",
+              _n15["calls"] > 1 and _out15.get("assessed_in_parts") is True,
+              f"calls={_n15['calls']} parts={_out15.get('assessed_in_parts')}")
+        check("the gate is floored by the worst part, under both names",
+              _out15.get("overall_gate_status") == "Red"
+              and _out15.get("gate_status") == "Red",
+              f"{_out15.get('overall_gate_status')} / {_out15.get('gate_status')}")
+        check("the audit-trail assessment takes the non-compliant part's verdict",
+              _out15["audit_trail_assessment"]["compliant"] is False)
+        check("nothing is discarded for describing evidence instead of quoting it",
+              not _out15.get("discarded_findings"),
+              "this schema asks for a description; verification must stay off (D-344)")
+        check("the coverage claim still reconciles against the whole input",
+              (_out15.get("coverage_claim") or {}).get("files_supplied") == 2,
+              str(_out15.get("coverage_claim")))
+    finally:
+        llm_gateway.call_tool = _real15
+
+    # -- and it is priced before it runs
+    _q15 = _re15.for_regulated_files(
+        [{"path": f"app/f{i}.py", "content": "x = 1\n" * 20000} for i in range(3)],
+        agent="cfr21-verification")
+    check("a regulated assessment can be quoted at all", _q15["calls"] >= 1, str(_q15))
+    check("...naming more than one call when it will not fit",
+          _q15["calls"] > 1 and _q15["assessed_in_parts"] is True, str(_q15["calls"]))
+    check("...with a ceiling above the expected cost",
+          _q15["ceiling_usd"] >= _q15["expected_usd"])
+    check("...priced against this agent's own output budget, not the 8000 default",
+          _re15.MAX_OUTPUT_TOKENS.get("cfr21-verification") == 16000,
+          "the ceiling is what a person approves a run against")
+    check("...and against its own prompt, not the code reviewer's",
+          _re15._frame_tokens("cfr21-verification") != _re15._frame_tokens("code"),
+          "falling through would quote this against a prompt it never sends")
+    _q15small = _re15.for_regulated_files([{"path": "a.py", "content": "x = 1\n"}],
+                                          agent="cfr21-verification")
+    check("a small one quotes a single call", _q15small["calls"] == 1
+          and _q15small["assessed_in_parts"] is False, str(_q15small["calls"]))
+
     print("\n" + "-" * 60)
     if _failures:
         print(f"FAILED: {len(_failures)} of {_checks} checks")

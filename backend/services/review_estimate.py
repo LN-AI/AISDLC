@@ -54,6 +54,11 @@ MAX_OUTPUT_TOKENS = {
     # started pricing its own half of the quote, so the wrong number never reached a screen.
     "auto-fix": 32000,
     "github-pr-review": 16000,
+    # Both regulated assessments call with max_tokens=16000. Without these keys they took
+    # the 8000 default and the ceiling -- the number a person approves a run against -- was
+    # half what the run could actually produce.
+    "cfr21-verification": 16000,
+    "gxp-document-check": 16000,
 }
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 
@@ -91,6 +96,20 @@ def _frame_tokens(agent: str) -> int:
             from backend.agents.base_agent import SECURITY_REVIEW_TOOL_SCHEMA as schema
             from backend.agents.security_intelligence.security_review_agent import (
                 SECURITY_REVIEW_SYSTEM_PROMPT as prompt,
+            )
+        elif agent == "cfr21-verification":
+            # Its own prompt and its own schema, for the reason the `auto-fix` branch above
+            # gives: falling through to the code reviewer's would quote this against a
+            # prompt it never sends. The Part 11 schema is much the larger of the two, so
+            # the error would be an under-quote on every call.
+            from backend.agents.security_intelligence.cfr21_agent import (
+                CFR21_TOOL_SCHEMA as schema,
+                SYSTEM_PROMPT as prompt,
+            )
+        elif agent == "gxp-document-check":
+            from backend.agents.security_intelligence.gxp_document_agent import (
+                GXP_DOCUMENT_TOOL_SCHEMA as schema,
+                SYSTEM_PROMPT as prompt,
             )
         else:
             from backend.agents.base_agent import CODE_REVIEW_TOOL_SCHEMA as schema
@@ -235,6 +254,31 @@ def for_text(text: str, agent: str = "code", model: str = "", extra_calls: int =
     chunks = code_chunker.chunk_artifact(text or "")
     quote = for_chunks([c.body for c in chunks], agent=agent, model=model, extra_calls=extra_calls)
     quote["files"] = 1
+    return quote
+
+
+def for_regulated_files(files: List[Dict[str, Any]], agent: str, model: str = "",
+                        frame_chars: int = 0) -> Dict[str, Any]:
+    """Price a 21 CFR Part 11 or GxP assessment over a file list, before it runs.
+
+    These products had no quote at all -- only Code Review and VAPT did -- so the first a
+    customer knew about the price of assessing a 400-file regulated system was the invoice,
+    and the first they knew it was *too large for one call* was the refusal after they
+    pressed the button.
+
+    Splits with the same `code_chunker` the assessment itself uses, so the number of calls
+    quoted is the number of calls made rather than a guess from dividing by an assumption.
+    `frame_chars` is the prompt the agent wraps around the code (the system description, the
+    file list, the knowledge-base context); counted because on a small artifact it is most
+    of the input, and ignoring it would under-quote the cheap cases.
+    """
+    # `.body` because `chunk_files` returns `Chunk` objects and `for_chunks` prices text.
+    bodies = [c.body for c in code_chunker.chunk_files(files)] or [""]
+    quote = for_chunks(bodies, agent=agent, model=model)
+    quote["files"] = len(files)
+    quote["assessed_in_parts"] = len(bodies) > 1
+    if frame_chars:
+        quote["frame_chars"] = frame_chars
     return quote
 
 
