@@ -401,7 +401,14 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
             <button class="btn btn-primary" onclick="runTestScenarioGeneration()">
               <span class="btn-icon">🧪</span> Generate Test Scenarios
             </button>
+          
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="ts-doc" accept=".pdf,.docx,.doc,.txt,.md" onchange="attachDocument('ts-requirement', this, 'ts-doc-note')" hidden />
+              Upload a document
+            </label>
           </div>
+          <div class="field-hint" id="ts-doc-note"></div>
         </div>
         <!-- Previous runs. Above the result and height-capped, for the reason in
              the Code Review screen's comment: neither element may push the other off
@@ -450,7 +457,14 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
             <button class="btn btn-primary" onclick="runTestCaseGeneration()">
               <span class="btn-icon">📝</span> Generate Test Cases
             </button>
+          
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="tc-doc" accept=".pdf,.docx,.doc,.txt,.md" onchange="attachDocument('tc-requirement', this, 'tc-doc-note')" hidden />
+              Upload a document
+            </label>
           </div>
+          <div class="field-hint" id="tc-doc-note"></div>
         </div>
         <!-- Previous runs. Above the result and height-capped, for the reason in
              the Code Review screen's comment: neither element may push the other off
@@ -985,15 +999,32 @@ Answer questions about patients based on the provided context."></textarea>
             </div>
             <div class="form-group">
               <label>Review Mode</label>
-              <select id="arch-mode">
+              <select id="arch-mode" onchange="onArchModeChange()">
                 <option value="review">Review — assess existing architecture</option>
                 <option value="recommend">Recommend — suggest architecture from requirements</option>
                 <option value="compare">Compare — evaluate multiple architecture options</option>
               </select>
             </div>
           </div>
-          <div class="form-group">
-            <label>Architecture / System Description <span class="required">*</span></label>
+          <!-- Compare mode takes one labelled box per option instead of one blob.
+               The three modes used to send an identical payload with one word changed, so
+               "compare these three designs" arrived as unseparated prose and the model had
+               to guess where one ended and the next began. The honest note below matters as
+               much as the boxes: the response schema carries a single `quality_scores`
+               object, so this returns a recommendation across the options, not a scorecard
+               per option. Saying otherwise would promise a table that cannot come back. -->
+          <div class="form-group hidden" id="arch-compare-wrap">
+            <label>Architecture options to compare <span class="required">*</span></label>
+            <p class="field-hint">One box per option. They are sent separately and by name, so
+              the review can refer to them &mdash; but the result carries <b>one</b> set of
+              quality scores, so expect a reasoned recommendation between them rather than a
+              score for each.</p>
+            <div id="arch-compare-options"></div>
+            <button type="button" class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
+              onclick="addArchOption()">+ Add another option</button>
+          </div>
+          <div class="form-group" id="arch-artifact-wrap">
+            <label id="arch-artifact-label">Architecture / System Description <span class="required">*</span></label>
             <textarea id="arch-artifact" rows="12" placeholder="Describe your architecture — components, services, databases, integrations, data flows, deployment.
 
 Examples:
@@ -1023,6 +1054,46 @@ e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI feature
               Upload Architecture Doc
             </label>
           </div>
+        </div>
+
+        <!-- ── Describe the architecture from the code that implements it ──────
+             A second card rather than another tab on the description box above, because
+             these are different acts with different costs: one reviews what you wrote,
+             the other reads a repository. The picker from Code Review is deliberately not
+             reused here -- its "paste" tab means source code, and this screen's paste box
+             means prose. See `backend/services/code_brief.py` for what is actually sent. -->
+        <div class="form-card" id="arch-code-card" data-product="architecture">
+          <div class="section-title" style="margin-top:0">Or review the architecture of a codebase</div>
+          <p class="subtitle" style="margin-top:-6px">
+            Reads the repository and computes its structure &mdash; the dependency graph, what
+            each file declares, what nothing imports &mdash; then reviews that. The analysis
+            itself calls no model and costs nothing; estimate first and the quote will name
+            the ceiling. Dependency parsing covers Python, PHP, Java/Kotlin/Scala, C#/VB.NET
+            and Delphi/Pascal; other languages are listed but contribute no edges, and the
+            estimate says so before you spend.
+          </p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>GitHub Repository URL</label>
+              <input type="url" id="arch-repo-url" placeholder="https://github.com/owner/repo" />
+            </div>
+            <div class="form-group">
+              <label>Branch, tag or commit (optional)</label>
+              <input type="text" id="arch-repo-ref" placeholder="main" />
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-secondary" onclick="previewDesignCost('architecture')">Estimate cost</button>
+            <button class="btn btn-primary btn-arch" id="arch-code-run" onclick="runDesignFromCode('architecture')" disabled>
+              <span class="btn-icon">&#127959;&#65039;</span> Review the codebase
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="arch-code-zip" accept=".zip" onchange="previewDesignCost('architecture', this.files[0])" hidden />
+              Upload codebase zip
+            </label>
+          </div>
+          <div id="arch-code-preview"></div>
         </div>
         <!-- Previous runs. Above the result and height-capped, for the reason in
              the Code Review screen's comment: neither element may push the other off
@@ -1097,7 +1168,14 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             <button class="btn btn-primary" onclick="runCodegenAdvisory()">
               <span class="btn-icon">🧭</span> Get Recommendation
             </button>
+          
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="cg-doc" accept=".pdf,.docx,.doc,.txt,.md" onchange="attachDocument('cg-requirement', this, 'cg-doc-note')" hidden />
+              Upload a document
+            </label>
           </div>
+          <div class="field-hint" id="cg-doc-note"></div>
         </div>
         <!-- Previous runs. Above the result and height-capped, for the reason in
              the Code Review screen's comment: neither element may push the other off
@@ -1271,8 +1349,15 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
           </div>
           <div class="form-row">
             <div class="form-group flex1">
+              <!-- `CreateRunRequest` has accepted `github_repo_url` since it was written
+                   (`routes/modernization.py`) and this screen only ever offered the zip, so
+                   converting a repository meant downloading and re-uploading it. Either
+                   one, not both: the run needs a single source of truth for what it is
+                   converting. -->
               <label>Source Zip <span class="required">*</span></label>
               <input type="file" id="mod-zip" accept=".zip" />
+              <div class="field-hint">&hellip; or give a repository instead:</div>
+              <input type="url" id="mod-repo-url" placeholder="https://github.com/owner/repo" />
             </div>
             <div class="form-group flex1">
               <label>Budget Cap (USD, optional)</label>
@@ -1667,6 +1752,45 @@ Examples:
              the Code Review screen's comment: neither element may push the other off
              the page. Filled by `loadAgentRuns('security')`, which reads this screen's row
              in `AGENT_SCREENS` for the product and review type to filter on. -->
+                <!-- ── Describe the architecture from the code that implements it ──────
+             A second card rather than another tab on the description box above, because
+             these are different acts with different costs: one reviews what you wrote,
+             the other reads a repository. The picker from Code Review is deliberately not
+             reused here -- its "paste" tab means source code, and this screen's paste box
+             means prose. See `backend/services/code_brief.py` for what is actually sent. -->
+        <div class="form-card" id="sec-code-card" data-product="security">
+          <div class="section-title" style="margin-top:0">Or threat-model a codebase</div>
+          <p class="subtitle" style="margin-top:-6px">
+            Reads the repository and computes its structure &mdash; the dependency graph, what
+            each file declares, what nothing imports &mdash; then threat-models that. The analysis
+            itself calls no model and costs nothing; estimate first and the quote will name
+            the ceiling. Dependency parsing covers Python, PHP, Java/Kotlin/Scala, C#/VB.NET
+            and Delphi/Pascal; other languages are listed but contribute no edges, and the
+            estimate says so before you spend.
+          </p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>GitHub Repository URL</label>
+              <input type="url" id="sec-repo-url" placeholder="https://github.com/owner/repo" />
+            </div>
+            <div class="form-group">
+              <label>Branch, tag or commit (optional)</label>
+              <input type="text" id="sec-repo-ref" placeholder="main" />
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-secondary" onclick="previewDesignCost('security')">Estimate cost</button>
+            <button class="btn btn-primary btn-security" id="sec-code-run" onclick="runDesignFromCode('security')" disabled>
+              <span class="btn-icon">&#128272;</span> Threat-model the codebase
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="sec-code-zip" accept=".zip" onchange="previewDesignCost('security', this.files[0])" hidden />
+              Upload codebase zip
+            </label>
+          </div>
+          <div id="sec-code-preview"></div>
+        </div>
         <div class="run-history">
           <div class="section-title">Previous runs</div>
           <p class="subtitle" style="margin-top:-6px">All reviews this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>
@@ -1734,6 +1858,43 @@ Examples:
              the Code Review screen's comment: neither element may push the other off
              the page. Filled by `loadAgentRuns('sensitive')`, which reads this screen's row
              in `AGENT_SCREENS` for the product and review type to filter on. -->
+        <!-- ── Scan a whole codebase ────────────────────────────────────────
+             Unlike the two design agents, this one is NOT given a structural summary: the
+             question is per file ("is there a credential in here"), and a summary of a
+             codebase cannot contain the hardcoded key that is the finding. So it fans out
+             over chunks like Code Review does, which is why the quote here can name several
+             calls. See `SensitiveDataAgent.scan`. -->
+        <div class="form-card" id="sd-code-card" data-product="sensitive-data">
+          <div class="section-title" style="margin-top:0">Or scan a whole codebase</div>
+          <p class="subtitle" style="margin-top:-6px">
+            Reads every file rather than summarising them, so nothing is missed &mdash; which
+            means a large repository is split across several model calls. Estimate first: the
+            quote is free and names how many calls and the ceiling. Credentials the ingest
+            scanner already matched are included at no cost, before any model runs.
+          </p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>GitHub Repository URL</label>
+              <input type="url" id="sd-repo-url" placeholder="https://github.com/owner/repo" />
+            </div>
+            <div class="form-group">
+              <label>Branch, tag or commit (optional)</label>
+              <input type="text" id="sd-repo-ref" placeholder="main" />
+            </div>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-secondary" onclick="previewDesignCost('sensitive-data')">Estimate cost</button>
+            <button class="btn btn-primary" id="sd-code-run" onclick="runDesignFromCode('sensitive-data')" disabled>
+              <span class="btn-icon">&#128269;</span> Scan the codebase
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="sd-code-zip" accept=".zip" onchange="previewDesignCost('sensitive-data', this.files[0])" hidden />
+              Upload codebase zip
+            </label>
+          </div>
+          <div id="sd-code-preview"></div>
+        </div>
         <div class="run-history">
           <div class="section-title">Previous runs</div>
           <p class="subtitle" style="margin-top:-6px">All scans this project has run, newest first. Opening one costs nothing and calls no model &mdash; the result was stored when it ran. The list stays here while you read one, so you can switch.</p>

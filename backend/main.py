@@ -65,6 +65,9 @@ from backend.models.schemas import (
     ArchitectureReviewRequest,
     CodeReviewSourceRequest,
     VAPTSourceRequest,
+    ArchitectureSourceRequest,
+    SecuritySourceRequest,
+    SensitiveDataSourceRequest,
 )
 from backend.models.api_models import (
     AIProvenanceRequest,
@@ -86,6 +89,7 @@ from backend.services import job_service
 from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
+from backend.services import code_brief
 from backend.services import (fix_apply, guardrail_service, review_estimate,
                               review_source_store, source_bundle)
 from backend.services.subject_service import resolve_subject
@@ -495,6 +499,99 @@ def _retention_note(req, bundle) -> dict:
             if refetchable else review_source_store.describe_retention(days)
         ),
     }
+
+
+def _run_sensitive_bundle(bundle, project_name: str, context: str) -> dict:
+    """Shared body for a sensitive-data scan over a bundle.
+
+    Separate from `_run_bundle_review` rather than folded into it: that one attaches
+    `suppression` and the deterministic dependency findings and routes through
+    `review_code`/`review_vapt`'s argument shape. This agent takes the secret findings
+    (which are exactly its subject) but has no use for a dependency scan.
+    """
+    _require_llm()
+    parts = [f"Source: {bundle.source_type} — {bundle.label}"]
+    if bundle.untrusted_label:
+        parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if context:
+        parts.append(context)
+    if len(bundle.files) > 1:
+        parts.append(
+            f"This scan covers {len(bundle.files)} file(s) from one codebase. Each part "
+            f"lists the files it contains; do not assert that data is handled safely "
+            f"elsewhere when the file that would show it was not shown to you.")
+    single = len(bundle.files) == 1 and not bundle.files[0].get("path")
+    deterministic = source_bundle.deterministic_findings(bundle)
+    return orchestrator.scan_sensitive_data(
+        content=(bundle.files[0].get("content") or "") if single else "",
+        files=None if single else bundle.files,
+        context="\n".join(parts),
+        project_name=project_name or bundle.label[:60] or "Unnamed Project",
+        coverage_incomplete=bundle.truncated,
+        coverage_reason=bundle.truncation_reason,
+        # The credentials the ingest scanner already matched, for free, before any model
+        # ran. This agent's own subject matter, so they are merged in rather than reported
+        # beside the result: they get verification, de-duplication, a fingerprint and a
+        # vote in the gate like everything else.
+        extra_findings=None if single else deterministic["findings"],
+        suppression=None if single else bundle.suppression,
+        source=bundle.summary(),
+    )
+
+
+def _preflight_design(req, request: Request, agent: str) -> dict:
+    """Quote a design review of a codebase. Free — neither the brief nor the quote calls a
+    model.
+
+    Priced from the **brief**, not the bundle, because that is what the agent is actually
+    sent: `for_bundle` would chunk three megabytes of source and quote twenty calls for a
+    run that makes one. Quoting the wrong artifact is worse than not quoting — a quote is
+    believed.
+
+    The coverage statement travels with the price, which is the point of doing this for
+    free: "only 12 of your 400 files can be parsed for dependencies" is worth knowing
+    *before* deciding to spend, not after reading a thin review.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Preflight source resolution failed for %s", agent)
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+
+    brief = code_brief.build(bundle)
+    quote = review_estimate.for_text(brief["markdown"], agent=agent)
+    subject = _ui_subject(request)
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": agent,
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (
+            None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
+        "code_brief": {k: brief[k] for k in ("coverage", "coverage_note", "stats", "files")},
+        "files_preview": _files_preview(bundle),
+        "skipped_all": bundle.skipped[:400],
+        # No retention block: a design review stores no source. It is not one of the two
+        # products with an inventory (`AGENT_SCREENS[...].inventory`), and offering a
+        # retention choice that nothing honours would be a promise about data handling that
+        # no code keeps.
+    }
+
+
+@app.post("/api/review/architecture/preflight")
+def preflight_architecture_ui(req: ArchitectureSourceRequest, request: Request):
+    return _preflight_design(req, request, "architecture")
+
+
+@app.post("/api/review/security/preflight")
+def preflight_security_ui(req: SecuritySourceRequest, request: Request):
+    return _preflight_design(req, request, "security")
 
 
 @app.post("/api/review/code/preflight")
@@ -1711,6 +1808,166 @@ def review_architecture(req: ArchitectureReviewRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+def _brief_for(bundle, agent: str):
+    """A codebase turned into something a single-call design review can actually read.
+
+    Free — `code_brief.build` calls no model. Refused rather than silently reviewed when the
+    input holds no source it can parse at all: an architecture review of an empty inventory
+    would return a confident verdict about nothing, which is the degenerate result `attest`
+    exists to stop reaching a screen.
+    """
+    brief = code_brief.build(bundle)
+    if not brief["markdown"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input, so there is nothing "
+                   "to describe. Check the repository, branch or archive.")
+    return brief
+
+
+def _brief_context(bundle, brief, context: str) -> str:
+    """What the agent is told about where this description came from and how solid it is."""
+    parts = [f"Source: {bundle.source_type} — {bundle.label}",
+             "The description below was computed from the source, not written by a person.",
+             brief["coverage_note"]]
+    if bundle.untrusted_label:
+        parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if bundle.truncated:
+        parts.append(f"The source itself was truncated before analysis: "
+                     f"{bundle.truncation_reason}")
+    if context:
+        parts.append(context)
+    return "\n".join(parts)
+
+
+def _design_review_from_source(bundle, agent: str, req) -> dict:
+    """Shared body for Architecture and Security Review over a codebase."""
+    _require_llm()
+    brief = _brief_for(bundle, agent)
+    ctx = _brief_context(bundle, brief, req.context or "")
+    project = req.project_name or bundle.label[:60] or "Unnamed Project"
+    if agent == "architecture":
+        mode = req.review_mode or "review"
+        if mode not in ("review", "recommend", "compare"):
+            raise HTTPException(status_code=400,
+                                detail="review_mode must be: review | recommend | compare")
+        result = orchestrator.review_architecture(
+            artifact=brief["markdown"], requirements=req.requirements or "",
+            review_mode=mode, context=ctx, project_name=project)
+    else:
+        result = orchestrator.review_security(
+            artifact=brief["markdown"], system_type=req.system_type or "",
+            context=ctx, project_name=project)
+    # The same coverage facts the prompt was given, returned so the screen prints the
+    # identical sentence. Two accounts of how much was read would be one too many.
+    result["source"] = bundle.summary()
+    result["code_brief"] = {k: brief[k] for k in ("coverage", "coverage_note", "stats", "files")}
+    return result
+
+
+@app.post("/api/review/architecture/source")
+def review_architecture_source(req: ArchitectureSourceRequest, request: Request):
+    """Architecture review of a codebase — zip, repository at a ref, PR, or branch compare.
+
+    Not a chunked review. See `services/code_brief` for why a holistic question cannot be
+    fanned out over chunks, and what is sent instead.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _design_review_from_source(bundle, "architecture", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/security/source")
+def review_security_source(req: SecuritySourceRequest, request: Request):
+    """Security review (STRIDE) of a codebase. See `/api/review/architecture/source`."""
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _design_review_from_source(bundle, "security", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+class _FormReq:
+    """The attribute bag `_design_review_from_source` reads, for the multipart doors.
+
+    A plain object rather than a Pydantic model because the fields arrive as `Form(...)`
+    parameters, already validated by FastAPI — building a model here would only re-validate
+    strings that are already strings.
+    """
+
+    def __init__(self, **kw):
+        self.project_name = kw.get("project_name", "")
+        self.context = kw.get("context", "")
+        self.requirements = kw.get("requirements", "")
+        self.review_mode = kw.get("review_mode", "review")
+        self.system_type = kw.get("system_type", "")
+
+
+# Two upload endpoints rather than one taking an `agent` form field, even though the bodies
+# are identical. `legacy_guard.product_for_request` maps a *path* to a product, so one path
+# serving two products would meter and entitle both as whichever the map named — a customer
+# entitled to Architecture Review could reach the security agent through it.
+@app.post("/api/review/architecture/upload-zip")
+async def review_architecture_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    requirements: str = Form(""),
+    review_mode: str = Form("review"),
+    context: str = Form(""),
+):
+    """Architecture review of an uploaded codebase. A zip travels as multipart, and the
+    JSON route cannot take one (D-234), so this is the archive door for the same review."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    req = _FormReq(project_name=project_name, context=context,
+                   requirements=requirements, review_mode=review_mode)
+    try:
+        return await asyncio.to_thread(_design_review_from_source, bundle, "architecture", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/security/upload-zip")
+async def review_security_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    system_type: str = Form(""),
+    context: str = Form(""),
+):
+    """Security review (STRIDE) of an uploaded codebase. See the architecture twin above."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    req = _FormReq(project_name=project_name, context=context, system_type=system_type)
+    try:
+        return await asyncio.to_thread(_design_review_from_source, bundle, "security", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
 @app.post("/api/review/architecture/upload")
 async def review_architecture_file(
     file: UploadFile = File(...),
@@ -2013,30 +2270,41 @@ _CFR21_MAX_TOTAL_CHARS = 120_000
 
 
 def _extract_zip_files(content: bytes) -> list:
-    files = []
-    total_chars = 0
-    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            path = info.filename.replace("\\", "/")
-            if any(f"/{d}/" in f"/{path}" for d in _CFR21_EXCLUDED_DIRS):
-                continue
-            ext = os.path.splitext(path)[1].lower()
-            if ext not in _CFR21_ALLOWED_EXTENSIONS:
-                continue
-            if len(files) >= _CFR21_MAX_FILES or total_chars >= _CFR21_MAX_TOTAL_CHARS:
-                break
-            try:
-                text = zf.read(info).decode("utf-8", errors="ignore")
-            except Exception:
-                continue
-            if not text.strip():
-                continue
-            remaining = _CFR21_MAX_TOTAL_CHARS - total_chars
-            text = text[:remaining]
-            files.append({"path": path, "content": text})
-            total_chars += len(text)
+    """The regulated products' archive intake, on the same ingester as everything else.
+
+    This used to be a second, weaker implementation: a bare `zipfile` walk with an excluded
+    directory list and an extension filter, and **no secret redaction, no path-traversal
+    guard, no symlink guard and no zip-bomb cap**. So a customer uploading their codebase to
+    a 21 CFR Part 11 verification had their hardcoded credentials sent to the model verbatim,
+    while the identical upload to Code Review had them replaced with
+    `__REDACTED_ASSIGNED_CREDENTIAL__` first. One of those is the product's stated behaviour
+    and the other was an accident of having two doors.
+
+    `source_bundle.from_zip_bytes` takes the extension set as a parameter, so the narrower
+    regulated filter is preserved as an argument rather than a fork. Two deliberate changes
+    come with it, both improvements: a credential file (`.env` and friends) is now skipped
+    entirely rather than uploaded, and secrets inside kept files are redacted before the
+    call. Neither costs a Part 11 or GxP assessment anything — a `.env` holds secrets, not
+    evidence of an audit trail.
+
+    The 60-file / 120,000-character caps stay: they bound what one regulated assessment is
+    priced and split against, and `review_estimate.for_regulated_files` is calibrated on them.
+    """
+    try:
+        bundle = source_bundle.from_zip_bytes(
+            content, label="upload", extensions=_CFR21_ALLOWED_EXTENSIONS)
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    files, total_chars = [], 0
+    for entry in bundle.files:
+        if len(files) >= _CFR21_MAX_FILES or total_chars >= _CFR21_MAX_TOTAL_CHARS:
+            break
+        text = (entry.get("content") or "")[:_CFR21_MAX_TOTAL_CHARS - total_chars]
+        if not text.strip():
+            continue
+        files.append({"path": entry.get("path") or "", "content": text})
+        total_chars += len(text)
     return files
 
 
@@ -2441,6 +2709,53 @@ def review_sensitive_data(req: SensitiveDataRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/sensitive-data/source")
+def review_sensitive_source(req: SensitiveDataSourceRequest, request: Request):
+    """A sensitive-data scan over a whole codebase — zip, repository at a ref, PR, compare.
+
+    Unlike Architecture and Security Review, this one is **not** given a structural summary:
+    its question is per-file ("is there a credential in here") and a summary of a codebase
+    cannot contain the hardcoded key that is the finding. So it fans out over chunks like
+    Code Review and VAPT do. See `SensitiveDataAgent.scan`.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _run_sensitive_bundle(bundle, req.project_name or "", req.context or "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/sensitive-data/upload-zip")
+async def review_sensitive_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    context: str = Form(""),
+):
+    """The archive door for the scan above — a zip cannot travel on a JSON route (D-234)."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    try:
+        return await asyncio.to_thread(_run_sensitive_bundle, bundle, project_name, context)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/sensitive-data/preflight")
+def preflight_sensitive_ui(req: SensitiveDataSourceRequest, request: Request):
+    return _preflight(req, request, "sensitive-data")
+
+
 @app.post("/api/review/sensitive-data/upload")
 async def review_sensitive_data_file(
     file: UploadFile = File(...),
@@ -2687,6 +3002,34 @@ async def get_controls():
 
 
 # ── Utility ────────────────────────────────────────────────────────────────
+
+@app.post("/api/documents/extract")
+async def extract_document_text(file: UploadFile = File(...)):
+    """Read a PDF, Word document or text file and hand back its text. No model, no charge.
+
+    One endpoint for every screen whose input is prose — a requirement, a test basis, a
+    stack brief. The alternative was an upload-and-run route per screen, three more entries
+    in the metering map and three more ways for a screen to spend money on a document
+    nobody had read yet.
+
+    Extraction is deliberately separate from running: the text lands in the textarea, the
+    person sees exactly what was pulled out of their document, and *then* they press the
+    button. A scanned PDF that yields two words of OCR noise is a thing you want to notice
+    before paying for a review of it, which is also why the character count comes back.
+
+    Absent from `legacy_guard`'s product map for the same reason `/preflight` is: it makes
+    no model call and spends nothing, so there is no product to meter it against.
+    """
+    raw = await file.read()
+    text = await asyncio.to_thread(_extract_text, raw, file.filename or "")
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="No text could be read from that file. A scanned PDF with no text layer "
+                   "needs OCR first — this reads text, it does not recognise images.")
+    return {"filename": file.filename or "", "text": text, "chars": len(text)}
+
 
 def _extract_text(content: bytes, filename: str) -> str:
     filename_lower = filename.lower()

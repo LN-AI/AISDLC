@@ -628,6 +628,9 @@ function _runPageLoader(page) {
     // agent's output. Rebuilt per visit for the same reason the history list is: the run
     // it offers must belong to the project selected now, not the one selected last time.
     if (RUN_HANDOFFS[page]) renderRunHandoff(page);
+    // The mode select drives which fields exist, so the screen has to be put in
+    // the selected mode on arrival as well as on change.
+    if (page === 'architecture') onArchModeChange();
     // The GitHub PR screen is retired -- the nav item lands on the review screen with
     // the source already set, so there is one implementation of reviewing a pull
     // request rather than two that drift apart.
@@ -3771,10 +3774,90 @@ function _foldSpendHeaders(res, body) {
 
 // ── Architecture Review ────────────────────────────────────────────────────
 
+// ── The three architecture modes, which used to be one word in a payload ──
+//
+// `review`, `recommend` and `compare` sent an identical body with `review_mode` changed,
+// and the screen never changed with it. Two consequences, both visible to a user before
+// this: in `recommend` you typed your requirements into a box labelled "Architecture /
+// System Description", and in `compare` you pasted several designs into one box with no
+// separator convention, so the model had to guess where each began.
+//
+// What is deliberately NOT fixed here: `ARCHITECTURE_TOOL_SCHEMA` has a single
+// `quality_scores` object and a single `architecture_type`, so per-option scoring is
+// impossible without changing the schema — and changing a schema changes what the model
+// answers, which has to be measured rather than assumed (D-344). There is no architecture
+// eval to measure it with. So the input is fixed now and the output stays as it is, with
+// the screen saying plainly what comes back.
+const ARCH_MODE_LABELS = {
+  review: 'Architecture / System Description',
+  recommend: 'What the system has to do',
+  compare: 'Architecture / System Description',
+};
+
+function onArchModeChange() {
+  const mode = (document.getElementById('arch-mode') || {}).value || 'review';
+  const artifactWrap = document.getElementById('arch-artifact-wrap');
+  const compareWrap = document.getElementById('arch-compare-wrap');
+  if (artifactWrap) artifactWrap.classList.toggle('hidden', mode === 'compare');
+  if (compareWrap) compareWrap.classList.toggle('hidden', mode !== 'compare');
+
+  const label = document.getElementById('arch-artifact-label');
+  if (label) {
+    label.innerHTML = `${esc(ARCH_MODE_LABELS[mode] || ARCH_MODE_LABELS.review)}
+      <span class="required">*</span>`;
+  }
+  const box = document.getElementById('arch-artifact');
+  if (box && mode === 'recommend') {
+    box.placeholder = 'Describe what you need built, not what exists — the scale it has to '
+      + 'reach, the data it holds, the constraints it works under.\n\ne.g. A clinical '
+      + 'decision support system. 500k patients, 10k concurrent users, PHI, 99.99% uptime, '
+      + 'HIPAA, AI risk scores refreshed hourly.';
+  }
+  if (mode === 'compare' && !document.querySelectorAll('.arch-option').length) {
+    addArchOption(); addArchOption();          // comparing needs at least two
+  }
+}
+
+function addArchOption() {
+  const wrap = document.getElementById('arch-compare-options');
+  if (!wrap) return;
+  const n = wrap.querySelectorAll('.arch-option').length + 1;
+  const row = document.createElement('div');
+  row.className = 'arch-option';
+  row.innerHTML = `
+    <div class="arch-option-head">
+      <input type="text" class="arch-option-name" placeholder="Option ${n} name — e.g. Modular monolith" />
+      <button type="button" class="about-link" onclick="this.closest('.arch-option').remove()">Remove</button>
+    </div>
+    <textarea class="arch-option-text" rows="5"
+      placeholder="Describe this option — components, data stores, how they communicate, how it deploys."></textarea>`;
+  wrap.appendChild(row);
+}
+
+// The options as one artifact, but a *delimited* one: each option is named and fenced, so
+// the model is not inferring boundaries from paragraph breaks.
+function architectureArtifact() {
+  const mode = (document.getElementById('arch-mode') || {}).value || 'review';
+  if (mode !== 'compare') return document.getElementById('arch-artifact').value.trim();
+  const rows = [...document.querySelectorAll('#arch-compare-options .arch-option')];
+  const opts = rows.map((row, i) => ({
+    name: row.querySelector('.arch-option-name').value.trim() || `Option ${i + 1}`,
+    text: row.querySelector('.arch-option-text').value.trim(),
+  })).filter(o => o.text);
+  if (opts.length < 2) return '';
+  return ['Compare the following architecture options against each other.', '']
+    .concat(opts.map(o => `## ${o.name}\n\n${o.text}\n`)).join('\n');
+}
+
 async function runArchitectureReview() {
-  const artifact = document.getElementById('arch-artifact').value.trim();
-  if (!artifact) { alert('Please describe the architecture or requirements.'); return; }
   const mode = document.getElementById('arch-mode').value;
+  const artifact = architectureArtifact();
+  if (!artifact) {
+    alert(mode === 'compare'
+      ? 'Comparing needs at least two options, each with a description.'
+      : 'Please describe the architecture or requirements.');
+    return;
+  }
   const modeLabels = { review: 'Reviewing architecture', recommend: 'Generating architecture recommendations', compare: 'Comparing architecture options' };
   showLoading(`${modeLabels[mode] || 'Running'}… this may take 20–40 seconds`);
   try {
@@ -7319,20 +7402,44 @@ async function createModernizationRun() {
   const fileInput = document.getElementById('mod-zip');
   const cap = document.getElementById('mod-cap').value;
   const ext = document.getElementById('mod-ext').value.trim();
+  const repo = (document.getElementById('mod-repo-url') || {}).value.trim();
   if (!name || !target) { alert('Run name and target stack are required.'); return; }
-  if (!fileInput.files.length) { alert('Choose a zip of the source repository.'); return; }
+  if (!fileInput.files.length && !repo) {
+    alert('Choose a zip of the source repository, or give a repository URL.');
+    return;
+  }
+  // Both would leave the run without a single source of truth for what it converted, and
+  // the JSON and multipart endpoints take different shapes — so this is a choice, not a
+  // precedence rule that would silently ignore one of them.
+  if (fileInput.files.length && repo) {
+    alert('Give a zip or a repository URL, not both — a run converts one source.');
+    return;
+  }
 
-  const form = new FormData();
-  form.append('file', fileInput.files[0]);
-  form.append('name', name);
-  form.append('target_stack', target);
-  if (ext) form.append('extensions', ext);
-  if (cap) form.append('budget_cap_usd', cap);
-
-  showLoading('Reading the archive, redacting secrets and building the dependency graph…');
+  showLoading('Reading the source, redacting secrets and building the dependency graph…');
   try {
-    // FormData sets its own multipart boundary — never set Content-Type by hand here.
-    const run = await apiFetch('/api/v1/modernization/runs/upload', { method: 'POST', body: form });
+    let run;
+    if (repo) {
+      // `POST /runs` has accepted `github_repo_url` since it was written; only this screen
+      // never offered it (`routes/modernization.py`, `_fetch_github_repo`).
+      run = await apiFetch('/api/v1/modernization/runs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name, target_stack: target, github_repo_url: repo,
+          extensions: ext ? ext.split(',').map(x => x.trim()).filter(Boolean) : undefined,
+          budget_cap_usd: cap ? Number(cap) : undefined,
+        }),
+      });
+    } else {
+      const form = new FormData();
+      form.append('file', fileInput.files[0]);
+      form.append('name', name);
+      form.append('target_stack', target);
+      if (ext) form.append('extensions', ext);
+      if (cap) form.append('budget_cap_usd', cap);
+      // FormData sets its own multipart boundary — never set Content-Type by hand here.
+      run = await apiFetch('/api/v1/modernization/runs/upload', { method: 'POST', body: form });
+    }
     await loadModernizationRuns();
     openModernizationRun(run.id);
   } catch (e) {
@@ -10424,6 +10531,251 @@ function screenForReview(result) {
 // `("code", "github_pr_url", "github_file_url")` while the screen visibly offers a zip
 // upload, a repository at a ref and a branch comparison as well — so rendering it as
 // "Accepts" would contradict the tabs directly above it, which is worse than saying nothing.
+// ── A document as the input to a screen that takes prose ──────────────────
+//
+// Requirements, test bases and stack briefs arrive as Word documents and PDFs, and three
+// screens could only be typed into. Extraction is its own step rather than an
+// upload-and-run route per screen: the text lands in the box, the person sees what was
+// actually pulled out of their file, and only then presses the button. A scanned PDF that
+// yields two words of noise is worth noticing before paying to review it.
+async function attachDocument(fieldId, input, noteId) {
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  const field = document.getElementById(fieldId);
+  const note = noteId ? document.getElementById(noteId) : null;
+  if (field && field.value.trim()
+      && !confirm('Replace what is already in that box with this document?')) {
+    input.value = '';
+    return;
+  }
+  if (note) note.textContent = `Reading ${file.name}…`;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const d = await apiFetch('/api/documents/extract', { method: 'POST', body: fd });
+    field.value = d.text;
+    if (note) {
+      note.textContent = `${d.chars.toLocaleString()} characters read from ${d.filename}. `
+        + 'Check it looks right before running — reading the file was free, the run is not.';
+    }
+  } catch (e) {
+    if (note) note.textContent = `Could not read that file: ${e.message}`;
+    else alert(`Could not read that file: ${e.message}`);
+  } finally {
+    input.value = '';                     // so choosing the same file again re-fires change
+  }
+}
+
+// ── Reviewing a design from the code that implements it ───────────────────
+//
+// Architecture and Security Review answer one holistic question, so unlike Code Review and
+// VAPT they cannot be fanned out over chunks — and a repository does not fit in one call.
+// The backend computes a structural description instead (`services/code_brief.py`), which
+// does fit, and reviews that. Both facts a person needs before spending are free: what the
+// call will cost, and how much of their codebase could actually be parsed.
+//
+// **The run button stays disabled until a quote exists.** Not politeness — the quote is the
+// only place the coverage statement appears before the money is spent, and a repository
+// whose language has no parser produces a much thinner review than the screen otherwise
+// implies. The two are shown together so the second is read.
+// One row per screen that can read a codebase without being the Code Review screen. The
+// element ids are irregular for the same reason `AGENT_SCREENS`' are — they predate any
+// convention — so they are written down rather than derived.
+//
+// `brief` says which kind of run this is, and it is the whole distinction Phase 3 turns on:
+// `true` sends a computed structural description and makes **one** call (Architecture,
+// Security — a holistic question cannot be merged from chunks); `false` fans the real
+// source out over chunks and merges the findings (Sensitive Data — a per-file question).
+// The screen wording differs because the guarantee differs.
+const CODE_SOURCE_CARDS = {
+  architecture: { prefix: 'arch', result: 'arch-result', brief: true,
+                  render: () => renderArchitectureResult },
+  security:     { prefix: 'sec', result: 'security-result', brief: true,
+                  render: () => renderSecurityResult },
+  'sensitive-data': { prefix: 'sd', result: 'sd-result', brief: false,
+                      render: () => renderSensitiveDataResult },
+};
+
+const _designQuote = {};      // agent -> { zip: File|null, quote }
+
+function _designEls(agent) {
+  const p = CODE_SOURCE_CARDS[agent].prefix;
+  return {
+    repo: document.getElementById(`${p}-repo-url`),
+    ref: document.getElementById(`${p}-repo-ref`),
+    zip: document.getElementById(`${p}-code-zip`),
+    run: document.getElementById(`${p}-code-run`),
+    out: document.getElementById(`${p}-code-preview`),
+    project: document.getElementById(`${p}-project`),
+    context: document.getElementById(`${p}-context`),
+  };
+}
+
+function _designBody(agent, els) {
+  const body = {
+    project_name: (els.project && els.project.value.trim()) || '',
+    context: (els.context && els.context.value.trim()) || '',
+  };
+  if (agent === 'architecture') {
+    body.requirements = (document.getElementById('arch-requirements') || {}).value || '';
+    body.review_mode = (document.getElementById('arch-mode') || {}).value || 'review';
+  } else if (agent === 'security') {
+    body.system_type = (document.getElementById('sec-type') || {}).value || '';
+  }
+  // A code-derived run can still be chained from an earlier one, where the screen offers
+  // it. `chainedFrom` returns null on screens with no handoff, which the backend reads as
+  // "no claim" rather than an empty one.
+  if (RUN_HANDOFFS[agent]) body.derived_from = chainedFrom(agent);
+  const repo = els.repo.value.trim();
+  if (repo) { body.github_repo_url = repo; body.ref = els.ref.value.trim() || undefined; }
+  return body;
+}
+
+async function previewDesignCost(agent, zipFile) {
+  const els = _designEls(agent);
+  const file = zipFile || null;
+  if (!file && !els.repo.value.trim()) {
+    alert('Give a repository URL, or choose a zip of the codebase.');
+    return;
+  }
+  _designQuote[agent] = null;
+  els.run.disabled = true;
+  els.out.innerHTML = '<div class="cost-note">Reading the source and working out its '
+    + 'structure… this calls no model and costs nothing.</div>';
+  try {
+    let quote;
+    if (file) {
+      // A zip cannot travel on a JSON route (D-234). The quote route takes JSON, so the
+      // archive is read here and posted as a file list — the same thing the server would
+      // have unpacked, and it keeps one preflight implementation rather than two.
+      const files = await _readZipAsFiles(file);
+      quote = await apiFetch(`/api/review/${agent}/preflight`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ..._designBody(agent, els), files }),
+      });
+    } else {
+      quote = await apiFetch(`/api/review/${agent}/preflight`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(_designBody(agent, els)),
+      });
+    }
+    _designQuote[agent] = { zip: file, quote };
+    els.run.disabled = false;
+    els.out.innerHTML = renderDesignQuote(quote);
+  } catch (e) {
+    els.out.innerHTML = `<div class="cost-note cost-note-bad">Could not read that source —
+      ${esc(e.message)}</div>`;
+  }
+}
+
+function renderDesignQuote(q) {
+  const est = q.estimate || {};
+  const brief = q.code_brief || {};
+  const src = q.source || {};
+  const calls = Number(est.calls || 1);
+  // The coverage line only exists for the brief-based runs. A fan-out has no analyzer
+  // coverage to report — it reads every file directly — so printing an empty box there
+  // would imply a caveat that does not apply.
+  const coverage = brief.coverage_note
+    ? `<div class="cost-note ${(brief.coverage || {}).files_not_analysed ? 'cost-note-warn' : ''}">
+         ${esc(brief.coverage_note)}</div>`
+    : '';
+  return `
+    <div class="cost-note">
+      <b>$${Number(est.expected_usd || 0).toFixed(4)}</b> expected,
+      ceiling <b>$${Number(est.ceiling_usd || 0).toFixed(4)}</b>,
+      ${calls} model call${calls === 1 ? '' : 's'}.
+      ${src.files != null ? `${Number(src.files).toLocaleString()} file(s) read.` : ''}
+      Estimating was free.
+    </div>
+    ${coverage}`;
+}
+
+// A zip is unpacked in the browser purely so the free quote can be a JSON call like the
+// repository one. Deliberately small: no dependency, no compression support beyond stored
+// entries would be wrong, so this hands the file to the server instead when it cannot read
+// it. `DecompressionStream` is in every browser this app supports.
+async function _readZipAsFiles(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const dv = new DataView(buf.buffer);
+  // Walk the central directory from the end-of-central-directory record.
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 66000; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('That does not look like a zip file.');
+  const count = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+  const out = [];
+  const dec = new TextDecoder('utf-8', { fatal: false });
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) break;
+    const method = dv.getUint16(off + 10, true);
+    const csize = dv.getUint32(off + 20, true);
+    const nameLen = dv.getUint16(off + 28, true);
+    const extraLen = dv.getUint16(off + 30, true);
+    const commentLen = dv.getUint16(off + 32, true);
+    const lho = dv.getUint32(off + 42, true);
+    const name = dec.decode(buf.subarray(off + 46, off + 46 + nameLen));
+    off += 46 + nameLen + extraLen + commentLen;
+    if (name.endsWith('/')) continue;
+    const lNameLen = dv.getUint16(lho + 26, true);
+    const lExtraLen = dv.getUint16(lho + 28, true);
+    const start = lho + 30 + lNameLen + lExtraLen;
+    const raw = buf.subarray(start, start + csize);
+    let content;
+    if (method === 0) {
+      content = dec.decode(raw);
+    } else if (method === 8) {
+      const ds = new DecompressionStream('deflate-raw');
+      const blob = new Blob([raw]).stream().pipeThrough(ds);
+      content = dec.decode(new Uint8Array(await new Response(blob).arrayBuffer()));
+    } else {
+      continue;                                   // an unsupported method is skipped, not guessed
+    }
+    out.push({ path: name, content });
+  }
+  if (!out.length) throw new Error('No readable files in that archive.');
+  return out;
+}
+
+async function runDesignFromCode(agent) {
+  const els = _designEls(agent);
+  const held = _designQuote[agent];
+  if (!held) { alert('Estimate the cost first — it is free.'); return; }
+  const card = CODE_SOURCE_CARDS[agent];
+  const target = card.result;
+  const render = card.render();
+  const ceiling = Number((held.quote.estimate || {}).ceiling_usd || 0);
+  if (!confirm(`Run this review? It will cost up to $${ceiling.toFixed(4)}.`)) return;
+
+  showLoading(card.brief
+    ? 'Reading the codebase and reviewing its structure… 30–60 seconds'
+    : 'Scanning every file… a large codebase is split across several calls and can take '
+      + 'a few minutes');
+  try {
+    let result;
+    if (held.zip) {
+      const fd = new FormData();
+      fd.append('file', held.zip);
+      const body = _designBody(agent, els);
+      Object.entries(body).forEach(([k, v]) => {
+        if (v !== undefined && v !== null && k !== 'derived_from') fd.append(k, v);
+      });
+      result = await apiFetch(`/api/review/${agent}/upload-zip`, { method: 'POST', body: fd });
+    } else {
+      result = await apiFetch(`/api/review/${agent}/source`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(_designBody(agent, els)),
+      });
+    }
+    render(target, result);
+    loadAgentRuns(agent);
+  } catch (e) {
+    showError(target, e.message);
+  } finally { hideLoading(); }
+}
+
 // ── Carrying one agent's output into the next agent's input ───────────────
 //
 // The SDLC is a chain — requirements inform an architecture, an architecture informs a

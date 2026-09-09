@@ -378,6 +378,30 @@ class _UISourceBase(BaseModel):
     )
 
 
+# ── Reviewing a design *from the code that implements it* ────────────────────
+#
+# Architecture and Security Review answer one holistic question, so they cannot be chunked
+# the way Code Review and VAPT are — and a repository does not fit in one call. These
+# routes take the same source set anyway and hand it to `services/code_brief`, which
+# computes a structural description (dependency graph, what nothing imports, what each file
+# declares) with no model involved. The agent then reviews that description in one call, so
+# the expensive half costs nothing. `derived_from` is inherited so a code-derived review can
+# still be chained from a requirement review.
+class ArchitectureSourceRequest(_UISourceBase, DerivedFromMixin):
+    requirements: Optional[str] = Field(None, description="Non-functional requirements the "
+                                                          "architecture must satisfy")
+    review_mode: Optional[str] = Field("review", description="review | recommend | compare")
+
+
+class SecuritySourceRequest(_UISourceBase, DerivedFromMixin):
+    system_type: Optional[str] = None
+
+
+class SensitiveDataSourceRequest(_UISourceBase, DerivedFromMixin):
+    """A sensitive-data scan over any source. Fans out over chunks like Code Review, unlike
+    the two design agents above — see `SensitiveDataAgent.scan` for why."""
+
+
 class CodeReviewSourceRequest(_UISourceBase):
     code: Optional[str] = Field(None, description="Pasted code or a unified diff")
     language: Optional[str] = None

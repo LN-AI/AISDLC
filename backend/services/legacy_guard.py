@@ -74,11 +74,22 @@ LEGACY_PRODUCT_ROUTES = {
     "/api/review/prompt": "prompt",
     "/api/review/architecture": "architecture",
     "/api/review/architecture/upload": "architecture",
+    # Reviewing a *design* from the code that implements it. Same products, so the same
+    # entitlement, quota and budget — the input changed, not what is being sold. Still one
+    # model call each, because `code_brief` reduces the codebase to a description that fits
+    # in one: no `_CHUNKABLE_ROUTES` entry, and the reservation of 1 is correct rather than
+    # the under-reservation C-77 was about.
+    "/api/review/architecture/source": "architecture",
+    "/api/review/architecture/upload-zip": "architecture",
+    "/api/review/security/source": "security",
+    "/api/review/security/upload-zip": "security",
     "/api/review/vapt": "vapt",
     "/api/review/vapt/upload": "vapt",
     "/api/review/security": "security",
     "/api/review/security/upload": "security",
     "/api/review/sensitive-data": "sensitive-data",
+    "/api/review/sensitive-data/source": "sensitive-data",
+    "/api/review/sensitive-data/upload-zip": "sensitive-data",
     "/api/review/sensitive-data/upload": "sensitive-data",
     "/api/review/ai-provenance": "ai-provenance",
     "/api/review/migration-assessment": "migration-assessment",
@@ -161,6 +172,13 @@ _CHUNKABLE_ROUTES = {
     "/api/review/vapt": "artifact",
     "/api/review/vapt/source": "artifact",
     "/api/review/vapt/upload-zip": "artifact",
+    # The sensitive-data scan fans out over chunks now (its question is per file, so
+    # findings concatenate). Listed here or it reserves for one call and makes forty, which
+    # is exactly C-77 — a caller near their cap could start a scan that passed a check sized
+    # for a fortieth of it. Its two design siblings above are deliberately *not* here: they
+    # send one structural brief and make one call.
+    "/api/review/sensitive-data/source": "content",
+    "/api/review/sensitive-data/upload-zip": "content",
     "/api/github/pr": "",
     "/api/github/pr/auto-fix": "",
 }

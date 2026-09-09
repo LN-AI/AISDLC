@@ -4103,6 +4103,90 @@ def main():
     check("reload can be turned off without a different command",
           os.getenv("RELOAD") is None or True)
 
+    # ── 32. A codebase reaches the agents that are not Code Review ─────────
+    #
+    # Three intakes were added at once and they are deliberately *not* the same shape, so
+    # the thing worth guarding is that each stays the shape its agent needs.
+    #
+    #  * Architecture and Security send a computed **structural brief** and make ONE call.
+    #    They answer a holistic question -- `ARCHITECTURE_TOOL_SCHEMA` has a single
+    #    `quality_scores` object -- so there is nothing sensible to merge from chunks, and a
+    #    repository does not fit in one call. If either ever appears in `_CHUNKABLE_ROUTES`
+    #    somebody has misread that as a chunking problem.
+    #  * Sensitive Data sends the **real source**, fanned out. Its question is per file, so
+    #    a summary would be worse than useless: a summary cannot contain the hardcoded key
+    #    that is the finding. It must be in `_CHUNKABLE_ROUTES` or it reserves budget for
+    #    one call and makes forty (C-77).
+    #
+    # And the brief must never claim more coverage than it has: real dependency edges exist
+    # only for the five parsed languages, and a JavaScript repository degrades to a file
+    # listing. Saying so is the whole reason the coverage note exists.
+    section("32. A codebase reaches the agents that are not Code Review")
+
+    from backend.services import code_brief as _cb32
+    from backend.services import legacy_guard as _lg32
+
+    _chunkable32 = set(_lg32._CHUNKABLE_ROUTES)
+    check("the two design routes do not chunk",
+          not ({"/api/review/architecture/source", "/api/review/security/source"}
+               & _chunkable32),
+          "a holistic verdict cannot be merged from chunks -- these send one brief and make "
+          "one call; listing them here would fan out a question that has no merge rule")
+    check("...and the sensitive-data scan does",
+          {"/api/review/sensitive-data/source",
+           "/api/review/sensitive-data/upload-zip"} <= _chunkable32,
+          "it reads every file, so it reserves for the fan-out it is about to make (C-77)")
+    check("...and all four are metered as their own product",
+          all(_lg32.product_for_request("POST", p) == a for p, a in (
+              ("/api/review/architecture/source", "architecture"),
+              ("/api/review/architecture/upload-zip", "architecture"),
+              ("/api/review/security/source", "security"),
+              ("/api/review/sensitive-data/source", "sensitive-data"))),
+          "an unmapped route is entitled to nobody and billed to nothing (D-289)")
+    check("...with the upload doors split per product, not one taking an `agent` field",
+          _lg32.product_for_request("POST", "/api/review/security/upload-zip") == "security",
+          "one path serving two products would entitle both as whichever the map named")
+
+    _py32 = _cb32.build(source_bundle.from_files([
+        {"path": "app/db.py", "content": "import app.util\n\ndef q():\n    return 1\n"},
+        {"path": "app/util.py", "content": "def helper():\n    return 2\n"},
+    ]))
+    check("a parsed codebase produces a real dependency graph",
+          _py32["stats"].get("edges", 0) >= 1 and _py32["coverage"]["files_analysed"] == 2,
+          f"{_py32['stats']} / {_py32['coverage']}")
+    check("...and the brief is a description, not the source",
+          "def q()" not in _py32["markdown"] and "app/db.py" in _py32["markdown"],
+          "the point is that it fits in one call; pasting the bodies back in defeats it")
+    check("...and every file reports its real size",
+          "| 0 |" not in _py32["markdown"],
+          "`render_inventory` prints `loc`, which `graph.build` does not set -- without it "
+          "a 2,000-line god object and an empty __init__.py look identical to the one call "
+          "that has to decide whether they belong together")
+
+    _js32 = _cb32.build(source_bundle.from_files([
+        {"path": "src/app.js", "content": "import x from './y';\nexport const a = 1;\n"},
+        {"path": "src/y.js", "content": "export default 2;\n"},
+    ]))
+    check("an unparsed language says so instead of implying a graph",
+          _js32["coverage"]["files_analysed"] == 0
+          and "no parser" in _js32["coverage_note"]
+          and "no dependency graph" in _js32["coverage_note"],
+          f"{_js32['coverage_note'][:160]!r} -- JavaScript has no analyzer (C-24), and a "
+          "brief that stayed quiet about it would read as a complete picture")
+    check("...and the same sentence goes to the model and to the screen",
+          _js32["coverage_note"] == _cb32.coverage_note(_js32["coverage"]),
+          "two accounts of how much was read would be one too many")
+
+    # Built directly rather than through `from_files`, which refuses an empty list at the
+    # door. The case this guards is the one that gets past that door: a bundle that resolved
+    # fine and whose files were all filtered out.
+    _empty32 = _cb32.build(source_bundle.Bundle(source_type="files", files=[]))
+    check("an input with no readable source produces no brief at all",
+          _empty32["markdown"] == "",
+          "the route turns this into a 400 -- reviewing an empty inventory would return a "
+          "confident verdict about nothing, which is the degenerate result `attest` exists "
+          "to stop reaching a screen")
+
     print()
     print("-" * 60)
     if FAILED:

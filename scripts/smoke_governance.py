@@ -676,11 +676,20 @@ def main_():
           "it overrides `_call_claude` and `scan` calls it directly, so the protections "
           "added to `BaseAgent.review` pass it by -- and a truncated 'no PHI found' is the "
           "most costly wrong answer this particular agent can give")
-    check("...and does not verify evidence, because its sample is deliberately masked",
-          "verify_evidence" not in _sdsrc11,
+    # Asserted as "never turned on" rather than "never mentioned". The original check was
+    # `"verify_evidence" not in source`, which held only while nothing in the file said the
+    # word -- so documenting *why* it is off broke it, and adding a second code path that
+    # explicitly passes `verify_evidence=False` would have broken it too. A check that fails
+    # when you write down the reason for it is training people to delete the reason.
+    _sdall11 = _i11.getsource(_sd11)
+    check("...and never turns evidence verification on, because its sample is masked",
+          "verify_evidence=True" not in _sdall11.replace(" ", "")
+          and "verify_evidence=False" in _sdall11.replace(" ", ""),
           "the schema asks for an 'Obfuscated sample (mask real data)', so a substring "
           "check against the source is guaranteed to fail for every correctly-masked "
-          "finding -- it would discard exactly the findings that followed instructions")
+          "finding -- it would discard exactly the findings that followed instructions. "
+          "The file-list path must pass it explicitly to `chunked_review`, whose own "
+          "default is True")
 
     # The API surface. These two endpoints build their response by hand rather than through
     # `_wrap`'s passthrough, so a new field reaches the browser (which reads the stored

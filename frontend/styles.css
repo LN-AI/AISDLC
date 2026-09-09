@@ -2761,3 +2761,28 @@ pre.fix-diff {
   border: 1px solid var(--border); border-radius: 5px;
   background: var(--surface); color: var(--text-muted);
 }
+
+/* A quote whose coverage line is the part that matters. `cost-note-warn` is used when some
+   of the codebase could not be parsed: the price is fine and the coverage is the caveat. */
+.cost-note-warn {
+  border-left: 3px solid var(--amber, #d19a2f);
+  background: rgba(209,154,47,.07);
+}
+.cost-note-bad {
+  border-left: 3px solid var(--red, #d1495b);
+  background: rgba(209,73,91,.07);
+}
+
+/* Compare mode: one bordered box per candidate architecture, so the boundary between two
+   options is a boundary on screen and not a paragraph break in one textarea. */
+.arch-option {
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 11px; margin-bottom: 10px; background: var(--surface2);
+}
+.arch-option-head { display: flex; gap: 10px; align-items: center; margin-bottom: 7px; }
+.arch-option-name {
+  flex: 1 1 auto; font-size: 13px; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--surface); color: var(--text);
+}
+.arch-option-text { width: 100%; }
