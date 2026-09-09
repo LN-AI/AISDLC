@@ -501,6 +501,680 @@ def main_():
 
     # ── done ───────────────────────────────────────────────────────────────
     stack.close()
+    # ── 11. What every assessment owes its reader ────────────────────────
+    #
+    # Code Review and VAPT go through `chunked_review`, which refuses a truncated response
+    # and floors the gate. Every other assessment returned whatever the model said. The
+    # worst instance was a regulated one: the 21 CFR Part 11 verifier back-filled
+    # `files_scanned` from its own input list when the model did not say what it read, so an
+    # FDA report could state that 400 files were verified when nobody knew whether they
+    # were.
+    #
+    # The judgement in `attest.py` is which protections are universal and which are not, so
+    # that is what most of this section is about.
+    section("11. Attestation — no assessment claims what nobody checked")
+
+    from backend.agents import attest as _at11
+    from backend.agents import base_agent as _ba11
+
+    _FILES11 = [{"path": "app/a.py", "content": "x = 1\n"},
+                {"path": "app/b.py", "content": "y = 2\n"},
+                {"path": "app/c.py", "content": "z = 3\n"}]
+
+    # ── The claim that started this ──────────────────────────────────────
+    _silent = _at11.coverage_claim({"files_scanned": []}, _FILES11)
+    check("a model that named no files is not credited with all of them",
+          _silent["files_claimed"] == 0 and _silent["files_supplied"] == 3,
+          str(_silent))
+    check("...and the report says so in words an auditor can act on",
+          "not the same as having examined all of them" in _silent["note"],
+          _silent["note"])
+    check("...and does not call the coverage complete",
+          _silent["complete"] is False)
+
+    _partial = _at11.coverage_claim({"files_scanned": ["app/a.py"]}, _FILES11)
+    check("a partial claim names the gap", _partial["files_unclaimed"] == 2
+          and set(_partial["unclaimed_sample"]) == {"app/b.py", "app/c.py"},
+          str(_partial))
+    check("...and says to treat the rest as unexamined",
+          "unexamined" in _partial["note"], _partial["note"])
+
+    _all = _at11.coverage_claim(
+        {"files_scanned": ["app/a.py", "app/b.py", "app/c.py"]}, _FILES11)
+    check("a complete claim is reported as complete", _all["complete"] is True, str(_all))
+
+    _invented = _at11.coverage_claim(
+        {"files_scanned": ["app/a.py", "app/nope.py"]}, _FILES11)
+    check("a file named but never supplied is surfaced",
+          _invented["files_not_supplied"] == 1
+          and _invented["not_supplied_sample"] == ["app/nope.py"], str(_invented))
+    check("...with a warning, because it usually means an invented filename",
+          "invented" in _invented["note"], _invented["note"])
+
+    _paste = _at11.coverage_claim({"files_scanned": []}, [])
+    check("a pasted artifact has no per-file coverage to report, and says that",
+          _paste["files_supplied"] == 0 and "pasted artifact" in _paste["note"],
+          str(_paste))
+
+    # ── Degeneracy: the failure that is hardest to notice ────────────────
+    _big11 = "x = 1\n" * 200
+    _raised = ""
+    try:
+        _at11.attest({"findings": [], "summary": "", "gate_status": "Green"},
+                     agent_name="Test Agent", artifact=_big11)
+    except RuntimeError as exc:
+        _raised = str(exc)
+    check("a response with no findings and no summary is refused, not stored",
+          "returned an empty result" in _raised, _raised[:200])
+    check("...naming the agent, so the error says which one",
+          "Test Agent" in _raised, _raised[:120])
+
+    _ok11 = _at11.attest({"findings": [], "summary": "Nothing found.",
+                          "gate_status": "Green"},
+                         agent_name="Test Agent", artifact=_big11)
+    check("a genuinely clean result with a summary is kept",
+          _ok11["gate_status"] == "Green")
+    _tiny = _at11.attest({"findings": [], "summary": "", "gate_status": "Green"},
+                         agent_name="Test Agent", artifact="x = 1")
+    check("a trivial artifact may legitimately produce nothing",
+          _tiny["gate_status"] == "Green",
+          "rejecting these would break every caller that probes an endpoint with a "
+          "one-liner")
+
+    # ── The gate floor, and the aliased key two schemas use ─────────────
+    _crit = {"findings": [{"severity": 5, "title": "Critical thing", "is_blocking": True}],
+             "summary": "One problem.", "gate_status": "Green", "risk_score": 5.0}
+    _floored = _at11.attest(_crit, agent_name="Test Agent", artifact=_big11)
+    check("a Critical cannot come out Green", _floored["gate_status"] == "Red",
+          _floored["gate_status"])
+    check("...and the model's own answer is kept, so the disagreement can be measured",
+          _floored["model_gate_status"] == "Green", str(_floored.get("model_gate_status")))
+
+    _overall = {"findings": [{"severity": 5, "title": "Critical", "is_blocking": True}],
+                "summary": "One problem.", "overall_gate_status": "Green",
+                "overall_risk_score": 5.0}
+    _fl2 = _at11.attest(_overall, agent_name="Part 11", artifact=_big11,
+                        gate_key="overall_gate_status", risk_key="overall_risk_score")
+    check("the aliased gate key is floored too", _fl2["overall_gate_status"] == "Red",
+          "the Part 11 verifier and the GxP document check name their verdict "
+          "`overall_gate_status`, so `reconcile_gate` would not have seen it at all")
+    check("...and written back under both names, so no screen can disagree with the record",
+          _fl2["gate_status"] == "Red" and _fl2["overall_gate_status"] == "Red",
+          f"gate_status={_fl2.get('gate_status')} "
+          f"overall={_fl2.get('overall_gate_status')}")
+
+    # ── Evidence verification is opt-in, and this is why ────────────────
+    _described = {
+        "findings": [{"severity": 4, "title": "No audit trail",
+                      "evidence": "app/a.py / save_record() / no audit call",
+                      "is_blocking": True}],
+        "summary": "A gap.", "gate_status": "Amber",
+    }
+    _off = _at11.attest(dict(_described), agent_name="Part 11", artifact=_big11)
+    check("a described (non-quoted) evidence field survives when verification is off",
+          len(_off["findings"]) == 1 and not _off["discarded_findings"],
+          "this schema asks for 'File path / function / code pattern', so a substring "
+          "check would discard a correct finding for being phrased as instructed")
+    check("...and no verification claim is made about it",
+          _off["findings"][0].get("evidence_verified") is None,
+          "False would mean 'we checked and could not confirm', which is untrue of a "
+          "finding nobody checked -- the same class of untruth as the back-filled file list")
+    check("...and the result records that quotes were not checked",
+          _off["attested"]["evidence_verified"] is False, str(_off["attested"]))
+
+    _on = _at11.attest(dict(_described), agent_name="Code", artifact=_big11,
+                       verify_evidence=True)
+    check("with verification on, the same finding is discarded",
+          not _on["findings"] and len(_on["discarded_findings"]) == 1,
+          "which is correct for a schema that demanded a verbatim quote, and wrong for one "
+          "that did not -- hence the flag")
+
+    _absent = _at11.attest(
+        {"findings": [{"severity": 3, "title": "There is no threat model",
+                       "is_blocking": False}],
+         "summary": "Design gap.", "gate_status": "Amber"},
+        agent_name="Architecture", artifact=_big11, verify_evidence=True)
+    check("a finding with no evidence at all is never discarded",
+          len(_absent["findings"]) == 1,
+          "a design-level finding has no line to quote, and dropping it would delete real "
+          "issues the moment a finding was about an absence")
+
+    # ── A generative result is not judged ───────────────────────────────
+    _gen = _at11.attest({"scaffold": "...", "files": ["a.py"]},
+                        agent_name="Codegen", artifact=_big11)
+    check("a result with no findings and no gate is left alone",
+          "gate_status" not in _gen and "discarded_findings" not in _gen,
+          "inventing a verdict for generated work would be judging something nobody asked "
+          "to have judged")
+
+    # ── And it is actually wired in, which is the part that matters ─────
+    import inspect as _i11
+    for _name11 in ("review", "review_architecture", "review_security"):
+        _owner = next(c for c in (_ba11.BaseAgent, _ba11.ArchitectureBaseAgent,
+                                  _ba11.SecurityReviewBaseAgent)
+                      if _name11 in c.__dict__)
+        _src11 = _i11.getsource(_owner.__dict__[_name11])
+        check(f"`{_name11}` attests its result", "attest.attest(" in _src11,
+              "this is the shared method for the requirement, prompt, compliance, "
+              "sensitive-data, provenance, triage, security and architecture products -- "
+              "one edit covers all of them")
+        check(f"...against the artifact, not the prompt we built around it",
+              "artifact=content" in _src11,
+              "padding the degeneracy threshold with our own context would let a one-line "
+              "artifact clear the 200-character floor and escape the check")
+        check(f"...and does not claim to have verified quotes it was never given",
+              "verify_evidence" not in _src11,
+              "no schema reached by these methods asks for a verbatim quote")
+
+    # Two products that the `base_agent` edit does **not** reach, each for its own reason.
+    # Both were found by looking for what the shared method misses rather than by assuming
+    # it covered everything.
+    from backend.agents.security_intelligence import sensitive_data_agent as _sd11
+    _sdsrc11 = _i11.getsource(_sd11.SensitiveDataAgent.scan)
+    check("the sensitive-data scan attests, even though it never calls `review`",
+          "attest.attest(" in _sdsrc11,
+          "it overrides `_call_claude` and `scan` calls it directly, so the protections "
+          "added to `BaseAgent.review` pass it by -- and a truncated 'no PHI found' is the "
+          "most costly wrong answer this particular agent can give")
+    # Asserted as "never turned on" rather than "never mentioned". The original check was
+    # `"verify_evidence" not in source`, which held only while nothing in the file said the
+    # word -- so documenting *why* it is off broke it, and adding a second code path that
+    # explicitly passes `verify_evidence=False` would have broken it too. A check that fails
+    # when you write down the reason for it is training people to delete the reason.
+    _sdall11 = _i11.getsource(_sd11)
+    check("...and never turns evidence verification on, because its sample is masked",
+          "verify_evidence=True" not in _sdall11.replace(" ", "")
+          and "verify_evidence=False" in _sdall11.replace(" ", ""),
+          "the schema asks for an 'Obfuscated sample (mask real data)', so a substring "
+          "check against the source is guaranteed to fail for every correctly-masked "
+          "finding -- it would discard exactly the findings that followed instructions. "
+          "The file-list path must pass it explicitly to `chunked_review`, whose own "
+          "default is True")
+
+    # The API surface. These two endpoints build their response by hand rather than through
+    # `_wrap`'s passthrough, so a new field reaches the browser (which reads the stored
+    # result) and not the API -- and the API is what a compliance pipeline reads.
+    from backend.routes import v1_agents as _v11
+    for _fn11 in (_v11.run_cfr21_verification, _v11.run_gxp_document_check):
+        _src11 = _i11.getsource(_fn11)
+        check(f"`{_fn11.__name__}` returns the coverage claim to an API caller",
+              '"coverage_claim"' in _src11,
+              "an integrator seeing an empty `files_scanned` needs this to tell them it "
+              "means 'the assessment did not say' rather than 'nothing was scanned' -- "
+              "without it the honest answer looks like a bug and invites someone to "
+              "re-add the back-fill")
+        check(f"...and which checks were applied", '"attested"' in _src11)
+        check(f"...and the model's verdict before the floor",
+              '"model_gate_status"' in _src11,
+              "so a reader can see when the arithmetic and the model disagreed")
+
+    from backend.agents.security_intelligence import cfr21_agent as _c11
+    _csrc11 = _i11.getsource(_c11.CFR21VerificationAgent.verify)
+    check("the Part 11 verifier no longer back-fills its own coverage",
+          'result["files_scanned"] = [f.get("path"' not in _csrc11,
+          "this is the line that turned 'the model did not tell us' into '400 files were "
+          "verified' inside an FDA report")
+    check("...and reconciles the claim instead",
+          'claim_key="files_scanned"' in _csrc11, _csrc11[-400:])
+
+    # -- 12. The attestation fires, not just appears in the source -----------
+    #
+    # Section 11 proves `attest.attest(` is written into each agent by reading its source.
+    # That is worth having, but it cannot tell you the call *works*: a wrong `gate_key`
+    # would leave a Part 11 verdict unfloored and the source grep would still pass, because
+    # the text is there either way. `SensitiveDataAgent` is the reason this matters -- it
+    # overrides `_call_claude`, so it was the one agent the shared `base_agent` edit did not
+    # reach (D-346), and only a behavioural check distinguishes "wired" from "written".
+    #
+    # So this drives the three regulated agents with a stubbed model and asserts the result.
+    section("12. ...and the attestation fires when the model answers")
+
+    from backend.agents.security_intelligence.cfr21_agent import CFR21VerificationAgent
+    from backend.agents.security_intelligence.gxp_document_agent import GxPDocumentAgent
+    from backend.agents.security_intelligence.sensitive_data_agent import SensitiveDataAgent
+
+    _CRIT12 = {"control_id": "SEC-003", "severity": 5, "risk_level": "Critical",
+               "title": "no audit trail", "description": "", "recommendation": "",
+               "is_blocking": True}
+    # Long enough to clear the 200-character degeneracy floor, which is about the size of
+    # the artifact under review rather than the prompt built around it.
+    _FILES12 = [{"path": "app/audit.py", "content": "def log_event(e):\n    pass\n" * 20},
+                {"path": "app/sign.py", "content": "def sign(u):\n    return True\n" * 20}]
+
+    _reply12 = {}
+
+    def _stub12(system_prompt, user_content, tool_schema, llm_override=None, max_tokens=None):
+        return dict(_reply12)
+
+    _real12, llm_gateway.call_tool = llm_gateway.call_tool, _stub12
+    try:
+        # A model that grades its own Critical as Green. The aliased-key case: this schema
+        # calls the verdict `overall_gate_status`, which `reconcile_gate` does not know.
+        _reply12 = {"findings": [dict(_CRIT12)], "overall_gate_status": "Green",
+                    "overall_risk_score": 0.0, "summary": "s", "files_scanned": []}
+        _out12 = CFR21VerificationAgent().verify(files=_FILES12, system_description="LIMS")
+        check("the Part 11 verifier really floors its own gate, not just imports the floor",
+              _out12.get("overall_gate_status") == "Red", str(_out12.get("overall_gate_status")))
+        check("...and under the plain key too, so screen and stored record agree",
+              _out12.get("gate_status") == "Red", str(_out12.get("gate_status")))
+        check("the Part 11 verifier leaves an unstated file list empty",
+              _out12.get("files_scanned") == [], str(_out12.get("files_scanned")))
+        check("...and reports the gap it did not fill",
+              (_out12.get("coverage_claim") or {}).get("files_supplied") == 2
+              and (_out12.get("coverage_claim") or {}).get("files_unclaimed") == 2,
+              str(_out12.get("coverage_claim")))
+
+        _reply12 = {"findings": [], "overall_gate_status": "Green", "overall_risk_score": 0.0,
+                    "summary": "", "files_scanned": []}
+        try:
+            CFR21VerificationAgent().verify(files=_FILES12, system_description="LIMS")
+            check("a truncated Part 11 response does not become a compliance report", False)
+        except RuntimeError:
+            check("a truncated Part 11 response does not become a compliance report", True)
+
+        _reply12 = {"findings": [dict(_CRIT12, title="unsigned SOP")],
+                    "overall_gate_status": "Green", "overall_risk_score": 0.0, "summary": "s"}
+        _out12 = GxPDocumentAgent().check(documents=[{"path": "SOP-1.md",
+                                                      "content": "text\n" * 60}])
+        check("the GxP document check really floors its own gate",
+              _out12.get("overall_gate_status") == "Red", str(_out12.get("overall_gate_status")))
+
+        # The agent D-346 is about. Its schema uses the plain keys, so nothing is aliased --
+        # what is being checked is that `scan` reaches `attest` at all.
+        _reply12 = {"findings": [dict(_CRIT12, title="hardcoded database password")],
+                    "gate_status": "Green", "risk_score": 0.0, "summary": "s"}
+        _out12 = SensitiveDataAgent().scan("PASSWORD = 'hunter2'\n" * 30)
+        check("the sensitive-data scan really floors its own gate",
+              _out12.get("gate_status") == "Red", str(_out12.get("gate_status")))
+
+        _reply12 = {"findings": [], "gate_status": "Green", "risk_score": 0.0, "summary": ""}
+        try:
+            SensitiveDataAgent().scan("PASSWORD = 'hunter2'\n" * 30)
+            check("a truncated sensitive-data scan is not stored as 'nothing found'", False)
+        except RuntimeError:
+            check("a truncated sensitive-data scan is not stored as 'nothing found'", True)
+    finally:
+        llm_gateway.call_tool = _real12
+
+    # Nothing here re-checks that the two regulated `/api/v1` responses carry
+    # `coverage_claim`/`attested`/`model_gate_status` (D-347): section 11 already does it
+    # with `inspect.getsource` on `run_cfr21_verification` and `run_gxp_document_check`,
+    # which is stricter than searching the file text.
+
+
+    # -- 13. The report cannot claim a sign-off nobody was asked for ---------
+    #
+    # `save_review` enqueues an approval on a Red gate or any Critical finding
+    # (`database.py`). The governance report re-derived its own answer as
+    # `gate_status in ("Amber", "Red")` -- so every Amber report told its reader a sign-off
+    # had been required when nobody was ever asked for one. That is an assertion about a
+    # control that did not run, inside the document whose entire purpose is to evidence
+    # that controls did run: the same class of defect as back-filling a compliance file
+    # list (D-345).
+    #
+    # C-38 decided 2026-09-07: fix the report, do not extend the queue. Extending it would
+    # raise approval volume for every existing customer at once and Amber is common.
+    section("13. Amber does not reach a human, and the report says so")
+
+    from backend.agents.governance_intelligence import report_generator as _rg13
+    from backend import context as _ctx14
+    from backend.services import finding_gate
+
+    check("an Amber gate with no Critical does not require sign-off",
+          finding_gate.requires_human_signoff("Amber", 0) is False)
+    check("a Red gate does", finding_gate.requires_human_signoff("Red", 0) is True)
+    check("...and so does a Critical under any gate",
+          finding_gate.requires_human_signoff("Amber", 1) is True)
+    check("a Green gate does not", finding_gate.requires_human_signoff("Green", 0) is False)
+
+    # The drift guard, and the check that would have caught the original defect: both
+    # readers must call the one function rather than spelling the rule out again.
+    _dbsrc13 = _i11.getsource(database.save_review)
+    check("`save_review` reads the shared rule rather than re-deriving it",
+          "requires_human_signoff" in _dbsrc13,
+          "two copies of this rule is how the report and the queue came to disagree")
+    _rgsrc13 = _i11.getsource(_rg13.ReportGeneratorAgent._build_report_document)
+    check("the governance report reads the same rule",
+          "requires_human_signoff" in _rgsrc13)
+    # Comments stripped first: the fix deliberately quotes the old predicate verbatim to
+    # record what it was, so searching the raw source would match the very comment
+    # explaining the removal. Naive splitting on `#` is fine here -- there is no `#` inside
+    # a string literal in that method.
+    _rgcode13 = "\n".join(ln.split("#", 1)[0] for ln in _rgsrc13.split("\n"))
+    check("...and no longer derives approval from the gate alone",
+          'gate_status in ("Amber", "Red")' not in _rgcode13,
+          "that predicate is what made an Amber report claim a sign-off")
+
+    _agent13 = _rg13.ReportGeneratorAgent()
+    _amber13 = _agent13._build_report_document(
+        project_name="P", all_findings=[{"control_id": "SEC-001", "severity": 4,
+                                         "title": "High but not critical", "description": "",
+                                         "recommendation": ""}],
+        review_results=[], gate_status="Amber", overall_risk_score=45.0,
+        llm_result={"summary": "s", "findings": [], "recommendations": []})
+    check("an Amber report does not claim an approval was required",
+          _amber13["approval_required"] is False, str(_amber13["approval_required"]))
+    check("...and states in words that none was requested",
+          "No human sign-off was requested" in _amber13.get("approval_basis", ""),
+          "silence is unreadable: 'never asked' and 'asked and granted' look identical")
+
+    _red13 = _agent13._build_report_document(
+        project_name="P", all_findings=[{"control_id": "SEC-003", "severity": 5,
+                                         "title": "Critical", "description": "",
+                                         "recommendation": ""}],
+        review_results=[], gate_status="Red", overall_risk_score=90.0,
+        llm_result={"summary": "s", "findings": [], "recommendations": []})
+    check("a Red report does claim one", _red13["approval_required"] is True)
+    check("...and says it is queued and blocking",
+          "approval queue" in _red13.get("approval_basis", ""),
+          str(_red13.get("approval_basis")))
+
+    # End to end: the queue itself must agree with the report. An Amber review with no
+    # Critical enqueues nothing, which is precisely what the old report denied.
+    _rid13 = database.save_review(
+        review_type="code", project_name="AmberProj", input_summary="amber",
+        input_content="x", result={"findings": [{"control_id": "SEC-001", "severity": 4,
+                                                 "title": "h", "description": "",
+                                                 "recommendation": ""}],
+                                   "gate_status": "Amber", "risk_score": 45.0,
+                                   "summary": "s"})
+    check("an Amber review really enqueues no approval",
+          database.get_pending_approval_for_review(_rid13) is None)
+
+    # -- 14. One decision per release, not one per finding-event -------------
+    #
+    # `save_review` enqueues a sign-off for a Red gate or any Critical, and a Core SDLC
+    # Review calls it several times -- the code review, the VAPT and the aggregate. So one
+    # run put three items in a reviewer's queue, all of them the same question ("ship this
+    # or not"), and the screen could not say which release any of them belonged to (C-37,
+    # C-39).
+    #
+    # The release is the API call: both guards open `context.bind_project` exactly once per
+    # call, so binding an id there groups every review the call saves and costs no new call
+    # sites. Outside a request there is no release and the old one-per-review behaviour
+    # stands, which is honest -- nothing grouped those.
+    section("14. A reviewer is asked about a release, not about each finding")
+
+    _CRIT14 = {"control_id": "SEC-003", "severity": 5, "risk_level": "Critical",
+               "title": "hardcoded key", "description": "", "recommendation": ""}
+
+    def _save14(rt, gate):
+        return database.save_review(
+            review_type=rt, project_name="Rel", input_summary="s", input_content="x",
+            result={"findings": [dict(_CRIT14)], "gate_status": gate,
+                    "risk_score": 90.0, "summary": "s"})
+
+    def _pending14():
+        conn = database.get_connection()
+        rows = conn.execute(
+            "SELECT id, priority, release_id FROM approvals WHERE status = 'pending'"
+            " AND project_name = 'Rel'").fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    with _ctx14.bind_project("proj-rel", "Rel", product_id="full"):
+        _a14 = _save14("code", "Amber")   # a Critical under Amber -> "high"
+        _b14 = _save14("vapt", "Red")     # a Red -> must escalate the whole release
+        _c14 = _save14("full", "Red")
+
+    _rows14 = _pending14()
+    check("three reviews in one run raise one sign-off request, not three",
+          len(_rows14) == 1, f"{len(_rows14)} pending")
+    check("...escalated to urgent by the Red, not left at the first review's priority",
+          _rows14 and _rows14[0]["priority"] == "urgent",
+          "a release containing a Red is urgent even if the run that raised it was Amber")
+
+    _found14 = [database.get_pending_approval_for_review(r) for r in (_a14, _b14, _c14)]
+    check("every review in the release can still say it is waiting on a human",
+          all(_found14), "`workflows.shared.attach_approval` asks this per review")
+    check("...and they all name the same decision",
+          len({f["id"] for f in _found14 if f}) == 1,
+          "otherwise the caller links a release to the wrong sign-off")
+
+    _q14 = [a for a in database.list_approvals(status="pending")
+            if a.get("project_name") == "Rel"]
+    check("the queue says how many runs the decision covers",
+          _q14 and _q14[0]["covered_count"] == 3, str(_q14 and _q14[0].get("covered_count")))
+    check("...and names them, so 'ship or not' is answerable",
+          _q14 and {c["review_type"] for c in _q14[0]["covered_reviews"]}
+          == {"code", "vapt", "full"},
+          str(_q14 and [c["review_type"] for c in _q14[0]["covered_reviews"]]))
+    check("the release gate is the strictest of the runs, not the raising one's",
+          _q14 and _q14[0]["release_gate"] == "Red",
+          "the run that raised this was Amber; the release holds a Red")
+    check("...and the finding counts are the release's total",
+          _q14 and _q14[0]["release_findings"] == 3 and _q14[0]["release_critical"] == 3,
+          str(_q14 and (_q14[0].get("release_findings"), _q14[0].get("release_critical"))))
+
+    with _ctx14.bind_project("proj-rel", "Rel", product_id="code"):
+        _save14("code", "Red")
+    check("a separate call is a separate release", len(_pending14()) == 2)
+
+    # Nesting must not split a run in two: an inner `bind_project` inherits the outer id.
+    with _ctx14.bind_project("proj-rel", "Rel", product_id="full"):
+        _save14("code", "Red")
+        with _ctx14.bind_project("proj-rel", "Rel", product_id="code"):
+            _save14("vapt", "Red")
+    _rows14 = _pending14()
+    check("a nested call stays inside the same release",
+          len(_rows14) == 3, f"{len(_rows14)} pending -- nesting must not start a new one")
+
+    # Outside any request there is no release, and pretending otherwise would merge two
+    # unrelated reviews into one decision.
+    _save14("code", "Red")
+    _save14("code", "Red")
+    check("outside a request each review still raises its own",
+          len(_pending14()) == 5, str(len(_pending14())))
+
+    # -- 15. A regulated system too big for one call ------------------------
+    #
+    # `cfr21-verification` was one model call and nothing else, so a system over
+    # MAX_AGENT_INPUT_CHARS was refused outright -- the product could not produce a report
+    # for the size of application that actually buys it, and the refusal arrived only after
+    # the button was pressed. It now splits, and the four §11 assessments are merged with
+    # the strictest reading rather than the last part winning.
+    section("15. A regulated system is assessed in parts, strictly")
+
+    from backend.agents.security_intelligence import cfr21_agent as _c15
+    from backend.services import review_estimate as _re15
+
+    def _assess15(compliant, gaps=(), applicable=None, text="t"):
+        out = {"compliant": compliant, "findings_summary": text,
+               "gaps": list(gaps), "strengths": []}
+        if applicable is not None:
+            out["applicable"] = applicable
+        return out
+
+    # -- the merge rule on its own, where each direction can be seen
+    _m = _c15._merge_assessments({"audit_trail_assessment": [
+        _assess15(True, text="part one"), _assess15(False, ["no timestamps"], text="part two")]})
+    _at = _m["audit_trail_assessment"]
+    check("one part finding a gap makes the whole assessment non-compliant",
+          _at["compliant"] is False,
+          "a report assembled from parts must not be looser than its worst part")
+    check("...and the gap survives into the merged assessment",
+          _at["gaps"] == ["no timestamps"], str(_at["gaps"]))
+    check("...with each part's prose kept under its own heading",
+          "Part 1 of 2" in _at["findings_summary"] and "part two" in _at["findings_summary"],
+          "re-summarising would cost another call and could assert what no part established")
+    check("...and it says how many parts it was assembled from",
+          _at.get("assembled_from_parts") == 2, str(_at.get("assembled_from_parts")))
+
+    _m = _c15._merge_assessments({"esignature_assessment": [
+        _assess15(True, applicable=False), _assess15(True, applicable=True)]})
+    check("a part with no signature workflow does not outvote one that found it",
+          _m["esignature_assessment"]["applicable"] is True,
+          "'not applicable' is true about that slice only; it must not erase the finding")
+
+    _m = _c15._merge_assessments({"esignature_assessment": [
+        _assess15(True, applicable=False), _assess15(False, ["weak"], applicable=True)]})
+    check("...and an applicable part's gap still lands",
+          _m["esignature_assessment"]["compliant"] is False)
+
+    _m = _c15._merge_assessments({"esignature_assessment": [
+        _assess15(True, applicable=False), _assess15(True, applicable=False)]})
+    check("nothing applicable is not reported as non-compliant",
+          _m["esignature_assessment"]["compliant"] is False
+          and _m["esignature_assessment"]["applicable"] is False,
+          "there was nothing to be compliant with; the `applicable` flag is what says so")
+
+    check("a field the merger does not know is kept, not dropped",
+          _c15._merge_assessments({"something_new": [{"a": 1}, {"a": 2}]})["something_new"]
+          == {"a": 1})
+
+    check("the files each part named are unioned, not overwritten",
+          _c15._merge_files_scanned({"files_scanned": [["a.py", "b.py"], ["b.py", "c.py"]]})
+          == ["a.py", "b.py", "c.py"])
+
+    # -- the whole path, with the model stubbed
+    _n15 = {"calls": 0}
+
+    def _stub15(system_prompt, user_content, tool_schema, llm_override=None, max_tokens=None):
+        _n15["calls"] += 1
+        first = _n15["calls"] == 1
+        return {
+            "findings": [{
+                "control_id": "GXP-001", "cfr_section": "§11.10(e)",
+                "title": f"gap {_n15['calls']}", "severity": 5 if first else 3,
+                "risk_level": "Critical" if first else "Moderate", "description": "",
+                # A *description*, which is what this schema asks for -- and exactly what
+                # evidence verification would discard if it were on.
+                "evidence": "not applicable / no code available",
+                "recommendation": "", "is_blocking": True}],
+            "audit_trail_assessment": _assess15(not first,
+                                                ["no timestamps"] if first else []),
+            "esignature_assessment": _assess15(True, applicable=not first),
+            "access_control_assessment": _assess15(True),
+            "data_integrity_assessment": _assess15(True),
+            "overall_gate_status": "Green", "overall_risk_score": 0.0,
+            "summary": f"part {_n15['calls']}", "files_scanned": ["app/f1.py"]}
+
+    _real15, llm_gateway.call_tool = llm_gateway.call_tool, _stub15
+    try:
+        _small15 = [{"path": "app/one.py", "content": "def f():\n    pass\n" * 20}]
+        _n15["calls"] = 0
+        _out15 = _c15.CFR21VerificationAgent().verify(files=_small15, system_description="LIMS")
+        check("a system that fits still takes exactly one call",
+              _n15["calls"] == 1, str(_n15["calls"]))
+        check("...and is not reported as assembled from parts",
+              _out15.get("assessed_in_parts") is False, str(_out15.get("assessed_in_parts")))
+
+        _big15 = [{"path": f"app/f{i}.py",
+                   "content": "x = 1\n" * (config.MAX_AGENT_INPUT_CHARS // 6)}
+                  for i in (1, 2)]
+        _n15["calls"] = 0
+        _out15 = _c15.CFR21VerificationAgent().verify(files=_big15, system_description="LIMS")
+        check("a system too big for one call is assessed rather than refused",
+              _n15["calls"] > 1 and _out15.get("assessed_in_parts") is True,
+              f"calls={_n15['calls']} parts={_out15.get('assessed_in_parts')}")
+        check("the gate is floored by the worst part, under both names",
+              _out15.get("overall_gate_status") == "Red"
+              and _out15.get("gate_status") == "Red",
+              f"{_out15.get('overall_gate_status')} / {_out15.get('gate_status')}")
+        check("the audit-trail assessment takes the non-compliant part's verdict",
+              _out15["audit_trail_assessment"]["compliant"] is False)
+        check("nothing is discarded for describing evidence instead of quoting it",
+              not _out15.get("discarded_findings"),
+              "this schema asks for a description; verification must stay off (D-344)")
+        check("the coverage claim still reconciles against the whole input",
+              (_out15.get("coverage_claim") or {}).get("files_supplied") == 2,
+              str(_out15.get("coverage_claim")))
+    finally:
+        llm_gateway.call_tool = _real15
+
+    # -- and it is priced before it runs
+    _q15 = _re15.for_regulated_files(
+        [{"path": f"app/f{i}.py", "content": "x = 1\n" * 20000} for i in range(3)],
+        agent="cfr21-verification")
+    check("a regulated assessment can be quoted at all", _q15["calls"] >= 1, str(_q15))
+    check("...naming more than one call when it will not fit",
+          _q15["calls"] > 1 and _q15["assessed_in_parts"] is True, str(_q15["calls"]))
+    check("...with a ceiling above the expected cost",
+          _q15["ceiling_usd"] >= _q15["expected_usd"])
+    check("...priced against this agent's own output budget, not the 8000 default",
+          _re15.MAX_OUTPUT_TOKENS.get("cfr21-verification") == 16000,
+          "the ceiling is what a person approves a run against")
+    check("...and against its own prompt, not the code reviewer's",
+          _re15._frame_tokens("cfr21-verification") != _re15._frame_tokens("code"),
+          "falling through would quote this against a prompt it never sends")
+    _q15small = _re15.for_regulated_files([{"path": "a.py", "content": "x = 1\n"}],
+                                          agent="cfr21-verification")
+    check("a small one quotes a single call", _q15small["calls"] == 1
+          and _q15small["assessed_in_parts"] is False, str(_q15small["calls"]))
+
+    # -- 16. Whether this is getting better --------------------------------
+    #
+    # `get_dashboard_stats` is six lifetime scalars plus the last five reviews, so the
+    # Dashboard could say "44 open" and not whether that was thirty fixed or thirty
+    # introduced. Both series are queries now that findings carry a resolution date --
+    # no new subsystem, no rollup table.
+    section("16. The dashboard can say whether this is getting better")
+
+    _F16 = lambda sev, t: {"control_id": "SEC-001", "severity": sev, "risk_level": "High",
+                           "title": t, "description": "", "recommendation": ""}
+
+    _r16 = database.save_review(
+        review_type="code", project_name="Trend16", input_summary="s", input_content="x",
+        result={"findings": [_F16(5, "t-a"), _F16(4, "t-b"), _F16(4, "t-c")],
+                "gate_status": "Red", "risk_score": 90.0, "summary": "s"})
+    database.save_review(
+        review_type="code", project_name="Trend16", input_summary="s", input_content="x",
+        result={"findings": [_F16(3, "t-d")], "gate_status": "Amber", "risk_score": 40.0,
+                "summary": "s"})
+
+    # Deltas, not absolutes: this suite shares one database and earlier sections have
+    # already created and resolved findings of their own, so "resolved == 0" would be
+    # asserting something about them rather than about this.
+    _trend16 = database.get_findings_trend()
+    check("the trend has a week in it once a review has run", bool(_trend16), str(_trend16))
+    _wk16 = _trend16[-1]
+    check("...counting what was introduced", _wk16["new"] >= 4, str(_wk16))
+    check("...with an open total no larger than what was ever reported",
+          _wk16["open_at_end"] <= _wk16["new"],
+          "open is reported-minus-resolved; it cannot exceed reported")
+
+    _conn16 = database.get_connection()
+    _fid16 = _conn16.execute(
+        "SELECT id FROM findings WHERE review_id = ? AND status = 'open' LIMIT 1",
+        (_r16,)).fetchone()["id"]
+    _conn16.execute("UPDATE findings SET status='resolved', resolved_at=datetime('now') "
+                    "WHERE id = ?", (_fid16,))
+    _conn16.commit()
+    _conn16.close()
+
+    _after16 = database.get_findings_trend()[-1]
+    check("resolving one is counted as resolved that week",
+          _after16["resolved"] == _wk16["resolved"] + 1,
+          f'{_wk16["resolved"]} -> {_after16["resolved"]}')
+    check("...and moves it out of the open total",
+          _after16["open_at_end"] == _wk16["open_at_end"] - 1,
+          f'{_wk16["open_at_end"]} -> {_after16["open_at_end"]}')
+    check("...so the net is introduced minus resolved, which is the direction",
+          _after16["net"] == _after16["new"] - _after16["resolved"], str(_after16))
+
+    _gates16 = database.get_gate_trend()
+    check("the gate mix is a separate series", bool(_gates16), str(_gates16))
+    check("...counting a Red and an Amber run rather than averaging them",
+          _gates16[-1]["Red"] >= 1 and _gates16[-1]["Amber"] >= 1, str(_gates16[-1]))
+    check("...and a total that includes gates outside the three",
+          _gates16[-1]["total"] >= _gates16[-1]["Red"] + _gates16[-1]["Amber"],
+          "an unknown gate must still be counted, not silently dropped")
+
+    check("the window keeps the most recent weeks",
+          len(database.get_findings_trend(weeks=1)) <= 1,
+          "a one-week window must not return the whole history")
+
+    _resp16 = client.get("/api/dashboard/trend?weeks=8", headers=admin)
+    check("the endpoint serves both series (200)", _resp16.status_code == 200,
+          f"{_resp16.status_code} {_resp16.text[:160]}")
+    check("...as findings and gates",
+          _resp16.status_code == 200 and "findings" in _resp16.json()
+          and "gates" in _resp16.json(),
+          str(list(_resp16.json()))[:120] if _resp16.status_code == 200 else "")
+    _un16 = client.get("/api/dashboard/trend")
+    check("...and refuses a caller with no credential",
+          _un16.status_code in (401, 403), str(_un16.status_code))
+
     print("\n" + "-" * 60)
     if _failures:
         print(f"FAILED: {len(_failures)} of {_checks} checks")

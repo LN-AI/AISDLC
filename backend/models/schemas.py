@@ -53,7 +53,31 @@ class AgentReviewResult(BaseModel):
     recommendations: List[str]
 
 
-class ReviewRequest(BaseModel):
+class DerivedFromMixin(BaseModel):
+    """Declares `derived_from` on the request models the browser posts to.
+
+    The field is **not read by any handler**, which is deliberate and worth knowing before
+    you go looking for the reader. `save_review` is called from nineteen places that know
+    nothing about where their artifact came from, so the ids travel by contextvar the same
+    way `project_id` and the actor do (`backend/context.py`) — and the one place on this
+    path that sees the request body before the handler is `legacy_guard`, which already
+    reads it to size the budget reservation. It binds the claim; `database.save_review`
+    keeps only the ids that exist and belong to the same project, then writes them.
+
+    Declared here anyway, rather than left as an undocumented extra field Pydantic happens
+    to ignore, so that it appears in `/docs` and so a field that changes what gets stored
+    is part of the published contract rather than a coupling somebody has to discover.
+    """
+
+    derived_from: Optional[List[str]] = Field(
+        None,
+        description="Ids of earlier reviews this run was built from — recorded on the "
+                    "stored review as provenance and shown when the run is reopened. Ids "
+                    "that do not exist, or belong to another project, are dropped.",
+    )
+
+
+class ReviewRequest(DerivedFromMixin):
     content: str
     context: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -75,7 +99,7 @@ class PromptReviewRequest(BaseModel):
     context: Optional[str] = None
 
 
-class FullReviewRequest(BaseModel):
+class FullReviewRequest(DerivedFromMixin):
     requirement: Optional[str] = None
     compliance_artifact: Optional[str] = None
     architecture: Optional[str] = None
@@ -94,7 +118,7 @@ class FullReviewRequest(BaseModel):
     include_sensitive_data: bool = False
 
 
-class ReleaseGateRequest(BaseModel):
+class ReleaseGateRequest(DerivedFromMixin):
     review_ids: Optional[List[str]] = None
     findings: Optional[List[Finding]] = None
     project_name: Optional[str] = None
@@ -232,7 +256,7 @@ class TrustBoundary(BaseModel):
     gaps: List[str]
 
 
-class SecurityReviewRequest(BaseModel):
+class SecurityReviewRequest(DerivedFromMixin):
     artifact: str = Field(description="Architecture diagram description, system design doc, or component description")
     system_type: Optional[str] = None
     context: Optional[str] = None
@@ -289,7 +313,7 @@ class ArchitectureAlternative(BaseModel):
     when_to_choose:       Optional[str] = None
 
 
-class ArchitectureReviewRequest(BaseModel):
+class ArchitectureReviewRequest(DerivedFromMixin):
     artifact: str = Field(description="Architecture description, system design doc, or diagram description")
     requirements: Optional[str] = Field(None, description="Functional and non-functional requirements")
     review_mode: Optional[str] = Field("review", description="review | recommend | compare")
@@ -352,6 +376,111 @@ class _UISourceBase(BaseModel):
                     "files were read is always kept, whatever this is set to.",
         examples=[7, 0],
     )
+
+
+# ── Reviewing a design *from the code that implements it* ────────────────────
+#
+# Architecture and Security Review answer one holistic question, so they cannot be chunked
+# the way Code Review and VAPT are — and a repository does not fit in one call. These
+# routes take the same source set anyway and hand it to `services/code_brief`, which
+# computes a structural description (dependency graph, what nothing imports, what each file
+# declares) with no model involved. The agent then reviews that description in one call, so
+# the expensive half costs nothing. `derived_from` is inherited so a code-derived review can
+# still be chained from a requirement review.
+class ArchitectureSourceRequest(_UISourceBase, DerivedFromMixin):
+    requirements: Optional[str] = Field(None, description="Non-functional requirements the "
+                                                          "architecture must satisfy")
+    review_mode: Optional[str] = Field("review", description="review | recommend | compare")
+
+
+class SecuritySourceRequest(_UISourceBase, DerivedFromMixin):
+    system_type: Optional[str] = None
+
+
+class SensitiveDataSourceRequest(_UISourceBase, DerivedFromMixin):
+    """A sensitive-data scan over any source. Fans out over chunks like Code Review, unlike
+    the two design agents above — see `SensitiveDataAgent.scan` for why."""
+
+
+class CodeBriefRequest(_UISourceBase):
+    """Describe a codebase, without reviewing it.
+
+    The structural brief on its own, for screens whose agent is not reading the code but
+    should know what already exists — Code Generation being the case that asked for it:
+    "generate something that fits this repository" needs the stack and shape of the
+    repository in the prompt.
+
+    Deliberately **not** a new field on the codegen request. The brief comes back here, the
+    browser puts it in the `context` box the agent already reads, and the person can see and
+    trim it before spending anything. A run with no repository is then byte-identical to one
+    from before this existed — which matters because there is no codegen eval to catch a
+    prompt regression (D-344).
+    """
+
+
+class DeliverGeneratedCodeRequest(BaseModel):
+    """Push a finished run's generated files to a branch of a GitHub repository.
+
+    Deliberately narrower than `fix_apply`'s delivery: there is no `same_pr`, no way to
+    target an existing branch, and no diff or zip output — the zip already has its own
+    download. See `services/code_delivery` for why the two are not equivalent doors.
+    """
+    github_repo_url: str = Field(
+        ..., description="The repository to write to, e.g. https://github.com/owner/repo")
+    branch: Optional[str] = Field(
+        None, description="Branch to create. Defaults to one named after the run. Must not "
+                          "already exist — a second generation is never committed on top "
+                          "of a first.")
+    base_branch: Optional[str] = Field(
+        None, description="Branch to cut from and, with open_pr, to target. Defaults to the "
+                          "repository's own default branch.")
+    commit_message: Optional[str] = None
+    open_pr: bool = Field(
+        False, description="Also open a pull request from the new branch. The body states "
+                           "whether anything reviewed the code.")
+    pr_title: Optional[str] = None
+    github_token: Optional[str] = Field(
+        None, description="A token for this call only — never stored. Overrides the saved "
+                          "credential and the deployment default.")
+
+
+class MigrationAssessmentSourceRequest(_UISourceBase, DerivedFromMixin):
+    """A migration assessment of a codebase rather than one pasted file.
+
+    Same class of question as an architecture review — the schema returns **one**
+    complexity, one effort estimate and one phased plan — so it gets the structural brief
+    and makes one call, not a fan-out. `MIGRATION_ASSESSMENT_TOOL_SCHEMA` has no per-file
+    dimension to merge on.
+
+    Migration *Execute* deliberately has no twin of this: C-12 / D-01 record it as a
+    single-file translator with no run identity or resume, and Legacy Modernization is the
+    whole-codebase answer.
+    """
+    migration_target: Optional[str] = Field(
+        None, description="What you are migrating to. Required to run; **not** required to "
+                          "get a quote, because pricing the job is how you decide whether "
+                          "to commit to a target at all.",
+        examples=["Struts 1 to Spring Boot 3", ".NET Framework 4.8 to .NET 8"])
+    constraints: Optional[str] = Field(
+        None, description="Scale, timeline, team or compliance constraints")
+
+
+class RegulatedSourceRequest(_UISourceBase, DerivedFromMixin):
+    """A 21 CFR Part 11 verification or GxP validation plan over a repository.
+
+    One model for both because they take the identical input — a file list plus a
+    description of the system — and differ only in what they are asked. The routes stay
+    separate per product all the same: `legacy_guard.product_for_request` maps a *path* to a
+    product, so one path serving two would entitle and meter both as whichever the map
+    named.
+
+    Unlike the design agents these are given the **real files**, not a brief: Part 11 asks
+    whether an audit-trail write exists in the code, and a structural summary cannot answer
+    that. The same 60-file / 120,000-character caps the zip door applies are applied here,
+    so a repository is priced and split exactly as an archive of it would be.
+    """
+    system_description: Optional[str] = Field(
+        None, description="What the system does — calibrates which §11 controls apply")
 
 
 class CodeReviewSourceRequest(_UISourceBase):

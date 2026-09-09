@@ -316,16 +316,42 @@ def sort_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(findings or [], key=key)
 
 
-def apply_path_suppression(findings: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Move findings in test/vendor/generated paths out of the main list.
+def apply_path_suppression(
+    findings: List[Dict[str, Any]],
+    suppression: Any = None,
+    use_evidence_fallback: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Move findings the team has already accepted out of the main list.
 
-    They are returned, not deleted — a hardcoded secret in a test fixture is still worth
-    seeing — but they no longer carry severity into the gate.
+    Two sources, in this order:
+
+    1. **The built-in path rules** — test, fixture, vendored, generated and build output.
+       Always on, and not configurable, because they are about what is not shipped rather
+       than about what a team has decided.
+    2. **The repository's own rules** — `.lmignore` and inline `lm-ignore` comments, if a
+       `suppression.Suppressions` was passed. See `backend/services/suppression.py`; the
+       rule that matters is that these lower the gate and never hide the evidence.
+
+    Nothing is deleted — a hardcoded secret in a test fixture is still worth seeing — but a
+    suppressed finding no longer carries severity into the gate. `suppressed_reason` names
+    which rule did it and where that rule lives, so a reader can go and change it.
+
+    `use_evidence_fallback` is for a **diff** source, where there is no per-file text to
+    scan for inline comments and so a directive can only be read out of the finding's own
+    evidence quote. Off by default: with real file text the precise line match is available
+    and strictly better.
     """
     kept, suppressed = [], []
     for f in findings or []:
+        reason = ""
         if is_suppressed_path(str(f.get("file_path", ""))):
-            f["suppressed_reason"] = "path is test, vendored, generated or build output"
+            reason = "path is test, vendored, generated or build output"
+        elif suppression is not None:
+            reason = suppression.match(f) or ""
+            if not reason and use_evidence_fallback:
+                reason = suppression.match_evidence(f) or ""
+        if reason:
+            f["suppressed_reason"] = reason
             f["is_blocking"] = False
             suppressed.append(f)
         else:
@@ -384,10 +410,57 @@ def apply_baseline(
     }
 
 
+def resolved_since(findings: List[Dict[str, Any]],
+                   previously_open: Dict[str, Dict[str, Any]],
+                   files_read: Optional[set] = None) -> Dict[str, Any]:
+    """What the last review of this code reported and this one does not.
+
+    `apply_baseline` above labels what is *here*. This labels what is *gone*, which is the
+    half that was missing — and without it there is no burn-down, no fix rate and no
+    time-to-remediate, because "still open" and "fixed" were the same absence.
+
+    **Only files this run actually read can be credited.** Without that restriction a
+    narrower review — one file instead of the whole repository — would report every finding
+    in every file it did not open as fixed, which is worse than reporting nothing: it is a
+    false all-clear that looks like progress. `files_read` comes from the coverage record,
+    so a file in a *failed* chunk is correctly not in it. When it is None (a single pasted
+    artifact, where there are no paths to compare) nothing is credited and
+    `scope_limited` says so, rather than guessing.
+
+    A finding with no `file_path` is never credited either: it is about the design rather
+    than a line, so its absence from one run is not evidence anybody changed anything.
+    """
+    still_here = {f.get("fingerprint") for f in (findings or []) if f.get("fingerprint")}
+    resolved, skipped = [], 0
+    for fingerprint, prior in (previously_open or {}).items():
+        if fingerprint in still_here:
+            continue
+        path = prior.get("file_path") or ""
+        if not path:
+            skipped += 1
+            continue
+        if files_read is None or path not in files_read:
+            skipped += 1
+            continue
+        resolved.append({**prior, "fingerprint": fingerprint})
+    resolved.sort(key=lambda r: (-(r.get("severity") or 0), r.get("file_path") or ""))
+    return {
+        "resolved_findings": resolved,
+        "resolved_count": len(resolved),
+        # How many previously-open findings this run could not speak to, because the file
+        # was not read or the finding names no file. Reported rather than hidden: "2 fixed"
+        # means something different when 40 were out of scope.
+        "unverifiable_count": skipped,
+        "scope_limited": files_read is None,
+    }
+
+
 def process(
     findings: List[Dict[str, Any]],
     artifact: str,
     correct_lines: bool = True,
+    suppression: Any = None,
+    verify: bool = True,
 ) -> Dict[str, Any]:
     """Verify, suppress, merge, sort and fingerprint. Returns the trustworthy list plus
     what was removed and why.
@@ -395,9 +468,28 @@ def process(
     Baseline comparison is a separate step (`apply_baseline`) rather than a parameter here,
     because fingerprints only exist once merging has happened — so the caller has to run
     this first, look the fingerprints up, and then apply what it found.
+
+    `verify` exists for a schema whose evidence field is not a verbatim quote. The 21 CFR
+    Part 11 verifier asks for "File path / function / code pattern that shows this gap", and
+    accepts "not applicable / no code available" — descriptions, and describing something
+    accurately is not the same as quoting it. Running a substring check over a description
+    discards a **correct** finding for being phrased exactly as it was asked to be, so the
+    check must be opt-in per agent, not per pipeline (D-344).
+
+    With `verify=False` nothing is discarded and `evidence_verified` is left **absent**
+    rather than set False: False means "we checked and could not confirm it", and claiming
+    that about a finding nobody checked is the same class of untruth as a back-filled file
+    list. Every renderer already treats an absent flag as "no claim either way".
     """
-    verified, discarded = verify_evidence(findings, artifact, correct_lines)
-    kept, suppressed = apply_path_suppression(verified)
+    if verify:
+        verified, discarded = verify_evidence(findings, artifact, correct_lines)
+    else:
+        verified, discarded = list(findings), []
+    # `use_evidence_fallback` because this is the single-haystack path, which is where a
+    # diff arrives: there is no file list to scan for inline directives, so the only place
+    # one can be seen is inside the finding's own quote.
+    kept, suppressed = apply_path_suppression(
+        verified, suppression, use_evidence_fallback=True)
     merged = sort_findings(merge_findings(kept))
     for f in merged:
         f["fingerprint"] = fingerprint(f)
@@ -583,10 +675,31 @@ def process_files(
     findings: List[Dict[str, Any]],
     files: List[Dict[str, Any]],
     correct_lines: bool = True,
+    suppression: Any = None,
+    verify: bool = True,
 ) -> Dict[str, Any]:
-    """`process`, for a multi-file artifact. Same three passes, per-file verification."""
-    verified, discarded = verify_evidence_per_file(findings, files, correct_lines)
-    kept, suppressed = apply_path_suppression(verified)
+    """`process`, for a multi-file artifact. Same three passes, per-file verification.
+
+    `verify` exists for a schema whose evidence field is not a verbatim quote. The 21 CFR
+    Part 11 verifier asks for "File path / function / code pattern that shows this gap", and
+    accepts "not applicable / no code available" — descriptions, and describing something
+    accurately is not the same as quoting it. Running a substring check over a description
+    discards a **correct** finding for being phrased exactly as it was asked to be, so the
+    check must be opt-in per agent, not per pipeline (D-344).
+
+    With `verify=False` nothing is discarded and `evidence_verified` is left **absent**
+    rather than set False: False means "we checked and could not confirm it", and claiming
+    that about a finding nobody checked is the same class of untruth as a back-filled file
+    list. Every renderer already treats an absent flag as "no claim either way".
+    """
+    if verify:
+        verified, discarded = verify_evidence_per_file(findings, files, correct_lines)
+    else:
+        verified, discarded = list(findings), []
+    # No evidence fallback here: the inline directives were scanned out of the real files
+    # with their real line numbers, so the precise match is available and the loose one
+    # would only add false suppressions.
+    kept, suppressed = apply_path_suppression(verified, suppression)
     merged = sort_findings(merge_findings(kept))
     for f in merged:
         f["fingerprint"] = fingerprint(f)

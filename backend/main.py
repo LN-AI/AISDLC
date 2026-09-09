@@ -1,3 +1,4 @@
+import asyncio
 import os
 import io
 import json
@@ -22,6 +23,9 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 from backend import database, config, scope
+# Aliased: `_run_bundle_review` and several review handlers take a parameter named
+# `context` (the free-text hint a user types), so the module cannot be `context` here.
+from backend import context as request_context
 from backend.workflows import full_review as full_review_workflow
 from backend.workflows.base import count_steps
 from backend.routes.auth import router as auth_router
@@ -30,10 +34,12 @@ from backend.routes.audit_trail import router as audit_router
 from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
 from backend.routes.findings import router as findings_router
+from backend.routes.notifications import router as notifications_router
 from backend.routes.github_credentials import router as github_credentials_router
 from backend.routes.github_webhook import router as github_webhook_router
 from backend.routes.modernization import router as modernization_router
 from backend.routes.v1_agents import router as v1_agents_router
+from backend.routes.frameworks import router as frameworks_router
 from backend.routes.api_keys import router as api_keys_router
 from backend.routes.plans import router as plans_router
 from backend.routes.products import router as products_router
@@ -59,6 +65,13 @@ from backend.models.schemas import (
     ArchitectureReviewRequest,
     CodeReviewSourceRequest,
     VAPTSourceRequest,
+    ArchitectureSourceRequest,
+    SecuritySourceRequest,
+    SensitiveDataSourceRequest,
+    MigrationAssessmentSourceRequest,
+    RegulatedSourceRequest,
+    DeliverGeneratedCodeRequest,
+    CodeBriefRequest,
 )
 from backend.models.api_models import (
     AIProvenanceRequest,
@@ -77,8 +90,11 @@ from backend.models.api_models import (
 )
 from backend.services.orchestrator import SDLCOrchestrator
 from backend.services import job_service
+from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
+from backend.services import code_brief
+from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
                               review_source_store, source_bundle)
 from backend.services.subject_service import resolve_subject
@@ -105,6 +121,12 @@ def _init_default_admin():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up - env=%s model=%s", config.APP_ENV, config.MODEL)
+    # Before anything else, and deliberately fatal: a production deployment must not run on
+    # the shipped default SECRET_KEY or admin password. Raising here rather than warning
+    # because a warning in a startup log is a warning nobody reads — and on the default
+    # SECRET_KEY every stored credential in the database is decryptable by anyone with a
+    # copy of this repository. No-ops unless APP_ENV=production.
+    config.assert_production_secrets()
     database.init_db()
     # Background jobs live in this process only, so anything still marked running
     # belongs to a process that no longer exists. Without this they stay 'running'
@@ -131,6 +153,22 @@ async def lifespan(app: FastAPI):
         # Never allowed to stop the app coming up. A missed sweep is a stale row; a failed
         # startup is an outage.
         logger.exception("Startup housekeeping failed — continuing")
+    # A third sweep, for the same missing scheduler. A notification is written as a row
+    # inside the review's own transaction and then attempted on a thread, so anything the
+    # last process was holding when it stopped is still `pending`. This is where it gets
+    # picked up — on a thread, so a slow chat service cannot delay the app coming up.
+    # Also retried whenever somebody reads the delivery log.
+    try:
+        # Put anything left mid-flight back in the queue first. A `sending` row belongs to
+        # a process that no longer exists, exactly like the job rows above.
+        stranded = notify.recover_sending()
+        if stranded:
+            logger.info("Notifications: %d delivery(ies) were mid-flight at shutdown and "
+                        "are queued again", stranded)
+        notify.kick()
+    except Exception:
+        logger.exception("Could not start the notification dispatcher — pending "
+                         "deliveries wait for the next read of the delivery log")
     knowledge_base.load()  # preload all docs/ markdown files into memory
     logger.info("Startup complete")
     yield
@@ -146,7 +184,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Not "*" — see config.CORS_ALLOW_ORIGINS for why a wildcard here was a real hole
+    # rather than a convenience. Empty by default: the bundled SPA is same-origin.
+    allow_origins=config.CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -159,6 +199,7 @@ app.add_middleware(
     expose_headers=[
         "X-Spend-Cost-USD", "X-Spend-Calls", "X-Spend-Tokens-In", "X-Spend-Tokens-Out",
         "X-Spend-Model", "X-Spend-Provider", "X-Spend-Billable", "X-Spend-Cost-Estimated",
+        "X-Project-Warning",
         "X-RateLimit-Limit-Minute", "X-RateLimit-Remaining-Minute",
         "X-RateLimit-Limit-Day", "X-RateLimit-Remaining-Day",
     ],
@@ -274,12 +315,14 @@ app.include_router(agents_router)
 app.include_router(inventory_router)
 app.include_router(v1_agents_router)
 app.include_router(findings_router)
+app.include_router(notifications_router)
 app.include_router(github_credentials_router)
 app.include_router(github_webhook_router)
 app.include_router(modernization_router)
 app.include_router(api_keys_router)
 app.include_router(plans_router)
 app.include_router(products_router)
+app.include_router(frameworks_router)
 app.include_router(usage_router)
 app.include_router(swarm_router)
 app.include_router(llm_config_router)
@@ -463,6 +506,99 @@ def _retention_note(req, bundle) -> dict:
     }
 
 
+def _run_sensitive_bundle(bundle, project_name: str, context: str) -> dict:
+    """Shared body for a sensitive-data scan over a bundle.
+
+    Separate from `_run_bundle_review` rather than folded into it: that one attaches
+    `suppression` and the deterministic dependency findings and routes through
+    `review_code`/`review_vapt`'s argument shape. This agent takes the secret findings
+    (which are exactly its subject) but has no use for a dependency scan.
+    """
+    _require_llm()
+    parts = [f"Source: {bundle.source_type} — {bundle.label}"]
+    if bundle.untrusted_label:
+        parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if context:
+        parts.append(context)
+    if len(bundle.files) > 1:
+        parts.append(
+            f"This scan covers {len(bundle.files)} file(s) from one codebase. Each part "
+            f"lists the files it contains; do not assert that data is handled safely "
+            f"elsewhere when the file that would show it was not shown to you.")
+    single = len(bundle.files) == 1 and not bundle.files[0].get("path")
+    deterministic = source_bundle.deterministic_findings(bundle)
+    return orchestrator.scan_sensitive_data(
+        content=(bundle.files[0].get("content") or "") if single else "",
+        files=None if single else bundle.files,
+        context="\n".join(parts),
+        project_name=project_name or bundle.label[:60] or "Unnamed Project",
+        coverage_incomplete=bundle.truncated,
+        coverage_reason=bundle.truncation_reason,
+        # The credentials the ingest scanner already matched, for free, before any model
+        # ran. This agent's own subject matter, so they are merged in rather than reported
+        # beside the result: they get verification, de-duplication, a fingerprint and a
+        # vote in the gate like everything else.
+        extra_findings=None if single else deterministic["findings"],
+        suppression=None if single else bundle.suppression,
+        source=bundle.summary(),
+    )
+
+
+def _preflight_design(req, request: Request, agent: str) -> dict:
+    """Quote a design review of a codebase. Free — neither the brief nor the quote calls a
+    model.
+
+    Priced from the **brief**, not the bundle, because that is what the agent is actually
+    sent: `for_bundle` would chunk three megabytes of source and quote twenty calls for a
+    run that makes one. Quoting the wrong artifact is worse than not quoting — a quote is
+    believed.
+
+    The coverage statement travels with the price, which is the point of doing this for
+    free: "only 12 of your 400 files can be parsed for dependencies" is worth knowing
+    *before* deciding to spend, not after reading a thin review.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Preflight source resolution failed for %s", agent)
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+
+    brief = code_brief.build(bundle)
+    quote = review_estimate.for_text(brief["markdown"], agent=agent)
+    subject = _ui_subject(request)
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": agent,
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (
+            None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
+        "code_brief": {k: brief[k] for k in ("coverage", "coverage_note", "stats", "files")},
+        "files_preview": _files_preview(bundle),
+        "skipped_all": bundle.skipped[:400],
+        # No retention block: a design review stores no source. It is not one of the two
+        # products with an inventory (`AGENT_SCREENS[...].inventory`), and offering a
+        # retention choice that nothing honours would be a promise about data handling that
+        # no code keeps.
+    }
+
+
+@app.post("/api/review/architecture/preflight")
+def preflight_architecture_ui(req: ArchitectureSourceRequest, request: Request):
+    return _preflight_design(req, request, "architecture")
+
+
+@app.post("/api/review/security/preflight")
+def preflight_security_ui(req: SecuritySourceRequest, request: Request):
+    return _preflight_design(req, request, "security")
+
+
 @app.post("/api/review/code/preflight")
 def preflight_code_ui(req: CodeReviewSourceRequest, request: Request):
     return _preflight(req, request, "code")
@@ -502,6 +638,10 @@ def _run_bundle_review(bundle, agent: str, project_name: str, context: str = "",
     deterministic = source_bundle.deterministic_findings(bundle)
     args["extra_findings"] = deterministic["findings"]
     args["source"] = {**args["source"], "dependency": deterministic["dependency"]}
+    # What the repository itself says not to gate on. Passed even when empty, so the agent
+    # can report "checked, no rules" rather than leaving a reader unable to tell that from
+    # "never looked".
+    args["suppression"] = bundle.suppression
     single = len(bundle.files) == 1 and not bundle.files[0].get("path")
     if single:
         text = bundle.files[0].get("content") or ""
@@ -510,14 +650,18 @@ def _run_bundle_review(bundle, agent: str, project_name: str, context: str = "",
     else:
         args["files"] = bundle.files
 
-    if agent == "vapt":
-        if single:
-            args["artifact"] = text
-        result = orchestrator.review_vapt(scope=scope, **args)
-    else:
-        if single:
-            args["code"] = text
-        result = orchestrator.review_code(language=language, **args)
+    # Which repository this review is about, published for `save_review` to store. Opened
+    # around the agent call rather than at the route, because this is the one function both
+    # Code Review and VAPT go through and the bundle is already in hand here.
+    with request_context.bind_source(bundle.source_ref()):
+        if agent == "vapt":
+            if single:
+                args["artifact"] = text
+            result = orchestrator.review_vapt(scope=scope, **args)
+        else:
+            if single:
+                args["code"] = text
+            result = orchestrator.review_code(language=language, **args)
 
     # Recorded here rather than inside the orchestrator for two reasons: `review_id` does not
     # exist until the result is saved, and the retention choice belongs to the surface the
@@ -880,9 +1024,41 @@ async def review_job_status(job_id: str, reader: dict = Depends(require_reader))
 
 # ── Dashboard ──────────────────────────────────────────────────────────────
 
+@app.get("/api/repositories", summary="Every repository this caller has reviewed, worst first")
+async def list_repositories(request: Request, limit: int = Query(100, ge=1, le=500),
+                            reader: dict = Depends(require_reader)):
+    """What no screen could ask before: how is each of our repositories doing.
+
+    `reviews` gained a repository dimension, so this is a query rather than a subsystem —
+    runs, last reviewed, the latest gate, open Critical and High, and what the repository
+    has cost. Reviews with no repository (a paste, a zip upload) are absent by design
+    rather than grouped under a blank name.
+    """
+    return {"repositories": database.list_repositories(
+        project_ids=_visible_project_ids(reader, request), limit=limit)}
+
+
 @app.get("/api/dashboard")
 async def get_dashboard(request: Request, reader: dict = Depends(require_reader)):
     return database.get_dashboard_stats(project_ids=_visible_project_ids(reader, request))
+
+
+@app.get("/api/dashboard/trend", summary="New vs resolved findings, and gate mix, per week")
+async def get_dashboard_trend(request: Request, weeks: int = Query(8, ge=1, le=52),
+                              reader: dict = Depends(require_reader)):
+    """Whether this is getting better, which six lifetime totals cannot say.
+
+    "44 open" reads the same in a month where thirty were fixed and one where thirty were
+    introduced. `findings` and `gates` are separate series on purpose: one Red release can
+    carry forty findings and forty Green ones carry none, so the two answer different
+    questions and averaging them would answer neither.
+    """
+    visible = _visible_project_ids(reader, request)
+    return {
+        "findings": database.get_findings_trend(project_ids=visible, weeks=weeks),
+        "gates": database.get_gate_trend(project_ids=visible, weeks=weeks),
+        "weeks": weeks,
+    }
 
 
 @app.get("/api/reviews")
@@ -1034,7 +1210,106 @@ async def fix_run(review_id: str, req: FixRequest, request: Request,
         _FIX_ZIPS[token] = (blob, review_id)
         result["download_url"] = f"/api/reviews/{review_id}/fix/download/{token}"
         result["download_bytes"] = len(blob)
+
+    # A preview holds the patched file contents server-side and hands back a token.
+    #
+    # They must not travel to the browser and back: a client that could post file contents
+    # to the delivery route would be able to commit anything it liked to the customer's
+    # repository under a fix's name. The token is the only thing that crosses, and the
+    # contents it names never leave this process.
+    if result.pop("preview", False):
+        token = uuid.uuid4().hex
+        _hold_pending_fix(token, review_id, result)
+        result["deliver_token"] = token
+        # The diff and the per-file explanations stay in the response — that is what there
+        # is to read. `patches` and `before` are the raw contents and are stripped.
+        result.pop("patches", None)
+        result.pop("before", None)
     return result
+
+
+# One generated-but-undelivered patch per token. Same shape and same reasoning as
+# `_FIX_ZIPS` below: in memory rather than on disk because it is a copy of the customer's
+# patched source, single use because a token that keeps working is a token that ends up in
+# a chat log, and capped because a long-lived process must not accumulate patches nobody
+# came back for. Losing one to a restart costs a re-run of the generation step, which is
+# the same trade already accepted for the archive.
+_FIX_PENDING: dict = {}
+_MAX_PENDING_FIXES = 8
+
+
+def _hold_pending_fix(token: str, review_id: str, result: dict) -> None:
+    while len(_FIX_PENDING) >= _MAX_PENDING_FIXES:
+        _FIX_PENDING.pop(next(iter(_FIX_PENDING)), None)
+    _FIX_PENDING[token] = {
+        "review_id": review_id,
+        "patches": result.get("patches") or [],
+        "before": result.get("before") or {},
+        "diff": result.get("diff") or "",
+        "blocked_patches": result.get("blocked_patches") or [],
+        "files_patched": result.get("files_patched") or [],
+        "unfixed_finding_titles": result.get("unfixed_finding_titles") or [],
+        "fixed_finding_titles": result.get("fixed_finding_titles") or [],
+        "commit_message": result.get("commit_message") or "",
+        "pr_title": result.get("pr_title") or "",
+        "pr_description": result.get("pr_description") or "",
+        "reviewed_by": result.get("reviewed_by") or "",
+        "verification_note": result.get("verification_note") or "",
+        "carried_over_criticals": result.get("carried_over_criticals") or [],
+        "unreadable_files": result.get("unreadable_files") or [],
+    }
+
+
+class FixDeliverRequest(BaseModel):
+    deliver_token: str = Field(..., description="The token the preview returned.")
+    output: str = Field(..., description="Where the patch should go: "
+                                        "pr | same_pr | branch | zip | diff")
+
+
+@app.post("/api/reviews/{review_id}/fix/deliver",
+          summary="Deliver a patch that was generated and previewed")
+async def fix_deliver(review_id: str, req: FixDeliverRequest, request: Request,
+                      reader: dict = Depends(require_reader)):
+    """Put a previewed patch where the person who read it chose.
+
+    **Calls no model.** That is the whole point of splitting this from `POST .../fix`: the
+    diff somebody approved is the diff that ships. Re-generating to change the destination
+    would pay for the same work twice and could produce a *different* patch the second
+    time, so the approval would refer to something that no longer exists.
+
+    Still entitlement-checked against `auto-fix` (D-307), because this is the step that
+    writes to a real repository — no model call does not mean no governance. `preflight`
+    rather than `guarded_call`: there is nothing to meter, and a zero-cost ledger row for
+    every delivery would make the usage export harder to read, not easier.
+    """
+    review = _review_in_scope(review_id, request, reader)
+    caller, rejection = legacy_guard.resolve_caller(request.headers)
+    if rejection is not None:
+        return rejection
+    caller["_subject"] = subject_service.resolve_subject(caller, request.headers)
+    try:
+        agent_guard.preflight(caller, "auto-fix")
+    except agent_guard.ScopeDeniedError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    held = _FIX_PENDING.pop(req.deliver_token, None)
+    if not held or held.get("review_id") != review_id:
+        raise HTTPException(
+            status_code=404,
+            detail="That patch has already been delivered, belongs to another review, or "
+                   "was generated before the server restarted. Generate it again — the "
+                   "quote and the diff both come back before anything is written.")
+    try:
+        return fix_apply.deliver(orchestrator, review_id, held, req.output,
+                                 project_id=review.get("project_id"))
+    except fix_apply.FixError as exc:
+        # Put it back: a refused delivery has spent nothing and the patch is still good,
+        # so the person can choose a different destination rather than pay to regenerate.
+        _FIX_PENDING[req.deliver_token] = held
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Fix delivery failed for review %s", review_id)
+        raise HTTPException(status_code=502, detail=f"Could not deliver the patch: {exc}")
 
 
 # One pending archive per download, keyed by a single-use token. Capped so a long-lived
@@ -1154,6 +1429,11 @@ async def get_review(review_id: str, request: Request, reader: dict = Depends(re
     # for a run that predates the link: "$0.00" would be a claim about a run whose cost
     # nobody recorded. See `database.get_review_spend`.
     review["spend"] = database.get_review_spend([review_id]).get(review_id)
+    # Enough about each parent to render it as a link to the screen that owns it rather
+    # than as an eight-character id nobody can act on. A parent that has since been deleted
+    # is simply absent here; the id stays in `derived_from`, because what this run was built
+    # from does not stop being true when the source is removed.
+    review["derived_from_detail"] = database.get_review_parents(review.get("derived_from") or [])
     return review
 
 
@@ -1195,7 +1475,7 @@ async def get_report(report_id: str, request: Request, reader: dict = Depends(re
 # ── Requirement Review ─────────────────────────────────────────────────────
 
 @app.post("/api/review/requirement")
-async def review_requirement(req: ReviewRequest, project_name: str = ""):
+def review_requirement(req: ReviewRequest, project_name: str = ""):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
@@ -1219,11 +1499,12 @@ async def review_requirement_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     try:
-        result = orchestrator.review_requirement(
+        result = await asyncio.to_thread(
+            orchestrator.review_requirement,
             content=text,
             context=context,
             project_name=project_name or file.filename,
@@ -1238,7 +1519,7 @@ async def review_requirement_file(
 # ── Code Review ────────────────────────────────────────────────────────────
 
 @app.post("/api/review/code")
-async def review_code(req: CodeReviewRequest, project_name: str = ""):
+def review_code(req: CodeReviewRequest, project_name: str = ""):
     if not req.code.strip():
         raise HTTPException(status_code=400, detail="Code is required")
     _require_llm()
@@ -1260,7 +1541,7 @@ async def review_code(req: CodeReviewRequest, project_name: str = ""):
 # ── Prompt Safety Review ───────────────────────────────────────────────────
 
 @app.post("/api/review/prompt")
-async def review_prompt(req: PromptReviewRequest, project_name: str = ""):
+def review_prompt(req: PromptReviewRequest, project_name: str = ""):
     if not any([req.system_prompt, req.user_prompt, req.tool_definitions, req.rag_config]):
         raise HTTPException(status_code=400, detail="At least one prompt field is required")
     _require_llm()
@@ -1326,7 +1607,15 @@ async def full_review(req: FullReviewRequest, request: Request):
         agent_guard.preflight(caller["_subject"], "full")
 
     def _run(on_progress):
-        with agent_guard.expect_calls(total_steps):
+        # Bound here rather than at the boundary, unlike every other browser route. This
+        # one is a 202 job and so is deliberately absent from `legacy_guard`'s product map
+        # (the work happens after the response is sent), which means the middleware that
+        # normally reads `derived_from` off the request body never sees this call. Bound
+        # *inside* `_run` because the body runs on a background thread that does not
+        # inherit the request's context -- the same reason `caller["_subject"]` is stashed
+        # above rather than resolved here.
+        with request_context.bind_derived_from(req.derived_from), \
+                agent_guard.expect_calls(total_steps):
             return agent_guard.guarded_call(
                 caller, "full", None, skip_preflight=True,
                 project_name=req.project_name or "Unnamed Project",
@@ -1363,7 +1652,7 @@ async def full_review_job_status(job_id: str, reader: dict = Depends(require_rea
 # ── GitHub PR Review ───────────────────────────────────────────────────────
 
 @app.post("/api/github/pr")
-async def review_github_pr(req: GithubPRRequest):
+def review_github_pr(req: GithubPRRequest):
     if not req.pr_url:
         raise HTTPException(status_code=400, detail="PR URL is required")
     _require_llm()
@@ -1453,7 +1742,7 @@ async def review_github_pr_async(req: GithubPRRequest, request: Request):
 
 
 @app.post("/api/github/pr/auto-fix")
-async def auto_fix_github_pr(req: GithubAutoFixRequest):
+def auto_fix_github_pr(req: GithubAutoFixRequest):
     if not req.pr_url:
         raise HTTPException(status_code=400, detail="PR URL is required")
     if not config.GITHUB_TOKEN:
@@ -1477,7 +1766,7 @@ async def auto_fix_github_pr(req: GithubAutoFixRequest):
 # ── Release Gate ───────────────────────────────────────────────────────────
 
 @app.post("/api/release-gate")
-async def release_gate(req: ReleaseGateRequest):
+def release_gate(req: ReleaseGateRequest):
     _require_llm()
 
     # Routed through the workflow rather than calling `gate_agent` inline. The inline
@@ -1503,7 +1792,7 @@ async def release_gate(req: ReleaseGateRequest):
 # ── Architecture Review ────────────────────────────────────────────────────
 
 @app.post("/api/review/architecture")
-async def review_architecture(req: ArchitectureReviewRequest):
+def review_architecture(req: ArchitectureReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Architecture description is required")
     _require_llm()
@@ -1524,6 +1813,187 @@ async def review_architecture(req: ArchitectureReviewRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+def _brief_for(bundle, agent: str):
+    """A codebase turned into something a single-call design review can actually read.
+
+    Free — `code_brief.build` calls no model. Refused rather than silently reviewed when the
+    input holds no source it can parse at all: an architecture review of an empty inventory
+    would return a confident verdict about nothing, which is the degenerate result `attest`
+    exists to stop reaching a screen.
+    """
+    brief = code_brief.build(bundle)
+    if not brief["markdown"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input, so there is nothing "
+                   "to describe. Check the repository, branch or archive.")
+    return brief
+
+
+def _brief_context(bundle, brief, context: str) -> str:
+    """What the agent is told about where this description came from and how solid it is."""
+    parts = [f"Source: {bundle.source_type} — {bundle.label}",
+             "The description below was computed from the source, not written by a person.",
+             brief["coverage_note"]]
+    if bundle.untrusted_label:
+        parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if bundle.truncated:
+        parts.append(f"The source itself was truncated before analysis: "
+                     f"{bundle.truncation_reason}")
+    if context:
+        parts.append(context)
+    return "\n".join(parts)
+
+
+def _design_review_from_source(bundle, agent: str, req) -> dict:
+    """Shared body for the three single-call agents that read a whole codebase.
+
+    Architecture Review, Security Review and Migration Assessment are the same shape of
+    question: each returns **one** verdict about the system as a whole, so none of them can
+    be fanned out over chunks and merged. `MIGRATION_ASSESSMENT_TOOL_SCHEMA` has one
+    `complexity` and one `estimated_effort` the way `ARCHITECTURE_TOOL_SCHEMA` has one
+    `quality_scores` — twenty partial answers have no merge rule. All three therefore get
+    the computed structural description and make a single call.
+    """
+    _require_llm()
+    brief = _brief_for(bundle, agent)
+    ctx = _brief_context(bundle, brief, req.context or "")
+    project = req.project_name or bundle.label[:60] or "Unnamed Project"
+    if agent == "migration-assessment":
+        target = (getattr(req, "migration_target", "") or "").strip()
+        if not target:
+            raise HTTPException(
+                status_code=400,
+                detail="A migration target is required — 'assess this codebase' has no "
+                       "answer without saying what it is being moved to.")
+        result = orchestrator.assess_migration(
+            source=brief["markdown"], migration_target=target,
+            constraints=getattr(req, "constraints", "") or "",
+            context=ctx, project_name=project)
+    elif agent == "architecture":
+        mode = req.review_mode or "review"
+        if mode not in ("review", "recommend", "compare"):
+            raise HTTPException(status_code=400,
+                                detail="review_mode must be: review | recommend | compare")
+        result = orchestrator.review_architecture(
+            artifact=brief["markdown"], requirements=req.requirements or "",
+            review_mode=mode, context=ctx, project_name=project)
+    else:
+        result = orchestrator.review_security(
+            artifact=brief["markdown"], system_type=req.system_type or "",
+            context=ctx, project_name=project)
+    # The same coverage facts the prompt was given, returned so the screen prints the
+    # identical sentence. Two accounts of how much was read would be one too many.
+    result["source"] = bundle.summary()
+    result["code_brief"] = {k: brief[k] for k in ("coverage", "coverage_note", "stats", "files")}
+    return result
+
+
+@app.post("/api/review/architecture/source")
+def review_architecture_source(req: ArchitectureSourceRequest, request: Request):
+    """Architecture review of a codebase — zip, repository at a ref, PR, or branch compare.
+
+    Not a chunked review. See `services/code_brief` for why a holistic question cannot be
+    fanned out over chunks, and what is sent instead.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _design_review_from_source(bundle, "architecture", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/security/source")
+def review_security_source(req: SecuritySourceRequest, request: Request):
+    """Security review (STRIDE) of a codebase. See `/api/review/architecture/source`."""
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _design_review_from_source(bundle, "security", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+class _FormReq:
+    """The attribute bag `_design_review_from_source` reads, for the multipart doors.
+
+    A plain object rather than a Pydantic model because the fields arrive as `Form(...)`
+    parameters, already validated by FastAPI — building a model here would only re-validate
+    strings that are already strings.
+    """
+
+    def __init__(self, **kw):
+        self.project_name = kw.get("project_name", "")
+        self.context = kw.get("context", "")
+        self.requirements = kw.get("requirements", "")
+        self.review_mode = kw.get("review_mode", "review")
+        self.system_type = kw.get("system_type", "")
+        self.migration_target = kw.get("migration_target", "")
+        self.constraints = kw.get("constraints", "")
+
+
+# Two upload endpoints rather than one taking an `agent` form field, even though the bodies
+# are identical. `legacy_guard.product_for_request` maps a *path* to a product, so one path
+# serving two products would meter and entitle both as whichever the map named — a customer
+# entitled to Architecture Review could reach the security agent through it.
+@app.post("/api/review/architecture/upload-zip")
+async def review_architecture_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    requirements: str = Form(""),
+    review_mode: str = Form("review"),
+    context: str = Form(""),
+):
+    """Architecture review of an uploaded codebase. A zip travels as multipart, and the
+    JSON route cannot take one (D-234), so this is the archive door for the same review."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    req = _FormReq(project_name=project_name, context=context,
+                   requirements=requirements, review_mode=review_mode)
+    try:
+        return await asyncio.to_thread(_design_review_from_source, bundle, "architecture", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/security/upload-zip")
+async def review_security_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    system_type: str = Form(""),
+    context: str = Form(""),
+):
+    """Security review (STRIDE) of an uploaded codebase. See the architecture twin above."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    req = _FormReq(project_name=project_name, context=context, system_type=system_type)
+    try:
+        return await asyncio.to_thread(_design_review_from_source, bundle, "security", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
 @app.post("/api/review/architecture/upload")
 async def review_architecture_file(
     file: UploadFile = File(...),
@@ -1533,12 +2003,13 @@ async def review_architecture_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.review_architecture(
+        result = await asyncio.to_thread(
+            orchestrator.review_architecture,
             artifact=text,
             requirements=requirements,
             review_mode=review_mode or "review",
@@ -1555,7 +2026,7 @@ async def review_architecture_file(
 # ── VAPT ──────────────────────────────────────────────────────────────────
 
 @app.post("/api/review/vapt")
-async def review_vapt(req: VAPTReviewRequest):
+def review_vapt(req: VAPTReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Artifact content is required")
     _require_llm()
@@ -1581,12 +2052,13 @@ async def review_vapt_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.review_vapt(
+        result = await asyncio.to_thread(
+            orchestrator.review_vapt,
             artifact=text,
             scope=scope,
             context=context,
@@ -1602,7 +2074,7 @@ async def review_vapt_file(
 # ── Security Review ────────────────────────────────────────────────────────
 
 @app.post("/api/review/security")
-async def review_security(req: SecurityReviewRequest):
+def review_security(req: SecurityReviewRequest):
     if not req.artifact.strip():
         raise HTTPException(status_code=400, detail="Artifact content is required")
     _require_llm()
@@ -1628,12 +2100,13 @@ async def review_security_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.review_security(
+        result = await asyncio.to_thread(
+            orchestrator.review_security,
             artifact=text,
             system_type=system_type,
             context=context,
@@ -1648,8 +2121,40 @@ async def review_security_file(
 
 # ── Code Generation ─────────────────────────────────────────────────────────
 
+@app.post("/api/code-brief")
+def build_code_brief(req: CodeBriefRequest, request: Request,
+                     reader: dict = Depends(require_reader)):
+    """A structural description of a codebase. **Free — calls no model.**
+
+    The same computation the design agents are given, handed back on its own so a screen
+    whose agent is *not* reading the code can still tell it what exists. Code Generation is
+    the case: "build something that fits this repository" is a different request from
+    "build this from scratch", and the difference is entirely in what the prompt knows.
+
+    Unmetered and mapped to no product, for the reason the `/preflight` routes are:
+    it spends nothing, and refusing to describe a repository to somebody near their cap
+    tells them less than the description would.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Code brief source resolution failed")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    brief = _brief_for(bundle, "code-brief")
+    return {
+        "source": bundle.summary(),
+        "markdown": brief["markdown"],
+        "coverage": brief["coverage"],
+        "coverage_note": brief["coverage_note"],
+        "stats": brief["stats"],
+    }
+
+
 @app.post("/api/codegen/advisory")
-async def codegen_advisory(req: CodeGenAdvisoryRequest):
+def codegen_advisory(req: CodeGenAdvisoryRequest):
     if not req.requirement.strip():
         raise HTTPException(status_code=400, detail="Requirement is required")
     _require_llm()
@@ -1676,7 +2181,7 @@ async def codegen_advisory(req: CodeGenAdvisoryRequest):
 
 
 @app.post("/api/codegen/scaffold")
-async def codegen_scaffold(req: CodeGenScaffoldRequest):
+def codegen_scaffold(req: CodeGenScaffoldRequest):
     _require_llm()
     try:
         result = orchestrator.generate_codegen_scaffold(
@@ -1730,10 +2235,82 @@ async def codegen_scaffold_download(review_id: str, request: Request,
     )
 
 
+_DELIVERABLE_RUNS = {
+    "codegen_scaffold": {"prefix": "lm-scaffold", "what": "generated starter project"},
+    "migration_execute": {"prefix": "lm-migration", "what": "migrated code"},
+}
+
+
+@app.post("/api/reviews/{review_id}/deliver-code")
+async def deliver_generated_code(review_id: str, req: DeliverGeneratedCodeRequest,
+                                 request: Request, reader: dict = Depends(require_reader)):
+    """Commit a finished run's generated files to a new branch, optionally opening a PR.
+
+    Until this existed, "generate the code for this requirement" ended at a zip somebody had
+    to unpack and copy in by hand, which is most of the value of generating it.
+
+    Scoped exactly like the zip download beside it: generated source is a review, and a
+    credential alone must not reach another project's. Makes **no model call** — the files
+    were produced and stored when the run happened — so nothing is metered here. It is
+    audited, before the write, by `code_delivery.deliver`.
+    """
+    review = database.get_review(review_id)
+    if not review or review.get("review_type") not in _DELIVERABLE_RUNS:
+        raise HTTPException(status_code=404, detail="No deliverable run with that id")
+    visible = _visible_project_ids(reader, request)
+    if visible is not None and review.get("project_id") not in visible:
+        raise HTTPException(status_code=404, detail="No deliverable run with that id")
+
+    spec = _DELIVERABLE_RUNS[review["review_type"]]
+    result = review.get("result") or {}
+    files = result.get("files") or []
+
+    # What checked this code, said plainly, because it goes into the pull request body and
+    # the person merging it is entitled to know before they read a line. A run without
+    # `auto_review` has had nothing look at it at all.
+    gov = result.get("governance_review") or {}
+    if gov:
+        reviewed = (f"Reviewed by the platform's Code Review and Sensitive Data agents — "
+                    f"gate {gov.get('gate_status', 'Unknown')}, "
+                    f"{len(gov.get('findings') or [])} finding(s).")
+    else:
+        reviewed = ("NOT reviewed. This run was produced without the pre-release check, so "
+                    "no agent has read this code.")
+
+    branch = (req.branch or "").strip() or code_delivery.branch_name(spec["prefix"], review_id)
+    project = str(result.get("project_name") or review.get("project_name") or "").strip()
+    message = (req.commit_message or "").strip() or (
+        f"Add {spec['what']}" + (f" for {project}" if project else ""))
+    try:
+        return await asyncio.to_thread(
+            code_delivery.deliver,
+            files, req.github_repo_url,
+            project_id=review.get("project_id"),
+            branch=branch,
+            base_branch=req.base_branch or "",
+            commit_message=message,
+            open_pr=bool(req.open_pr),
+            pr_title=(req.pr_title or "").strip() or message,
+            pr_body=code_delivery.pr_body_for(
+                review["review_type"], review_id, reviewed,
+                result.get("summary") or result.get("migration_summary") or ""),
+            token=(req.github_token or "").strip(),
+            review_id=review_id,
+            review_type=review["review_type"],
+            actor=str(reader.get("username") or reader.get("sub") or "system"),
+        )
+    except code_delivery.DeliveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as e:
+        logger.exception("Could not deliver generated code for %s", review_id)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
 # ── AI Code Provenance & Risk ────────────────────────────────────────────────
 
 @app.post("/api/review/ai-provenance")
-async def review_ai_provenance(req: AIProvenanceRequest):
+def review_ai_provenance(req: AIProvenanceRequest):
     if not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Code is required")
     _require_llm()
@@ -1763,7 +2340,7 @@ async def review_ai_provenance(req: AIProvenanceRequest):
 # ── Code Migration ─────────────────────────────────────────────────────────
 
 @app.post("/api/review/migration-assessment")
-async def review_migration_assessment(req: MigrationAssessmentRequest):
+def review_migration_assessment(req: MigrationAssessmentRequest):
     if not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Code is required")
     if not req.migration_target.strip():
@@ -1784,8 +2361,65 @@ async def review_migration_assessment(req: MigrationAssessmentRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/migration-assessment/source")
+def review_migration_assessment_source(req: MigrationAssessmentSourceRequest, request: Request):
+    """Assess a migration from the codebase rather than from one pasted file.
+
+    Reuses the architecture path wholesale: one holistic question, so a computed structural
+    description and a single call. The **language caveat matters more here than anywhere
+    else** — migration assessment is most wanted for the oldest stacks, and `code_brief`
+    only builds real dependency edges for Python, PHP, Java/Kotlin/Scala, C#/VB.NET and
+    Delphi/Pascal. A COBOL or RPG codebase degrades to an annotated file listing, and the
+    brief's own coverage note says so in the prompt and on the screen.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _design_review_from_source(bundle, "migration-assessment", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/migration-assessment/upload-zip")
+async def review_migration_assessment_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    migration_target: str = Form(""),
+    constraints: str = Form(""),
+    context: str = Form(""),
+):
+    """The archive door for the assessment above — a zip cannot travel on a JSON route."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    req = _FormReq(project_name=project_name, context=context,
+                   migration_target=migration_target, constraints=constraints)
+    try:
+        return await asyncio.to_thread(
+            _design_review_from_source, bundle, "migration-assessment", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/migration-assessment/preflight")
+def preflight_migration_assessment(req: MigrationAssessmentSourceRequest, request: Request):
+    """What assessing this codebase will cost. Free — neither the brief nor the quote calls
+    a model. Deliberately does not require `migration_target`: someone sizing the job before
+    committing to a target should not have to invent one to get a price."""
+    return _preflight_design(req, request, "migration-assessment")
+
+
 @app.post("/api/review/migration-execute")
-async def review_migration_execute(req: MigrationExecutionRequest):
+def review_migration_execute(req: MigrationExecutionRequest):
     if not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Code is required")
     if not req.migration_target.strip():
@@ -1822,36 +2456,153 @@ _CFR21_MAX_FILES = 60
 _CFR21_MAX_TOTAL_CHARS = 120_000
 
 
-def _extract_zip_files(content: bytes) -> list:
-    files = []
-    total_chars = 0
-    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            path = info.filename.replace("\\", "/")
-            if any(f"/{d}/" in f"/{path}" for d in _CFR21_EXCLUDED_DIRS):
-                continue
-            ext = os.path.splitext(path)[1].lower()
-            if ext not in _CFR21_ALLOWED_EXTENSIONS:
-                continue
-            if len(files) >= _CFR21_MAX_FILES or total_chars >= _CFR21_MAX_TOTAL_CHARS:
-                break
-            try:
-                text = zf.read(info).decode("utf-8", errors="ignore")
-            except Exception:
-                continue
-            if not text.strip():
-                continue
-            remaining = _CFR21_MAX_TOTAL_CHARS - total_chars
-            text = text[:remaining]
-            files.append({"path": path, "content": text})
-            total_chars += len(text)
-    return files
+def _regulated_files(bundle) -> dict:
+    """The regulated products' file intake — Part 11 and GxP — with its caps made visible.
+
+    **On the same ingester as everything else.** This used to be a second, weaker
+    implementation: a bare `zipfile` walk with an excluded directory list and an extension
+    filter, and **no secret redaction, no path-traversal guard, no symlink guard and no
+    zip-bomb cap**. So a customer uploading their codebase to a 21 CFR Part 11 verification
+    had their hardcoded credentials sent to the model verbatim, while the identical upload
+    to Code Review had them replaced with `__REDACTED_ASSIGNED_CREDENTIAL__` first. One of
+    those is the product's stated behaviour and the other was an accident of having two
+    doors. Callers now build the `Bundle` through `source_bundle` — from a zip, or from a
+    repository at a ref — and this only applies the regulated bounds to it.
+
+    The 60-file / 120,000-character caps stay: they bound what one regulated assessment is
+    priced and split against, and `review_estimate.for_regulated_files` is calibrated on
+    them. A repository makes them much easier to hit than a hand-assembled archive did,
+    which is why the cap is now **reported rather than applied silently**. Before this, a
+    400-file system had 60 files assessed and the report said nothing about the other 340 —
+    and `attest.coverage_claim` could not catch it, because it reconciles the model's claim
+    against *the input it was given*, which was already the truncated 60. So the gap was
+    invisible at exactly the point an FDA-facing report is least allowed to overstate its
+    coverage. The note returned here goes into the prompt and onto the screen, the same
+    sentence in both places.
+    """
+    files, total_chars, considered, oversize = [], 0, 0, []
+    for entry in bundle.files:
+        text = (entry.get("content") or "")
+        if not text.strip():
+            continue
+        considered += 1
+        if len(files) >= _CFR21_MAX_FILES:
+            continue
+        # **A file goes in whole or not at all.** This used to be
+        # `text[:remaining]`, which cut the last file that fit in half and handed the model
+        # a partial file with nothing saying so — and "no audit-trail write in this file" is
+        # then a *wrong* finding in an FDA-facing report whenever the write was in the half
+        # that was dropped. Skipping it instead keeps every file the assessment sees
+        # complete, and the file lands in the coverage note as unread, which is true.
+        if total_chars + len(text) > _CFR21_MAX_TOTAL_CHARS:
+            if len(text) > _CFR21_MAX_TOTAL_CHARS:
+                oversize.append(entry.get("path") or "")
+            continue
+        files.append({"path": entry.get("path") or "", "content": text})
+        total_chars += len(text)
+
+    capped = considered > len(files)
+    note = ""
+    if capped:
+        note = (
+            f"Coverage limit: this source holds {considered:,} readable files and this "
+            f"assessment covers {len(files):,} of them "
+            f"({total_chars:,} characters). The remaining {considered - len(files):,} were "
+            f"not read, so no conclusion here — including a compliant one — applies to "
+            f"them. Split the system and assess it in parts to cover all of it.")
+        if oversize:
+            # Named, because this one is not "we ran out of room" — the file is larger than
+            # the whole budget, so it can never be covered by splitting the *system*, only
+            # by splitting the file. Somebody trying to get to full coverage needs to know
+            # which case they are in.
+            note += (
+                f" {len(oversize)} file(s) are individually larger than one assessment's "
+                f"whole budget and can never be included by re-running: "
+                f"{', '.join(oversize[:5])}"
+                f"{'…' if len(oversize) > 5 else ''}.")
+    return {"files": files, "considered": considered, "assessed": len(files),
+            "chars": total_chars, "capped": capped, "cap_note": note,
+            "oversize": oversize}
+
+
+def _regulated_context(bundle, batch: dict, context: str) -> str:
+    """What a regulated assessment is told about where its files came from.
+
+    The cap note is first because it is the one thing that changes how the *report* may be
+    read: an assessment of 60 files out of 400 is not an assessment of the system.
+    """
+    parts = [f"Source: {bundle.source_type} — {bundle.label}"]
+    if batch["cap_note"]:
+        parts.append(batch["cap_note"])
+    if bundle.untrusted_label:
+        parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if bundle.truncated:
+        parts.append(f"The source was truncated before analysis: {bundle.truncation_reason}")
+    if context:
+        parts.append(context)
+    return "\n".join(parts)
+
+
+def _run_regulated_bundle(bundle, agent: str, system_description: str,
+                          project_name: str, context: str) -> dict:
+    """Shared body for a Part 11 verification or a GxP validation plan over a codebase.
+
+    These get the **real files**, not the structural brief the design agents get: "is there
+    an audit-trail write when a record changes" is a question about the code, and a summary
+    of a codebase cannot answer it. That makes them the same shape as Code Review — which is
+    why `cfr21_agent.verify` already fans out over `chunked_review` when the prompt does not
+    fit (D-354) and needed no change to accept a repository.
+    """
+    _require_llm()
+    batch = _regulated_files(bundle)
+    if not batch["files"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input. Check the "
+                   "repository, branch or archive — a regulated assessment reads code, "
+                   "not documentation.")
+    ctx = _regulated_context(bundle, batch, context)
+    project = project_name or bundle.label[:60] or "Unnamed Project"
+    runner = (orchestrator.verify_cfr21 if agent == "cfr21-verification"
+              else orchestrator.plan_gxp_validation_package)
+    result = runner(files=batch["files"], system_description=system_description,
+                    context=ctx, project_name=project)
+    result["source"] = bundle.summary()
+    # The same three numbers the prompt was given and the quote was based on. One account
+    # of how much was read, not three.
+    result["coverage_limit"] = {k: batch[k] for k in
+                                ("considered", "assessed", "chars", "capped", "cap_note")}
+    return result
+
+
+def _preflight_regulated(bundle, agent: str, request: Request) -> dict:
+    """What a regulated assessment of this source will cost. Free — no model call."""
+    batch = _regulated_files(bundle)
+    if not batch["files"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input.")
+    quote = review_estimate.for_regulated_files(batch["files"], agent=agent)
+    subject = _ui_subject(request)
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": agent,
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (
+            None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
+        "coverage_limit": {k: batch[k] for k in
+                           ("considered", "assessed", "chars", "capped", "cap_note")},
+        "files_preview": [f["path"] for f in batch["files"]][:200],
+        "skipped_all": bundle.skipped[:400],
+    }
 
 
 @app.post("/api/review/cfr21-verification")
-async def review_cfr21_verification(req: CFR21VerificationRequest):
+def review_cfr21_verification(req: CFR21VerificationRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
@@ -1871,6 +2622,31 @@ async def review_cfr21_verification(req: CFR21VerificationRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/cfr21-verification/preflight-zip")
+async def preflight_cfr21_upload_zip(request: Request, file: UploadFile = File(...)):
+    """What a Part 11 verification of this zip will cost. **Free — no model call.**
+
+    The browser's Part 11 screen uploads a zip, so a quote that existed only on the JSON
+    API would be a quote no actual user ever saw. Reads and splits the archive exactly as
+    the run will, and stops.
+
+    Now built by `_preflight_regulated`, the same function the repository door uses. It was
+    a second implementation, and it had drifted twice over: no budget line, and no statement
+    of the 60-file cap — so a 400-file archive was quoted as though all of it would be read.
+    """
+    if not (file.filename or "").endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    content = await file.read()
+    try:
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, "upload", _CFR21_ALLOWED_EXTENSIONS)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid zip file")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _preflight_regulated(bundle, "cfr21-verification", request)
+
+
 @app.post("/api/review/cfr21-verification/upload-zip")
 async def review_cfr21_verification_upload_zip(
     file: UploadFile = File(...),
@@ -1880,33 +2656,81 @@ async def review_cfr21_verification_upload_zip(
 ):
     if not (file.filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
-    _require_llm()
     content = await file.read()
     try:
-        files = _extract_zip_files(content)
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, file.filename or "upload",
+            _CFR21_ALLOWED_EXTENSIONS)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
-    if not files:
-        raise HTTPException(status_code=400, detail="No scannable source files found in the zip (check extensions / excluded dirs)")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     try:
-        result = orchestrator.verify_cfr21(
-            files=files,
-            system_description=system_description,
-            context=context,
-            project_name=project_name or (file.filename or "Unnamed Project"),
-        )
-        result["files_extracted"] = len(files)
+        result = await asyncio.to_thread(
+            _run_regulated_bundle, bundle, "cfr21-verification",
+            system_description, project_name or (file.filename or "Unnamed Project"),
+            context)
+        # Kept as a count for the screen that has always read it as one.
+        result["files_extracted"] = result["coverage_limit"]["assessed"]
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/cfr21-verification/source")
+def review_cfr21_source(req: RegulatedSourceRequest, request: Request):
+    """A Part 11 verification of a repository, branch, pull request or file list.
+
+    The archive door has always existed; this is the same assessment reached from a
+    repository at a ref, which is how a validated system is usually kept. Both go through
+    `_regulated_files`, so a repo and a zip of that repo are priced, split and capped
+    identically.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _run_regulated_bundle(bundle, "cfr21-verification",
+                                     req.system_description or "",
+                                     req.project_name or "", req.context or "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/cfr21-verification/preflight")
+def preflight_cfr21_source(req: RegulatedSourceRequest, request: Request):
+    """What a Part 11 verification of this repository will cost. Free — no model call.
+
+    Separate from `/preflight-zip` because a zip cannot travel on a JSON route (D-234), not
+    because they answer different questions: both call `_preflight_regulated`.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Part 11 preflight source resolution failed")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    return _preflight_regulated(bundle, "cfr21-verification", request)
+
+
 # ── GxP Document Check ────────────────────────────────────────────────────────
 
 @app.post("/api/review/gxp-document-check")
-async def review_gxp_document_check(req: GxPDocumentCheckRequest):
+def review_gxp_document_check(req: GxPDocumentCheckRequest):
     documents = [{"name": d.name, "content": d.content} for d in (req.documents or [])]
     if not documents and not (req.content or "").strip():
         raise HTTPException(status_code=400, detail="Provide `documents` or `content`")
@@ -1937,13 +2761,14 @@ async def review_gxp_document_check_upload(
     documents = []
     for f in files:
         content_bytes = await f.read()
-        text = _extract_text(content_bytes, f.filename or "")
+        text = await asyncio.to_thread(_extract_text, content_bytes, f.filename or "")
         if text.strip():
             documents.append({"name": f.filename or "document", "content": text})
     if not documents:
         raise HTTPException(status_code=400, detail="Could not extract text from any uploaded file")
     try:
-        result = orchestrator.check_gxp_documents(
+        result = await asyncio.to_thread(
+            orchestrator.check_gxp_documents,
             documents=documents,
             document_type_hint=document_type_hint,
             context=context,
@@ -1960,7 +2785,7 @@ async def review_gxp_document_check_upload(
 # ── GxP Validation Document Generation ───────────────────────────────────────
 
 @app.post("/api/review/gxp-generate-plan")
-async def review_gxp_generate_plan(req: GxPValidationPlanRequest):
+def review_gxp_generate_plan(req: GxPValidationPlanRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
@@ -1989,33 +2814,99 @@ async def review_gxp_generate_plan_upload_zip(
 ):
     if not (file.filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
-    _require_llm()
     content = await file.read()
     try:
-        files = _extract_zip_files(content)
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, file.filename or "upload",
+            _CFR21_ALLOWED_EXTENSIONS)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
-    if not files:
-        raise HTTPException(status_code=400, detail="No scannable source files found in the zip (check extensions / excluded dirs)")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     try:
-        result = orchestrator.plan_gxp_validation_package(
-            files=files,
-            system_description=system_description,
-            context=context,
-            project_name=project_name or (file.filename or "Unnamed Project"),
-        )
-        # Return the extracted files too, so the frontend can reuse them for gxp-generate-document
-        # calls without re-uploading the zip for every document.
-        result["files_extracted"] = files
+        result = await asyncio.to_thread(
+            _run_regulated_bundle, bundle, "gxp-generate-plan",
+            system_description, project_name or (file.filename or "Unnamed Project"),
+            context)
+        # Return the extracted files too, so the frontend can reuse them for
+        # gxp-generate-document calls without re-uploading the zip for every document.
+        result["files_extracted"] = await asyncio.to_thread(
+            lambda: _regulated_files(bundle)["files"])
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/gxp-generate-plan/source")
+def review_gxp_plan_source(req: RegulatedSourceRequest, request: Request):
+    """A GxP validation plan built from a repository rather than an uploaded archive.
+
+    Same intake and same caps as the Part 11 twin above — see `_run_regulated_bundle`. This
+    one makes a single model call (`gxp_generator_agent.plan` does not chunk), so it takes
+    no `_CHUNKABLE_ROUTES` entry.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        result = _run_regulated_bundle(bundle, "gxp-generate-plan",
+                                       req.system_description or "",
+                                       req.project_name or "", req.context or "")
+        # The files travel back for the same reason the zip door returns them: generating
+        # each document is a separate call that needs the same source, and re-reading the
+        # repository per document would be several more GitHub round trips for bytes the
+        # browser already has.
+        result["files_extracted"] = _regulated_files(bundle)["files"]
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/gxp-generate-plan/preflight")
+def preflight_gxp_plan_source(req: RegulatedSourceRequest, request: Request):
+    """What a GxP validation plan for this repository will cost. Free — no model call."""
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("GxP plan preflight source resolution failed")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    return _preflight_regulated(bundle, "gxp-generate-plan", request)
+
+
+@app.post("/api/review/gxp-generate-plan/preflight-zip")
+async def preflight_gxp_plan_zip(request: Request, file: UploadFile = File(...)):
+    """The archive twin of the quote above. This screen had no cost preview at all, which
+    made it the one regulated door where the first number a customer saw was the invoice."""
+    if not (file.filename or "").endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    content = await file.read()
+    try:
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, "upload", _CFR21_ALLOWED_EXTENSIONS)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid zip file")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _preflight_regulated(bundle, "gxp-generate-plan", request)
+
+
 @app.post("/api/review/gxp-generate-document")
-async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
+def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
     files = [{"path": f.path, "content": f.content} for f in (req.files or [])]
     if not files and not (req.code or "").strip():
         raise HTTPException(status_code=400, detail="Provide `files` or `code`")
@@ -2043,7 +2934,7 @@ async def review_gxp_generate_document(req: GxPDocumentGenerateRequest):
 # ── Issue Triaging Agent ─────────────────────────────────────────────────────
 
 @app.post("/api/review/issue-triage")
-async def review_issue_triage(req: IssueTriageRequest):
+def review_issue_triage(req: IssueTriageRequest):
     title, description = req.title or "", req.description or ""
     if req.github_issue_url and not (title.strip() or description.strip()):
         from backend.services.github_service import GitHubService
@@ -2073,7 +2964,7 @@ async def review_issue_triage(req: IssueTriageRequest):
 
 
 @app.post("/api/review/issue-triage/batch-github")
-async def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
+def review_issue_triage_batch_github(req: IssueTriageBatchGitHubRequest):
     if not req.github_repo_url.strip():
         raise HTTPException(status_code=400, detail="github_repo_url is required")
     _require_llm()
@@ -2155,7 +3046,7 @@ async def review_issue_triage_batch_github_async(req: IssueTriageBatchGitHubRequ
 # ── QA Intelligence — Test Scenario / Test Case Generation ──────────────────
 
 @app.post("/api/review/test-scenario")
-async def review_test_scenario(req: ReviewRequest, project_name: str = ""):
+def review_test_scenario(req: ReviewRequest, project_name: str = ""):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
@@ -2178,7 +3069,7 @@ class TestCaseInternalRequest(BaseModel):
 
 
 @app.post("/api/review/test-case")
-async def review_test_case(req: TestCaseInternalRequest):
+def review_test_case(req: TestCaseInternalRequest):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
@@ -2203,7 +3094,7 @@ class SensitiveDataRequest(BaseModel):
 
 
 @app.post("/api/review/sensitive-data")
-async def review_sensitive_data(req: SensitiveDataRequest):
+def review_sensitive_data(req: SensitiveDataRequest):
     if not req.content.strip():
         raise HTTPException(status_code=400, detail="Content is required")
     _require_llm()
@@ -2218,6 +3109,53 @@ async def review_sensitive_data(req: SensitiveDataRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/sensitive-data/source")
+def review_sensitive_source(req: SensitiveDataSourceRequest, request: Request):
+    """A sensitive-data scan over a whole codebase — zip, repository at a ref, PR, compare.
+
+    Unlike Architecture and Security Review, this one is **not** given a structural summary:
+    its question is per-file ("is there a credential in here") and a summary of a codebase
+    cannot contain the hardcoded key that is the finding. So it fans out over chunks like
+    Code Review and VAPT do. See `SensitiveDataAgent.scan`.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _run_sensitive_bundle(bundle, req.project_name or "", req.context or "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/sensitive-data/upload-zip")
+async def review_sensitive_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    context: str = Form(""),
+):
+    """The archive door for the scan above — a zip cannot travel on a JSON route (D-234)."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    try:
+        return await asyncio.to_thread(_run_sensitive_bundle, bundle, project_name, context)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/sensitive-data/preflight")
+def preflight_sensitive_ui(req: SensitiveDataSourceRequest, request: Request):
+    return _preflight(req, request, "sensitive-data")
+
+
 @app.post("/api/review/sensitive-data/upload")
 async def review_sensitive_data_file(
     file: UploadFile = File(...),
@@ -2225,12 +3163,13 @@ async def review_sensitive_data_file(
     context: str = Form(""),
 ):
     content = await file.read()
-    text = _extract_text(content, file.filename or "")
+    text = await asyncio.to_thread(_extract_text, content, file.filename or "")
     if not text:
         raise HTTPException(status_code=400, detail="Could not extract text from file")
     _require_llm()
     try:
-        result = orchestrator.scan_sensitive_data(
+        result = await asyncio.to_thread(
+            orchestrator.scan_sensitive_data,
             content=text, context=context, project_name=project_name or file.filename or "Unnamed Project",
         )
         return result
@@ -2259,25 +3198,135 @@ async def get_agents_info():
 # Every agent has its own KB category (see knowledge_base.KB_CATEGORIES). Docs are
 # either global/shared (used as context for every project) or scoped to one
 # project_name (used only when that same project is reviewed/generated for).
+#
+# **Every route here was unauthenticated — read, upload, overwrite and delete.** That was
+# the most serious authorization gap in the platform, because a knowledge-base document is
+# not passive data: `SDLCOrchestrator._kb()` folds it into the prompt of every subsequent
+# review in its category, and several agents call `knowledge_base.get_context` directly.
+# So an anonymous caller could upload a Markdown file instructing the reviewer to ignore a
+# class of vulnerability, or to report a Green gate, and every later run in that project
+# would read it and look entirely normal. Uploading with `project_name=""` writes a
+# *global* doc, which reaches every project at once.
+#
+# Three rules, and the asymmetry between them is the point:
+#
+#   * **Reading** needs a signed-in caller, and returns global docs plus the docs of
+#     projects they belong to.
+#   * **Writing a project's doc** needs an admin *of that project*. It is not ordinary
+#     work: it changes the standing instructions every future review in that project is
+#     given, which is closer to setting a budget than to running a review.
+#   * **Writing a global doc** needs a super admin, because it changes the instructions
+#     given to every project in the deployment. This is the one bar that could not be
+#     relaxed without recreating the hole.
+#
+# `project_name` is free text and KB paths are keyed by its slug, so the check maps the
+# caller's project *ids* to slugs rather than trusting the string it was handed.
+
+def _kb_slugs_for(project_ids: Optional[List[str]]) -> Optional[set]:
+    """Project slugs a caller may touch. `None` (from `scope`) stays None — unrestricted."""
+    from backend.services.knowledge_base import slugify_project
+    if project_ids is None:
+        return None
+    slugs = set()
+    for pid in project_ids:
+        project = database.get_project(pid)
+        if project and project.get("name"):
+            slugs.add(slugify_project(project["name"]))
+    return slugs
+
+
+def _kb_readable(reader: dict, request: Request) -> Optional[set]:
+    return _kb_slugs_for(scope.visible_project_ids(reader, request))
+
+
+def _kb_require_writable(reader: dict, project_name: str) -> None:
+    """Refuse a KB write the caller is not entitled to make.
+
+    A global doc (`project_name` empty) is super-admin-only. A project doc requires a row
+    in `project_admins` for that project — membership alone is not enough, for the reason
+    in the section comment above.
+    """
+    from backend.services.knowledge_base import slugify_project
+    user = reader.get("_user") or {}
+    if is_super_admin(user):
+        return
+    if reader.get("type") != "jwt":
+        # An API key has no notion of "admin of a project"; it carries one project and a
+        # scope list of agents it may *call*. Editing standing review instructions is not
+        # one of those, and silently allowing it would let a CI credential rewrite the
+        # rules its own reviews are judged by.
+        raise HTTPException(
+            status_code=403,
+            detail="Knowledge Base documents can only be changed by a signed-in project "
+                   "admin, not by an API key.",
+        )
+    if not (project_name or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail="Only a super admin can add or change a shared Knowledge Base document "
+                   "— a shared document is used as context for every project in this "
+                   "deployment. Set a project name to scope it to one project instead.",
+        )
+    target = slugify_project(project_name)
+    admin_slugs = _kb_slugs_for(database.list_admin_project_ids(user.get("sub") or "")) or set()
+    if target not in admin_slugs:
+        raise HTTPException(
+            status_code=403,
+            detail=f"You are not an admin of '{project_name}'. A Knowledge Base document "
+                   "sets the standing instructions every review in that project is given, "
+                   "so changing one requires project admin.",
+        )
+
+
+def _kb_audit(event: str, reader: dict, category: str, name: str, project_name: str) -> None:
+    """Record a Knowledge Base change in the audit trail.
+
+    These changes were previously invisible: nothing anywhere recorded that the standing
+    instructions given to an agent had been edited, so a review whose behaviour changed
+    because somebody rewrote its knowledge base looked identical to one that changed
+    because the code did. A shared document is stored with a NULL project (super-admin
+    visible only), which is the right scope for a change that affects every project.
+    """
+    user = reader.get("_user") or {}
+    actor = user.get("username") or reader.get("team") or "unknown"
+    project = database.get_project_by_name(project_name) if project_name else None
+    database.record_audit_event(
+        event, "kb_document", f"{category}/{name}", actor,
+        details=f"project={project_name or 'shared (all projects)'}",
+        project_id=(project or {}).get("id") or "",
+    )
+
 
 @app.get("/api/knowledge-base/categories")
-async def list_kb_categories():
+async def list_kb_categories(reader: dict = Depends(require_reader)):
     from backend.services.knowledge_base import KB_CATEGORIES
     return {"categories": KB_CATEGORIES}
 
 
 @app.get("/api/knowledge-base")
-async def list_kb_docs(project_name: Optional[str] = None, category: Optional[str] = None):
-    """Without project_name: every document (admin view).
-    With project_name: global docs + that project's docs only. Optionally filter by category."""
+async def list_kb_docs(request: Request, project_name: Optional[str] = None,
+                       category: Optional[str] = None,
+                       reader: dict = Depends(require_reader)):
+    """Global docs plus the docs of projects this caller may see.
+
+    `project_name` narrows further, to one project. It used to be the *only* filter, and
+    omitting it returned every project's documents to anyone.
+    """
     docs = knowledge_base.list_docs(project_name=project_name, category=category)
+    allowed = _kb_readable(reader, request)
+    if allowed is not None:
+        docs = [d for d in docs if not d["project_name"] or d["project_name"] in allowed]
     return {"docs": docs, "total": len(docs)}
 
 
 @app.get("/api/knowledge-base/{name}")
-async def get_kb_doc(name: str, category: str, project_name: str = ""):
+async def get_kb_doc(name: str, category: str, request: Request, project_name: str = "",
+                     reader: dict = Depends(require_reader)):
     doc = knowledge_base.get_doc(name, category=category, project_name=project_name)
-    if not doc:
+    allowed = _kb_readable(reader, request)
+    # 404 rather than 403 on another project's document, as everywhere else: whether a
+    # named document exists in someone else's project is itself information.
+    if not doc or (doc.project_name and allowed is not None and doc.project_name not in allowed):
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found in category '{category}'")
     return {
         "name": doc.name, "title": doc.title, "path": doc.path, "content": doc.content,
@@ -2290,8 +3339,10 @@ async def upload_kb_doc(
     file: UploadFile = File(...),
     category: str = Form(...),
     project_name: str = Form(""),
+    reader: dict = Depends(require_reader),
 ):
     from backend.services.knowledge_base import VALID_KB_CATEGORIES
+    _kb_require_writable(reader, project_name)
     if category not in VALID_KB_CATEGORIES:
         raise HTTPException(status_code=400, detail=f"category must be one of {VALID_KB_CATEGORIES}")
     content_bytes = await file.read()
@@ -2302,6 +3353,7 @@ async def upload_kb_doc(
         raise HTTPException(status_code=400, detail="Only .md files are accepted")
     name = (file.filename or "doc").replace(".md", "")
     doc = knowledge_base.add_doc(name, text, category, project_name=project_name)
+    _kb_audit("kb_document_uploaded", reader, doc.category, doc.name, project_name)
     return {
         "message": "Document uploaded", "name": doc.name, "title": doc.title,
         "category": doc.category, "path": doc.path, "project_name": doc.project_name,
@@ -2309,19 +3361,25 @@ async def upload_kb_doc(
 
 
 @app.put("/api/knowledge-base/{name}")
-async def update_kb_doc(name: str, req: ReviewRequest, category: str, project_name: str = ""):
+async def update_kb_doc(name: str, req: ReviewRequest, category: str, project_name: str = "",
+                        reader: dict = Depends(require_reader)):
+    _kb_require_writable(reader, project_name)
     doc = knowledge_base.get_doc(name, category=category, project_name=project_name)
     if not doc:
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found in category '{category}'")
     updated = knowledge_base.add_doc(name, req.content, doc.category, project_name=doc.project_name)
+    _kb_audit("kb_document_updated", reader, doc.category, updated.name, project_name)
     return {"message": "Document updated", "name": updated.name, "title": updated.title}
 
 
 @app.delete("/api/knowledge-base/{name}")
-async def delete_kb_doc(name: str, category: str, project_name: str = ""):
+async def delete_kb_doc(name: str, category: str, project_name: str = "",
+                        reader: dict = Depends(require_reader)):
+    _kb_require_writable(reader, project_name)
     deleted = knowledge_base.delete_doc(name, category=category, project_name=project_name)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Document '{name}' not found in category '{category}'")
+    _kb_audit("kb_document_deleted", reader, category, name, project_name)
     return {"message": f"Document '{name}' deleted"}
 
 
@@ -2344,6 +3402,34 @@ async def get_controls():
 
 
 # ── Utility ────────────────────────────────────────────────────────────────
+
+@app.post("/api/documents/extract")
+async def extract_document_text(file: UploadFile = File(...)):
+    """Read a PDF, Word document or text file and hand back its text. No model, no charge.
+
+    One endpoint for every screen whose input is prose — a requirement, a test basis, a
+    stack brief. The alternative was an upload-and-run route per screen, three more entries
+    in the metering map and three more ways for a screen to spend money on a document
+    nobody had read yet.
+
+    Extraction is deliberately separate from running: the text lands in the textarea, the
+    person sees exactly what was pulled out of their document, and *then* they press the
+    button. A scanned PDF that yields two words of OCR noise is a thing you want to notice
+    before paying for a review of it, which is also why the character count comes back.
+
+    Absent from `legacy_guard`'s product map for the same reason `/preflight` is: it makes
+    no model call and spends nothing, so there is no product to meter it against.
+    """
+    raw = await file.read()
+    text = await asyncio.to_thread(_extract_text, raw, file.filename or "")
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="No text could be read from that file. A scanned PDF with no text layer "
+                   "needs OCR first — this reads text, it does not recognise images.")
+    return {"filename": file.filename or "", "text": text, "chars": len(text)}
+
 
 def _extract_text(content: bytes, filename: str) -> str:
     filename_lower = filename.lower()

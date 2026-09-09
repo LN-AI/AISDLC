@@ -39,9 +39,21 @@ os.environ.setdefault("SECRET_KEY", "smoke-secret-key-not-for-production")
 
 from backend import config, database  # noqa: E402
 from backend.services import (  # noqa: E402
-    code_chunker, finding_pipeline, llm_gateway, review_estimate, source_bundle,
+    code_chunker, finding_gate, finding_pipeline, llm_gateway, review_estimate,
+    source_bundle,
 )
 from backend.services import sarif as sarif_mod  # noqa: E402
+
+import base64 as _b64mod34  # noqa: E402
+import json as _json34  # noqa: E402
+import os as _os34  # noqa: E402
+import time as _time34  # noqa: E402
+
+
+def _b64d34(segment: str) -> bytes:
+    """Decode one base64url JWS segment, restoring the padding JWS strips."""
+    return _b64mod34.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+
 
 PASSED = 0
 FAILED = 0
@@ -100,6 +112,90 @@ DIFF = (
     '+    query = "SELECT * FROM users WHERE name=" + u\n'
     "     return conn.execute(query)\n"
 )
+
+
+# ── Fixtures for the incremental pull-request review (section 33) ─────────
+#
+# Two diffs: the whole pull request, and the slice one push added. The point of the pair is
+# that a check can tell which of them reached the model — `app/old.py` appears only in the
+# full one.
+_PR33 = "https://github.com/acme/portal/pull/42"
+
+_FULL_DIFF33 = (
+    "diff --git a/app/old.py b/app/old.py\n"
+    "--- a/app/old.py\n"
+    "+++ b/app/old.py\n"
+    "@@ -1,2 +1,3 @@\n"
+    " import os\n"
+    "+query = \"SELECT * FROM t WHERE u=\" + u\n"
+    " return query\n"
+    "diff --git a/app/new.py b/app/new.py\n"
+    "--- /dev/null\n"
+    "+++ b/app/new.py\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+def run(cmd):\n"
+    "+    os.system(cmd)\n"
+)
+
+_SLICE_DIFF33 = (
+    "diff --git a/app/new.py b/app/new.py\n"
+    "--- /dev/null\n"
+    "+++ b/app/new.py\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+def run(cmd):\n"
+    "+    os.system(cmd)\n"
+)
+
+_PRIOR_FINDING33 = dict(
+    control_id="SEC-003", severity=5, risk_level="Critical",
+    title="SQL injection in the old handler",
+    description="User input concatenated into a query.",
+    recommendation="Parameterize it.", is_blocking=True,
+    file_path="app/old.py", line_start=2, confidence="High",
+    evidence='query = "SELECT * FROM t WHERE u=" + u',
+)
+_PRIOR_FINGERPRINT33 = finding_pipeline.fingerprint(_PRIOR_FINDING33)
+_PRIOR_FINDING33["fingerprint"] = _PRIOR_FINGERPRINT33
+
+
+def _seed_pr_review33(project_id=None, pr_number=42):
+    """A previous review of the same pull request, with one Critical left open.
+
+    Written directly rather than run through the workflow, because what is under test is
+    the *lookup*: a wrong repository, a wrong pull-request number, or a `pr_number` column
+    nothing ever populated all produce an empty carry-forward list and a wrongly Green
+    gate, and every one of those failures is silent.
+    """
+    import uuid as _u33
+    from datetime import datetime as _dt33
+    rid = str(_u33.uuid4())
+    conn = database.get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO reviews (id, review_type, project_name, project_id, input_summary, "
+        "input_content, result_json, findings_count, critical_count, high_count, "
+        "risk_score, gate_status, created_at, repo_host, repo_owner, repo_name, branch, "
+        "commit_sha, pr_number) VALUES (?, 'code', 'Add the thing', ?, 'PR #42', '', '{}', "
+        "1, 1, 0, 90.0, 'Red', ?, 'github.com', 'acme', 'portal', 'feature', ?, ?)",
+        (rid, project_id, _dt33.utcnow().isoformat(), "a" * 40, pr_number),
+    )
+    # No `created_at` on `findings`: a finding takes its date from the review it belongs
+    # to, which is why `open_findings_for_pr` orders on the joined `reviews.created_at`.
+    cur.execute(
+        "INSERT INTO findings (id, review_id, control_id, severity, risk_level, title, "
+        "description, recommendation, is_blocking, status, fingerprint, file_path, "
+        "line_start, evidence, project_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?, ?, ?, ?)",
+        (str(_u33.uuid4()), rid, _PRIOR_FINDING33["control_id"],
+         _PRIOR_FINDING33["severity"], _PRIOR_FINDING33["risk_level"],
+         _PRIOR_FINDING33["title"], _PRIOR_FINDING33["description"],
+         _PRIOR_FINDING33["recommendation"], _PRIOR_FINGERPRINT33,
+         _PRIOR_FINDING33["file_path"], _PRIOR_FINDING33["line_start"],
+         _PRIOR_FINDING33["evidence"], project_id),
+    )
+    conn.commit()
+    conn.close()
+    return rid
 
 
 def make_zip(files):
@@ -1992,6 +2088,42 @@ def main():
                   int(_pf.headers.get("X-Spend-Calls", 0)) == 0,
                   f"a free preflight claimed {_pf.headers.get('X-Spend-Calls')} call(s)")
 
+            # ── The upload variants, which nothing had ever exercised (C-83) ──
+            #
+            # These ten routes had no test of any kind, and they are the only agent routes
+            # that are legitimately `async def` -- they must `await file.read()`. C-83 moved
+            # their model call and their PDF/zip parsing onto a thread with
+            # `asyncio.to_thread`, and that is not a free change: `to_thread` runs the
+            # function in a **copy** of the context, so anything a contextvar is supposed to
+            # report *back up* could have started silently returning nothing.
+            #
+            # `context.collect_saved_reviews()` is exactly that mechanism, and it is how
+            # `legacy_guard` learns which review to bill (D-311). It holds a mutable list
+            # for this reason -- the thread appends to the same object the middleware is
+            # holding -- so it should survive. "Should" is why this is a test: the same
+            # reasoning applied to a plain value would be wrong, and no existing check
+            # would have noticed.
+            _up = client.post(
+                "/api/review/requirement/upload",
+                files={"file": ("requirement.txt",
+                                b"The system shall log every access to a patient record.",
+                                "text/plain")},
+                data={"project_name": "Sources", "context": ""},
+                headers=H)
+            check("an upload route answers 200 with its model call off the event loop",
+                  _up.status_code == 200, _up.text[:200])
+            _up_missing = [h for h in _METERED if h not in _up.headers]
+            check("...and the spend still reaches the browser through the context copy",
+                  not _up_missing,
+                  f"absent: {_up_missing} -- `asyncio.to_thread` gives the call a *copy* of "
+                  f"the context, so if attribution rode on a plain contextvar rather than "
+                  f"the mutable list of D-311, moving the call off the loop would have "
+                  f"silently unbilled every upload")
+            check("...priced by the same arithmetic as the JSON route",
+                  int(_up.headers.get("X-Spend-Tokens-In", 0)) >= 1200,
+                  f"{_up.headers.get('X-Spend-Tokens-In')} in -- the figure must come from "
+                  f"the gateway's own record, not from a re-estimate")
+
             # Iterate the map rather than spot-checking one route, so a product that
             # reports its spend by no mechanism at all is named by the test instead of
             # passing quietly. There are exactly three mechanisms and every product must
@@ -2665,8 +2797,11 @@ def main():
               hasattr(_GH31, "create_branch_at_sha"),
               "branching off the commit a review read is the whole reason Apply Fixes does "
               "not just branch off the tip")
+        # `_write31` is the write path. `apply` generates, guards and stops at the preview;
+        # `_deliver` is what touches a repository, and every check below is about writing.
+        _write31 = _i31.getsource(fix_apply._deliver)
         check("...and it is the one Apply Fixes calls",
-              "create_branch_at_sha(" in _i31.getsource(fix_apply.apply),
+              "create_branch_at_sha(" in _write31,
               "create_branch resolves its fourth argument as a branch NAME; a sha there is "
               "a request for /git/ref/heads/<sha>, which 404s every time")
         check("...and it refuses a branch name, rather than asking GitHub about a bad ref",
@@ -2688,7 +2823,7 @@ def main():
         # `owner/repo@ref`, so that works. A **pull request's** label is its title, so the
         # fix pull request was opened with `base="CB-104: AI visit summary endpoint"` and
         # GitHub answered 422 with nothing naming the branch.
-        _src31 = _i31.getsource(fix_apply.apply)
+        _src31 = _write31
         check("a fix from a pull request targets a branch, not the review's label",
               'source.get("source_type") == "github_pr"' in _src31
               and 'source.get("head_branch")' in _src31,
@@ -2703,6 +2838,138 @@ def main():
               "opaque 422")
         check("the default branch is a real lookup with a safe fallback",
               hasattr(_GH31, "get_default_branch"))
+
+        # ── The fallback above was itself a crash ─────────────────────────
+        #
+        # `base_ref = gh.get_default_branch(owner, repo)` sat *above* the lines assigning
+        # `owner`, `repo` and `gh`. All three are assigned somewhere in `apply`, so Python
+        # treats them as locals throughout it and that call raised `UnboundLocalError`
+        # instead of reaching GitHub — the sentence written to replace an opaque 422 was a
+        # traceback. Third defect in the same twenty lines (D-314, D-315), and invisible to
+        # every test here because they all stop at `plan`, which writes nothing.
+        #
+        # Checked structurally rather than by string, because the failure is an *ordering*
+        # property: walk the function body and require the first binding of each name to
+        # come before its first read. This catches the whole class, not the one instance.
+        import ast as _ast31
+        import textwrap as _tw31
+
+        # `ast.unparse(ast.parse(...))` first, so every check below reads *code* and not
+        # comments. The first version of this check compared string offsets over the raw
+        # source and passed/failed on a comment that happened to mention the function it
+        # was looking for -- which is the same class of mistake it exists to catch.
+        _code31 = _ast31.unparse(_ast31.parse(_tw31.dedent(_i31.getsource(fix_apply._deliver))))
+        # Guard against this check quietly emptying out. If the block it watches moves
+        # again, the names disappear from the function and the ordering check below starts
+        # passing because there is nothing left to order — the failure mode that made this
+        # comment necessary the first time.
+        check("...and the check is looking at the function that actually writes",
+              all(n in _code31 for n in ("gh", "owner", "repo", "resolve_base_branch")),
+              "the owner/repo/client resolution is no longer in `_deliver`, so the "
+              "ordering check below would pass vacuously -- point it at wherever the "
+              "write path went")
+
+        def _read_before_bound(code: str, names):
+            """Names read on a line above the line that first binds them.
+
+            These are function-locals, so such a read is an `UnboundLocalError` at runtime
+            rather than a fall-through to a module global -- which is exactly what the
+            default-branch fallback did.
+            """
+            bound, offenders = {}, []
+            for node in _ast31.walk(_ast31.parse(code)):
+                if isinstance(node, _ast31.Name) and node.id in names:
+                    if isinstance(node.ctx, _ast31.Store):
+                        bound[node.id] = min(bound.get(node.id, node.lineno), node.lineno)
+            for node in _ast31.walk(_ast31.parse(code)):
+                if (isinstance(node, _ast31.Name) and node.id in names
+                        and isinstance(node.ctx, _ast31.Load)):
+                    first = bound.get(node.id)
+                    if first is not None and node.lineno < first:
+                        offenders.append(f"{node.id}@line{node.lineno}")
+            return sorted(set(offenders))
+
+        _offenders31 = _read_before_bound(_code31, {"gh", "owner", "repo"})
+        check("the write path never reads owner/repo/gh before assigning them",
+              not _offenders31,
+              "read before assignment: " + ", ".join(_offenders31)
+              + " -- function-locals, so a read above the assignment is an "
+                "UnboundLocalError and not a fall-through to a global")
+        check("...and the repository client is resolved before the base branch is asked for",
+              _code31.index("gh = orch.github") < _code31.index("resolve_base_branch("),
+              "the base-branch resolution takes the client and the owner/repo it names")
+
+        # ── One copy of the base-branch rule, and it checks ───────────────
+        #
+        # Three separate live defects were the same shape: a base branch derived from a
+        # human label and handed straight to GitHub (D-314, D-315, D-364). None was visible
+        # offline because every fix test stops before writing. The rule now lives in one
+        # function shared by `fix_apply` and the generated-code deliveries, which makes this
+        # the single place it can regress -- so it is checked as a property, not by reading
+        # `_deliver`'s text.
+        from backend.services import code_delivery as _cd31
+        _rbb31 = _ast31.unparse(_ast31.parse(_tw31.dedent(_i31.getsource(_cd31.resolve_base_branch))))
+        check("a derived base branch is verified against GitHub before it is used",
+              "branch_exists(" in _rbb31,
+              "a tag, a sha, a deleted branch and a plausible non-branch all fail as an "
+              "identical bare 422 from POST /pulls -- one request tells them apart")
+        check("...and an unusable one falls back to the repository's own default",
+              "get_default_branch(" in _rbb31,
+              "assuming 'main' fails on every repository still on master or develop")
+
+        class _FakeGH31:
+            """Answers `branch_exists` for exactly one name, and records the fallback."""
+            def __init__(self, real): self.real, self.asked_default = real, False
+            def branch_exists(self, o, r, b): return b == self.real
+            def get_default_branch(self, o, r):
+                self.asked_default = True
+                return "trunk"
+
+        _gh_ok31 = _FakeGH31("develop")
+        check("a candidate that is a real branch is kept",
+              _cd31.resolve_base_branch(_gh_ok31, "o", "r", "develop") == "develop"
+              and not _gh_ok31.asked_default,
+              "a verified branch must be used as given, not replaced by the default")
+        for _bad31 in ("", "CB-104: AI visit summary endpoint", "scratch-repo", "61f9b8f"):
+            _gh_bad31 = _FakeGH31("develop")
+            check(f"...and {_bad31 or 'an empty name'!r} falls back rather than reaching GitHub",
+                  _cd31.resolve_base_branch(_gh_bad31, "o", "r", _bad31) == "trunk",
+                  "these are the four shapes that actually reached POST /pulls: nothing, a "
+                  "pull request title, a repository name, and a short sha")
+
+        # ── The patch is shown before it is delivered ─────────────────────
+        #
+        # `apply` used to take the destination with it, so one call generated the patch and
+        # opened the pull request; the diff was in the result, after the branch existed. On
+        # a platform whose argument is that a human approves what an agent proposes, this
+        # was the one write with no approval step.
+        check("a fix can be generated without being delivered",
+              fix_apply.PREVIEW not in fix_apply.OUTPUTS,
+              "preview is the step before a delivery, not one of them -- in OUTPUTS it "
+              "would appear in the destination list as somewhere a patch can go")
+        check("...and there is a separate call that only delivers",
+              callable(getattr(fix_apply, "deliver", None)))
+        _dsrc = _i31.getsource(fix_apply.deliver)
+        check("...which never generates, so the diff approved is the diff that ships",
+              "_fix_one_file" not in _dsrc and "_guard_patches" not in _dsrc
+              and "call_tool" not in _dsrc,
+              "regenerating to change the destination would pay twice and could produce a "
+              "different patch, so the approval would refer to something else")
+        check("...and takes the patched contents from the held preview, not from its caller",
+              'held.get("patches")' in _dsrc,
+              "a caller that could post file contents here could commit anything it liked "
+              "to the customer's repository under a fix's name")
+        check("...and refuses a destination this review cannot use",
+              "_available_outputs(" in _dsrc and "not in available" in _dsrc)
+        _main_src = io.open(_i31.getsourcefile(main), encoding="utf-8").read()
+        check("the preview route holds the contents server-side, not in the response",
+              all(frag in _main_src
+                  for frag in ('result.pop("patches", None)', "_FIX_PENDING")),
+              "the patched source must not travel to the browser and back")
+        check("...and delivery is still entitlement-checked, having no model call to meter",
+              'agent_guard.preflight(caller, "auto-fix")' in _main_src,
+              "D-307: writing to a repository is the auto-fix product whichever review the "
+              "findings came from, and no model call does not mean no governance")
 
         # The delivery options are unchanged by any of this -- checked because the fix
         # touched the function that reads them.
@@ -2819,6 +3086,823 @@ def main():
         check("an unsupported algorithm is refused",
               _wh._verify(WEBHOOK_SECRET, body, "sha1=" + "0" * 40) is False)
         check("a missing header is refused", _wh._verify(WEBHOOK_SECRET, body, None) is False)
+        # ── 34. GitHub App and the check run ─────────────────────────────
+        #
+        # A check run is the only way a finding lands on the line it is about, and GitHub
+        # refuses the endpoint for a personal access token — so this needs an App, and an
+        # App means an RS256 JWT and a minted installation token.
+        #
+        # **Two of these calls have never reached GitHub.** What is checked here is
+        # everything that does not need the network: the JWT's structure and claims, the
+        # token cache, the annotation mapping, the conclusion mapping, the cap, which
+        # findings are deliberately not placed, and the fallback when no App is configured.
+        # D-314 and D-315 are two GitHub write paths that shipped broken because nothing
+        # offline could reach them, so the boundary is drawn explicitly rather than left to
+        # be assumed.
+        section("34. GitHub App auth and check-run assembly")
+
+        from backend.services import github_app as _ga34
+        from backend.services.github_service import GitHubService as _GHS34
+
+        check("with nothing configured, the App is not configured",
+              _ga34.is_configured() is False)
+        check("...and says which variables are missing rather than just 'no'",
+              "GITHUB_APP_ID" in (_ga34.status().get("note") or ""),
+              str(_ga34.status()))
+        check("...and explains what still works without one",
+              "commit status" in (_ga34.status().get("note") or ""),
+              "a person reading this needs to know the review is not broken")
+        check("a token is not attempted when nothing is configured",
+              _ga34.token_for("acme", "portal") == "",
+              "every caller's fallback is the commit status, so this must return empty "
+              "rather than raise")
+
+        # An id with no key cannot mint anything, and reporting it as configured would mean
+        # every review tried, failed and fell back, once per review.
+        _ga34.config.GITHUB_APP_ID = "123456"
+        try:
+            check("an App id with no private key is not 'configured'",
+                  _ga34.is_configured() is False,
+                  "half-configured would mean a failed attempt on every single review")
+        finally:
+            _ga34.config.GITHUB_APP_ID = ""
+
+        # A real RSA key, generated here. `cryptography` is a declared dependency and is
+        # what signs the JWT — PyJWT is importable in this environment but is not in
+        # requirements.txt, and building an auth path on a transitive dependency is how it
+        # disappears in the next upgrade.
+        from cryptography.hazmat.primitives import serialization as _ser34
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa34
+        _key34 = _rsa34.generate_private_key(public_exponent=65537, key_size=2048)
+        _pem34 = _key34.private_bytes(
+            encoding=_ser34.Encoding.PEM,
+            format=_ser34.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=_ser34.NoEncryption(),
+        ).decode("ascii")
+
+        _ga34.config.GITHUB_APP_ID = "123456"
+        _ga34.config.GITHUB_APP_PRIVATE_KEY = _pem34
+        try:
+            check("an id and a key together are 'configured'", _ga34.is_configured() is True)
+            check("...and the status reports it without returning the key",
+                  _ga34.status()["configured"] is True
+                  and "BEGIN" not in _json34.dumps(_ga34.status()),
+                  "a private key echoed by a status endpoint is a private key in a log")
+
+            _jwt34 = _ga34.app_jwt()
+            _parts34 = _jwt34.split(".")
+            check("the App assertion is a three-part JWS", len(_parts34) == 3, _jwt34[:40])
+            _hdr34 = _json34.loads(_b64d34(_parts34[0]))
+            _pay34 = _json34.loads(_b64d34(_parts34[1]))
+            check("...signed RS256, which is the only algorithm GitHub accepts here",
+                  _hdr34.get("alg") == "RS256", str(_hdr34))
+            check("...issued by the App id", _pay34.get("iss") == "123456", str(_pay34))
+            check("...backdated, so a fast clock does not produce a future token",
+                  _pay34["iat"] < _time34.time(),
+                  "GitHub rejects an assertion issued in the future, which a server a few "
+                  "seconds fast otherwise sends every time")
+            check("...and expiring inside GitHub's ten-minute ceiling",
+                  0 < _pay34["exp"] - _time34.time() <= 600, str(_pay34["exp"]))
+            check("...with no padding on the base64, which JWS forbids",
+                  "=" not in _jwt34, _jwt34[:60])
+
+            # And it really verifies, which is the only thing that makes the rest of it
+            # meaningful — a signature over the wrong bytes is a well-formed useless token.
+            from cryptography.hazmat.primitives import hashes as _h34
+            from cryptography.hazmat.primitives.asymmetric import padding as _pad34
+            _sig34 = _b64d34(_parts34[2])
+            _key34.public_key().verify(
+                _sig34, (_parts34[0] + "." + _parts34[1]).encode("ascii"),
+                _pad34.PKCS1v15(), _h34.SHA256())
+            check("...and the signature verifies against the key that made it", True)
+
+            # A PEM whose newlines were flattened by a deployment tool. This is the single
+            # most common way this is misconfigured, and the raw error says nothing.
+            _ga34.config.GITHUB_APP_PRIVATE_KEY = _pem34.replace("\n", "\\n")
+            check("a PEM with escaped newlines still works",
+                  bool(_ga34.app_jwt()),
+                  "every deployment tool flattens a PEM into one line, and the "
+                  "'could not deserialize key' that follows says nothing about the cause")
+
+            _ga34.config.GITHUB_APP_PRIVATE_KEY = "-----BEGIN RSA PRIVATE KEY-----\nnope\n"
+            _err34 = ""
+            try:
+                _ga34.app_jwt()
+            except _ga34.AppAuthError as exc:
+                _err34 = str(exc)
+            check("an unreadable key is refused with a sentence, not a stack trace",
+                  "starting with '-----BEGIN'" in _err34, _err34[:200])
+            check("...and `token_for` swallows it so the review still reports",
+                  _ga34.token_for("acme", "portal") == "",
+                  "an App problem must degrade the richness of the report, never lose it")
+        finally:
+            _ga34.config.GITHUB_APP_ID = ""
+            _ga34.config.GITHUB_APP_PRIVATE_KEY = ""
+            _ga34._token_cache.clear()
+
+        # ── The check run's body, which is where the judgement is ────────
+        class _Check34(_GHS34):
+            """`create_check_run` with the HTTP call replaced, so the body can be read."""
+
+            def __init__(self):
+                self.token = "unused"
+                self.sent = None
+
+        def _capture34(self, url, headers=None, json=None, **kw):
+            self.sent = {"url": url, "headers": headers, "body": json}
+            class _R:
+                status_code = 201
+                text = ""
+                @staticmethod
+                def json():
+                    return {"id": 9, "html_url": "https://github.com/acme/portal/runs/9"}
+            return _R()
+
+        def _run_check34(result, **kw):
+            svc = _Check34()
+            import httpx as _hx34
+            _real_client = _hx34.Client
+
+            class _StubClient:
+                def __init__(self, *a, **k):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+                def post(self, url, headers=None, json=None, **k):
+                    return _capture34(svc, url, headers=headers, json=json)
+
+            _hx34.Client = _StubClient
+            try:
+                out = svc.create_check_run("acme", "portal", "b" * 40, result,
+                                           "ghs_installationtoken", **kw)
+            finally:
+                _hx34.Client = _real_client
+            return out, svc.sent
+
+        _placeable34 = dict(SQLI, fingerprint="fp-1")
+        _noline34 = dict(control_id="GOV-001", severity=3, risk_level="Moderate",
+                         title="No threat model", description="Design level.",
+                         recommendation="Write one.", is_blocking=False)
+        _unverified34 = dict(SQLI, title="Invented", file_path="app/auth.py",
+                             line_start=9, evidence_verified=False)
+        _out34, _sent34 = _run_check34({
+            "gate_status": "Red", "risk_score": 90.0, "summary": "One real problem.",
+            "findings": [dict(_placeable34, evidence_verified=True), _noline34, _unverified34],
+        }, details_url="https://sdlc.example/x")
+
+        check("the check run goes to the check-runs endpoint",
+              _sent34["url"].endswith("/repos/acme/portal/check-runs"), _sent34["url"])
+        check("...with the installation token, not this service's own credential",
+              _sent34["headers"]["Authorization"] == "Bearer ghs_installationtoken",
+              "GitHub refuses this endpoint for a PAT, which is the entire reason "
+              "github_app.py exists")
+        check("...and an explicit API version, so a default change cannot break it",
+              _sent34["headers"].get("X-GitHub-Api-Version") == "2022-11-28")
+        check("a Red gate concludes as a failure, which is what blocks a merge",
+              _sent34["body"]["conclusion"] == "failure", str(_sent34["body"]["conclusion"]))
+        check("only the placeable finding is annotated",
+              len(_sent34["body"]["output"]["annotations"]) == 1,
+              str(_sent34["body"]["output"]["annotations"]))
+        check("...on the file and line it names",
+              _sent34["body"]["output"]["annotations"][0]["path"] == "app/auth.py"
+              and _sent34["body"]["output"]["annotations"][0]["start_line"] == 1,
+              str(_sent34["body"]["output"]["annotations"][0]))
+        check("...at failure level for a Critical",
+              _sent34["body"]["output"]["annotations"][0]["annotation_level"] == "failure")
+        check("a finding whose quote was not found is not placed on a guessed line",
+              _out34["unplaceable"] == 2,
+              "an annotation on the wrong line sends a reviewer to code that is fine and "
+              "teaches them the tool is unreliable")
+        check("...and the summary says how many could not be placed",
+              "2 finding(s) could not be placed"
+              in _sent34["body"]["output"]["summary"],
+              _sent34["body"]["output"]["summary"][:300])
+        check("the Details link is passed through when there is one",
+              _sent34["body"].get("details_url") == "https://sdlc.example/x")
+        check("the result carries the check run's own URL back",
+              _out34["created"] is True and "runs/9" in _out34["url"], str(_out34))
+
+        for _gate34, _concl34 in (("Green", "success"), ("Amber", "neutral"),
+                                  ("Red", "failure")):
+            _o34, _s34 = _run_check34({"gate_status": _gate34, "findings": []})
+            check(f"a {_gate34} gate concludes as {_concl34}",
+                  _s34["body"]["conclusion"] == _concl34, str(_s34["body"]["conclusion"]))
+        check("Amber deliberately does not block a merge",
+              _GHS34._CHECK_CONCLUSION["Amber"] == "neutral",
+              "whether an Amber gate should stop a merge is the open policy question C-38 "
+              "records; choosing action_required here would answer it for every customer")
+
+        _many34 = [dict(_placeable34, title=f"Finding {i}", line_start=i + 1,
+                        evidence_verified=True, fingerprint=f"fp-{i}")
+                   for i in range(_GHS34.MAX_ANNOTATIONS + 7)]
+        _o34, _s34 = _run_check34({"gate_status": "Red", "findings": _many34})
+        check("GitHub's fifty-annotation cap is respected",
+              len(_s34["body"]["output"]["annotations"]) == _GHS34.MAX_ANNOTATIONS,
+              str(len(_s34["body"]["output"]["annotations"])))
+        check("...and the overflow is counted rather than dropped silently",
+              _o34["annotations_omitted"] == 7
+              and "7 further finding(s)" in _s34["body"]["output"]["summary"],
+              _s34["body"]["output"]["summary"][:200])
+
+        _o34, _s34 = _run_check34({
+            "gate_status": "Red",
+            "findings": [dict(_placeable34, evidence_verified=True, carried_forward=True)],
+        })
+        check("a carried finding says so in its annotation",
+              "did not re-read" in _s34["body"]["output"]["annotations"][0]["message"],
+              "otherwise an annotation on a line this run never read looks like one it did")
+
+        # A refusal has to be a sentence with a cause, not a status code.
+        def _refuse34(status):
+            svc = _Check34()
+            import httpx as _hx34
+            _real = _hx34.Client
+
+            class _Deny:
+                def __init__(self, *a, **k):
+                    pass
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+                def post(self, *a, **k):
+                    class _R:
+                        status_code = status
+                        text = '{"message":"nope"}'
+                        @staticmethod
+                        def json():
+                            return {}
+                    return _R()
+
+            _hx34.Client = _Deny
+            try:
+                return svc.create_check_run("acme", "portal", "b" * 40,
+                                            {"gate_status": "Red", "findings": []}, "t")
+            finally:
+                _hx34.Client = _real
+
+        check("a 403 names the permission that is missing",
+              "Checks: Read and write" in (_refuse34(403).get("hint") or ""),
+              str(_refuse34(403)))
+        check("a 404 names the thing people actually forget",
+              "not installed" in (_refuse34(404).get("hint") or ""),
+              "an App that exists is not an App with access")
+        check("a refusal is reported, never raised",
+              _refuse34(500)["created"] is False,
+              "the review is stored and paid for by the time this runs")
+
+        # ── The setup endpoint ───────────────────────────────────────────
+        _st34 = client.get("/api/github/app/status")
+        check("the App status endpoint answers", _st34.status_code == 200, _st34.text[:200])
+        check("...saying what an App enables that a token cannot",
+              "annotated on its own line" in _st34.text, _st34.text[:300])
+        check("...and what already works without one",
+              "SARIF" in _st34.text and "commit status" in _st34.text)
+        check("...and the exact permissions to set",
+              _st34.json()["permissions_needed"]["Checks"] == "Read and write",
+              str(_st34.json().get("permissions_needed")))
+        check("...without returning anything secret",
+              "BEGIN" not in _st34.text and "ghs_" not in _st34.text, _st34.text[:200])
+        check("the written instructions exist, since the status points at them",
+              _os34.path.exists(_os34.path.join(
+                  _os34.path.dirname(_os34.path.dirname(_os34.path.abspath(__file__))),
+                  "docs", "github-app.md")),
+              "a status that names a document that is not there is worse than one that "
+              "names nothing")
+
+        # ── 33. Incremental review of a pull request ─────────────────────
+        #
+        # `synchronize` fires on every push, so an active pull request cost a full review
+        # per push. The saving is obvious; the danger is the whole of the work. A run that
+        # reads only the newest commits does not see a Critical raised two pushes ago in a
+        # file it never opened — **and an absent finding reads as a fixed one**, so the
+        # stored gate goes Green and `set_commit_status` clears the merge button.
+        #
+        # Everything below is about that one property.
+        section("33. An incremental review cannot turn a blocked pull request Green")
+
+        from backend.workflows import review_pr as _rp33
+
+        class _GH33:
+            """A GitHub stub that records what was asked of it.
+
+            Two calls matter: `get_pr_diff` (the whole pull request) and `get_compare_diff`
+            (the slice). Which of them the diff came from is the question.
+            """
+
+            def __init__(self, compare=None, compare_error=None):
+                self.compare = compare
+                self.compare_error = compare_error
+                self.asked = []
+                self.comments = []
+
+            def get_pr_diff(self, pr_url):
+                self.asked.append(("pr", pr_url))
+                return {
+                    "pr_number": 42, "title": "Add the thing", "description": "",
+                    "author": "dev", "base_branch": "main", "head_branch": "feature",
+                    "head_sha": "b" * 40, "base_sha": "a" * 40,
+                    "head_repo": "acme/portal", "base_repo": "acme/portal",
+                    "from_fork": False, "maintainer_can_modify": True,
+                    "diff": _FULL_DIFF33, "diff_truncated": False,
+                    "diff_full_chars": len(_FULL_DIFF33),
+                    "files_changed": ["app/old.py", "app/new.py"],
+                    "additions": 4, "deletions": 0, "url": pr_url,
+                }
+
+            def get_compare_diff(self, repo_url, base, head):
+                self.asked.append(("compare", base, head))
+                if self.compare_error:
+                    raise RuntimeError(self.compare_error)
+                return dict(self.compare, base=base, head=head)
+
+            def get_file_content_at_ref(self, owner, repo, path, ref):
+                raise RuntimeError("404 Not Found")
+
+            def parse_pr_url(self, pr_url):
+                return ("acme", "portal", 42)
+
+            def get_pr_head_sha(self, pr_url):
+                return "b" * 40
+
+            def format_pr_review_comment(self, result, result_url=""):
+                from backend.services.github_service import GitHubService
+                return GitHubService.format_pr_review_comment(self, result, result_url)
+
+            def _format_location(self, f):
+                return f"`{f.get('file_path', '')}`"
+
+            MAX_COMMENT_FINDINGS = 20
+            COMMENT_MARKER = "<!-- lm-ai-sdlc:review -->"
+
+            def upsert_pr_comment(self, pr_url, body):
+                self.comments.append(body)
+                return {"posted": True}
+
+            def set_commit_status(self, owner, repo, sha, gate, description=""):
+                return {"set": True, "gate": gate}
+
+        class _Orch33:
+            def __init__(self, gh, agent):
+                self.github = gh
+                self.code_agent = agent
+
+        class _Agent33:
+            """Records the diff it was shown, and answers with whatever is scripted."""
+
+            def __init__(self):
+                self.seen = []
+                self.answer = None
+                self.suppression = "unset"
+
+            def review_code(self, code="", language="", context="", files=None,
+                            is_diff=None, coverage_incomplete=False, coverage_reason="",
+                            extra_findings=None, suppression=None, on_progress=None,
+                            **kw):
+                self.seen.append({"code": code, "context": context,
+                                  "coverage_incomplete": coverage_incomplete})
+                self.suppression = suppression
+                out = dict(self.answer or {"findings": [], "gate_status": "Green",
+                                           "risk_score": 0.0, "summary": "Clean."})
+                finding_gate.reconcile_gate(out)
+                return out
+
+        _NEW33 = dict(
+            control_id="SEC-001", severity=5, risk_level="Critical",
+            title="Command injection in the new helper", description="Shell out.",
+            recommendation="Use argv.", is_blocking=True, file_path="app/new.py",
+            line_start=2, evidence="os.system(cmd)", confidence="High",
+        )
+
+        # ── The saving: only the new commits reach the model ─────────────
+        _gh33 = _GH33(compare={
+            "diff": _SLICE_DIFF33, "status": "ahead", "ahead_by": 2, "behind_by": 0,
+            "head_sha": "b" * 40, "diff_truncated": False,
+            "diff_full_chars": len(_SLICE_DIFF33),
+            "files_changed": ["app/new.py"],
+            "url": "https://github.com/acme/portal/compare/aaa...bbb",
+        })
+        _ag33 = _Agent33()
+        _ag33.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                        "summary": "The new commits are clean."}
+        _out33 = _rp33.run(_Orch33(_gh33, _ag33), pr_url=_PR33,
+                           post_mode="none", set_status=False, since_sha="a" * 40)
+        check("a push reviews only the commits since the last review",
+              "app/new.py" in _ag33.seen[0]["code"]
+              and "app/old.py" not in _ag33.seen[0]["code"],
+              "the model was shown: " + _ag33.seen[0]["code"][:120])
+        check("...asked for as a compare of the two commits",
+              ("compare", "a" * 40, "b" * 40) in _gh33.asked, str(_gh33.asked))
+        check("...and the reviewer is told it is seeing part of a pull request",
+              "INCREMENTAL review" in _ag33.seen[0]["context"],
+              "otherwise it reports a control missing when the file that implements it "
+              "simply was not in this push")
+        check("...and told the whole pull request's file list anyway",
+              "app/old.py" in _ag33.seen[0]["context"], _ag33.seen[0]["context"][:300])
+        check("a narrowed scope does not clamp the gate to Amber",
+              _out33["review_result"]["gate_status"] == "Green",
+              "the coverage clamp is for code nobody chose to skip; clamping a deliberate "
+              "narrowing would mean a clean push could never be Green, which is the point")
+        check("the result says what it read",
+              _out33["incremental"].get("commits") == 2
+              and _out33["incremental"].get("files_reviewed") == 1
+              and _out33["incremental"].get("files_in_pr") == 2,
+              str(_out33["incremental"]))
+        check("...and the comment says so too, before the gate is believed",
+              "commit(s) pushed since" in (_out33.get("comment_preview") or ""),
+              (_out33.get("comment_preview") or "")[:300])
+
+        # ── The danger: an earlier Critical must still block ─────────────
+        #
+        # Written straight into the database as a previous review of the same pull request,
+        # because what is under test is the *lookup* — a wrong repository, a wrong PR
+        # number or a missing `pr_number` column all produce an empty list and a wrongly
+        # Green gate, and each of those is a silent failure.
+        _prior33 = _seed_pr_review33(project_id=None, pr_number=42)
+        _gh33b = _GH33(compare={
+            "diff": _SLICE_DIFF33, "status": "ahead", "ahead_by": 1, "behind_by": 0,
+            "head_sha": "b" * 40, "diff_truncated": False,
+            "diff_full_chars": len(_SLICE_DIFF33),
+            "files_changed": ["app/new.py"],
+            "url": "https://github.com/acme/portal/compare/aaa...bbb",
+        })
+        _ag33b = _Agent33()
+        _ag33b.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                         "summary": "The new commits are clean."}
+        _out33b = _rp33.run(_Orch33(_gh33b, _ag33b), pr_url=_PR33,
+                            post_mode="none", set_status=False, since_sha="a" * 40)
+        _res33b = _out33b["review_result"]
+        _carried33 = [f for f in _res33b["findings"] if f.get("carried_forward")]
+        check("a still-open finding from an earlier push is carried into this run",
+              len(_carried33) == 1, str([f.get("title") for f in _res33b["findings"]]))
+        check("...so a clean push cannot turn a blocked pull request Green",
+              _res33b["gate_status"] == "Red", _res33b["gate_status"])
+        check("...and it is labelled as carried, not as found",
+              _carried33 and _carried33[0]["carried_from_review"] == _prior33,
+              str(_carried33[0] if _carried33 else None)[:200])
+        check("...with its evidence neither claimed nor denied",
+              _carried33 and _carried33[0]["evidence_verified"] is None
+              and "did not re-read" in (_carried33[0].get("evidence_note") or ""),
+              "it was verified against the file *then*; this run never opened the file, so "
+              "asserting either answer would be a claim about code nobody read")
+        check("...and the comment says which findings this run did not find",
+              "carried from an earlier review" in (_out33b.get("comment_preview") or ""),
+              (_out33b.get("comment_preview") or "")[:400])
+        check("the model's own verdict is still recorded, not overwritten by the re-floor",
+              _res33b.get("model_gate_status") == "Green",
+              str(_res33b.get("model_gate_status"))
+              + " -- reconcile_gate reads gate_status as the model's answer, so a second "
+                "call would replace it with the already-floored value and the suite could "
+                "no longer measure model-versus-arithmetic disagreement")
+
+        # A finding this run *did* find again must not appear twice.
+        _ag33c = _Agent33()
+        _ag33c.answer = {"findings": [dict(_PRIOR_FINDING33)], "gate_status": "Red",
+                         "risk_score": 90.0, "summary": "Still there."}
+        _out33c = _rp33.run(_Orch33(_GH33(compare=dict(_gh33b.compare)), _ag33c),
+                            pr_url=_PR33, post_mode="none", set_status=False,
+                            since_sha="a" * 40)
+        _same33 = [f for f in _out33c["review_result"]["findings"]
+                   if f.get("fingerprint") == _PRIOR_FINGERPRINT33]
+        check("a finding found again is not also carried",
+              len(_same33) == 1, f"{len(_same33)} copies of the same fingerprint")
+        check("...and the one that survives is the one this run actually verified",
+              _same33 and not _same33[0].get("carried_forward"), str(_same33[0])[:200])
+
+        # ── The fallbacks, all of which review the whole thing ───────────
+        for _label, _kwargs, _reason in (
+            ("a force-push or a rebase",
+             {"compare": {"diff": _SLICE_DIFF33, "status": "diverged", "ahead_by": 1,
+                          "behind_by": 3, "head_sha": "b" * 40, "diff_truncated": False,
+                          "diff_full_chars": 10, "files_changed": [], "url": ""}},
+             "rewritten"),
+            ("a comparison GitHub will not answer",
+             {"compare_error": "422 no common ancestor"}, "could not be fetched"),
+            ("a push that changes no reviewable code",
+             {"compare": {"diff": "   ", "status": "ahead", "ahead_by": 1, "behind_by": 0,
+                          "head_sha": "b" * 40, "diff_truncated": False,
+                          "diff_full_chars": 3, "files_changed": [], "url": ""}},
+             "no reviewable code"),
+        ):
+            _ghx = _GH33(**_kwargs)
+            _agx = _Agent33()
+            _agx.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                           "summary": "Clean."}
+            _outx = _rp33.run(_Orch33(_ghx, _agx), pr_url=_PR33, post_mode="none",
+                              set_status=False, since_sha="a" * 40)
+            check(f"{_label} falls back to the whole pull request",
+                  "app/old.py" in _agx.seen[0]["code"],
+                  "the model was shown: " + _agx.seen[0]["code"][:120])
+            check(f"...and the result says why, rather than silently costing more",
+                  _reason in (_outx["incremental"].get("reason") or ""),
+                  str(_outx["incremental"]))
+
+        # Comparing a commit with itself is a review of nothing, so it must not happen.
+        _ghs = _GH33(compare=dict(_gh33b.compare))
+        _ags = _Agent33()
+        _ags.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                       "summary": "Clean."}
+        _rp33.run(_Orch33(_ghs, _ags), pr_url=_PR33, post_mode="none", set_status=False,
+                  since_sha="b" * 40)
+        check("a sha equal to the head is not compared with itself",
+              not any(a[0] == "compare" for a in _ghs.asked), str(_ghs.asked))
+
+        # With no `since_sha` at all — every non-push event — nothing changes.
+        _ghn = _GH33()
+        _agn = _Agent33()
+        _agn.answer = {"findings": [], "gate_status": "Green", "risk_score": 0.0,
+                       "summary": "Clean."}
+        _outn = _rp33.run(_Orch33(_ghn, _agn), pr_url=_PR33, post_mode="none",
+                          set_status=False)
+        check("without a previous review the whole pull request is read, and nothing is said",
+              "app/old.py" in _agn.seen[0]["code"] and not _outn["incremental"],
+              str(_outn["incremental"]))
+
+        # ── The bookkeeping the webhook reads ────────────────────────────
+        database.record_webhook_review("acme/portal", "c" * 40, _PR33, "job-1", "d1")
+        database.record_webhook_review("acme/portal", "d" * 40, _PR33, "job-2", "d2")
+        check("the last reviewed commit for a pull request is the newest one",
+              database.last_reviewed_sha_for_pr("acme/portal", _PR33) == "d" * 40,
+              str(database.last_reviewed_sha_for_pr("acme/portal", _PR33)))
+        check("...excluding the push being handled right now",
+              database.last_reviewed_sha_for_pr(
+                  "acme/portal", _PR33, before_sha="d" * 40) == "c" * 40,
+              "the webhook records its own row after queueing, and a redelivery would "
+              "otherwise compare a sha with itself")
+        check("another pull request in the same repository is not confused with this one",
+              database.last_reviewed_sha_for_pr(
+                  "acme/portal", "https://github.com/acme/portal/pull/99") is None)
+        check("a repository with no reviewed pushes yields nothing rather than an error",
+              database.last_reviewed_sha_for_pr("acme/other", _PR33) is None)
+
+        # And the repository dimension, which pull-request reviews never recorded at all.
+        _stored33 = database.get_review(_out33b["review_id"])
+        check("a pull-request review now records which repository it was of",
+              _stored33.get("repo_owner") == "acme" and _stored33.get("repo_name") == "portal",
+              f"owner={_stored33.get('repo_owner')!r} name={_stored33.get('repo_name')!r} "
+              f"-- every PR review ever stored had NULL here, so `GET /api/repositories`, "
+              f"the findings repo filter and the carry-forward lookup were all blind to "
+              f"the one source where the repository is least ambiguous")
+        check("...and which pull request", _stored33.get("pr_number") == 42,
+              str(_stored33.get("pr_number")))
+        check("...and at which commit", _stored33.get("commit_sha") == "b" * 40,
+              str(_stored33.get("commit_sha")))
+        check("the repository's ignore rules are offered to a pull-request review",
+              _ag33b.suppression is not None,
+              "a `.lmignore` in the repository has to reach the review that reads its diff, "
+              "and the fetch fails open -- this stub answers 404, which is the common case")
+
+        # Which scope the *webhook* asks for. Checked on the source rather than by firing a
+        # delivery, because the decision is three lines of policy — only a push, only when
+        # the switch is on, never against this push's own sha — and each of them is a
+        # different way to get a review of nothing or a review of everything.
+        import inspect as _i33
+        from backend.routes import github_webhook as _wh33
+        _whsrc33 = _i33.getsource(_wh33.github_webhook)
+        check("only a push asks for an incremental review",
+              'action == "synchronize"' in _whsrc33,
+              "opened, reopened and ready_for_review are the moments where scope matters "
+              "more than cost, and `opened` has nothing earlier to compare against")
+        check("...and only when the switch is on",
+              "config.INCREMENTAL_PR_REVIEW" in _whsrc33)
+        check("...and never against the sha being reviewed right now",
+              "before_sha=head_sha" in _whsrc33,
+              "the webhook records its own row after queueing, so a redelivery would "
+              "compare a commit with itself and review nothing")
+        check("the switch defaults to on, and can be turned off",
+              config.INCREMENTAL_PR_REVIEW is True
+              and "INCREMENTAL_PR_REVIEW" in _i33.getsource(config),
+              str(config.INCREMENTAL_PR_REVIEW))
+        check("the delivery response says which scope was chosen",
+              '"scope"' in _whsrc33,
+              "GitHub's delivery log is where somebody looks to find out why a push cost "
+              "what it cost")
+
+        # ── The live driver, which is the only thing that can reach any of this ──
+        #
+        # D-317's landmine stands: every check in this section is *structural*. It reads
+        # the source of `_deliver` and asserts the shape of the code, because the offline
+        # suite stops at `plan` and `plan` writes nothing. Structure caught D-314, D-315
+        # and D-325 only after a person had already found them by reading.
+        #
+        # `scripts/verify_fix_apply.py` is the counterpart that actually writes, and the
+        # property guarded here is that it does not fall behind: a sixth delivery mode
+        # added to `fix_apply.OUTPUTS` with no stage in the driver is a write path back to
+        # having no coverage at all, which is exactly how this subsystem got three bugs.
+        _driver31 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "verify_fix_apply.py")
+        check("a live driver for fix delivery exists at all",
+              os.path.exists(_driver31),
+              "`verify_pr_review.py` covers pull-request *review* writes; fix delivery had "
+              "no equivalent, and three defects lived in twenty lines because of it")
+        _dsrc31 = io.open(_driver31, encoding="utf-8").read() if os.path.exists(_driver31) else ""
+        _uncovered31 = [o for o in fix_apply.OUTPUTS if f'"{o}"' not in _dsrc31]
+        check("...and it drives EVERY delivery `fix_apply` offers",
+              not _uncovered31,
+              f"no stage for: {_uncovered31} -- a delivery nothing exercises is a delivery "
+              "nobody knows is broken, which is the D-314 story exactly")
+        check("...including the preview, which must write nothing",
+              fix_apply.PREVIEW in _dsrc31 and "NOTHING WAS WRITTEN" in _dsrc31)
+        check("...and it can be run without writing, and can undo what it wrote",
+              "--dry-run" in _dsrc31 and "--cleanup" in _dsrc31,
+              "a driver that can only be run destructively is a driver nobody runs")
+        # The three defects are named in it, so a failure points at the history rather than
+        # leaving the next person to rediscover why the check is there.
+        _named31 = [d for d in ("D-314", "D-315", "D-325") if d not in _dsrc31]
+        check("...and cites the defects each write-path check exists for", not _named31,
+              f"missing: {_named31}")
+
+        # ── 32. Suppression as code, end to end ──────────────────────────
+        #
+        # Section 13 of `smoke_code_review.py` covers the rules themselves. What only
+        # exists end to end is the *plumbing*: the ignore file has no reviewable extension,
+        # so it is dropped by `repo_ingest.normalize_files` and can only be found in the
+        # raw list — a wiring mistake there means the feature silently never fires, and
+        # every unit test still passes.
+        section("32. Suppression as code reaches a real review")
+
+        from backend.services import suppression as _sup32
+
+        # Deliberately not a hardcoded credential. `repo_ingest` redacts those at ingest
+        # (D-04), so a finding quoting the literal is *discarded* by evidence verification
+        # before suppression is reached -- which is correct, and would have made this
+        # section pass or fail for a reason unrelated to what it is testing.
+        _IGNORED_HIT = dict(
+            control_id="SEC-001", severity=5, risk_level="Critical",
+            title="Unsafe eval in the legacy parser", description="Evaluates input.",
+            recommendation="Parse it instead.", is_blocking=True,
+            file_path="legacy/parser.py", line_start=2, confidence="High",
+            evidence="return eval(payload)",
+        )
+        _KEPT_HIT = dict(
+            control_id="SEC-001", severity=5, risk_level="Critical",
+            title="Command injection in the runner", description="Shell out of user input.",
+            recommendation="Use a list argv.", is_blocking=True,
+            file_path="app/runner.py", line_start=4, confidence="High",
+            evidence="os.system(cmd)",
+        )
+        _SRC32 = {
+            "legacy/parser.py": "def parse(payload):\n    return eval(payload)\n",
+            "app/runner.py": "import os\n\ndef run(cmd):\n    os.system(cmd)\n",
+            ".lmignore": (
+                "# legacy/ is deleted in Q3, tracked in JIRA-4412\n"
+                "legacy/**: SEC-001 scheduled for deletion\n"
+                "this/pattern/matches/nothing/**\n"
+            ),
+        }
+
+        # The parse, straight off a zip, before any review. This is the wiring check.
+        _b32 = source_bundle.from_zip_bytes(make_zip(_SRC32), label="ignore-demo")
+        check("the ignore file is found in a zip even though it is never reviewed",
+              _b32.suppression is not None and len(_b32.suppression.rules) == 2,
+              str(getattr(_b32.suppression, "rules", None)))
+        check("...and is itself excluded from the files sent to the model",
+              all(f["path"] != ".lmignore" for f in _b32.files),
+              "a rules file in the prompt is tokens spent on instructions to ourselves")
+        check("the source summary states how many rules the repository brought",
+              _b32.summary()["ignore_rules"] == 2, str(_b32.summary().get("ignore_rules")))
+
+        scripted["code"] = code_response([dict(_IGNORED_HIT), dict(_KEPT_HIT)], gate="Red")
+        _run32 = client.post(
+            "/api/review/code/upload-zip",
+            files={"file": ("ignore-demo.zip", make_zip(_SRC32), "application/zip")},
+            data={"project_name": "Sources"}, headers=UI,
+        )
+        check("a zip carrying a .lmignore reviews normally",
+              _run32.status_code == 200, _run32.text[:240])
+        _r32 = _run32.json()
+        _titles32 = [f.get("title") for f in (_r32.get("findings") or [])]
+        _sup_titles32 = [f.get("title") for f in (_r32.get("suppressed_findings") or [])]
+        check("the finding the repository asked us to ignore leaves the gating list",
+              "Unsafe eval in the legacy parser" not in _titles32, str(_titles32))
+        check("...and is still reported, so nobody can hide a Critical by committing a file",
+              "Unsafe eval in the legacy parser" in _sup_titles32, str(_sup_titles32))
+        check("...naming the rule and the line it lives on",
+              ".lmignore:2" in str([f.get("suppressed_reason")
+                                    for f in _r32.get("suppressed_findings") or []]),
+              str([f.get("suppressed_reason") for f in _r32.get("suppressed_findings") or []]))
+        check("a finding the rules do not cover is untouched",
+              "Command injection in the runner" in _titles32, str(_titles32))
+        check("...so the gate is still Red on what is left",
+              _r32.get("gate_status") == "Red", str(_r32.get("gate_status")))
+
+        _rep32 = _r32.get("suppression") or {}
+        check("the run reports the rules it was given", _rep32.get("rules") == 2, str(_rep32))
+        check("...and how many findings they took out",
+              _rep32.get("findings_suppressed") == 1, str(_rep32))
+        check("...and names the rule that matched nothing",
+              _rep32.get("unused_count") == 1
+              and "this/pattern/matches/nothing" in str(_rep32.get("unused")),
+              str(_rep32.get("unused")))
+
+        # An inline comment, on the source that would otherwise have been reported.
+        _INLINE32 = {
+            "app/runner.py": ("import os\n"
+                              "def run(cmd):\n"
+                              "    os.system(cmd)  # lm-ignore: SEC-001 admin CLI only\n"),
+        }
+        _inline_hit = dict(_KEPT_HIT, line_start=3,
+                           evidence="os.system(cmd)  # lm-ignore: SEC-001 admin CLI only")
+        scripted["code"] = code_response([dict(_inline_hit)], gate="Red")
+        _run33 = client.post(
+            "/api/review/code/upload-zip",
+            files={"file": ("inline.zip", make_zip(_INLINE32), "application/zip")},
+            data={"project_name": "Sources"}, headers=UI,
+        )
+        check("an inline lm-ignore comment reaches a real review",
+              _run33.status_code == 200, _run33.text[:240])
+        _r33 = _run33.json()
+        check("...and takes its own line out of the gating list",
+              not (_r33.get("findings") or []),
+              str([f.get("title") for f in _r33.get("findings") or []]))
+        check("...while still reporting it with the comment as the reason",
+              len(_r33.get("suppressed_findings") or []) == 1
+              and "lm-ignore at app/runner.py:3"
+              in (_r33["suppressed_findings"][0].get("suppressed_reason") or ""),
+              str([f.get("suppressed_reason") for f in _r33.get("suppressed_findings") or []]))
+        check("...and the gate still cannot be talked down from the model's own verdict",
+              _r33.get("gate_status") == "Red", str(_r33.get("gate_status")),)
+        # The other direction, so the pairing is not an accident: with the model reporting
+        # Green, an ignored finding leaves nothing to floor the gate up from.
+        scripted["code"] = code_response([dict(_inline_hit)], gate="Green", risk=1.0)
+        _run34 = client.post(
+            "/api/review/code/upload-zip",
+            files={"file": ("inline2.zip", make_zip(_INLINE32), "application/zip")},
+            data={"project_name": "Sources"}, headers=UI,
+        )
+        check("an ignored finding does not floor the gate upward either",
+              _run34.status_code == 200
+              and _run34.json().get("gate_status") in ("Green", "Amber"),
+              str(_run34.json().get("gate_status")))
+        check("...and it is still on the record in that run too",
+              len(_run34.json().get("suppressed_findings") or []) == 1,
+              "a rule lowers the gate; it never removes the evidence")
+
+        # A pull request has no file list, so `.lmignore` has to be fetched. The fetch must
+        # fail open: a repository without one answers 404, which is the common case.
+        class _NoIgnoreGH:
+            def get_file_content_at_ref(self, owner, repo, path, ref):
+                raise RuntimeError("404 Not Found")
+
+        _pr32 = source_bundle.pr_bundle(
+            {"diff": "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "title": "t",
+             "head_sha": "d" * 40, "files_changed": ["x.py"]},
+            "https://github.com/acme/portal/pull/7", github=_NoIgnoreGH(),
+        )
+        check("a repository with no ignore file still yields a reviewable pull request",
+              _pr32.suppression is not None and not _pr32.suppression.rules,
+              "a 404 for .lmignore must not fail the review")
+
+        class _IgnoreGH:
+            def __init__(self):
+                self.asked = []
+
+            def get_file_content_at_ref(self, owner, repo, path, ref):
+                self.asked.append((owner, repo, path, ref))
+                return {"content": "docs/**  prose, not code\n"}
+
+        _gh32 = _IgnoreGH()
+        _pr33 = source_bundle.pr_bundle(
+            {"diff": "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", "title": "t",
+             "head_sha": "e" * 40, "files_changed": ["x.py"]},
+            "https://github.com/acme/portal/pull/9", github=_gh32,
+        )
+        check("a pull request reads the ignore file out of the repository",
+              len(_pr33.suppression.rules) == 1, str(_gh32.asked))
+        check("...at the commit the review is about, not the branch tip",
+              _gh32.asked and _gh32.asked[0][3] == "e" * 40, str(_gh32.asked))
+        check("...from the right repository", _gh32.asked[0][:3] == ("acme", "portal", ".lmignore"),
+              str(_gh32.asked))
+        _pr34 = source_bundle.pr_bundle(
+            {"diff": "d", "title": "t", "head_sha": "f" * 40}, "https://x/pull/1")
+        check("a caller that passes no client gets no rules rather than an error",
+              _pr34.suppression is None)
+
+        # ── The migration path off click-by-click waivers ────────────────
+        #
+        # The friction this feature exists to remove: a team that has been waiving the same
+        # findings for months has those decisions in the database only.
+        _w32 = client.get("/api/v1/findings/lmignore", headers=H)
+        check("the waiver export answers", _w32.status_code == 200, _w32.text[:200])
+        check("...as a file, not as JSON",
+              "text/plain" in _w32.headers.get("content-type", ""),
+              _w32.headers.get("content-type", ""))
+        check("...offered as a download named .lmignore",
+              ".lmignore" in _w32.headers.get("content-disposition", ""),
+              _w32.headers.get("content-disposition", ""))
+        check("...warning that a rule is wider than the waiver it came from",
+              "wider than" in _w32.text,
+              "an exported rule covers the control and the path; the waiver covered one "
+              "finding, matched on its title and evidence too")
+        _parsed32 = _sup32.parse(_w32.text)
+        check("...and whatever it produces parses as a valid ignore file",
+              not _parsed32.errors, str(_parsed32.errors))
+        check("the export requires a credential",
+              client.get("/api/v1/findings/lmignore").status_code in (401, 403),
+              "it lists what a team has decided not to fix, which is a map of known holes")
+
 
 
 
@@ -3056,6 +4140,410 @@ def main():
 
     check("reload can be turned off without a different command",
           os.getenv("RELOAD") is None or True)
+
+    # ── 32. A codebase reaches the agents that are not Code Review ─────────
+    #
+    # Three intakes were added at once and they are deliberately *not* the same shape, so
+    # the thing worth guarding is that each stays the shape its agent needs.
+    #
+    #  * Architecture and Security send a computed **structural brief** and make ONE call.
+    #    They answer a holistic question -- `ARCHITECTURE_TOOL_SCHEMA` has a single
+    #    `quality_scores` object -- so there is nothing sensible to merge from chunks, and a
+    #    repository does not fit in one call. If either ever appears in `_CHUNKABLE_ROUTES`
+    #    somebody has misread that as a chunking problem.
+    #  * Sensitive Data sends the **real source**, fanned out. Its question is per file, so
+    #    a summary would be worse than useless: a summary cannot contain the hardcoded key
+    #    that is the finding. It must be in `_CHUNKABLE_ROUTES` or it reserves budget for
+    #    one call and makes forty (C-77).
+    #
+    # And the brief must never claim more coverage than it has: real dependency edges exist
+    # only for the five parsed languages, and a JavaScript repository degrades to a file
+    # listing. Saying so is the whole reason the coverage note exists.
+    section("32. A codebase reaches the agents that are not Code Review")
+
+    from backend.services import code_brief as _cb32
+    from backend.services import legacy_guard as _lg32
+
+    _chunkable32 = set(_lg32._CHUNKABLE_ROUTES)
+    check("the two design routes do not chunk",
+          not ({"/api/review/architecture/source", "/api/review/security/source"}
+               & _chunkable32),
+          "a holistic verdict cannot be merged from chunks -- these send one brief and make "
+          "one call; listing them here would fan out a question that has no merge rule")
+    check("...and the sensitive-data scan does",
+          {"/api/review/sensitive-data/source",
+           "/api/review/sensitive-data/upload-zip"} <= _chunkable32,
+          "it reads every file, so it reserves for the fan-out it is about to make (C-77)")
+    check("...and all four are metered as their own product",
+          all(_lg32.product_for_request("POST", p) == a for p, a in (
+              ("/api/review/architecture/source", "architecture"),
+              ("/api/review/architecture/upload-zip", "architecture"),
+              ("/api/review/security/source", "security"),
+              ("/api/review/sensitive-data/source", "sensitive-data"))),
+          "an unmapped route is entitled to nobody and billed to nothing (D-289)")
+    check("...with the upload doors split per product, not one taking an `agent` field",
+          _lg32.product_for_request("POST", "/api/review/security/upload-zip") == "security",
+          "one path serving two products would entitle both as whichever the map named")
+
+    _py32 = _cb32.build(source_bundle.from_files([
+        {"path": "app/db.py", "content": "import app.util\n\ndef q():\n    return 1\n"},
+        {"path": "app/util.py", "content": "def helper():\n    return 2\n"},
+    ]))
+    check("a parsed codebase produces a real dependency graph",
+          _py32["stats"].get("edges", 0) >= 1 and _py32["coverage"]["files_analysed"] == 2,
+          f"{_py32['stats']} / {_py32['coverage']}")
+    check("...and the brief is a description, not the source",
+          "def q()" not in _py32["markdown"] and "app/db.py" in _py32["markdown"],
+          "the point is that it fits in one call; pasting the bodies back in defeats it")
+    check("...and every file reports its real size",
+          "| 0 |" not in _py32["markdown"],
+          "`render_inventory` prints `loc`, which `graph.build` does not set -- without it "
+          "a 2,000-line god object and an empty __init__.py look identical to the one call "
+          "that has to decide whether they belong together")
+
+    _js32 = _cb32.build(source_bundle.from_files([
+        {"path": "src/app.js", "content": "import x from './y';\nexport const a = 1;\n"},
+        {"path": "src/y.js", "content": "export default 2;\n"},
+    ]))
+    check("an unparsed language says so instead of implying a graph",
+          _js32["coverage"]["files_analysed"] == 0
+          and "no parser" in _js32["coverage_note"]
+          and "no dependency graph" in _js32["coverage_note"],
+          f"{_js32['coverage_note'][:160]!r} -- JavaScript has no analyzer (C-24), and a "
+          "brief that stayed quiet about it would read as a complete picture")
+    check("...and the same sentence goes to the model and to the screen",
+          _js32["coverage_note"] == _cb32.coverage_note(_js32["coverage"]),
+          "two accounts of how much was read would be one too many")
+
+    # Built directly rather than through `from_files`, which refuses an empty list at the
+    # door. The case this guards is the one that gets past that door: a bundle that resolved
+    # fine and whose files were all filtered out.
+    _empty32 = _cb32.build(source_bundle.Bundle(source_type="files", files=[]))
+    check("an input with no readable source produces no brief at all",
+          _empty32["markdown"] == "",
+          "the route turns this into a 400 -- reviewing an empty inventory would return a "
+          "confident verdict about nothing, which is the degenerate result `attest` exists "
+          "to stop reaching a screen")
+
+    # ── 33. The rest of the agents get a codebase, and generated code gets out ──
+    #
+    # Four intakes and one outtake, and again the shapes differ on purpose.
+    #
+    #  * **Migration Assessment** joins Architecture and Security on the structural brief.
+    #    `MIGRATION_ASSESSMENT_TOOL_SCHEMA` returns one `complexity` and one
+    #    `estimated_effort`, so it is the same holistic question and must not chunk.
+    #  * **Part 11 and GxP** get the **real files**, because "is there an audit-trail write
+    #    when a record changes" is a question about code and a summary cannot answer it.
+    #    Part 11 splits when the prompt does not fit (D-354) so it must be chunkable; the
+    #    GxP planner does not split, so it must not be.
+    #  * **The regulated cap is reported, not applied silently.** 60 files / 120,000
+    #    characters bounds what `review_estimate.for_regulated_files` is calibrated on, and
+    #    a repository hits it far more easily than a hand-made zip did. `attest.coverage_claim`
+    #    cannot catch this one: it reconciles the model's claim against *the input it was
+    #    given*, which is already the truncated 60. An FDA-facing report is the last place
+    #    an unstated coverage gap belongs.
+    #  * **Generated code can be pushed**, and `code_delivery` is deliberately narrower than
+    #    `fix_apply`: no existing branch, no commit onto somebody's checkout, and a
+    #    deny-by-default list of which stored runs may be delivered at all.
+    section("33. Codebases into the remaining agents, and generated code back out")
+
+    from backend.services import legacy_guard as _lg33
+    from backend.services import code_delivery as _cd33
+    import backend.main as _m33
+
+    def _refuses(mod, fname, *args, _pre=None, **kw):
+        """True when the call raises `DeliveryError` — the module's own refusal.
+
+        Any other exception propagates: a guard that happens to crash is not a guard, and
+        a bare `except Exception` here would report a TypeError as a successful refusal.
+        """
+        if _pre:
+            _pre()
+        try:
+            getattr(mod, fname)(*args, **kw)
+            return False
+        except mod.DeliveryError:
+            return True
+
+    _chunk33 = set(_lg33._CHUNKABLE_ROUTES)
+    check("a migration assessment of a codebase is one call, not a fan-out",
+          "/api/review/migration-assessment/source" not in _chunk33,
+          "one complexity and one effort estimate have no merge rule across chunks, the "
+          "same reason the two design agents are absent")
+    check("...and a Part 11 verification of one is a fan-out",
+          "/api/review/cfr21-verification/source" in _chunk33,
+          "cfr21_agent.verify splits when the prompt does not fit (D-354) -- unlisted, it "
+          "reserves for one call and makes several (C-77)")
+    check("...and the GxP planner is not, because it does not split",
+          "/api/review/gxp-generate-plan/source" not in _chunk33,
+          "gxp_generator_agent.plan makes a single call; reserving for a fan-out that never "
+          "happens denies calls that would have succeeded")
+    check("every new run door is metered as its own product",
+          all(_lg33.product_for_request("POST", p) == a for p, a in (
+              ("/api/review/migration-assessment/source", "migration-assessment"),
+              ("/api/review/migration-assessment/upload-zip", "migration-assessment"),
+              ("/api/review/cfr21-verification/source", "cfr21-verification"),
+              ("/api/review/gxp-generate-plan/source", "gxp-generate-plan"))),
+          "an unmapped route is entitled to nobody and billed to nothing (D-289)")
+    check("...and no preflight is, because a quote spends nothing",
+          all(_lg33.product_for_request("POST", p) is None for p in (
+              "/api/review/migration-assessment/preflight",
+              "/api/review/cfr21-verification/preflight",
+              "/api/review/gxp-generate-plan/preflight",
+              "/api/review/gxp-generate-plan/preflight-zip",
+              "/api/code-brief")),
+          "refusing to quote somebody near their cap tells them less than the quote would")
+
+    # -- the regulated cap, and saying so ---------------------------------
+    _small33 = source_bundle.from_files(
+        [{"path": f"a{i}.py", "content": "x = 1\n"} for i in range(5)])
+    _b33 = _m33._regulated_files(_small33)
+    check("a source inside the regulated cap reports no gap",
+          _b33["assessed"] == 5 and _b33["considered"] == 5
+          and not _b33["capped"] and _b33["cap_note"] == "",
+          f"{_b33['assessed']}/{_b33['considered']} capped={_b33['capped']}")
+
+    _big33 = source_bundle.from_files(
+        [{"path": f"b{i}.py", "content": "y = 2\n"} for i in range(140)])
+    _c33 = _m33._regulated_files(_big33)
+    check("a source over the file cap is truncated to exactly the cap",
+          _c33["assessed"] == _m33._CFR21_MAX_FILES,
+          f"assessed {_c33['assessed']}, cap {_m33._CFR21_MAX_FILES}")
+    check("...and says how much was left out, with both numbers",
+          _c33["capped"] and str(_c33["considered"]) in _c33["cap_note"]
+          and str(_c33["considered"] - _c33["assessed"]) in _c33["cap_note"],
+          f"{_c33['cap_note'][:200]!r} -- a Part 11 report covering 60 of 140 files that "
+          "does not say so overstates its coverage, and coverage_claim cannot catch it "
+          "because the 60 is all it ever sees")
+    check("...and refuses to let a compliant verdict travel to the unread files",
+          "applies to" in _c33["cap_note"] or "apply to" in _c33["cap_note"],
+          "the note has to say what the conclusion does *not* cover, not only the count")
+    # A whole file or none of it. This was `text[:remaining]`, so the last file that fit was
+    # cut in half and handed to the model with nothing saying so -- and "no audit-trail
+    # write in this file" is then a *wrong* finding in an FDA-facing report whenever the
+    # write was in the discarded half.
+    _huge33 = source_bundle.from_files([
+        {"path": "small.py", "content": "a = 1\n"},
+        {"path": "big.py", "content": "x = 1\n" * (_m33._CFR21_MAX_TOTAL_CHARS // 4)},
+        {"path": "also_small.py", "content": "b = 2\n"},
+    ])
+    _d33 = _m33._regulated_files(_huge33)
+    check("a file is assessed whole or not at all, never half",
+          all(len(f["content"]) == len(o["content"])
+              for f in _d33["files"]
+              for o in _huge33.files if o["path"] == f["path"]),
+          "a partial file the model is not told is partial turns an absent finding into a "
+          "clean verdict over code nobody read")
+    check("...and a file too large for the whole budget is named, not just dropped",
+          _d33["assessed"] == 2 and _d33["oversize"] == ["big.py"]
+          and "never be included by re-running" in _d33["cap_note"],
+          f"{_d33['assessed']} assessed, oversize={_d33['oversize']} -- splitting the "
+          "system does not help with this one, so somebody chasing full coverage has to "
+          "know which case they are in")
+
+    check("...and the same sentence goes to the model",
+          _c33["cap_note"] in _m33._regulated_context(_big33, _c33, ""),
+          "a gap stated on the screen and not in the prompt is a gap the report will not "
+          "mention")
+
+    # -- code_delivery: what it refuses before writing --------------------
+    check("a repository URL is parsed or refused, never half-parsed",
+          _cd33.owner_repo("https://github.com/o/r.git/") == ("o", "r"),
+          "an empty owner produces a 404 from a URL that looks almost right")
+    for _bad33 in ("", "not a url", "https://github.com/onlyowner"):
+        try:
+            _cd33.owner_repo(_bad33)
+            check(f"...and {_bad33!r} is refused", False, "it was accepted")
+        except _cd33.DeliveryError:
+            check(f"...and {_bad33!r} is refused", True)
+
+    check("a generated path that escapes the repository is refused",
+          _refuses(_cd33, "safe_path", "../../etc/passwd"),
+          "generated paths come from a model, which is exactly the input that should not "
+          "be trusted to stay inside the tree")
+    check("...while an ordinary one is normalised, not rejected",
+          _cd33.safe_path("./src//app.py") == "src/app.py")
+
+    check("two generated files claiming one path are refused",
+          _refuses(_cd33, "_check_files",
+                   [{"path": "a.py", "content": "1"}, {"path": "./a.py", "content": "2"}]),
+          "letting the second silently overwrite the first loses a file with no error")
+    check("...and a run that produced nothing is refused",
+          _refuses(_cd33, "_check_files", []),
+          "an empty delivery would create a branch with nothing on it")
+    check("...and more files than one click should push is refused",
+          _refuses(_cd33, "_check_files",
+                   [{"path": f"f{i}.py", "content": "1"} for i in range(_cd33.MAX_FILES + 1)]),
+          "a scaffold is 8-16 files by its own prompt; anything near the cap means "
+          "something else happened")
+
+    class _GH33:
+        """A GitHub that has one branch and remembers what it was asked to do."""
+        token = "t"
+        def __init__(self, existing=("main",)):
+            self.existing, self.created, self.committed = set(existing), [], []
+        def branch_exists(self, o, r, b): return b in self.existing
+        def get_default_branch(self, o, r): return "main"
+        def get_branch_head_sha(self, o, r, b): return "0" * 40
+        def create_branch_at_sha(self, o, r, b, sha): self.created.append(b)
+        def commit_file(self, o, r, b, p, c, m): self.committed.append(p); return {"path": p}
+        def create_pull_request(self, o, r, t, b, h, base):
+            return {"number": 1, "url": "u", "state": "open"}
+
+    _orig_gfr33 = source_bundle.github_for_repo
+    try:
+        _gh33 = _GH33()
+        source_bundle.github_for_repo = lambda url, pid=None: _gh33
+        _files33 = [{"path": "src/app.py", "content": "print(1)\n"}]
+        _url33 = "https://github.com/o/r"
+
+        check("generated code is never committed onto the branch it would merge into",
+              _refuses(_cd33, "deliver", _files33, _url33, branch="main"),
+              "that is `fix_apply`'s `same_pr` delivery, which is opt-in there only because "
+              "a review had already read the branch -- nothing has read this")
+        check("...nor onto a branch that already exists",
+              _refuses(_cd33, "deliver", _files33, _url33, branch="lm-scaffold/x",
+                       _pre=lambda: _gh33.existing.add("lm-scaffold/x")),
+              "re-running a scaffold is cheap and easy to do twice; stacking a second "
+              "generation on the first is not something a person can see before it happens")
+
+        _gh33 = _GH33()
+        source_bundle.github_for_repo = lambda url, pid=None: _gh33
+        _out33 = _cd33.deliver(_files33, _url33, branch="lm-scaffold/abc",
+                               commit_message="m", review_id="r1")
+        check("a clean delivery cuts the branch from the default and commits to it",
+              _out33["branch"] == "lm-scaffold/abc" and _out33["base_branch"] == "main"
+              and _gh33.created == ["lm-scaffold/abc"] and _gh33.committed == ["src/app.py"],
+              f"{_out33} / created={_gh33.created} committed={_gh33.committed}")
+        check("...and opens no pull request unless asked",
+              _out33["pull_request"] is None,
+              "a branch is a proposal somebody can ignore; a pull request asks for a review")
+    finally:
+        source_bundle.github_for_repo = _orig_gfr33
+
+    check("an unreviewed run says so in the pull request body",
+          "NOT reviewed" in _cd33.pr_body_for(
+              "codegen_scaffold", "r1",
+              "NOT reviewed. This run was produced without the pre-release check, so no "
+              "agent has read this code."),
+          "the person merging generated code is entitled to know nothing checked it "
+          "before they read a line")
+
+    check("only runs that actually produce files can be delivered",
+          set(_m33._DELIVERABLE_RUNS) == {"codegen_scaffold", "migration_execute"},
+          "deny by default -- a review type absent from the map cannot be pushed at all, "
+          "rather than the route guessing from the shape of `result`")
+
+    # -- and the whole way through, with the model stubbed ----------------
+    #
+    # The checks above are about shape. These are the only ones that would notice that a
+    # route calls its orchestrator method with an argument it does not take, or that a
+    # single-call agent quietly became a fan-out.
+    from fastapi.testclient import TestClient as _TC33
+    import backend.main as _main33
+    _main33.llm_settings_service.is_llm_configured = lambda: True
+
+    _calls33 = []
+
+    def _fake33(system_prompt, user_content, schema, override=None, max_tokens=None, **kw):
+        name = schema.get("name", "")
+        _calls33.append(name)
+        if "migration" in name:
+            return {"source_stack": "Python/Flask", "target_stack": "FastAPI",
+                    "migration_type": "Framework", "complexity": "Moderate",
+                    "estimated_effort": "3 weeks", "breaking_changes": ["routing"],
+                    "risk_areas": ["sessions"],
+                    "phased_plan": [{"phase": "1", "deliverables": ["x"]}],
+                    "recommended_approach": "incremental", "justification": "small surface",
+                    "rollback_strategy": "keep both", "summary": "A moderate migration."}
+        if "gxp" in name:
+            return {"gxp_classification": "GxP-Supporting", "summary": "Supporting system.",
+                    "system_understanding": "A small data service.", "gamp5_category": "4",
+                    "validation_approach": "risk based",
+                    "applicable_documents": [{"document_type": "URS", "applicable": True,
+                                              "rationale": "needed", "outline": ["scope"]}]}
+        return {"overall_gate_status": "Amber", "overall_risk_score": 40,
+                "summary": "Audit trail partially present.",
+                "files_scanned": ["app/db.py"],
+                "findings": [{"severity": 3, "title": "No audit trail on update",
+                              "control_id": "21CFR11-10e", "file": "app/db.py",
+                              "evidence": "the update path writes no history row",
+                              "recommendation": "write an audit row"}],
+                "audit_trail_assessment": {"applicable": True, "compliant": False,
+                                           "gaps": ["no history table"], "strengths": []},
+                "electronic_signature_assessment": {"applicable": False},
+                "access_control_assessment": {"applicable": True, "compliant": True,
+                                              "gaps": [], "strengths": ["role checks"]},
+                "data_integrity_assessment": {"applicable": True, "compliant": True,
+                                              "gaps": [], "strengths": ["ALCOA ok"]}}
+
+    _prev33 = llm_gateway.call_tool
+    llm_gateway.call_tool = _fake33
+    try:
+        with _TC33(_main33.app, raise_server_exceptions=False) as _c33:
+            _tok33 = _c33.post("/api/auth/login",
+                               json={"username": "admin",
+                                     "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+            _pid33 = _c33.post("/api/v1/projects", json={"name": "S33"},
+                               headers={"Authorization": f"Bearer {_tok33}"}
+                               ).json()["project"]["id"]
+            _H33 = {"Authorization": f"Bearer {_tok33}", "X-Project-Id": _pid33}
+            _files33e = [
+                {"path": "app/db.py",
+                 "content": "import app.util\n\ndef update(row):\n    conn.execute('UPDATE t')\n"},
+                {"path": "app/util.py", "content": "def helper():\n    return 2\n"},
+            ]
+
+            for _agent33, _extra33, _single33 in (
+                    ("migration-assessment", {"migration_target": "Flask to FastAPI"}, True),
+                    ("cfr21-verification", {"system_description": "LIMS"}, True),
+                    ("gxp-generate-plan", {"system_description": "LIMS"}, True)):
+                _body33 = {"files": _files33e, **_extra33}
+                _q33 = _c33.post(f"/api/review/{_agent33}/preflight", json=_body33, headers=_H33)
+                check(f"{_agent33} quotes before it runs", _q33.status_code == 200,
+                      f"{_q33.status_code} {_q33.text[:200]}")
+                _n33 = len(_calls33)
+                check("...and the quote itself calls no model",
+                      _n33 == len(_calls33), "a free preflight that spends is not free")
+                _r33 = _c33.post(f"/api/review/{_agent33}/source", json=_body33, headers=_H33)
+                check(f"...and {_agent33} runs a codebase end to end",
+                      _r33.status_code == 200, f"{_r33.status_code} {_r33.text[:300]}")
+                _made33 = len(_calls33) - _n33
+                check("...in exactly the number of calls it was quoted for",
+                      _made33 == (_q33.json().get("estimate", {}).get("calls")
+                                  if _q33.status_code == 200 else -1),
+                      f"quoted {_q33.json().get('estimate', {}).get('calls')}, made {_made33}"
+                      " -- a quote and an invoice that disagree are worse than no quote")
+                if _r33.status_code == 200:
+                    check("...and the run is stored, so it has a history entry",
+                          bool(_r33.json().get("review_id")), str(_r33.json())[:160])
+
+            # The two things the shape checks above cannot see, both about the target.
+            _q33 = _c33.post("/api/review/migration-assessment/preflight",
+                             json={"files": _files33e}, headers=_H33)
+            check("a migration can be priced before a target is chosen",
+                  _q33.status_code == 200,
+                  f"{_q33.status_code} {_q33.text[:200]} -- pricing the job is how somebody "
+                  "decides whether to commit to a target at all, so requiring one to quote "
+                  "would put the question in the wrong order")
+            _r33 = _c33.post("/api/review/migration-assessment/source",
+                             json={"files": _files33e}, headers=_H33)
+            check("...but not run without one, and it says why in a sentence",
+                  _r33.status_code == 400 and "migration target" in _r33.text.lower(),
+                  f"{_r33.status_code} {_r33.text[:200]} -- a required Pydantic field would "
+                  "answer 422 with a field-path nobody can act on")
+
+            _b33 = _c33.post("/api/code-brief", json={"files": _files33e}, headers=_H33)
+            check("a codebase can be described without being reviewed",
+                  _b33.status_code == 200 and _b33.json().get("markdown"),
+                  f"{_b33.status_code} {_b33.text[:200]} -- Code Generation reads this into "
+                  "its context box, where a person can see it before it is sent")
+            check("...and describing one calls no model either",
+                  _b33.status_code != 200 or "code-brief" not in "".join(_calls33),
+                  "the brief is computed, not generated")
+    finally:
+        llm_gateway.call_tool = _prev33
+
 
     print()
     print("-" * 60)

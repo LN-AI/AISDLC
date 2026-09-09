@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 from backend.agents.base_agent import BaseAgent
 from backend.controls.control_library import ALL_CONTROLS
+from backend.services import finding_gate
 
 SYSTEM_PROMPT = """You are the LM AI-SDLC Governance Report Generator — a technical writer and compliance specialist.
 
@@ -171,6 +172,8 @@ The report should be suitable for presenting to a CISO, compliance officer, or e
     ) -> Dict[str, Any]:
         report_id = str(uuid.uuid4())
         now = datetime.utcnow().isoformat()
+        # Same severity convention as `finding_gate.severity_counts`: 5 is Critical.
+        critical_count = sum(1 for f in all_findings if f.get("severity") == 5)
 
         findings_by_category: Dict[str, List] = {
             "Security": [],
@@ -223,7 +226,26 @@ The report should be suitable for presenting to a CISO, compliance officer, or e
             "controls_passed": controls_passed,
             "controls_failed": controls_failed,
             "recommendations": llm_result.get("recommendations", []),
-            "approval_required": gate_status in ("Amber", "Red"),
+            # Was `gate_status in ("Amber", "Red")`, which was not the rule the platform
+            # runs on. `save_review` enqueues an approval for a Red gate or a Critical
+            # finding and nothing else, so every Amber report told its reader a sign-off had
+            # been required when nobody was ever asked for one -- an assertion about a
+            # control that did not run, inside the document that exists to evidence that
+            # controls did run. Both now read one function so they cannot drift (C-38).
+            "approval_required": finding_gate.requires_human_signoff(
+                gate_status, critical_count),
+            # And say it in words, because the absence of the banner is not something a
+            # reader can interpret: "no sign-off was requested" and "sign-off was requested
+            # and given" look identical on a page that only speaks when one is required.
+            "approval_basis": (
+                f"A {gate_status} gate with {critical_count} Critical finding(s). "
+                + ("This release was placed in the approval queue and cannot proceed "
+                   "without a recorded human sign-off."
+                   if finding_gate.requires_human_signoff(gate_status, critical_count)
+                   else "No human sign-off was requested: this platform requires one for a "
+                        "Red gate or any Critical finding, and neither is present. The "
+                        "findings below are advisory.")
+            ),
             "approvers_needed": self._determine_approvers(all_findings, gate_status),
             "audit_trail": [
                 {

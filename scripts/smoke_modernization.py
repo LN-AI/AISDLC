@@ -1227,6 +1227,23 @@ llm_gateway.call_agentic = fake_call_agentic
 try:
     cp = [c for c in store.list_checkpoints(api_run_id, "open")
           if c["kind"] == "discovery_approval"][0]
+
+    # Answering a checkpoint is how a *blocking* gate gets waived, so the scope check has
+    # to happen before the write — and it used to happen after it. `answer_checkpoint`
+    # committed first and called `_require_run` second, so a caller from another project
+    # got a 404 back and the row was already answered with their name on it. The response
+    # code alone cannot catch that: it was 404 before this fix and it is 404 now. The
+    # check that catches it is the state of the row afterwards.
+    intruder = client.post(f"/api/v1/modernization/checkpoints/{cp['id']}/answer",
+                           headers=other_hdr, json={"decision": "approved"})
+    check("another project cannot answer this run's checkpoint (404)",
+          intruder.status_code == 404, f"{intruder.status_code} {intruder.text[:160]}")
+    _after = store.get_checkpoint(cp["id"]) or {}
+    check("...and the checkpoint is still open — the write did not happen first",
+          _after.get("status") == "open", f"status={_after.get('status')!r}")
+    check("...and nobody is recorded as having answered it",
+          not _after.get("answered_by"), f"answered_by={_after.get('answered_by')!r}")
+
     approved = client.post(f"/api/v1/modernization/checkpoints/{cp['id']}/answer",
                            headers=HDR, json={"decision": "approved"})
     check("answering a checkpoint over HTTP works", approved.status_code == 200,

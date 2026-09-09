@@ -72,7 +72,7 @@ python run.py
 
 ## Tests: smoke scripts, no framework
 
-There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These eight scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
+There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
 
 ```
 python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
@@ -81,24 +81,38 @@ python scripts/smoke_review_sources.py  # zip/repo/branch intake, cost preview, 
 python scripts/smoke_modernization.py   # run lifecycle, dependency order, crash/resume (much the longest)
 python scripts/smoke_governance.py      # Core SDLC Review stages, reports, gate fan-in, swarm
 python scripts/smoke_llm_providers.py   # admin LLM connections: key never returned, resolution order
+python scripts/smoke_cli.py             # scripts/lmsdlc.py driven as a subprocess against a real server
 node   scripts/smoke_render.js          # frontend result rendering (DOM-stubbed, no deps)
 node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans screen product picker
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
-Two live drivers sit beside these. They are **not** part of the offline net: both spend real
-money, and `verify_pr_review.py` writes to a real repository.
+Four live drivers sit beside these. They are **not** part of the offline net: three of
+them spend real money, and three write to a real repository — use a scratch one.
+`verify_code_delivery.py` is the odd one: it writes but calls no model, because the
+thing it verifies is the push, not the generation.
 
 ```
-python scripts/eval_code_review.py                       # accuracy against the labelled corpus (~$0.20)
+python scripts/eval_code_review.py                       # accuracy, 3 runs per case (~$0.55)
+python scripts/eval_code_review.py --repeat 1            # cheaper; cannot measure variance
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
 python scripts/verify_pr_review.py <pr-url> --dry-run    # ...the same, writing nothing
 python scripts/verify_pr_review.py <pr-url> --cleanup    # remove what it posted
+python scripts/verify_fix_apply.py <repo-or-pr-url>      # every Apply Fixes delivery, for real
+python scripts/verify_fix_apply.py <url> --dry-run       # ...stopping at the preview
+python scripts/verify_fix_apply.py <url> --cleanup --review-id <id>
+python scripts/verify_code_delivery.py <repo-url>        # pushing generated code, for real
+python scripts/verify_code_delivery.py <url> --dry-run   # ...refusals only, writes nothing
+python scripts/verify_code_delivery.py <url> --cleanup
 ```
 
 `eval_code_review.py` is the only thing that can tell an accuracy improvement from a
 regression — the floors in it are measured, not guessed (D-245), so a prompt change that
-looks better and scores worse gets caught. `verify_pr_review.py` exists because the offline
+looks better and scores worse gets caught. **A decision run is three runs per case**, and
+the gate floor is applied only to cases that answered the same way every time: one case
+returns Amber, Amber, Green on the same ten-line file, so pooling every run let a single
+coin flip read as a regression (D-358, D-359). `--repeat 1` still works and says what it
+cannot answer. `verify_pr_review.py` exists because the offline
 suites stub the model and never touch GitHub: they cannot tell you that an inline comment
 landed on the line intended, and the worst defect of the session was invisible until a real
 diff went through it (D-244).
@@ -121,6 +135,19 @@ The Python ones drive the real app through FastAPI's `TestClient` against a thro
 - `smoke_llm_providers.py` stubs the *provider* functions (`_call_anthropic` / `_call_openai`) rather than `call_tool`, because the resolution logic under test lives inside `call_tool` — stubbing that would stub out the thing being tested.
 - `smoke_plan_picker.js` takes a `products.json` argument (a saved `GET /api/v1/products` response) and **there is no such file in the repo**, so it dies with `ENOENT` until you capture one from a running server. `smoke_render.js` needs no argument — it defaults to `frontend/app.js`.
 
+Two of the scripts are neither tests nor throwaway tooling, and both exist because a
+caveat asked for evidence rather than an edit:
+
+- **`scripts/measure_event_loop.py`** answers C-31. It starts a server whose model gateway
+  sleeps, fires one review, and times `GET /` alongside it — so "does a long review freeze
+  the server" has a number instead of an opinion. It found that it did (`GET /` blocked
+  5.45s of a 6s review) and confirmed the fix (0.30s). Offline, no key. Re-run it before
+  claiming anything about concurrency.
+- **`scripts/lmsdlc.py`** is the CLI, and the thing CI actually runs. `--fail-on red` is
+  what makes a review a build step; `--sarif` is how findings reach GitHub's Security tab
+  without a GitHub App. `docs/ci/` has ready workflows for GitHub Actions and GitLab CI.
+  `smoke_cli.py` drives it as a subprocess, which is the only way to check an exit code.
+
 Everything else under `scripts/` is tooling, not tests; don't run it expecting a free offline check. `eval_code_review.py` measures the agent against a labelled corpus and **spends real money**. `build_run.py` compiles a converted codebase with the local .NET SDK and posts the verdict back — the app itself prints that command into modernization checkpoints and the UI (`build_results.py`, `runtime.py`, `frontend/app.js`), so it has to keep working. `drive_modernization.py` walks a run through the live HTTP API as the browser does; `audit_source_analysis.py` reports what the deterministic layer concludes about a zip before any spend.
 
 ## Architecture
@@ -135,10 +162,64 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   `backend/agents/chunked_review.py` fans the chunks out and assembles the result;
   `finding_pipeline.py` verifies each finding's quote against the file it names, de-duplicates,
   suppresses test/vendor paths and fingerprints; `finding_gate.py` floors the gate so a model's
-  own verdict can only ever be tightened. `review_estimate.py` prices a run before it happens,
+  own verdict can only ever be tightened; `suppression.py` reads the repository's own
+  `.lmignore` and inline `lm-ignore` comments, which is carried on the `Bundle` and applied
+  at the same stage as the built-in test/vendor path filter — **an ignore rule lowers the
+  gate and never removes the finding**, because otherwise a commit could turn a Red release
+  Green and the audit trail would agree with it (`docs/suppression.md`). `review_estimate.py` prices a run before it happens,
   reusing `modernization/estimate.py`'s arithmetic so a quote and an invoice come from one
   price table. `sarif.py` exports a finished review in the format GitHub code scanning and
   most security dashboards read.
+
+  **A push reviews only what the push added.** `workflows/review_pr.py` takes a
+  `since_sha`, and `routes/github_webhook.py` supplies it on `synchronize` only — so an
+  active pull request costs one slice per push rather than a full review per push. The
+  property that makes it safe is `_carry_forward`: still-open findings from earlier reviews
+  of **the same pull request** (`database.open_findings_for_pr`, keyed on `pr_number`) are
+  appended to this run's findings, labelled `carried_forward`, and re-floored through
+  `finding_gate.reconcile_gate` — because a run that never opened a file cannot see the
+  Critical in it, and an absent finding otherwise reads as a fixed one. Read D-341 before
+  changing any of it; the fallbacks are wide on purpose.
+
+  **Every other assessment gets `attest`, and the judgement is which protections are
+  universal.** `backend/agents/attest.py` gives a single-call agent the two things
+  `chunked_review` provided and nobody else had: a degenerate response (no findings, no
+  summary, non-trivial artifact) becomes an **error** rather than a stored clean result, and
+  the gate is floored against the findings the agent itself reported. Applied in the three
+  shared methods of `base_agent.py`, which between them cover the requirement, prompt,
+  compliance, security and architecture products, plus the three regulated ones wired
+  directly. **A subclass that overrides `_call_claude` is not reached by that edit** —
+  `sensitive_data_agent` was exactly that case and needed its own (D-346); check before
+  assuming a new agent is covered. `ai_provenance`, `issue_triage` and `migration` return
+  no findings and no gate, so `attest` is a genuine no-op for them and they are left alone.
+
+  **Evidence verification is opt-in and must stay that way.** Only
+  `CODE_REVIEW_TOOL_SCHEMA` and `VAPT_TOOL_SCHEMA` demand a verbatim quote, and both already
+  chunk. Every other schema asks for something else — `REVIEW_TOOL_SCHEMA` has no evidence
+  field at all (`_code_review_schema` says why in as many words), and the Part 11 verifier
+  asks for "File path / function / code pattern", a *description*. Running a substring check
+  over a description discards a correct finding for being phrased as instructed. Turning it
+  on for a product means changing that product's schema first, which changes what the model
+  answers — measure it, do not assume it (D-344).
+
+  **A regulated system too large for one call is now assessed in parts, not refused.**
+  `cfr21_agent.verify` takes one call when the prompt fits — identical output, no extra
+  cost for the common case — and otherwise goes through `chunked_review` with two things
+  set differently from a code review: `verify_evidence=False`, because this schema asks for
+  a *description* of evidence and a substring check over one discards correct findings
+  (D-344); and `merge_extra`, because the four §11 assessments are objects and only this
+  agent knows that one is applicable if **any** part found it applicable and compliant only
+  if **every** applicable part said so. `review_estimate.for_regulated_files` prices it
+  first, and both intake shapes have a free preflight — `/api/v1/agents/cfr21-verification/preflight`
+  and `POST /api/review/cfr21-verification/preflight-zip`, the second because the browser
+  uploads a zip and a quote only on the JSON API is a quote nobody sees. See D-354.
+
+  **And no assessment may claim coverage it does not have.** `cfr21_agent` used to
+  back-fill `files_scanned` from its own input when the model did not say what it read, so
+  an FDA 21 CFR Part 11 report could state that 400 files were verified when nobody knew.
+  `attest.coverage_claim` reconciles the claim against the input and states the gap
+  instead — including paths the model named that were never supplied, which is usually an
+  invented filename.
 
   **One screen reviews everything, including pull requests.** The separate GitHub PR screen
   is retired (D-267); its nav item opens the review screen with the source pre-set, and the
@@ -179,8 +260,34 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   invents the helper it needs rather than using the one already in the project (D-316). Read
   that row before changing the fixer's prompt. Relatedly, Apply Fixes' `pr` and `branch`
   deliveries were broken from the day they shipped (D-314, D-315) and no offline test could
-  see it: every fix test stops at `plan`, which writes nothing. `verify_pr_review.py` covers
-  PR *review* writes and there is still no equivalent for fixes.
+  see it: every fix test stops at `plan`, which writes nothing. **`verify_fix_apply.py` is
+  the equivalent for fixes** — it drives all five deliveries plus the preview against a real
+  repository, and `smoke_review_sources.py` §31 fails if a delivery is added to
+  `fix_apply.OUTPUTS` without a stage in it (D-362). `same_pr` is opt in: it commits onto a
+  branch somebody may have checked out.
+
+  **Generated code has its own way out, and it is deliberately narrower.** Codegen Scaffold
+  and Migration Execute store their files on the review row, and
+  `POST /api/reviews/{id}/deliver-code` pushes them through `services/code_delivery.py`: a
+  **new** branch that must not already exist, a pull request only if asked for, and never a
+  commit onto an existing branch. Apply Fixes may do the last of those because a review had
+  already read that branch; nothing has read a scaffold unless `auto_review` was ticked, and
+  the pull request body says so where whoever merges it will see it. `_DELIVERABLE_RUNS` in
+  `main.py` is a deny-by-default list of review types, not a guess from the shape of
+  `result`. The one thing shared with `fix_apply` is `resolve_base_branch`, because that is
+  where D-314, D-315 and D-364 all landed and a second copy in a second writer is how they
+  come back. **`verify_code_delivery.py` is its live driver** — offline tests of a write path
+  stop before writing (D-317), so a new writer starts with exactly that exposure.
+
+  **Its first live run found three more, and one of them had left the whole feature
+  non-functional for eight commits** — `_available_outputs` called with two arguments
+  against a one-argument definition, so every `apply` and `deliver` raised `TypeError`
+  before reaching a delivery; a GitHub zipball carrying only **7 characters** of the commit
+  sha, which `POST /git/refs` rejects with a bare 422; and a base branch derived by
+  splitting a label on `@` that isn't there, which returns the repository name. All three
+  are fixed and re-verified against a real repository, `smoke_products.py` §21 now guards
+  the cheapest class of the first, and D-364 has the detail. The lesson is the one D-317
+  recorded: **read that row before trusting an offline test about a write path.**
 - `backend/services/modernization/` — the one subsystem with its own schema and its own durable
   execution model: whole-codebase conversion runs (ingest → dependency graph → charter → claim-and-lease
   worker loop → Tier-0 validation). Its DDL lives in `store.py` and is called from `database.init_db()`.
@@ -191,7 +298,15 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   already exists, so a column added to the DDL alone is missing on every existing database.
   There is also **no scheduler in this deployment**, so anything time-based runs at startup
   *and* on the read path that depends on it: `lapse_expired_waivers` (before every baseline
-  lookup) and `review_source_store.sweep_expired` (on every inventory read).
+  lookup), `review_source_store.sweep_expired` (on every inventory read), and
+  `notify.dispatch_pending` (at startup, kicked after a review saves, and on every read of
+  the delivery log). Notifications are the clearest case of what that costs:
+  `save_review` writes the delivery row on **its own cursor**, so it commits with the
+  review and cannot be lost, and a background thread then attempts it — a row in flight is
+  `sending` and `notify.recover_sending()` puts it back at startup, the same way
+  `recover_orphaned_jobs` reaps job rows. What none of that buys is promptness after a
+  crash, and `backend/services/notify.py` says so at the top rather than leaving it to be
+  discovered.
 - `backend/config.py` — env var loading (see below).
 - **What a run cost reaches the browser two different ways, and you need to know which.**
   `agent_guard.guarded_call` attaches `_budget_stats` to the response *body* — that covers
@@ -232,7 +347,7 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
 Required: `ANTHROPIC_API_KEY`. **`GITHUB_TOKEN` is now a fallback, not the only option** —
 per-project credentials live in the `github_credentials` table (encrypted, managed at
 `/api/v1/github-credentials`, settable from the review screens) and take precedence over it;
-see D-236. Optional: `GITHUB_TOKEN` (fine-grained PAT, "Pull requests: Read and Write" — needed for GitHub PR/Auto-Fix features; public repos/PRs/issues work without it. **Also "Contents: Read and Write"** if you use the modernization PR workflow, which pushes a converted tree to a branch rather than only commenting), `DATABASE_PATH` (default `sdlc_agent.db`), `CLAUDE_MODEL` (default `claude-sonnet-4-6`), `MAX_TOKENS`, `APP_ENV`, `SECRET_KEY` (JWT/crypto — must be changed for production). Also present in `backend/config.py` but not in `.env.example`: `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`/`JIRA_PROJECT` (optional Jira integration), `DEFAULT_ADMIN_PASSWORD` (defaults to a hardcoded value — flag this if touching real deployment config), `COST_OPTIMIZATION_ENABLED`, `MAX_AGENT_INPUT_CHARS`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `PUBLIC_BASE_URL` (only for the modernization build loop — the address a GitHub Actions runner posts diagnostics back to; it cannot be derived from the request behind a proxy).
+see D-236. Optional: `GITHUB_TOKEN` (fine-grained PAT, "Pull requests: Read and Write" — needed for GitHub PR/Auto-Fix features; public repos/PRs/issues work without it. **Also "Contents: Read and Write"** if you use the modernization PR workflow, which pushes a converted tree to a branch rather than only commenting), `DATABASE_PATH` (default `sdlc_agent.db`), `CLAUDE_MODEL` (default `claude-sonnet-4-6`), `MAX_TOKENS`, `APP_ENV`, `SECRET_KEY` (JWT/crypto — must be changed for production). Also present in `backend/config.py` but not in `.env.example`: `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`/`JIRA_PROJECT` (optional Jira integration), `DEFAULT_ADMIN_PASSWORD` (defaults to a hardcoded value — flag this if touching real deployment config), `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` (optional — the only credential GitHub accepts for a **check run**, which is the only way a finding lands on a diff line; unset means the commit-status path, unchanged. `docs/github-app.md`, D-343), `INCREMENTAL_PR_REVIEW` (default **true** — a push to an open pull request reviews only the commits since the last review; see D-341 for the trade it makes and why the gate stays correct), `COST_OPTIMIZATION_ENABLED`, `MAX_AGENT_INPUT_CHARS`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `PUBLIC_BASE_URL` (only for the modernization build loop — the address a GitHub Actions runner posts diagnostics back to; it cannot be derived from the request behind a proxy).
 
 ## Windows-specific note
 

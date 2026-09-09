@@ -36,6 +36,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from backend.services import suppression
 from backend.services.modernization import repo_ingest
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,13 @@ class Bundle:
     # Extra facts a caller may want in the response but that are not part of the review:
     # PR number, head branch, commit sha.
     meta: Dict[str, Any] = field(default_factory=dict)
+    # What the repository itself says not to gate on — its `.lmignore` and its inline
+    # `lm-ignore` comments. A `suppression.Suppressions`, or None when the source has no
+    # repository to have said anything (a paste). Carried here rather than looked up in the
+    # agent because this is the only layer that knows what kind of source this is, and the
+    # two source shapes find the ignore file two different ways: a file list already
+    # contains it, a diff has to be asked for it.
+    suppression: Any = None
 
     @property
     def total_chars(self) -> int:
@@ -108,6 +116,39 @@ class Bundle:
     @property
     def untrusted_label(self) -> Optional[str]:
         return UNTRUSTED_LABELS.get(self.source_type)
+
+    def source_ref(self) -> Dict[str, Any]:
+        """Which repository, branch, commit and pull request this bundle came from.
+
+        Every fact here is already in `meta` — but each GitHub constructor spells it
+        slightly differently (`ref` on a repo, `head_branch` on a pull request, `head` on a
+        compare), so a caller that wanted "which repo was this" had to know which of the
+        three shapes it was holding. One method rather than that knowledge at every call
+        site, which is the same reason `commit_sha` is normalized in `from_github_pr`.
+
+        Empty strings, not None, for a source that has no repository (a paste, an upload) —
+        `save_review` stores them as NULL, and a caller can treat the whole dict as absent
+        by testing `repo_name`.
+        """
+        meta = self.meta or {}
+        repo_url = (meta.get("repo_url") or "").rstrip("/")
+        owner, name = "", ""
+        if "github.com/" in repo_url:
+            owner_repo = repo_url.split("github.com/")[-1].strip("/")
+            owner, _, name = owner_repo.partition("/")
+            name = name.split("/")[0].removesuffix(".git")
+        # The branch a human would name this review by. A pull request is its head branch,
+        # a compare is its head, a repository is whatever ref was asked for.
+        branch = (meta.get("head_branch") or meta.get("head") or meta.get("ref") or "")
+        pr_number = meta.get("pr_number")
+        return {
+            "repo_host": "github.com" if repo_url else "",
+            "repo_owner": owner,
+            "repo_name": name,
+            "branch": branch or "",
+            "commit_sha": meta.get("commit_sha") or "",
+            "pr_number": int(pr_number) if str(pr_number or "").isdigit() else None,
+        }
 
     def text(self) -> str:
         """One document, for the evidence verifier to search.
@@ -163,6 +204,12 @@ class Bundle:
             # count above is the number that matters; this is the sample that makes it
             # concrete.
             "skipped_sample": self.skipped[:25],
+            # Two counts, not the whole report: how many rules the repository brought is a
+            # fact about the *source* and is known before any model runs, which is what
+            # this dict is. Which rules actually fired is a fact about the *result* and
+            # lands there instead (`chunked_review.run` -> `result["suppression"]`).
+            "ignore_rules": len(getattr(self.suppression, "rules", []) or []),
+            "ignore_inline": len(getattr(self.suppression, "inline", []) or []),
         }
 
 
@@ -236,6 +283,10 @@ def from_files(files: List[Dict[str, str]], label: str = "",
 
     # The redaction map rides along so `secret_findings` can turn it into findings. It
     # carries path, line and category — never a value; see `repo_ingest.redact`.
+    # `files` (raw) for the ignore file, `capped` (reviewed) for the inline comments —
+    # see `suppression.from_files` for why the two lists differ.
+    rules = suppression.from_files(files, comment_files=capped)
+
     kept_paths = {f["path"] for f in capped}
     stats = {
         **stats,
@@ -249,7 +300,7 @@ def from_files(files: List[Dict[str, str]], label: str = "",
     )
     return Bundle(
         source_type=source_type, label=label, files=capped, skipped=skipped, stats=stats,
-        truncated=truncated, truncation_reason=reason.strip(),
+        truncated=truncated, truncation_reason=reason.strip(), suppression=rules,
     )
 
 
@@ -311,6 +362,19 @@ def from_github_repo(github, repo_url: str, ref: str = "",
     except Exception as exc:
         raise SourceError(f"Could not download {repo_url}: {exc}") from exc
     commit_sha = sha_from_zipball(archive)
+    # A zipball's root directory carries only **7** characters of the sha, and
+    # `POST /git/refs` rejects an abbreviated sha with a bare 422 — so every `branch` and
+    # `pr` fix delivery from a repository review failed, after the patch had been generated
+    # and paid for. Expanded here rather than at the write, because the recorded provenance
+    # should be the full commit too: a 7-character sha on an audit record is ambiguous by
+    # construction. This asks GitHub to name the *same* commit in full and never re-resolves
+    # the branch, so the reason `sha_from_zipball` reads the archive still holds. Found by
+    # `scripts/verify_fix_apply.py` on its first real run; see D-364.
+    if commit_sha and len(commit_sha) < 40 and hasattr(github, "expand_commit_sha"):
+        owner_repo = repo_url.rstrip("/").split("github.com/")[-1].strip("/")
+        _owner, _, _repo = owner_repo.partition("/")
+        commit_sha = (github.expand_commit_sha(_owner, _repo.split("/")[0], commit_sha)
+                      or commit_sha)
     bundle = from_zip_bytes(archive, label=repo_url, extensions=extensions)
     bundle.source_type = "github_repo"
     bundle.label = repo_url.rstrip("/").split("/")[-1] + (f"@{ref}" if ref else "")
@@ -331,6 +395,34 @@ def github_for_repo(repo_url: str, project_id: Optional[str] = None) -> Any:
     return GitHubService.for_project(project_id, _owner_repo(repo_url))
 
 
+def attach_repo_suppression(bundle: Bundle, github: Any) -> Bundle:
+    """Read `.lmignore` out of the repository a **diff** came from.
+
+    A pull request and a `base...head` compare are single unified diffs: there is no file
+    list for the ignore file to be found in, so it has to be asked for. One extra Contents
+    API call, on the commit the review is about — which is the same sha the source
+    inventory records, so the rules are the ones that were in the tree at review time
+    rather than whatever is on the branch now.
+
+    Costs one request and fails open: a repository with no `.lmignore` answers 404, which
+    is the overwhelmingly common case and must not turn into a failed review.
+
+    Called from the constructors rather than from `resolve`, because `workflows/review_pr.py`
+    and `workflows/autofix_pr.py` build their Bundle from a payload they already fetched
+    and never go through `resolve` at all.
+    """
+    if bundle.suppression is not None or github is None:
+        return bundle
+    ref = bundle.source_ref()
+    if not ref.get("repo_name"):
+        return bundle
+    bundle.suppression = suppression.fetch(
+        github, ref["repo_owner"], ref["repo_name"],
+        ref.get("commit_sha") or ref.get("branch") or "",
+    )
+    return bundle
+
+
 def from_github_pr(github, pr_url: str) -> Bundle:
     """A pull request diff.
 
@@ -340,21 +432,26 @@ def from_github_pr(github, pr_url: str) -> Bundle:
     numbers.
     """
     data = github.get_pr_diff(pr_url)
-    return pr_bundle(data, pr_url)
+    return pr_bundle(data, pr_url, github=github)
 
 
-def pr_bundle(data: Dict[str, Any], pr_url: str) -> Bundle:
+def pr_bundle(data: Dict[str, Any], pr_url: str, github: Any = None) -> Bundle:
     """The same Bundle, from a payload somebody already fetched.
 
     Split out because `workflows/review_pr.py` and `workflows/autofix_pr.py` call
     `get_pr_diff` themselves and then need a Bundle to record a source inventory from —
     fetching the diff a second time to get one would double the request and, on a busy
     branch, could return a *different* diff than the one being reviewed.
+
+    `github` is optional and only used to read `.lmignore` out of the repository. A caller
+    that does not pass it gets a Bundle with no repository suppression rules — the review
+    still runs, and inline `lm-ignore` comments inside the diff still work, because those
+    are read out of the finding's own evidence quote.
     """
     diff = data.get("diff") or ""
     if not diff.strip():
         raise SourceError(f"{pr_url} has no reviewable diff — it may be empty or binary-only.")
-    return Bundle(
+    bundle = Bundle(
         source_type="github_pr",
         label=data.get("title") or pr_url,
         ref=pr_url,
@@ -384,6 +481,7 @@ def pr_bundle(data: Dict[str, Any], pr_url: str) -> Bundle:
             "maintainer_can_modify": bool(data.get("maintainer_can_modify")),
         },
     )
+    return attach_repo_suppression(bundle, github)
 
 
 def from_branch_compare(github, repo_url: str, base: str, head: str) -> Bundle:
@@ -399,7 +497,7 @@ def from_branch_compare(github, repo_url: str, base: str, head: str) -> Bundle:
             f"There is no difference between {base} and {head} in {repo_url}, "
             f"so there is nothing to review."
         )
-    return Bundle(
+    bundle = Bundle(
         source_type="github_compare",
         label=f"{repo_url.rstrip('/').split('/')[-1]} {base}...{head}",
         files=[{"path": "", "content": diff}],
@@ -413,6 +511,7 @@ def from_branch_compare(github, repo_url: str, base: str, head: str) -> Bundle:
             "repo_url": repo_url,
         },
     )
+    return attach_repo_suppression(bundle, github)
 
 
 def from_github_file(github, file_url: str) -> Bundle:

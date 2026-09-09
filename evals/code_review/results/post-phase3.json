@@ -1,0 +1,507 @@
+{
+  "prompt_version": "2026-09-03.1",
+  "generated_at": "2026-09-08T09:30:12.133452+00:00",
+  "cases": 10,
+  "repeat": 1,
+  "errors": 0,
+  "recall": 1.0,
+  "false_positive_rate": 0.0,
+  "gate_accuracy": 0.9,
+  "hallucinated_findings_discarded": 0,
+  "unverified_findings": 0,
+  "determinism_jaccard": null,
+  "tokens_in": 5943,
+  "tokens_out": 11245,
+  "cache_read_tokens": 31509,
+  "estimated_cost_usd": 0.186504,
+  "runs": [
+    {
+      "case": "fp-example-credentials",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 597,
+        "output_tokens": 363,
+        "cache_write_tokens": 3501,
+        "cache_read_tokens": 0
+      },
+      "seconds": 10.7
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Amber",
+      "model_gate": "Amber",
+      "gate_ok": false,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "5db31eee8b13d362980d283ad99d2080",
+        "73c1f3221c328d9359836f9848c89e6b",
+        "a536ea6f6da7ac4d09844675fd49f977"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-005",
+          "title": "No rate limiting on profile update endpoint",
+          "line_start": 6,
+          "description": "The POST handler for the profile view has no rate limiting applied. An authenticated attacker could repeatedly submit large or specially crafted 'bio' values in rapid succession, causing excessive database writes and potentially contributin",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Unvalidated user input written directly to model field",
+          "line_start": 8,
+          "description": "The 'bio' field value is taken directly from POST data without any sanitization, length validation, or type checking before being assigned to the user model and persisted to the database. While Django's ORM prevents SQL injection here, the ",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "Missing KeyError handling for POST data access",
+          "line_start": 8,
+          "description": "The code accesses request.POST[\"bio\"] using direct dictionary-style access. If the 'bio' key is absent from the POST body (e.g., a malformed or crafted request), Python will raise an unhandled KeyError, which Django will convert to a 500 In",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1420,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 27.1
+    },
+    {
+      "case": "fp-parameterized-orm",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 332,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 8.7
+    },
+    {
+      "case": "fp-test-fixture",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 0,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [],
+      "findings": [],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 604,
+        "output_tokens": 397,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 10.0
+    },
+    {
+      "case": "hardcoded-secret",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "5e27865a11515b0fd6848e59623ac6e2",
+        "e1ac8b5e341bb3848b994d26cfb64855"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-003",
+          "title": "Hardcoded AWS Secret Access Key",
+          "line_start": 3,
+          "description": "A raw AWS Secret Access Key is hardcoded directly in the source file as a string literal assigned to AWS_SECRET and then passed directly to the boto3 S3 client. Anyone with read access to this file (version control history, CI logs, contain",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-006",
+          "title": "AWS Client Instantiated Without Explicit Region or Endpoint TLS Enforcement",
+          "line_start": 4,
+          "description": "The boto3 S3 client is created without specifying a region_name or enforcing HTTPS-only endpoint configuration. While boto3 defaults to HTTPS, the absence of an explicit region can cause requests to fall back to the us-east-1 global endpoin",
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 1263,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 23.7
+    },
+    {
+      "case": "llm-output-to-exec",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 5,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "2e84ef70941cc701196bc76c3227b8c5",
+        "476839b8f8eb13d305435f02e66e8424",
+        "7440b62cb33b93c2f8074a54d66fdf7b",
+        "bf623a33f4589dd109f1fe5a4e55e7c0",
+        "fb61faa46ed509cdf707e4cfce5ffcfc"
+      ],
+      "findings": [
+        {
+          "control_id": "AI-002",
+          "title": "LLM output passed directly to exec() without any validation",
+          "line_start": 3,
+          "description": "The raw text returned by the LLM is executed verbatim via Python's `exec()`. There is zero validation, sandboxing, or allow-listing of the generated code. An attacker who can influence the prompt (or who compromises the model endpoint) can ",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "AI-001",
+          "title": "Unsanitized user input passed directly to LLM",
+          "line_start": 2,
+          "description": "The raw `user_prompt` parameter is forwarded to the LLM API without any sanitization, filtering, or validation. An attacker can craft a prompt that manipulates the model's behavior, leaks system context, or causes the model to generate mali",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "AI-007",
+          "title": "Agent tool grants unrestricted code execution capability",
+          "line_start": 3,
+          "description": "By executing arbitrary LLM output via `exec()`, this agent tool is effectively granted unlimited permissions: full file-system access, network access, ability to import any installed library, environment variable access (including secrets),",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-005",
+          "title": "No max_tokens or timeout on LLM API call \u2014 denial-of-service risk",
+          "line_start": 2,
+          "description": "The `client.messages.create()` call specifies no `max_tokens` limit and no request timeout. An attacker (or a misbehaving model) can cause the call to generate an extremely large response or hang indefinitely, exhausting resources and creat",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "Unvalidated LLM response content returned/executed with no error handling",
+          "line_start": 2,
+          "description": "There is no error handling around the LLM API call or the `exec()` call. If the API returns an unexpected structure, a network error, a content-filtered response, or if `exec()` raises an exception, the raw exception (potentially including ",
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 593,
+        "output_tokens": 2064,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 37.2
+    },
+    {
+      "case": "missing-auth",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 1,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 6,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "09be000e60ccb2716cd8d0e9901ec7d6",
+        "0a808b31f1e57c74ce7f141b762322a2",
+        "46b50b2b7634549a6c1e4185fc249d74",
+        "78c7addf25db33c2c15c32703b83bdc8",
+        "956df9165472bfb6a092b49d18c2daeb",
+        "b79e23f6e79efe25924329a33805daca"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-001",
+          "title": "No Authentication on Destructive DELETE Endpoint",
+          "line_start": 4,
+          "description": "The `/api/users/{user_id}` DELETE endpoint has no authentication or authorization middleware applied. Any unauthenticated caller can delete any user record by supplying an arbitrary `user_id`. FastAPI does not enforce authentication by defa",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-002",
+          "title": "Missing Role-Based Access Control (RBAC) on User Deletion",
+          "line_start": 5,
+          "description": "Even if authentication were added, there is no role check to confirm the caller is an administrator or privileged user before deleting an account. Any authenticated user could potentially delete other users' accounts without a role guard.",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-016",
+          "title": "Insecure Direct Object Reference (IDOR) \u2014 No Ownership Check",
+          "line_start": 6,
+          "description": "The `user_id` path parameter is taken directly from the request and used to delete a user record without verifying that the authenticated caller owns or is authorized to act on that resource. An attacker who can authenticate can delete any ",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-005",
+          "title": "No Rate Limiting on Destructive Endpoint",
+          "line_start": 4,
+          "description": "The DELETE endpoint has no rate limiting applied, making it trivial for an attacker to issue bulk delete requests in rapid succession. Even if authentication is added, an attacker who obtains valid credentials could delete many accounts in ",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-013",
+          "title": "No Audit Logging of User Deletion",
+          "line_start": 6,
+          "description": "User deletion is a high-impact, irreversible action. There is no audit log recording who initiated the deletion, when it occurred, or which record was affected. This impairs incident response, forensics, and compliance requirements (e.g., S",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "Deleted Resource ID Echoed Back in Response",
+          "line_start": 7,
+          "description": "The response body returns `{\"deleted\": user_id}` \u2014 reflecting the caller-supplied path parameter back verbatim. While low risk here, this pattern can leak internal identifiers and is unnecessary; a status 204 No Content or a generic success",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 605,
+        "output_tokens": 1960,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 33.7
+    },
+    {
+      "case": "pii-in-logs",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "47f3b44cfef9098c844063071dbcdd61",
+        "6c63b0a2041279d6da7bf89fa8afc55f"
+      ],
+      "findings": [
+        {
+          "control_id": "PCI-001",
+          "title": "Full card number logged in plaintext",
+          "line_start": 4,
+          "description": "The user's full card number (`user.card_number`) is written to the application log. PCI-DSS requirement 3.4 prohibits storing Primary Account Numbers (PANs) in readable form, and logging constitutes storage. Log files are frequently forward",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-004",
+          "title": "SSN (PII) logged in plaintext",
+          "line_start": 4,
+          "description": "The user's Social Security Number (SSN) is written directly to the application log via logging.info(). SSNs are highly sensitive PII and must never appear in log files, which are often stored unencrypted, forwarded to log aggregators, or ac",
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 581,
+        "output_tokens": 1386,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 24.5
+    },
+    {
+      "case": "sql-injection",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "2a4954b0b93d689bc03c08d8ec3b60bb",
+        "adc1876f94821708feebbe361d33ae29"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "SQL Injection via String Concatenation",
+          "line_start": 2,
+          "description": "The `user_id` parameter is concatenated directly into the SQL query string without any parameterization or sanitization. An attacker who controls `user_id` can inject arbitrary SQL, potentially reading, modifying, or deleting any data in th",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "SELECT * Returns All Columns Including Potentially Sensitive Fields",
+          "line_start": 2,
+          "description": "`SELECT *` retrieves every column in the `users` table. This likely includes sensitive fields such as password hashes, email addresses, PII, or other regulated data. Returning more data than necessary increases the blast radius of any downs",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 577,
+        "output_tokens": 1129,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 36.7
+    },
+    {
+      "case": "weak-crypto",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 1,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "0db39da62ad535fa20fdd89dc13b9140"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-006",
+          "title": "MD5 used for password hashing \u2014 cryptographically broken",
+          "line_start": 4,
+          "description": "The function uses MD5 to hash passwords. MD5 is a fast, general-purpose hash function that is cryptographically broken and entirely unsuitable for password storage. It is trivially reversible via rainbow tables and GPU-accelerated brute for",
+          "severity": 5,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 565,
+        "output_tokens": 931,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 21.6
+    }
+  ]
+}

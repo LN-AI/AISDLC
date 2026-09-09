@@ -174,7 +174,10 @@ def create_key(req: CreateKeyRequest, user: dict = Depends(_require_super_admin)
 )
 def revoke_key(key_id: str, user: dict = Depends(_require_auth)):
     _authorize_key(key_id, user)
-    revoke_api_key(key_id)
+    # The actor is passed down rather than recorded here: `revoke_api_key` already writes
+    # the audit row, and a second one from this layer would double every revocation in the
+    # trail. It used to hardcode "admin".
+    revoke_api_key(key_id, revoked_by=user.get("username", "admin"))
     return {"message": "Key revoked", "key_id": key_id}
 
 

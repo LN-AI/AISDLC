@@ -1,0 +1,100 @@
+# Review every pull request, publish the findings, and block a merge on a Red gate.
+#
+# Copy to `.github/workflows/lm-sdlc-review.yml`. Set two repository secrets:
+#   LM_SDLC_URL      https://sdlc.example.com
+#   LM_SDLC_API_KEY  from the API Keys page — it carries the project, plan and budget
+#
+# The shape of this file is deliberate in two places; both are explained where they happen.
+name: LM AI-SDLC review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  # Required by upload-sarif so findings reach the Security tab.
+  security-events: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The client sends the pull request URL and the server fetches the diff, so a
+          # shallow checkout is enough — this is only here for the client itself.
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the client
+        run: pip install --quiet httpx
+
+      # ── 1. Price it before spending anything ──────────────────────────────
+      #
+      # First, and on its own step. A pull request touching 800 files otherwise spends
+      # whatever it spends and you find out on the invoice. `--quote-only` calls no model.
+      - name: Quote the review
+        id: quote
+        env:
+          LM_SDLC_URL: ${{ secrets.LM_SDLC_URL }}
+          LM_SDLC_API_KEY: ${{ secrets.LM_SDLC_API_KEY }}
+        run: |
+          python scripts/lmsdlc.py --json review \
+            --pr "${{ github.event.pull_request.html_url }}" \
+            --quote-only > quote.json || { cat quote.json; exit 1; }
+          cat quote.json
+
+      # Raise or lower this. It is a ceiling per pull request, not a monthly budget — the
+      # monthly cap lives on the API key and is enforced server-side regardless.
+      - name: Refuse a review that costs more than expected
+        env:
+          MAX_USD: '2.00'
+        run: |
+          CEILING=$(python -c "import json;print(json.load(open('quote.json'))['estimate']['ceiling_usd'])")
+          echo "Ceiling for this pull request: \$$CEILING (limit \$$MAX_USD)"
+          python - <<'PY'
+          import json, os, sys
+          ceiling = json.load(open('quote.json'))['estimate']['ceiling_usd']
+          if float(ceiling) > float(os.environ['MAX_USD']):
+              sys.exit(f"Refusing: ${ceiling:.2f} is over the ${os.environ['MAX_USD']} "
+                       f"per-PR limit set in this workflow. Narrow the change, or raise "
+                       f"MAX_USD deliberately.")
+          PY
+
+      # ── 2. Review, and let it fail — but publish first ───────────────────
+      #
+      # `continue-on-error` so the SARIF upload below still runs on a Red gate. Failing the
+      # job here would block the developer *and* hide the reason, which is how a check gets
+      # switched off rather than fixed. The gate is re-asserted in the last step.
+      - name: Review the pull request
+        id: review
+        continue-on-error: true
+        env:
+          LM_SDLC_URL: ${{ secrets.LM_SDLC_URL }}
+          LM_SDLC_API_KEY: ${{ secrets.LM_SDLC_API_KEY }}
+        run: |
+          python scripts/lmsdlc.py review \
+            --pr "${{ github.event.pull_request.html_url }}" \
+            --sarif lm-sdlc.sarif \
+            --fail-on red
+
+      - name: Publish the findings
+        # `always()` so they are published whether the gate passed or failed. A finding
+        # nobody can see is a finding nobody fixes.
+        if: always() && hashFiles('lm-sdlc.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: lm-sdlc.sarif
+          category: lm-ai-sdlc
+
+      # ── 3. Now fail, with the findings already visible ───────────────────
+      - name: Fail on a Red gate
+        if: steps.review.outcome == 'failure'
+        run: |
+          echo "::error::The review gate is Red. The findings are in this repository's"\
+               "Security tab under 'lm-ai-sdlc', and in the step log above."
+          exit 1

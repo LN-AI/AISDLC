@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 
 from backend import config, database
+from backend import context as request_context
 from backend.products import registry
 from backend.workflows import full_review as full_review_workflow
 from backend.workflows.base import count_steps
@@ -413,6 +414,10 @@ def _review_args(bundle, req, agent: str) -> dict:
     deterministic = source_bundle.deterministic_findings(bundle)
     args["extra_findings"] = deterministic["findings"]
     args["source"] = {**args["source"], "dependency": deterministic["dependency"]}
+    # What the repository itself says not to gate on. Passed even when empty, so the agent
+    # can report "checked, no rules" rather than leaving a reader unable to tell that from
+    # "never looked".
+    args["suppression"] = bundle.suppression
     if len(bundle.files) == 1 and not bundle.files[0].get("path"):
         text = bundle.files[0].get("content") or ""
         if label:
@@ -609,7 +614,11 @@ def run_code(req: CodeReviewRequest, caller: dict = Depends(get_caller)):
     # A large artifact is reviewed as N parallel calls, not one, so the reservation has to
     # be sized from N. Without this a 40-chunk review reserved for a single call and could
     # spend far past a budget cap that had already been checked.
-    with agent_guard.expect_calls(_expected_calls(bundle)):
+    # Which repository this is about, for `save_review` to store — the same binding the
+    # UI surface opens in `main._run_bundle_review`, so a review recorded through the API
+    # is placed the same way as one recorded through the browser.
+    with request_context.bind_source(bundle.source_ref()), \
+            agent_guard.expect_calls(_expected_calls(bundle)):
         result = agent_guard.guarded_call(
             caller, "code", override,
             lambda: _orch.review_code(
@@ -741,7 +750,8 @@ def run_vapt(req: VAPTRequest, caller: dict = Depends(get_caller)):
     override = _effective_llm_override(req, caller, "vapt")
     # VAPT is chunked now (C-73), so it reserves like Code Review does. Before, a
     # repository-sized assessment reserved for one call.
-    with agent_guard.expect_calls(_expected_calls(bundle)):
+    with request_context.bind_source(bundle.source_ref()), \
+            agent_guard.expect_calls(_expected_calls(bundle)):
         result = agent_guard.guarded_call(
             caller, "vapt", override,
             lambda: _orch.review_vapt(
@@ -1291,6 +1301,60 @@ def run_migration_execute(req: MigrationExecutionRequest, caller: dict = Depends
 
 # ── 17. 21 CFR Part 11 Verification ─────────────────────────────────────────
 
+def _cfr21_files(req) -> list:
+    """The file list a Part 11 verification will actually assess, from either shape.
+
+    Shared by the run and its quote so the two cannot disagree about what is being priced —
+    a quote that splits a different artifact from the one the run splits is worse than no
+    quote, because it will be believed.
+    """
+    if req.files:
+        return [{"path": f.path, "content": f.content} for f in req.files]
+    artifact, _t, _r, _p = _resolve(req)
+    return [{"path": "", "content": artifact}]
+
+
+@router.post(
+    "/cfr21-verification/preflight",
+    summary="Cost estimate for a 21 CFR Part 11 verification (free, no model call)",
+    description="""Price a Part 11 verification before running it. **Free — no model call, nothing metered.**
+
+These products had no quote at all, so the first anyone knew about the cost of assessing a
+large regulated system was the invoice — and the first they knew it was too large for a
+single call was the refusal, after pressing the button. A system that does not fit is now
+assessed in parts, and this says how many parts and what they will cost.
+
+- `estimate.calls` — how many model calls the assessment will make
+- `estimate.assessed_in_parts` — true when one report will be assembled from several
+- `estimate.ceiling_usd` — a hard upper bound the run button can name
+- `budget` — what this caller has left, so the price can be read against it
+""",
+)
+def preflight_cfr21(req: CFR21VerificationRequest, caller: dict = Depends(get_caller)):
+    subject = subject_from_caller(caller)
+    # Entitlement is checked; the budget deliberately is not. Showing someone their
+    # remaining headroom beside a price is the point, and a 402 in its place says less.
+    agent_guard.check_scope(subject, "cfr21-verification")
+    files = _cfr21_files(req)
+    override = _effective_llm_override(req, caller, "cfr21-verification")
+    quote = review_estimate.for_regulated_files(
+        files, agent="cfr21-verification", model=(override or {}).get("model") or "")
+    headroom = review_estimate.budget_headroom(subject)
+    return {
+        "agent": "cfr21-verification",
+        "source": {"files": len(files),
+                   "chars": sum(len(f.get("content") or "") for f in files)},
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (None if headroom is None
+                          else quote["expected_usd"] <= headroom["remaining_usd"]),
+        "ceiling_within_budget": (None if headroom is None
+                                  else quote["ceiling_usd"] <= headroom["remaining_usd"]),
+    }
+
+
 @router.post(
     "/cfr21-verification",
     summary="Verify a codebase against FDA 21 CFR Part 11",
@@ -1349,6 +1413,21 @@ def run_cfr21_verification(req: CFR21VerificationRequest, caller: dict = Depends
         "data_integrity_assessment": result.get("data_integrity_assessment"),
         "validation_readiness_notes": result.get("validation_readiness_notes", ""),
         "files_scanned": result.get("files_scanned", []),
+        # How much of this report is actually established, and by what checks. Both fields
+        # are on the stored result and both are drawn on screen by
+        # `renderReviewTransparency`, but this response is a hand-written allowlist rather
+        # than `_wrap`'s passthrough (`v1_agents._wrap`, the `k not in CORE` spread), so
+        # unnamed here they would reach the browser and not the API -- and the API is what
+        # a compliance pipeline reads. That matters most for exactly this pair of
+        # endpoints: `files_scanned` is no longer back-filled from our own input, so an
+        # integrator who sees an empty list needs `coverage_claim` to tell them it means
+        # "the assessment did not say" rather than "nothing was scanned". Without it the
+        # honest answer looks like a bug and invites someone to re-add the back-fill.
+        # `model_gate_status` is the verdict before the floor was applied, so a reader can
+        # see when the two disagreed.
+        "coverage_claim": result.get("coverage_claim"),
+        "attested": result.get("attested"),
+        "model_gate_status": result.get("model_gate_status"),
         "compliance_flags": result.get("compliance_flags", []),
         "recommendations": result.get("recommendations", []),
         "summary": result.get("summary", ""),
@@ -1421,6 +1500,21 @@ def run_gxp_document_check(req: GxPDocumentCheckRequest, caller: dict = Depends(
         "version_control_check": result.get("version_control_check"),
         "traceability_check": result.get("traceability_check"),
         "missing_sections": result.get("missing_sections", []),
+        # How much of this report is actually established, and by what checks. Both fields
+        # are on the stored result and both are drawn on screen by
+        # `renderReviewTransparency`, but this response is a hand-written allowlist rather
+        # than `_wrap`'s passthrough (`v1_agents._wrap`, the `k not in CORE` spread), so
+        # unnamed here they would reach the browser and not the API -- and the API is what
+        # a compliance pipeline reads. That matters most for exactly this pair of
+        # endpoints: `files_scanned` is no longer back-filled from our own input, so an
+        # integrator who sees an empty list needs `coverage_claim` to tell them it means
+        # "the assessment did not say" rather than "nothing was scanned". Without it the
+        # honest answer looks like a bug and invites someone to re-add the back-fill.
+        # `model_gate_status` is the verdict before the floor was applied, so a reader can
+        # see when the two disagreed.
+        "coverage_claim": result.get("coverage_claim"),
+        "attested": result.get("attested"),
+        "model_gate_status": result.get("model_gate_status"),
         "compliance_flags": result.get("compliance_flags", []),
         "recommendations": result.get("recommendations", []),
         "summary": result.get("summary", ""),

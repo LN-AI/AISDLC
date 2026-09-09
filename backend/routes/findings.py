@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from backend import database, scope
 from backend.routes.v1_agents import get_caller
-from backend.services import sarif
+from backend.services import sarif, suppression
 from backend.services.finding_pipeline import WAIVED_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -67,6 +67,16 @@ def list_findings(
     status: Optional[str] = Query(None, description="Filter by lifecycle status, e.g. 'open'."),
     min_severity: int = Query(0, ge=0, le=5, description="1 Info … 4 High, 5 Critical."),
     review_id: Optional[str] = Query(None, description="Only this review's findings."),
+    q: Optional[str] = Query(None, min_length=1, max_length=200,
+                             description="Free text over the title, description and file path."),
+    control_id: Optional[str] = Query(None, max_length=40,
+                                      description="Control id prefix — 'SEC' matches SEC-001…SEC-016."),
+    product_id: Optional[str] = Query(None, max_length=60,
+                                      description="Only findings from this agent, e.g. 'vapt'."),
+    repo: Optional[str] = Query(None, max_length=200,
+                                description="'owner/name', or just the repository name."),
+    since: Optional[str] = Query(None, max_length=32,
+                                 description="ISO date/time — only reviews at or after it."),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
@@ -76,16 +86,25 @@ def list_findings(
     from the first day the column existed, but the only way to *find* one was to open the
     review that produced it, so "what is still open in this project" was unanswerable.
 
-    `counts` describes the whole status-filtered set rather than the page, so a caller can
-    show "12 open, 3 critical" without paging through everything.
+    The filters beyond `status` and `min_severity` are what turn that from a list into a
+    working queue. "Show me the SQL injections in the payments service", "every finding the
+    vulnerability assessor raised this month", "everything under SEC-004" — each of those
+    was impossible, and a screen offering two dropdowns over a thousand findings is a
+    screen people stop opening.
+
+    `counts` describes the whole set the filters select, minus `min_severity`, so a caller
+    can show "12 open, 3 critical" without paging through everything.
     """
     visible = scope.visible_from_caller(caller)
+    filters = dict(status=status, review_id=review_id, q=q, control_id=control_id,
+                   product_id=product_id, repo=repo, since=since)
     findings = database.list_findings(
-        project_ids=visible, status=status, min_severity=min_severity,
-        review_id=review_id, limit=limit, offset=offset,
+        project_ids=visible, min_severity=min_severity, limit=limit, offset=offset,
+        **filters,
     )
+    # Same filters, one source of truth — the header and the body describe one set.
     counts = database.count_findings(
-        project_ids=visible, status=status, min_severity=min_severity, review_id=review_id)
+        project_ids=visible, min_severity=min_severity, **filters)
     return {
         "findings": findings,
         "count": len(findings),
@@ -145,6 +164,56 @@ def set_status(finding_id: str, req: FindingStatusRequest, caller: dict = Depend
         ),
         "false_positive_recorded": updated["status"] == "false_positive",
     }
+
+
+@router.get(
+    "/lmignore",
+    summary="Export this project's waivers as a .lmignore file",
+    response_class=Response,
+)
+def export_lmignore(
+    caller: dict = Depends(get_caller),
+    repo: Optional[str] = Query(None, max_length=200,
+                                description="'owner/name', or just the repository name. "
+                                            "Narrow to the repository you are committing "
+                                            "the file into."),
+):
+    """Render the waivers this caller can see as a `.lmignore`, ready to commit.
+
+    **Why this exists.** A waiver is a row in this database, set by a person clicking. That
+    is right for a decision somebody signs, and it means a team that has been accepting the
+    same twelve findings for six months has those decisions in one place only: here. They
+    do not show up in code review, they do not travel to a fork, and a new project starts
+    from zero. Suppression as code fixes that going forward; this is how a project that has
+    already done the clicking stops doing it again.
+
+    **What it deliberately does not preserve.** A waiver is keyed on a *fingerprint* — the
+    control, the path, the title and the evidence. A `.lmignore` rule can only express the
+    path and the control, so an exported rule is **wider** than the waiver it came from: it
+    will also cover a different finding of the same control in the same file. That is
+    stated in the file's own header rather than hidden, because it is a decision for the
+    person committing it, and it is the reason this returns a file to review instead of
+    writing one into the repository.
+
+    An expiry cannot be expressed either, so a lapsed acceptance is excluded by the query
+    rather than exported as permanent — see `database.list_waived_findings`.
+    """
+    waived = database.list_waived_findings(
+        project_ids=scope.visible_from_caller(caller), repo=repo)
+    body = suppression.to_ignore_file(waived)
+    header = (
+        f"# {len(waived)} waiver(s)"
+        + (f" for {repo}" if repo else "")
+        + ".\n#\n"
+        + "# A waiver was granted about ONE finding, matched on its control, path, title and\n"
+        + "# evidence. A rule below matches the control and the path only, so it is wider than\n"
+        + "# the waiver it came from. Read it before committing.\n"
+    )
+    return Response(
+        content=header + body,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename=".lmignore"'},
+    )
 
 
 @router.get("/false-positives",

@@ -154,6 +154,9 @@ GOVERNANCE_SUMMARY_TOOL_SCHEMA = {
 }
 
 
+from backend.agents import attest  # noqa: E402
+
+
 class BaseAgent:
     def __init__(self, agent_name: str, system_prompt: str):
         self.agent_name = agent_name
@@ -180,7 +183,25 @@ class BaseAgent:
 
         result = self._call_claude(user_content, llm_override)
         result["agent_name"] = self.agent_name
-        return result
+        # Two protections that apply to any assessment, regardless of what its schema asks
+        # for, and that only `chunked_review` used to provide:
+        #
+        #  * **A degenerate response is an error.** No findings and no summary over a
+        #    non-trivial artifact is the signature of a truncated tool call, and storing it
+        #    reads as "we looked and found nothing" -- the most expensive kind of wrong
+        #    answer a governance tool can give.
+        #  * **The gate is a floor.** `stricter(derive_gate(findings), model_gate)`, so a
+        #    Critical the agent itself reported cannot come out Green.
+        #
+        # Evidence is *not* verified here: no schema reached by this method asks for a
+        # verbatim quote (see `_code_review_schema` for why), so a substring check would
+        # discard correct findings for being phrased as instructed. See `attest.py`.
+        #
+        # `artifact=content`, not `user_content`: the degeneracy threshold is about the size
+        # of the thing under review, and padding it with the context we wrote ourselves
+        # would let a one-line artifact with a long context clear the 200-character floor
+        # and escape the check entirely.
+        return attest.attest(result, agent_name=self.agent_name, artifact=content)
 
     def prose_summary(self, content: str, context: str = "", llm_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """For agents whose gate_status/risk_score/findings are computed deterministically
@@ -492,7 +513,8 @@ class ArchitectureBaseAgent(BaseAgent):
             user_content = f"Context:\n{context}\n\n---\n\nSystem to Review:\n{content}"
         result = self._call_claude_architecture(user_content, llm_override)
         result["agent_name"] = self.agent_name
-        return result
+        # See `BaseAgent.review` for what this does and what it deliberately does not.
+        return attest.attest(result, agent_name=self.agent_name, artifact=content)
 
 
 class SecurityReviewBaseAgent(BaseAgent):
@@ -509,4 +531,5 @@ class SecurityReviewBaseAgent(BaseAgent):
             user_content = f"Context:\n{context}\n\n---\n\nSystem to Review:\n{content}"
         result = self._call_claude_security(user_content, llm_override)
         result["agent_name"] = self.agent_name
-        return result
+        # See `BaseAgent.review` for what this does and what it deliberately does not.
+        return attest.attest(result, agent_name=self.agent_name, artifact=content)

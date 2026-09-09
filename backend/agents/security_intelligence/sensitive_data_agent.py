@@ -1,3 +1,6 @@
+from typing import Any, Dict, List, Optional
+
+from backend.agents import attest, chunked_review
 from backend.agents.base_agent import BaseAgent
 from backend.controls.control_library import ALL_CONTROLS
 from backend.services import llm_gateway
@@ -117,11 +120,37 @@ class SensitiveDataAgent(BaseAgent):
     def _call_claude(self, user_content: str):
         return llm_gateway.call_tool(self.system_prompt, user_content, SENSITIVE_DATA_TOOL_SCHEMA, max_tokens=16000)
 
-    def scan(self, content: str, context: str = "", project_name: str = "") -> dict:
+    def scan(self, content: str = "", context: str = "", project_name: str = "",
+             files: Optional[List[Dict[str, Any]]] = None,
+             coverage_incomplete: bool = False, coverage_reason: str = "",
+             extra_findings: Optional[List[Dict[str, Any]]] = None,
+             suppression: Any = None, source: Optional[Dict[str, Any]] = None,
+             on_progress=None) -> dict:
+        """Scan one artifact, or a whole codebase.
+
+        The file-list path exists because this is the one non-code product whose question is
+        genuinely **per file**: "is there a credential in here, is there PHI in here". That
+        is exactly the shape `chunked_review` was built for — twenty lists of findings
+        concatenate into one list of findings — so unlike Architecture or Security Review,
+        this one does not need a structural summary and would be worse for having one. A
+        summary of a codebase cannot contain the hardcoded key that is the finding.
+
+        `verify_evidence` stays **off** on that path for the reason it is off everywhere
+        else here, and it is a stronger reason than usual: this schema asks for `sample` to
+        be an *obfuscated* sample with the real value replaced by `[REDACTED]`, so a
+        substring check against the source would discard precisely the findings that
+        followed instructions. `smoke_governance.py` asserts that in as many words.
+        """
         controls_summary = "\n".join(
             f"- {cid}: {ctrl.title}" for cid, ctrl in ALL_CONTROLS.items()
             if ctrl.category in ("Security", "Governance")
         )
+        if files:
+            return self._scan_files(
+                files, controls_summary, context=context, project_name=project_name,
+                coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
+                extra_findings=extra_findings, suppression=suppression,
+                source=source, on_progress=on_progress)
         prompt = f"""Scan the following artifact for sensitive data exposure, mishandling, or privacy risks.
 
 Project: {project_name or 'Unknown'}
@@ -137,4 +166,77 @@ Available controls for reference:
 Identify every instance of PII, PHI, PCI, credentials, location data, or other regulated sensitive data.
 For each finding, provide the exact location, an obfuscated sample, and the regulation reference."""
 
-        return self._call_claude(prompt)
+        result = self._call_claude(prompt)
+        result["agent_name"] = self.agent_name
+        # This agent never went through `BaseAgent.review`, so it had none of the
+        # protections that method now applies: it overrides `_call_claude` and `scan`
+        # calls it directly. Two of them apply here and matter:
+        #
+        #  * **A truncated response is refused, not stored.** A scan that came back
+        #    cut off used to be saved with the schema's default gate, which reads as
+        #    "we looked for PHI and credentials and found none" — the most costly wrong
+        #    answer this particular agent can give.
+        #  * **The gate is a floor.** A hardcoded credential reported at severity 5
+        #    cannot come out Green.
+        #
+        # Evidence verification is off, and here the reason is stronger than elsewhere:
+        # this schema asks for `sample` to be an **obfuscated** sample with the real data
+        # replaced by `[REDACTED]`. A substring check against the source is therefore
+        # guaranteed to fail for every correctly-masked finding, so turning it on would
+        # discard exactly the findings that followed instructions. `location` is a
+        # "file, function, or line reference" — a description, not a quote — for the same
+        # reason it is elsewhere. See `backend/agents/attest.py`.
+        #
+        # No `claim_key`: this product takes one text artifact (`content` or
+        # `github_file_url`), never a file list, so there is no per-file coverage to
+        # reconcile.
+        #
+        # `artifact=content`, not `prompt`: the degeneracy threshold is about the size of
+        # the thing under review, and padding it with the control summary and preamble we
+        # wrote ourselves would let a one-line artifact clear the 200-character floor and
+        # escape the check.
+        return attest.attest(result, agent_name=self.agent_name, artifact=content)
+
+    def _scan_files(self, files, controls_summary, *, context, project_name,
+                    coverage_incomplete, coverage_reason, extra_findings,
+                    suppression, source, on_progress) -> dict:
+        """A codebase, fanned out over chunks and reassembled by `chunked_review`.
+
+        No `attest` call and no `merge_extra`. The first because `chunked_review` already
+        refuses a degenerate response and floors the gate — the two protections `scan`'s own
+        `attest` call exists to add, applied once rather than twice. The second because this
+        schema's only non-prose field is `findings`, which concatenates; unlike the Part 11
+        verifier there is no assessment object needing an any/every rule (D-354).
+        """
+        preamble = (
+            "Scan the following codebase for sensitive data exposure, mishandling, or "
+            "privacy risks.\n\n"
+            f"Project: {project_name or 'Unknown'}\n"
+            f"Context: {context or 'Not provided'}\n\n"
+            "Available controls for reference:\n"
+            f"{controls_summary}\n\n"
+            "Identify every instance of PII, PHI, PCI, credentials, location data, or other "
+            "regulated sensitive data. For each finding, give the file it is in, an "
+            "obfuscated sample, and the regulation reference.\n\n"
+            "--- CODEBASE (part) ---\n"
+        )
+
+        def _call_chunk(chunk_text: str):
+            return self._call_claude(f"{preamble}{chunk_text}\n--- END ---")
+
+        result = chunked_review.run(
+            agent_name=self.agent_name,
+            review_type="sensitive_data",
+            call_chunk=_call_chunk,
+            files=files,
+            coverage_incomplete=coverage_incomplete,
+            coverage_reason=coverage_reason,
+            extra_findings=extra_findings,
+            suppression=suppression,
+            on_progress=on_progress,
+            verify_evidence=False,
+        )
+        result["agent_name"] = self.agent_name
+        if source:
+            result["source"] = source
+        return result

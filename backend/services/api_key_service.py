@@ -87,8 +87,10 @@ def validate_api_key(raw_key: str) -> Optional[dict]:
     return database.get_api_key_by_hash(_hash(raw_key))
 
 
-def revoke_api_key(key_id: str) -> bool:
-    return database.revoke_api_key(key_id)
+def revoke_api_key(key_id: str, revoked_by: str = "") -> bool:
+    """`revoked_by` is threaded through for the audit row, which used to say "admin" for
+    every revocation regardless of who did it."""
+    return database.revoke_api_key(key_id, revoked_by=revoked_by)
 
 
 def list_api_keys(project_ids: Optional[list] = None) -> list:

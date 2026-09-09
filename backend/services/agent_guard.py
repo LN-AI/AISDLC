@@ -63,6 +63,7 @@ from backend.services.entitlement_service import (
 from backend.services.subject_service import (
     ProjectBindingError,
     Subject,
+    project_warning,
     require_project,
     subject_from_caller,
 )
@@ -436,7 +437,8 @@ def guarded_call(
         # when the registry has no record for it (an internal stage), which is the
         # better fallback: a labelled row beats a NULL one.
         with context.bind_project(project_id, project_name,
-                                  product_id=getattr(product, "id", None) or agent_name), \
+                                  product_id=getattr(product, "id", None) or agent_name,
+                                  actor=caller_ref or caller_type), \
                 hold_budget_reservation(subject, model_for_reservation, _expected_calls(product)), \
                 llm_gateway.track_usage():
             try:
@@ -538,6 +540,14 @@ def guarded_call(
         cost_estimated=bool(usage["calls"]) and _is_estimated(model),
         project_id=project_id, project_name=project_name, result=result, status=status,
     )
+    # Why derived here rather than threaded out of `preflight`: the async job endpoints call
+    # `preflight` on the HTTP request and `guarded_call(skip_preflight=True)` in the job
+    # thread, so a warning produced during preflight would never reach the result. The
+    # subject is available on both paths and cannot go stale.
+    if isinstance(result, dict):
+        _pw = project_warning(subject)
+        if _pw:
+            result["_project_warning"] = _pw
     return result
 
 

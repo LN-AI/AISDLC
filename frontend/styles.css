@@ -1325,10 +1325,33 @@ button.not-entitled::after {
    does not inherit one, so the options would paint light-on-white (see D-32). */
 .findings-toolbar select {
   background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
-  color: var(--text); font-size: 13px; padding: 6px 12px; min-width: 160px;
+  color: var(--text); font-size: 13px; padding: 6px 12px;
+  /* `width: auto` overrides the global `select { width: 100% }` (line ~918). In a flex row
+     that global makes every select demand the whole line, so each one wrapped onto its
+     own — a six-row toolbar for six filters. Survivable with the two controls this screen
+     used to have, which is why it was never noticed; not survivable now. */
+  width: auto; flex: 0 0 auto; min-width: 150px; max-width: 220px;
 }
 .findings-toolbar select:focus { outline: none; border-color: var(--accent); }
 .findings-counts { color: var(--text-muted); font-size: 13px; margin-left: auto; }
+
+/* The text filters, matching the selects beside them. The toolbar already wraps, which it
+   needs to now that it carries nine controls rather than two.
+   `type="search"` and `type="text"` do not inherit the app's field styling the way a
+   <select> does, so they are named here rather than relying on a generic input rule. */
+.findings-toolbar input[type="search"],
+.findings-toolbar input[type="text"] {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 13px; padding: 6px 12px;
+}
+.findings-toolbar input:focus { outline: none; border-color: var(--accent); }
+.findings-toolbar input::placeholder { color: var(--text-dim, #7d8590); }
+/* The search box earns the room; a repository or control id does not. Both need an
+   explicit width for the same reason the selects do. */
+.findings-toolbar .findings-search { flex: 1 1 240px; min-width: 200px; max-width: 420px; }
+.findings-toolbar .findings-narrow { flex: 0 0 auto; width: 140px; }
+/* The buttons and the counts end the row rather than wrapping alone under it. */
+.findings-toolbar .btn { flex: 0 0 auto; }
 
 /* Which review a finding came from. On every other screen that is implied by the page
    you are on; here findings from different reviews and different agents sit together,
@@ -2585,3 +2608,181 @@ pre.fix-diff {
   padding: 8px 11px; margin-bottom: 10px; font-size: 12.5px;
   background: rgba(209,154,47,.07);
 }
+
+
+/* ── A unified diff, and a finding's own line ───────────────────────────────
+ *
+ * The diff was a bare `<pre>` and a finding's `file:line` was plain text. Both are on the
+ * path a developer takes when deciding whether to trust a patch, which is the moment the
+ * platform most needs to be readable.
+ *
+ * Colours come from the existing severity tokens rather than new greens and reds, so a
+ * diff sits in the same palette as everything around it. */
+
+.diff-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 10px; border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.dl-stat { font-family: var(--mono, ui-monospace, monospace); font-weight: 600; }
+.dl-stat-add { color: var(--green, #3fb950); }
+.dl-stat-del { color: var(--red, #f85149); }
+
+.diff-view {
+  width: 100%; border-collapse: collapse;
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12.5px; line-height: 1.55;
+}
+/* Two gutters: the old file's line and the new file's. An added line has no old number
+ * and a removed line has no new one, which is the information a reader cannot reconstruct
+ * from a flat listing. */
+.diff-view .dl-n {
+  width: 1%; min-width: 44px; padding: 0 8px;
+  text-align: right; vertical-align: top;
+  color: var(--text-dim, #7d8590); background: var(--bg-2, #161b22);
+  border-right: 1px solid var(--border);
+  user-select: none; white-space: nowrap;
+}
+.diff-view .dl-s {
+  padding: 0 10px; white-space: pre-wrap; word-break: break-word;
+  vertical-align: top;
+}
+.diff-view tr.dl-add .dl-s { background: color-mix(in srgb, var(--green, #3fb950) 14%, transparent); }
+.diff-view tr.dl-del .dl-s { background: color-mix(in srgb, var(--red, #f85149) 14%, transparent); }
+.diff-view tr.dl-hunk .dl-s {
+  background: var(--bg-2, #161b22); color: var(--accent, #a5a5ff);
+  font-weight: 600;
+}
+.diff-view tr.dl-meta .dl-s { color: var(--text-dim, #7d8590); }
+/* `color-mix` is recent enough to want a floor under it: without support the row keeps the
+ * table background, so the +/- prefix in the text is still there and nothing is lost. */
+@supports not (background: color-mix(in srgb, red 10%, transparent)) {
+  .diff-view tr.dl-add .dl-s { background: rgba(63, 185, 80, 0.14); }
+  .diff-view tr.dl-del .dl-s { background: rgba(248, 81, 73, 0.14); }
+}
+
+/* A finding's location, now a link into the file viewer at that line. Styled as a path
+ * rather than as a button: it reads as the thing it names, and the pointer says it acts. */
+.finding-loc-link {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: inherit; padding: 0; border: 0; background: none;
+  color: var(--accent, #a5a5ff); cursor: pointer; text-align: left;
+}
+.finding-loc-link:hover { text-decoration: underline; }
+
+/* The line a finding named, once its file is open. A left rule rather than a full-row wash
+ * so the code itself keeps its own syntax-free contrast. */
+.code-view tr.code-line-hit .src {
+  background: color-mix(in srgb, var(--amber, #d29922) 16%, transparent);
+  box-shadow: inset 3px 0 0 var(--amber, #d29922);
+}
+@supports not (background: color-mix(in srgb, red 10%, transparent)) {
+  .code-view tr.code-line-hit .src { background: rgba(210, 153, 34, 0.16); }
+}
+
+/* ── A chip that explains itself, and the panel it opens ───────────────────
+   The chips were inert text; they are now buttons. They must still read as chips —
+   the strip is reference material a reader consults and stops seeing, and a row of
+   obvious buttons under every page header would compete with the form below it. So the
+   affordance is the cursor and a hover border, not a button shape. */
+.about-chip-btn {
+  font: inherit; font-size: 11px; line-height: inherit;
+  cursor: pointer; transition: border-color .12s, color .12s;
+}
+.about-chip-btn:hover, .about-chip-btn:focus-visible {
+  border-color: var(--accent, #4f7cff); color: var(--accent, #4f7cff);
+}
+.about-link {
+  background: none; border: 0; padding: 0; font: inherit; font-size: 12px;
+  color: var(--accent, #4f7cff); cursor: pointer; text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.about-link:hover, .about-link:focus-visible { opacity: .8; }
+
+/* SOC 2 resolves to 45 controls. Scrolled rather than truncated: "and 37 more" hides
+   exactly the half someone checking coverage came to read. */
+.info-control-list {
+  max-height: 38vh; overflow-y: auto; border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 0;
+}
+.info-control {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 5px 11px; font-size: 12.5px; border-bottom: 1px solid var(--border);
+}
+.info-control:last-child { border-bottom: 0; }
+.info-control code {
+  flex: 0 0 auto; min-width: 78px; font-size: 11.5px; color: var(--text-muted);
+}
+.info-control-title { flex: 1 1 auto; }
+.info-blocking {
+  flex: 0 0 auto; font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--red, #d1495b); border: 1px solid currentColor; border-radius: 8px;
+  padding: 0 5px;
+}
+
+/* The sentence that stops a chip reading as an audit result, and the one that says the
+   API reference was left out. Bordered rather than muted: both are the qualification on
+   everything above them, and a caveat set in grey is a caveat nobody reads. */
+.info-caveat {
+  margin-top: 18px; padding: 9px 12px; font-size: 12.5px; line-height: 1.5;
+  border: 1px solid var(--border); border-left: 3px solid var(--text-muted);
+  border-radius: 6px; background: var(--surface2); color: var(--text-muted);
+}
+.md-body.info-doc { font-size: 13.5px; }
+.md-body.info-doc h2 { font-size: 14px; margin: 18px 0 6px; }
+
+/* ── Starting one agent from another's output ──────────────────────────────
+   Sits directly above the field it fills, so the relationship is positional and needs no
+   explaining. Quiet like `.agent-about`: it is an option, not the main path, and the
+   person who came here to paste something should not have to read past a loud panel. */
+.run-handoff {
+  display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center;
+  margin: 0 0 8px; padding: 8px 11px; font-size: 12px;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--surface2);
+}
+.run-handoff-stacked { flex-direction: column; align-items: stretch; }
+.run-handoff-label {
+  text-transform: uppercase; letter-spacing: .06em; font-size: 10px;
+  color: var(--text-muted); opacity: .85;
+}
+.run-handoff-select {
+  flex: 1 1 260px; min-width: 0; font-size: 12px; padding: 4px 7px;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--surface); color: var(--text);
+}
+.run-handoff-select:disabled { opacity: .6; }
+.run-handoff-btn { font-size: 12px; padding: 4px 11px; }
+/* Full width on its own line: it carries the reason the control exists, and reasons that
+   wrap into a 60px column do not get read. */
+.run-handoff-note { flex: 1 0 100%; color: var(--text-muted); line-height: 1.5; }
+.run-handoff-carry {
+  margin: 6px 0 0; padding: 8px 10px; max-height: 22vh; overflow: auto;
+  font-size: 11.5px; line-height: 1.5; white-space: pre-wrap;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--surface); color: var(--text-muted);
+}
+
+/* A quote whose coverage line is the part that matters. `cost-note-warn` is used when some
+   of the codebase could not be parsed: the price is fine and the coverage is the caveat. */
+.cost-note-warn {
+  border-left: 3px solid var(--amber, #d19a2f);
+  background: rgba(209,154,47,.07);
+}
+.cost-note-bad {
+  border-left: 3px solid var(--red, #d1495b);
+  background: rgba(209,73,91,.07);
+}
+
+/* Compare mode: one bordered box per candidate architecture, so the boundary between two
+   options is a boundary on screen and not a paragraph break in one textarea. */
+.arch-option {
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px 11px; margin-bottom: 10px; background: var(--surface2);
+}
+.arch-option-head { display: flex; gap: 10px; align-items: center; margin-bottom: 7px; }
+.arch-option-name {
+  flex: 1 1 auto; font-size: 13px; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--surface); color: var(--text);
+}
+.arch-option-text { width: 100%; }

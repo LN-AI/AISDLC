@@ -544,6 +544,417 @@ check("the waive endpoint is actually registered on the app",
       "a router that is imported but never included is invisible until someone calls it")
 check("it is a PATCH", "patch" in _paths.get("/api/v1/findings/{finding_id}", {}))
 
+# ── The case above has one review. The real one has several (C-81) ─────────
+#
+# One fingerprint gets one findings row per review that reported it, and those rows
+# disagree: review 1 saw it open, somebody waived it from review 2's list. The old query
+# grouped by fingerprint with bare columns and a single `MIN(r.created_at)`, which triggers
+# SQLite's documented min/max special case -- the bare columns come from the row with the
+# **minimum**, the *oldest* review. So a waiver set on any review after the first was
+# invisible for ever and the finding was gated on again after a team had accepted it.
+#
+# Rows are inserted directly because the point is two reviews with controlled timestamps
+# sharing a fingerprint, which `save_review` cannot express.
+_C81_COLS = ("id, review_id, fingerprint, status, severity, project_id, control_id, "
+             "risk_level, title, resolved_by, resolved_at, resolution_comment, "
+             "waiver_expires_at")
+_C81_Q = f"INSERT INTO findings ({_C81_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+
+
+def _c81_seed(fp, project, *, expires=None, reverse=False):
+    """Two reviews of one project; the older row open, the newer row waived."""
+    conn = database.get_connection()
+    cur = conn.cursor()
+    old_id, new_id = f"{fp}-rev-old", f"{fp}-rev-new"
+    for rid, when in ((old_id, "2026-01-01T00:00:00"), (new_id, "2026-06-01T00:00:00")):
+        cur.execute("INSERT INTO reviews (id, review_type, gate_status, created_at, "
+                    "project_id) VALUES (?,?,?,?,?)", (rid, "code", "Red", when, project))
+    rows = [
+        (f"{fp}-old", old_id, fp, "open", 5, project, "SEC-001", "Critical", "t",
+         None, None, None, None),
+        (f"{fp}-new", new_id, fp, "accepted_risk", 5, project, "SEC-001", "Critical", "t",
+         "alice", "2026-06-02T00:00:00", "accepted for this release", expires),
+    ]
+    # Insertion order must not change the answer -- that is the whole point of replacing
+    # bare columns with a window function.
+    for row in (reversed(rows) if reverse else rows):
+        cur.execute(_C81_Q, row)
+    conn.commit()
+    conn.close()
+
+
+_c81_seed("c81-fp-1", "c81-proj")
+_b81 = database.get_finding_baseline("c81-proj", ["c81-fp-1"])["c81-fp-1"]
+check("A WAIVER SET ON A LATER REVIEW IS STILL A WAIVER",
+      _b81["status"] == "accepted_risk",
+      f"the baseline reports {_b81['status']!r} -- with bare columns SQLite returned the "
+      "OLDEST row, so a finding a team had explicitly accepted was reported and gated on "
+      "again by every run afterwards, which is how people stop reading reviews")
+check("...and the decision is attributed to whoever made it",
+      _b81["resolved_by"] == "alice" and "accepted for this release" in
+      (_b81["resolution_comment"] or ""),
+      f"{_b81['resolved_by']!r} / {_b81['resolution_comment']!r} -- the oldest row has no "
+      "resolver, so the status and its attribution came from different rows")
+check("...while first_seen is still the oldest sighting, not the waiver's date",
+      _b81["first_seen"] == "2026-01-01T00:00:00",
+      f"{_b81['first_seen']} -- 'how long have we had this' must not reset when someone "
+      "accepts it")
+
+_c81_seed("c81-fp-2", "c81-proj", reverse=True)
+check("...and the answer does not depend on the order rows were written",
+      database.get_finding_baseline("c81-proj", ["c81-fp-2"])["c81-fp-2"]["status"]
+      == "accepted_risk",
+      "a query whose result depends on physical row order is one that passes in a test and "
+      "fails on a customer's database")
+
+# The unscoped branch is a separate SQL string in the same function, so it is checked
+# separately -- fixing one and not the other is the obvious way to half-fix this.
+_c81_seed("c81-fp-3", None)
+check("...on the project-less path too, which is a second copy of the query",
+      database.get_finding_baseline(None, ["c81-fp-3"])["c81-fp-3"]["status"]
+      == "accepted_risk",
+      "`get_finding_baseline` builds one SQL string for a bound project and another for "
+      "none; they have to agree")
+
+# "Any live waiver wins" is bounded by expiry, which is why the rule is defensible: the
+# cost of being wrong is one finding hidden for at most the acceptance window, and
+# `lapse_expired_waivers` runs before every baseline lookup (D-259).
+_c81_seed("c81-fp-4", "c81-proj", expires="2026-09-01T00:00:00")
+check("an acceptance that ran out stops winning",
+      database.lapse_expired_waivers() >= 1
+      and database.get_finding_baseline("c81-proj", ["c81-fp-4"])["c81-fp-4"]["status"]
+      == "open",
+      "otherwise 'any waiver wins' would mean 'any waiver wins for ever', and an expiry "
+      "date that changes nothing is worse than no expiry date")
+
+# ── 12. The other half of the baseline ─────────────────────────────────────
+#
+# Section 11 asks "what is new". Nothing asked "what is gone", so a fix and a still-open
+# finding were the same absence: no burn-down, no fix rate, no time-to-remediate, and no
+# way for a run to say "this change closed four and introduced one".
+section("12. A later run says what got fixed, and refuses to guess")
+
+# Titles and paths deliberately unlike section 11's: `fingerprint` is a hash of
+# control_id + path + title + evidence, and `cf()` defaults the path to `src/auth.py` and
+# the title to "SQL injection" -- so a finding that only overrides `severity` here would
+# share section 11's fingerprint and inherit the waiver it set.
+GONE = cf(severity=5, control_id="SEC-003", title="Secret in settings loader",
+          file_path="src/settings.py")
+GONE["fingerprint"] = finding_pipeline.fingerprint(GONE)
+STAYS = cf(severity=4, control_id="SEC-001", title="Unparameterised order lookup",
+           file_path="src/orders.py")
+STAYS["fingerprint"] = finding_pipeline.fingerprint(STAYS)
+NO_FILE = cf(severity=3, control_id="GOV-001", title="No threat model on record",
+             file_path="")
+NO_FILE["fingerprint"] = finding_pipeline.fingerprint(NO_FILE)
+check("this section's fingerprints do not collide with section 11's",
+      len({GONE["fingerprint"], STAYS["fingerprint"], NO_FILE["fingerprint"],
+           BASE[0]["fingerprint"]}) == 4,
+      "a colliding fingerprint would make this section assert against the waiver "
+      "section 11 set, which is how the first version of it passed for the wrong reason")
+
+prior = {
+    GONE["fingerprint"]: {"file_path": "src/settings.py", "title": GONE["title"], "severity": 5},
+    STAYS["fingerprint"]: {"file_path": "src/orders.py", "title": STAYS["title"], "severity": 4},
+    NO_FILE["fingerprint"]: {"file_path": "", "title": NO_FILE["title"], "severity": 3},
+}
+ALL_READ = {"src/settings.py", "src/orders.py"}
+
+out = finding_pipeline.resolved_since([dict(STAYS)], prior, files_read=ALL_READ)
+check("a finding the previous run reported and this one does not is resolved",
+      out["resolved_count"] == 1, str(out))
+check("...and it is the right one",
+      out["resolved_findings"][0]["fingerprint"] == GONE["fingerprint"])
+check("a finding still being reported is not resolved",
+      all(r["fingerprint"] != STAYS["fingerprint"] for r in out["resolved_findings"]))
+check("a finding that names no file is never credited as fixed",
+      all(r["fingerprint"] != NO_FILE["fingerprint"] for r in out["resolved_findings"]),
+      "it is about the design, not a line -- its absence from one run is not evidence "
+      "anybody changed anything")
+check("...and is counted as unverifiable rather than dropped silently",
+      out["unverifiable_count"] == 1, str(out))
+
+# The check that matters most: a narrower review must not report the rest of the
+# repository as fixed. Reviewing only `src/orders.py` says nothing about `src/settings.py`.
+narrow = finding_pipeline.resolved_since([], prior, files_read={"src/orders.py"})
+_credited = {r["file_path"] for r in narrow["resolved_findings"]}
+check("a run that did not read a file cannot claim its finding was fixed",
+      "src/settings.py" not in _credited, str(narrow))
+check("...while the file it did read is credited normally",
+      _credited == {"src/orders.py"}, str(sorted(_credited)))
+check("...and the two it could not speak to are counted, not dropped",
+      narrow["unverifiable_count"] == 2,
+      f"{narrow['unverifiable_count']} -- src/settings.py (not read) and the finding "
+      "with no file at all")
+
+blind = finding_pipeline.resolved_since([], prior, files_read=None)
+check("a single pasted artifact credits nothing, having no paths to compare",
+      blind["resolved_count"] == 0 and blind["scope_limited"] is True, str(blind))
+
+check("resolved findings come back worst-first",
+      [r["severity"] for r in finding_pipeline.resolved_since(
+          [], prior, files_read=ALL_READ)["resolved_findings"]] == [5, 4])
+
+# ── 13. Suppression as code ────────────────────────────────────────────────
+#
+# `.lmignore` and inline `lm-ignore`. Two properties are load-bearing and everything else
+# is detail: a rule must **not delete** the finding it matches (only stop it gating), and a
+# rule that matched nothing must **say so** — a misspelled pattern is otherwise invisible
+# and the developer blames the tool for still failing their build.
+section("13. Suppression as code -- .lmignore and inline lm-ignore")
+
+from backend.services import suppression  # noqa: E402
+
+
+def _f(path, control="SEC-001", ls=None, le=None, ev="", sev=5, title="Issue"):
+    return {"file_path": path, "control_id": control, "line_start": ls, "line_end": le,
+            "evidence": ev, "severity": sev, "title": title}
+
+
+_IGN = """
+# comment
+legacy/**
+fixtures
+*.generated.ts
+src/parser.py: SEC-003 known, admin-only tool
+infra/**: SEC-003, SEC-010  tracked in JIRA-4412
+!legacy/payments/**
+src/*.py: CWE-89
+"""
+_sup = suppression.parse(_IGN)
+check("comments and blanks are skipped", len(_sup.rules) == 7, str(len(_sup.rules)))
+check("a well-formed file parses with no errors", not _sup.errors, str(_sup.errors))
+
+check("** crosses directories", bool(_sup.match(_f("legacy/a/b.py"))))
+check("a pattern is not a prefix match", _sup.match(_f("legacyx/a.py")) is None,
+      "'legacy/**' must not cover a sibling directory whose name starts the same")
+check("a bare name matches any whole path segment", bool(_sup.match(_f("a/fixtures/x.py"))))
+check("a basename glob matches anywhere in the tree",
+      bool(_sup.match(_f("web/src/api.generated.ts"))))
+check("...and is anchored at the end", _sup.match(_f("web/api.generated.ts.bak")) is None)
+check("a single * does not cross a slash", _sup.match(_f("src/a/b.py", "CWE-89")) is None,
+      "otherwise a rule written for one directory silently covers a subtree")
+check("a control-scoped rule fires only for its control",
+      bool(_sup.match(_f("src/parser.py", "SEC-003")))
+      and _sup.match(_f("src/parser.py", "SEC-999")) is None)
+check("a comma-separated control list is honoured",
+      bool(_sup.match(_f("infra/main.tf", "SEC-010"))))
+check("the last matching rule wins, so ! carves an exception",
+      _sup.match(_f("legacy/payments/card.py")) is None
+      and bool(_sup.match(_f("legacy/other/x.py"))))
+check("the justification names the file and the line the rule lives on",
+      ".lmignore:6" in str(_sup.match(_f("src/parser.py", "SEC-003"))),
+      "a reader has to be able to go and change the rule")
+check("a rule with no reason still names itself",
+      "legacy/**" in str(_sup.match(_f("legacy/a.py"))))
+
+# A dotfile is the case this feature cannot afford to get wrong: the ignore file is itself
+# a dotfile, so a path normalizer that ate the leading dot broke the whole feature.
+check("a rule about a dotfile path matches",
+      bool(suppression.parse(".github/**").match(_f(".github/workflows/ci.yml"))),
+      "`lstrip('./')` strips a character set, not a prefix -- it turns `.lmignore` into "
+      "`lmignore` and `.github/...` into `github/...`")
+check("a ./ prefix on a finding's path is normalized away",
+      bool(suppression.parse("src/**").match(_f("./src/a.py"))))
+
+# The unused report. This is the point of the feature's honesty, not a nicety.
+_fresh = suppression.parse(_IGN)
+_fresh.match(_f("legacy/a/b.py"))
+_rep = _fresh.report()
+check("a rule that matched nothing is reported", _rep["unused_count"] == 5, str(_rep["unused"]))
+check("...with the line number to go and fix",
+      any(u["line"] == 4 and u["rule"] == "fixtures" for u in _rep["unused"]))
+check("a negation is never reported as unused",
+      not any("payments" in u["rule"] for u in _rep["unused"]),
+      "a ! rule exists to *not* suppress, so it has nothing to match")
+check("rules with no stated reason are counted for the record",
+      _rep["rules_without_reason"] == 4, str(_rep["rules_without_reason"]))
+_fresh.reset()
+check("reset zeroes the counters, so a retry reports this run",
+      _fresh.report()["findings_suppressed"] == 0)
+
+# A malformed file degrades, it does not refuse: a review of a repository with one bad
+# line must not behave as though the file were absent, with no explanation.
+_bad = suppression.parse(": SEC-003 nothing before the colon\ngood/**\n")
+check("a bad line is named and the good lines still work",
+      len(_bad.rules) == 1 and len(_bad.errors) == 1, str((len(_bad.rules), _bad.errors)))
+_big = suppression.parse("\n".join("p%d/**" % i for i in range(suppression.MAX_RULES + 5)))
+check("the rule cap is enforced and announced",
+      len(_big.rules) == suppression.MAX_RULES and len(_big.errors) == 1)
+
+# ── Inline directives ─────────────────────────────────────────────────────
+_FILES = [
+    {"path": "app/db.py", "content": (
+        "import x\n"
+        "q = 'SELECT'  # lm-ignore: SEC-001 admin tool\n"
+        "# lm-ignore-next-line CWE-79\n"
+        "render(user)\n"
+        "plain = 1\n"
+    )},
+    {"path": "vendor/lib.js", "content": "// lm-ignore-file  upstream's problem\nvar a=1;\n"},
+    {"path": "deep/late.py", "content": ("\n" * 40) + "# lm-ignore-file too far down\n"},
+]
+_inline = {(d.path, d.line): d for d in suppression.scan_inline(_FILES)}
+check("a same-line directive is found with its line number",
+      _inline[("app/db.py", 2)].kind == "line")
+check("a next-line directive is distinguished",
+      _inline[("app/db.py", 3)].kind == "next-line")
+check("a whole-file directive is distinguished",
+      _inline[("vendor/lib.js", 1)].kind == "file")
+check("a file directive buried past the header is demoted to a line directive",
+      _inline[("deep/late.py", 41)].kind == "line",
+      "a directive nobody reading the top of the file can see must not exempt the file")
+check("the control and the reason are parsed off the directive",
+      _inline[("app/db.py", 2)].controls == frozenset({"SEC-001"})
+      and _inline[("app/db.py", 2)].reason == "admin tool")
+
+_both = suppression.from_files(_FILES + [{"path": ".lmignore", "content": "legacy/**\n"}])
+check("the ignore file is found by name in a raw file list", len(_both.rules) == 1,
+      "it has no reviewable extension, so it is only in the list before filtering")
+check("a same-line directive suppresses that line",
+      bool(_both.match(_f("app/db.py", "SEC-001", 2, 2))))
+check("...and not a different control on the same line",
+      _both.match(_f("app/db.py", "SEC-999", 2, 2)) is None)
+check("a next-line directive suppresses the line below, not its own",
+      bool(_both.match(_f("app/db.py", "CWE-79", 4, 4)))
+      and _both.match(_f("app/db.py", "CWE-79", 3, 3)) is None)
+check("a file directive covers any line in that file",
+      bool(_both.match(_f("vendor/lib.js", "SEC-001", 99, 99))))
+check("a line directive cannot suppress a finding that names no line",
+      _both.match(_f("app/db.py", "SEC-001", None, None)) is None,
+      "otherwise one comment silently exempts a whole file, which is what "
+      "lm-ignore-file is for and has to be asked for")
+check("an unrelated line in the same file is untouched",
+      _both.match(_f("app/db.py", "SEC-001", 5, 5)) is None)
+
+_none = suppression.from_files([{"path": "a.py", "content": "x = 1\n"}])
+check("a repository with no ignore file yields no rules", not bool(_none))
+check("...but records that it was looked for", _none.report()["checked"] is True,
+      "'no rules' and 'never checked' are different facts")
+
+# The diff fallback: a pull request has no file list, so the only place a directive can be
+# seen is inside the finding's own evidence quote.
+_ev = suppression.Suppressions()
+check("a directive inside the evidence quote is honoured for a diff source",
+      bool(_ev.match_evidence(_f("x.py", "SEC-001", ev="q = 1  # lm-ignore: SEC-001 fine"))))
+check("...still narrowed by control",
+      _ev.match_evidence(_f("x.py", "SEC-9", ev="q = 1  # lm-ignore: SEC-001 fine")) is None)
+check("...and silent when there is no directive",
+      _ev.match_evidence(_f("x.py", "SEC-001", ev="q = 1")) is None)
+
+# ── The property that makes any of this safe ──────────────────────────────
+_HAY = "line one\nsecret = 'abc'\nline three\n"
+_hit = {"title": "Hardcoded secret", "severity": 5, "control_id": "SEC-003",
+        "file_path": "legacy/old.py", "evidence": "secret = 'abc'", "line_start": 2}
+_out = finding_pipeline.process([dict(_hit)], _HAY,
+                                suppression=suppression.parse("legacy/**  agreed\n"))
+check("a suppressed finding leaves the gating list",
+      not _out["findings"], str(_out["findings"]))
+check("...and is still reported, not deleted",
+      len(_out["suppressed_findings"]) == 1,
+      "anyone with commit access could otherwise turn a Red release Green by adding two "
+      "lines, and the review would agree with them in writing")
+check("...carrying the rule that did it",
+      ".lmignore" in (_out["suppressed_findings"][0].get("suppressed_reason") or ""))
+check("...and marked non-blocking",
+      _out["suppressed_findings"][0].get("is_blocking") is False)
+
+_kept = finding_pipeline.process([dict(_hit)], _HAY,
+                                 suppression=suppression.parse("other/**\n"))
+check("a non-matching rule changes nothing", len(_kept["findings"]) == 1)
+check("no suppression object at all changes nothing",
+      len(finding_pipeline.process([dict(_hit)], _HAY)["findings"]) == 1)
+
+# The built-in path rules must still win where they always did, and must not need a
+# `.lmignore` to be present.
+_test_hit = dict(_hit, file_path="tests/test_old.py")
+_tp = finding_pipeline.process([_test_hit], _HAY, suppression=suppression.parse(""))
+check("the built-in test/vendor filter still applies with an empty ignore file",
+      len(_tp["suppressed_findings"]) == 1
+      and "test, vendored" in _tp["suppressed_findings"][0]["suppressed_reason"])
+
+# ── The waiver export ─────────────────────────────────────────────────────
+#
+# The migration path, and the reason this is worth building: a project that has been
+# clicking waivers for months can export them once instead of re-entering them.
+_exported = suppression.to_ignore_file([
+    {"file_path": "src/a.py", "control_id": "SEC-003", "reason": "accepted 2026-01"},
+    {"file_path": "src/a.py", "control_id": "SEC-003", "reason": "a duplicate row"},
+    {"file_path": "", "title": "design finding", "fingerprint": "abc123"},
+])
+check("one rule per path and control, duplicates collapsed",
+      _exported.count("src/a.py: SEC-003") == 1, _exported)
+check("a waiver with no file path is named in the output, not dropped",
+      "SKIPPED (no file path)" in _exported,
+      "a waiver that vanishes on export is one somebody still has to re-enter by hand")
+_round = suppression.parse(_exported)
+check("the export round-trips through its own parser",
+      len(_round.rules) == 1 and not _round.errors, str(_round.errors))
+check("...keeping the control narrow",
+      bool(_round.match(_f("src/a.py", "SEC-003")))
+      and _round.match(_f("src/a.py", "SEC-001")) is None,
+      "an export that widened to every control would grant what nobody approved")
+
+
+# ── Through the real database, against a real repository ──────────────────
+from backend import context as _ctx12  # noqa: E402
+
+_first = None
+with _ctx12.bind_source({"repo_host": "github.com", "repo_owner": "acme",
+                         "repo_name": "shop", "branch": "main",
+                         "commit_sha": "a" * 40, "pr_number": None}):
+    _first = database.save_review(
+        review_type="code", project_name="p", input_summary="s", input_content="c",
+        result={"findings": [GONE, STAYS], "risk_score": 90.0, "gate_status": "Red",
+                "summary": "s"},
+    )
+_row12 = database.get_review(_first)
+check("a review stores the repository it was about",
+      (_row12["repo_owner"], _row12["repo_name"]) == ("acme", "shop"),
+      f"{_row12['repo_owner']}/{_row12['repo_name']}")
+check("...and the commit, so a later run compares like with like",
+      _row12["commit_sha"] == "a" * 40)
+check("a review with no repository stores NULL, not an empty string",
+      database.get_review(database.save_review(
+          review_type="code", project_name="p", input_summary="s", input_content="c",
+          result={"findings": [], "gate_status": "Green", "summary": "s"},
+      ))["repo_name"] is None,
+      "a paste has no repository; NULL keeps it out of the repository index entirely")
+
+_open12 = database.previously_open_findings(None, repo_owner="acme", repo_name="shop")
+check("the previous run's open findings are found by repository",
+      {GONE["fingerprint"], STAYS["fingerprint"]} <= set(_open12), str(sorted(_open12)))
+_other = database.previously_open_findings(None, repo_owner="acme", repo_name="other-repo")
+check("...and another repository's are not",
+      _other == {}, str(_other))
+
+_closed = database.mark_findings_resolved([GONE["fingerprint"]], None, actor="second-run")
+check("a resolved finding is closed in the database", _closed == 1, str(_closed))
+_after12 = database.get_finding_baseline(None, [GONE["fingerprint"]])
+check("...with status 'resolved'",
+      _after12[GONE["fingerprint"]]["status"] == "resolved", str(_after12))
+check("...naming what closed it",
+      _after12[GONE["fingerprint"]]["resolved_by"] == "second-run", str(_after12))
+check("only open findings are closed -- a waiver is not overwritten by a later run",
+      database.mark_findings_resolved([BASE[0]["fingerprint"]], None, actor="second-run") == 0,
+      "section 11 waived that fingerprint; a run that stops reporting it must not "
+      "silently convert a deliberate acceptance into 'fixed'")
+check("'resolved' does NOT suppress a future report of the same finding",
+      "resolved" not in finding_pipeline.WAIVED_STATUSES,
+      "if it comes back it must come back as a regression, not be silently muted -- that "
+      "is the difference between 'we fixed it' and 'we stopped looking'")
+_reported = finding_pipeline.apply_baseline([dict(GONE)], _after12)
+check("...so a returning finding is reported again", len(_reported["findings"]) == 1)
+
+check("a repository view can be built from the column",
+      any(r["repo_name"] == "shop" for r in database.list_repositories(None)),
+      str([r.get("repo_name") for r in database.list_repositories(None)]))
+_repo12 = [r for r in database.list_repositories(None) if r["repo_name"] == "shop"][0]
+check("...and it counts what is still open, not what was ever found",
+      _repo12["open_critical"] == 0 and _repo12["open_high"] == 1,
+      f"critical={_repo12['open_critical']} high={_repo12['open_high']} "
+      "-- the Critical was resolved above, the High is still open")
+
 section("Control mapping -- every id the prompt offers has to exist")
 
 # The prompt hands the model a list of control ids and the model returns one per finding.
@@ -590,6 +1001,206 @@ check("...and the reviewer is told not to infer it from the project name",
 check("HIPAA-003 is now reachable -- it is what the mis-filed finding actually was",
       "HIPAA-003" in _CODE_PROMPT and _CATALOGUE["HIPAA-003"].title.startswith("Audit Logging"))
 
+
+# -- An artifact too big for one call says how big ------------------------
+section("15. Too large to review says how much too large")
+
+# Code Review and VAPT chunk; every other agent gets one call and this hard stop. The old
+# message ("split the artifact into smaller pieces") was true and unactionable -- it did not
+# say whether you were 5% over or four times over, so the only way to find out was to keep
+# resubmitting. The size of the problem is the one thing this function knows for certain.
+
+_LIM = guardrail_service.config.MAX_AGENT_INPUT_CHARS
+
+guardrail_service.enforce_input_limit("x" * (_LIM - 1))
+check("an artifact inside the limit passes", True)
+
+
+def _refusal(n, limit=None):
+    try:
+        guardrail_service.enforce_input_limit("x" * n, limit)
+        return ""
+    except guardrail_service.GuardrailViolation as exc:
+        return str(exc)
+
+
+_msg = _refusal(_LIM + 1)
+check("one character over is refused", bool(_msg))
+check("...as two runs' worth, not one -- 1.01x the limit still needs a second call",
+      "roughly 2 runs" in _msg, _msg[:160])
+check("...and says nothing was spent, because it is refused before the model call",
+      "Nothing was spent" in _msg,
+      "otherwise a refusal on a large codebase reads as a charge for nothing")
+check("...and points at the two agents that do not have this problem",
+      "Code Review" in _msg and "VAPT" in _msg,
+      "the honest next step is 'use the one that chunks', where that is an option")
+
+check("four times the limit asks for four parts",
+      "roughly 4 runs" in _refusal(_LIM * 4), _refusal(_LIM * 4)[:160])
+check("...and a fraction over four rounds up to five",
+      "roughly 5 runs" in _refusal(_LIM * 4 + 1), _refusal(_LIM * 4 + 1)[:160])
+
+check("an explicit limit is honoured over the configured one",
+      "roughly 3 runs" in _refusal(2500, 1000), _refusal(2500, 1000)[:160])
+check("empty content is never refused", _refusal(0) == "")
+
+
+# -- 16. The eval's own scoring (C-85) -------------------------------------
+section("16. The eval's scoring -- a coin flip must not read as a regression")
+
+# `eval_code_review.py` costs money to run, so its arithmetic had no test of any kind --
+# and that arithmetic is what decides whether a change to the review pipeline gets called
+# a regression. These checks drive the pure `score`/`thresholds` pair with the real data
+# from D-358, so no model is called and nothing is spent.
+import importlib.util as _ilu
+import inspect as _i16
+
+_espec = _ilu.spec_from_file_location(
+    "_eval_cr", os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_code_review.py"))
+_ev = _ilu.module_from_spec(_espec)
+_espec.loader.exec_module(_ev)
+
+
+def _erun(case, gate_ok, gate="Green", fps=(), must=(0, 0), traps=(0, 0), error=""):
+    """One run of one case, in the shape `run_case` returns."""
+    if error:
+        return {"case": case, "error": error, "usage": {}}
+    return {
+        "case": case, "gate": gate, "gate_ok": gate_ok,
+        "must_find_total": must[0], "must_find_hit": must[1],
+        "trap_total": traps[0], "traps_tripped": traps[1],
+        "discarded_hallucinated": 0, "findings_unverified": 0,
+        "fingerprints": list(fps), "usage": {},
+    }
+
+
+def _nine_good(repeat=3):
+    """Nine cases that answer correctly and identically every time."""
+    return {f"case-{i}": [_erun(f"case-{i}", True, "Red", ("fp-a",)) for _ in range(repeat)]
+            for i in range(9)}
+
+
+# The measurement that opened C-85: the same 10-line file returned Amber, Amber, Green with
+# no finding in common. Pooled, that one case dragged a 10-case corpus to exactly 90.0% --
+# the floor -- and was indistinguishable from a real regression.
+_flaky = _nine_good()
+_flaky["fp-framework-csrf"] = [
+    _erun("fp-framework-csrf", False, "Amber", ("fp-x",)),
+    _erun("fp-framework-csrf", False, "Amber", ("fp-y",)),
+    _erun("fp-framework-csrf", True, "Green", ("fp-z",)),
+]
+_sf = _ev.score(_flaky)
+
+check("a case that answers Amber/Amber/Green is excluded from the gate floor",
+      _sf["gate_accuracy"] == 1.0 and _sf["gate_cases_stable"] == 9,
+      f"gate_accuracy={_sf['gate_accuracy']} over {_sf['gate_cases_stable']} cases -- a case "
+      "whose verdict changes run to run is not evidence of a pass or of a regression, and "
+      "averaging it in is what made the 2026-09-08 run report exactly the 90% floor")
+check("...and is named instead of silently averaged",
+      _sf["unstable_gate_cases"] == ["fp-framework-csrf"],
+      f"{_sf['unstable_gate_cases']} -- which case is unstable is the actionable half; "
+      "a mean hides it")
+check("...and the run still passes, because nothing actually regressed",
+      _ev.thresholds(_sf) == [], _ev.thresholds(_sf))
+check("...while the old pooled figure is still recorded for comparison",
+      _sf["gate_accuracy_pooled"] == round(28 / 30, 3),
+      f"{_sf['gate_accuracy_pooled']} -- result files written before 2026-09-08 used this "
+      "definition, and comparing 90% against 100% across the change would conclude "
+      "something false")
+check("...and the 0% finding overlap that proved it is reported per case",
+      any(c["case"] == "fp-framework-csrf" and c["finding_overlap"] == 0.0
+          for c in _sf["case_stability"]),
+      "not one finding fingerprint recurred across the three runs; that number is the "
+      "evidence the exclusion rests on, so it has to survive into the result file")
+
+# The other direction, and the one that matters more: a case that is *consistently* wrong is
+# a real regression and must not be excused as noise.
+_broken = _nine_good()
+_broken["fp-framework-csrf"] = [_erun("fp-framework-csrf", False, "Amber") for _ in range(3)]
+_sb = _ev.score(_broken)
+check("a case that is wrong every time counts against the floor, not as noise",
+      _sb["gate_accuracy"] == 0.9 and _sb["gate_cases_unstable"] == 0,
+      f"gate_accuracy={_sb['gate_accuracy']} unstable={_sb['gate_cases_unstable']} -- "
+      "excluding this would turn the fix for C-85 into a way of hiding regressions")
+
+# Unanimity is about *correctness*, not about the gate letter. Two runs can be wrong in two
+# different ways, and that is a stably broken case rather than an unstable one.
+_wrong_two_ways = _nine_good()
+_wrong_two_ways["odd"] = [_erun("odd", False, "Red"), _erun("odd", False, "Amber"),
+                          _erun("odd", False, "Green")]
+_sw = _ev.score(_wrong_two_ways)
+check("wrong three different ways is still stably wrong, not unstable",
+      _sw["gate_cases_unstable"] == 0 and _sw["gate_accuracy"] == 0.9,
+      f"unstable={_sw['gate_cases_unstable']} accuracy={_sw['gate_accuracy']} -- keying "
+      "stability on the gate letter would let a case that is never right hide in the "
+      "excluded set")
+
+# A growing set of coin-flip cases is its own regression: the pipeline is becoming less
+# reproducible, and no accuracy number will show it.
+_two_flaky = _nine_good()
+for _n in ("flip-a", "flip-b"):
+    _two_flaky[_n] = [_erun(_n, True, "Green"), _erun(_n, False, "Amber")]
+_s2 = _ev.score(_two_flaky)
+_t2 = _ev.thresholds(_s2)
+check("two inconsistent cases breach the ceiling and fail the run",
+      len(_t2) == 1 and "inconsistent gates" in _t2[0],
+      f"{_t2} -- one coin flip is tolerated because one was measured; a second means "
+      "reproducibility itself has regressed")
+check("...and the failure names them, so it is actionable",
+      "flip-a" in _t2[0] and "flip-b" in _t2[0], _t2)
+
+# Recall stays pooled across runs -- it was stable in every measured run, so more samples
+# only tighten the estimate. Majority-voting it would hide a real loss of detection.
+_recall_slip = {"c": [_erun("c", True, "Red", must=(1, 1)), _erun("c", True, "Red", must=(1, 1)),
+                      _erun("c", True, "Red", must=(1, 0))]}
+_sr = _ev.score(_recall_slip)
+check("recall is pooled over runs, not majority-voted per case",
+      _sr["recall"] == round(2 / 3, 3),
+      f"recall={_sr['recall']} -- a real finding missed in one run of three is a third of a "
+      "miss, and rounding it away to 'the case passed' is how a detection regression "
+      "becomes invisible")
+check("...and a pooled recall below the floor is reported as a failure",
+      any("recall" in f for f in _ev.thresholds(_sr)), _ev.thresholds(_sr))
+
+# Traps likewise.
+_trap = {"t": [_erun("t", True, "Green", traps=(4, 0)), _erun("t", True, "Green", traps=(4, 2))]}
+check("a trap tripped in only one run still raises the false-positive rate",
+      _ev.score(_trap)["false_positive_rate"] == 0.25,
+      "the 'xss' trap on fp-framework-csrf fired in one run of three; a per-case vote would "
+      "report it as never firing")
+
+# --repeat 1 has to keep working, and has to stop short of claiming confidence.
+_single = {f"case-{i}": [_erun(f"case-{i}", True, "Red")] for i in range(9)}
+_single["bad"] = [_erun("bad", False, "Amber")]
+_s1 = _ev.score(_single)
+check("one run per case reduces exactly to the old pooled scoring",
+      _s1["gate_accuracy"] == _s1["gate_accuracy_pooled"] == 0.9,
+      f"{_s1['gate_accuracy']} vs {_s1['gate_accuracy_pooled']} -- with a single sample "
+      "every case is trivially consistent, so --repeat 1 must not silently change what the "
+      "number means")
+check("...and no case is called unstable on the strength of one sample",
+      _s1["gate_cases_unstable"] == 0, _s1["unstable_gate_cases"])
+
+# Errors must not be scored as correct answers.
+_errored = _nine_good()
+_errored["dead"] = [_erun("dead", False, error="TimeoutError: x") for _ in range(3)]
+_se = _ev.score(_errored)
+check("a case that errored every run is skipped, not counted as a correct gate",
+      _se["gate_cases_stable"] == 9 and _se["errors"] == 3,
+      f"stable={_se['gate_cases_stable']} errors={_se['errors']} -- counting an error as a "
+      "pass is how an outage reads as a green run")
+
+check("the scoring definition is recorded in the result",
+      _sf["scoring"] == _ev.SCORING and _ev.SCORING == "stable-cases-v2",
+      "two result files with the same key and different definitions of it is a trap for "
+      "whoever compares them next")
+_repeat_default = _ev.build_parser().parse_args([]).repeat
+check("a decision run defaults to three repeats",
+      _repeat_default == 3,
+      f"--repeat defaults to {_repeat_default}; one sample cannot separate a regression "
+      "from variance (D-358), and the default is what a person actually runs")
+check("...and one repeat is still available for a cheap look",
+      _ev.build_parser().parse_args(["--repeat", "1"]).repeat == 1)
 
 print()
 print("-" * 60)

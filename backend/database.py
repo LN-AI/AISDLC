@@ -9,7 +9,9 @@ from backend import config, context
 from backend.config import DATABASE_PATH, JOB_STALE_MINUTES, SQLITE_BUSY_TIMEOUT_MS
 # Imported here rather than lazily: `crypto_service` depends only on `config`, so there
 # is no cycle, and a lazy import inside the credential helpers would run on every call.
-from backend.services import crypto_service
+# `finding_gate` is import-free by design (its own module docstring says so), so it is
+# safe at this layer too.
+from backend.services import crypto_service, finding_gate
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,49 @@ def init_db():
             last_login TEXT
         );
 
+        -- Where a notification goes. The URL is encrypted because a Slack or Teams
+        -- incoming-webhook URL *is* its own authentication -- anyone holding it can post
+        -- to that channel -- so it is stored like the keys in `llm_connections` and never
+        -- returned by the API. `project_id` is NOT NULL in effect: a target belonging to
+        -- no project would be matched by no project's review, and a deployment-wide one
+        -- would carry one customer's findings to another customer's channel.
+        CREATE TABLE IF NOT EXISTS notification_targets (
+            id TEXT PRIMARY KEY,
+            project_id TEXT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'webhook',
+            url_encrypted TEXT NOT NULL,
+            secret_encrypted TEXT,
+            events TEXT NOT NULL DEFAULT 'review_gated',
+            min_severity INTEGER NOT NULL DEFAULT 5,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT,
+            created_by TEXT,
+            last_status TEXT,
+            last_error TEXT,
+            last_attempt_at TEXT
+        );
+
+        -- One row per notification that should go out. Written inside the same
+        -- transaction as the review, so a notification can never describe a review that
+        -- failed to save and a saved review can never lose its notification to a crash.
+        -- The row is the durability: there is no queue in this deployment, so `pending`
+        -- rows are retried at startup and on the deliveries read path -- the same pattern
+        -- `lapse_expired_waivers` and `sweep_expired` use for the same reason.
+        CREATE TABLE IF NOT EXISTS notification_deliveries (
+            id TEXT PRIMARY KEY,
+            target_id TEXT NOT NULL,
+            project_id TEXT,
+            event_type TEXT NOT NULL,
+            review_id TEXT,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at TEXT,
+            sent_at TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS approvals (
             id TEXT PRIMARY KEY,
             review_id TEXT NOT NULL,
@@ -121,6 +166,18 @@ def init_db():
             decision_at TEXT,
             decision_comment TEXT,
             created_at TEXT NOT NULL,
+            FOREIGN KEY (review_id) REFERENCES reviews(id)
+        );
+
+        -- Which reviews one release decision covers. A Core SDLC Review saves the code
+        -- review, the VAPT and the aggregate; all three belong to one "ship it or not",
+        -- and before this each queued its own request (C-37). `approvals.review_id` stays
+        -- as the review that *raised* it, so every existing reader keeps working.
+        CREATE TABLE IF NOT EXISTS approval_reviews (
+            approval_id TEXT NOT NULL,
+            review_id TEXT NOT NULL,
+            PRIMARY KEY (approval_id, review_id),
+            FOREIGN KEY (approval_id) REFERENCES approvals(id),
             FOREIGN KEY (review_id) REFERENCES reviews(id)
         );
 
@@ -518,6 +575,23 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # column already exists
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_project ON approvals(project_id, status, created_at)")
+    # One API call is one release, so all the reviews it saves share this and queue a single
+    # sign-off request instead of one each (C-37). NULL on pre-existing rows and on any
+    # review saved outside a request -- a smoke script, a `scripts/` driver -- which then
+    # falls back to the old one-per-review behaviour, honestly, because nothing grouped them.
+    try:
+        cursor.execute("ALTER TABLE approvals ADD COLUMN release_id TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_approvals_release "
+                   "ON approvals(release_id, status)")
+    # The dispatcher's only query: pending, oldest first.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_notif_pending "
+                   "ON notification_deliveries(status, created_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_notif_target "
+                   "ON notification_deliveries(target_id, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_notif_targets_project "
+                   "ON notification_targets(project_id, active)")
 
     # A risk accepted with no end date is not accepted, it is forgotten. `waiver_expires_at`
     # is set only for `accepted_risk`: "waived" (by design, not applicable) and
@@ -545,6 +619,67 @@ def init_db():
         pass  # column already exists
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_product "
                    "ON reviews(product_id, created_at DESC)")
+
+    # Which project an audit event and an AI-inventory row belong to.
+    #
+    # Both tables predate project scoping and had no column to express it, which is why
+    # `GET /api/audit` and `/api/inventory/*` were the two governance surfaces `scope.py`
+    # was never applied to -- there was nothing to filter on. NULL on every pre-existing
+    # row, and `_project_scope_sql` renders `project_id IN (...)`, which never matches
+    # NULL: historical rows therefore stay super-admin-only, exactly as `reviews`,
+    # `reports` and `approvals` already do. Deployment-wide events belonging to no project
+    # (`user_login`, `plan_created`) are NULL deliberately and stay super-admin-only for
+    # the same reason.
+    for _table in ("audit_trail", "ai_systems"):
+        try:
+            cursor.execute(f"ALTER TABLE {_table} ADD COLUMN project_id TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    # `audit_trail` carried no index at all, on a table that only grows and is always read
+    # newest-first with an offset.
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_project "
+                   "ON audit_trail(project_id, created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_trail(created_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ai_systems_project "
+                   "ON ai_systems(project_id, created_at DESC)")
+
+    # Which repository, branch, commit and pull request a review was about.
+    #
+    # `reviews` could say what a run found and what it cost and never *where*, so every
+    # question about a place was unanswerable by query: is this repository improving, what
+    # has it cost us, which of ours is worst, did this pull request make things better. The
+    # facts were always present at run time (`Bundle.source_ref`) and thrown away.
+    #
+    # Denormalized here rather than joined from `review_sources`: those rows exist only for
+    # the two products that keep a re-readable source, while `github_repo_url` is a declared
+    # source for eight. NULL for a paste or an upload, which is the honest answer and not a
+    # missing value — the index below is on (owner, name) so those rows simply never appear
+    # in a repository view.
+    for column, ddl_type in (
+        ("repo_host", "TEXT"), ("repo_owner", "TEXT"), ("repo_name", "TEXT"),
+        ("branch", "TEXT"), ("commit_sha", "TEXT"), ("pr_number", "INTEGER"),
+    ):
+        try:
+            cursor.execute(f"ALTER TABLE reviews ADD COLUMN {column} {ddl_type} DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_repo "
+                   "ON reviews(repo_owner, repo_name, created_at DESC)")
+    _backfill_review_repo(cursor)
+
+    # Which earlier reviews this one was built from — a JSON array of review ids, NULL when
+    # the artifact was pasted or uploaded rather than carried over from another run.
+    #
+    # A Security Review built from an Architecture Review's output is a different artefact
+    # from one somebody typed, and the record could not tell them apart. On a platform whose
+    # product is evidence, a chain of assessments that leaves no trace of being a chain is
+    # weaker evidence than it should be. Nothing is backfilled: an existing row genuinely
+    # does not know where its input came from, and inventing a parent would be the same
+    # class of untruth as back-filling a scanned-file list (D-345).
+    try:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN derived_from TEXT DEFAULT NULL")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     cursor.executescript("""
         -- What a user told us we got wrong. The only free signal about our own accuracy,
@@ -594,6 +729,33 @@ def init_db():
     logger.info("Database ready")
 
 
+def _verified_parent_reviews(cursor, claimed, project_id: Optional[str]) -> List[str]:
+    """The claimed parent reviews that actually exist and are in reach of this project.
+
+    Order is preserved and duplicates dropped, because the list is read back as prose ("built
+    from these two runs") and a repeated id would read as two sources.
+
+    The project rule matches how a review is read back: `GET /api/reviews/{id}` answers 404
+    across a project boundary, so recording a parent the reader can never open would produce
+    a dead link in an audit trail. A review with no project (a smoke script, a `scripts/`
+    driver) can only ever cite another review with no project, which is the same rule
+    applied to the same value rather than a special case.
+    """
+    ids, seen = [], set()
+    for claim in claimed or []:
+        if claim in seen:
+            continue
+        seen.add(claim)
+        row = cursor.execute(
+            "SELECT project_id FROM reviews WHERE id = ?", (claim,)).fetchone()
+        if row is None:
+            continue
+        if (row["project_id"] or None) != (project_id or None):
+            continue
+        ids.append(claim)
+    return ids
+
+
 def save_review(
     review_type: str,
     project_name: Optional[str],
@@ -611,6 +773,9 @@ def save_review(
     # published by the API boundary (see backend/context.py). Taking it from the context
     # rather than from a parameter keeps all 19 call sites of this function unchanged.
     project_id = context.current_project_id()
+    # Where this work was, by the same route and for the same reason as `project_id`. An
+    # empty dict for a paste or an upload, which stores NULL in all six columns.
+    source_ref = context.current_source_ref()
 
     findings = result.get("findings", [])
     # Stamp the row id onto each finding *before* the result is serialized, so the id
@@ -628,13 +793,24 @@ def save_review(
     conn = get_connection()
     cursor = conn.cursor()
 
+    # What this run was built from, published by the API boundary (see backend/context.py).
+    # The ids arrive on the request body, so they are a *claim* by the caller — only those
+    # that exist and belong to the same project are kept, so a chain in the audit trail can
+    # never point at a review the reader is unable to open. Filtering down is the safe
+    # direction to be wrong in: it under-claims provenance rather than asserting a link
+    # that nothing supports.
+    derived_from = _verified_parent_reviews(
+        cursor, context.current_derived_from(), project_id)
+
     cursor.execute(
         """
         INSERT INTO reviews
             (id, review_type, project_name, input_summary, input_content,
              result_json, findings_count, critical_count, high_count,
-             risk_score, gate_status, created_at, project_id, product_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             risk_score, gate_status, created_at, project_id, product_id,
+             repo_host, repo_owner, repo_name, branch, commit_sha, pr_number,
+             derived_from)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             review_id, review_type, project_name, input_summary, input_content,
@@ -644,6 +820,16 @@ def save_review(
             # `review_type` cannot answer it: "code" is written by Code Review, the GitHub PR
             # review and Auto-Fix, so a screen filtering on it showed all three histories.
             context.current_product_id(),
+            # And where it was. `or None` rather than the empty string these arrive as, so
+            # "no repository" is NULL in the column and the repository index never has to
+            # hold a row for a pasted snippet.
+            source_ref.get("repo_host") or None,
+            source_ref.get("repo_owner") or None,
+            source_ref.get("repo_name") or None,
+            source_ref.get("branch") or None,
+            source_ref.get("commit_sha") or None,
+            source_ref.get("pr_number"),
+            json.dumps(derived_from) if derived_from else None,
         ),
     )
 
@@ -685,25 +871,132 @@ def save_review(
     # it every approval was unattributed, so the queue could not be scoped and showed one
     # customer's blocked releases to anyone holding a token. Rows written before this
     # column stay NULL and remain super-admin-only, exactly like pre-existing reviews.
-    if gate_status == "Red" or critical_count > 0:
+    # `finding_gate.requires_human_signoff` is the single definition of this rule --
+    # the governance report reads the same function, so the report can never claim a
+    # sign-off the queue was never asked for. See that docstring and C-38.
+    if finding_gate.requires_human_signoff(gate_status, critical_count):
         priority = "urgent" if gate_status == "Red" else "high"
-        approval_id = str(uuid.uuid4())
-        cursor.execute(
-            "INSERT INTO approvals (id, review_id, project_id, project_name, requested_by,"
-            " priority, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (approval_id, review_id, project_id, project_name or "", "system", priority, created_at),
-        )
-        # `approval_created` is one of the event types the Audit Trail filter has always
-        # offered and nothing ever emitted, so that filter always came back empty — which
-        # on a compliance product reads as "no approvals were ever raised".
-        log_audit(cursor, "approval_created", "approval", approval_id,
-                  details=f"review={review_id} priority={priority}")
+        # **One decision per release, not one per review** (C-37). A Core SDLC Review saves
+        # the code review, the VAPT and the aggregate; all three used to satisfy the rule
+        # above and each queued its own request, so a reviewer opened three items that were
+        # one question -- "ship this or not" -- and the screen could not say which release
+        # any of them was about.
+        #
+        # The release is the API call (`context.current_release_id`, set by both guards via
+        # `bind_project`). Outside a request there is none, and then this falls back to one
+        # approval per review: nothing grouped them, so claiming otherwise would be worse.
+        release_id = context.current_release_id()
+        existing = None
+        if release_id:
+            cursor.execute(
+                "SELECT id, priority FROM approvals"
+                " WHERE release_id = ? AND status = 'pending' ORDER BY created_at LIMIT 1",
+                (release_id,),
+            )
+            existing = cursor.fetchone()
 
-    log_audit(cursor, "review_created", "review", review_id, details=f"type={review_type}")
+        if existing:
+            approval_id = existing["id"]
+            # Escalate, never relax: a release carrying one Red is urgent even if a later
+            # review in the same run only reported a Critical under an Amber gate. Same
+            # floor-not-ceiling rule the gate itself follows.
+            if priority == "urgent" and existing["priority"] != "urgent":
+                cursor.execute("UPDATE approvals SET priority = 'urgent' WHERE id = ?",
+                               (approval_id,))
+            log_audit(cursor, "approval_extended", "approval", approval_id,
+                      actor=context.current_actor() or "system",
+                      details=f"review={review_id} release={release_id}")
+        else:
+            approval_id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO approvals (id, review_id, project_id, project_name, requested_by,"
+                " priority, status, created_at, release_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (approval_id, review_id, project_id, project_name or "", "system", priority,
+                 created_at, release_id),
+            )
+            # `approval_created` is one of the event types the Audit Trail filter has always
+            # offered and nothing ever emitted, so that filter always came back empty — which
+            # on a compliance product reads as "no approvals were ever raised".
+            log_audit(cursor, "approval_created", "approval", approval_id,
+                      actor=context.current_actor() or "system",
+                      details=f"review={review_id} priority={priority}")
+
+        # What this decision actually covers. `approvals.review_id` stays the review that
+        # raised it so every existing reader keeps working; this is how the queue can say
+        # "3 reviews" and how `get_pending_approval_for_review` finds the release's request
+        # from any member.
+        cursor.execute(
+            "INSERT OR IGNORE INTO approval_reviews (approval_id, review_id) VALUES (?, ?)",
+            (approval_id, review_id),
+        )
+
+    # Named, not defaulted. This row said `actor='system'` for every review ever run,
+    # because `log_audit`'s default was the only thing available here -- so the Audit
+    # Trail could not answer "who ran this", which is the question it exists for. The
+    # actor comes from the request boundary via `context`, the same route `project_id`
+    # above already travels. Still falls back to "system" for a review saved outside any
+    # request (the smoke suites, `scripts/`), which is honest: nobody ran those.
+    log_audit(cursor, "review_created", "review", review_id,
+              actor=context.current_actor() or "system",
+              # The chain is part of what happened, so it belongs in the trail and not only
+              # in the row: an auditor asking "where did this assessment's input come from"
+              # should be able to answer it from the audit log alone.
+              details=f"type={review_type}"
+                      + (f" derived_from={','.join(derived_from)}" if derived_from else ""))
+
+    # Tell whoever asked to be told. Written on **this** cursor so the delivery rows are
+    # part of the same transaction as the review: a notification about a review that then
+    # failed to save would be a message about something that did not happen, and a review
+    # saved without its notification is exactly the silent drop the design avoids.
+    #
+    # `notify` is imported here rather than at module scope because it imports this module
+    # back (for `get_connection`), and the pair at top level is a cycle. Failure is
+    # swallowed inside `enqueue` — a misconfigured Slack URL must not stop a review from
+    # being saved.
+    from backend.services import notify as _notify
+    _queued = _notify.enqueue_for_review(
+        cursor, review_id=review_id, review_type=review_type, project_id=project_id,
+        project_name=project_name or "", gate_status=gate_status,
+        critical_count=critical_count, high_count=high_count,
+        repo="/".join(x for x in (source_ref.get("repo_owner"),
+                                  source_ref.get("repo_name")) if x),
+    )
 
     conn.commit()
     conn.close()
+
+    # After the commit, never before: the dispatcher thread opens its own connection and
+    # would not see an uncommitted row. Fire-and-forget on purpose — the review's caller is
+    # waiting on this function and must not wait on somebody's chat service, which is the
+    # defect D-334 was about.
+    if _queued:
+        try:
+            _notify.kick()
+        except Exception:                                        # noqa: BLE001
+            logger.exception("Could not start the notification dispatcher — the rows stay "
+                             "pending and are retried at startup")
     return review_id
+
+
+def get_review_parents(review_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Enough about each parent review to render it as a link rather than an id.
+
+    Separate from `get_review` on purpose: every caller of that wants the row, and only the
+    one endpoint that renders provenance wants a second query per parent. Missing ids are
+    simply absent from the result — a review can be deleted after something cited it, and
+    the citing row is still true about what it was built from.
+    """
+    if not review_ids:
+        return {}
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in review_ids)
+    rows = conn.execute(
+        f"SELECT id, review_type, product_id, project_name, gate_status, findings_count, "
+        f"created_at FROM reviews WHERE id IN ({placeholders})", tuple(review_ids)
+    ).fetchall()
+    conn.close()
+    return {r["id"]: dict(r) for r in rows}
 
 
 def get_review(review_id: str) -> Optional[Dict[str, Any]]:
@@ -716,22 +1009,33 @@ def get_review(review_id: str) -> Optional[Dict[str, Any]]:
         return None
     data = dict(row)
     data["result"] = json.loads(data["result_json"]) if data["result_json"] else {}
+    # Decoded here rather than left as a JSON string, the same way `result` is: every
+    # reader wants the list, and a caller that has to remember which of two adjacent
+    # columns is still encoded is a caller that will forget.
+    data["derived_from"] = json.loads(data["derived_from"]) if data.get("derived_from") else []
     return data
 
 
-def list_reviews_by_type(review_type: str, project_name: Optional[str] = None, limit: int = 25) -> List[Dict[str, Any]]:
+def list_reviews_by_type(review_type: str, project_name: Optional[str] = None, limit: int = 25,
+                         project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Whole review rows of one type, newest first, scoped to what the caller may read.
+
+    `project_name` is free text a user typed into a form: it is a *filter*, not a
+    permission. Omitting it used to mean "every project in the deployment", which is how
+    the Issue Triage dashboard came to aggregate every customer's triage reviews for any
+    signed-in user. `project_ids` is the permission, and applies whether or not a name
+    was given.
+    """
+    scope_sql, scope_params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
+    where = "WHERE review_type = ?" + scope_sql
+    params = [review_type, *scope_params]
     if project_name:
-        cursor.execute(
-            "SELECT * FROM reviews WHERE review_type = ? AND project_name = ? ORDER BY created_at DESC LIMIT ?",
-            (review_type, project_name, limit),
-        )
-    else:
-        cursor.execute(
-            "SELECT * FROM reviews WHERE review_type = ? ORDER BY created_at DESC LIMIT ?",
-            (review_type, limit),
-        )
+        where += " AND project_name = ?"
+        params.append(project_name)
+    params.append(limit)
+    cursor.execute(f"SELECT * FROM reviews {where} ORDER BY created_at DESC LIMIT ?", params)
     rows = cursor.fetchall()
     conn.close()
     results = []
@@ -758,7 +1062,7 @@ def get_latest_review(project_name: str, review_type: str) -> Optional[Dict[str,
     return data
 
 
-# ── Scoping reviews to what a caller may see ──────────────────────────────
+# ── Scoping rows to what a caller may see ─────────────────────────────────
 #
 # `project_ids=None` means "no restriction" and is for super admins only. An empty list
 # means "restricted to nothing" and must return nothing — the distinction matters, because
@@ -767,8 +1071,13 @@ def get_latest_review(project_name: str, review_type: str) -> Optional[Dict[str,
 # Rows with a NULL project_id are everything reviewed before reviews were attributed, plus
 # anything run without a project selected. There is no way to know retrospectively whose
 # they were, so they are visible to super admins and to nobody else.
+#
+# Named for the column, not for one table: `reviews`, `reports`, `approvals`, `findings`,
+# `audit_trail` and `ai_systems` all carry `project_id` and all scope through this. It was
+# `_review_scope_sql` while only reviews used it, which read as though the other tables
+# needed their own — they do not.
 
-def _review_scope_sql(project_ids: Optional[List[str]], alias: str = "") -> tuple:
+def _project_scope_sql(project_ids: Optional[List[str]], alias: str = "") -> tuple:
     prefix = f"{alias}." if alias else ""
     if project_ids is None:
         return "", ()
@@ -786,7 +1095,10 @@ def _review_scope_sql(project_ids: Optional[List[str]], alias: str = "") -> tupl
 # was the cheap half of adding a second caller for this query.
 _REVIEW_LIST_COLUMNS = (
     "id, review_type, product_id, project_name, project_id, input_summary, findings_count, "
-    "critical_count, high_count, risk_score, gate_status, created_at, created_by"
+    "critical_count, high_count, risk_score, gate_status, created_at, created_by, "
+    # Six small columns rather than a join: a run-history row wants to say which repository
+    # and branch it was, and the alternative is a second query per row.
+    "repo_host, repo_owner, repo_name, branch, commit_sha, pr_number"
 )
 
 
@@ -808,7 +1120,7 @@ def list_reviews(limit: int = 20, offset: int = 0,
     `review_type` — otherwise every existing customer's history would read as empty, which
     looks exactly like data loss.
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     if product_id and review_type:
         scope += " AND (product_id = ? OR (product_id IS NULL AND review_type = ?))"
         params = params + (product_id, review_type)
@@ -884,13 +1196,13 @@ def count_reviews(project_ids: Optional[List[str]] = None,
                   product_id: Optional[str] = None) -> int:
     """How many reviews the caller may see — the denominator a pager needs.
 
-    Scoped through the same `_review_scope_sql` as `list_reviews` and taking the same two
+    Scoped through the same `_project_scope_sql` as `list_reviews` and taking the same two
     filters *with the same fallback*, so the count and the page it describes can never
     disagree about which projects or which agent are in view. Duplicating the predicate here
     is the bug this docstring exists to prevent: a count that forgot the NULL fallback would
     say "3 of 0".
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     if product_id and review_type:
         scope += " AND (product_id = ? OR (product_id IS NULL AND review_type = ?))"
         params = params + (product_id, review_type)
@@ -1052,6 +1364,204 @@ def set_active_llm_connection(connection_id: Optional[str], updated_by: str = "a
     set_platform_setting(ACTIVE_LLM_CONNECTION_KEY, connection_id or "", updated_by)
 
 
+def list_repositories(project_ids: Optional[List[str]] = None,
+                      limit: int = 100) -> List[Dict[str, Any]]:
+    """Every repository this caller has reviewed, worst first.
+
+    The query the repository columns exist for. One row per `owner/name`, carrying what a
+    lead actually asks: how many runs, when the last one was, what its gate said, how many
+    Critical and High findings are open, and what the whole repository has cost. Ordered by
+    open Critical then High then recency, because a list of repositories sorted by name is
+    a list nobody reads twice.
+
+    `open_critical`/`open_high` count *findings* through their review, so a waived finding
+    stops counting the moment it is waived (`findings.status`), and `spend_usd` comes from
+    `usage_events` rather than from the review rows, so it agrees with the invoice for the
+    same reason D-310 gives.
+    """
+    scope_sql, params = _project_scope_sql(project_ids, alias="r")
+    conn = get_connection()
+    rows = conn.execute(
+        f"""
+        SELECT r.repo_host, r.repo_owner, r.repo_name,
+               COUNT(DISTINCT r.id)                                   AS runs,
+               MAX(r.created_at)                                      AS last_reviewed_at,
+               SUM(CASE WHEN f.severity = 5 AND f.status = 'open' THEN 1 ELSE 0 END)
+                                                                      AS open_critical,
+               SUM(CASE WHEN f.severity = 4 AND f.status = 'open' THEN 1 ELSE 0 END)
+                                                                      AS open_high
+        FROM reviews r
+        LEFT JOIN findings f ON f.review_id = r.id
+        WHERE r.repo_name IS NOT NULL{scope_sql}
+        GROUP BY r.repo_host, r.repo_owner, r.repo_name
+        ORDER BY open_critical DESC, open_high DESC, last_reviewed_at DESC
+        LIMIT ?
+        """,
+        params + (limit,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        repo = dict(row)
+        # The gate of the most recent run, which is what "how is it doing" means to a
+        # reader. Separate from the aggregate above because `MAX(created_at)` and the gate
+        # on that same row cannot both come out of one GROUP BY without a self-join.
+        latest = conn.execute(
+            f"SELECT gate_status, created_at, branch, commit_sha, id FROM reviews r "
+            f"WHERE r.repo_owner = ? AND r.repo_name = ?{scope_sql} "
+            f"ORDER BY created_at DESC LIMIT 1",
+            (repo["repo_owner"], repo["repo_name"]) + params,
+        ).fetchone()
+        repo["latest"] = dict(latest) if latest else None
+        spend = conn.execute(
+            """SELECT COALESCE(SUM(u.cost_usd), 0) AS spend
+               FROM usage_events u JOIN reviews r ON r.id = u.review_id
+               WHERE r.repo_owner = ? AND r.repo_name = ?""",
+            (repo["repo_owner"], repo["repo_name"]),
+        ).fetchone()
+        repo["spend_usd"] = round(spend["spend"] or 0.0, 6)
+        out.append(repo)
+    conn.close()
+    return out
+
+
+def _backfill_review_repo(cursor) -> int:
+    """Fill the new repository columns for reviews that already have a recorded source.
+
+    `review_sources` has carried `ref` (the repository or pull-request URL) and
+    `commit_sha` since it shipped, so every code and VAPT review over a GitHub source can
+    be placed retrospectively — which matters because a repository view whose history
+    starts today cannot show a trend, and a trend is the entire point of having the column.
+
+    Runs inside `init_db`'s own transaction, once: the `WHERE repo_name IS NULL` guard makes
+    it idempotent and cheap after the first pass. Rows whose `ref` is not a GitHub URL (a
+    zip, a paste) are left NULL deliberately and will not be revisited, because
+    `repo_name IS NULL` is also the state of a review that genuinely has no repository —
+    re-scanning them costs one indexed scan of a table that is already being read.
+    """
+    try:
+        rows = cursor.execute(
+            "SELECT r.id, s.ref, s.commit_sha, s.head_branch, s.source_type "
+            "FROM reviews r JOIN review_sources s ON s.review_id = r.id "
+            "WHERE r.repo_name IS NULL AND s.ref LIKE '%github.com/%'"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0  # review_sources not created yet — its own init_schema runs after this
+    filled = 0
+    for row in rows:
+        ref = (row["ref"] or "").rstrip("/")
+        owner_repo = ref.split("github.com/")[-1].strip("/")
+        owner, _, rest = owner_repo.partition("/")
+        name = rest.split("/")[0].removesuffix(".git")
+        if not (owner and name):
+            continue
+        pr_number = None
+        if "/pull/" in ref:
+            tail = ref.split("/pull/")[-1].split("/")[0]
+            pr_number = int(tail) if tail.isdigit() else None
+        cursor.execute(
+            "UPDATE reviews SET repo_host = 'github.com', repo_owner = ?, repo_name = ?, "
+            "branch = ?, commit_sha = ?, pr_number = ? WHERE id = ?",
+            (owner, name, row["head_branch"] or "", row["commit_sha"] or "",
+             pr_number, row["id"]),
+        )
+        filled += 1
+    if filled:
+        logger.info("Backfilled the repository of %d review(s) from review_sources", filled)
+    return filled
+
+
+def get_findings_trend(project_ids: Optional[List[str]] = None,
+                       weeks: int = 8) -> List[Dict[str, Any]]:
+    """New and resolved findings per week, oldest first, plus the running open total.
+
+    The number a lead actually asks for, and the one thing six lifetime totals cannot show:
+    whether this is getting better. "44 open" is the same sentence in a month where 30 were
+    fixed and one where 30 were introduced.
+
+    `findings` has no date of its own — it inherits its review's `created_at` through the
+    join — so "new in this week" means "reported by a review run this week", which is the
+    honest reading: a finding did not exist for us before the run that found it. `resolved`
+    counts `resolved_at`, which `apply_baseline` writes when a later run over the same
+    repository stops reporting a finding it can see is gone.
+
+    `open_at_end` is a running total rather than a per-week count, because "open" is a
+    state, not an event: it is every finding reported up to that week and not yet resolved.
+    Computed in Python from the two event columns rather than with a correlated subquery
+    per week, which on SQLite is the difference between one scan and `weeks` of them.
+    """
+    scope_sql, params = _project_scope_sql(project_ids, alias="r")
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    # `%Y-%W` buckets by week starting Monday. Grouped in SQL so the whole history is one
+    # scan; the window is applied after, so `open_at_end` can carry everything before it.
+    cursor.execute(
+        f"""SELECT strftime('%Y-%W', r.created_at) AS wk, COUNT(*) AS n
+            FROM findings f JOIN reviews r ON r.id = f.review_id
+            WHERE r.created_at IS NOT NULL{scope_sql}
+            GROUP BY wk ORDER BY wk""",
+        params,
+    )
+    new_by_week = {row["wk"]: row["n"] for row in cursor.fetchall()}
+
+    cursor.execute(
+        f"""SELECT strftime('%Y-%W', f.resolved_at) AS wk, COUNT(*) AS n
+            FROM findings f JOIN reviews r ON r.id = f.review_id
+            WHERE f.resolved_at IS NOT NULL{scope_sql}
+            GROUP BY wk ORDER BY wk""",
+        params,
+    )
+    resolved_by_week = {row["wk"]: row["n"] for row in cursor.fetchall()}
+    conn.close()
+
+    every_week = sorted(set(new_by_week) | set(resolved_by_week))
+    running, series = 0, []
+    for wk in every_week:
+        added = new_by_week.get(wk, 0)
+        closed = resolved_by_week.get(wk, 0)
+        running += added - closed
+        series.append({
+            "week": wk,
+            "new": added,
+            "resolved": closed,
+            "net": added - closed,
+            # Cannot go below zero: a finding resolved in a week whose review predates the
+            # window would otherwise drive the running total negative and read as nonsense.
+            "open_at_end": max(running, 0),
+        })
+    return series[-weeks:] if weeks else series
+
+
+def get_gate_trend(project_ids: Optional[List[str]] = None,
+                   weeks: int = 8) -> List[Dict[str, Any]]:
+    """Green / Amber / Red counts per week, oldest first.
+
+    Gate mix over time answers "are we shipping more blocked releases than we were", which
+    is a different question from the finding count: one Red release can carry forty findings
+    and forty Green ones carry none.
+    """
+    scope_sql, params = _project_scope_sql(project_ids, alias="r")
+    conn = get_connection()
+    rows = conn.execute(
+        f"""SELECT strftime('%Y-%W', r.created_at) AS wk,
+                   COALESCE(r.gate_status, 'Unknown') AS gate, COUNT(*) AS n
+            FROM reviews r WHERE r.created_at IS NOT NULL{scope_sql}
+            GROUP BY wk, gate ORDER BY wk""",
+        params,
+    ).fetchall()
+    conn.close()
+
+    by_week: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        bucket = by_week.setdefault(
+            row["wk"], {"week": row["wk"], "Green": 0, "Amber": 0, "Red": 0, "total": 0})
+        if row["gate"] in ("Green", "Amber", "Red"):
+            bucket[row["gate"]] += row["n"]
+        bucket["total"] += row["n"]
+    series = [by_week[k] for k in sorted(by_week)]
+    return series[-weeks:] if weeks else series
+
+
 def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """Headline numbers, scoped to the projects the caller may see.
 
@@ -1059,14 +1569,14 @@ def get_dashboard_stats(project_ids: Optional[List[str]] = None) -> Dict[str, An
     finding belongs to a review, and a review now belongs to a project, so an unscoped
     count would leak how much critical work another customer has open.
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute(f"SELECT COUNT(*) as total FROM reviews WHERE 1 = 1{scope}", params)
     total = cursor.fetchone()["total"]
 
-    finding_scope, finding_params = _review_scope_sql(project_ids, alias="r")
+    finding_scope, finding_params = _project_scope_sql(project_ids, alias="r")
     cursor.execute(
         "SELECT COUNT(*) as cnt FROM findings f JOIN reviews r ON r.id = f.review_id "
         f"WHERE f.severity = 5 AND f.status = 'open'{finding_scope}",
@@ -1144,7 +1654,7 @@ def list_reports(limit: int = 25, offset: int = 0,
     rather than the whole document, so a listing screen doesn't transfer every report in
     full. Use `get_report` for the document itself.
     """
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -1171,10 +1681,23 @@ def list_reports(limit: int = 25, offset: int = 0,
     return reports
 
 
-def log_audit(cursor, event_type: str, entity_type: str, entity_id: str, actor: str = "system", details: str = ""):
+def log_audit(cursor, event_type: str, entity_type: str, entity_id: str, actor: str = "system",
+              details: str = "", project_id: Optional[str] = None):
+    """Append one audit row on the caller's own transaction.
+
+    `project_id` defaults to whichever project the request is bound to, the same source
+    `save_review` reads, so a caller that already opened `context.bind_project` gets a
+    scoped row without passing anything. Pass it explicitly for an event about a project
+    other than the bound one, and pass `""` for a deployment-wide event that belongs to no
+    project — that stores NULL and stays super-admin-only.
+    """
+    if project_id is None:
+        project_id = context.current_project_id()
     cursor.execute(
-        "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details, datetime.utcnow().isoformat()),
+        "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, project_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details,
+         project_id or None, datetime.utcnow().isoformat()),
     )
 
 
@@ -1183,17 +1706,31 @@ def list_audit_events(
     event_type: Optional[str] = None,
     entity_type: Optional[str] = None,
     actor: Optional[str] = None,
+    project_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
+    """One page of audit events, newest first, scoped to what the caller may read.
+
+    `project_ids` is not optional in practice — every caller passes
+    `scope.visible_from_caller(...)`. It defaults to `None` only because that is what a
+    super admin resolves to, and because the signature has to stay compatible with
+    `count_audit_events` beside it.
+    """
+    scope_sql, scope_params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
-    conditions, params = [], []
+    conditions, params = [], list(scope_params)
     if event_type:
         conditions.append("event_type = ?"); params.append(event_type)
     if entity_type:
         conditions.append("entity_type = ?"); params.append(entity_type)
     if actor:
         conditions.append("actor LIKE ?"); params.append(f"%{actor}%")
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    # `_project_scope_sql` returns a fragment that already begins with " AND ", so the
+    # WHERE has to open on something. `1 = 1` rather than reordering the fragment, which
+    # is what every other caller of that helper does.
+    where = "WHERE 1 = 1" + scope_sql
+    if conditions:
+        where += " AND " + " AND ".join(conditions)
     params.extend([limit, offset])
     cursor.execute(
         f"SELECT * FROM audit_trail {where} ORDER BY created_at DESC LIMIT ? OFFSET ?", params
@@ -1303,13 +1840,75 @@ def get_pending_approval_for_review(review_id: str) -> Optional[Dict[str, Any]]:
     """
     conn = get_connection()
     cursor = conn.cursor()
+    # Matches on the link table as well as `review_id`, because one release decision now
+    # covers several reviews and only the first of them is named on the approval row. A
+    # sub-review of a Core SDLC Review has to be able to report "yes, this is waiting on a
+    # human" -- `workflows/shared.attach_approval` asks exactly that, per review.
     cursor.execute(
-        "SELECT * FROM approvals WHERE review_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
-        (review_id,),
+        """SELECT a.* FROM approvals a
+           LEFT JOIN approval_reviews ar ON ar.approval_id = a.id
+           WHERE (a.review_id = ? OR ar.review_id = ?) AND a.status = 'pending'
+           ORDER BY a.created_at DESC LIMIT 1""",
+        (review_id, review_id),
     )
     row = cursor.fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def _attach_covered_reviews(cursor, approvals: List[Dict[str, Any]]) -> None:
+    """Fill in what each release decision actually covers, in one query for the page.
+
+    A reviewer is being asked "ship this release or not", and the only thing that makes that
+    answerable is seeing the runs behind it. Kept as a rollup plus a short list rather than
+    the findings themselves: the queue is for deciding, and the run pages already render
+    findings properly.
+
+    `release_gate` is the **strictest** across the covered reviews, for the same reason
+    `finding_gate.stricter` exists -- a release containing one Red is Red, and showing the
+    raising review's own gate would let an Amber row stand for a Red release.
+    """
+    if not approvals:
+        return
+    ids = [a["id"] for a in approvals]
+    marks = ",".join("?" for _ in ids)
+    cursor.execute(
+        f"""SELECT ar.approval_id, r.id AS rid, r.review_type, r.gate_status, r.risk_score,
+                   r.findings_count, r.critical_count
+            FROM approval_reviews ar
+            JOIN reviews r ON r.id = ar.review_id
+            WHERE ar.approval_id IN ({marks})
+            ORDER BY r.created_at""",
+        ids,
+    )
+    by_approval: Dict[str, List[Dict[str, Any]]] = {}
+    for row in cursor.fetchall():
+        by_approval.setdefault(row["approval_id"], []).append({
+            "review_id": row["rid"], "review_type": row["review_type"],
+            "gate_status": row["gate_status"], "risk_score": row["risk_score"],
+            "findings_count": row["findings_count"], "critical_count": row["critical_count"],
+        })
+
+    for a in approvals:
+        covered = by_approval.get(a["id"], [])
+        a["covered_reviews"] = covered
+        a["covered_count"] = len(covered)
+        if covered:
+            gate = "Green"
+            for c in covered:
+                gate = finding_gate.stricter(gate, c.get("gate_status") or "Green")
+            a["release_gate"] = gate
+            a["release_findings"] = sum(c.get("findings_count") or 0 for c in covered)
+            a["release_critical"] = sum(c.get("critical_count") or 0 for c in covered)
+            a["release_risk_score"] = max((c.get("risk_score") or 0) for c in covered)
+        else:
+            # A row raised outside any request, or written before the link table existed.
+            # Falls back to the raising review's own figures rather than reporting zeros,
+            # which would read as "this release is clean" on a blocked release.
+            a["release_gate"] = a.get("review_gate")
+            a["release_findings"] = a.get("findings_count")
+            a["release_critical"] = a.get("critical_count")
+            a["release_risk_score"] = a.get("risk_score")
 
 
 def get_approval(approval_id: str) -> Optional[Dict[str, Any]]:
@@ -1324,19 +1923,21 @@ def get_approval(approval_id: str) -> Optional[Dict[str, Any]]:
         (approval_id,),
     )
     row = cursor.fetchone()
+    out = [dict(row)] if row else []
+    _attach_covered_reviews(cursor, out)
     conn.close()
-    return dict(row) if row else None
+    return out[0] if out else None
 
 
 def list_approvals(status: Optional[str] = None, limit: int = 50,
                    project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """The approval queue, newest first. `project_ids=None` means every project.
 
-    Scoped through the same `_review_scope_sql` as `list_reviews`, on `approvals.project_id`
+    Scoped through the same `_project_scope_sql` as `list_reviews`, on `approvals.project_id`
     — before this, the queue was the one governance surface that showed every customer's
     rows to every caller.
     """
-    scope, params = _review_scope_sql(project_ids, alias="a")
+    scope, params = _project_scope_sql(project_ids, alias="a")
     status_sql = " AND a.status = ?" if status else ""
     status_params = (status,) if status else ()
     conn = get_connection()
@@ -1350,9 +1951,11 @@ def list_approvals(status: Optional[str] = None, limit: int = 50,
             ORDER BY a.created_at DESC LIMIT ?""",
         params + status_params + (limit,),
     )
-    rows = cursor.fetchall()
+    out = [dict(r) for r in cursor.fetchall()]
+    # One extra query for the whole page, not one per row.
+    _attach_covered_reviews(cursor, out)
     conn.close()
-    return [dict(r) for r in rows]
+    return out
 
 
 def decide_approval(approval_id: str, status: str, decision_by: str, comment: str = "") -> None:
@@ -1370,7 +1973,7 @@ def decide_approval(approval_id: str, status: str, decision_by: str, comment: st
 def get_approval_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
     """Counts behind the sidebar badge. Scoped like `list_approvals`, so the number on the
     badge and the rows on the page can never disagree about which projects are in view."""
-    scope, params = _review_scope_sql(project_ids)
+    scope, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
@@ -1394,21 +1997,30 @@ def create_ai_system(
 ) -> Dict[str, Any]:
     system_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
+    # Whose register this row belongs to, taken from the request boundary exactly as
+    # `save_review` takes it. The AI inventory holds `owner`, `team`,
+    # `data_classification` and `compliance_frameworks` -- a customer's own account of
+    # which of their systems touch regulated data -- and until this column existed there
+    # was no way to keep one customer's register out of another's.
+    project_id = context.current_project_id()
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         """INSERT INTO ai_systems
            (id, name, description, use_case_type, risk_level, model_name, model_provider,
             owner, team, status, data_classification, compliance_frameworks,
-            jira_project, github_repo, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            jira_project, github_repo, project_id, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (system_id, name, description, use_case_type, risk_level, model_name,
          model_provider, owner, team, status, data_classification,
-         compliance_frameworks, jira_project, github_repo, now, now),
+         compliance_frameworks, jira_project, github_repo, project_id, now, now),
     )
     conn.commit()
     conn.close()
-    return {"id": system_id, "name": name, "risk_level": risk_level, "status": status, "created_at": now}
+    _audit("ai_system_registered", "ai_system", system_id,
+           context.current_actor() or "system", f"{name} ({risk_level})")
+    return {"id": system_id, "name": name, "risk_level": risk_level, "status": status,
+            "created_at": now}
 
 
 def get_ai_system(system_id: str) -> Optional[Dict[str, Any]]:
@@ -1420,15 +2032,19 @@ def get_ai_system(system_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def list_ai_systems(status: Optional[str] = None, risk_level: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_ai_systems(status: Optional[str] = None, risk_level: Optional[str] = None,
+                    project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    scope_sql, scope_params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
-    conditions, params = [], []
+    conditions, params = [], list(scope_params)
     if status:
         conditions.append("status = ?"); params.append(status)
     if risk_level:
         conditions.append("risk_level = ?"); params.append(risk_level)
-    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    where = "WHERE 1 = 1" + scope_sql
+    if conditions:
+        where += " AND " + " AND ".join(conditions)
     cursor.execute(f"SELECT * FROM ai_systems {where} ORDER BY created_at DESC", params)
     rows = cursor.fetchall()
     conn.close()
@@ -1449,14 +2065,19 @@ def update_ai_system(system_id: str, fields: Dict[str, Any]) -> Optional[Dict[st
     return get_ai_system(system_id)
 
 
-def get_inventory_stats() -> Dict[str, Any]:
+def get_inventory_stats(project_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    scope_sql, params = _project_scope_sql(project_ids)
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) as total FROM ai_systems")
+    cursor.execute(f"SELECT COUNT(*) as total FROM ai_systems WHERE 1 = 1{scope_sql}", params)
     total = cursor.fetchone()["total"]
-    cursor.execute("SELECT risk_level, COUNT(*) as cnt FROM ai_systems GROUP BY risk_level")
+    cursor.execute(
+        f"SELECT risk_level, COUNT(*) as cnt FROM ai_systems WHERE 1 = 1{scope_sql} "
+        "GROUP BY risk_level", params)
     by_risk = {r["risk_level"]: r["cnt"] for r in cursor.fetchall()}
-    cursor.execute("SELECT status, COUNT(*) as cnt FROM ai_systems GROUP BY status")
+    cursor.execute(
+        f"SELECT status, COUNT(*) as cnt FROM ai_systems WHERE 1 = 1{scope_sql} "
+        "GROUP BY status", params)
     by_status = {r["status"]: r["cnt"] for r in cursor.fetchall()}
     conn.close()
     return {"total": total, "by_risk": by_risk, "by_status": by_status}
@@ -1709,7 +2330,16 @@ def create_api_key(
     )
     conn.commit()
     conn.close()
-    _audit("api_key_created", "api_key", key_id, created_by, f"Team: {team_name}")
+    # `project_id` explicitly, not from `context`: key creation is a super-admin route that
+    # opens no `bind_project`, so the row would land deployment-wide (NULL) and be invisible
+    # to the project admin whose budget the key spends. And the details now carry what the
+    # key may do -- its scopes and its cap -- because "a key was created" without them does
+    # not answer the question an auditor is asking. Never the key itself: these rows are
+    # admin-readable and exported as CSV, and the raw key is shown exactly once for a reason.
+    _audit("api_key_created", "api_key", key_id, created_by,
+           f"team={team_name} scopes={scopes} budget={monthly_budget_usd} "
+           f"rate={rate_limit_per_minute}/min",
+           project_id=project_id)
     return {
         "id": key_id, "prefix": prefix, "team_name": team_name,
         "description": description, "scopes": scopes, "created_by": created_by,
@@ -1748,15 +2378,30 @@ def get_api_key_by_id(key_id: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
-def revoke_api_key(key_id: str) -> bool:
+def revoke_api_key(key_id: str, revoked_by: str = "") -> bool:
+    """Deactivate a key. `revoked_by` is who did it, for the trail.
+
+    It used to record `actor="admin"` unconditionally -- the same defect `review_created`
+    had with `'system'`, and on the same table: revoking a key is one of the events an
+    auditor most wants attributed, and the trail could only ever say "admin". Defaults to
+    the request's actor from `context` so a caller that forgets still records something
+    true, and falls back to "system" only where there genuinely is no request.
+    """
     conn = get_connection()
     cursor = conn.cursor()
+    # Read the project before the update so the audit row can be scoped to it -- otherwise
+    # the row is deployment-wide and the project admin whose key it was cannot see it.
+    cursor.execute("SELECT project_id FROM api_keys WHERE id = ?", (key_id,))
+    row = cursor.fetchone()
+    project_id = row["project_id"] if row else None
     cursor.execute("UPDATE api_keys SET is_active = 0 WHERE id = ?", (key_id,))
     changed = cursor.rowcount > 0
     conn.commit()
     conn.close()
     if changed:
-        _audit("api_key_revoked", "api_key", key_id, "admin", "Key revoked")
+        _audit("api_key_revoked", "api_key", key_id,
+               revoked_by or context.current_actor() or "system", "Key revoked",
+               project_id=project_id)
     return changed
 
 
@@ -2574,18 +3219,66 @@ def get_usage_breakdown(key_id: str, since_iso: str) -> List[Dict[str, Any]]:
     return get_usage_summary(key_id=key_id, start=since_iso)["by_product"]
 
 
-def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, details: str = ""):
+def audit_event(event_type: str, entity_type: str, entity_id: str, actor: str,
+                details: str = "", project_id: Optional[str] = None):
+    """Record one governance event from a caller that has no transaction of its own.
+
+    The public name for `_audit`. It exists because the events an auditor actually asks
+    about — who changed a credential, who applied a fix to a repository, who failed to log
+    in, who deleted retained source — happen in routes and services, and none of them
+    should be reaching into this module for an underscore-prefixed function.
+
+    Pass `project_id=""` for a deployment-wide event that belongs to no project (a login, a
+    user record): that stores NULL and stays super-admin-only, which is correct — one
+    customer's admin has no business reading another customer's sign-in attempts.
+
+    **Never pass a secret in `details`.** These rows are readable by an admin and exported
+    as CSV; the event is "a credential was replaced", not what it was replaced with.
+    """
+    _audit(event_type, entity_type, entity_id, actor, details, project_id)
+
+
+def _audit(event_type: str, entity_type: str, entity_id: str, actor: str, details: str = "",
+           project_id: Optional[str] = None):
+    """Append one audit row on its own connection, for a caller that has no transaction.
+
+    Still deliberately non-fatal — a governance write must not fail because its audit row
+    could not be stored — but no longer *silent*. `except Exception: pass` meant a locked
+    database, a full disk or a schema drift produced an audit trail with holes in it and
+    nothing anywhere saying so, which is the one failure an audit trail must not have.
+    """
+    if project_id is None:
+        project_id = context.current_project_id()
     try:
         conn = get_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, created_at) VALUES (?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details, datetime.utcnow().isoformat()),
+            "INSERT INTO audit_trail (id, event_type, entity_type, entity_id, actor, details, project_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), event_type, entity_type, entity_id, actor, details,
+             project_id or None, datetime.utcnow().isoformat()),
         )
         conn.commit()
         conn.close()
     except Exception:
-        pass
+        logger.exception("Audit row not stored: %s on %s %s by %s",
+                         event_type, entity_type, entity_id, actor)
+
+
+def record_audit_event(event_type: str, entity_type: str, entity_id: str, actor: str,
+                      details: str = "", project_id: Optional[str] = None) -> None:
+    """Append one audit row from outside this module.
+
+    The public face of `_audit`, which every function in here already uses. A router
+    reaching for `_audit` directly reads as though it were breaking a boundary, and the
+    audit trail is about to gain rows from several routers (applying a fix, writing to a
+    repository, rotating a credential), so it needs a name that says it is meant to be
+    called.
+
+    `project_id=None` means "take the project this request is bound to"; pass `""` for a
+    deployment-wide event, which stores NULL and stays super-admin-only.
+    """
+    _audit(event_type, entity_type, entity_id, actor, details, project_id=project_id)
 
 
 # ── Agent jobs (async/progress-pollable long-running agent runs) ───────────
@@ -2651,6 +3344,86 @@ def update_job(
     conn.close()
 
 
+def previously_open_findings(project_id: Optional[str], repo_owner: str = "",
+                             repo_name: str = "",
+                             product_id: str = "") -> Dict[str, Dict[str, Any]]:
+    """What the last review of this same thing left open.
+
+    The missing half of the baseline. `get_finding_baseline` answers "have we seen this
+    before"; nothing answered "what did we see last time that is gone now" — so there was
+    no burn-down, no fix rate, and no time-to-remediate, and a run could not say "this
+    change fixed four and introduced one", which is the number a lead actually wants.
+
+    Scoped to **the previous review of the same repository**, not to the whole project. A
+    project-wide diff would be wrong in the one direction that matters: reviewing file A
+    would report every open finding in file B as resolved. Where there is no repository (a
+    paste, a zip upload) it falls back to the same product within the project, which is the
+    closest honest equivalent — the same screen reviewing the same kind of thing.
+
+    Returns {fingerprint: {file_path, title, severity, control_id, review_id, last_seen}}
+    for findings still `open` at that point. The caller decides which of them this run
+    actually covered; this function deliberately does not guess.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    where, params = ["f.status = 'open'", "f.fingerprint IS NOT NULL"], []
+    if project_id:
+        where.append("f.project_id = ?")
+        params.append(project_id)
+    else:
+        where.append("f.project_id IS NULL")
+    if repo_owner and repo_name:
+        where.append("r.repo_owner = ? AND r.repo_name = ?")
+        params += [repo_owner, repo_name]
+    elif product_id:
+        where.append("r.product_id = ?")
+        params.append(product_id)
+    else:
+        conn.close()
+        return {}
+    rows = cursor.execute(
+        f"""SELECT f.fingerprint, f.file_path, f.title, f.severity, f.control_id,
+                   f.review_id, MAX(r.created_at) AS last_seen
+            FROM findings f JOIN reviews r ON r.id = f.review_id
+            WHERE {' AND '.join(where)}
+            GROUP BY f.fingerprint""",
+        params,
+    ).fetchall()
+    conn.close()
+    return {r["fingerprint"]: dict(r) for r in rows}
+
+
+def mark_findings_resolved(fingerprints: List[str], project_id: Optional[str],
+                           actor: str = "system") -> int:
+    """Close findings a later review of the same code no longer reports.
+
+    Sets `status='resolved'`, which is deliberately *not* one of `WAIVED_STATUSES` — a
+    resolved finding does not suppress a future report of the same fingerprint. If it comes
+    back, it comes back as a regression rather than being silently muted, which is the
+    difference between "we fixed it" and "we stopped looking".
+    """
+    if not fingerprints:
+        return 0
+    now = datetime.utcnow().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    changed = 0
+    for i in range(0, len(fingerprints), 400):
+        batch = fingerprints[i:i + 400]
+        placeholders = ",".join("?" * len(batch))
+        sql = (f"UPDATE findings SET status = 'resolved', resolved_by = ?, resolved_at = ? "
+               f"WHERE fingerprint IN ({placeholders}) AND status = 'open'")
+        args = [actor, now, *batch]
+        if project_id:
+            sql += " AND project_id = ?"
+            args.append(project_id)
+        cursor.execute(sql, args)
+        changed += cursor.rowcount
+    conn.commit()
+    conn.close()
+    return changed
+
+
 def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> Dict[str, Dict[str, Any]]:
     """Look up what this project already knows about these findings.
 
@@ -2661,6 +3434,27 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
 
     Scoped to the project, so one team's decision to waive something never silently
     suppresses it for another.
+
+    **A live waiver wins over every other row for the same fingerprint** (C-81). One
+    fingerprint has one row per review that reported it, and they disagree: review 1 saw it
+    open, someone waived it from review 2's list, so there is an `open` row and an
+    `accepted_risk` row. The old query grouped by fingerprint with bare columns and one
+    `MIN(r.created_at)`, which triggers SQLite's documented min/max special case: the bare
+    columns come from the row with the **minimum**, i.e. the *oldest* review. So a waiver
+    set on any review after the first was invisible for ever, and the finding was reported
+    and gated on again after a team had explicitly accepted it — which is precisely how
+    people stop reading reviews. Verified against SQLite 3.45.3 rather than assumed.
+
+    The rule is "any live waiver wins", not "newest row wins", because the two fail
+    differently: a stale waiver hides one finding, and its blast radius is already bounded
+    (`accepted_risk` expires after 90 days and `lapse_expired_waivers` runs before every
+    baseline lookup, which is why `waiver_lapsed_at IS NULL` is part of the test — a lapsed
+    acceptance is not a waiver, per D-259). Re-reporting a decided finding, by contrast,
+    devalues every review after it.
+
+    Ties break on the most recent decision and then on `f.id`, so the answer is fully
+    deterministic — a window function rather than bare columns, so there is no
+    implementation-defined behaviour left to depend on.
     """
     if not fingerprints:
         return {}
@@ -2674,20 +3468,30 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
         placeholders = ",".join("?" * len(batch))
         if project_id:
             sql = (
-                f"SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
-                f"f.resolution_comment, MIN(r.created_at) AS first_seen "
-                f"FROM findings f JOIN reviews r ON r.id = f.review_id "
-                f"WHERE f.fingerprint IN ({placeholders}) AND f.project_id = ? "
-                f"GROUP BY f.fingerprint"
+                f"SELECT fingerprint, status, resolved_by, resolved_at, resolution_comment, "
+                f"       first_seen FROM ("
+                f"  SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
+                f"         f.resolution_comment, "
+                f"         MIN(r.created_at) OVER (PARTITION BY f.fingerprint) AS first_seen, "
+                f"         ROW_NUMBER() OVER (PARTITION BY f.fingerprint "
+                f"                            ORDER BY {_BASELINE_ROW_PICK}) AS rn "
+                f"  FROM findings f JOIN reviews r ON r.id = f.review_id "
+                f"  WHERE f.fingerprint IN ({placeholders}) AND f.project_id = ? "
+                f") WHERE rn = 1"
             )
             params = batch + [project_id]
         else:
             sql = (
-                f"SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
-                f"f.resolution_comment, MIN(r.created_at) AS first_seen "
-                f"FROM findings f JOIN reviews r ON r.id = f.review_id "
-                f"WHERE f.fingerprint IN ({placeholders}) AND f.project_id IS NULL "
-                f"GROUP BY f.fingerprint"
+                f"SELECT fingerprint, status, resolved_by, resolved_at, resolution_comment, "
+                f"       first_seen FROM ("
+                f"  SELECT f.fingerprint, f.status, f.resolved_by, f.resolved_at, "
+                f"         f.resolution_comment, "
+                f"         MIN(r.created_at) OVER (PARTITION BY f.fingerprint) AS first_seen, "
+                f"         ROW_NUMBER() OVER (PARTITION BY f.fingerprint "
+                f"                            ORDER BY {_BASELINE_ROW_PICK}) AS rn "
+                f"  FROM findings f JOIN reviews r ON r.id = f.review_id "
+                f"  WHERE f.fingerprint IN ({placeholders}) AND f.project_id IS NULL "
+                f") WHERE rn = 1"
             )
             params = batch
         for row in cursor.execute(sql, params):
@@ -2696,11 +3500,88 @@ def get_finding_baseline(project_id: Optional[str], fingerprints: List[str]) -> 
     return out
 
 
+# The three statuses that all mean "do not gate on this". A list, not the set in
+# `finding_pipeline.WAIVED_STATUSES`, because a parameterized `IN (?, ?, ?)` needs a stable
+# order — and declared here rather than imported because the data layer does not otherwise
+# depend on the services layer.
+WAIVED_STATUS_LIST = ["waived", "false_positive", "accepted_risk"]
+
+
+# Which row speaks for a fingerprint when several disagree. See `get_finding_baseline`
+# for why a live waiver outranks recency, and C-81 for what the bare-column version did.
+_BASELINE_ROW_PICK = (
+    "CASE WHEN f.status IN ('" + "', '".join(WAIVED_STATUS_LIST) + "') "
+    "          AND f.waiver_lapsed_at IS NULL THEN 0 ELSE 1 END, "
+    "COALESCE(f.resolved_at, r.created_at) DESC, f.id DESC"
+)
+
+
+def _finding_filter_sql(status: Optional[str] = None, min_severity: int = 0,
+                        review_id: Optional[str] = None, q: Optional[str] = None,
+                        control_id: Optional[str] = None, product_id: Optional[str] = None,
+                        repo: Optional[str] = None,
+                        since: Optional[str] = None) -> tuple:
+    """The WHERE fragment for a findings query, built once.
+
+    Shared by `list_findings` and `count_findings` deliberately: they answer "which rows"
+    and "how many rows" about the *same* set, and the counts are shown beside the list.
+    Two copies of this logic is two chances for the header to disagree with the body, which
+    is worse than either being wrong on its own.
+
+    `q` searches the title, the description and the file path. `LIKE` with a leading
+    wildcard cannot use an index — accepted rather than worked around: this table is
+    bounded by how much a team has reviewed, and the alternative is an FTS5 virtual table
+    to maintain for a screen someone opens a few times a day.
+    """
+    clauses = ""
+    extra: tuple = ()
+    if status:
+        clauses += " AND f.status = ?"
+        extra += (status,)
+    if min_severity:
+        clauses += " AND f.severity >= ?"
+        extra += (min_severity,)
+    if review_id:
+        clauses += " AND f.review_id = ?"
+        extra += (review_id,)
+    if q:
+        needle = f"%{q.strip()}%"
+        clauses += (" AND (f.title LIKE ? OR f.description LIKE ? OR f.file_path LIKE ?)")
+        extra += (needle, needle, needle)
+    if control_id:
+        # A prefix, so `SEC` matches SEC-001..SEC-016 and `SEC-004` matches just that one.
+        # Which is what a security reviewer means by "show me the access-control ones".
+        clauses += " AND f.control_id LIKE ?"
+        extra += (f"{control_id.strip()}%",)
+    if product_id:
+        clauses += " AND r.product_id = ?"
+        extra += (product_id,)
+    if repo:
+        # `owner/name`, or just the name. The repository dimension exists on `reviews` now,
+        # so "every open Critical in the payments service" is finally a query.
+        owner, _, name = repo.strip().partition("/")
+        if name:
+            clauses += " AND r.repo_owner = ? AND r.repo_name = ?"
+            extra += (owner, name)
+        else:
+            clauses += " AND r.repo_name = ?"
+            extra += (owner,)
+    if since:
+        clauses += " AND r.created_at >= ?"
+        extra += (since,)
+    return clauses, extra
+
+
 def list_findings(
     project_ids: Optional[List[str]] = None,
     status: Optional[str] = None,
     min_severity: int = 0,
     review_id: Optional[str] = None,
+    q: Optional[str] = None,
+    control_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    repo: Optional[str] = None,
+    since: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
@@ -2714,22 +3595,15 @@ def list_findings(
     Joined to `reviews` for the context a row is meaningless without: which review, of what
     type, when. Scoped on `findings.project_id`, which `save_review` stamps.
     """
-    scope, params = _review_scope_sql(project_ids, alias="f")
-    clauses = ""
-    extra: tuple = ()
-    if status:
-        clauses += " AND f.status = ?"
-        extra += (status,)
-    if min_severity:
-        clauses += " AND f.severity >= ?"
-        extra += (min_severity,)
-    if review_id:
-        clauses += " AND f.review_id = ?"
-        extra += (review_id,)
+    scope, params = _project_scope_sql(project_ids, alias="f")
+    clauses, extra = _finding_filter_sql(
+        status=status, min_severity=min_severity, review_id=review_id, q=q,
+        control_id=control_id, product_id=product_id, repo=repo, since=since)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        f"""SELECT f.*, r.review_type, r.project_name, r.created_at AS review_created_at
+        f"""SELECT f.*, r.review_type, r.project_name, r.created_at AS review_created_at,
+                   r.repo_owner, r.repo_name, r.product_id
             FROM findings f
             LEFT JOIN reviews r ON r.id = f.review_id
             WHERE 1 = 1{scope}{clauses}
@@ -2741,31 +3615,249 @@ def list_findings(
     return [dict(r) for r in rows]
 
 
+# ── Notification targets ─────────────────────────────────────────────────
+#
+# The URL is the credential. A Slack or Teams incoming-webhook URL authenticates by
+# possession — anyone holding it can post to that channel — so it is encrypted at rest and
+# **never** read back out of any of these functions. `_redact_target` is the only shape
+# that leaves this layer, and it carries a host and four characters, which is enough to
+# tell two channels apart and not enough to use one. Same rule as `llm_connections`.
+
+def _redact_target(row: Dict[str, Any]) -> Dict[str, Any]:
+    """A target as the API may show it: no URL, just where it points."""
+    from urllib.parse import urlparse
+
+    from backend.services import crypto_service
+
+    out = {k: v for k, v in row.items() if k not in ("url_encrypted", "secret_encrypted")}
+    host, tail = "", ""
+    try:
+        url = crypto_service.decrypt(row["url_encrypted"])
+        host = urlparse(url).hostname or ""
+        tail = url[-4:]
+    except Exception:                                            # noqa: BLE001
+        # An undecryptable URL means `SECRET_KEY` changed. Reported on the row rather than
+        # raised: the list must still render, and this is the only place a user would ever
+        # find out why that channel stopped working.
+        out["unreadable"] = ("This channel's URL cannot be decrypted — SECRET_KEY changed "
+                             "since it was added. Delete it and add it again.")
+    out["host"] = host
+    out["url_tail"] = tail
+    out["signed"] = bool(row.get("secret_encrypted"))
+    out["active"] = bool(row.get("active"))
+    return out
+
+
+def create_notification_target(*, project_id: str, name: str, kind: str, url: str,
+                               secret: str = "", events: str = "review_gated",
+                               min_severity: int = 5,
+                               created_by: str = "unknown") -> Dict[str, Any]:
+    """Store a channel. The URL is encrypted here and cannot be read back."""
+    from backend.services import crypto_service
+
+    target_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO notification_targets (id, project_id, name, kind, url_encrypted, "
+        "secret_encrypted, events, min_severity, active, created_at, created_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        (target_id, project_id, name, kind, crypto_service.encrypt(url),
+         crypto_service.encrypt(secret) if secret else None,
+         events, int(min_severity), now, created_by),
+    )
+    log_audit(cursor, "notification_target_created", "notification_target", target_id,
+              actor=created_by, details=f"kind={kind} events={events}",
+              project_id=project_id)
+    conn.commit()
+    conn.close()
+    return get_notification_target(target_id, redacted=True)
+
+
+def get_notification_target(target_id: str, redacted: bool = False) -> Optional[Dict[str, Any]]:
+    """One target. Raw by default — the dispatcher and the test endpoint need the
+    ciphertext to decrypt; pass `redacted=True` for anything a caller will see.
+
+    Joined to `projects` for the name, because a notification body says which project it is
+    about and the target row only carries an id.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT t.*, p.name AS project_name FROM notification_targets t "
+        "LEFT JOIN projects p ON p.id = t.project_id WHERE t.id = ?",
+        (target_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return _redact_target(dict(row)) if redacted else dict(row)
+
+
+def list_notification_targets(project_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Every channel in the caller's projects, redacted. Newest first."""
+    scope, params = _project_scope_sql(project_ids, alias="t")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT t.*, p.name AS project_name FROM notification_targets t "
+        f"LEFT JOIN projects p ON p.id = t.project_id "
+        f"WHERE 1 = 1{scope} ORDER BY t.created_at DESC",
+        params,
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [_redact_target(dict(r)) for r in rows]
+
+
+def update_notification_target(target_id: str, fields: Dict[str, Any],
+                               actor: str = "unknown") -> Optional[Dict[str, Any]]:
+    """Update the named columns only.
+
+    The column list is a fixed whitelist rather than whatever the caller sent, because this
+    builds SQL from the keys: `url_encrypted` must not be reachable this way (see the route
+    for why a channel's destination is not editable), and neither must `project_id`, which
+    would move a channel between customers.
+    """
+    allowed = {"name", "events", "min_severity", "active"}
+    sets = {k: v for k, v in (fields or {}).items() if k in allowed}
+    if not sets:
+        return get_notification_target(target_id, redacted=True)
+    assignments = ", ".join(f"{k} = ?" for k in sets)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"UPDATE notification_targets SET {assignments} WHERE id = ?",
+        tuple(sets.values()) + (target_id,),
+    )
+    log_audit(cursor, "notification_target_updated", "notification_target", target_id,
+              actor=actor, details=", ".join(f"{k}={v}" for k, v in sets.items()))
+    conn.commit()
+    conn.close()
+    return get_notification_target(target_id, redacted=True)
+
+
+def delete_notification_target(target_id: str, actor: str = "unknown") -> bool:
+    """Remove a channel. Its deliveries are deliberately left behind — they are the record
+    of what left this deployment and where it went, and deleting a channel must not be a
+    way to erase that."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM notification_targets WHERE id = ?", (target_id,))
+    removed = cursor.rowcount > 0
+    log_audit(cursor, "notification_target_deleted", "notification_target", target_id,
+              actor=actor, details="deliveries retained")
+    conn.commit()
+    conn.close()
+    return removed
+
+
+def list_notification_deliveries(project_ids: Optional[List[str]] = None,
+                                 status: Optional[str] = None,
+                                 limit: int = 50) -> List[Dict[str, Any]]:
+    """The delivery log. `payload_json` is not returned — it is what we sent, and the
+    fields that matter are already columns."""
+    scope, params = _project_scope_sql(project_ids, alias="d")
+    clause, extra = "", ()
+    if status:
+        clause = " AND d.status = ?"
+        extra = (status,)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"SELECT d.id, d.target_id, d.project_id, d.event_type, d.review_id, d.status, "
+        f"       d.attempts, d.last_error, d.created_at, d.sent_at, "
+        f"       t.name AS target_name, t.kind AS target_kind "
+        f"FROM notification_deliveries d "
+        f"LEFT JOIN notification_targets t ON t.id = d.target_id "
+        f"WHERE 1 = 1{scope}{clause} ORDER BY d.created_at DESC LIMIT ?",
+        params + extra + (limit,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_waived_findings(
+    project_ids: Optional[List[str]] = None,
+    repo: Optional[str] = None,
+    limit: int = 2000,
+) -> List[Dict[str, Any]]:
+    """Every finding a team has decided not to act on, for export as a `.lmignore`.
+
+    A separate function rather than `list_findings(status=...)` because a waiver is three
+    statuses, not one — waived, false_positive and accepted_risk are different decisions
+    that all mean "do not gate on this" — and `_finding_filter_sql` takes a single status
+    on purpose, because everywhere else in the UI a status filter means exactly one.
+
+    `waiver_lapsed_at IS NULL` matters: an acceptance that ran out is *not* a waiver any
+    more (`lapse_expired_waivers` reopens it), and exporting it into a file with no expiry
+    would silently make a lapsed acceptance permanent — the one thing the expiry exists to
+    prevent.
+
+    Newest first, and `repo` narrows to one repository so a team exports the rules for the
+    repository they are about to commit the file into rather than every project they own.
+    """
+    scope, params = _project_scope_sql(project_ids, alias="f")
+    clauses, extra = "", ()
+    if repo:
+        owner, _, name = repo.strip().partition("/")
+        if name:
+            clauses += " AND r.repo_owner = ? AND r.repo_name = ?"
+            extra += (owner, name)
+        else:
+            clauses += " AND r.repo_name = ?"
+            extra += (owner,)
+    placeholders = ", ".join("?" for _ in WAIVED_STATUS_LIST)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        f"""SELECT f.*, r.repo_owner, r.repo_name, r.created_at AS review_created_at
+            FROM findings f
+            LEFT JOIN reviews r ON r.id = f.review_id
+            WHERE f.status IN ({placeholders})
+              AND f.waiver_lapsed_at IS NULL{scope}{clauses}
+            ORDER BY r.created_at DESC LIMIT ?""",
+        tuple(WAIVED_STATUS_LIST) + params + extra + (limit,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def count_findings(
     project_ids: Optional[List[str]] = None,
     status: Optional[str] = None,
     min_severity: int = 0,
     review_id: Optional[str] = None,
+    q: Optional[str] = None,
+    control_id: Optional[str] = None,
+    product_id: Optional[str] = None,
+    repo: Optional[str] = None,
+    since: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Totals for the same filter `list_findings` applies, plus a severity breakdown.
 
     The breakdown ignores `min_severity` deliberately: it is what the filter buttons are
     counting, so it has to describe the whole filtered-by-status set rather than the slice
-    currently on screen.
+    currently on screen. Every *other* filter is applied, through the same builder the list
+    uses — a header that counted a different set from the body would be worse than no
+    header, and that is exactly what happens when these two grow apart.
     """
-    scope, params = _review_scope_sql(project_ids, alias="f")
-    clauses = ""
-    extra: tuple = ()
-    if status:
-        clauses += " AND f.status = ?"
-        extra += (status,)
-    if review_id:
-        clauses += " AND f.review_id = ?"
-        extra += (review_id,)
+    scope, params = _project_scope_sql(project_ids, alias="f")
+    # `min_severity=0` on purpose, per the docstring. The join is needed because the
+    # repository, product and date filters live on `reviews`.
+    clauses, extra = _finding_filter_sql(
+        status=status, min_severity=0, review_id=review_id, q=q,
+        control_id=control_id, product_id=product_id, repo=repo, since=since)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        f"SELECT severity, COUNT(*) AS cnt FROM findings f WHERE 1 = 1{scope}{clauses} GROUP BY severity",
+        f"""SELECT f.severity, COUNT(*) AS cnt FROM findings f
+            LEFT JOIN reviews r ON r.id = f.review_id
+            WHERE 1 = 1{scope}{clauses} GROUP BY f.severity""",
         params + extra,
     )
     by_severity = {int(row["severity"] or 0): row["cnt"] for row in cursor.fetchall()}
@@ -3185,6 +4277,84 @@ def resolve_github_token(project_id: Optional[str], owner_repo: str = "") -> Dic
         # write paths already check for themselves and fail with GitHub's own message.
         "can_write": bool(config.GITHUB_TOKEN),
     }
+
+
+def last_reviewed_sha_for_pr(repo: str, pr_url: str,
+                             before_sha: str = "") -> Optional[str]:
+    """The commit this pull request was last reviewed at, or None.
+
+    What makes an incremental review possible: `<that sha>...<the new head>` is the code
+    that has arrived since anybody looked. Read from `webhook_reviews` because that table
+    already records exactly one row per (repo, reviewed sha) and is the same bookkeeping
+    that stops a redelivered event being paid for twice.
+
+    `before_sha` excludes the row for the push being handled right now — the webhook
+    records its own row *after* queueing, but a redelivery or a retry can mean it is
+    already there, and comparing a sha against itself yields an empty diff and a review of
+    nothing.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    params: tuple = (repo, pr_url)
+    clause = ""
+    if before_sha:
+        clause = " AND head_sha != ?"
+        params += (before_sha,)
+    row = cursor.execute(
+        f"SELECT head_sha FROM webhook_reviews WHERE repo = ? AND pr_url = ?{clause} "
+        f"ORDER BY created_at DESC LIMIT 1",
+        params,
+    ).fetchone()
+    conn.close()
+    return (dict(row).get("head_sha") or None) if row else None
+
+
+def open_findings_for_pr(project_id: Optional[str], repo_owner: str, repo_name: str,
+                         pr_number: int, exclude_review_id: str = "") -> List[Dict[str, Any]]:
+    """Findings still open from earlier reviews of this same pull request.
+
+    An incremental review reads only the newest commits, so a Critical raised two pushes
+    ago in a file this run never opened would simply be absent — and absent reads as fixed.
+    These are carried into the new result so the gate still blocks and the comment still
+    lists them, labelled as carried rather than found again.
+
+    Keyed on the pull request, not the repository: another open pull request's findings are
+    not this one's problem, and flooring this gate with them would make a branch
+    unmergeable for somebody else's work.
+
+    One row per fingerprint, newest review first. `MAX(r.created_at)` is deliberately not
+    used — this needs the *whole* row, and mixing an aggregate with bare columns is the
+    defect C-81 records; the window function picks a specific row instead.
+    """
+    if not (repo_owner and repo_name and pr_number):
+        return []
+    where = ["f.status = 'open'", "f.fingerprint IS NOT NULL",
+             "r.repo_owner = ?", "r.repo_name = ?", "r.pr_number = ?"]
+    params: List[Any] = [repo_owner, repo_name, int(pr_number)]
+    if project_id:
+        where.append("f.project_id = ?")
+        params.append(project_id)
+    else:
+        where.append("f.project_id IS NULL")
+    if exclude_review_id:
+        where.append("f.review_id != ?")
+        params.append(exclude_review_id)
+    conn = get_connection()
+    cursor = conn.cursor()
+    rows = cursor.execute(
+        f"""SELECT * FROM (
+                SELECT f.*, r.created_at AS review_created_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY f.fingerprint ORDER BY r.created_at DESC
+                       ) AS rn
+                FROM findings f JOIN reviews r ON r.id = f.review_id
+                WHERE {' AND '.join(where)}
+            ) WHERE rn = 1
+            ORDER BY severity DESC, review_created_at DESC""",
+        params,
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def record_webhook_review(repo: str, head_sha: str, pr_url: str, job_id: str,

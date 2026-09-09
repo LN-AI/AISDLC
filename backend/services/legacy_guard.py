@@ -39,6 +39,7 @@ from starlette.responses import JSONResponse
 from backend import config, context, database
 from backend.products import registry
 from backend.services import agent_guard, code_chunker, llm_gateway
+from backend.services.subject_service import project_warning
 from backend.services.agent_guard import (
     BudgetExceededError,
     QuotaExceededError,
@@ -73,17 +74,38 @@ LEGACY_PRODUCT_ROUTES = {
     "/api/review/prompt": "prompt",
     "/api/review/architecture": "architecture",
     "/api/review/architecture/upload": "architecture",
+    # Reviewing a *design* from the code that implements it. Same products, so the same
+    # entitlement, quota and budget — the input changed, not what is being sold. Still one
+    # model call each, because `code_brief` reduces the codebase to a description that fits
+    # in one: no `_CHUNKABLE_ROUTES` entry, and the reservation of 1 is correct rather than
+    # the under-reservation C-77 was about.
+    "/api/review/architecture/source": "architecture",
+    "/api/review/architecture/upload-zip": "architecture",
+    "/api/review/security/source": "security",
+    "/api/review/security/upload-zip": "security",
     "/api/review/vapt": "vapt",
     "/api/review/vapt/upload": "vapt",
     "/api/review/security": "security",
     "/api/review/security/upload": "security",
     "/api/review/sensitive-data": "sensitive-data",
+    "/api/review/sensitive-data/source": "sensitive-data",
+    "/api/review/sensitive-data/upload-zip": "sensitive-data",
     "/api/review/sensitive-data/upload": "sensitive-data",
     "/api/review/ai-provenance": "ai-provenance",
     "/api/review/migration-assessment": "migration-assessment",
+    # Assessing a whole codebase. Same product, same entitlement: the input changed, not
+    # what is being sold. One model call, because it takes the structural brief its two
+    # design siblings take — so no `_CHUNKABLE_ROUTES` entry.
+    "/api/review/migration-assessment/source": "migration-assessment",
+    "/api/review/migration-assessment/upload-zip": "migration-assessment",
     "/api/review/migration-execute": "migration-execute",
     "/api/review/cfr21-verification": "cfr21-verification",
     "/api/review/cfr21-verification/upload-zip": "cfr21-verification",
+    # The regulated products reading a repository. Unlike the design agents these get the
+    # real files, so a Part 11 verification of a large system fans out — see
+    # `_CHUNKABLE_ROUTES` below, without which it would reserve one call and make several.
+    "/api/review/cfr21-verification/source": "cfr21-verification",
+    "/api/review/gxp-generate-plan/source": "gxp-generate-plan",
     "/api/review/gxp-document-check": "gxp-document-check",
     "/api/review/gxp-document-check/upload": "gxp-document-check",
     "/api/review/gxp-generate-plan": "gxp-generate-plan",
@@ -160,6 +182,18 @@ _CHUNKABLE_ROUTES = {
     "/api/review/vapt": "artifact",
     "/api/review/vapt/source": "artifact",
     "/api/review/vapt/upload-zip": "artifact",
+    # The sensitive-data scan fans out over chunks now (its question is per file, so
+    # findings concatenate). Listed here or it reserves for one call and makes forty, which
+    # is exactly C-77 — a caller near their cap could start a scan that passed a check sized
+    # for a fortieth of it. Its two design siblings above are deliberately *not* here: they
+    # send one structural brief and make one call.
+    "/api/review/sensitive-data/source": "content",
+    "/api/review/sensitive-data/upload-zip": "content",
+    # A Part 11 verification splits when the prompt does not fit (D-354), using the same
+    # `code_chunker.chunk_files` that sizes the reservation here — so the number reserved is
+    # the number made. Bounded either way by the 60-file / 120,000-character regulated cap.
+    # `gxp-generate-plan` is deliberately absent: `gxp_generator_agent.plan` does not chunk.
+    "/api/review/cfr21-verification/source": "code",
     "/api/github/pr": "",
     "/api/github/pr/auto-fix": "",
 }
@@ -230,6 +264,73 @@ async def _expected_calls(request, product_id: str) -> int:
 _UNKNOWN_REMOTE_SOURCE_CALLS = 4
 
 
+async def _claimed_parents(request) -> list:
+    """The earlier reviews the caller says this run was built from, off the request body.
+
+    Read here for the same reason `_expected_calls` sizes here: this is the one place on the
+    browser path that sees the request body before the handler, and threading a
+    `derived_from` parameter through the nineteen callers of `save_review` is exactly the
+    cost `backend/context.py` exists to avoid.
+
+    The same three guards as the sizing read, and for the same reasons — JSON only (a
+    multipart zip must never be buffered into memory to look for a field that cannot be in
+    it), a size cap, and **fail open to no claim**: a provenance link is worth having and
+    never worth turning a working review into a 500 for.
+    """
+    try:
+        if "application/json" not in (request.headers.get("content-type") or "").lower():
+            return []
+        if int(request.headers.get("content-length") or 0) > _MAX_SIZING_BODY_BYTES:
+            return []
+        body = await request.body()
+        if not body:
+            return []
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            return []
+        claimed = payload.get("derived_from")
+        # The Release Gate's provenance *is* its `review_ids` — that is the whole input —
+        # so it needs no second field saying the same thing. This closes the other half of
+        # the gap: the gate stored `aggregated_reviews` as a count, so reopening a decision
+        # could not say what it covered.
+        #
+        # But only when it actually gated on them. Pasted `findings` win outright over
+        # `review_ids` in `workflows/release_gate.py`, deliberately, so that a gate can
+        # never be issued over a set nobody saw — and recording the ignored ids as
+        # provenance would assert exactly the link that code exists to prevent.
+        if claimed is None and not payload.get("findings"):
+            claimed = payload.get("review_ids")
+        if isinstance(claimed, str):
+            claimed = [claimed]
+        if not isinstance(claimed, list):
+            return []
+        # Bounded: a caller could otherwise post ten thousand ids and make `save_review`
+        # run ten thousand lookups inside its write transaction.
+        return [str(x) for x in claimed[:_MAX_CLAIMED_PARENTS] if x]
+    except Exception:                                                     # noqa: BLE001
+        logger.exception("Could not read `derived_from` for %s — recording no provenance "
+                         "rather than failing the run", request.url.path)
+        return []
+
+
+# More than this many parents is not a chain, it is a mistake or an attack. The Release Gate
+# is the widest real case and it aggregates whatever a person ticked on one screen.
+_MAX_CLAIMED_PARENTS = 100
+
+
+def _actor_for(subject) -> str:
+    """Who to name in an audit row written while this request runs.
+
+    The same string `agent_guard._caller_identity` produces, derived from the same two
+    sources -- a signed-in user's username, or an API key's team name. Written here rather
+    than imported because `agent_guard` reads a `caller` dict and this middleware only ever
+    holds a resolved `Subject`.
+    """
+    user = getattr(subject, "user", None) or {}
+    key = getattr(subject, "key_record", None) or {}
+    return user.get("username") or key.get("team_name") or ""
+
+
 async def legacy_product_guard(request, call_next):
     product_id = product_for_request(request.method, request.url.path)
     if not product_id:
@@ -283,7 +384,8 @@ async def legacy_product_guard(request, call_next):
     # link all along; on these routes it was always NULL, because this middleware never
     # learned which review the handler wrote.
     with context.bind_project(subject.project_id, subject.project_name,
-                              product_id=product_id), \
+                              product_id=product_id, actor=_actor_for(subject)), \
+            context.bind_derived_from(await _claimed_parents(request)), \
             agent_guard.hold_budget_reservation(subject), \
             llm_gateway.track_usage(), \
             context.collect_saved_reviews():
@@ -298,6 +400,20 @@ async def legacy_product_guard(request, call_next):
         response.headers["X-RateLimit-Remaining-Minute"] = str(rate["remaining_per_minute"])
         response.headers["X-RateLimit-Limit-Day"] = str(rate["limit_per_day"])
         response.headers["X-RateLimit-Remaining-Day"] = str(rate["remaining_per_day"])
+
+    # Set here rather than with the spend headers below, because this is deliberately
+    # *above* the `not usage["calls"]` return: whether the run was governed has nothing to
+    # do with whether a model was reached, and a free preflight that will run ungoverned is
+    # exactly when a person still has time to pick a project.
+    #
+    # These routes are the ones the browser actually uses, so without this the warning would
+    # exist only on the `/api/v1` surface and no real user would ever see it. Same channel
+    # and same reason as the spend headers: this middleware runs *around* the handler, so by
+    # the time it can act, `call_next` has already serialized the body. `apiFetch` folds it
+    # back into `_project_warning`.
+    _pw = project_warning(subject)
+    if _pw:
+        response.headers["X-Project-Warning"] = _pw
 
     if not usage["calls"]:
         return response  # nothing reached an LLM (validation error, cache hit, 4xx)

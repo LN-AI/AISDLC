@@ -1,0 +1,404 @@
+{
+  "scoring": "stable-cases-v2",
+  "errors": 0,
+  "recall": 1.0,
+  "false_positive_rate": 0.167,
+  "gate_accuracy": 1.0,
+  "gate_accuracy_pooled": 0.667,
+  "gate_cases_stable": 1,
+  "gate_cases_unstable": 1,
+  "unstable_gate_cases": [
+    "fp-framework-csrf"
+  ],
+  "case_stability": [
+    {
+      "case": "fp-framework-csrf",
+      "runs": 3,
+      "gate_correct_runs": 1,
+      "gates": [
+        "Amber",
+        "Green"
+      ],
+      "unanimous": false,
+      "finding_overlap": 0.0
+    },
+    {
+      "case": "sql-injection",
+      "runs": 3,
+      "gate_correct_runs": 3,
+      "gates": [
+        "Red"
+      ],
+      "unanimous": true,
+      "finding_overlap": 0.25
+    }
+  ],
+  "hallucinated_findings_discarded": 0,
+  "unverified_findings": 0,
+  "tokens_in": 3567,
+  "tokens_out": 8803,
+  "cache_read_tokens": 17505,
+  "prompt_version": "2026-09-03.1",
+  "generated_at": "2026-09-08T09:50:50.848218+00:00",
+  "cases": 2,
+  "repeat": 3,
+  "determinism_jaccard": 0.125,
+  "estimated_cost_usd": 0.142746,
+  "runs": [
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Green",
+      "model_gate": "Green",
+      "gate_ok": true,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "062a311f91d9dfe46bf6aeae28cf8c13",
+        "28da1650d8f300920a82175a187a017e",
+        "abd7d6d91ace8dcbfcdebbc174feae2f"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-014",
+          "title": "Missing KeyError handling for absent POST field",
+          "line_start": 8,
+          "description": "Accessing `request.POST[\"bio\"]` with bracket notation raises an unhandled `KeyError` if the `bio` key is absent from the POST body (e.g., a malformed or manually crafted request). This results in an unhandled exception that, depending on Dj",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-016",
+          "title": "No explicit confirmation that the record being modified belongs to the authenticated user",
+          "line_start": 8,
+          "description": "Although the view uses `@login_required` and writes to `request.user` directly \u2014 which is safe in this specific pattern \u2014 there is no guard against subtle future refactors where a user ID might be accepted from POST data to select a target ",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Unvalidated/unsanitized user input written directly to user model",
+          "line_start": 8,
+          "description": "The `bio` field is taken directly from POST data without any validation, sanitization, or length limiting before being saved to the database. While Django's ORM prevents SQL injection here, the raw value is persisted without checking for XS",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1404,
+        "cache_write_tokens": 3501,
+        "cache_read_tokens": 0
+      },
+      "seconds": 34.2
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Amber",
+      "model_gate": "Amber",
+      "gate_ok": false,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 1,
+      "tripped": [
+        {
+          "match": "csrf",
+          "note": "Django's CsrfViewMiddleware handles CSRF on every POST by default"
+        }
+      ],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "18eb4cb705830720a3ed69808ae4732d",
+        "7ad1cbc446b37884b0d699e2a285d4f4",
+        "ed1c93cca87c507d0d5d9d5afae4b6bb"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-014",
+          "title": "KeyError on missing POST field exposed to caller",
+          "line_start": 8,
+          "description": "Accessing `request.POST[\"bio\"]` with a bracket lookup raises an unhandled `KeyError` if the `bio` key is absent from the POST body (e.g., a crafted or malformed request). Django's default 500 error handler will return a generic error page i",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Unsanitized user input written directly to model field",
+          "line_start": 8,
+          "description": "The `bio` field is taken directly from POST data without any validation, sanitization, or length enforcement before being saved to the user model. While this is not an injection risk in the classic SQL sense (Django ORM parameterizes querie",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-010",
+          "title": "CSRF protection \u2014 confirm middleware is active",
+          "line_start": 7,
+          "description": "This Django view accepts POST requests and modifies user data. Django's `CsrfViewMiddleware` provides CSRF protection by default and is almost certainly present. However, if the project has removed `django.middleware.csrf.CsrfViewMiddleware",
+          "severity": 1,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1450,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 33.2
+    },
+    {
+      "case": "fp-framework-csrf",
+      "gate": "Amber",
+      "model_gate": "Amber",
+      "gate_ok": false,
+      "expected_gate": [
+        "Green"
+      ],
+      "must_find_total": 0,
+      "must_find_hit": 0,
+      "missed": [],
+      "trap_total": 4,
+      "traps_tripped": 1,
+      "tripped": [
+        {
+          "match": "csrf",
+          "note": "Django's CsrfViewMiddleware handles CSRF on every POST by default"
+        }
+      ],
+      "findings_total": 4,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "461018ddb1f66b9c5039b1f0cd5d5eef",
+        "5db31eee8b13d362980d283ad99d2080",
+        "81b48e9f038625f5ced5a4743633ae76",
+        "bb683939ea030d7dd84f83c8ac3ad582"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-009",
+          "title": "Profile template rendered without passing user object \u2014 potential for unsafe rendering elsewhere",
+          "line_start": 8,
+          "description": "The `render` call passes no explicit context dictionary to `profile.html`. The template has access to the request context (including `request.user`) via Django's context processors, but the `bio` field just saved is not re-fetched or valida",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Unvalidated user input written directly to model field",
+          "line_start": 8,
+          "description": "The `bio` field is taken directly from `request.POST` without any validation, sanitization, or length limiting before being saved to the database. While Django's ORM prevents SQL injection here, there is no enforcement of maximum length, al",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "KeyError on missing POST field exposes unhandled exception",
+          "line_start": 8,
+          "description": "Accessing `request.POST[\"bio\"]` with bracket notation raises an unhandled `KeyError` if the `bio` key is absent from the POST body (e.g., a crafted or malformed request). Django's DEBUG mode would return a detailed traceback page exposing i",
+          "severity": 2,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-010",
+          "title": "CSRF protection \u2014 verify CsrfViewMiddleware is active",
+          "line_start": 10,
+          "description": "Django's `CsrfViewMiddleware` protects POST endpoints by default and is almost certainly active here. However, the template (`profile.html`) is not shown in this review. If `{% csrf_token %}` is absent from the form in that template, CSRF p",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 612,
+        "output_tokens": 1809,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 34.4
+    },
+    {
+      "case": "sql-injection",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 2,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "5dcda2bcecdb5f8a3788f542899a0f78",
+        "adc1876f94821708feebbe361d33ae29"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "SQL Injection via String Concatenation",
+          "line_start": 2,
+          "description": "The `user_id` parameter is concatenated directly into the SQL query string without any parameterization or sanitization. An attacker who controls `user_id` can manipulate the SQL statement to bypass authentication, exfiltrate data, modify r",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "SELECT * Returns All Columns \u2014 Risk of Over-Fetching Sensitive Fields",
+          "line_start": 2,
+          "description": "Using `SELECT *` retrieves every column from the `users` table, which likely includes sensitive fields such as password hashes, email addresses, PII, or other regulated data. If the result is forwarded to a caller or serialized into an API ",
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 577,
+        "output_tokens": 1153,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 21.9
+    },
+    {
+      "case": "sql-injection",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "37693163c6a9df2eddd3bedc8e1604fa",
+        "adc1876f94821708feebbe361d33ae29",
+        "f60c73aedbba845e70700bf3591a7f99"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "SQL Injection via String Concatenation",
+          "line_start": 2,
+          "description": "The `user_id` parameter is directly concatenated into a raw SQL query string without any parameterization, escaping, or type validation. An attacker who controls `user_id` can inject arbitrary SQL, enabling data exfiltration, authentication",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "Overly Broad SELECT * May Expose Sensitive Fields to Callers",
+          "line_start": 2,
+          "description": "`SELECT *` retrieves every column in the `users` table, which likely includes sensitive fields such as password hashes, salts, security questions, tokens, or PII (email, phone, address). The raw row is returned directly to the caller with n",
+          "severity": 3,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-013",
+          "title": "No Access Logging for User Record Retrieval",
+          "line_start": 1,
+          "description": "The function reads a user record without recording who initiated the lookup, when it occurred, or which record was accessed. In environments handling personal data or operating under compliance requirements (e.g., GDPR, HIPAA), an audit tra",
+          "severity": 2,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 577,
+        "output_tokens": 1563,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 29.0
+    },
+    {
+      "case": "sql-injection",
+      "gate": "Red",
+      "model_gate": "Red",
+      "gate_ok": true,
+      "expected_gate": [
+        "Red",
+        "Amber"
+      ],
+      "must_find_total": 1,
+      "must_find_hit": 1,
+      "missed": [],
+      "trap_total": 0,
+      "traps_tripped": 0,
+      "tripped": [],
+      "findings_total": 3,
+      "findings_unverified": 0,
+      "discarded_hallucinated": 0,
+      "fingerprints": [
+        "82726a645bc8c3d71bbf8af2559be805",
+        "adc1876f94821708feebbe361d33ae29",
+        "c883e689aabe001f03d4f5c53e538a4d"
+      ],
+      "findings": [
+        {
+          "control_id": "SEC-008",
+          "title": "SQL Injection via String Concatenation",
+          "line_start": 2,
+          "description": "The `user_id` parameter is directly concatenated into a raw SQL query string without any parameterization or sanitization. An attacker who controls `user_id` can inject arbitrary SQL, enabling them to bypass authentication, exfiltrate data,",
+          "severity": 5,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-008",
+          "title": "Missing Input Validation / Type Enforcement on user_id",
+          "line_start": 1,
+          "description": "There is no validation that `user_id` is of an expected type (e.g., integer) or format before it is used in the query. Even after switching to parameterized queries, validating that `user_id` is a positive integer provides defense-in-depth,",
+          "severity": 4,
+          "evidence_verified": true
+        },
+        {
+          "control_id": "SEC-014",
+          "title": "Overly Broad SELECT * Exposes All User Columns to Caller",
+          "line_start": 2,
+          "description": "The query uses `SELECT *`, which returns every column in the `users` table \u2014 likely including sensitive fields such as password hashes, API tokens, date of birth, SSNs, or other PII/PHI. Returning more data than necessary to the caller incr",
+          "severity": 3,
+          "evidence_verified": true
+        }
+      ],
+      "usage": {
+        "calls": 1,
+        "input_tokens": 577,
+        "output_tokens": 1424,
+        "cache_write_tokens": 0,
+        "cache_read_tokens": 3501
+      },
+      "seconds": 26.6
+    }
+  ]
+}

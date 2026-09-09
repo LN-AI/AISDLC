@@ -14,10 +14,10 @@ Entitlement here reflects the same layers the guard enforces: the selected proje
 """
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
 from backend import database
-from backend.products import registry
+from backend.products import agent_docs, registry
 from backend.routes.v1_agents import get_caller
 from backend.services.entitlement_service import resolve_entitlements
 from backend.services.subject_service import subject_from_caller
@@ -41,6 +41,11 @@ def list_products(kind: Optional[str] = None, caller: dict = Depends(get_caller)
     for product in registry.list_products(kind=kind or ""):
         entry = registry.to_public_dict(product)
         entry["entitled"] = entitlement.allows(product.id)
+        # Whether `/{id}/doc` will answer. Computed here rather than in `to_public_dict`
+        # because `agent_docs` imports the registry, and the screen needs it to decide
+        # whether to offer an "About this agent" link at all — two products deliberately
+        # have no document, and a link that always 404s teaches people not to click links.
+        entry["has_doc"] = agent_docs.doc_path(product.id) is not None
 
         quota = entitlement.quota_for(product.id)
         entry["quota_calls_per_month"] = quota.get("quota_calls_per_month")
@@ -86,3 +91,28 @@ def list_products(kind: Optional[str] = None, caller: dict = Depends(get_caller)
         "period_start": period,
         "version": "1.0",
     }
+
+
+@router.get(
+    "/{product_id}/doc",
+    summary="This agent's reference document, as the screen should show it",
+    description="Serves `docs/agents/<product id>.md` with the sections that describe the "
+                "HTTP API removed -- Request, Response, Example and Authentication document "
+                "the /api/v1 endpoint's field names, which are not what a screen sends "
+                "(the same reason `sources` is not rendered on an agent screen; D-291). "
+                "`omitted_sections` names what was dropped so the page does not quietly "
+                "read as the whole document. "
+                "404 when the product has no document; the message says why, because for "
+                "two of them that is a deliberate state rather than an oversight.",
+)
+def get_product_doc(product_id: str, caller: dict = Depends(get_caller)):
+    if not registry.exists(product_id):
+        raise HTTPException(status_code=404, detail=f"No product '{product_id}'.")
+    doc = agent_docs.render(product_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=agent_docs.NO_DOC.get(product_id)
+            or f"No reference document for '{product_id}'.",
+        )
+    return doc

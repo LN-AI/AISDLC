@@ -1,8 +1,8 @@
 """Measure the Code Review agent against a labelled corpus.
 
-    python scripts/eval_code_review.py                # every case
+    python scripts/eval_code_review.py                # every case, 3 runs each (~$0.55)
     python scripts/eval_code_review.py sql-injection  # one case
-    python scripts/eval_code_review.py --repeat 2     # also measure determinism
+    python scripts/eval_code_review.py --repeat 1     # cheaper; cannot measure variance
 
 UNLIKE scripts/smoke_code_review.py, this calls the real model and therefore COSTS MONEY
 and needs ANTHROPIC_API_KEY. Run it deliberately — before and after a prompt change — not
@@ -17,7 +17,11 @@ What it measures, and why each one:
   Recall alone will happily reward a change that makes the agent unusable in practice,
   which is why half the corpus is traps.
 - **Gate accuracy** — did the release decision come out right, which is what actually
-  blocks a deploy.
+  blocks a deploy. Scored **only over cases that gave the same verdict in every run**: one
+  case here answers Amber, Amber, Green on the same 10-line file, and averaging a coin flip
+  into the score is how a run reported exactly 90.0% and looked like a regression when
+  nothing had changed (D-358). Inconsistent cases are named instead, and too many of them
+  is its own failure.
 - **Evidence integrity** — how many findings the verifier discarded because their quote
   was not in the source. This is a direct hallucination rate.
 - **Determinism** (with --repeat) — Jaccard overlap of finding fingerprints across runs.
@@ -54,22 +58,45 @@ PROMPT_VERSION = "2026-09-03.1"
 # 2026-09-02.1, the first honest run of this corpus (2026-09-02): recall 100% over 6
 # must-find specs, 12.5% of 8 traps tripped, gate 100% over 10 cases, 0 hallucinated.
 #
-# The floors sit one step below each measurement rather than at it, because **variance is
-# still unmeasured**: this is n=1 at this prompt version, and finding counts visibly moved
-# between runs (the same SQL-injection case returned 3, then 2, then 1 finding). A floor set
-# at the measurement would fail on noise, and a suite that cries wolf gets deleted.
-#
 # Each step is one whole spec, so the floors mean something concrete:
 #   recall 0.83  -> tolerates losing 1 of 6 real findings, fails on 2
 #   fp     0.25  -> tolerates 2 of 8 traps, fails on 3
-#   gate   0.90  -> tolerates 1 wrong gate of 10, fails on 2
-# Run `--repeat 3` (about $0.50) to measure variance, then tighten toward the measurement.
+#   gate   0.90  -> tolerates 1 wrong gate, fails on 2
 MIN_RECALL = 0.83
 MAX_FALSE_POSITIVE_RATE = 0.25
 # The gate is what blocks a release, so it gets a threshold of its own. It had none, which
 # meant a run could regress from a correct verdict to a wrong one and still report "within
 # thresholds".
 MIN_GATE_ACCURACY = 0.90
+
+# ── Why a decision run is three runs, not one (C-85, D-358) ──────────────────────────
+# The original note here said "variance is still unmeasured … a floor set at the measurement
+# would fail on noise". Variance has since been measured, and it is worse than that warning
+# assumed: three runs of `fp-framework-csrf`, one 10-line file, at one PROMPT_VERSION,
+# returned **Amber, Amber, Green with 0% finding-fingerprint overlap**. Not one finding
+# recurred. So a single run of that case is a coin flip, and because `MIN_GATE_ACCURACY`
+# pooled every run together, one coin flip out of ten cases consumed the entire margin: the
+# 2026-09-08 run reported exactly 90.0%, indistinguishable from a real regression.
+#
+# Two fixes were rejected before this one. Lowering the floor is how a project loses its only
+# regression detector, and it was the tempting move because the script still printed "OK".
+# Relaxing that one case to accept Green-or-Amber deletes the assertion instead of repairing
+# it. Neither addresses the actual problem, which is that **one sample cannot estimate an
+# expectation**.
+#
+# So: `--repeat` defaults to 3, and the gate floor is applied only to cases that gave the
+# *same verdict every time*. A case whose answer changes run to run cannot evidence a pass or
+# a regression, so it is named, counted, and held against `MAX_UNSTABLE_GATE_CASES` rather
+# than being silently averaged into the score. That ceiling is measured the same way as the
+# floors: exactly one case was unstable on 2026-09-08, so one is tolerated and two fail.
+# Recall and the hallucination count were stable in every run and are still pooled.
+MAX_UNSTABLE_GATE_CASES = 1
+
+# `gate_accuracy` means something different from what it meant in result files written before
+# 2026-09-08 — stable cases now, pooled runs then. Recorded in every result file so a reader
+# comparing two of them can tell which definition produced the number, rather than comparing
+# 90% against 100% and concluding something false.
+SCORING = "stable-cases-v2"
 
 
 def load_cases(only=None):
@@ -216,12 +243,128 @@ def _priced(tokens_in: int, tokens_out: int) -> float:
         return 0.0
 
 
-def main():
+def score(per_case):
+    """Turn {case_name: [run, ...]} into the numbers the floors are checked against.
+
+    Pure: no model, no network, no files. That is deliberate — this arithmetic decides
+    whether a change to the review pipeline is called a regression, and until C-85 it had
+    **no test of any kind** because the only thing that exercised it cost money to run. It
+    is now driven offline by `smoke_code_review.py` with the real Amber/Amber/Green data
+    that produced D-358, so a future edit that quietly re-pools the gate score gets caught.
+
+    Three things are scored differently on purpose:
+
+    - **Recall and traps are pooled** across every run. They were stable in all four
+      measured runs (recall 100% each time), so more samples just tightens the estimate.
+    - **The gate is scored per case, over cases that answered the same way every time.**
+      A case that says Amber, Amber, Green is not evidence of anything; averaging it in
+      makes noise look like accuracy. `unstable` names those cases instead.
+    - **Determinism is reported per case**, not only as one number, because "which case is
+      unstable" is the actionable half and the mean hides it.
+
+    With `--repeat 1` every case is trivially unanimous, so this reduces exactly to the old
+    pooled behaviour — which is why the caller warns that a single run cannot tell a
+    regression from variance rather than silently reporting a confident number.
+    """
+    runs = [r for attempts in per_case.values() for r in attempts]
+    ok = [r for r in runs if not r.get("error")]
+
+    must_total = sum(r["must_find_total"] for r in ok)
+    must_hit = sum(r["must_find_hit"] for r in ok)
+    trap_total = sum(r["trap_total"] for r in ok)
+    trap_hit = sum(r["traps_tripped"] for r in ok)
+
+    stability, stable_correct, stable_total, unstable = [], 0, 0, []
+    for name in sorted(per_case):
+        good = [a for a in per_case[name] if not a.get("error")]
+        if not good:
+            continue
+        correct = sum(1 for a in good if a["gate_ok"])
+        # Unanimity of *correctness*, not of the gate letter: two runs can both be wrong
+        # with different verdicts, and that case is still stably wrong — a real regression
+        # that must not be excused as noise.
+        unanimous = correct in (0, len(good))
+        overlaps = [jaccard(good[0].get("fingerprints", []), good[i].get("fingerprints", []))
+                    for i in range(1, len(good))]
+        stability.append({
+            "case": name,
+            "runs": len(good),
+            "gate_correct_runs": correct,
+            "gates": sorted({a.get("gate") for a in good}, key=lambda g: str(g)),
+            "unanimous": unanimous,
+            "finding_overlap": round(sum(overlaps) / len(overlaps), 3) if overlaps else None,
+        })
+        if unanimous:
+            stable_total += 1
+            stable_correct += 1 if correct else 0
+        else:
+            unstable.append(name)
+
+    return {
+        "scoring": SCORING,
+        "errors": len(runs) - len(ok),
+        "recall": round(must_hit / must_total, 3) if must_total else 1.0,
+        "false_positive_rate": round(trap_hit / trap_total, 3) if trap_total else 0.0,
+        # Over cases that answered consistently. This is the floor-checked figure.
+        "gate_accuracy": round(stable_correct / stable_total, 3) if stable_total else 1.0,
+        # Over every run, which is what result files before 2026-09-08 recorded. Kept so
+        # two runs can be compared on the same definition.
+        "gate_accuracy_pooled": (round(sum(1 for r in ok if r["gate_ok"]) / len(ok), 3)
+                                 if ok else 1.0),
+        "gate_cases_stable": stable_total,
+        "gate_cases_unstable": len(unstable),
+        "unstable_gate_cases": unstable,
+        "case_stability": stability,
+        "hallucinated_findings_discarded": sum(r["discarded_hallucinated"] for r in ok),
+        "unverified_findings": sum(r["findings_unverified"] for r in ok),
+        "tokens_in": sum(r["usage"].get("input_tokens", 0) for r in ok),
+        "tokens_out": sum(r["usage"].get("output_tokens", 0) for r in ok),
+        "cache_read_tokens": sum(r["usage"].get("cache_read_tokens", 0) for r in ok),
+    }
+
+
+def thresholds(scored):
+    """The floors, as a list of failure sentences. Empty means the run passed.
+
+    Separate from `score` so the smoke suite can assert *what fails* rather than only what
+    the numbers are — a floor that stops being checked is the same defect as a floor set
+    too low, and it is much harder to notice.
+    """
+    failed = []
+    if scored["recall"] < MIN_RECALL:
+        failed.append(f"recall {scored['recall']:.1%} is below the {MIN_RECALL:.0%} floor")
+    if scored["false_positive_rate"] > MAX_FALSE_POSITIVE_RATE:
+        failed.append(f"false-positive rate {scored['false_positive_rate']:.1%} is above "
+                      f"the {MAX_FALSE_POSITIVE_RATE:.0%} ceiling")
+    if scored["gate_accuracy"] < MIN_GATE_ACCURACY:
+        failed.append(f"gate accuracy {scored['gate_accuracy']:.1%} over "
+                      f"{scored['gate_cases_stable']} consistent case(s) is below the "
+                      f"{MIN_GATE_ACCURACY:.0%} floor")
+    # A growing set of coin-flip cases is its own regression: it means the pipeline's answer
+    # is becoming less reproducible, which no accuracy number will show.
+    if scored["gate_cases_unstable"] > MAX_UNSTABLE_GATE_CASES:
+        failed.append(f"{scored['gate_cases_unstable']} cases gave inconsistent gates "
+                      f"({', '.join(scored['unstable_gate_cases'])}), above the ceiling of "
+                      f"{MAX_UNSTABLE_GATE_CASES}")
+    return failed
+
+
+def build_parser():
+    """Separate from `main` so the smoke suite can assert the *default* without paying for a
+    run. The default is the whole point of C-85 — a flag nobody passes protects nobody."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("cases", nargs="*", help="case names to run (default: all)")
-    ap.add_argument("--repeat", type=int, default=1, help="runs per case, for determinism")
+    # Three, not one. A single run cannot tell a regression from variance — see the
+    # MAX_UNSTABLE_GATE_CASES note above for the measurement that settled this. `--repeat 1`
+    # is still there for a cheap look and says what it cannot answer.
+    ap.add_argument("--repeat", type=int, default=3,
+                    help="runs per case (default 3; 1 is cheaper and cannot measure variance)")
     ap.add_argument("--label", default="", help="name for the results file")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     # Importing `backend.config` is what loads `.env` — it calls `load_dotenv()` and is the
     # project's single definition of environment loading. This check used to read
@@ -273,56 +416,60 @@ def main():
         print("\nEvery case errored — nothing to score.")
         return 1
 
-    must_total = sum(r["must_find_total"] for r in ok)
-    must_hit = sum(r["must_find_hit"] for r in ok)
-    trap_total = sum(r["trap_total"] for r in ok)
-    trap_hit = sum(r["traps_tripped"] for r in ok)
-    recall = must_hit / must_total if must_total else 1.0
-    fp_rate = trap_hit / trap_total if trap_total else 0.0
-    gate_acc = sum(1 for r in ok if r["gate_ok"]) / len(ok)
-
-    tokens_in = sum(r["usage"].get("input_tokens", 0) for r in ok)
-    tokens_out = sum(r["usage"].get("output_tokens", 0) for r in ok)
-    cache_read = sum(r["usage"].get("cache_read_tokens", 0) for r in ok)
+    scored = score(per_case)
     # `cost_optimization_service.estimate_cost_usd` does not exist, so this always
     # resolved to None and a run that had just spent real money reported no cost at all.
     # Priced from `agent_guard.estimate_cost` -- the same table the platform bills on, so
     # the eval and the invoice cannot disagree.
-    cost = _priced(tokens_in, tokens_out)
+    cost = _priced(scored["tokens_in"], scored["tokens_out"])
 
-    determinism = None
-    if args.repeat > 1:
-        scores = [
-            jaccard(a[0].get("fingerprints", []), a[i].get("fingerprints", []))
-            for a in per_case.values() for i in range(1, len(a))
-            if not a[0].get("error") and not a[i].get("error")
-        ]
-        determinism = round(sum(scores) / len(scores), 3) if scores else None
+    overlaps = [s["finding_overlap"] for s in scored["case_stability"]
+                if s["finding_overlap"] is not None]
+    determinism = round(sum(overlaps) / len(overlaps), 3) if overlaps else None
 
-    summary = {
+    summary = dict(scored)
+    summary.update({
         "prompt_version": PROMPT_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "cases": len(cases), "repeat": args.repeat, "errors": len(runs) - len(ok),
-        "recall": round(recall, 3),
-        "false_positive_rate": round(fp_rate, 3),
-        "gate_accuracy": round(gate_acc, 3),
-        "hallucinated_findings_discarded": sum(r["discarded_hallucinated"] for r in ok),
-        "unverified_findings": sum(r["findings_unverified"] for r in ok),
+        "cases": len(cases), "repeat": args.repeat,
         "determinism_jaccard": determinism,
-        "tokens_in": tokens_in, "tokens_out": tokens_out, "cache_read_tokens": cache_read,
         "estimated_cost_usd": cost,
         "runs": runs,
-    }
+    })
 
     print("\n" + "-" * 60)
-    print(f"recall               {recall:.1%}   (floor {MIN_RECALL:.0%})")
-    print(f"false-positive rate  {fp_rate:.1%}   (ceiling {MAX_FALSE_POSITIVE_RATE:.0%})")
-    print(f"gate accuracy        {gate_acc:.1%}   (floor {MIN_GATE_ACCURACY:.0%})")
-    print(f"hallucinated (discarded by evidence check)  {summary['hallucinated_findings_discarded']}")
+    print(f"recall               {scored['recall']:.1%}   (floor {MIN_RECALL:.0%})")
+    print(f"false-positive rate  {scored['false_positive_rate']:.1%}   "
+          f"(ceiling {MAX_FALSE_POSITIVE_RATE:.0%})")
+    print(f"gate accuracy        {scored['gate_accuracy']:.1%}   (floor {MIN_GATE_ACCURACY:.0%}) "
+          f"over {scored['gate_cases_stable']} case(s) that answered consistently")
+    print(f"  ...pooled over runs {scored['gate_accuracy_pooled']:.1%}   "
+          f"(what result files before 2026-09-08 recorded)")
+    print(f"hallucinated (discarded by evidence check)  "
+          f"{scored['hallucinated_findings_discarded']}")
     if determinism is not None:
         print(f"determinism          {determinism:.1%} finding overlap across runs")
-    print(f"tokens               in={tokens_in:,} out={tokens_out:,} cache_read={cache_read:,}")
+    print(f"tokens               in={scored['tokens_in']:,} out={scored['tokens_out']:,} "
+          f"cache_read={scored['cache_read_tokens']:,}")
     print(f"cost                 ${cost:.4f}")
+
+    # The actionable half. A mean says accuracy moved; this says which case cannot be
+    # trusted to say anything, which is what a reader needs in order to act.
+    if scored["unstable_gate_cases"]:
+        print(f"\ninconsistent gate, excluded from the floor "
+              f"(ceiling {MAX_UNSTABLE_GATE_CASES}):")
+        for s in scored["case_stability"]:
+            if not s["unanimous"]:
+                overlap = ("n/a" if s["finding_overlap"] is None
+                           else f"{s['finding_overlap']:.0%}")
+                print(f"  {s['case']:<26} correct {s['gate_correct_runs']}/{s['runs']} runs, "
+                      f"gates {'/'.join(str(g) for g in s['gates'])}, "
+                      f"finding overlap {overlap}")
+    if args.repeat < 2:
+        print("\nNOTE: --repeat 1 cannot separate a regression from run-to-run variance. "
+              "Every case counts as consistent because it only answered once, so the gate "
+              "figure above is one sample (see D-358). Use the default of 3 to decide "
+              "anything.")
 
     os.makedirs(RESULTS, exist_ok=True)
     label = args.label or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -331,13 +478,7 @@ def main():
         json.dump(summary, fh, indent=2)
     print(f"\nwritten to {os.path.relpath(path, REPO)}")
 
-    failed = []
-    if recall < MIN_RECALL:
-        failed.append(f"recall {recall:.1%} is below the {MIN_RECALL:.0%} floor")
-    if fp_rate > MAX_FALSE_POSITIVE_RATE:
-        failed.append(f"false-positive rate {fp_rate:.1%} is above the {MAX_FALSE_POSITIVE_RATE:.0%} ceiling")
-    if gate_acc < MIN_GATE_ACCURACY:
-        failed.append(f"gate accuracy {gate_acc:.1%} is below the {MIN_GATE_ACCURACY:.0%} floor")
+    failed = thresholds(scored)
     if failed:
         print("\nFAILED: " + "; ".join(failed))
         return 1

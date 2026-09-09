@@ -88,9 +88,24 @@ const fetchLog = [];
 let nextFetchBody = {};
 let nextFetchHeaders = {};
 
+const sharedLocation = { href: '', hash: '' };
+
 const sandbox = {
   document,
-  window: { location: { href: '' } },
+  // `addEventListener` and `location.hash` are both real now: app.js registers a
+  // `hashchange` listener at module scope for deep links (`#/code/run/<id>`), so a
+  // window without either stops the file loading at all rather than failing a check.
+  // `location` is a global in a browser and `window.location` is the same object, so the
+  // stub shares one rather than holding two that can drift. app.js reads bare `location`
+  // (`_applyHash`, `_setHash`) now that screens and runs have addresses.
+  location: sharedLocation,
+  // A browser global. app.js has used it since paging existed, but no check ever called a
+  // function that reached it; `_applyFindingHashFilters` does.
+  URLSearchParams,
+  window: {
+    location: sharedLocation,
+    addEventListener() {}, removeEventListener() {},
+  },
   localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
   console,
   // logger.js is a separate script tag in index.html, so it isn't in `source`; the
@@ -218,6 +233,8 @@ check('renders a stored report document', () => {
   assert(html.includes('Executive Summary'), 'summary section missing');
   assert(html.includes('Hardcoded key'), 'finding missing');
   assert(html.includes('Security Lead'), 'approver missing');
+  assert(html.includes('approval queue') || html.includes('Approval required'),
+    'a required sign-off must say so, and why');
   assert(html.includes('HIPAA'), 'compliance flag missing');
   assert(!html.includes('Governance (0)'), 'empty category should be skipped');
 });
@@ -235,6 +252,11 @@ check('accepts the report-generate response shape (compliance_mapping, no review
   const html = document.getElementById('report-result').innerHTML;
   assert(html.includes('GDPR'), 'compliance_mapping fallback failed');
   assert(html.includes('OWASP-LLM'), 'second flag missing');
+  // The Amber case. This block used to render nothing at all when no sign-off was
+  // required, so an auditor reading an Amber report could not tell 'never asked' from
+  // 'asked and granted' -- and the report itself used to claim the latter.
+  assert(html.includes('No human sign-off was requested'),
+    'an Amber report must state that no sign-off was requested');
 });
 
 check('survives a sparse report', () => {
@@ -1878,6 +1900,190 @@ check('suppressed findings are readable, so the filter can be overruled', () => 
   if (!html.includes('Fixture key')) throw new Error('the suppressed finding is not rendered');
 });
 
+check('a finding suppressed by the repository is labelled as the repo\'s decision', () => {
+  // Two different facts. "In test/vendor paths" is our filter; ".lmignore" is a decision
+  // somebody on the team wrote down. Reporting the second as the first would credit us
+  // with a judgement we did not make.
+  const html = sandbox.renderReviewTransparency({
+    suppressed_findings: [
+      { title: 'Fixture key', file_path: 'tests/conftest.py', severity: 5,
+        suppressed_reason: 'path is test, vendored, generated or build output' },
+      { title: 'Legacy eval', file_path: 'legacy/p.py', severity: 5,
+        suppressed_reason: '.lmignore:2 — scheduled for deletion' },
+    ],
+    suppression: { source: '.lmignore', rules: 2, findings_suppressed: 1,
+                   inline_directives: 0, unused_count: 0, unused: [] },
+  });
+  if (!html.includes('1 in test/vendor paths'))
+    throw new Error('the built-in filter count is not stated separately');
+  if (!html.includes('1 ignored by the repo'))
+    throw new Error("the repository's own suppressions are not distinguished");
+  if (!html.includes('.lmignore:2'))
+    throw new Error('the rule that did it is not shown, so nobody can go and change it');
+});
+
+check('an ignore rule that matched nothing is reported, not swallowed', () => {
+  // The failure this feature invites: a misspelled pattern. The developer believes they
+  // suppressed something, the gate still fails, and the tool takes the blame.
+  const html = sandbox.renderReviewTransparency({
+    suppression: { source: '.lmignore', rules: 3, findings_suppressed: 1,
+                   inline_directives: 1, inline_fired: 0, unused_count: 2,
+                   unused: [{ rule: 'legcy/**', line: 4 },
+                            { rule: 'lm-ignore', path: 'app/x.py', line: 12 }],
+                   rules_without_reason: 1, errors: [] },
+  });
+  if (!html.includes('matched nothing'))
+    throw new Error('an unused rule is not surfaced at all');
+  if (!html.includes('legcy/**'))
+    throw new Error('the misspelled pattern itself is not shown');
+  if (!html.includes('line 4'))
+    throw new Error('the line to go and fix is not given');
+  if (!html.includes('app/x.py'))
+    throw new Error('an unused inline directive does not name its file');
+  if (!html.includes('give no reason'))
+    throw new Error('a rule with no stated reason is not counted for the record');
+});
+
+check('a repository with no ignore rules gets no panel about them', () => {
+  // Most repositories have no `.lmignore`. A panel saying "0 rules" on every result is
+  // noise that teaches a reader to skip the whole transparency block.
+  const html = sandbox.renderReviewTransparency({
+    findings: [{ title: 'SQLi', severity: 5, file_path: 'a.py' }],
+    suppression: { source: '', checked: true, rules: 0, inline_directives: 0,
+                   findings_suppressed: 0, unused_count: 0, unused: [] },
+  });
+  if (/lmignore/i.test(html))
+    throw new Error('an empty ignore report still painted a panel');
+});
+
+check('a result from before suppression existed still renders', () => {
+  // Every stored review predates this field. A renderer that needed it would break the
+  // history rather than degrade.
+  const html = sandbox.renderReviewTransparency({
+    suppressed_findings: [{ title: 'fixture', file_path: 'tests/x.py', severity: 5 }],
+  });
+  if (!html.includes('panel-suppressed'))
+    throw new Error('an older result lost its suppressed panel');
+  if (/matched nothing/.test(html))
+    throw new Error('an absent report was rendered as an empty one');
+});
+
+check('an incremental review says how much of the pull request it read', () => {
+  // A Green gate on a stored incremental review is otherwise indistinguishable from a
+  // Green gate over the whole change, which is a claim the run did not make.
+  const html = sandbox.renderReviewTransparency({
+    gate_status: 'Red',
+    incremental: { since_sha: 'abcdef0123456789', head_sha: 'b'.repeat(40), commits: 3,
+                   files_reviewed: 1, files_in_pr: 12, carried_findings: 2 },
+  });
+  if (!html.includes('3 commit(s)')) throw new Error('the commit count is not stated');
+  if (!html.includes('abcdef012345')) throw new Error('the commit it read from is not named');
+  if (!html.includes('12')) throw new Error('the size of the whole pull request is not stated');
+  if (!/cannot\s+turn a blocked pull request Green/.test(html.replace(/\s+/g, ' ')))
+    throw new Error('nothing explains why a narrower run is still a trustworthy gate');
+});
+
+check('...and says so differently when nothing was left open', () => {
+  const html = sandbox.renderReviewTransparency({
+    incremental: { since_sha: 'abcdef0123456789', commits: 1, files_reviewed: 1,
+                   files_in_pr: 4, carried_findings: 0 },
+  });
+  if (!html.includes('left nothing open'))
+    throw new Error('a reader cannot tell "nothing carried" from "nothing checked"');
+});
+
+check('an incremental review that was not possible says why', () => {
+  const html = sandbox.renderReviewTransparency({
+    incremental: { attempted: true, used: false,
+                   reason: 'the branch was rewritten since the last review' },
+  });
+  if (!html.includes('whole pull request'))
+    throw new Error('it does not say what it did instead');
+  if (!html.includes('rewritten'))
+    throw new Error('"why did this push cost a full review" has no answer');
+});
+
+check('a carried finding is labelled as one', () => {
+  const html = sandbox.renderFinding({
+    title: 'SQL injection', severity: 5, file_path: 'app/old.py', line_start: 2,
+    carried_forward: true, carried_from_review: 'r-1',
+    evidence_verified: null,
+  });
+  if (!html.includes('carried forward'))
+    throw new Error('a finding this run never verified is presented as one it did');
+});
+
+check('a result from before incremental review existed still renders', () => {
+  const html = sandbox.renderReviewTransparency({ gate_status: 'Green', findings: [] });
+  if (/commit\(s\)/.test(html))
+    throw new Error('an absent incremental block was rendered as an empty one');
+});
+
+check('an assessment that named no files says so instead of implying coverage', () => {
+  // The defect this replaces: the Part 11 verifier filled `files_scanned` in from its own
+  // input list, so a reader saw 400 paths with no way to know we wrote them.
+  const html = sandbox.renderReviewTransparency({
+    coverage_claim: { files_supplied: 400, files_claimed: 0, files_unclaimed: 400,
+                      files_not_supplied: 0, unclaimed_sample: ['a.py', 'b.py'],
+                      not_supplied_sample: [], complete: false,
+                      note: 'The assessment did not say which of the 400 supplied file(s) '
+                          + 'it examined. That is not the same as having examined all of '
+                          + 'them, and this report does not claim it did.' },
+  });
+  if (!html.includes('0 of 400'))
+    throw new Error('the gap between supplied and claimed is not stated');
+  if (!html.includes('not the same as having examined all of them'))
+    throw new Error('the sentence an auditor needs is missing');
+});
+
+check('...and a file it named but was never given is flagged loudly', () => {
+  const html = sandbox.renderReviewTransparency({
+    coverage_claim: { files_supplied: 3, files_claimed: 2, files_unclaimed: 1,
+                      files_not_supplied: 1, unclaimed_sample: ['b.py'],
+                      not_supplied_sample: ['invented.py'], complete: false,
+                      note: 'x invented y' },
+  });
+  if (!html.includes('invented.py'))
+    throw new Error('an invented filename is not surfaced');
+  if (!html.includes('treat findings against these with suspicion'))
+    throw new Error('nothing tells the reader what to do about it');
+});
+
+check('complete coverage is not dressed up as a warning', () => {
+  const html = sandbox.renderReviewTransparency({
+    coverage_claim: { files_supplied: 3, files_claimed: 3, files_unclaimed: 0,
+                      files_not_supplied: 0, unclaimed_sample: [],
+                      not_supplied_sample: [], complete: true,
+                      note: 'All 3 supplied file(s) are named in the assessment.' },
+  });
+  if (html.includes('panel-suppressed'))
+    throw new Error('a complete claim was styled as a problem');
+  if (!html.includes('3 of 3')) throw new Error('the count is not stated');
+});
+
+check('the checks a result actually got are stated, not implied', () => {
+  // "The gate was floored" and "every quote was checked" are different guarantees, and
+  // only two products on this platform have the second.
+  const off = sandbox.renderReviewTransparency({
+    attested: { degeneracy_refused: true, gate_floored: true, evidence_verified: false },
+  });
+  if (!/quotes were <b>not<\/b> checked/.test(off))
+    throw new Error('a result whose quotes were never checked implies that they were');
+  const on = sandbox.renderReviewTransparency({
+    attested: { degeneracy_refused: true, gate_floored: true, evidence_verified: true },
+  });
+  if (!on.includes('every quote was checked'))
+    throw new Error('a verified result does not say so');
+});
+
+check('a result from before attestation existed still renders', () => {
+  const html = sandbox.renderReviewTransparency({ gate_status: 'Green', findings: [] });
+  if (/Checks applied/.test(html))
+    throw new Error('an absent attestation block was rendered as an empty one');
+  if (/supplied file/.test(html))
+    throw new Error('an absent coverage claim was rendered as an empty one');
+});
+
 check('the source and what was filtered out of it is stated on the result', () => {
   const html = sandbox.renderReviewTransparency({
     source: { label: 'acme/app@main', source_type: 'github_repo',
@@ -2888,8 +3094,472 @@ check('a generative agent is offered no SARIF export, having no findings', () =>
 });
 }
 
+// ── Addresses, diffs, and a finding you can click ────────────────────────────
+//
+// All three are on the path a developer takes when deciding whether to trust a patch, and
+// none of them existed: no URL state at all, the only diff in the app was an escaped
+// `<pre>`, and a finding's `file:line` was plain text beside a file viewer nothing linked
+// into.
+function runNavigationChecks() {
+  section('Addresses, diffs, and a clickable finding location');
+
+  // `showPage` itself is not checked here: this stub's `document.querySelector` always
+  // returns null, so it could never resolve a nav item, and faking one would make the
+  // "unknown page falls back" case pass for the wrong reason too. Routing against the real
+  // nav is `ui_examine.py`'s job — it drives an actual browser precisely because a
+  // DOM-stubbed check cannot tell whether an id in index.html matches what app.js reads.
+
+  check('a stored run is addressable, which is what makes it shareable', () => {
+    const setHash = vm.runInContext('_setHash', sandbox);
+    setHash('#/code/run/rv-42');
+    assert(sharedLocation.hash === '#/code/run/rv-42', sharedLocation.hash);
+    const addressFor = vm.runInContext('_addressFor', sandbox);
+    const openIds = vm.runInContext('_openRunId', sandbox);
+    openIds.code = 'rv-42';
+    assert(addressFor('code') === '#/code/run/rv-42', addressFor('code'));
+    openIds.code = null;
+    assert(addressFor('code') === '#/code', addressFor('code'));
+  });
+
+  check('a filtered findings address survives the page segment being parsed', () => {
+    // `#/findings?q=sql` must resolve to the `findings` screen. Splitting the path before
+    // stripping the query yields a first segment of `findings?q=sql`, which matches no nav
+    // item -- so a shared filter link would have landed on the dashboard.
+    sharedLocation.hash = '#/findings?q=sql&repo=acme/shop';
+    const raw = sharedLocation.hash.split('?')[0];
+    const page = raw.replace(/^#\/?/, '').split('/').filter(Boolean)[0];
+    assert(page === 'findings', `parsed page was ${page}`);
+    const applyFilters = vm.runInContext('_applyFindingHashFilters', sandbox);
+    assert(applyFilters() === true, 'a hash carrying a query should report that it applied');
+    assert(document.getElementById('findings-q').value === 'sql',
+      `search box got ${document.getElementById('findings-q').value}`);
+    assert(document.getElementById('findings-repo').value === 'acme/shop',
+      `repo box got ${document.getElementById('findings-repo').value}`);
+  });
+
+  check('clearing the filters puts every control back, not just the text ones', () => {
+    document.getElementById('findings-q').value = 'sql';
+    document.getElementById('findings-repo').value = 'acme/shop';
+    document.getElementById('findings-control').value = 'SEC';
+    document.getElementById('findings-severity').value = '5';
+    vm.runInContext('clearFindingFilters', sandbox)();
+    const val = id => document.getElementById(id).value;
+    assert(val('findings-q') === '' && val('findings-repo') === ''
+      && val('findings-control') === '', 'the text filters should be empty');
+    assert(val('findings-severity') === '0', `severity went back to ${val('findings-severity')}`);
+    assert(val('findings-status') === 'open',
+      `status should return to the screen's default, got ${val('findings-status')}`);
+  });
+
+  check('a unified diff is coloured, counted, and numbered from its own hunk headers', () => {
+    const render = vm.runInContext('renderUnifiedDiff', sandbox);
+    const html = render([
+      'diff --git a/src/auth.py b/src/auth.py',
+      '--- a/src/auth.py',
+      '+++ b/src/auth.py',
+      '@@ -10,4 +10,5 @@ def login(u, p):',
+      '     cur = db.cursor()',
+      '-    cur.execute("SELECT * FROM users WHERE u=" + u)',
+      '+    cur.execute("SELECT * FROM users WHERE u=?", (u,))',
+      '+    log.info("login attempt")',
+      '     return cur.fetchone()',
+    ].join('\n'));
+    assert((html.match(/class="dl-add"/g) || []).length === 2, 'two added lines');
+    assert((html.match(/class="dl-del"/g) || []).length === 1, 'one removed line');
+    assert(html.includes('dl-hunk'), 'the @@ header is marked, not treated as context');
+    assert(html.includes('>+2<') && html.includes('>-1<'),
+      'the +/- tally is what a reader checks first');
+    // The line numbers have to be the file's own. Counting from one is the failure that
+    // makes a diff unusable for finding the code it describes.
+    assert(html.includes('<td class="dl-n">10</td><td class="dl-n">10</td>'),
+      'the first context line after "@@ -10,4 +10,5 @@" is line 10 in both files');
+    assert(!html.includes('<script'), 'diff content is escaped');
+  });
+
+  check('a diff of an added file does not invent old-file line numbers', () => {
+    const render = vm.runInContext('renderUnifiedDiff', sandbox);
+    const html = render(['new file mode 100644', '@@ -0,0 +1,2 @@', '+one', '+two'].join('\n'));
+    // An added line has no counterpart in the old file, so its left gutter is empty
+    // rather than showing a number that does not exist.
+    assert(html.includes('<tr class="dl-add"><td class="dl-n"></td><td class="dl-n">1</td>'),
+      'an added line has no old-file number');
+  });
+
+  check('the preview shows the patch, the guardrail, and where it may go — and delivers nothing', () => {
+    const render = vm.runInContext('renderFixPreview', sandbox);
+    const html = render('rv-1', {
+      deliver_token: 'tok-1',
+      files_patched: [{ path: 'src/auth.py', explanation: 'Parameterised the lookup.' }],
+      blocked_patches: [{ path: 'src/legacy.py', reason: 'still Critical after the patch' }],
+      unfixed_finding_titles: ['No threat model on record'],
+      carried_over_criticals: ['Broken object-level authorization'],
+      diff: '@@ -1,2 +1,2 @@\n-old\n+new',
+      verification_note: 'no build ran and no test ran',
+      available_outputs: [
+        { id: 'pr', label: 'A new pull request' },
+        { id: 'diff', label: 'Just the diff', note: 'nothing is written' },
+        { id: 'same_pr', label: 'Into the pull request', unavailable: 'it comes from a fork' },
+      ],
+    });
+    assert(/nothing delivered yet/i.test(html),
+      'the heading has to say the patch has not gone anywhere');
+    assert(html.includes('no build ran and no test ran'),
+      'the verification note is the honest half of the offer');
+    assert(html.includes('diff-view'), 'the diff is rendered, not described');
+    assert(html.includes('Broken object-level authorization'),
+      'a Critical the patch did not close, that the original review already knew about, '
+      + 'has to be visible at the moment of approval');
+    assert(html.includes('still Critical after the patch'),
+      'a rejected patch is named, so "2 files" is not read as "everything"');
+    // The destinations are here rather than in the quote panel, because this is the first
+    // point at which the reader has seen what they are approving.
+    assert((html.match(/name="fix-deliver"/g) || []).length === 2,
+      'two available destinations get a radio; the unavailable one must not');
+    assert(/radio-off[\s\S]*it comes from a fork/.test(html),
+      'an unavailable destination is shown with its reason, not hidden -- a missing option '
+      + 'reads as a broken screen');
+    assert(html.includes("deliverFix('rv-1','tok-1')"),
+      'delivering goes through the token, never through posted file contents');
+    assert(/costs nothing/.test(html),
+      'if reading the diff looked like it cost money it would be a tax, not a gate');
+  });
+
+  check('a preview with nowhere to deliver still shows the diff, and cannot deliver', () => {
+    const render = vm.runInContext('renderFixPreview', sandbox);
+    const html = render('rv-2', {
+      deliver_token: 'tok-2', files_patched: [{ path: 'a.py' }],
+      diff: '@@ -1 +1 @@\n-a\n+b', available_outputs: [],
+    });
+    // A pasted snippet has no repository. The patch is still worth reading.
+    assert(html.includes('diff-view'), 'the diff is the point, repository or not');
+    assert(html.includes('disabled'), 'the deliver button must be disabled, not absent');
+  });
+
+  check('a finding links into the file viewer only when there is a source to read', () => {
+    const renderFinding = vm.runInContext('renderFinding', sandbox);
+    const f = { id: 'f1', title: 'SQL injection', severity: 5, file_path: 'src/auth.py',
+                line_start: 12, control_id: 'SEC-001' };
+
+    vm.runInContext('_openFileAgent = ""; _openFileRunId = "";', sandbox);
+    const plain = renderFinding(f);
+    assert(plain.includes('src/auth.py:12'), 'the location is always shown');
+    assert(!plain.includes('finding-loc-link'),
+      'with no recorded source there is nothing to open, so it must not look clickable');
+
+    vm.runInContext('_openFileAgent = "code"; _openFileRunId = "rv-9";', sandbox);
+    const linked = renderFinding(f);
+    assert(linked.includes('finding-loc-link'), 'a run with a source gets a link');
+    assert(linked.includes("openReviewFile('code','rv-9','src/auth.py',12)"),
+      `the link must carry the line: ${linked.match(/openReviewFile\([^)]*\)/)}`);
+  });
+}
+
+// An ungoverned run says so, on both paths it can arrive by
+//
+// `UI_PROJECT_MODE=warn` is the middle state that makes enforcing a project shippable: the
+// run goes through and the result says it was not attributed to one. It reaches the browser
+// two different ways, and the legacy one is the one a real user actually hits.
+
+// The approval queue shows a release, not a finding-event
+//
+// One Core SDLC Review used to put three items in a reviewer's queue -- the code review,
+// the VAPT and the aggregate -- all of them the same question. They are now one decision
+// covering several runs, and the card has to say so, or a reviewer approves three runs
+// believing they approved one.
+
+// The leadership half of the Dashboard
+//
+// Both panels are new screens over data that already existed -- `/api/repositories` was
+// being served to nobody. What can break silently is the arithmetic in the bars and the
+// empty states, which is what a reader sees on day one.
+
+// The command palette
+//
+// 37 sidebar items grouped by the builder's taxonomy, and one keyboard shortcut in the
+// whole application. What matters in a test is the property that keeps it honest: the list
+// comes out of the sidebar, not a second table somebody has to remember to update.
+
+function runCommandPaletteChecks() {
+  console.log('\nCommand palette');
+
+  // The DOM stub returns a fresh element for any id, so `querySelectorAll` has to be given
+  // something to find. A small fake sidebar is enough to exercise the real functions.
+  function fakeNav(items) {
+    const nodes = items.map(it => ({
+      textContent: it.label,
+      style: { display: it.hidden ? 'none' : '' },
+      getAttribute: name => (name === 'data-page' ? it.page : null),
+      closest: sel => (sel === '.nav-section' && it.group
+        ? { querySelector: () => ({ textContent: it.group }) } : null),
+    }));
+    sandbox.document.querySelectorAll = sel =>
+      (sel === '.nav-item[data-page]' ? nodes : []);
+  }
+
+  check('the palette reads the sidebar rather than its own list of screens', () => {
+    fakeNav([
+      { page: 'code', label: '🔍 Code Review', group: 'Developer Intelligence' },
+      { page: 'cfr21', label: '💊 21 CFR Part 11', group: 'Security Intelligence' },
+    ]);
+    const items = vm.runInContext('collectCommandItems', sandbox)();
+    assert(items.length === 2, `read ${items.length}`);
+    assert(items[0].page === 'code' && items[0].group === 'Developer Intelligence',
+      `page and group must both come from the nav: ${JSON.stringify(items[0])}`);
+  });
+
+  check('a screen hidden by role is not offered', () => {
+    // `updateAuthUI` hides the admin nav items with `display:none`. Offering one here would
+    // send a developer to a screen the server will refuse.
+    fakeNav([
+      { page: 'code', label: 'Code Review', group: '' },
+      { page: 'users', label: 'Users', group: '', hidden: true },
+    ]);
+    const items = vm.runInContext('collectCommandItems', sandbox)();
+    assert(items.length === 1 && items[0].page === 'code',
+      `hidden items must be absent: ${JSON.stringify(items)}`);
+  });
+
+  check('typing filters by subsequence, so "gxpdoc" finds "GxP Document Check"', () => {
+    fakeNav([
+      { page: 'gxp-doc', label: 'GxP Document Check', group: 'Security Intelligence' },
+      { page: 'code', label: 'Code Review', group: 'Developer Intelligence' },
+    ]);
+    vm.runInContext('_cmdItems = collectCommandItems(); _cmdIndex = 0;', sandbox);
+    const matches = vm.runInContext('_cmdMatches', sandbox);
+    assert(matches('gxpdoc').length === 1, 'a subsequence should match');
+    assert(matches('gxpdoc')[0].page === 'gxp-doc', 'and match the right one');
+    assert(matches('').length === 2, 'an empty query lists everything');
+    assert(matches('zzz').length === 0, 'a query matching nothing matches nothing');
+  });
+
+  check('...and by the group name, since that is how the sidebar is organised', () => {
+    const matches = vm.runInContext('_cmdMatches', sandbox);
+    assert(matches('developer').some(m => m.page === 'code'),
+      'searching the module name has to work -- it is the only label some people know');
+  });
+
+  check('nothing matching says so rather than rendering an empty list', () => {
+    vm.runInContext('renderCommandPalette', sandbox)('zzz');
+    const html = document.getElementById('cmd-palette-list').innerHTML;
+    assert(html.includes('No screen'), `expected a sentence: ${html.slice(0, 120)}`);
+  });
+
+  check('a match renders with its group and is clickable', () => {
+    vm.runInContext('renderCommandPalette', sandbox)('code');
+    const html = document.getElementById('cmd-palette-list').innerHTML;
+    assert(html.includes('Code Review'), 'the label');
+    assert(html.includes('Developer Intelligence'), 'the group, so duplicates are separable');
+    assert(html.includes("runCommandPalette('code')"), 'and a way to open it');
+  });
+
+  // Restored before leaving. These checks swap `document.querySelectorAll` for a fake
+  // sidebar, and leaving it swapped would be a trap for whoever adds the next check --
+  // the same reason the paging section guards against a leftover `fetch`.
+  const _realQSA = sandbox.document.querySelectorAll;
+
+  check('opening a screen goes through the hash router, so it stays addressable', () => {
+    let hash = '';
+    vm.runInContext('_setHash = h => { globalThis.__lastHash = h; };', sandbox);
+    vm.runInContext('runCommandPalette("architecture")', sandbox);
+    hash = vm.runInContext('__lastHash', sandbox);
+    assert(hash === '#/architecture',
+      `a palette jump must be a real address, not a silent page swap: ${hash}`);
+  });
+
+  sandbox.document.querySelectorAll = _realQSA;
+}
+
+async function runDashboardChecks() {
+  console.log('\nDashboard trend and repository health');
+
+  await checkAsync('the trend says which direction the backlog moved', async () => {
+    nextFetchBody = {
+      findings: [
+        { week: '2026-30', new: 10, resolved: 2, net: 8, open_at_end: 8 },
+        { week: '2026-31', new: 1, resolved: 6, net: -5, open_at_end: 3 },
+      ],
+      gates: [{ week: '2026-31', Green: 4, Amber: 1, Red: 2, total: 7 }],
+    };
+    await sandbox.loadDashboardTrend();
+    const html = document.getElementById('dashboard-trend').innerHTML;
+    assert(html.includes('3 open'), 'the latest open total is the headline');
+    assert(html.includes('down 5'), `the direction over the period: ${html.slice(0, 200)}`);
+    assert(html.includes('4/1/2'), 'the gate mix for the week should be shown');
+  });
+
+  await checkAsync('...and says "up" when it got worse', async () => {
+    nextFetchBody = {
+      findings: [
+        { week: '2026-30', new: 2, resolved: 0, net: 2, open_at_end: 2 },
+        { week: '2026-31', new: 9, resolved: 1, net: 8, open_at_end: 10 },
+      ],
+      gates: [],
+    };
+    await sandbox.loadDashboardTrend();
+    const html = document.getElementById('dashboard-trend').innerHTML;
+    assert(html.includes('up 8'), `expected a rise: ${html.slice(0, 200)}`);
+  });
+
+  await checkAsync('an empty trend explains itself rather than showing an empty table', async () => {
+    nextFetchBody = { findings: [], gates: [] };
+    await sandbox.loadDashboardTrend();
+    const html = document.getElementById('dashboard-trend').innerHTML;
+    assert(/no trend to\s+show/.test(html), `bare empty state: ${html.slice(0, 160)}`);
+    assert(!html.includes('<table'), 'an empty table is worse than a sentence');
+  });
+
+  await checkAsync('repository health lists worst first and shows the latest gate', async () => {
+    nextFetchBody = {
+      repositories: [
+        { repo_owner: 'acme', repo_name: 'payments', open_critical: 3, open_high: 5,
+          runs: 12, last_reviewed_at: '2026-09-07T10:00:00', spend_usd: 1.234,
+          latest: { gate_status: 'Red', branch: 'main' } },
+        { repo_owner: 'acme', repo_name: 'docs', open_critical: 0, open_high: 0,
+          runs: 2, last_reviewed_at: '2026-09-01T10:00:00', spend_usd: 0,
+          latest: { gate_status: 'Green', branch: 'main' } },
+      ],
+    };
+    await sandbox.loadDashboardRepos();
+    const html = document.getElementById('dashboard-repos').innerHTML;
+    assert(html.indexOf('payments') < html.indexOf('docs'),
+      'the server orders worst-first and the table must not resort it');
+    assert(html.includes('acme/payments'), 'the repository has to be nameable');
+    assert(html.includes('Red'), 'the latest gate is the "how is it doing" column');
+    // A repository with no recorded spend shows a dash, not $0.00 -- the same judgement
+    // the run-history spend chip already makes about an unknown cost.
+    assert(html.includes('—'), 'zero spend should read as unknown, not as free');
+  });
+
+  await checkAsync('...and says why it is empty when nothing has a repository', async () => {
+    nextFetchBody = { repositories: [] };
+    await sandbox.loadDashboardRepos();
+    const html = document.getElementById('dashboard-repos').innerHTML;
+    assert(html.includes('paste or a zip upload has no repository'),
+      `the reason matters -- it is not a bug: ${html.slice(0, 180)}`);
+  });
+}
+
+function runApprovalCardChecks() {
+  console.log('\nApproval card');
+  const render = () => vm.runInContext('renderApprovalCard', sandbox);
+
+  check('a release decision says how many runs it covers, and lists them', () => {
+    const html = render()({
+      id: 'ap-1', status: 'pending', priority: 'urgent', created_at: '2026-09-08T10:00:00',
+      project_name: 'CareBrief', review_id: 'rv-1', review_type: 'code', review_gate: 'Amber',
+      release_gate: 'Red', release_findings: 7, release_critical: 2, release_risk_score: 88,
+      covered_count: 3,
+      covered_reviews: [
+        { review_id: 'rv-1', review_type: 'code', gate_status: 'Amber', findings_count: 3, critical_count: 0 },
+        { review_id: 'rv-2', review_type: 'vapt', gate_status: 'Red', findings_count: 4, critical_count: 2 },
+        { review_id: 'rv-3', review_type: 'full', gate_status: 'Red', findings_count: 0, critical_count: 0 },
+      ],
+    });
+    assert(html.includes('Covers 3 runs'), 'the card must say it is one decision over three runs');
+    assert(html.includes('approving it releases all of them'),
+      'a reviewer has to know the scope of the button they are pressing');
+    // The release gate, not the raising review's own -- this one was raised by an Amber run
+    // and the release holds a Red.
+    assert(html.includes('Gate: <strong>Red'), `showed the wrong gate: ${html.match(/Gate: <strong>[^<]*/)}`);
+    assert(html.includes('7') && html.includes('2 critical'), 'release totals missing');
+  });
+
+  check('...and each covered run links to its own findings', () => {
+    const html = render()({
+      id: 'ap-2', status: 'pending', priority: 'high', created_at: '2026-09-08T10:00:00',
+      project_name: 'P', review_id: 'rv-1', covered_count: 2,
+      release_gate: 'Red', release_findings: 2, release_critical: 1,
+      covered_reviews: [
+        { review_id: 'rv-1', review_type: 'code', gate_status: 'Red', findings_count: 2, critical_count: 1 },
+        { review_id: 'rv-9', review_type: 'modernization', gate_status: 'Red', findings_count: 0, critical_count: 0 },
+      ],
+    });
+    assert(html.includes('href="#/code/run/rv-1"'),
+      `a run with a screen must be reachable: ${html.match(/href="[^"]*"/g)}`);
+    // Modernization is deliberately absent from AGENT_SCREENS -- it has its own, richer
+    // history page -- so it must render as text rather than a link that goes nowhere.
+    assert(!html.includes('run/rv-9'), 'modernization has no per-agent run page to link to');
+  });
+
+  check('a single-run approval still reads the old way', () => {
+    const html = render()({
+      id: 'ap-3', status: 'pending', priority: 'high', created_at: '2026-09-08T10:00:00',
+      project_name: 'P', review_id: 'rv-abcdef123', review_type: 'code', review_gate: 'Red',
+      risk_score: 70, findings_count: 1, critical_count: 1, covered_count: 1,
+      covered_reviews: [{ review_id: 'rv-abcdef123', review_type: 'code', gate_status: 'Red',
+                          findings_count: 1, critical_count: 1 }],
+    });
+    assert(html.includes('Review ID: rv-abcde'), 'one run should still name its review');
+    assert(!html.includes('Covers'), 'nothing to say about covering one run');
+  });
+
+  check('a row raised outside any request falls back rather than showing zeros', () => {
+    // No covered_reviews at all: a review saved by a script, or a row from before the link
+    // table existed. Reporting 0 findings on a blocked release would read as "clean".
+    const html = render()({
+      id: 'ap-4', status: 'pending', priority: 'urgent', created_at: '2026-09-08T10:00:00',
+      project_name: 'P', review_id: 'rv-x', review_type: 'code', review_gate: 'Red',
+      risk_score: 90, findings_count: 5, critical_count: 3,
+    });
+    assert(html.includes('Gate: <strong>Red'), 'must fall back to the review gate');
+    assert(html.includes('5') && html.includes('3 critical'), 'must fall back to its counts');
+  });
+}
+
+async function runProjectWarningChecks() {
+  console.log('\nUngoverned-run warning');
+
+  await checkAsync('apiFetch folds the legacy route header into the body', async () => {
+    // `/api/review/*` is metered by `legacy_guard`, which runs *around* the handler -- by
+    // the time it knows, the body is already serialized, so a header is the only channel
+    // left. Same reason the X-Spend-* figures travel that way.
+    nextFetchBody = { gate_status: 'Green', findings: [] };
+    nextFetchHeaders = { 'X-Project-Warning': 'This run was not attributed to a project.' };
+    const body = await sandbox.apiFetch('/api/review/code', { method: 'POST' });
+    assert(body._project_warning === 'This run was not attributed to a project.',
+      `header was not folded: ${JSON.stringify(body._project_warning)}`);
+    nextFetchHeaders = {};
+  });
+
+  await checkAsync('...and does not fold it when the body already said it', async () => {
+    // The /api/v1 surface goes through `guarded_call`, which can reach the body. If both
+    // arrive the body must win, exactly like `_budget_stats`.
+    nextFetchBody = { gate_status: 'Green', _project_warning: 'from the body' };
+    nextFetchHeaders = { 'X-Project-Warning': 'from the header' };
+    const body = await sandbox.apiFetch('/api/v1/agents/code', { method: 'POST' });
+    assert(body._project_warning === 'from the body',
+      `body should win: ${body._project_warning}`);
+    nextFetchHeaders = {};
+  });
+
+  await checkAsync('a run with no warning gains no key', async () => {
+    nextFetchBody = { gate_status: 'Green' };
+    nextFetchHeaders = {};
+    const body = await sandbox.apiFetch('/api/review/code', { method: 'POST' });
+    assert(!('_project_warning' in body), 'a governed run must stay silent');
+  });
+
+  check('the transparency block renders the warning', () => {
+    const render = vm.runInContext('renderReviewTransparency', sandbox);
+    const html = render({ _project_warning: 'no plan, quota or budget cap applied' });
+    assert(html.includes('not governed'),
+      'a reader skimming a result has to be able to see that it was ungoverned');
+    assert(html.includes('no plan, quota or budget cap applied'),
+      'the consequence itself must be shown, not just a label');
+  });
+
+  check('...and stays silent for a governed run', () => {
+    const render = vm.runInContext('renderReviewTransparency', sandbox);
+    const html = render({ coverage: {}, source: {} });
+    assert(!html.includes('not governed'), 'nothing to say about a governed run');
+  });
+}
+
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
-  .then(runReviewSourceChecks).then(runScreenIsolationChecks).then(() => {
+  .then(runReviewSourceChecks).then(runScreenIsolationChecks)
+  .then(runNavigationChecks).then(runProjectWarningChecks)
+  .then(runApprovalCardChecks).then(runDashboardChecks)
+  .then(runCommandPaletteChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

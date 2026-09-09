@@ -114,6 +114,57 @@ several agents in parallel behind one policy-enforced gate decision.
   OpenAI-compatible credentials (`PUT /api/v1/llm-config`, X-API-Key auth) instead of the
   platform's shared account, or override a single call via `llm_provider` / `llm_api_key` /
   `llm_base_url` / `llm_model` fields on any agent request.
+- **No assessment claims what nobody checked** — every agent's result now refuses a
+  truncated model response instead of storing it as a clean pass, and floors its gate
+  against its own findings so a Critical cannot come out Green. Previously only Code Review
+  and the vulnerability assessor did either. The compliance products also stop asserting
+  coverage: a 21 CFR Part 11 report used to fill in "files scanned" from its own input list
+  when the model didn't say what it read — so it could state that 400 files were verified
+  when nobody knew. It now states the gap, including any file the assessment named that was
+  never supplied.
+- **Findings on the lines they are about** — with a GitHub App configured, a
+  pull-request review creates a **check run** with each finding annotated in the diff, in
+  addition to the commit status (never instead of it, so branch protection that already
+  requires the status keeps working). A personal access token cannot do this at all —
+  GitHub refuses the check-runs endpoint for one — so `docs/github-app.md` is the five-step
+  setup, and `GET /api/github/app/status` says whether it is done. Unconfigured is the
+  commit-status path, unchanged. A finding with no line, or whose quoted code was not found
+  in the file it names, is deliberately **not** annotated: a marker on the wrong line sends
+  a reviewer to code that is fine.
+- **Incremental review on a push** — `synchronize` fires every time somebody pushes, so an
+  active 40-file pull request used to cost a full review per push. A push now reviews only
+  the commits that have arrived since the last look. The gate stays correct because
+  still-open findings from earlier reviews of the same pull request are **carried into the
+  new result and still vote** — a clean push cannot turn a blocked pull request Green — and
+  the comment names the commit range it read. Anything but a clean fast-forward (a
+  force-push, a rebase, a comparison GitHub will not answer) falls back to the whole diff
+  and says why. `INCREMENTAL_PR_REVIEW=0` turns it off; the trade it makes is that files
+  changed two pushes ago are not re-read.
+- **Notifications** — a blocked review can reach a Slack, Teams or your own webhook
+  instead of waiting for somebody to open a tab. One https URL per channel, per project,
+  encrypted and never shown again. Delivery is a **durable row written inside the review's
+  own transaction**, then attempted on a background thread and retried at startup — there
+  is no job runner here, so a notification written seconds before a restart is *late*
+  rather than lost, and the delivery log says which. The URL is checked against private
+  and link-local address space before anything is stored or sent, because a webhook this
+  server requests on a user's behalf is server-side request forgery if it is not.
+- **Suppression as code** — a team's accepted risks live in their repository, not in this
+  database. A `.lmignore` at the root takes path globs optionally narrowed to a control
+  (`legacy/**: SEC-003 deleted in Q3`), and an inline `# lm-ignore: SEC-001 admin only`
+  covers one line. An ignore rule **lowers the gate and never hides the evidence** — a
+  suppressed finding is still reported and still exported, marked with the rule that did
+  it, because otherwise anyone with commit access could turn a Red release Green by adding
+  two lines. Rules that matched nothing are reported, because the way this fails is a typo.
+  Existing waivers export as a file with `lmsdlc findings --lmignore`. See
+  [`docs/suppression.md`](docs/suppression.md).
+- **CLI and CI** — `scripts/lmsdlc.py` runs a review from a terminal or any pipeline.
+  `--fail-on red` exits non-zero on a Red gate, so the review *is* the build step rather
+  than a report beside it; `--sarif out.sarif` writes the format GitHub code scanning and
+  GitLab ingest, so findings land in the Security tab **without needing a GitHub App**; and
+  `--quote-only` prices the run without calling a model, so a pipeline can refuse to spend.
+  Ready workflows for GitHub Actions and GitLab CI are in [`docs/ci/`](docs/ci/README.md),
+  including a per-pull-request cost ceiling. What it deliberately does *not* do — inline
+  diff annotations, incremental review — is listed there too.
 - **No-code integration** — importable [n8n](https://n8n.io) workflow templates (PR gate, nightly
   compliance sweep, Jira requirement gate) are in [`docs/n8n-workflows/`](docs/n8n-workflows/) for
   teams who'd rather wire this up visually than write CI scripts.

@@ -56,6 +56,7 @@ def _merge_raw(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     summaries: List[str] = []
     gate, risk = "Green", 0.0
     extra: Dict[str, List[str]] = {}
+    structured: Dict[str, List[Any]] = {}
 
     for res in results:
         findings.extend(res.get("findings") or [])
@@ -71,12 +72,22 @@ def _merge_raw(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Any prose field an agent's own schema adds (VAPT's attack_surface_summary,
         # for instance) is collected per chunk and joined, rather than the last chunk
         # silently winning.
+        #
+        # Anything that is *not* prose — the Part 11 verifier's four assessment objects, a
+        # list of required elements — cannot be joined with a space and used to be dropped
+        # here without a word. That was invisible while only Code Review and VAPT chunked,
+        # because neither has such a field; it would have quietly emptied four of the six
+        # things an FDA report is made of. Those keys are gathered per chunk instead and
+        # handed to `merge_extra`, and if an agent supplies no merger they are reported
+        # rather than discarded. See `run`.
         for key, value in res.items():
             if key in ("findings", "summary", "gate_status", "risk_score", "agent_name") \
                     or key in _STRING_LISTS:
                 continue
             if isinstance(value, str) and value.strip():
                 extra.setdefault(key, []).append(value.strip())
+            elif value not in (None, "", [], {}):
+                structured.setdefault(key, []).append(value)
 
     merged: Dict[str, Any] = {
         "findings": findings,
@@ -88,6 +99,12 @@ def _merge_raw(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         merged[key] = list(dict.fromkeys(strings[key]))
     for key, values in extra.items():
         merged[key] = " ".join(dict.fromkeys(values))
+    # Left under a private key rather than merged blindly: only the agent whose schema
+    # defined these knows what combining two of them means. `run` gives them to
+    # `merge_extra` and, failing that, keeps the first and says how many it could not
+    # combine — a wrong merge of a compliance verdict is worse than an honest one part.
+    if structured:
+        merged["_structured_parts"] = structured
     return merged
 
 
@@ -193,7 +210,11 @@ def run(
     coverage_reason: str = "",
     extra_findings: Optional[List[Dict[str, Any]]] = None,
     baseline_lookup: Optional[Callable[[List[Dict[str, Any]]], Dict[str, Any]]] = None,
+    resolved_lookup: Optional[Callable[[], Dict[str, Any]]] = None,
+    suppression: Any = None,
     on_progress: Optional[Callable[[int, int], None]] = None,
+    merge_extra: Optional[Callable[[Dict[str, List[Any]]], Dict[str, Any]]] = None,
+    verify_evidence: bool = True,
 ) -> Dict[str, Any]:
     """Review one artifact — a string or a file list — and return a gated result.
 
@@ -209,6 +230,30 @@ def run(
     de-duplication against the model's version of the same finding, path suppression when
     they are in a fixture, a fingerprint so they can be waived, and a vote in the gate.
     Appending them afterwards would have made them second-class in all five ways.
+
+    `verify_evidence` must be turned **off** for an agent whose schema asks for a
+    description rather than a verbatim quote — the 21 CFR Part 11 verifier does, and running
+    the substring check over a description discards correct findings for being phrased as
+    instructed (D-344). Everything else in the pipeline still runs: de-duplication, path
+    suppression, fingerprints, the baseline and the gate.
+
+    `merge_extra` combines the fields only *this* agent's schema has, when they are not
+    prose. Prose is joined here; a structured field cannot be, and only the agent that
+    defined it knows what two of them mean together — for the 21 CFR Part 11 verifier, an
+    assessment is applicable if any part found it applicable and compliant only if every
+    applicable part said so, which is the same floor-not-ceiling rule the gate follows and
+    is not something this module could guess. Called with `{key: [value per chunk]}` and
+    its return value is merged into the result. Without it, the first value of each such
+    field is kept and `partial_fields` names what could not be combined, because dropping
+    four of the six things an FDA report is made of is the one outcome worse than a clumsy
+    merge.
+
+    `suppression` is what the repository itself says not to gate on — its `.lmignore` and
+    its inline `lm-ignore` comments, parsed by `backend/services/suppression.py` and
+    carried on the Bundle. It is applied at the same stage as the built-in test/vendor path
+    rules, which means a suppressed finding is still reported and still exported; it just
+    stops voting in the gate. Passed in rather than looked up here for the same reason
+    `baseline_lookup` is: this module does not know what a source is.
     """
     multi_file = bool(files) and not (len(files) == 1 and not files[0].get("path"))
     if multi_file:
@@ -237,6 +282,21 @@ def run(
         )
 
     result = _merge_raw(results)
+    parts = result.pop("_structured_parts", None)
+    if parts:
+        if merge_extra:
+            result.update(merge_extra(parts))
+        else:
+            # Honest fallback. One part's answer is a real answer about part of the
+            # artifact; an absent field reads as "there was nothing to say".
+            for key, values in parts.items():
+                result[key] = values[0]
+            multi = sorted(k for k, v in parts.items() if len(v) > 1)
+            if multi:
+                result["partial_fields"] = multi
+                logger.warning(
+                    "%s: %d structured field(s) came from one chunk of %d and were not "
+                    "combined: %s", agent_name, len(multi), len(chunks), ", ".join(multi))
     result["agent_name"] = agent_name
     result["review_type"] = review_type
 
@@ -257,12 +317,20 @@ def run(
         result["findings"] = list(extra_findings) + list(result["findings"])
         result["deterministic_findings_count"] = len(extra_findings)
 
+    # Zeroed first, so the report below names the rules that fired on *this* run rather
+    # than accumulating across a retry of the same Bundle.
+    if suppression is not None:
+        suppression.reset()
+
     if multi_file:
-        processed = finding_pipeline.process_files(result["findings"], files, correct_lines=True)
+        processed = finding_pipeline.process_files(
+            result["findings"], files, correct_lines=True, suppression=suppression,
+            verify=verify_evidence)
     else:
         # Line correction is off for diffs — see verify_evidence's docstring.
         processed = finding_pipeline.process(
-            result["findings"], haystack, correct_lines=not diff_mode
+            result["findings"], haystack, correct_lines=not diff_mode,
+            suppression=suppression, verify=verify_evidence,
         )
 
     # Baseline comparison has to follow `process`, because fingerprints only exist after
@@ -272,6 +340,31 @@ def run(
     baseline = baseline_lookup(processed["findings"]) if baseline_lookup else {}
     processed.update(finding_pipeline.apply_baseline(processed["findings"], baseline))
     result.update(processed)
+
+    # And the other direction: what the last review of this same code reported that this
+    # one does not. Computed here rather than in the pipeline because this is the only
+    # place that knows which files were actually read -- a file in a failed chunk was never
+    # opened, so nothing in it may be credited as fixed.
+    if resolved_lookup:
+        files_read = None
+        if multi_file:
+            files_read = {f.get("path") for f in files if f.get("path")}
+            for failure in failures:
+                for path in (failure.get("files") or []):
+                    files_read.discard(path)
+        try:
+            closed = finding_pipeline.resolved_since(
+                result["findings"], resolved_lookup(), files_read)
+            result.update(closed)
+        except Exception:
+            logger.exception("Resolved-since comparison failed — reporting none as fixed")
+
+    # What the repository asked not to be gated on, and — the part that matters — which of
+    # its rules matched nothing. A misspelled pattern is otherwise invisible: the developer
+    # believes they suppressed something, the gate still fails, and the tool takes the
+    # blame.
+    if suppression is not None:
+        result["suppression"] = suppression.report()
 
     result["coverage"] = {
         "chunks_total": len(chunks),
@@ -324,4 +417,27 @@ def default_baseline(findings: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
         return database.get_finding_baseline(context.current_project_id(), fingerprints)
     except Exception:
         logger.exception("Finding baseline lookup failed — treating every finding as new")
+        return {}
+
+
+def default_resolved() -> Dict[str, Dict[str, Any]]:
+    """What the last review of this same repository left open.
+
+    Lazily imported and failure-tolerant for the same reasons as `default_baseline`: a
+    lookup that cannot run degrades to "nothing was fixed", which understates progress and
+    never invents it. Reads the repository from the request context — the same binding
+    `save_review` uses to store it, so the comparison is against the same repository the
+    row will be filed under.
+    """
+    try:
+        from backend import context, database
+        ref = context.current_source_ref()
+        return database.previously_open_findings(
+            context.current_project_id(),
+            repo_owner=ref.get("repo_owner") or "",
+            repo_name=ref.get("repo_name") or "",
+            product_id=context.current_product_id() or "",
+        )
+    except Exception:
+        logger.exception("Previously-open lookup failed — reporting nothing as fixed")
         return {}

@@ -137,6 +137,7 @@ class SDLCOrchestrator:
                     coverage_incomplete: bool = False, coverage_reason: str = "",
                     source: Optional[Dict[str, Any]] = None,
                     extra_findings: Optional[List[Dict[str, Any]]] = None,
+                    suppression: Any = None,
                     on_progress=None) -> Dict[str, Any]:
         """Review a paste, a diff, or a whole file list (a zip or a repository).
 
@@ -158,7 +159,8 @@ class SDLCOrchestrator:
             result = self.code_agent.review_code(
                 language=language, context=context, files=files,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                extra_findings=extra_findings, on_progress=on_progress,
+                extra_findings=extra_findings, suppression=suppression,
+                on_progress=on_progress,
             )
             label = (source or {}).get("label", "")
             input_summary = f"Code review over {len(files)} file(s)" + (f" — {label}" if label else "")
@@ -168,7 +170,7 @@ class SDLCOrchestrator:
             result = self.code_agent.review_code(
                 code=compressed_code, language=language, context=context,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                on_progress=on_progress,
+                suppression=suppression, on_progress=on_progress,
             )
             input_summary = f"Code review{f' for PR: {pr_url}' if pr_url else ''} ({len(code)} chars)"
             input_content = code[:5000]
@@ -277,6 +279,7 @@ class SDLCOrchestrator:
         coverage_reason: str = "",
         source: Optional[Dict[str, Any]] = None,
         extra_findings: Optional[List[Dict[str, Any]]] = None,
+        suppression: Any = None,
         on_progress=None,
     ) -> Dict[str, Any]:
         """Assess a paste, a diff, or a whole file list, and persist a gated result.
@@ -300,7 +303,8 @@ class SDLCOrchestrator:
             result = self.vapt_agent.run_vapt(
                 context=context, scope=scope, files=files,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                extra_findings=extra_findings, on_progress=on_progress,
+                extra_findings=extra_findings, suppression=suppression,
+                on_progress=on_progress,
             )
             label = (source or {}).get("label", "")
             input_summary = f"VAPT over {len(files)} file(s)" + (f" — {label}" if label else "")
@@ -310,7 +314,7 @@ class SDLCOrchestrator:
             result = self.vapt_agent.run_vapt(
                 artifact=compressed_artifact, context=context, scope=scope,
                 coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
-                on_progress=on_progress,
+                suppression=suppression, on_progress=on_progress,
             )
             input_summary = f"VAPT — {artifact[:150]}{'...' if len(artifact) > 150 else ''}"
             input_content = artifact[:5000]
@@ -396,21 +400,47 @@ class SDLCOrchestrator:
     @_log_call
     def scan_sensitive_data(
         self,
-        content: str,
+        content: str = "",
         context: str = "",
         project_name: str = "Unnamed Project",
+        files: Optional[List[Dict[str, Any]]] = None,
+        coverage_incomplete: bool = False,
+        coverage_reason: str = "",
+        extra_findings: Optional[List[Dict[str, Any]]] = None,
+        suppression: Any = None,
+        source: Optional[Dict[str, Any]] = None,
+        on_progress=None,
     ) -> Dict[str, Any]:
-        context = self._kb("sensitive-data", context, content, project_name)
-        compressed_content, cost_stats = self._compress(content)
-        result = self.sensitive_agent.scan(compressed_content, context, project_name)
+        """One artifact, or a whole codebase fanned out over chunks.
+
+        The file path skips Headroom compression deliberately: `chunked_review` already
+        splits to fit, and compressing a codebase before splitting it would change the text
+        the per-file evidence is then reconciled against.
+        """
+        kb_seed = content or "\n".join((f.get("path") or "") for f in (files or []))
+        context = self._kb("sensitive-data", context, kb_seed, project_name)
+        cost_stats = None
+        if files:
+            result = self.sensitive_agent.scan(
+                context=context, project_name=project_name, files=files,
+                coverage_incomplete=coverage_incomplete, coverage_reason=coverage_reason,
+                extra_findings=extra_findings, suppression=suppression,
+                source=source, on_progress=on_progress)
+            summary = f"Sensitive Data Scan — {len(files)} file(s)"
+            stored_input = "\n".join((f.get("path") or "") for f in files)[:5000]
+        else:
+            compressed_content, cost_stats = self._compress(content)
+            result = self.sensitive_agent.scan(compressed_content, context, project_name)
+            summary = f"Sensitive Data Scan — {len(content)} chars"
+            stored_input = content[:5000]
         if cost_stats:
             result["_cost_stats"] = cost_stats
         findings = result.get("findings", [])
         review_id = database.save_review(
             review_type="sensitive_data",
             project_name=project_name,
-            input_summary=f"Sensitive Data Scan — {len(content)} chars",
-            input_content=content[:5000],
+            input_summary=summary,
+            input_content=stored_input,
             result=result,
         )
         result["review_id"] = review_id

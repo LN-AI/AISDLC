@@ -269,6 +269,53 @@ class GitHubService:
             logger.info("Created branch %s/%s:%s from %s", owner, repo, new_branch, from_branch)
         return result
 
+    def branch_exists(self, owner: str, repo: str, branch: str) -> bool:
+        """Whether this is a real branch. Never raises, unlike `get_branch_head_sha`.
+
+        Exists so a *derived* branch name can be checked before it is used. The base of a
+        pull request has to be a branch — a tag, a sha or a plausible-looking string that
+        happens not to be one all fail as an identical bare 422 from `POST /pulls`, thirty
+        lines away from whatever produced the name.
+        """
+        if not branch:
+            return False
+        try:
+            with httpx.Client(headers=self.headers, timeout=20) as client:
+                return client.get(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/git/ref/heads/{branch}"
+                ).is_success
+        except Exception:  # noqa: BLE001
+            return False
+
+    def expand_commit_sha(self, owner: str, repo: str, sha: str) -> str:
+        """Turn an abbreviated commit sha into its full 40 characters.
+
+        Needed because `POST /git/refs` — the only way to create a branch — **rejects an
+        abbreviated sha with a bare 422**, and a GitHub zipball only carries 7 characters:
+        the archive's root directory is `{owner}-{repo}-{short_sha}`, which is where
+        `source_bundle.sha_from_zipball` correctly reads the commit from.
+
+        This names the *same* commit rather than re-resolving a branch, so it keeps the
+        property that made reading the sha out of the archive right in the first place: a
+        busy branch cannot move underneath us between the download and this call.
+
+        Returns "" on any failure. The caller keeps the short sha in that case, which still
+        works for reading a file back through the contents API — only ref creation needs the
+        full form, and that failure is then GitHub's to report rather than ours to invent.
+        """
+        if not sha:
+            return ""
+        try:
+            with httpx.Client(headers=self.headers, timeout=20) as client:
+                resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/commits/{sha}")
+                if resp.is_success:
+                    return (resp.json() or {}).get("sha") or ""
+                logger.warning("Could not expand %s in %s/%s: HTTP %s",
+                               sha[:8], owner, repo, resp.status_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not expand %s in %s/%s: %s", sha[:8], owner, repo, exc)
+        return ""
+
     def get_default_branch(self, owner: str, repo: str) -> str:
         """The repository's own default branch.
 
@@ -787,10 +834,36 @@ class GitHubService:
         gate_emoji = {"Green": "✅", "Amber": "⚠️", "Red": "🔴"}.get(gate, "❓")
         severity_map = {5: "🔴 Critical", 4: "🟠 High", 3: "🟡 Moderate", 2: "🔵 Minor", 1: "⚪ Low"}
 
+        def _carried_note(f: Dict[str, Any]) -> str:
+            """The label on a finding this run did not find itself."""
+            return (" _(carried from an earlier review of this pull request; this run did "
+                    "not re-read the file)_" if f.get("carried_forward") else "")
+
         lines = [
             f"## {gate_emoji} LM AI-SDLC Review — Gate: **{gate}** · Risk **{score:.0f}/100**",
             "",
         ]
+
+        # What this run actually read. A Green gate on a comment that does not say it only
+        # looked at the last two commits is a comment that says something untrue by
+        # omission — and it is the same sentence that explains why the carried findings
+        # below were not found by this run.
+        inc = review_result.get("incremental") or {}
+        if inc.get("since_sha"):
+            lines += [
+                f"> Reviewed the **{inc.get('commits', 0)} commit(s) pushed since "
+                f"`{str(inc['since_sha'])[:12]}`** — {inc.get('files_reviewed', 0)} of the "
+                f"{inc.get('files_in_pr', 0)} file(s) this pull request changes. Findings "
+                f"still open from earlier reviews of this pull request are listed below and "
+                f"still count toward the gate."
+                + (f" [Compare]({inc['compare_url']})" if inc.get("compare_url") else ""),
+                "",
+            ]
+        elif inc.get("attempted") and not inc.get("used"):
+            lines += [
+                f"> Reviewed the **whole pull request**: {inc.get('reason', 'unknown')}.",
+                "",
+            ]
 
         # The counts row. "3 new, 41 already seen" is the difference between a comment a team
         # acts on and the tenth identical comment they mute.
@@ -802,7 +875,8 @@ class GitHubService:
         if review_result.get("waived_count"):
             tally.append(f"{review_result['waived_count']} waived")
         if review_result.get("suppressed_findings"):
-            tally.append(f"{len(review_result['suppressed_findings'])} in test/vendor paths")
+            tally.append(f"{len(review_result['suppressed_findings'])} not counted "
+                         f"(filtered paths or this repo's ignore rules)")
         if review_result.get("discarded_findings"):
             tally.append(
                 f"{len(review_result['discarded_findings'])} discarded (quoted code not "
@@ -845,7 +919,7 @@ class GitHubService:
                 new_tag = " 🆕" if f.get("is_new") else ""
                 lines.append(
                     f"**{sev_label}{blocking}{new_tag}** — `{f.get('control_id', 'N/A')}` "
-                    f"{f.get('title', '')}"
+                    f"{f.get('title', '')}{_carried_note(f)}"
                 )
                 # The location. The single most important thing this comment was missing.
                 where = self._format_location(f)
@@ -1014,6 +1088,16 @@ class GitHubService:
         return {
             "base": base, "head": head, "diff": text,
             "head_sha": head_sha,
+            # GitHub's own verdict on the relationship: `ahead` (head has commits base does
+            # not, and none the other way), `behind`, `diverged`, `identical`. An
+            # incremental review is only sound when it is `ahead` — after a force-push or a
+            # rebase the old sha is no longer an ancestor, so `old...new` is not "what
+            # changed since we last looked" and reviewing it would miss code and mislabel
+            # the rest. Reported rather than inferred from the diff, because a diverged
+            # compare still returns a perfectly plausible-looking one.
+            "status": meta.get("status") or "",
+            "ahead_by": meta.get("ahead_by") or 0,
+            "behind_by": meta.get("behind_by") or 0,
             "diff_truncated": truncated, "diff_full_chars": full,
             "truncation_reason": (
                 f"The {base}...{head} diff was truncated to {self.MAX_DIFF_CHARS:,} of "
@@ -1023,6 +1107,145 @@ class GitHubService:
             "commits": len(meta.get("commits") or []),
             "url": f"https://github.com/{owner}/{repo}/compare/{spec}",
             "fetch_type": "compare",
+        }
+
+    # ── Check runs ────────────────────────────────────────────────────────
+    #
+    # GitHub caps a check run at 50 annotations per request. More can be added by updating
+    # the run, which is deliberately not done here: the fiftieth annotation on a pull
+    # request is not read, and the count of what was omitted is more useful than the rows.
+    MAX_ANNOTATIONS = 50
+
+    # Gate to conclusion. `failure` is the only one that blocks a merge under branch
+    # protection, and Amber is `neutral` on purpose — whether an Amber gate should stop a
+    # merge is the open policy question C-38 records, and answering it here by choosing
+    # `action_required` would decide it silently for every customer.
+    _CHECK_CONCLUSION = {"Red": "failure", "Amber": "neutral", "Green": "success"}
+
+    # Severity to annotation level. `failure` for Critical and High, so the annotation is
+    # visually distinct from advice; anything below Moderate is a `notice`, because a diff
+    # with forty orange warnings is a diff nobody reads.
+    _ANNOTATION_LEVEL = {5: "failure", 4: "failure", 3: "warning"}
+
+    def create_check_run(self, owner: str, repo: str, head_sha: str,
+                         review_result: Dict[str, Any], token: str,
+                         details_url: str = "",
+                         name: str = "LM AI-SDLC review") -> Dict[str, Any]:
+        """Create a check run with the findings annotated on their own lines.
+
+        `token` must be a **GitHub App installation token**. A PAT is refused by GitHub for
+        this endpoint — that is the whole reason `github_app.py` exists — so this takes the
+        token as an argument rather than using `self.headers`, and a caller with no App
+        should not be calling it at all.
+
+        Only findings that can be placed are annotated: a path, a line, and evidence that
+        was verified against the file that names it. An annotation on the wrong line is
+        worse than no annotation — it sends a reviewer to code that is fine and teaches
+        them the tool is unreliable — so an unplaceable finding stays in the summary text,
+        where it is still read.
+
+        Returns `{"created": bool, ...}` and never raises. The commit status has already
+        been set by the time this runs, so a failure here loses richness, not the report.
+        """
+        gate = review_result.get("gate_status") or "Green"
+        findings = review_result.get("findings") or []
+        annotations, unplaceable = [], 0
+        for f in findings:
+            path = str(f.get("file_path") or "")
+            line = f.get("line_start")
+            if not path or not isinstance(line, int) or line < 1:
+                unplaceable += 1
+                continue
+            if f.get("evidence_verified") is False:
+                # Its quote was not found in the file it names, so its line number is a
+                # guess. Counted rather than placed.
+                unplaceable += 1
+                continue
+            end = f.get("line_end")
+            annotations.append({
+                "path": path,
+                "start_line": line,
+                "end_line": end if isinstance(end, int) and end >= line else line,
+                "annotation_level": self._ANNOTATION_LEVEL.get(
+                    f.get("severity"), "notice"),
+                "title": f"{f.get('control_id', '')} {f.get('title', '')}".strip()[:255],
+                "message": (
+                    (f.get("description") or "")
+                    + (f"\n\nFix: {f.get('recommendation')}"
+                       if f.get("recommendation") else "")
+                    + ("\n\nCarried from an earlier review of this pull request; this "
+                       "run did not re-read the file."
+                       if f.get("carried_forward") else "")
+                )[:64000],
+                "raw_details": (f.get("evidence") or "")[:64000] or None,
+            })
+
+        shown = annotations[:self.MAX_ANNOTATIONS]
+        blocking = sum(1 for f in findings if f.get("is_blocking"))
+        summary_lines = [
+            f"**Gate: {gate}** · {len(findings)} finding(s)"
+            + (f", {blocking} blocking" if blocking else ""),
+        ]
+        if len(annotations) > len(shown):
+            summary_lines.append(
+                f"\n{len(annotations) - len(shown)} further finding(s) are in the review "
+                f"comment; GitHub shows at most {self.MAX_ANNOTATIONS} annotations on a "
+                f"check run."
+            )
+        if unplaceable:
+            summary_lines.append(
+                f"\n{unplaceable} finding(s) could not be placed on a line — they name no "
+                f"file, or their quoted code was not found in the file they name. They are "
+                f"in the review comment."
+            )
+        if review_result.get("summary"):
+            summary_lines.append("\n" + str(review_result["summary"]))
+
+        body: Dict[str, Any] = {
+            "name": name,
+            "head_sha": head_sha,
+            "status": "completed",
+            "conclusion": self._CHECK_CONCLUSION.get(gate, "neutral"),
+            "output": {
+                "title": f"Gate {gate} — {len(findings)} finding(s)",
+                "summary": "\n".join(summary_lines)[:65535],
+                "annotations": shown,
+            },
+        }
+        if details_url:
+            body["details_url"] = details_url
+
+        try:
+            with httpx.Client(timeout=60) as client:
+                resp = client.post(
+                    f"{self.BASE_URL}/repos/{owner}/{repo}/check-runs",
+                    headers={"Authorization": f"Bearer {token}",
+                             "Accept": "application/vnd.github+json",
+                             "X-GitHub-Api-Version": "2022-11-28"},
+                    json=body,
+                )
+        except Exception as exc:                                 # noqa: BLE001
+            logger.warning("Check run for %s/%s@%s could not be sent: %s",
+                           owner, repo, head_sha[:12], exc)
+            return {"created": False, "error": f"{type(exc).__name__}: {exc}"}
+        if resp.status_code >= 400:
+            logger.warning("GitHub refused a check run for %s/%s@%s: HTTP %s %s",
+                           owner, repo, head_sha[:12], resp.status_code,
+                           (resp.text or "")[:200])
+            return {"created": False, "status": resp.status_code,
+                    "error": (resp.text or "")[:300],
+                    "hint": ("A 403 here almost always means the App lacks 'Checks: Read "
+                             "and write'. A 404 means it is not installed on this "
+                             "repository." if resp.status_code in (403, 404) else "")}
+        data = resp.json() or {}
+        return {
+            "created": True,
+            "id": data.get("id"),
+            "url": data.get("html_url") or "",
+            "conclusion": body["conclusion"],
+            "annotations_sent": len(shown),
+            "annotations_omitted": len(annotations) - len(shown),
+            "unplaceable": unplaceable,
         }
 
     # An HTML comment carrying our identity. Invisible in the rendered comment, and the only

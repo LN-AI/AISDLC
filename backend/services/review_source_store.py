@@ -581,14 +581,27 @@ def summarize(review_id: str) -> Dict[str, Any]:
 
 
 def delete_for_review(review_id: str) -> None:
-    """Forget everything about one review's source, on request. Rows and content both."""
+    """Forget everything about one review's source, on request. Rows and content both.
+
+    Audited, because this is the one operation whose whole purpose is that the evidence
+    stops existing. Without a row saying it happened, a reviewer's stored source simply is
+    not there any more and nothing distinguishes "deleted on request" from "never kept" or
+    "swept when its window expired".
+    """
+    from backend import context
     from backend import database
 
     conn = database.get_connection()
     try:
         cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) AS n FROM review_source_files WHERE review_id = ?",
+                    (review_id,))
+        _n_files = (cur.fetchone() or {"n": 0})["n"]
         cur.execute("DELETE FROM review_source_files WHERE review_id = ?", (review_id,))
         cur.execute("DELETE FROM review_sources WHERE review_id = ?", (review_id,))
+        database.log_audit(cur, "review_source_deleted", "review", review_id,
+                           actor=context.current_actor() or "system",
+                           details=f"files={_n_files}")
         conn.commit()
     finally:
         conn.close()

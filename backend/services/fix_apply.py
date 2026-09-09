@@ -51,6 +51,12 @@ logger = logging.getLogger(__name__)
 # `diff` need neither and write nothing anywhere.
 OUTPUTS = ("pr", "same_pr", "branch", "zip", "diff")
 
+# Not a delivery — the step before one. `apply(output=PREVIEW)` generates and guards the
+# patch and writes nothing, and `deliver()` then puts it where a person chose, with no
+# further model call. Kept out of `OUTPUTS` so nothing that enumerates deliveries (the
+# radio list, the availability check, `_available_outputs`) has to special-case it.
+PREVIEW = "preview"
+
 # Most files one request may fix. Not a technical limit — each file is an independent call, so
 # fifty files would work and cost fifty calls. It is a guard against a click that spends more
 # than the person meant: the quote names the number, and above this they have to say so again.
@@ -84,7 +90,7 @@ def eligible(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
             why = ("The code this finding quotes could not be found in your source, so a fix "
                    "for it would be a change to code that may not exist.")
         elif f.get("suppressed_reason"):
-            why = (f"In a path that is reported but not counted — {f['suppressed_reason']}. "
+            why = (f"Reported but not counted — {f['suppressed_reason']}. "
                    f"Fix it by hand if you disagree.")
         elif not f.get("file_path"):
             why = ("This finding names no file. It is about the design rather than a line of "
@@ -393,8 +399,10 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     """
     from backend.services import review_source_store
 
-    if output not in OUTPUTS:
-        raise FixError(f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}.")
+    if output not in OUTPUTS and output != PREVIEW:
+        raise FixError(
+            f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}, or "
+            f"'{PREVIEW}' to generate the patch without delivering it.")
 
     loaded = _load(review_id, project_id)
     review_agent = _review_agent(loaded["review"])
@@ -409,6 +417,9 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
             f"than you meant.")
 
     source = review_source_store.summarize(review_id)
+    # A preview writes nothing, so it is not held to the delivery preconditions below — a
+    # pasted snippet can still have its patch generated and read, even though there is no
+    # repository to push it to. Which delivery *is* possible is reported back instead.
     if output in ("pr", "branch", "same_pr") and not (
             source.get("ref") and source.get("commit_sha")):
         raise FixError(
@@ -507,6 +518,101 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
         }),
     }
 
+    # ── The preview gate ──────────────────────────────────────────────────
+    #
+    # Everything above has happened: the patch is generated, the secret scan has passed,
+    # and every file has been re-reviewed by the agent that found the original problem.
+    # Nothing has been written. This is the moment a person should decide.
+    #
+    # It exists because the delivery choice used to be made *before* any of that ran: one
+    # click generated the patch and opened the pull request, and the diff appeared only in
+    # the result — after the branch existed. For a platform whose whole argument is that a
+    # human approves what an agent proposes, remediation was the one place with no such
+    # step. `plan` quotes the cost beforehand and this shows the change beforehand; between
+    # them there is no longer a point where money or a repository is committed unseen.
+    #
+    # The patches are handed back to the caller to hold, and delivering them later calls no
+    # model — so reading the diff first costs nothing, which is what makes it a gate rather
+    # than a tax.
+    if output == PREVIEW:
+        result["applied"] = False
+        result["preview"] = True
+        result["available_outputs"] = _available_outputs(source)
+        result["patches"] = [{"path": p["path"], "fixed_content": p.get("fixed_content", ""),
+                              "explanation": p.get("explanation", "")} for p in safe]
+        result["before"] = before
+        return result
+
+    return _deliver(orch, review_id, output, safe, before, result, blocked, source,
+                    diff_text, project_id)
+
+
+def deliver(orch, review_id: str, held: Dict[str, Any], output: str,
+            project_id: Optional[str] = None) -> Dict[str, Any]:
+    """Deliver a patch that was already generated, guarded and previewed.
+
+    The second half of `apply`, callable on its own. **No model runs here**, which is the
+    point: a person reads the diff, chooses where it goes, and the choice costs nothing
+    beyond the write itself. Re-running `apply` to change the destination would pay for
+    the same patch twice and could produce a *different* patch the second time, so the
+    diff somebody approved would not be the diff that shipped.
+
+    `held` is what `apply(output=PREVIEW)` returned. The patched contents come from it
+    rather than from the caller: a client that could post file contents here would be able
+    to commit anything it liked to the customer's repository under a fix's name.
+    """
+    from backend.services import review_source_store
+
+    if output not in OUTPUTS:
+        raise FixError(f"Unknown output '{output}'. One of: {', '.join(OUTPUTS)}.")
+    loaded = _load(review_id, project_id)
+    source = review_source_store.summarize(review_id)
+    available = {o["id"] for o in _available_outputs(source)
+                 if not o.get("unavailable")}
+    if output not in available:
+        raise FixError(
+            f"'{output}' is not available for this review. Available: "
+            f"{', '.join(sorted(available)) or 'none'}.")
+
+    safe = [dict(p) for p in (held.get("patches") or [])]
+    if not safe:
+        raise FixError("There is no held patch to deliver. Generate one first.")
+    before = held.get("before") or {}
+    result = {k: v for k, v in held.items()
+              if k not in ("patches", "before", "available_outputs", "preview")}
+    result["output"] = output
+    result["applied"] = True
+    return _deliver(orch, review_id, output, safe, before, result,
+                    held.get("blocked_patches") or [], source,
+                    held.get("diff") or "", project_id)
+
+
+def _deliver(orch, review_id: str, output: str, safe: List[Dict[str, Any]],
+             before: Dict[str, str], result: Dict[str, Any],
+             blocked: List[Dict[str, Any]], source: Dict[str, Any],
+             diff_text: str, project_id: Optional[str]) -> Dict[str, Any]:
+    """Put a guarded patch where the caller asked for it. Writes; never generates."""
+    # Recorded here, at the single funnel both `apply` and `deliver` pass through, and
+    # *before* the write rather than after it. Deliberate: `_deliver` has several exits and
+    # an event added to each would be one refactor away from missing one -- and for an audit
+    # trail an *attempted* write to a customer's repository is itself the event. A failure
+    # still reaches the caller as an exception; what must not happen is a write nobody can
+    # find a record of.
+    #
+    # `diff` and `zip` are recorded too, because "somebody took the patch out of the
+    # platform" is a governance event even though nothing was pushed. The output name says
+    # which it was.
+    # Both imported locally, as everything in this module is -- it is reached from the
+    # orchestrator and a module-level `database` import would be a cycle.
+    from backend import context as _context
+    from backend import database
+    _writes = output in ("pr", "branch", "same_pr")
+    database.audit_event(
+        "fix_delivered" if _writes else "fix_exported", "review", review_id,
+        actor=_context.current_actor() or "system", project_id=project_id,
+        details=(f"output={output} files={len(safe)} blocked={len(blocked)} "
+                 f"repo={source.get('ref') or source.get('label') or 'n/a'}"))
+
     if output == "diff":
         return result
 
@@ -520,22 +626,13 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     # From here on the repository is written to, and none of it can be rolled back by
     # returning an error — so it is last, after both guards have passed on every patch.
     repo_url = source.get("ref") or ""
-    # Which branch a fix pull request should target.
-    #
-    # This was `label.split("@")[-1]` for every source. That is right for a repository,
-    # whose label is `owner/repo@ref` — and badly wrong for a pull request, whose label is
-    # the PR **title**: it asked GitHub to open a pull request against a base branch called
-    # "CB-104: AI visit summary endpoint" and got a bare 422 (D-315). For a pull request the
-    # answer is the branch the review read, which is what `_available_outputs` already
-    # promises: "a pull request against the branch it came from".
-    if source.get("source_type") == "github_pr":
-        base_ref = source.get("head_branch") or ""
-    else:
-        base_ref = (source.get("label") or "").split("@")[-1] or ""
-    if not base_ref:
-        # Asked, not assumed. "main" is a guess that fails on every repository still using
-        # master, or develop, and fails as another opaque 422 rather than as a sentence.
-        base_ref = gh.get_default_branch(owner, repo)
+    # Resolve the repository and a client for it *first*. This block used to sit below the
+    # `base_ref` block, which called `gh.get_default_branch(owner, repo)` — and because
+    # `owner`, `repo` and `gh` are all assigned here, in the same function scope, Python
+    # treated them as locals and that call raised `UnboundLocalError` rather than reaching
+    # GitHub. The fallback written to turn an opaque 422 into a sentence was therefore a
+    # crash, on the write path, in the same twenty lines as D-314 and D-315. Nothing
+    # offline could see it: every fix test stops at `plan`, which writes nothing (D-317).
     owner_repo = repo_url.rstrip("/").split("github.com/")[-1].strip("/")
     owner, _, repo = owner_repo.partition("/")
     repo = repo.split("/")[0]
@@ -545,6 +642,36 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
         gh = source_bundle.github_for_repo(repo_url, project_id)
     except Exception:
         logger.warning("Falling back to the shared GitHub client for %s", repo_url)
+
+    # Which branch a fix pull request should target — *choosing* the candidate here,
+    # *validating* it in `code_delivery.resolve_base_branch`.
+    #
+    # This was `label.split("@")[-1]` for every source. That is right for a repository,
+    # whose label is `owner/repo@ref` — and badly wrong for a pull request, whose label is
+    # the PR **title**: it asked GitHub to open a pull request against a base branch called
+    # "CB-104: AI visit summary endpoint" and got a bare 422 (D-315). For a pull request the
+    # answer is the branch the review read, which is what `_available_outputs` already
+    # promises: "a pull request against the branch it came from".
+    if source.get("source_type") == "github_pr":
+        base_candidate = source.get("head_branch") or ""
+    else:
+        # **Only when the label actually carries an `@`.** A repository reviewed at its
+        # default branch is labelled `scratch-repo` with no `@` at all, and `split("@")[-1]`
+        # then returns the *repository name* — a non-empty, entirely plausible-looking
+        # string that is not a branch. `POST /pulls` answered a bare 422 and the emptiness
+        # guard could not see it, because the value was not empty. Same family as D-315: a
+        # branch name must never be derived from a human label without being checked. Found
+        # by `scripts/verify_fix_apply.py` on its first real run (D-364).
+        label = source.get("label") or ""
+        base_candidate = label.split("@")[-1] if "@" in label else ""
+    # The check that turns all three of those defects into one sentence lives in
+    # `code_delivery`, shared with the generated-code deliveries, because a second copy of
+    # it in a second writer is exactly how they come back. It asks GitHub whether the
+    # candidate is a branch — a tag, a sha, a deleted branch and a plausible non-branch all
+    # fail identically otherwise — and falls back to the repository's own default rather
+    # than guessing "main".
+    from backend.services import code_delivery
+    base_ref = code_delivery.resolve_base_branch(gh, owner, repo, base_candidate)
 
     if output == "same_pr":
         # No new branch: the fix is committed onto the pull request's own head branch, which
@@ -606,5 +733,5 @@ def apply(orch, review_id: str, finding_ids: Optional[List[str]] = None,
     return result
 
 
-__all__ = ["OUTPUTS", "MAX_FILES_PER_RUN", "FixError", "eligible", "plan", "apply",
-           "make_diff", "make_zip"]
+__all__ = ["OUTPUTS", "PREVIEW", "MAX_FILES_PER_RUN", "FixError", "eligible", "plan",
+           "apply", "deliver", "make_diff", "make_zip"]

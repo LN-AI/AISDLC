@@ -29,8 +29,11 @@ function updateAuthUI() {
   const navKeys = document.getElementById('nav-api-keys');
   const navProjects = document.getElementById('nav-projects');
   const navVertical = document.getElementById('nav-vertical');
-  // Plans define what customers can reach and the usage ledger spans every project, so
-  // both are super-admin only — matching /api/v1/plans and /api/v1/usage on the server.
+  // Plans define what customers can reach, so they stay super-admin only. Usage is now two
+  // surfaces: the cross-customer ledger (super admin) and one project's own spend, which an
+  // admin of that project may read. Before that split, the person who owned a budget could
+  // not see it — their only reading of their own spend was the one-line cap under the
+  // sidebar picker, so "why was I refused?" had no answer they could look up.
   const navPlans = document.getElementById('nav-plans');
   const navUsage = document.getElementById('nav-usage');
   if (_authUser) {
@@ -55,7 +58,7 @@ function updateAuthUI() {
     if (navKeys) navKeys.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navVertical) navVertical.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     if (navPlans) navPlans.style.display = isSuperAdmin() ? '' : 'none';
-    if (navUsage) navUsage.style.display = isSuperAdmin() ? '' : 'none';
+    if (navUsage) navUsage.style.display = (isSuperAdmin() || isProjectAdmin()) ? '' : 'none';
     // Credentials, so super admin only — but the badge below it is for everyone.
     const navLlm = document.getElementById('nav-llm-providers');
     if (navLlm) navLlm.style.display = isSuperAdmin() ? '' : 'none';
@@ -89,9 +92,155 @@ function closeLogin() {
   document.getElementById('login-error').classList.add('hidden');
 }
 
+// ── Command palette ──────────────────────────────────────────────────────
+//
+// 37 sidebar items grouped by the *builder's* taxonomy -- "Requirement Intelligence",
+// "Developer Intelligence" -- so reaching a screen meant remembering which module its
+// author filed it under. And the whole application had one keyboard shortcut, Escape.
+//
+// The list is read out of the sidebar at open time rather than kept as its own table.
+// That is the point: a table would be a second place to add every new screen, and it would
+// be wrong the first time somebody forgot -- exactly the drift `AGENT_SCREENS` already has
+// a smoke check for. Reading the DOM also means a nav item hidden by role (the admin ones)
+// is absent here too, for free, instead of offering somebody a screen they will be refused.
+
+let _cmdItems = [];
+let _cmdIndex = 0;
+
+/** Every reachable screen, as {page, label, group}. Read from the sidebar, not a list. */
+function collectCommandItems() {
+  const out = [];
+  document.querySelectorAll('.nav-item[data-page]').forEach(el => {
+    // `offsetParent === null` catches both the item's own `display:none` (the admin gating
+    // in `updateAuthUI`) and a collapsed section. A screen you cannot click should not be
+    // offered here either.
+    const hiddenByRole = el.style.display === 'none';
+    if (hiddenByRole) return;
+    const section = el.closest('.nav-section');
+    const group = section
+      ? (section.querySelector('.nav-section-label')?.textContent || '').trim()
+      : '';
+    out.push({
+      page: el.getAttribute('data-page'),
+      label: (el.textContent || '').trim(),
+      group,
+    });
+  });
+  return out;
+}
+
+function openCommandPalette() {
+  const modal = document.getElementById('cmd-palette');
+  if (!modal) return;
+  _cmdItems = collectCommandItems();
+  _cmdIndex = 0;
+  modal.classList.remove('hidden');
+  const input = document.getElementById('cmd-palette-input');
+  if (input) {
+    input.value = '';
+    input.focus();
+  }
+  renderCommandPalette('');
+}
+
+function closeCommandPalette() {
+  const modal = document.getElementById('cmd-palette');
+  if (modal) modal.classList.add('hidden');
+}
+
+/** Subsequence match, so "gxpdoc" finds "GxP Document Check" without exact substrings. */
+function _cmdMatches(query) {
+  const q = (query || '').toLowerCase().replace(/\s+/g, '');
+  if (!q) return _cmdItems;
+  return _cmdItems.filter(item => {
+    const hay = (item.label + ' ' + item.group).toLowerCase().replace(/\s+/g, '');
+    let i = 0;
+    for (const ch of q) {
+      i = hay.indexOf(ch, i);
+      if (i === -1) return false;
+      i += 1;
+    }
+    return true;
+  });
+}
+
+function renderCommandPalette(query) {
+  const list = document.getElementById('cmd-palette-list');
+  if (!list) return;
+  const matches = _cmdMatches(query);
+  if (_cmdIndex >= matches.length) _cmdIndex = Math.max(0, matches.length - 1);
+  if (!matches.length) {
+    list.innerHTML = `<li style="padding:14px 12px;color:var(--text-muted)">No screen
+      matches “${esc(query)}”.</li>`;
+    return;
+  }
+  list.innerHTML = matches.map((item, i) => `
+    <li role="option" aria-selected="${i === _cmdIndex}"
+        data-cmd-page="${esc(item.page)}"
+        onmousedown="runCommandPalette('${esc(item.page)}')"
+        style="padding:9px 12px;border-radius:6px;cursor:pointer;display:flex;
+               justify-content:space-between;gap:12px;
+               background:${i === _cmdIndex ? 'var(--bg-hover,#2a2d34)' : 'transparent'}">
+      <span>${esc(item.label)}</span>
+      ${item.group ? `<span style="color:var(--text-muted);font-size:12px">${esc(item.group)}</span>` : ''}
+    </li>`).join('');
+}
+
+function runCommandPalette(page) {
+  closeCommandPalette();
+  // Through the hash router, so a screen opened from here is addressable and the Back button
+  // works -- the same path a nav click takes.
+  _setHash(`#/${page}`);
+}
+
+function _cmdKeydown(e) {
+  const modal = document.getElementById('cmd-palette');
+  if (!modal || modal.classList.contains('hidden')) return false;
+  const matches = _cmdMatches(document.getElementById('cmd-palette-input')?.value || '');
+  if (e.key === 'ArrowDown') {
+    _cmdIndex = Math.min(_cmdIndex + 1, matches.length - 1);
+    renderCommandPalette(document.getElementById('cmd-palette-input').value);
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === 'ArrowUp') {
+    _cmdIndex = Math.max(_cmdIndex - 1, 0);
+    renderCommandPalette(document.getElementById('cmd-palette-input').value);
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === 'Enter') {
+    if (matches[_cmdIndex]) runCommandPalette(matches[_cmdIndex].page);
+    e.preventDefault();
+    return true;
+  }
+  return false;
+}
+
+document.addEventListener('keydown', e => {
+  // Ctrl-K and Cmd-K. Not plain "k": the palette must not open while somebody is typing a
+  // requirement into a textarea.
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    const modal = document.getElementById('cmd-palette');
+    if (modal && modal.classList.contains('hidden')) openCommandPalette();
+    else closeCommandPalette();
+    return;
+  }
+  if (_cmdKeydown(e)) return;
+});
+
+document.addEventListener('input', e => {
+  if (e.target && e.target.id === 'cmd-palette-input') {
+    _cmdIndex = 0;
+    renderCommandPalette(e.target.value);
+  }
+});
+
 // Global Escape key handler for modals
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
+    closeCommandPalette();
     const gate = document.getElementById('login-gate');
     if (gate && !gate.classList.contains('hidden')) closeLogin();
     const llmModal = document.getElementById('llm-config-modal');
@@ -104,6 +253,8 @@ document.addEventListener('keydown', e => {
     if (keyModal && !keyModal.classList.contains('hidden')) closeKeyEditor();
     const projectModal = document.getElementById('project-edit-modal');
     if (projectModal && !projectModal.classList.contains('hidden')) closeProjectEditor();
+    const infoModal = document.getElementById('agent-info-modal');
+    if (infoModal && !infoModal.classList.contains('hidden')) closeAgentInfo();
   }
 });
 
@@ -368,14 +519,98 @@ async function refreshApprovalBadge() {
 }
 
 // ── Navigation ────────────────────────────────────────────────────────────
+//
+// Every screen and every stored run now has an address: `#/code`, `#/findings`,
+// `#/code/run/<id>`. Before this the application had no URL state at all — no way to send
+// a colleague a finding, no way to bookmark a run, an inert Back button, and a reload that
+// always landed on the Dashboard however deep you were. For a tool meant to be used daily
+// by a team, "here, look at this" was impossible, which is a bigger gap than it sounds.
+//
+// Deliberately a hash and not the History API: the app is served as static files from
+// FastAPI with no server-side rewrite, so a real path (`/code/run/<id>`) would 404 on
+// reload. A hash never reaches the server.
+//
+// `showPage` is the one place a screen is activated. The click handler and the hash
+// listener both call it, so a click and a pasted link cannot diverge — which is the bug
+// that would otherwise appear the first time a screen gained a loader in one path only.
+
+/** Activate a screen and run its loader. `push` writes the address; the hash listener
+ *  passes false so answering a hash change does not re-enter itself. */
+function showPage(page, push = true) {
+  const item = document.querySelector(`.nav-item[data-page="${page}"]`);
+  const body = document.getElementById('page-' + page);
+  if (!item || !body) return false;
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  item.classList.add('active');
+  body.classList.add('active');
+  if (push) _setHash('#/' + page);
+  _runPageLoader(page);
+  return true;
+}
+
+/** Write the address without the hash listener treating it as a navigation. */
+let _suppressHashChange = false;
+function _setHash(hash) {
+  if (location.hash === hash) return;
+  _suppressHashChange = true;
+  location.hash = hash;
+  // Cleared on a timer rather than in the listener: assigning `location.hash` fires
+  // `hashchange` asynchronously, so clearing it synchronously here would be too early and
+  // clearing it only in the listener would leave it stuck if the browser coalesced two
+  // assignments into one event.
+  setTimeout(() => { _suppressHashChange = false; }, 0);
+}
+
+/** The address the current view should have, including an open run. */
+function _addressFor(page) {
+  const runId = _openRunId && _openRunId[page];
+  return runId ? `#/${page}/run/${runId}` : `#/${page}`;
+}
+
+/** Answer an address: `#/code`, `#/code/run/<id>`. Unknown pages fall back to the
+ *  dashboard rather than leaving a blank shell, and say nothing about it — a mistyped
+ *  fragment is not an error worth a dialog. */
+async function _applyHash() {
+  // The query has to come off before the path is split, or `#/findings?q=sql` yields a
+  // first segment of `findings?q=sql`, matches no nav item, and silently lands on the
+  // dashboard — which is how a shared filtered link would have looked broken.
+  const raw = (location.hash || '').split('?')[0];
+  const parts = raw.replace(/^#\/?/, '').split('/').filter(Boolean);
+  const page = parts[0] || 'dashboard';
+  if (!showPage(page, false)) { showPage('dashboard', false); return; }
+  // `#/<page>/run/<id>` reopens a stored run. Only meaningful for a screen in
+  // AGENT_SCREENS, which is what knows how to render one.
+  if (parts[1] === 'run' && parts[2] && AGENT_SCREENS[page]) {
+    try {
+      await openAgentRun(page, parts[2]);
+    } catch (e) {
+      feLog.warn(`Could not open run ${parts[2]} from the address bar`, { source: 'router' });
+    }
+  }
+}
+
+window.addEventListener('hashchange', () => {
+  if (_suppressHashChange) { _suppressHashChange = false; return; }
+  _applyHash();
+});
 
 document.querySelectorAll('.nav-item').forEach(item => {
   item.addEventListener('click', () => {
     const page = item.dataset.page;
-    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
-    item.classList.add('active');
-    document.getElementById('page-' + page).classList.add('active');
+    // A click on the screen you are already on clears any open run rather than doing
+    // nothing, so the nav item is also the way back out of one.
+    if (_openRunId && page in _openRunId && document.getElementById('page-' + page)
+        ?.classList.contains('active')) {
+      _openRunId[page] = null;
+    }
+    showPage(page);
+  });
+});
+
+/** Everything a screen needs when it becomes visible. Extracted from the click handler so
+ *  a pasted address gets exactly what a click gets. */
+function _runPageLoader(page) {
     if (page === 'dashboard') loadDashboard();
     // The source pickers are built on first visit rather than at load: they are two of
     // thirty-seven screens, and building every screen's controls up front is what makes a
@@ -389,6 +624,13 @@ document.querySelectorAll('.nav-item').forEach(item => {
     // than no history list. Screens absent from `AGENT_SCREENS` -- modernization and the
     // governance report -- keep the richer lists they already had.
     if (AGENT_SCREENS[page]) { loadAgentRuns(page); renderAgentAbout(page); }
+    // The "start from a previous run" control, on the five screens whose input is another
+    // agent's output. Rebuilt per visit for the same reason the history list is: the run
+    // it offers must belong to the project selected now, not the one selected last time.
+    if (RUN_HANDOFFS[page]) renderRunHandoff(page);
+    // The mode select drives which fields exist, so the screen has to be put in
+    // the selected mode on arrival as well as on change.
+    if (page === 'architecture') onArchModeChange();
     // The GitHub PR screen is retired -- the nav item lands on the review screen with
     // the source already set, so there is one implementation of reviewing a pull
     // request rather than two that drift apart.
@@ -402,7 +644,9 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'agent-hub') { loadAgentHub(); loadSwarmPolicies(); }
     if (page === 'gate') loadReviewPicker();
     if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
-    if (page === 'findings') loadFindings(0);
+    if (page === 'findings') {
+      _fillFindingProducts().then(() => { _applyFindingHashFilters(); loadFindings(0); });
+    }
     if (page === 'inventory') loadInventory();
     if (page === 'sensitive') { /* page ready, no auto-load */ }
     if (page === 'ai-provenance') { /* page ready, no auto-load */ }
@@ -414,14 +658,14 @@ document.querySelectorAll('.nav-item').forEach(item => {
     if (page === 'cfr21') { /* page ready, no auto-load */ }
     if (page === 'gxp-docs') { /* page ready, no auto-load */ }
     if (page === 'gxp-generate') { /* page ready, no auto-load */ }
+    if (page === 'notifications') loadNotifiers();
     if (page === 'api-keys') loadApiKeys();
     if (page === 'llm-providers') loadLlmProviders();
     if (page === 'plans') loadPlans();
     if (page === 'usage') loadUsage();
     if (page === 'projects') loadProjects();
     if (page === 'vertical') loadVerticalPage();
-  });
-});
+}
 
 // ── Code Generation ─────────────────────────────────────────────────────────
 
@@ -466,6 +710,61 @@ initCodegenDropdowns();
 
 let _lastCodegenAdvisory = null;
 
+// ── Generating code that fits a codebase that already exists ──────────────
+//
+// "Build something that fits this repository" is a different request from "build this from
+// scratch", and the whole difference is what the prompt knows about what is already there.
+//
+// Deliberately **not** a new field on the codegen request, and deliberately not automatic.
+// The brief is fetched by itself, dropped into the existing context box, and left there to
+// be read and trimmed before anything is spent. Two reasons: a prompt change is the one
+// kind of change with no eval here to catch a regression (D-344), so a run with no
+// repository has to stay byte-identical to one from before this existed; and a computed
+// description of somebody's codebase is exactly the sort of thing that should be visible
+// before it is sent, not folded invisibly into a request.
+//
+// `/api/code-brief` calls no model, so this costs nothing and is not metered.
+async function loadCodebaseContext() {
+  const repo = (document.getElementById('cg-repo-url').value || '').trim();
+  const zip = (document.getElementById('cg-code-zip').files || [])[0];
+  const out = document.getElementById('cg-context-note');
+  const box = document.getElementById('cg-existing');
+  if (!repo && !zip) { alert('Give a repository URL, or choose a zip of the codebase.'); return; }
+  out.innerHTML = '<div class="cost-note">Reading the codebase and working out its '
+    + 'structure… this calls no model and costs nothing.</div>';
+  try {
+    const body = {};
+    if (zip) {
+      body.files = await _readZipAsFiles(zip);
+    } else {
+      body.github_repo_url = repo;
+      const ref = (document.getElementById('cg-repo-ref').value || '').trim();
+      if (ref) body.ref = ref;
+      const token = (document.getElementById('cg-gh-token').value || '').trim();
+      if (token) body.github_token = token;
+    }
+    const r = await apiFetch('/api/code-brief', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    box.value = 'The generated code has to fit this existing codebase:\n\n' + r.markdown;
+    const stats = r.stats || {};
+    out.innerHTML = `<div class="cost-note">Read ${Number((r.source || {}).files || 0).toLocaleString()}
+      file(s); ${Number(stats.units || 0).toLocaleString()} unit(s),
+      ${Number(stats.edges || 0).toLocaleString()} dependency edge(s). It is in the box
+      below — read it, trim it, or clear it. Nothing has been spent.</div>
+      ${r.coverage_note ? `<div class="cost-note ${(r.coverage || {}).files_not_analysed ? 'cost-note-warn' : ''}">${esc(r.coverage_note)}</div>` : ''}`;
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note cost-note-bad">Could not read that source —
+      ${esc(e.message)}</div>`;
+  }
+}
+
+function clearCodebaseContext() {
+  document.getElementById('cg-existing').value = '';
+  document.getElementById('cg-context-note').innerHTML = '';
+}
+
 async function runCodegenAdvisory() {
   const requirement = document.getElementById('cg-requirement').value.trim();
   if (!requirement) { alert('Please describe the requirement.'); return; }
@@ -484,9 +783,12 @@ async function runCodegenAdvisory() {
         pin_frontend_framework: document.getElementById('cg-pin-frontend').value.trim() || null,
         pin_database: document.getElementById('cg-pin-database').value.trim() || null,
         pin_architecture_pattern: document.getElementById('cg-pin-pattern').value.trim() || null,
+        // Empty unless somebody read a codebase into it, in which case the recommendation
+        // has to fit what already exists rather than starting from a blank page.
+        context: document.getElementById('cg-existing').value.trim(),
+        derived_from: chainedFrom('codegen'),
       }),
     });
-    _lastCodegenAdvisory = result;
     renderCodegenAdvisory('codegen-advisory-result', result);
     loadDashboard();
   } catch (e) { showError('codegen-advisory-result', e.message); }
@@ -494,6 +796,11 @@ async function runCodegenAdvisory() {
 }
 
 function renderCodegenAdvisory(targetId, result) {
+  // Armed here rather than in `runCodegenAdvisory`, because the buttons this result draws
+  // ("Use this stack for the scaffold") are only usable if the variable they read is set --
+  // and reopening a stored run from history renders those buttons through this same
+  // function while setting nothing. They were dead on every reopened run (C-36).
+  _lastCodegenAdvisory = result;
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const r = result.recommendation || {};
@@ -609,6 +916,7 @@ async function runCodegenScaffold() {
         database: document.getElementById('cg-s-database').value.trim() || null,
         architecture_pattern: document.getElementById('cg-s-pattern').value.trim() || 'Modular Monolith',
         requirement: document.getElementById('cg-requirement').value.trim(),
+        context: document.getElementById('cg-existing').value.trim(),
         include_auth: document.getElementById('cg-s-auth').checked,
         include_docker: document.getElementById('cg-s-docker').checked,
         include_tests: document.getElementById('cg-s-tests').checked,
@@ -702,7 +1010,117 @@ function renderCodegenScaffold(targetId, result) {
         <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">${esc(f.path)}${f.purpose ? ` — <span style="color:var(--text-muted);font-family:inherit">${esc(f.purpose)}</span>` : ''}</summary>
         <pre class="api-usage-code" style="margin-top:8px">${esc(f.content || '')}</pre>
       </details>`).join('')}
+
+    ${renderGeneratedCodeDelivery(result, 'generated starter project')}
   `;
+}
+
+// ── Getting generated code out of the platform and into a repository ──────
+//
+// A scaffold and a migrated file were downloadable as a zip and nothing else, so the last
+// step of "generate the code for this requirement" was a person unpacking an archive and
+// copying files in by hand.
+//
+// **This is deliberately not Apply Fixes.** That starts from a review, runs two guardrails
+// and a re-review over every patch, and only then writes — and it can commit onto the pull
+// request being reviewed, because a review had already read that branch. Nothing has read
+// this code unless the run's pre-release check was ticked. So the offer here is narrower on
+// purpose: a new branch that must not already exist, a pull request only if asked for, and
+// the review status stated in the pull request body where whoever merges it will see it.
+// `services/code_delivery` enforces all three server-side; this is the door, not the guard.
+function renderGeneratedCodeDelivery(result, kind) {
+  const files = result.files || [];
+  if (!result.review_id || !files.length) return '';
+  const gov = result.governance_review;
+  const p = `gd-${esc(result.review_id)}`;
+  const status = gov
+    ? `<span class="cost-note">Reviewed before delivery — Code Review
+        ${esc(gov.code_review?.gate_status || '?')}, Sensitive Data
+        ${esc(gov.sensitive_data_scan?.gate_status || '?')}. This is stated in the pull
+        request body too.</span>`
+    : `<span class="cost-note cost-note-warn">This code has <b>not been reviewed</b>: the
+        run was made without the pre-release check, so no agent has read it. The pull
+        request body will say so, because whoever merges it should not have to work that
+        out.</span>`;
+  return `
+    <div class="section-title" style="margin-top:20px">Push to a GitHub repository</div>
+    <p class="subtitle" style="margin-top:-6px">
+      Commits all ${files.length} file(s) to a <b>new</b> branch. It will not write to a
+      branch that already exists, and it never commits onto one somebody may have checked
+      out &mdash; generated code goes somewhere a person can read it first.
+    </p>
+    ${status}
+    <div class="form-row" style="margin-top:10px">
+      <div class="form-group flex1">
+        <label>Repository URL <span class="required">*</span></label>
+        <input type="url" id="${p}-repo" placeholder="https://github.com/owner/repo" />
+      </div>
+      <div class="form-group">
+        <label>Branch (optional)</label>
+        <input type="text" id="${p}-branch" placeholder="named after this run" />
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group flex1">
+        <label>Base branch (optional)</label>
+        <input type="text" id="${p}-base" placeholder="the repository's own default" />
+      </div>
+      <div class="form-group flex1">
+        <label>GitHub token for this call (optional)</label>
+        <input type="password" id="${p}-token" autocomplete="off"
+               placeholder="used once, never stored" />
+      </div>
+    </div>
+    <label style="font-size:13px;display:block;margin-top:4px">
+      <input type="checkbox" id="${p}-pr" /> Also open a pull request from that branch
+    </label>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="deliverGeneratedCode('${esc(result.review_id)}', '${esc(kind)}')">
+        <span class="btn-icon">&#128640;</span> Push to GitHub
+      </button>
+    </div>
+    <div id="${p}-out"></div>`;
+}
+
+async function deliverGeneratedCode(reviewId, kind) {
+  const p = `gd-${reviewId}`;
+  const val = suffix => (document.getElementById(`${p}-${suffix}`) || {}).value || '';
+  const repo = val('repo').trim();
+  const out = document.getElementById(`${p}-out`);
+  if (!repo) { alert('Give the repository URL to push to.'); return; }
+  const openPr = !!(document.getElementById(`${p}-pr`) || {}).checked;
+  if (!confirm(`Commit this ${kind} to ${repo}?`
+             + (openPr ? ' A pull request will be opened from the new branch.' : '')
+             + ' This writes to that repository.')) return;
+  out.innerHTML = '<div class="cost-note">Creating the branch and committing… this calls '
+    + 'no model and costs nothing.</div>';
+  try {
+    const r = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/deliver-code`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        github_repo_url: repo,
+        branch: val('branch').trim() || undefined,
+        base_branch: val('base').trim() || undefined,
+        open_pr: openPr,
+        github_token: val('token').trim() || undefined,
+      }),
+    });
+    const pr = r.pull_request;
+    // A partial delivery is reported as one. The branch exists and some files are on it,
+    // so saying "failed" would send somebody looking for something they would be told is
+    // not there — the same reason `code_delivery` returns what landed rather than raising.
+    const failed = (r.files_failed || []).length;
+    out.innerHTML = `<div class="cost-note${failed ? ' cost-note-warn' : ''}">
+      Committed ${(r.files_committed || []).length} file(s) to
+      <a href="${esc(r.branch_url || '#')}" target="_blank" rel="noopener">${esc(r.branch)}</a>
+      in ${esc(r.repo)}, cut from ${esc(r.base_branch)}.
+      ${failed ? `<b>${failed} file(s) could not be committed</b> — ${esc((r.files_failed[0] || {}).error || '')}.` : ''}
+      ${pr ? ` <a href="${esc(pr.url)}" target="_blank" rel="noopener">Pull request #${esc(String(pr.number))}</a>.` : ''}
+      ${r.pull_request_error ? ` The commits landed but the pull request did not open: ${esc(r.pull_request_error)}` : ''}
+    </div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note cost-note-bad">${esc(e.message)}</div>`;
+  }
 }
 
 // ── Code Migration ───────────────────────────────────────────────────────────
@@ -727,7 +1145,6 @@ async function runMigrationAssessment() {
         project_name: document.getElementById('mg-project').value.trim(),
       }),
     });
-    _lastMigrationAssessment = result;
     renderMigrationAssessment('migration-assessment-result', result);
     loadDashboard();
   } catch (e) { showError('migration-assessment-result', e.message); }
@@ -735,6 +1152,7 @@ async function runMigrationAssessment() {
 }
 
 function renderMigrationAssessment(targetId, r) {
+  _lastMigrationAssessment = r;                    // see renderCodegenAdvisory
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const breaking = r.breaking_changes || [];
@@ -805,11 +1223,62 @@ function renderMigrationAssessment(targetId, r) {
   `;
 }
 
+// What the assessment concluded, carried into the execution that follows it.
+let _migrationGuidance = '';
+
+// This used to guard on `_lastMigrationAssessment` and then never read it: it copied the
+// *assessment form's own* target and source fields across to the execution form, so the
+// assessment's actual output — the recommended approach, the breaking changes, the
+// rollback strategy — reached the migration call nowhere. The button said "Use this for
+// Execution" and used none of it.
+//
+// `execute_migration` has taken a `requirement` since it was written (`main.py`,
+// `/api/review/migration-execute`) and the browser has never sent one, so carrying the
+// guidance forward needs no backend change. It is shown rather than hidden, because a
+// person about to spend money on a migration should see what is being sent with it.
 function applyMigrationAssessment() {
   if (!_lastMigrationAssessment) return;
+  const a = _lastMigrationAssessment;
   document.getElementById('mg-e-target').value = document.getElementById('mg-target').value.trim();
   document.getElementById('mg-e-source').value = document.getElementById('mg-source').value.trim();
+
+  const parts = [];
+  if (a.recommended_approach) parts.push(`Approach: ${a.recommended_approach}`);
+  (a.breaking_changes || []).slice(0, 12).forEach(b => parts.push(
+    `Breaking change: ${typeof b === 'string' ? b : (b.description || b.title || JSON.stringify(b))}`));
+  (a.risk_areas || []).slice(0, 12).forEach(r => parts.push(
+    `Risk: ${typeof r === 'string' ? r : (r.description || r.title || JSON.stringify(r))}`));
+  if (a.rollback_strategy) parts.push(`Rollback: ${a.rollback_strategy}`);
+  _migrationGuidance = parts.join('\n');
+
+  renderMigrationGuidance();
   document.getElementById('mg-execute-card')?.scrollIntoView({ behavior: 'smooth' });
+}
+
+function renderMigrationGuidance() {
+  const card = document.getElementById('mg-execute-card');
+  if (!card) return;
+  let box = document.getElementById('mg-guidance');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'mg-guidance';
+    box.className = 'run-handoff run-handoff-stacked';
+    const first = card.querySelector('.form-group');
+    if (first) first.insertAdjacentElement('beforebegin', box);
+    else card.appendChild(box);
+  }
+  if (!_migrationGuidance) { box.innerHTML = ''; return; }
+  box.innerHTML = `
+    <span class="run-handoff-label">Carrying the assessment forward</span>
+    <span class="run-handoff-note">Sent with the migration so the converter knows what the
+      assessment already found. Clear it to migrate on the code alone.
+      <button type="button" class="about-link" onclick="clearMigrationGuidance()">Clear</button></span>
+    <pre class="run-handoff-carry">${esc(_migrationGuidance)}</pre>`;
+}
+
+function clearMigrationGuidance() {
+  _migrationGuidance = '';
+  renderMigrationGuidance();
 }
 
 async function runMigrationExecution() {
@@ -829,6 +1298,9 @@ async function runMigrationExecution() {
         file_path: document.getElementById('mg-e-filepath').value.trim(),
         project_name: document.getElementById('mg-project').value.trim(),
         auto_review: document.getElementById('mg-e-review').checked,
+        // What the assessment concluded, if one was carried over. The endpoint has always
+        // taken this and the browser has never sent it.
+        requirement: _migrationGuidance || undefined,
       }),
     });
     renderMigrationExecution('migration-execution-result', result);
@@ -884,6 +1356,8 @@ function renderMigrationExecution(targetId, result) {
         <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">${esc(f.path)}${f.purpose ? ` — <span style="color:var(--text-muted);font-family:inherit">${esc(f.purpose)}</span>` : ''}</summary>
         <pre class="api-usage-code" style="margin-top:8px">${esc(f.content || '')}</pre>
       </details>`).join('')}
+
+    ${renderGeneratedCodeDelivery(result, 'migrated code')}
   `;
 }
 
@@ -1170,7 +1644,127 @@ async function loadDashboard() {
   // Reset to the newest page: switching project or re-entering the dashboard should not
   // land the reader deep in a history that may no longer be that long.
   recentReviewsOffset = 0;
-  await loadRecentReviews();
+  // In parallel, and each guarded on its own: a trend query that fails must not leave the
+  // reader without their repository grid, and neither is worth blocking the review list on.
+  await Promise.all([loadRecentReviews(), loadDashboardTrend(), loadDashboardRepos()]);
+}
+
+// ── The leadership half of the Dashboard ─────────────────────────────────
+//
+// Two questions six lifetime totals cannot answer: is this getting better, and which of
+// our repositories is in trouble. Both are queries now that `reviews` carries a repository
+// and findings carry a resolution date -- no new subsystem, and `/api/repositories` was
+// already serving the second one to nobody.
+//
+// Drawn with CSS width bars rather than a charting library, matching how every other
+// bar-like widget here is built. Picking a charting library is a real decision with a
+// bundle cost and this project has no build step; it should not be made as a side effect
+// of adding one panel.
+
+/** New vs resolved per week, with the open total as the line that matters. */
+async function loadDashboardTrend() {
+  const wrap = document.getElementById('dashboard-trend');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/api/dashboard/trend?weeks=8', { _silent: true });
+    const findings = data.findings || [];
+    const gates = data.gates || [];
+    if (!findings.length && !gates.length) {
+      wrap.innerHTML = `<div class="empty-state">No reviews yet, so there is no trend to
+        show. This fills in from the second week you run reviews.</div>`;
+      return;
+    }
+    // Scale to the busiest week so a quiet week is visibly quiet rather than rescaled to
+    // look the same as a busy one.
+    const peak = Math.max(1, ...findings.map(w => Math.max(w.new || 0, w.resolved || 0)));
+    const gateByWeek = Object.fromEntries(gates.map(g => [g.week, g]));
+    const last = findings[findings.length - 1] || {};
+    const first = findings[0] || {};
+    const direction = (last.open_at_end ?? 0) - (first.open_at_end ?? 0);
+
+    wrap.innerHTML = `
+      <div class="field-hint" style="margin-bottom:10px">
+        <b>${last.open_at_end ?? 0} open</b> at the end of the most recent week —
+        ${direction === 0
+          ? 'unchanged over the period.'
+          : direction < 0
+            ? `<span style="color:var(--green)">down ${Math.abs(direction)}</span> over the period.`
+            : `<span style="color:var(--red)">up ${direction}</span> over the period.`}
+        A week where more were resolved than introduced is a week the backlog shrank.
+      </div>
+      <table class="users-table">
+        <thead><tr><th>Week</th><th>New</th><th>Resolved</th><th style="width:40%"></th>
+          <th>Open</th><th>Gates</th></tr></thead>
+        <tbody>
+          ${findings.map(w => {
+            const g = gateByWeek[w.week] || {};
+            const bar = (n, colour) => `<div style="height:8px;border-radius:2px;
+              width:${Math.round((n / peak) * 100)}%;background:${colour};min-width:${n ? 2 : 0}px"></div>`;
+            return `<tr>
+              <td style="font-size:12px;color:var(--text-muted)">${esc(w.week)}</td>
+              <td>${w.new || 0}</td>
+              <td>${w.resolved || 0}</td>
+              <td>${bar(w.new || 0, 'var(--red)')}${bar(w.resolved || 0, 'var(--green)')}</td>
+              <td><strong>${w.open_at_end ?? 0}</strong></td>
+              <td style="font-size:12px;color:var(--text-muted)">
+                ${g.total ? `${g.Green || 0}/${g.Amber || 0}/${g.Red || 0}` : '—'}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      <div class="field-hint">Red bar: introduced. Green bar: resolved. Gates column is
+        Green/Amber/Red runs that week. A finding counts as introduced by the run that
+        found it — it did not exist for us before that.</div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load the
+      trend: ${esc(e.message)}</div>`;
+  }
+}
+
+/** One row per repository, worst first — which is how the server already orders it. */
+async function loadDashboardRepos() {
+  const wrap = document.getElementById('dashboard-repos');
+  if (!wrap) return;
+  try {
+    const data = await apiFetch('/api/repositories?limit=50', { _silent: true });
+    const repos = data.repositories || [];
+    if (!repos.length) {
+      wrap.innerHTML = `<div class="empty-state">No repository has been reviewed yet.
+        A paste or a zip upload has no repository to group under, so only reviews of a
+        GitHub source appear here.</div>`;
+      return;
+    }
+    const icon = g => ({ Green: '✅', Amber: '⚠️', Red: '🔴' }[g] || '❓');
+    wrap.innerHTML = `
+      <table class="users-table">
+        <thead><tr><th>Repository</th><th>Latest gate</th><th>Open critical</th>
+          <th>Open high</th><th>Runs</th><th>Last reviewed</th><th>Spend</th></tr></thead>
+        <tbody>
+          ${repos.map(r => {
+            const latest = r.latest || {};
+            const name = `${r.repo_owner || ''}/${r.repo_name || ''}`;
+            return `<tr>
+              <td><strong>${esc(name)}</strong>
+                ${latest.branch ? `<div style="font-size:11px;color:var(--text-muted)">${esc(latest.branch)}</div>` : ''}</td>
+              <td>${icon(latest.gate_status)} ${esc(latest.gate_status || '—')}</td>
+              <td>${r.open_critical
+                ? `<span style="color:var(--red);font-weight:600">${r.open_critical}</span>`
+                : '0'}</td>
+              <td>${r.open_high || 0}</td>
+              <td>${r.runs || 0}</td>
+              <td style="font-size:12px;color:var(--text-muted)">${esc((r.last_reviewed_at || '').slice(0, 10))}</td>
+              <td>${r.spend_usd ? _money(r.spend_usd) : '—'}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+      <div class="field-hint">Worst first: open Critical, then High, then how recently it
+        was reviewed. Spend comes from the billing ledger, so it agrees with the invoice.
+        A waived finding stops counting the moment it is waived.</div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="empty-state" style="color:var(--red)">Could not load
+      repository health: ${esc(e.message)}</div>`;
+  }
 }
 
 async function loadRecentReviews() {
@@ -1363,9 +1957,9 @@ async function runTestScenarioGeneration() {
     const result = await apiFetch(`/api/review/test-scenario?project_name=${encodeURIComponent(project)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content, context }),
+      body: JSON.stringify({ content, context,
+                             derived_from: chainedFrom('test-scenario') }),
     });
-    _lastTestScenarioResult = result;
     renderTestScenarios('test-scenario-result', result);
     loadDashboard();
   } catch (e) {
@@ -1376,6 +1970,7 @@ async function runTestScenarioGeneration() {
 }
 
 function renderTestScenarios(targetId, r) {
+  _lastTestScenarioResult = r;                     // see renderCodegenAdvisory
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const scenarios = r.scenarios || [];
@@ -1436,7 +2031,11 @@ function renderTestScenarios(targetId, r) {
 // ── QA Intelligence — Test Case Generation ─────────────────────────────────
 
 function useLastTestScenarioResult() {
-  if (!_lastTestScenarioResult) { alert('Run Test Scenario Generation first.'); return; }
+  if (!_lastTestScenarioResult) {
+    // Reopening a stored run now arms this too, so the instruction says both ways.
+    alert('Run Test Scenario Generation first, or open one of its previous runs.');
+    return;
+  }
   document.getElementById('tc-scenarios-context').value = JSON.stringify(_lastTestScenarioResult.scenarios || [], null, 2);
 }
 
@@ -1601,6 +2200,7 @@ async function runFullReview() {
       body: JSON.stringify({
         project_name, requirement, compliance_artifact, architecture, code, prompt, test_evidence,
         include_security, include_vapt, include_sensitive_data,
+        derived_from: chainedFrom('full'),
       }),
     });
     const result = await pollFullReviewJob(submitResp.job_id);
@@ -1876,11 +2476,27 @@ function renderGovernanceReport(targetId, report) {
       <div class="summary-box">${esc(report.executive_summary)}</div></div>`;
   }
 
+  // Say something either way. This block used to render only when a sign-off was required,
+  // and the report only claimed one for an Amber gate that never actually reached a human --
+  // so an auditor read an Amber report, saw no banner, and had nothing telling them whether
+  // sign-off had been requested and given or never asked for at all. Those are very
+  // different facts and they looked identical. `approval_basis` states which it is; the
+  // gate_status fallback keeps an older stored report readable.
+  const _ab = report.approval_basis
+    || (report.approval_required
+      ? 'This release was placed in the approval queue and cannot proceed without a recorded human sign-off.'
+      : 'No human sign-off was requested: this platform requires one for a Red gate or any Critical finding.');
   if (report.approval_required) {
     const approvers = report.approvers_needed || [];
     html += `<div class="info-box" style="margin-top:12px">
       <strong>Approval required before release.</strong>
+      <div class="field-hint">${esc(_ab)}</div>
       ${approvers.length ? `<ul class="recs-list">${approvers.map(a => `<li>${esc(a)}</li>`).join('')}</ul>` : ''}
+    </div>`;
+  } else {
+    html += `<div class="info-box" style="margin-top:12px">
+      <strong>No human sign-off was requested for this release.</strong>
+      <div class="field-hint">${esc(_ab)}</div>
     </div>`;
   }
   if (report.human_oversight_required) {
@@ -2166,8 +2782,24 @@ function renderFinding(f) {
   const age = f.is_new === false
     ? '<span class="compliance-chip" title="This project has seen this finding before">Pre-existing</span>'
     : (f.is_new === true ? '<span class="compliance-chip">New</span>' : '');
+  // `file:line` was plain text, and the file viewer that could show it — with a line
+  // gutter, and a chip saying whether the bytes are the ones reviewed or a refetch at the
+  // same commit — had nothing anywhere linking into it. Reading a finding in its context
+  // meant finding the path in the inventory table by eye and clicking that instead.
+  //
+  // Linked only where it can actually work: `_fixCapable`-style capability, but for
+  // reading. `_openFileAgent` is set by whichever screen rendered this result, because
+  // `renderFinding` is shared by fourteen renderers and has no idea which one it is in.
+  const canOpen = f.file_path && _openFileAgent && _openFileRunId;
   const where = f.file_path
-    ? `<div class="finding-loc">${esc(f.file_path)}${f.line_start ? ':' + f.line_start : ''}</div>` : '';
+    ? `<div class="finding-loc">${canOpen
+        ? `<button class="btn-link finding-loc-link" title="Open this file at line ${
+            f.line_start || 1}, exactly as the review read it"
+            onclick="openReviewFile('${esc(_openFileAgent)}','${esc(_openFileRunId)}','${
+              esc(f.file_path)}',${Number(f.line_start) || 0})">${esc(f.file_path)}${
+            f.line_start ? ':' + f.line_start : ''}</button>`
+        : `${esc(f.file_path)}${f.line_start ? ':' + f.line_start : ''}`}</div>`
+    : '';
   const evidence = f.evidence
     ? `<pre class="finding-evidence">${esc(String(f.evidence).slice(0, 400))}</pre>` : '';
   // How much to trust this one. A reader who cannot tell a proven finding from an inferred
@@ -2191,6 +2823,21 @@ function renderFinding(f) {
   }
   if (f.occurrences > 1) {
     marks.push(`<span class="mark-chip" title="Reported ${f.occurrences} times and merged into one">×${f.occurrences}</span>`);
+  }
+  // Which rule took this finding out of the gate. It used to be enough for the panel's
+  // heading to say "test/vendor paths", because that was the only possible answer. Now a
+  // finding can be here because of a line in this repository's own `.lmignore` or a
+  // comment on the line itself, and a reader who cannot see *which* has no way to go and
+  // change it.
+  if (f.suppressed_reason) {
+    marks.push(`<span class="mark-chip" title="Not counted toward the gate. This is the rule that did it -- change the rule to get the finding back.">not counted: ${esc(f.suppressed_reason)}</span>`);
+  }
+  // A finding this run did not find. It is here because an earlier review of the same pull
+  // request raised it and it is still open, so it still blocks — but the file was not
+  // re-read, and presenting it as though it had been would be a claim about code nobody
+  // looked at.
+  if (f.carried_forward) {
+    marks.push('<span class="mark-chip" title="Reported by an earlier review of this pull request and still open. This run reviewed only the newest commits and did not re-read this file.">carried forward</span>');
   }
   const markRow = marks.length ? `<div class="mark-row">${marks.join('')}</div>` : '';
 
@@ -2233,7 +2880,7 @@ function fixEligibility(f) {
       + 'would be a change to code that may not exist.';
   }
   if (f.suppressed_reason) {
-    return `In a path that is reported but not counted — ${f.suppressed_reason}.`;
+    return `Reported but not counted — ${f.suppressed_reason}.`;
   }
   if (!f.file_path) {
     return 'This finding names no file. It is about the design rather than a line of code, '
@@ -2301,6 +2948,14 @@ let _fixCapable = false;
 // Why not, when not — so a screen can say so once instead of saying nothing.
 let _fixBlockedReason = '';
 
+// Which screen and which run a finding's `file:line` should open. `renderFinding` is
+// called by fourteen renderers and cannot know which one it is inside, so the screen that
+// painted the result publishes it here — the same shape and the same reason as
+// `_fixCapable` above. Reading a file needs neither an entitlement nor a write, so the
+// only condition is that the run recorded a source at all (`AGENT_SCREENS[...].inventory`).
+let _openFileAgent = '';
+let _openFileRunId = '';
+
 /** Everything a freshly-painted result arms outside its own HTML: which screen owns it,
  *  whether its findings can be fixed, and its file-by-file inventory.
  *
@@ -2333,6 +2988,11 @@ function armResultActions(result, targetId) {
 
   _fixReviewId = result.review_id || null;
   _fixCapable = hasInventory && !!result.review_id && entitled;
+  // Deliberately not gated on `entitled`: opening a file the review already read is a
+  // read of the customer's own source, not a use of the Auto-Fix product. A plan without
+  // Auto-Fix still gets to see its findings in context.
+  _openFileAgent = hasInventory && result.review_id ? owner : '';
+  _openFileRunId = hasInventory && result.review_id ? result.review_id : '';
   _fixBlockedReason = (hasInventory && result.review_id && !entitled)
     ? 'Applying fixes is part of Auto-Fix, which this project\'s plan does not include.'
     : '';
@@ -2454,42 +3114,118 @@ function renderFixPlan(reviewId, d, picked) {
           <summary>${d.unavailable_files.length} file(s) cannot be patched</summary>
           <ul>${d.unavailable_files.map(u => `<li><code>${esc(u.path)}</code> — ${esc(u.reason)}</li>`).join('')}</ul>
         </details>` : ''}
-      <div class="form-group">
-        <label>Where the fix goes</label>
-        <div class="radio-stack">
-          ${outs.map((o, i) => `<label class="${o.unavailable ? 'radio-off' : ''}">
-            <input type="radio" name="fix-output" value="${esc(o.id)}"${i === 0 ? ' checked' : ''}${o.unavailable ? ' disabled' : ''} />
-            <b>${esc(o.label)}</b>${o.unavailable
-              ? ` — <span class="radio-why">cannot be used: ${esc(o.unavailable)}</span>`
-              : (o.note ? ` — ${esc(o.note)}` : '')}</label>`).join('')}
-        </div>
-      </div>
+      ${outs.length ? `<div class="cost-note">Where it can go once you have read it:
+        ${outs.filter(o => !o.unavailable).map(o => esc(o.label)).join(' · ') || 'nowhere — this review has no writable source'}.</div>` : ''}
       <div class="cost-actions">
         <button class="btn btn-primary" onclick="runFix('${esc(reviewId)}')">
-          Fix them — up to $${Number(e.ceiling_usd || 0).toFixed(2)}
+          Write the fix — up to $${Number(e.ceiling_usd || 0).toFixed(2)}
         </button>
         <button class="btn btn-secondary" onclick="closeFixPanel()">Cancel</button>
       </div>
+      <div class="field-hint">You will see the diff before anything is delivered, and
+        choosing where it goes then costs nothing more.</div>
     </div>`;
 }
 
+/** Generate the patch and show it. Delivers nothing.
+ *
+ *  This used to take the destination with it, so one click generated the patch *and*
+ *  opened the pull request — and the diff appeared in the result, after the branch already
+ *  existed. On a platform whose argument is that a human approves what an agent proposes,
+ *  remediation was the one place with no such step. The quote came before the spend and
+ *  nothing came before the write. */
 async function runFix(reviewId) {
   const picked = [...document.querySelectorAll('.fix-check:checked')].map(c => c.value);
-  const output = document.querySelector('input[name="fix-output"]:checked')?.value || 'diff';
   const panel = document.getElementById('fix-panel');
-  if (panel) panel.innerHTML = `<div class="source-panel">Fixing, then re-reviewing every
-    patch before offering it. This is the slow part and it is the point — a patch nobody
-    re-read is how a fix introduces a worse problem.</div>`;
+  if (panel) panel.innerHTML = `<div class="source-panel">Writing the fix, then re-reviewing
+    every patch before showing it. This is the slow part and it is the point — a patch
+    nobody re-read is how a fix introduces a worse problem.</div>`;
   try {
     const d = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/fix`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ finding_ids: picked, output }),
+      body: JSON.stringify({ finding_ids: picked, output: 'preview' }),
+    });
+    if (panel) panel.innerHTML = d.deliver_token ? renderFixPreview(reviewId, d) : renderFixResult(d);
+  } catch (e) {
+    if (panel) panel.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not
+      write the fixes — ${esc(e.message)}</div></div>`;
+  }
+}
+
+/** The patch, before it goes anywhere. */
+function renderFixPreview(reviewId, d) {
+  const outs = (d.available_outputs || []).filter(o => !o.unavailable);
+  const blockedOuts = (d.available_outputs || []).filter(o => o.unavailable);
+  return `
+    <div class="source-panel fix-preview">
+      <div class="section-title" style="margin-top:0">
+        ${d.files_patched.length} file(s) written — nothing delivered yet
+      </div>
+      <div class="cost-warn">${esc(d.verification_note || '')}</div>
+      ${(d.carried_over_criticals || []).length ? `
+        <div class="cost-warn">Still Critical after the fix, and reported before:
+          ${d.carried_over_criticals.map(t => esc(t)).join('; ')}. The patch was not
+          rejected for these — they were already known — but they are still in the file.</div>` : ''}
+      <ul>${d.files_patched.map(f =>
+        `<li><code>${esc(f.path)}</code> — ${esc(f.explanation || 'patched')}</li>`).join('')}</ul>
+      ${(d.blocked_patches || []).length ? `
+        <details class="review-panel panel-discarded" open>
+          <summary>${d.blocked_patches.length} patch(es) rejected before you saw them</summary>
+          <div class="field-hint">The guardrail working: a patch that introduced a secret,
+            or one whose re-review still found a Critical the original review had not
+            reported. These are not in the diff below and will not be delivered.</div>
+          <ul>${d.blocked_patches.map(b =>
+            `<li><code>${esc(b.path)}</code> — ${esc(b.reason)}</li>`).join('')}</ul>
+        </details>` : ''}
+      ${(d.unfixed_finding_titles || []).length ? `
+        <details class="cost-skipped">
+          <summary>${d.unfixed_finding_titles.length} finding(s) deliberately not fixed</summary>
+          <ul>${d.unfixed_finding_titles.map(u => `<li>${esc(u)}</li>`).join('')}</ul>
+        </details>` : ''}
+      ${d.diff ? `<details class="review-panel" open>
+        <summary>The diff — this is what will be delivered</summary>
+        ${renderUnifiedDiff(d.diff)}
+      </details>` : ''}
+      <div class="form-group">
+        <label>Where it goes</label>
+        <div class="radio-stack">
+          ${outs.map((o, i) => `<label>
+            <input type="radio" name="fix-deliver" value="${esc(o.id)}"${i === 0 ? ' checked' : ''} />
+            <b>${esc(o.label)}</b>${o.note ? ` — ${esc(o.note)}` : ''}</label>`).join('')}
+          ${blockedOuts.map(o => `<label class="radio-off">
+            <input type="radio" disabled />
+            <b>${esc(o.label)}</b> — <span class="radio-why">cannot be used: ${
+              esc(o.unavailable)}</span></label>`).join('')}
+        </div>
+      </div>
+      <div class="cost-actions">
+        <button class="btn btn-primary" onclick="deliverFix('${esc(reviewId)}','${esc(d.deliver_token)}')"
+          ${outs.length ? '' : 'disabled'}>Deliver it</button>
+        <button class="btn btn-secondary" onclick="closeFixPanel()">Discard the patch</button>
+      </div>
+      <div class="field-hint">Delivering calls no model and costs nothing — the diff above
+        is the one that ships. Discarding it writes nothing anywhere.</div>
+    </div>`;
+}
+
+/** Put the previewed patch where the reader chose. No model, no further cost. */
+async function deliverFix(reviewId, token) {
+  const output = document.querySelector('input[name="fix-deliver"]:checked')?.value || 'diff';
+  const panel = document.getElementById('fix-panel');
+  if (panel) panel.innerHTML = `<div class="source-panel">Delivering the patch you read…</div>`;
+  try {
+    const d = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/fix/deliver`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deliver_token: token, output }),
     });
     if (panel) panel.innerHTML = renderFixResult(d);
   } catch (e) {
     if (panel) panel.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not
-      apply the fixes — ${esc(e.message)}</div></div>`;
+      deliver the patch — ${esc(e.message)}</div>
+      <div class="cost-actions"><button class="btn btn-secondary"
+        onclick="runFix('${esc(reviewId)}')">Write it again</button></div></div>`;
   }
 }
 
@@ -2539,9 +3275,57 @@ function renderFixResult(d) {
         </details>` : ''}
       ${d.diff ? `<details class="review-panel" open>
         <summary>The diff — read this before applying any of it</summary>
-        <div class="file-view-body"><pre class="fix-diff">${esc(d.diff)}</pre></div>
+        ${renderUnifiedDiff(d.diff)}
       </details>` : ''}
     </div>`;
+}
+
+/** A unified diff, line-coloured.
+ *
+ *  This was one escaped `<pre>`: the only diff in the application, on the screen that asks
+ *  you to read a patch before it reaches your repository, rendered as undifferentiated
+ *  monospace. An uncoloured diff of any size is a diff nobody reads, which makes the
+ *  "read this first" instruction above it decorative.
+ *
+ *  Deliberately not side-by-side. A unified diff is what `git` shows, what the patch
+ *  actually is, and what fits a 220px-sidebar layout without a horizontal scroller of its
+ *  own; two panes would be a second reading experience to keep consistent with this one.
+ *
+ *  Line numbers come from the `@@` hunk headers rather than from counting, because a diff's
+ *  own numbering is the only one that maps back to the file — and the old-file and new-file
+ *  numbers advance at different rates, which is exactly the thing a reader cannot do in
+ *  their head. */
+function renderUnifiedDiff(diff) {
+  const rows = [];
+  let oldNo = 0, newNo = 0;
+  for (const raw of String(diff || '').split('\n')) {
+    const line = raw.replace(/\r$/, '');
+    let cls = 'dl-ctx', left = '', right = '';
+    if (line.startsWith('@@')) {
+      // @@ -12,7 +12,9 @@ — restart both counters from what the hunk declares.
+      const m = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (m) { oldNo = Number(m[1]); newNo = Number(m[2]); }
+      cls = 'dl-hunk';
+    } else if (/^(diff |index |--- |\+\+\+ |new file|deleted file|similarity |rename )/.test(line)) {
+      cls = 'dl-meta';
+    } else if (line.startsWith('+')) {
+      cls = 'dl-add'; right = newNo++;
+    } else if (line.startsWith('-')) {
+      cls = 'dl-del'; left = oldNo++;
+    } else if (line.startsWith('\\')) {
+      cls = 'dl-meta';                       // "\ No newline at end of file"
+    } else {
+      left = oldNo++; right = newNo++;
+    }
+    rows.push(`<tr class="${cls}"><td class="dl-n">${left}</td><td class="dl-n">${right}</td>`
+      + `<td class="dl-s">${esc(line) || '&nbsp;'}</td></tr>`);
+  }
+  const added = (String(diff || '').match(/^\+(?!\+\+)/gm) || []).length;
+  const removed = (String(diff || '').match(/^-(?!--)/gm) || []).length;
+  return `<div class="diff-head"><span class="dl-stat dl-stat-add">+${added}</span>
+      <span class="dl-stat dl-stat-del">-${removed}</span>
+      <span class="field-hint">line numbers are the file's own, taken from the hunk headers</span></div>
+    <div class="file-view-body"><table class="diff-view"><tbody>${rows.join('')}</tbody></table></div>`;
 }
 
 /** Same reason `downloadSarif` exists: a link sends no auth header and 401s. */
@@ -2575,6 +3359,63 @@ async function downloadFixZip(url) {
 const FINDINGS_PAGE_SIZE = 25;
 let _findingsOffset = 0;
 
+/** Reset every filter to the state the screen opens in. Without this the only way back
+ *  from a four-filter search that returned nothing was to clear four controls by hand,
+ *  which is where a user concludes the screen is broken. */
+function clearFindingFilters() {
+  ['findings-q', 'findings-repo', 'findings-control'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
+  const status = document.getElementById('findings-status');
+  if (status) status.value = 'open';
+  ['findings-severity', 'findings-since', 'findings-product'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = id === 'findings-severity' ? '0' : '';
+  });
+  loadFindings(0);
+}
+
+/** Fill the agent filter from the product catalogue rather than a hardcoded list.
+ *
+ *  `GET /api/v1/products` is already fetched for entitlements, and it is the only list
+ *  that cannot drift from what the backend actually runs — a hardcoded set here would be
+ *  a third place agent names live, after the registry and `AGENT_SCREENS`. */
+async function _fillFindingProducts() {
+  const sel = document.getElementById('findings-product');
+  if (!sel || sel.dataset.filled) return;
+  try {
+    const data = await apiFetch('/api/v1/products', { _silent: true });
+    const rows = (data.products || [])
+      .filter(p => p.review_type)   // only products that write findings can be filtered on
+      .sort((a, b) => String(a.title).localeCompare(String(b.title)));
+    sel.innerHTML = '<option value="">Any agent</option>'
+      + rows.map(p => `<option value="${esc(p.id)}">${esc(p.title)}</option>`).join('');
+    sel.dataset.filled = '1';
+  } catch (e) {
+    // A filter that could not be populated is left as "Any agent" rather than blocking the
+    // screen: the rest of the queue still works without it.
+    feLog.warn('Could not fill the agent filter', { source: 'findings' });
+  }
+}
+
+/** Apply `#/findings?q=…&repo=…` to the controls, so a shared link opens the same queue. */
+function _applyFindingHashFilters() {
+  const raw = (location.hash || '').split('?')[1];
+  if (!raw) return false;
+  const qs = new URLSearchParams(raw);
+  const put = (id, key) => {
+    const el = document.getElementById(id);
+    if (el && qs.has(key)) el.value = qs.get(key);
+  };
+  put('findings-q', 'q');
+  put('findings-repo', 'repo');
+  put('findings-control', 'control_id');
+  put('findings-product', 'product_id');
+  put('findings-severity', 'min_severity');
+  const status = document.getElementById('findings-status');
+  if (status) status.value = qs.get('status') || '';
+  return true;
+}
+
 async function loadFindings(offset) {
   _findingsOffset = Math.max(0, offset || 0);
   const wrap = document.getElementById('findings-list');
@@ -2582,12 +3423,31 @@ async function loadFindings(offset) {
   if (!wrap) return;
   wrap.innerHTML = '<div class="empty-state">Loading…</div>';
 
-  const status = document.getElementById('findings-status').value;
-  const minSeverity = document.getElementById('findings-severity').value;
+  const val = id => (document.getElementById(id) || {}).value || '';
   const params = new URLSearchParams({
-    limit: FINDINGS_PAGE_SIZE, offset: _findingsOffset, min_severity: minSeverity,
+    limit: FINDINGS_PAGE_SIZE, offset: _findingsOffset,
+    min_severity: val('findings-severity') || '0',
   });
+  const status = val('findings-status');
   if (status) params.set('status', status);
+  if (val('findings-q').trim()) params.set('q', val('findings-q').trim());
+  if (val('findings-product')) params.set('product_id', val('findings-product'));
+  if (val('findings-repo').trim()) params.set('repo', val('findings-repo').trim());
+  if (val('findings-control').trim()) params.set('control_id', val('findings-control').trim());
+  // "Last 30 days" is a day count in the control and an ISO instant on the wire: the
+  // server filters on `reviews.created_at`, and a relative window resolved in the browser
+  // is the only place the user's own clock is the right one to use.
+  const days = Number(val('findings-since'));
+  if (days > 0) {
+    params.set('since', new Date(Date.now() - days * 86400000).toISOString());
+  }
+  // The address carries the filter, so a filtered queue is a link — "here are the open
+  // Criticals in payments" is the message somebody actually wants to send.
+  _setHash('#/findings' + (params.get('q') || params.get('repo') || params.get('control_id')
+    || params.get('product_id') || params.get('since') || status !== 'open'
+    ? '?' + new URLSearchParams([...params].filter(([k]) =>
+        !['limit', 'offset'].includes(k))).toString()
+    : ''));
 
   try {
     const data = await apiFetch(`/api/v1/findings?${params}`);
@@ -3050,6 +3910,15 @@ function _foldSpendHeaders(res, body) {
   // A response without a readable header bag is not an error worth raising from inside a
   // successful request: cross-origin without `expose_headers`, or a test double.
   if (!res || !res.headers || typeof res.headers.get !== 'function') return body;
+  // Read before the two early returns below. A run that reached no model still ran without
+  // a project, and a free preflight is the moment a person can still fix that -- gating the
+  // warning on spend would hide it exactly when it is most actionable. The body wins if the
+  // route already put one there (`guarded_call` does, on the /api/v1 surface).
+  const projWarn = res.headers.get('X-Project-Warning');
+  if (projWarn && body && typeof body === 'object' && !body._project_warning) {
+    body._project_warning = projWarn;
+  }
+
   const cost = res.headers.get('X-Spend-Cost-USD');
   const calls = res.headers.get('X-Spend-Calls');
   // No header at all means the route is not metered this way (a v1 route, a static file, a
@@ -3076,10 +3945,90 @@ function _foldSpendHeaders(res, body) {
 
 // ── Architecture Review ────────────────────────────────────────────────────
 
+// ── The three architecture modes, which used to be one word in a payload ──
+//
+// `review`, `recommend` and `compare` sent an identical body with `review_mode` changed,
+// and the screen never changed with it. Two consequences, both visible to a user before
+// this: in `recommend` you typed your requirements into a box labelled "Architecture /
+// System Description", and in `compare` you pasted several designs into one box with no
+// separator convention, so the model had to guess where each began.
+//
+// What is deliberately NOT fixed here: `ARCHITECTURE_TOOL_SCHEMA` has a single
+// `quality_scores` object and a single `architecture_type`, so per-option scoring is
+// impossible without changing the schema — and changing a schema changes what the model
+// answers, which has to be measured rather than assumed (D-344). There is no architecture
+// eval to measure it with. So the input is fixed now and the output stays as it is, with
+// the screen saying plainly what comes back.
+const ARCH_MODE_LABELS = {
+  review: 'Architecture / System Description',
+  recommend: 'What the system has to do',
+  compare: 'Architecture / System Description',
+};
+
+function onArchModeChange() {
+  const mode = (document.getElementById('arch-mode') || {}).value || 'review';
+  const artifactWrap = document.getElementById('arch-artifact-wrap');
+  const compareWrap = document.getElementById('arch-compare-wrap');
+  if (artifactWrap) artifactWrap.classList.toggle('hidden', mode === 'compare');
+  if (compareWrap) compareWrap.classList.toggle('hidden', mode !== 'compare');
+
+  const label = document.getElementById('arch-artifact-label');
+  if (label) {
+    label.innerHTML = `${esc(ARCH_MODE_LABELS[mode] || ARCH_MODE_LABELS.review)}
+      <span class="required">*</span>`;
+  }
+  const box = document.getElementById('arch-artifact');
+  if (box && mode === 'recommend') {
+    box.placeholder = 'Describe what you need built, not what exists — the scale it has to '
+      + 'reach, the data it holds, the constraints it works under.\n\ne.g. A clinical '
+      + 'decision support system. 500k patients, 10k concurrent users, PHI, 99.99% uptime, '
+      + 'HIPAA, AI risk scores refreshed hourly.';
+  }
+  if (mode === 'compare' && !document.querySelectorAll('.arch-option').length) {
+    addArchOption(); addArchOption();          // comparing needs at least two
+  }
+}
+
+function addArchOption() {
+  const wrap = document.getElementById('arch-compare-options');
+  if (!wrap) return;
+  const n = wrap.querySelectorAll('.arch-option').length + 1;
+  const row = document.createElement('div');
+  row.className = 'arch-option';
+  row.innerHTML = `
+    <div class="arch-option-head">
+      <input type="text" class="arch-option-name" placeholder="Option ${n} name — e.g. Modular monolith" />
+      <button type="button" class="about-link" onclick="this.closest('.arch-option').remove()">Remove</button>
+    </div>
+    <textarea class="arch-option-text" rows="5"
+      placeholder="Describe this option — components, data stores, how they communicate, how it deploys."></textarea>`;
+  wrap.appendChild(row);
+}
+
+// The options as one artifact, but a *delimited* one: each option is named and fenced, so
+// the model is not inferring boundaries from paragraph breaks.
+function architectureArtifact() {
+  const mode = (document.getElementById('arch-mode') || {}).value || 'review';
+  if (mode !== 'compare') return document.getElementById('arch-artifact').value.trim();
+  const rows = [...document.querySelectorAll('#arch-compare-options .arch-option')];
+  const opts = rows.map((row, i) => ({
+    name: row.querySelector('.arch-option-name').value.trim() || `Option ${i + 1}`,
+    text: row.querySelector('.arch-option-text').value.trim(),
+  })).filter(o => o.text);
+  if (opts.length < 2) return '';
+  return ['Compare the following architecture options against each other.', '']
+    .concat(opts.map(o => `## ${o.name}\n\n${o.text}\n`)).join('\n');
+}
+
 async function runArchitectureReview() {
-  const artifact = document.getElementById('arch-artifact').value.trim();
-  if (!artifact) { alert('Please describe the architecture or requirements.'); return; }
   const mode = document.getElementById('arch-mode').value;
+  const artifact = architectureArtifact();
+  if (!artifact) {
+    alert(mode === 'compare'
+      ? 'Comparing needs at least two options, each with a description.'
+      : 'Please describe the architecture or requirements.');
+    return;
+  }
   const modeLabels = { review: 'Reviewing architecture', recommend: 'Generating architecture recommendations', compare: 'Comparing architecture options' };
   showLoading(`${modeLabels[mode] || 'Running'}… this may take 20–40 seconds`);
   try {
@@ -3092,6 +4041,7 @@ async function runArchitectureReview() {
         review_mode:  mode,
         context:      document.getElementById('arch-context').value.trim(),
         project_name: document.getElementById('arch-project').value.trim(),
+        derived_from: chainedFrom('architecture'),
       }),
     });
     renderArchitectureResult('arch-result', result);
@@ -3375,6 +4325,7 @@ async function runSecurityReview() {
         system_type:  document.getElementById('sec-type').value.trim(),
         context:      document.getElementById('sec-context').value.trim(),
         project_name: document.getElementById('sec-project').value.trim(),
+        derived_from: chainedFrom('security'),
       }),
     });
     renderSecurityResult('security-result', result);
@@ -3893,23 +4844,6 @@ async function runCFR21Verification() {
   finally { hideLoading(); }
 }
 
-async function uploadCFR21Zip() {
-  const file = document.getElementById('cfr-zip-input').files[0];
-  if (!file) return;
-  if (!file.name.endsWith('.zip')) { alert('Only .zip files are accepted.'); return; }
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('system_description', document.getElementById('cfr-system-desc').value.trim());
-  fd.append('project_name', document.getElementById('cfr-project').value.trim());
-  showLoading(`Extracting and verifying ${file.name}… this may take 1-2 minutes for a full codebase`);
-  try {
-    const result = await apiFetch('/api/review/cfr21-verification/upload-zip', { method: 'POST', body: fd });
-    renderCFR21Result('cfr21-result', result);
-    loadDashboard();
-  } catch (e) { showError('cfr21-result', e.message); }
-  finally { hideLoading(); document.getElementById('cfr-zip-input').value = ''; }
-}
-
 function renderCFR21Result(targetId, r) {
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
@@ -3943,7 +4877,12 @@ function renderCFR21Result(targetId, r) {
     ${renderReviewTransparency(r)}
     <div class="summary-box">${esc(r.summary || '')}</div>
 
-    ${scanned.length ? `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">Files scanned (${scanned.length}): ${scanned.map(esc).join(', ')}</p>` : ''}
+    ${scanned.length
+      ? `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">Files the
+         assessment names (${scanned.length}): ${scanned.map(esc).join(', ')}</p>`
+      : `<p style="font-size:12px;color:var(--text-muted);margin-top:8px">The assessment did
+         not name the files it examined. That is not the same as it having examined all of
+         them — see the coverage note above.</p>`}
 
     <div class="section-title" style="margin-top:20px">Assessments</div>
     ${renderAssessment('Audit Trail (§11.10(e))', r.audit_trail_assessment)}
@@ -4123,30 +5062,6 @@ async function runGxPPlan() {
     renderGxPPlan('gxg-plan-result', result);
   } catch (e) { showError('gxg-plan-result', e.message); }
   finally { hideLoading(); }
-}
-
-async function uploadGxPPlanZip() {
-  const file = document.getElementById('gxg-zip-input').files[0];
-  if (!file) return;
-  if (!file.name.endsWith('.zip')) { alert('Only .zip files are accepted.'); return; }
-  _gxgState.systemDescription = document.getElementById('gxg-system-desc').value.trim();
-  _gxgState.projectName = document.getElementById('gxg-project').value.trim();
-  _gxgState.code = '';
-  _gxgState.generatedDocs = [];
-  document.getElementById('gxg-documents-result').classList.add('hidden');
-
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('system_description', _gxgState.systemDescription);
-  fd.append('project_name', _gxgState.projectName);
-  showLoading(`Extracting ${file.name} and planning the validation package…`);
-  try {
-    const result = await apiFetch('/api/review/gxp-generate-plan/upload-zip', { method: 'POST', body: fd });
-    _gxgState.files = result.files_extracted || [];
-    _gxgState.plan = result;
-    renderGxPPlan('gxg-plan-result', result);
-  } catch (e) { showError('gxg-plan-result', e.message); }
-  finally { hideLoading(); document.getElementById('gxg-zip-input').value = ''; }
 }
 
 function renderGxPPlan(targetId, r) {
@@ -5187,11 +6102,39 @@ function filterApprovals(status, btn) {
   loadApprovals(status);
 }
 
+/** The screen key for a stored `reviews.review_type`, or '' when no screen owns it.
+ *
+ *  An approval covers runs, and a reviewer being asked "ship this or not" needs to read the
+ *  findings behind them -- there was no link from an approval to anything at all (C-39).
+ *  `openAgentRun` and the hash router are keyed on the *screen*, not the review type, so
+ *  this is the join between them.
+ *
+ *  Returns '' for a review type no screen owns -- modernization and the governance report
+ *  are deliberately absent from AGENT_SCREENS because they have their own, richer histories
+ *  (see that table's own comment). Those render as plain text rather than as a link that
+ *  would go nowhere. `full` *is* in the table, so a Core SDLC Review does link.
+ */
+function _screenForReviewType(reviewType) {
+  if (!reviewType) return '';
+  for (const [screen, spec] of Object.entries(AGENT_SCREENS)) {
+    if (spec.reviewType === reviewType) return screen;
+  }
+  return '';
+}
+
 function renderApprovalCard(a) {
   const statusCls = a.status || 'pending';
   const priCls = a.priority || 'normal';
-  const gateIcon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[a.review_gate] || '❓';
+  // The *release* gate, not the raising review's own. One sign-off now covers every run in
+  // the API call that produced it, so a Core SDLC Review is one decision instead of three
+  // queue items -- and a release holding one Red is Red even if the run that happened to
+  // raise the request was Amber. Falls back to the old field for a row raised outside a
+  // request, which covers nothing but itself.
+  const gate = a.release_gate || a.review_gate;
+  const gateIcon = { Green: '✅', Amber: '⚠️', Red: '🔴' }[gate] || '❓';
   const dateStr = (a.created_at || '').slice(0, 16).replace('T', ' ');
+  const covered = a.covered_reviews || [];
+  const nCovered = a.covered_count || covered.length;
   const pendingActions = a.status === 'pending' ? `
     <textarea class="approval-comment-input" id="comment-${a.id}" placeholder="Decision comment (optional)…" rows="2"></textarea>
     <div class="approval-actions">
@@ -5210,18 +6153,35 @@ function renderApprovalCard(a) {
         <div class="approval-card-meta">
           <div class="approval-project-name">${esc(a.project_name || 'Unnamed Project')}</div>
           <div class="approval-sub-meta">
-            Review ID: ${(a.review_id || '').slice(0, 8)}… · Requested by: ${esc(a.requested_by || 'system')} · ${dateStr}
+            ${nCovered > 1
+              ? `Covers ${nCovered} runs in one release`
+              : `Review ID: ${(a.review_id || '').slice(0, 8)}…`} ·
+            Requested by: ${esc(a.requested_by || 'system')} · ${dateStr}
           </div>
         </div>
         <span class="approval-status-badge ${statusCls}">${statusCls}</span>
         <span class="approval-priority-badge ${priCls}">${priCls}</span>
       </div>
       <div class="approval-review-info">
-        <span>${gateIcon} Gate: <strong>${esc(a.review_gate || '—')}</strong></span>
-        <span>Type: <strong>${esc(a.review_type || '—')}</strong></span>
-        <span>Risk: <strong>${a.risk_score ?? '—'}/100</strong></span>
-        <span>Findings: <strong>${a.findings_count ?? 0}</strong> (${a.critical_count ?? 0} critical)</span>
+        <span>${gateIcon} Gate: <strong>${esc(gate || '—')}</strong></span>
+        <span>Type: <strong>${nCovered > 1
+          ? esc(covered.map(c => c.review_type).join(', '))
+          : esc(a.review_type || '—')}</strong></span>
+        <span>Risk: <strong>${a.release_risk_score ?? a.risk_score ?? '—'}/100</strong></span>
+        <span>Findings: <strong>${a.release_findings ?? a.findings_count ?? 0}</strong>
+          (${a.release_critical ?? a.critical_count ?? 0} critical)</span>
       </div>
+      ${nCovered > 1 ? `<div class="field-hint">You are approving the release, not one run.
+        This decision covers every run below; approving it releases all of them.
+        <ul class="recs-list">${covered.map(c => {
+          const screen = _screenForReviewType(c.review_type);
+          const label = `${esc(c.review_type || 'review')} — gate
+            <b>${esc(c.gate_status || '—')}</b>, ${c.findings_count ?? 0} finding(s),
+            ${c.critical_count ?? 0} critical`;
+          return `<li>${screen
+            ? `<a href="#/${screen}/run/${esc(c.review_id)}">${label}</a>`
+            : label}</li>`;
+        }).join('')}</ul></div>` : ''}
       ${pendingActions}
     </div>`;
 }
@@ -6227,23 +7187,49 @@ async function loadUsage() {
     } catch { productSelect.innerHTML = '<option value="">All products</option>'; }
   }
 
-  // Same, for projects. This page is super-admin only, so the list is every project —
-  // which is the point: it is the one screen that spans customers.
+  // Same, for projects. `/api/v1/projects` already returns only what the caller may see, so
+  // a project admin gets their own and a super admin gets every one — which is the point of
+  // this screen for a super admin: it is the one view that spans customers.
+  //
+  // The difference is "All projects". A super admin may leave it blank and read the whole
+  // ledger; a project admin may not, because there is no cross-customer endpoint for them
+  // to call. So for them the blank option is dropped and one project is always selected.
   const projectSelect = document.getElementById('usage-filter-project');
+  const crossCustomer = isSuperAdmin();
   if (projectSelect && !projectSelect.options.length) {
     try {
       const data = await apiFetch('/api/v1/projects', { _silent: true });
-      projectSelect.innerHTML = '<option value="">All projects</option>' +
-        (data.projects || []).map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
-    } catch { projectSelect.innerHTML = '<option value="">All projects</option>'; }
+      const opts = (data.projects || [])
+        .map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+      projectSelect.innerHTML = (crossCustomer ? '<option value="">All projects</option>' : '') + opts;
+      if (!crossCustomer && !projectSelect.value && projectSelect.options.length) {
+        projectSelect.selectedIndex = 0;
+      }
+    } catch {
+      projectSelect.innerHTML = crossCustomer
+        ? '<option value="">All projects</option>'
+        : '<option value="">No projects you administer</option>';
+    }
   }
 
   stats.innerHTML = '<div class="empty-state">Loading…</div>';
   const query = _usageQuery();
+  // Which surface. A project admin reads `/usage/projects/<id>/…`, where the project is the
+  // URL and not a parameter — the server overrides any `project_id` query value with the
+  // path, so there is nothing to fiddle with. A super admin keeps the cross-customer routes.
+  const scopeId = crossCustomer ? '' : (projectSelect?.value || '');
+  if (!crossCustomer && !scopeId) {
+    stats.innerHTML = `<div class="empty-state">You do not administer any project, so there
+      is no spend to show you. Ask a super admin to make you an admin of one.</div>`;
+    return;
+  }
+  const base = crossCustomer
+    ? '/api/v1/usage'
+    : `/api/v1/usage/projects/${encodeURIComponent(scopeId)}`;
   try {
     const [summary, recent] = await Promise.all([
-      apiFetch(`/api/v1/usage/summary?${query}`, { _silent: true }),
-      apiFetch(`/api/v1/usage/events?limit=50&${query}`, { _silent: true }),
+      apiFetch(`${base}/summary?${query}`, { _silent: true }),
+      apiFetch(`${base}/events?limit=50&${query}`, { _silent: true }),
     ]);
     _renderUsageStats(summary);
     _renderUsageByProduct(summary.by_product || []);
@@ -6388,7 +7374,12 @@ async function downloadUsageCsv() {
 
 _restoreNavSectionState();
 _loadAuthState();
-loadDashboard();
+// Routing is kicked off at the *end of the file*, not here. This init block sits in the
+// middle of a 10,000-line script, and `_applyHash` reaches `AGENT_SCREENS` and
+// `_openRunId` — both `const`, both declared ~3,000 lines below. Calling it from here
+// works for `#/dashboard` and throws a temporal-dead-zone `ReferenceError` for every
+// agent address, which is the half of the feature worth having. Search for
+// "Routing, last" at the bottom.
 
 // ── Legacy Modernization ───────────────────────────────────────────────────
 //
@@ -6541,20 +7532,44 @@ async function createModernizationRun() {
   const fileInput = document.getElementById('mod-zip');
   const cap = document.getElementById('mod-cap').value;
   const ext = document.getElementById('mod-ext').value.trim();
+  const repo = (document.getElementById('mod-repo-url') || {}).value.trim();
   if (!name || !target) { alert('Run name and target stack are required.'); return; }
-  if (!fileInput.files.length) { alert('Choose a zip of the source repository.'); return; }
+  if (!fileInput.files.length && !repo) {
+    alert('Choose a zip of the source repository, or give a repository URL.');
+    return;
+  }
+  // Both would leave the run without a single source of truth for what it converted, and
+  // the JSON and multipart endpoints take different shapes — so this is a choice, not a
+  // precedence rule that would silently ignore one of them.
+  if (fileInput.files.length && repo) {
+    alert('Give a zip or a repository URL, not both — a run converts one source.');
+    return;
+  }
 
-  const form = new FormData();
-  form.append('file', fileInput.files[0]);
-  form.append('name', name);
-  form.append('target_stack', target);
-  if (ext) form.append('extensions', ext);
-  if (cap) form.append('budget_cap_usd', cap);
-
-  showLoading('Reading the archive, redacting secrets and building the dependency graph…');
+  showLoading('Reading the source, redacting secrets and building the dependency graph…');
   try {
-    // FormData sets its own multipart boundary — never set Content-Type by hand here.
-    const run = await apiFetch('/api/v1/modernization/runs/upload', { method: 'POST', body: form });
+    let run;
+    if (repo) {
+      // `POST /runs` has accepted `github_repo_url` since it was written; only this screen
+      // never offered it (`routes/modernization.py`, `_fetch_github_repo`).
+      run = await apiFetch('/api/v1/modernization/runs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name, target_stack: target, github_repo_url: repo,
+          extensions: ext ? ext.split(',').map(x => x.trim()).filter(Boolean) : undefined,
+          budget_cap_usd: cap ? Number(cap) : undefined,
+        }),
+      });
+    } else {
+      const form = new FormData();
+      form.append('file', fileInput.files[0]);
+      form.append('name', name);
+      form.append('target_stack', target);
+      if (ext) form.append('extensions', ext);
+      if (cap) form.append('budget_cap_usd', cap);
+      // FormData sets its own multipart boundary — never set Content-Type by hand here.
+      run = await apiFetch('/api/v1/modernization/runs/upload', { method: 'POST', body: form });
+    }
     await loadModernizationRuns();
     openModernizationRun(run.id);
   } catch (e) {
@@ -8036,8 +9051,101 @@ function renderModernizationArtifacts(data) {
       </details>`).join('')
       : `<div class="mod-meta" style="margin-top:10px">No file's path contains “${esc(_modArtifactQuery)}”.</div>`}`
     : '<div class="mod-meta" style="margin-top:10px">Nothing has been written yet. Files appear here as components convert.</div>'}
+  </div>
+  ${renderModernizationDelivery(all.length)}`;
+}
+
+
+// ── Pushing a converted codebase, and letting the customer's CI compile it ──
+//
+// `workflows/modernization_pr.py` has existed since the build loop was written and no
+// screen ever offered it, so the only way to reach it was curl. It is not "export, but to
+// GitHub": the pull request carries `.github/workflows/modernization-build.yml`, which
+// compiles the branch on the customer's own runner and POSTs the compiler output back to
+// `POST /runs/{id}/build-results` — where the ingest maps each diagnostic to the unit that
+// produced the file and sets it back to `ready`, so the claim loop re-converts it.
+//
+// Nothing on this platform builds converted code (D-05: building customer source on the API
+// host is arbitrary code execution), so until that loop closes, a type error in generated C#
+// reaches the customer rather than the agent (C-42). This button is how it closes.
+//
+// The target repository is asked for rather than inferred: a PHP → .NET conversion usually
+// belongs in a *new* repository, so guessing from the run's source would be wrong more often
+// than right. The route says the same thing in its own docstring.
+function renderModernizationDelivery(count) {
+  if (!count) return '';
+  return `<div class="mod-panel" style="margin-top:14px">
+    <div class="section-title" style="margin-top:0">Push to GitHub and let your CI compile it</div>
+    <p class="subtitle" style="margin-top:-6px">
+      Commits all ${count} converted file(s) to a branch of a repository you name, opens a
+      pull request, and adds a build workflow that compiles the branch on your own runner
+      and reports the compiler errors back here. Failing units are then re-queued and
+      re-converted automatically &mdash; <b>nothing on this platform compiles your code</b>,
+      so this is the only path that closes that loop. Usually a <b>new</b> repository, not
+      the legacy one.
+    </p>
+    <div class="form-row">
+      <div class="form-group flex1">
+        <label>Owner <span class="required">*</span></label>
+        <input type="text" id="mod-pr-owner" placeholder="github account or organisation" />
+      </div>
+      <div class="form-group flex1">
+        <label>Repository <span class="required">*</span></label>
+        <input type="text" id="mod-pr-repo" placeholder="the target repo, usually a new one" />
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group flex1">
+        <label>Base branch (optional)</label>
+        <input type="text" id="mod-pr-base" placeholder="defaults to the repository's own default" />
+      </div>
+      <div class="form-group flex1">
+        <label>.NET version for the build workflow</label>
+        <input type="text" id="mod-pr-dotnet" value="8.0.x" />
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="openModernizationPR()">
+        <span class="btn-icon">&#128640;</span> Push and open a pull request
+      </button>
+    </div>
+    <div id="mod-pr-result"></div>
   </div>`;
 }
+
+async function openModernizationPR() {
+  const owner = (document.getElementById('mod-pr-owner').value || '').trim();
+  const repo = (document.getElementById('mod-pr-repo').value || '').trim();
+  const out = document.getElementById('mod-pr-result');
+  if (!owner || !repo) { alert('Name the owner and repository to push to.'); return; }
+  if (!confirm(`Commit this run's converted code to ${owner}/${repo} and open a pull `
+             + `request? This writes to that repository.`)) return;
+  out.innerHTML = '<div class="cost-note">Committing the converted tree and opening the '
+    + 'pull request… this calls no model.</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/github-pr`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        owner, repo,
+        base_branch: (document.getElementById('mod-pr-base').value || '').trim(),
+        dotnet_version: (document.getElementById('mod-pr-dotnet').value || '').trim() || '8.0.x',
+      }),
+    });
+    const url = r.pull_request_url || r.pr_url || (r.pull_request || {}).url || '';
+    out.innerHTML = `<div class="cost-note">
+      Pushed ${Number(r.files_committed || r.files || 0).toLocaleString()} file(s) to
+      <b>${esc(r.branch || 'the branch')}</b>.
+      ${url ? `<a href="${esc(url)}" target="_blank" rel="noopener">Open the pull request</a>.` : ''}
+      The build workflow runs on your runner and reports back here; failing units return to
+      <b>ready</b> and are re-converted.</div>`;
+  } catch (e) {
+    // The commonest failure by far is a missing PUBLIC_BASE_URL, and the route answers that
+    // with a sentence explaining why a callback cannot be derived from the request. Showing
+    // it verbatim is more useful than a generic "could not push".
+    out.innerHTML = `<div class="cost-note cost-note-bad">${esc(e.message)}</div>`;
+  }
+}
+
 
 function filterModernizationArtifacts(value, caret) {
   _modArtifactQuery = value || '';
@@ -9451,7 +10559,7 @@ function renderReviewSources(agent, d) {
     </div>`;
 }
 
-async function openReviewFile(agent, reviewId, path) {
+async function openReviewFile(agent, reviewId, path, line = 0) {
   const box = document.getElementById(`${agent}-file-view`);
   if (!box) return;
   box.innerHTML = `<div class="mod-panel">Reading <code>${esc(path)}</code>…</div>`;
@@ -9478,8 +10586,16 @@ async function openReviewFile(agent, reviewId, path) {
           <button class="btn-link" onclick="document.getElementById('${agent}-file-view').innerHTML=''">Close</button>
         </div>
         <div class="file-view-body"><table class="code-view"><tbody>${lines.map((l, i) =>
-          `<tr><td class="ln">${i + 1}</td><td class="src">${esc(l) || '&nbsp;'}</td></tr>`).join('')}</tbody></table></div>
+          `<tr${i + 1 === Number(line) ? ' class="code-line-hit" id="code-line-hit"' : ''}><td class="ln">${
+            i + 1}</td><td class="src">${esc(l) || '&nbsp;'}</td></tr>`).join('')}</tbody></table></div>
       </div>`;
+    // Bring the finding's own line into view inside the file's scroller. A 900-line file
+    // opened at the top, with the line that mattered somewhere below the fold, is the
+    // reason reading a finding in context was a manual search.
+    if (Number(line) > 0) {
+      document.getElementById('code-line-hit')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
   } catch (e) {
     box.innerHTML = `<div class="source-panel"><div class="cost-warn">Could not read
       ${esc(path)} — ${esc(e.message)}</div></div>`;
@@ -9638,6 +10754,649 @@ function screenForReview(result) {
 // `("code", "github_pr_url", "github_file_url")` while the screen visibly offers a zip
 // upload, a repository at a ref and a branch comparison as well — so rendering it as
 // "Accepts" would contradict the tabs directly above it, which is worse than saying nothing.
+// ── A document as the input to a screen that takes prose ──────────────────
+//
+// Requirements, test bases and stack briefs arrive as Word documents and PDFs, and three
+// screens could only be typed into. Extraction is its own step rather than an
+// upload-and-run route per screen: the text lands in the box, the person sees what was
+// actually pulled out of their file, and only then presses the button. A scanned PDF that
+// yields two words of noise is worth noticing before paying to review it.
+async function attachDocument(fieldId, input, noteId) {
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  const field = document.getElementById(fieldId);
+  const note = noteId ? document.getElementById(noteId) : null;
+  if (field && field.value.trim()
+      && !confirm('Replace what is already in that box with this document?')) {
+    input.value = '';
+    return;
+  }
+  if (note) note.textContent = `Reading ${file.name}…`;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const d = await apiFetch('/api/documents/extract', { method: 'POST', body: fd });
+    field.value = d.text;
+    if (note) {
+      note.textContent = `${d.chars.toLocaleString()} characters read from ${d.filename}. `
+        + 'Check it looks right before running — reading the file was free, the run is not.';
+    }
+  } catch (e) {
+    if (note) note.textContent = `Could not read that file: ${e.message}`;
+    else alert(`Could not read that file: ${e.message}`);
+  } finally {
+    input.value = '';                     // so choosing the same file again re-fires change
+  }
+}
+
+// ── Reviewing a design from the code that implements it ───────────────────
+//
+// Architecture and Security Review answer one holistic question, so unlike Code Review and
+// VAPT they cannot be fanned out over chunks — and a repository does not fit in one call.
+// The backend computes a structural description instead (`services/code_brief.py`), which
+// does fit, and reviews that. Both facts a person needs before spending are free: what the
+// call will cost, and how much of their codebase could actually be parsed.
+//
+// **The run button stays disabled until a quote exists.** Not politeness — the quote is the
+// only place the coverage statement appears before the money is spent, and a repository
+// whose language has no parser produces a much thinner review than the screen otherwise
+// implies. The two are shown together so the second is read.
+// One row per screen that can read a codebase without being the Code Review screen. The
+// element ids are irregular for the same reason `AGENT_SCREENS`' are — they predate any
+// convention — so they are written down rather than derived.
+//
+// ── Six screens that can read a whole codebase ────────────────────────────
+//
+// Keyed by **screen**, not by product id, so `AGENT_SCREENS` stays the one place a screen
+// says what it is: the result container, the renderer and the run history all come from
+// there. Keying this table by product id instead was a quiet bug — `runDesignFromCode`
+// finished a Sensitive Data scan and called `loadAgentRuns('sensitive-data')`, but that
+// screen's key is `sensitive`, so the lookup missed and the "Previous runs" list silently
+// never refreshed.
+//
+// `brief` is the whole distinction these intakes turn on, and it is not a style choice:
+//
+//   * `true`  — the agent is sent a **computed structural description** and makes ONE call.
+//               Architecture, Security and Migration Assessment each answer one holistic
+//               question (`ARCHITECTURE_TOOL_SCHEMA` has a single `quality_scores` object;
+//               the migration schema a single `complexity`), so twenty partial answers have
+//               no merge rule. The description costs nothing — no model is involved in
+//               building it.
+//   * `false` — the agent is sent the **real files**, fanned out over as many calls as it
+//               takes. Sensitive Data, Part 11 and the GxP planner all ask questions about
+//               the code itself: a summary of a codebase cannot contain the hardcoded key
+//               that is the finding, or the audit-trail write that is the evidence.
+//
+// The wording on each card differs for the same reason, and so does the quote: a `brief`
+// run is always one call, a fan-out names how many.
+//
+// `after` is for a screen where finishing the run is not the end of it. Only the GxP
+// planner has one: generating each document afterwards is a separate call that needs the
+// same source, so the plan and the files it was built from are held rather than re-read.
+const CODE_SOURCE_CARDS = {
+  architecture:   { prefix: 'arch', agent: 'architecture',        brief: true },
+  security:       { prefix: 'sec',  agent: 'security',            brief: true },
+  migration:      { prefix: 'mg',   agent: 'migration-assessment', brief: true },
+  sensitive:      { prefix: 'sd',   agent: 'sensitive-data',      brief: false },
+  cfr21:          { prefix: 'cfr',  agent: 'cfr21-verification',  brief: false },
+  'gxp-generate': { prefix: 'gxg',  agent: 'gxp-generate-plan',   brief: false,
+                    after: result => {
+                      _gxgState.files = result.files_extracted || [];
+                      _gxgState.plan = result;
+                      _gxgState.code = '';
+                      _gxgState.generatedDocs = [];
+                      _gxgState.systemDescription =
+                        document.getElementById('gxg-system-desc').value.trim();
+                      _gxgState.projectName =
+                        document.getElementById('gxg-project').value.trim();
+                      document.getElementById('gxg-documents-result').classList.add('hidden');
+                    } },
+};
+
+const _designQuote = {};      // screen -> { zip: File|null, quote }
+
+function _designEls(screen) {
+  const p = CODE_SOURCE_CARDS[screen].prefix;
+  return {
+    repo: document.getElementById(`${p}-repo-url`),
+    ref: document.getElementById(`${p}-repo-ref`),
+    token: document.getElementById(`${p}-gh-token`),
+    zip: document.getElementById(`${p}-code-zip`),
+    run: document.getElementById(`${p}-code-run`),
+    out: document.getElementById(`${p}-code-preview`),
+    project: document.getElementById(`${p}-project`),
+    context: document.getElementById(`${p}-context`),
+  };
+}
+
+function _designBody(screen, els) {
+  const card = CODE_SOURCE_CARDS[screen];
+  const body = {
+    project_name: (els.project && els.project.value.trim()) || '',
+    context: (els.context && els.context.value.trim()) || '',
+  };
+  const v = id => ((document.getElementById(id) || {}).value || '').trim();
+  if (card.agent === 'architecture') {
+    body.requirements = v('arch-requirements');
+    body.review_mode = v('arch-mode') || 'review';
+  } else if (card.agent === 'security') {
+    body.system_type = v('sec-type');
+  } else if (card.agent === 'migration-assessment') {
+    body.migration_target = v('mg-target');
+    body.constraints = v('mg-constraints');
+  } else if (card.agent === 'cfr21-verification') {
+    body.system_description = v('cfr-system-desc');
+  } else if (card.agent === 'gxp-generate-plan') {
+    body.system_description = v('gxg-system-desc');
+  }
+  // A code-derived run can still be chained from an earlier one, where the screen offers
+  // it. `chainedFrom` returns null on screens with no handoff, which the backend reads as
+  // "no claim" rather than an empty one.
+  if (RUN_HANDOFFS[screen]) body.derived_from = chainedFrom(screen);
+  const repo = els.repo.value.trim();
+  if (repo) { body.github_repo_url = repo; body.ref = els.ref.value.trim() || undefined; }
+  // A token for this call only, never stored — the same override Code Review and VAPT take
+  // (`_UISourceBase.github_token`). Only needed for a private repository, or when the
+  // deployment credential cannot see this one; GitHub answers 404 rather than 403 for a
+  // repository a token cannot see, so a private repo, an expired token and a typo all look
+  // identical without it.
+  const token = (els.token && els.token.value.trim()) || '';
+  if (token) body.github_token = token;
+  return body;
+}
+
+async function previewDesignCost(screen, zipFile) {
+  const els = _designEls(screen);
+  const card = CODE_SOURCE_CARDS[screen];
+  const file = zipFile || null;
+  if (!file && !els.repo.value.trim()) {
+    alert('Give a repository URL, or choose a zip of the codebase.');
+    return;
+  }
+  _designQuote[screen] = null;
+  els.run.disabled = true;
+  els.out.innerHTML = '<div class="cost-note">Reading the source and working out its '
+    + 'structure… this calls no model and costs nothing.</div>';
+  try {
+    let quote;
+    if (file) {
+      // A zip cannot travel on a JSON route (D-234). The quote route takes JSON, so the
+      // archive is read here and posted as a file list — the same thing the server would
+      // have unpacked, and it keeps one preflight implementation rather than two.
+      const files = await _readZipAsFiles(file);
+      quote = await apiFetch(`/api/review/${card.agent}/preflight`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ..._designBody(screen, els), files }),
+      });
+    } else {
+      quote = await apiFetch(`/api/review/${card.agent}/preflight`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(_designBody(screen, els)),
+      });
+    }
+    _designQuote[screen] = { zip: file, quote };
+    els.run.disabled = false;
+    els.out.innerHTML = renderDesignQuote(quote);
+  } catch (e) {
+    els.out.innerHTML = `<div class="cost-note cost-note-bad">Could not read that source —
+      ${esc(e.message)}</div>`;
+  }
+}
+
+function renderDesignQuote(q) {
+  const est = q.estimate || {};
+  const brief = q.code_brief || {};
+  const src = q.source || {};
+  const limit = q.coverage_limit || {};
+  const calls = Number(est.calls || 1);
+  // The coverage line only exists for the brief-based runs. A fan-out has no analyzer
+  // coverage to report — it reads every file directly — so printing an empty box there
+  // would imply a caveat that does not apply.
+  const coverage = brief.coverage_note
+    ? `<div class="cost-note ${(brief.coverage || {}).files_not_analysed ? 'cost-note-warn' : ''}">
+         ${esc(brief.coverage_note)}</div>`
+    : '';
+  // The regulated cap is the other kind of gap, and it is worse to leave unsaid: Part 11
+  // and GxP read at most 60 files, so a larger system is assessed in part. Said here, on
+  // the free quote, because "60 of your 400 files" is a reason to split the system before
+  // paying rather than a footnote to the report afterwards.
+  const capped = limit.capped
+    ? `<div class="cost-note cost-note-warn">${esc(limit.cap_note)}</div>`
+    : '';
+  return `
+    <div class="cost-note">
+      <b>$${Number(est.expected_usd || 0).toFixed(4)}</b> expected,
+      ceiling <b>$${Number(est.ceiling_usd || 0).toFixed(4)}</b>,
+      ${calls} model call${calls === 1 ? '' : 's'}.
+      ${src.files != null ? `${Number(src.files).toLocaleString()} file(s) read.` : ''}
+      Estimating was free.
+    </div>
+    ${coverage}${capped}`;
+}
+
+// A zip is unpacked in the browser purely so the free quote can be a JSON call like the
+// repository one. Deliberately small: no dependency, no compression support beyond stored
+// entries would be wrong, so this hands the file to the server instead when it cannot read
+// it. `DecompressionStream` is in every browser this app supports.
+async function _readZipAsFiles(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  const dv = new DataView(buf.buffer);
+  // Walk the central directory from the end-of-central-directory record.
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0 && i > buf.length - 66000; i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('That does not look like a zip file.');
+  const count = dv.getUint16(eocd + 10, true);
+  let off = dv.getUint32(eocd + 16, true);
+  const out = [];
+  const dec = new TextDecoder('utf-8', { fatal: false });
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(off, true) !== 0x02014b50) break;
+    const method = dv.getUint16(off + 10, true);
+    const csize = dv.getUint32(off + 20, true);
+    const nameLen = dv.getUint16(off + 28, true);
+    const extraLen = dv.getUint16(off + 30, true);
+    const commentLen = dv.getUint16(off + 32, true);
+    const lho = dv.getUint32(off + 42, true);
+    const name = dec.decode(buf.subarray(off + 46, off + 46 + nameLen));
+    off += 46 + nameLen + extraLen + commentLen;
+    if (name.endsWith('/')) continue;
+    const lNameLen = dv.getUint16(lho + 26, true);
+    const lExtraLen = dv.getUint16(lho + 28, true);
+    const start = lho + 30 + lNameLen + lExtraLen;
+    const raw = buf.subarray(start, start + csize);
+    let content;
+    if (method === 0) {
+      content = dec.decode(raw);
+    } else if (method === 8) {
+      const ds = new DecompressionStream('deflate-raw');
+      const blob = new Blob([raw]).stream().pipeThrough(ds);
+      content = dec.decode(new Uint8Array(await new Response(blob).arrayBuffer()));
+    } else {
+      continue;                                   // an unsupported method is skipped, not guessed
+    }
+    out.push({ path: name, content });
+  }
+  if (!out.length) throw new Error('No readable files in that archive.');
+  return out;
+}
+
+async function runDesignFromCode(screen) {
+  const els = _designEls(screen);
+  const held = _designQuote[screen];
+  if (!held) { alert('Estimate the cost first — it is free.'); return; }
+  const card = CODE_SOURCE_CARDS[screen];
+  const spec = AGENT_SCREENS[screen] || {};
+  const target = spec.result;
+  const render = spec.render;
+  const ceiling = Number((held.quote.estimate || {}).ceiling_usd || 0);
+  // The cap is repeated in the confirmation, not only on the quote above it. Somebody who
+  // scrolled past a warning about 60 of 400 files is about to pay for a partial assessment
+  // and call it a verification of the system.
+  const limit = held.quote.coverage_limit || {};
+  const capWarning = limit.capped
+    ? `\n\n${limit.cap_note}`
+    : '';
+  if (!confirm(`Run this? It will cost up to $${ceiling.toFixed(4)}.${capWarning}`)) return;
+
+  showLoading(card.brief
+    ? 'Reading the codebase and working out its structure… 30–60 seconds'
+    : 'Reading every file… a large codebase is split across several calls and can take '
+      + 'a few minutes');
+  try {
+    let result;
+    if (held.zip) {
+      const fd = new FormData();
+      fd.append('file', held.zip);
+      const body = _designBody(screen, els);
+      Object.entries(body).forEach(([k, v]) => {
+        if (v !== undefined && v !== null && k !== 'derived_from') fd.append(k, v);
+      });
+      result = await apiFetch(`/api/review/${card.agent}/upload-zip`, { method: 'POST', body: fd });
+    } else {
+      result = await apiFetch(`/api/review/${card.agent}/source`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(_designBody(screen, els)),
+      });
+    }
+    if (card.after) card.after(result);
+    if (render && target) render(target, result);
+    loadAgentRuns(screen);
+  } catch (e) {
+    if (target) showError(target, e.message);
+  } finally { hideLoading(); }
+}
+
+// ── Carrying one agent's output into the next agent's input ───────────────
+//
+// The SDLC is a chain — requirements inform an architecture, an architecture informs a
+// threat model — and until now the browser could not carry a step forward. Three handoffs
+// existed as module-level variables (`_lastCodegenAdvisory`, `_lastTestScenarioResult`,
+// `_lastMigrationAssessment`), which meant they were lost on a page refresh, could only
+// ever offer the run you had *just* done in this tab, and left no record that a chain had
+// happened at all (C-36).
+//
+// Everything this needs already existed and had two callers each: `GET /api/reviews`
+// filtered by product and type is exactly what `loadAgentRuns` asks for, and fetching one
+// review's full stored result is exactly what `openAgentRun` does. This is a third caller,
+// not new plumbing.
+//
+// Declared as a table rather than wired per screen, for the reason `AGENT_SCREENS` is: the
+// alternative is five near-identical blocks of markup and five chances for one to drift.
+// `from` is a key in `AGENT_SCREENS`, so the product id, the `review_type` and the noun for
+// the empty state all come from there.
+const RUN_HANDOFFS = {
+  architecture: {
+    from: 'requirement', field: 'arch-requirements',
+    why: 'The requirements a review already established, as the constraints this '
+       + 'architecture has to satisfy.',
+  },
+  security: {
+    from: 'architecture', field: 'sec-artifact',
+    why: 'Threat-model the architecture that was already reviewed, rather than describing '
+       + 'it again from memory.',
+  },
+  full: {
+    from: 'architecture', field: 'full-arch',
+    why: 'Reuse a reviewed architecture as this run\'s architecture stage.',
+  },
+  'test-scenario': {
+    from: 'requirement', field: 'ts-requirement',
+    why: 'Generate scenarios against requirements that have already been risk-reviewed.',
+  },
+  codegen: {
+    from: 'requirement', field: 'cg-requirement',
+    why: 'Recommend a stack for requirements that have already been reviewed.',
+  },
+};
+
+// Which run each screen's input was carried from, so the run can record it. Cleared when
+// the field is emptied — at that point the text it was seeded with is gone and the claim
+// would be false. Editing the text is *not* clearing it: "built from" does not mean
+// "identical to", and a person trimming a summary before running is still working from it.
+const _chainedFrom = {};
+
+function chainedFrom(screen) {
+  const claim = _chainedFrom[screen];
+  if (!claim) return null;
+  const field = document.getElementById(RUN_HANDOFFS[screen].field);
+  if (field && !field.value.trim()) { delete _chainedFrom[screen]; return null; }
+  return claim;
+}
+
+// A stored result is structured JSON with no single prose field, so the handoff has to
+// decide what "the output" is. Markdown rather than `JSON.stringify`, because this text
+// lands in a textarea a person reads and edits before running, and because it becomes part
+// of the *next* agent's prompt — a wall of JSON spends tokens on punctuation and buries the
+// findings. (`useLastTestScenarioResult` keeps its JSON: `#tc-scenarios-context` is parsed
+// by the next agent rather than read by a person.)
+function summariseResultForHandoff(result, sourceLabel) {
+  const lines = [];
+  if (sourceLabel) lines.push(`## From ${sourceLabel}`, '');
+  if (result.summary) lines.push(result.summary, '');
+
+  const findings = result.findings || [];
+  if (findings.length) {
+    lines.push(`### Findings raised (${findings.length})`, '');
+    findings.forEach(f => {
+      const sev = f.risk_level || severityName(f.severity) || '';
+      const head = [sev && `**${sev}**`, f.control_id, f.title].filter(Boolean).join(' — ');
+      lines.push(`- ${head}`);
+      if (f.description) lines.push(`  ${f.description}`);
+      if (f.recommendation) lines.push(`  _Recommended:_ ${f.recommendation}`);
+    });
+    lines.push('');
+  }
+
+  const recs = result.recommendations || [];
+  if (recs.length) {
+    lines.push('### Recommendations', '');
+    recs.forEach(r => lines.push(`- ${typeof r === 'string' ? r : (r.title || JSON.stringify(r))}`));
+    lines.push('');
+  }
+  if (result.gate_status) {
+    lines.push(`Gate at the time: **${result.gate_status}**`
+             + (result.risk_score != null ? ` (risk ${result.risk_score})` : ''));
+  }
+  return lines.join('\n').trim();
+}
+
+// Injected above the target field rather than added to five pages of markup, the same
+// approach `renderAgentAbout` takes and for the same reason.
+function renderRunHandoff(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  if (!wiring) return;
+  const field = document.getElementById(wiring.field);
+  const source = AGENT_SCREENS[wiring.from];
+  if (!field || !source) return;
+  const group = field.closest('.form-group') || field.parentElement;
+  if (!group) return;
+
+  let box = document.getElementById(`${screen}-handoff`);
+  if (!box) {
+    box = document.createElement('div');
+    box.id = `${screen}-handoff`;
+    box.className = 'run-handoff';
+    // Inside the field's own group and below its label, not above the group. Placed above,
+    // it sits in the gap between two fields and reads as belonging to the one before it —
+    // which on the Architecture screen is the description box it does not fill.
+    const label = group.querySelector('label');
+    if (label) label.insertAdjacentElement('afterend', box);
+    else group.insertAdjacentElement('afterbegin', box);
+  }
+  box.innerHTML = `
+    <span class="run-handoff-label">Start from a previous
+      ${esc(source.noun.replace(/s$/, ''))}</span>
+    <select id="${screen}-handoff-pick" class="run-handoff-select">
+      <option value="">Loading…</option>
+    </select>
+    <button type="button" class="btn btn-secondary run-handoff-btn"
+      onclick="useRunAsInput('${jsArg(screen)}')">Use its output</button>
+    <span class="run-handoff-note" id="${screen}-handoff-note">${esc(wiring.why)}</span>`;
+  loadRunHandoffOptions(screen);
+}
+
+async function loadRunHandoffOptions(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  const source = AGENT_SCREENS[wiring.from];
+  const pick = document.getElementById(`${screen}-handoff-pick`);
+  if (!pick) return;
+  try {
+    const d = await apiFetch(
+      `/api/reviews?product_id=${source.product}&review_type=${source.reviewType}`
+      + `&limit=${RUNS_PAGE_SIZE}&offset=0`, { _silent: true });
+    const runs = d.reviews || [];
+    if (!runs.length) {
+      pick.innerHTML = `<option value="">No ${esc(source.noun)} in this project yet</option>`;
+      pick.disabled = true;
+      return;
+    }
+    pick.disabled = false;
+    // The newest is not preselected. Seeding a textarea from a run nobody chose, on a
+    // screen somebody opened to type into, would be the charter form's mistake (C-54).
+    pick.innerHTML = '<option value="">— choose a run —</option>'
+      + runs.map(r => `<option value="${esc(r.id)}">${esc(
+          `${new Date(r.created_at + 'Z').toLocaleString()} · `
+          + `${r.gate_status || '—'} · ${r.findings_count ?? 0} finding(s) · `
+          + `${(r.input_summary || 'no summary').slice(0, 70)}`)}</option>`).join('');
+  } catch (e) {
+    pick.innerHTML = `<option value="">Could not load: ${esc(e.message)}</option>`;
+    pick.disabled = true;
+  }
+}
+
+async function useRunAsInput(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  const source = AGENT_SCREENS[wiring.from];
+  const pick = document.getElementById(`${screen}-handoff-pick`);
+  const note = document.getElementById(`${screen}-handoff-note`);
+  const field = document.getElementById(wiring.field);
+  const reviewId = pick && pick.value;
+  if (!reviewId) { alert('Choose a run to start from first.'); return; }
+
+  if (field.value.trim()
+      && !confirm('Replace what is already in that box with this run\'s output?')) return;
+
+  if (note) note.textContent = 'Loading that run…';
+  try {
+    const row = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}`, { _silent: true });
+    const result = typeof row.result_json === 'string'
+      ? JSON.parse(row.result_json || '{}') : (row.result_json || row.result || {});
+    field.value = summariseResultForHandoff(
+      result, `${source.product} run of ${new Date(row.created_at + 'Z').toLocaleString()}`);
+    _chainedFrom[screen] = reviewId;
+    if (note) {
+      note.innerHTML = `Carried over. Edit it freely — this run will be recorded as
+        derived from that one either way.
+        <button type="button" class="about-link" onclick="clearRunHandoff('${jsArg(screen)}')"
+          >Undo</button>`;
+    }
+  } catch (e) {
+    if (note) note.textContent = `Could not load that run: ${e.message}`;
+  }
+}
+
+function clearRunHandoff(screen) {
+  const wiring = RUN_HANDOFFS[screen];
+  delete _chainedFrom[screen];
+  const field = document.getElementById(wiring.field);
+  if (field) field.value = '';
+  const note = document.getElementById(`${screen}-handoff-note`);
+  if (note) note.textContent = wiring.why;
+  const pick = document.getElementById(`${screen}-handoff-pick`);
+  if (pick) pick.value = '';
+}
+
+// ── What a chip means, and what this agent does ───────────────────────────
+//
+// The strip below has always rendered `SOC2` and `21CFR11` as inert text. To anyone who
+// does not already know what 21 CFR Part 11 is that conveys nothing; to anyone who does, a
+// chip reading `SOC2` above a Green gate can convey something worse — that running this
+// agent produced an audit result. So the chips became buttons, and the panel they open
+// carries the one sentence that settles it (`mapping_caveat`, served with the glossary).
+//
+// Both panels share one modal. Five copy-pasted `.modal-backdrop` blocks already exist and
+// each one has to be added by hand to the global Escape handler; a sixth and a seventh
+// would be two more. The content differs, the container does not.
+//
+// Two caches, both filled once per session and neither invalidated: the glossary is static
+// reference data, and a product's document changes only when the repository does.
+let _frameworkGlossary = null;
+let _frameworkCaveat = '';
+const _agentDocCache = {};
+
+async function _ensureFrameworkGlossary() {
+  if (_frameworkGlossary) return _frameworkGlossary;
+  const data = await apiFetch('/api/v1/frameworks', { _silent: true });
+  _frameworkGlossary = {};
+  (data.frameworks || []).forEach(f => { _frameworkGlossary[f.id] = f; });
+  _frameworkCaveat = data.mapping_caveat || '';
+  return _frameworkGlossary;
+}
+
+function _openInfoModal(title, subtitle, bodyHtml) {
+  const modal = document.getElementById('agent-info-modal');
+  if (!modal) return;
+  document.getElementById('agent-info-title').textContent = title;
+  document.getElementById('agent-info-subtitle').textContent = subtitle || '';
+  document.getElementById('agent-info-body').innerHTML = bodyHtml;
+  modal.classList.remove('hidden');
+}
+
+function closeAgentInfo() {
+  const modal = document.getElementById('agent-info-modal');
+  if (modal) modal.classList.add('hidden');
+}
+
+async function openFrameworkInfo(token) {
+  _openInfoModal(token, 'Loading…', '<p class="subtitle">Loading…</p>');
+  let entry;
+  try {
+    entry = (await _ensureFrameworkGlossary())[token];
+  } catch (e) {
+    _openInfoModal(token, '', `<p class="error-text">${esc(e.message)}</p>`);
+    return;
+  }
+  if (!entry) {
+    // Reachable only if a product gains a framework token with no glossary entry, which
+    // `smoke_products.py` section 23 fails on. Says so rather than opening blank.
+    _openInfoModal(token, 'Not in the glossary',
+      `<p class="subtitle">This agent maps to <code>${esc(token)}</code>, but the platform
+       has no description for it. That is a gap on our side, not a property of the
+       framework.</p>`);
+    return;
+  }
+
+  // 45 controls for SOC 2 is a list, not a paragraph — scrolled rather than truncated,
+  // because "and 37 more" is the half that a person checking coverage actually wants.
+  const controls = (entry.controls || []).length
+    ? `<div class="section-title" style="margin-top:18px">Controls a finding can cite
+         (${entry.controls.length})</div>
+       <div class="info-control-list">
+         ${entry.controls.map(c => `
+           <div class="info-control">
+             <code>${esc(c.id)}</code>
+             <span class="info-control-title">${esc(c.title)}</span>
+             ${c.blocking ? '<span class="info-blocking" title="Violating this blocks a release by default">blocking</span>' : ''}
+           </div>`).join('')}
+       </div>`
+    : `<p class="subtitle" style="margin-top:16px">${esc(entry.controls_note || '')}</p>`;
+
+  _openInfoModal(entry.name, entry.kind_label || entry.kind, `
+    <p>${esc(entry.summary)}</p>
+    <div class="section-title" style="margin-top:16px">Who it applies to</div>
+    <p class="subtitle" style="margin-top:-4px">${esc(entry.applies_to)}</p>
+    ${controls}
+    <div class="info-caveat">${esc(_frameworkCaveat)}</div>
+    ${entry.url ? `<p style="margin-top:12px"><a href="${esc(entry.url)}" target="_blank"
+       rel="noopener noreferrer">Read the source →</a></p>` : ''}
+  `);
+}
+
+// Three screens are deliberately absent from `AGENT_SCREENS` (see its own comment):
+// modernization and the governance report have their own, richer run histories, and the
+// GitHub PR screen is retired. Two of them are still real products with real reference
+// documents, so they name their product directly rather than being denied the link —
+// `renderAgentAbout` cannot run for them, but there is no reason the document cannot open.
+// Keyed by screen, valued by **product id** — and they differ here: the Governance Report
+// screen is `page-governance-report` and its product is `report-generate`.
+const DOC_ONLY_SCREENS = {
+  modernization: 'modernization',
+  'governance-report': 'report-generate',
+};
+
+async function openAgentDoc(page) {
+  const spec = AGENT_SCREENS[page]
+    || (DOC_ONLY_SCREENS[page] ? { product: DOC_ONLY_SCREENS[page] } : null);
+  if (!spec) return;
+  const product = _productCatalogue.find(x => x.id === spec.product);
+  const title = (product && product.title) || spec.product;
+  _openInfoModal(title, 'Loading…', '<p class="subtitle">Loading…</p>');
+
+  let doc = _agentDocCache[spec.product];
+  if (!doc) {
+    try {
+      doc = await apiFetch(`/api/v1/products/${encodeURIComponent(spec.product)}/doc`,
+                           { _silent: true });
+      _agentDocCache[spec.product] = doc;
+    } catch (e) {
+      // The 404 body explains *why* for the two products that deliberately have none, so
+      // it is shown rather than replaced with a generic failure.
+      _openInfoModal(title, '', `<p class="subtitle">${esc(e.message)}</p>`);
+      return;
+    }
+  }
+
+  // Named, not hidden: someone integrating against the API should know the field
+  // reference exists and where it is, rather than concluding this is the whole document.
+  const omitted = (doc.omitted_sections || []).length
+    ? `<div class="info-caveat" style="margin-top:18px">${esc(doc.omitted_note)}</div>`
+    : '';
+  _openInfoModal(doc.title || title, 'What this agent does',
+                 `${md(doc.markdown, 'info-doc')}${omitted}`);
+}
+
 function renderAgentAbout(page) {
   const spec = AGENT_SCREENS[page];
   if (!spec) return;
@@ -9660,7 +11419,18 @@ function renderAgentAbout(page) {
   if ((p.frameworks || []).length) {
     bits.push(`<span class="about-item" title="Findings from this agent carry control ids from these frameworks, so a compliance report can cite them">
       <span class="about-label">Maps to</span>
-      ${p.frameworks.map(f => `<span class="about-chip">${esc(f)}</span>`).join('')}</span>`);
+      ${p.frameworks.map(f => `<button type="button" class="about-chip about-chip-btn"
+          onclick="openFrameworkInfo('${jsArg(f)}')"
+          title="What ${esc(f)} is, and which controls a finding can cite">${esc(f)}</button>`).join('')}</span>`);
+  }
+
+  // `has_doc` is false for the two products that deliberately have no reference document
+  // (`agent_docs.NO_DOC`), and a link that always 404s teaches people not to click links.
+  if (p.has_doc) {
+    bits.push(`<span class="about-item">
+      <button type="button" class="about-link" onclick="openAgentDoc('${jsArg(page)}')"
+        title="What this agent looks for, what makes its verdict Red, and what guards the run">
+        About this agent</button></span>`);
   }
 
   // Quota. `used_*` come back null when there is no project or no entitlement, and a null
@@ -9806,10 +11576,42 @@ function pageAgentRuns(agent, direction) {
 }
 
 /** Reopen a stored run in the result panel, with its file inventory beneath it. */
+// Where this run's input came from, when it came from another run. Absent — not "derived
+// from nothing" — for every review saved before the column existed and for every one whose
+// input was typed: the record genuinely does not know, and a line saying "no parents" would
+// dress that up as a finding.
+//
+// Each parent is a link, resolved through `_screenForReviewType` the same way the approval
+// card resolves its covered runs, so a reader can follow the chain backwards rather than
+// being told an id.
+function renderRunProvenance(row) {
+  const parents = row.derived_from || [];
+  if (!parents.length) return '';
+  const detail = row.derived_from_detail || {};
+  const links = parents.map(id => {
+    const parent = detail[id];
+    // A parent that has been deleted since is named, not hidden: what this run was built
+    // from does not stop being true when the source row goes away.
+    if (!parent) return `<code title="${esc(id)}">${esc(id.slice(0, 8))}</code> (deleted)`;
+    const screen = _screenForReviewType(parent.review_type);
+    const label = `${esc(parent.review_type || 'review')} ·
+      ${esc(String(parent.created_at || '').slice(0, 10))}`;
+    return screen
+      ? `<a href="#/${esc(screen)}/run/${esc(id)}" title="${esc(id)}">${label}</a>`
+      : `<code title="${esc(id)}">${label}</code>`;
+  }).join(', ');
+  return `<div class="cost-note">Built from ${parents.length === 1 ? 'an earlier run' :
+    `${parents.length} earlier runs`}: ${links}. That input was carried over rather than
+    written here, so this assessment is only as good as the one it came from.</div>`;
+}
+
 async function openAgentRun(agent, reviewId) {
   const spec = AGENT_SCREENS[agent];
   if (!spec) return;
   _openRunId[agent] = reviewId;
+  // The run is now addressable: `#/code/run/<id>`. This is what makes a finding sendable
+  // to somebody — before it, the only way to show a colleague a result was to describe it.
+  _setHash(`#/${agent}/run/${reviewId}`);
   await loadAgentRuns(agent);
   // Keep the run you just clicked in view inside its own scroller. Without this, repainting
   // the list resets its scroll to the top, so opening the eighth run scrolled your place in
@@ -9866,7 +11668,8 @@ async function openAgentRun(agent, reviewId) {
              below with the rest of what it recorded.`
           : `What that run cost was not recorded against it, so the figures below do not
              include a cost — your usage records are where that lives.`}
-        The gate below describes the code as it was then.</div>`);
+        The gate below describes the code as it was then.</div>
+      ${renderRunProvenance(row)}`);
     // The list is above the result now, so bring the answer up rather than leaving the
     // reader to guess that something appeared below the fold.
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -10241,6 +12044,19 @@ function renderReviewTransparency(r) {
   const src = r.source || {};
   let html = '';
 
+  // First, above the coverage block, because it is about whether this run was governed at
+  // all rather than about what it found. `UI_PROJECT_MODE=warn` is the middle state that
+  // makes enforcement shippable: the run goes through and says it was not attributed to a
+  // project, so no plan, quota or budget cap applied and its cost is recorded against
+  // nothing. Deliberately worded as a consequence, not a suggestion -- a grace period only
+  // ends if somebody acts during it, and "select a project" reads as a preference.
+  if (r._project_warning) {
+    html += `<div class="review-panel panel-suppressed">
+      <b>This run was not governed.</b>
+      <div class="field-hint">${esc(r._project_warning)}</div>
+    </div>`;
+  }
+
   // Coverage first. A gate over part of a codebase is a different claim from a gate over all
   // of it, and this is the only place the reader can tell them apart.
   const total = cov.chunks_total || 0;
@@ -10311,7 +12127,19 @@ function renderReviewTransparency(r) {
   if (r.pre_existing_count) chips.push(`<span class="tally-chip">${r.pre_existing_count} pre-existing</span>`);
   if (r.deterministic_findings_count) chips.push(`<span class="tally-chip tally-scanner" title="Found by a pattern scanner before any model ran — no model was asked, so there is nothing to hallucinate">${r.deterministic_findings_count} from the scanner</span>`);
   if (r.waived_count) chips.push(`<span class="tally-chip">${r.waived_count} waived</span>`);
-  if (r.suppressed_findings?.length) chips.push(`<span class="tally-chip">${r.suppressed_findings.length} in test/vendor paths</span>`);
+  if (r.suppressed_findings?.length) {
+    // Split by origin. "In test/vendor paths" is our filter; "ignored by .lmignore" is the
+    // team's own written decision, and reporting the second as the first would credit us
+    // with a judgement somebody else made.
+    const _byRepo = r.suppressed_findings.filter(f => /lmignore|lm-ignore/.test(f.suppressed_reason || '')).length;
+    const _byPath = r.suppressed_findings.length - _byRepo;
+    if (_byPath) chips.push(`<span class="tally-chip">${_byPath} in test/vendor paths</span>`);
+    if (_byRepo) chips.push(`<span class="tally-chip" title="Suppressed by this repository's own .lmignore or an inline lm-ignore comment">${_byRepo} ignored by the repo</span>`);
+  }
+  // The rule that matched nothing. This is the whole reason the report exists: a misspelled
+  // pattern is otherwise invisible — the developer believes they suppressed something, the
+  // gate still fails, and the tool takes the blame.
+  if (r.suppression?.unused_count) chips.push(`<span class="tally-chip tally-discarded" title="An ignore rule that matched no finding in this run — usually a typo in the pattern">${r.suppression.unused_count} ignore rule(s) matched nothing</span>`);
   if (r.discarded_findings?.length) chips.push(`<span class="tally-chip tally-discarded">${r.discarded_findings.length} discarded</span>`);
   if (chips.length) html += `<div class="tally-row">${chips.join('')}</div>`;
 
@@ -10334,11 +12162,101 @@ function renderReviewTransparency(r) {
   // The suppressed panel, with the findings themselves so a reader can overrule the filter.
   if (r.suppressed_findings?.length) {
     html += `<details class="review-panel panel-suppressed">
-      <summary>${r.suppressed_findings.length} finding(s) hidden — test, fixture, vendored or generated code</summary>
-      <div class="field-hint">Still reported here, but not counted toward the gate: a fake key in a
-        test fixture is not a production risk, and flagging it is the fastest way to teach a team
-        to ignore this tool. Read them if you want to overrule that.</div>
+      <summary>${r.suppressed_findings.length} finding(s) not counted — filtered paths, or this repository's own ignore rules</summary>
+      <div class="field-hint">Still reported here, but not counted toward the gate. Two things land
+        in this list: a path we filter (test, fixture, vendored, generated — a fake key in a
+        fixture is not a production risk, and flagging it is the fastest way to teach a team to
+        ignore this tool), and anything the repository's own <code>.lmignore</code> or an inline
+        <code>lm-ignore</code> comment asked us not to gate on. Each finding says which rule did
+        it and where that rule lives. Nothing is deleted, so you can always overrule it.</div>
       ${r.suppressed_findings.map(f => renderFinding(f)).join('')}
+    </details>`;
+  }
+
+  // How much of the input this assessment actually accounts for. The important case is a
+  // compliance report: this used to be filled in from our own input list when the model
+  // did not say what it read, so a Part 11 report could state that 400 files were verified
+  // when nobody knew whether they were. The gap is now stated instead.
+  const _cc = r.coverage_claim;
+  if (_cc && _cc.files_supplied) {
+    const short = _cc.complete;
+    html += `<div class="review-panel${short ? '' : ' panel-suppressed'}">
+      <b>${_cc.files_claimed} of ${_cc.files_supplied} supplied file(s) are named in this
+      assessment.</b>
+      <div class="field-hint">${esc(_cc.note || '')}</div>
+      ${_cc.unclaimed_sample?.length ? `<details><summary>Not named
+        (${_cc.files_unclaimed})</summary><div class="field-hint">
+        ${_cc.unclaimed_sample.map(p => `<code>${esc(p)}</code>`).join(' ')}
+        ${_cc.files_unclaimed > _cc.unclaimed_sample.length
+          ? ` …and ${_cc.files_unclaimed - _cc.unclaimed_sample.length} more` : ''}
+        </div></details>` : ''}
+      ${_cc.not_supplied_sample?.length ? `<details open><summary>Named but never supplied
+        (${_cc.files_not_supplied}) — treat findings against these with suspicion</summary>
+        <div class="field-hint">
+        ${_cc.not_supplied_sample.map(p => `<code>${esc(p)}</code>`).join(' ')}
+        </div></details>` : ''}
+    </div>`;
+  }
+
+  // Which protections this run got. A reader comparing two assessments needs to be able to
+  // tell them apart: "the gate was floored" and "every quote was checked" are different
+  // guarantees, and only two products on this platform have the second.
+  const _at = r.attested;
+  if (_at && typeof _at === 'object') {
+    const had = [];
+    if (_at.degeneracy_refused) had.push('a truncated response would have been refused');
+    if (_at.gate_floored) had.push('the gate was floored against the findings');
+    had.push(_at.evidence_verified
+      ? 'every quote was checked against the source'
+      : 'quotes were <b>not</b> checked — this agent\'s schema does not ask for verbatim evidence');
+    html += `<div class="field-hint" style="margin-top:8px">Checks applied to this result:
+      ${had.join('; ')}.</div>`;
+  }
+
+  // How much of the pull request this run read. Without it a Green gate on a stored
+  // incremental review is indistinguishable from a Green gate over the whole change, which
+  // is a claim the run did not make.
+  const _inc = r.incremental;
+  if (_inc?.since_sha) {
+    html += `<div class="review-panel">
+      <b>This run reviewed ${_inc.commits || 0} commit(s)</b>, not the whole pull request —
+      ${_inc.files_reviewed || 0} of the ${_inc.files_in_pr || 0} file(s) it changes, pushed
+      since <code>${esc(String(_inc.since_sha).slice(0, 12))}</code>.
+      <div class="field-hint">${_inc.carried_findings
+        ? `${_inc.carried_findings} finding(s) still open from earlier reviews of this pull
+           request are included below and still count toward the gate — a clean push cannot
+           turn a blocked pull request Green.`
+        : `Earlier reviews of this pull request left nothing open, so the gate covers the
+           whole change.`}</div>
+    </div>`;
+  } else if (_inc?.attempted && !_inc.used) {
+    html += `<div class="review-panel"><b>Reviewed the whole pull request.</b>
+      <div class="field-hint">An incremental review was possible in principle but not here:
+        ${esc(_inc.reason || 'unknown')}.</div></div>`;
+  }
+
+  // What the repository asked for, and — the part worth surfacing — what it asked for and
+  // did not get. Shown whenever a rule exists or a rule missed, and skipped entirely for a
+  // repository with no ignore file, which is most of them.
+  const _sup = r.suppression;
+  if (_sup && (_sup.rules || _sup.inline_directives || _sup.unused_count)) {
+    const bits = [];
+    if (_sup.rules) bits.push(`${_sup.rules} rule(s) in <code>${esc(_sup.source || '.lmignore')}</code>`);
+    if (_sup.inline_directives) bits.push(`${_sup.inline_directives} inline <code>lm-ignore</code> comment(s)`);
+    html += `<details class="review-panel"${_sup.unused_count ? ' open' : ''}>
+      <summary>${_sup.findings_suppressed || 0} finding(s) ignored by this repository's own rules${_sup.unused_count ? ` — ${_sup.unused_count} rule(s) matched nothing` : ''}</summary>
+      <div class="field-hint">${bits.join(', ') || 'No ignore rules in this repository.'}
+        An ignore rule lowers the gate; it never hides the evidence — every finding it
+        touched is in the list above, marked with the rule that did it.</div>
+      ${_sup.unused_count ? `<div class="field-hint"><b>Matched nothing in this run.</b> Usually a
+        typo in the pattern, or a rule left behind after the code moved. Harmless, but it is
+        not suppressing what whoever wrote it thinks it is.</div>
+      <ul>${(_sup.unused || []).map(u => `<li><code>${esc(u.rule || '')}</code>${u.path ? ` in <code>${esc(u.path)}</code>` : ''}${u.line ? ` (line ${u.line})` : ''}</li>`).join('')}</ul>` : ''}
+      ${_sup.rules_without_reason ? `<div class="field-hint">${_sup.rules_without_reason} rule(s)
+        give no reason. Honoured anyway, but an auditor reading this later has nothing to go
+        on — a few words after the pattern is enough.</div>` : ''}
+      ${(_sup.errors || []).length ? `<div class="field-hint"><b>Lines that could not be read:</b>
+        <ul>${_sup.errors.map(e => `<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
     </details>`;
   }
 
@@ -10660,3 +12578,180 @@ function renderDependencyNote(dep) {
   }
   return html;
 }
+
+
+// ── Notifications ────────────────────────────────────────────────────────
+//
+// A channel is a per-project setting, and the URL is a credential: it goes in once and is
+// never shown again, so everything on this screen is built around that. The list shows a
+// host and four characters, the test button exists because a URL you cannot verify is a
+// URL nobody trusts, and the delivery log is how a failure becomes visible instead of
+// being a message that quietly never arrived.
+
+function openCreateNotifier() {
+  document.getElementById('notifier-panel')?.classList.remove('hidden');
+  document.getElementById('notifier-error').textContent = '';
+}
+function closeCreateNotifier() {
+  document.getElementById('notifier-panel')?.classList.add('hidden');
+}
+
+async function loadNotifiers() {
+  const list = document.getElementById('notifier-list');
+  if (!list) return;
+  list.innerHTML = '<div class="field-hint">Loading…</div>';
+  try {
+    const d = await apiFetch('/api/v1/notifications/targets');
+    const rows = d.targets || [];
+    if (!rows.length) {
+      list.innerHTML = `<div class="empty-state">No channels in this project yet.
+        A Red gate is discovered by whoever next opens this screen.</div>`;
+    } else {
+      list.innerHTML = rows.map(t => renderNotifier(t)).join('');
+    }
+  } catch (e) {
+    // The most likely failure by far, and it has a specific answer.
+    list.innerHTML = `<div class="empty-state">${esc(e.message || 'Could not load channels.')}
+      ${/project/i.test(e.message || '') ? '<br>Pick a project in the sidebar first — a channel belongs to one project.' : ''}</div>`;
+  }
+  loadNotifierDeliveries();
+}
+
+function renderNotifier(t) {
+  const when = t.events === 'review_gated'
+    ? 'when a review is blocked'
+    : (t.events || '').split(',').join(', ');
+  const sev = { 5: 'Critical', 4: 'High or worse', 0: 'anything' }[t.min_severity] ?? t.min_severity;
+  // The last outcome, on the channel itself. Otherwise the only way to find out a channel
+  // is broken is to read the delivery log, which nobody opens until they notice silence.
+  const health = t.last_status === 'ok'
+    ? '<span class="mark-chip mark-verified">delivering</span>'
+    : (t.last_status === 'failed'
+        ? `<span class="mark-chip mark-unverified" title="${esc(t.last_error || '')}">failing</span>`
+        : '<span class="mark-chip">never used</span>');
+  return `
+    <div class="finding-card" style="border-left-color:var(--border)">
+      <div class="finding-header">
+        <strong>${esc(t.name || 'channel')}</strong>
+        <span class="compliance-chip">${esc(t.kind || 'webhook')}</span>
+        ${health}
+        ${t.active ? '' : '<span class="mark-chip">paused</span>'}
+        ${t.signed ? '<span class="mark-chip" title="Deliveries carry an X-LMSDLC-Signature HMAC">signed</span>' : ''}
+      </div>
+      <div class="field-hint">
+        Sends ${esc(when)}, ${t.events === 'review_gated' ? `if a finding is ${esc(String(sev))}` : 'every time'}.
+        → <code>${esc(t.host || '?')}</code>…<code>${esc(t.url_tail || '')}</code>
+      </div>
+      ${t.unreadable ? `<div class="field-hint" style="color:var(--danger)">${esc(t.unreadable)}</div>` : ''}
+      ${t.last_error ? `<div class="field-hint">Last attempt: ${esc(t.last_error)}</div>` : ''}
+      <div class="finding-actions">
+        <button class="btn btn-secondary" onclick="testNotifier('${esc(t.id)}')">Send a test</button>
+        <button class="btn btn-secondary" onclick="toggleNotifier('${esc(t.id)}',${t.active ? 'false' : 'true'})">
+          ${t.active ? 'Pause' : 'Resume'}</button>
+        <button class="btn btn-secondary" onclick="deleteNotifier('${esc(t.id)}','${esc(t.name || '')}')">Delete</button>
+      </div>
+      <div id="notifier-test-${esc(t.id)}" class="field-hint"></div>
+    </div>`;
+}
+
+async function createNotifier() {
+  const err = document.getElementById('notifier-error');
+  err.textContent = '';
+  const body = {
+    name: document.getElementById('notifier-name').value.trim(),
+    url: document.getElementById('notifier-url').value.trim(),
+    events: document.getElementById('notifier-events').value,
+    min_severity: Number(document.getElementById('notifier-severity').value),
+    secret: document.getElementById('notifier-secret').value.trim(),
+  };
+  if (!body.name || !body.url) { err.textContent = 'A name and a URL, both.'; return; }
+  try {
+    const d = await apiFetch('/api/v1/notifications/targets',
+                             { method: 'POST', body: JSON.stringify(body) });
+    closeCreateNotifier();
+    document.getElementById('notifier-url').value = '';
+    document.getElementById('notifier-secret').value = '';
+    alert(d.note || 'Channel added.');
+    loadNotifiers();
+  } catch (e) {
+    // The server's message is written for a person — an https requirement, a host inside
+    // the network, a name that does not resolve — so it is shown rather than restated.
+    err.textContent = e.message || 'Could not add that channel.';
+  }
+}
+
+async function testNotifier(id) {
+  const out = document.getElementById(`notifier-test-${id}`);
+  if (out) out.textContent = 'Sending…';
+  try {
+    const d = await apiFetch(`/api/v1/notifications/targets/${id}/test`, { method: 'POST' });
+    if (out) {
+      out.innerHTML = d.ok
+        ? `<span style="color:var(--success)">Delivered (HTTP ${d.status}). ${esc(d.note || '')}</span>`
+        // The destination's own words. Attributed to it, because "403 invalid_token" is
+        // Slack's answer and reading it as ours sends somebody debugging the wrong system.
+        : `<span style="color:var(--danger)">Nothing was delivered — HTTP ${d.status}
+             ${d.destination_said ? `· the destination said: <code>${esc(d.destination_said)}</code>` : ''}
+           </span>`;
+    }
+  } catch (e) {
+    if (out) out.textContent = e.message || 'The test could not be sent.';
+  }
+  loadNotifierDeliveries();
+}
+
+async function toggleNotifier(id, active) {
+  try {
+    await apiFetch(`/api/v1/notifications/targets/${id}`,
+                   { method: 'PATCH', body: JSON.stringify({ active }) });
+    loadNotifiers();
+  } catch (e) { alert(e.message || 'Could not change that channel.'); }
+}
+
+async function deleteNotifier(id, name) {
+  if (!confirm(`Delete "${name}"? Its delivery history is kept.`)) return;
+  try {
+    const d = await apiFetch(`/api/v1/notifications/targets/${id}`, { method: 'DELETE' });
+    alert(d.note || 'Channel deleted.');
+    loadNotifiers();
+  } catch (e) { alert(e.message || 'Could not delete that channel.'); }
+}
+
+async function loadNotifierDeliveries() {
+  const box = document.getElementById('notifier-deliveries');
+  if (!box) return;
+  try {
+    // Reading this list also retries anything pending — see the route. So the refresh
+    // button on this screen is not only a refresh, and the note below says so.
+    const d = await apiFetch('/api/v1/notifications/deliveries?limit=25');
+    const rows = d.deliveries || [];
+    if (!rows.length) { box.innerHTML = '<div class="field-hint">Nothing sent yet.</div>'; return; }
+    const label = { sent: 'mark-verified', pending: 'mark-conf', sending: 'mark-conf',
+                    abandoned: 'mark-unverified', failed: 'mark-unverified' };
+    box.innerHTML = `
+      ${d.note ? `<div class="field-hint">${esc(d.note)}</div>` : ''}
+      <table class="data-table"><thead><tr>
+        <th>When</th><th>Channel</th><th>Event</th><th>Status</th><th>Tries</th><th>Detail</th>
+      </tr></thead><tbody>
+      ${rows.map(r => `<tr>
+        <td>${esc((r.created_at || '').replace('T', ' ').slice(0, 19))}</td>
+        <td>${esc(r.target_name || '(deleted channel)')}</td>
+        <td>${esc(r.event_type || '')}</td>
+        <td><span class="mark-chip ${label[r.status] || ''}">${esc(r.status || '')}</span></td>
+        <td>${r.attempts ?? 0}</td>
+        <td class="field-hint">${esc(r.last_error || '')}</td>
+      </tr>`).join('')}
+      </tbody></table>`;
+  } catch (e) {
+    box.innerHTML = `<div class="field-hint">${esc(e.message || 'Could not load deliveries.')}</div>`;
+  }
+}
+
+// ── Routing, last ─────────────────────────────────────────────────────────
+//
+// Deliberately the final statement in this file. `_applyHash` reads `AGENT_SCREENS` and
+// `_openRunId`, which are `const` and therefore unreachable — a `ReferenceError`, not
+// `undefined` — from anywhere above their declarations. The `// ── Init ──` block sits at
+// roughly line 6,400 for historical reasons, so anything there that touches the later
+// half of the file has to be moved down here instead of read as safe.
+_applyHash();

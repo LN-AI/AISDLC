@@ -1165,6 +1165,475 @@ def main():
                 check("another screen shows the same project",
                       "Caption check" in (vcap.text_content() or ""), vcap.text_content())
 
+            # ── 15. Every screen has an address ───────────────────────────
+            #
+            # Checked in a real browser rather than in `smoke_render.js`, because the whole
+            # question is whether `data-page` in index.html, `#page-<name>` in index.html
+            # and the router in app.js agree — and a DOM stub whose `querySelector` returns
+            # null cannot tell. This is the gap `ui_examine.py` exists for.
+            section("15. Every screen has an address, and a link opens it")
+
+            pages = page.eval_on_selector_all(
+                ".nav-item[data-page]", "els => els.map(e => e.dataset.page)")
+            # `github` is the retired PR-review screen (D-267): its loader deliberately
+            # redirects to Code Review with the source pre-set, so it is the one nav item
+            # that must NOT end on its own page. Named rather than filtered out, so if it
+            # ever stops redirecting this says so.
+            REDIRECTS = {"github"}
+            broken = []
+            for name in pages:
+                page.evaluate(f"showPage({name!r})")
+                ok = page.evaluate(
+                    f"document.getElementById('page-{name}')?.classList.contains('active') === true")
+                if (name in REDIRECTS) == ok:
+                    broken.append(name if name not in REDIRECTS
+                                  else f"{name} (stopped redirecting)")
+            check(f"all {len(pages)} nav items reach their own screen, "
+                  f"bar the {len(REDIRECTS)} that redirect", not broken,
+                  "these did not: " + ", ".join(broken))
+            check("the retired PR-review item still lands on Code Review instead",
+                  page.evaluate("showPage('github'); "
+                                "document.getElementById('page-code').classList.contains('active')"),
+                  "D-267 merged PR review into the review screen; the nav item is a shortcut")
+            page.evaluate("showPage('dashboard')")
+            check("...and the address bar says which screen you are on",
+                  page.evaluate("location.hash") == "#/dashboard",
+                  page.evaluate("location.hash"))
+
+            # The case that matters: a pasted address, not a click.
+            page.evaluate("location.hash = '#/findings'")
+            page.wait_for_timeout(250)
+            check("a pasted address opens that screen",
+                  page.evaluate(
+                      "document.getElementById('page-findings').classList.contains('active')"),
+                  page.evaluate("location.hash"))
+            page.evaluate("location.hash = '#/no-such-screen'")
+            page.wait_for_timeout(250)
+            check("an address naming no screen falls back to the dashboard, not a blank shell",
+                  page.evaluate(
+                      "document.getElementById('page-dashboard').classList.contains('active')"),
+                  page.evaluate(
+                      "[...document.querySelectorAll('.page.active')].map(p => p.id).join(',')"))
+
+            # A filtered queue is a link — the message somebody actually wants to send.
+            page.evaluate("location.hash = '#/findings?q=injection&repo=acme%2Fshop'")
+            page.wait_for_timeout(400)
+            check("a filtered findings link opens the findings screen, not the dashboard",
+                  page.evaluate(
+                      "document.getElementById('page-findings').classList.contains('active')"),
+                  page.evaluate(
+                      "[...document.querySelectorAll('.page.active')].map(p => p.id).join(',')"))
+            check("...with the filters it carried already in the controls",
+                  page.evaluate("document.getElementById('findings-q').value") == "injection"
+                  and page.evaluate("document.getElementById('findings-repo').value") == "acme/shop",
+                  page.evaluate(
+                      "document.getElementById('findings-q').value + ' | ' + "
+                      "document.getElementById('findings-repo').value"))
+
+            # Reloading a deep address has to land in the same place. This is the whole
+            # point: before it, a reload always went back to the Dashboard.
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(600)
+            check("reloading a deep address stays where it was, rather than resetting",
+                  page.evaluate(
+                      "document.getElementById('page-findings')?.classList.contains('active')"),
+                  page.evaluate("location.hash + ' -> ' + "
+                                "[...document.querySelectorAll('.page.active')].map(p=>p.id).join(',')"))
+
+            # ── 16. The notifications screen, driven ──────────────────────
+            #
+            # Section 15 proves the nav item reaches its own page. That is not the same as
+            # the page *working*: the first version of this screen called a `showToast`
+            # that does not exist in this app, which is a ReferenceError on the first
+            # successful save and is invisible to any check that only navigates. So this
+            # section calls the handlers.
+            section("16. Notifications — the handlers run, and the URL never comes back")
+
+            page.evaluate("location.hash = '#/notifications'")
+            page.wait_for_timeout(700)
+            check("the notifications screen opens from its address",
+                  page.evaluate(
+                      "document.getElementById('page-notifications').classList.contains('active')"),
+                  page.evaluate("location.hash"))
+            check("...and says something rather than staying blank",
+                  len((page.text_content("#notifier-list") or "").strip()) > 10,
+                  repr(page.text_content("#notifier-list"))[:200])
+
+            page.evaluate("openCreateNotifier()")
+            check("the add-a-channel form opens",
+                  page.evaluate(
+                      "!document.getElementById('notifier-panel').classList.contains('hidden')"))
+
+            # An empty submit must be refused in the browser rather than posting nothing.
+            page.evaluate("createNotifier()")
+            page.wait_for_timeout(300)
+            check("submitting an empty form is refused with a sentence",
+                  (page.text_content("#notifier-error") or "").strip() != "",
+                  "an empty submit that posts anyway teaches people the form is broken")
+
+            # An http:// URL. The server refuses it; what is checked here is that the
+            # refusal reaches the screen instead of vanishing into a rejected promise.
+            page.fill("#notifier-name", "Console check")
+            page.fill("#notifier-url", "http://hooks.example/services/x")
+            page.evaluate("createNotifier()")
+            page.wait_for_timeout(700)
+            _err16 = (page.text_content("#notifier-error") or "")
+            check("the server's own refusal is shown, not swallowed",
+                  len(_err16.strip()) > 20, repr(_err16)[:240])
+
+            # The renderer, with a row shaped as the API returns one. This is where a typo
+            # in the template or a missing helper shows up.
+            _html16 = page.evaluate(
+                """renderNotifier({ id: 't1', name: 'Platform alerts', kind: 'slack',
+                                    host: 'hooks.slack.com', url_tail: 'bC9d', signed: true,
+                                    active: true, events: 'review_gated', min_severity: 5,
+                                    last_status: 'ok' })""")
+            check("a channel renders with where it points",
+                  "hooks.slack.com" in _html16 and "bC9d" in _html16, _html16[:200])
+            check("...and never with a usable URL",
+                  "/services/" not in _html16 and "https://" not in _html16,
+                  "the list is the one place a stored webhook URL could leak back out")
+            check("...and says whether it is actually delivering",
+                  "delivering" in _html16, _html16[:300])
+            _paused16 = page.evaluate(
+                """renderNotifier({ id: 't2', name: 'Paused', kind: 'webhook', host: 'x.example',
+                                    url_tail: 'aaaa', active: false, events: 'review_gated',
+                                    min_severity: 5, last_status: 'failed',
+                                    last_error: 'HTTP 404' })""")
+            check("a broken channel says so on the channel itself",
+                  "failing" in _paused16 and "paused" in _paused16 and "HTTP 404" in _paused16,
+                  "otherwise the only way to find out is a delivery log nobody opens")
+
+            # The success branch, which is where the ReferenceError actually was: the
+            # error path and the render both worked, and the one line that ran only after a
+            # save succeeded called a function that does not exist. Reached here by
+            # answering the save from a stub rather than by needing a real webhook host —
+            # `apiFetch` is the single seam every screen goes through, and a dialog is
+            # auto-dismissed by the driver, so this runs the branch end to end.
+            page.evaluate(
+                """() => {
+                    window.__realApiFetch = window.apiFetch;
+                    // Every call, not the last: a successful save reloads the list and
+                    // the delivery log, so a single slot would hold whichever of those
+                    // ran last and the POST would be invisible.
+                    window.__calls = [];
+                    window.apiFetch = async (url, opts) => {
+                      window.__calls.push({ url, body: (opts || {}).body || '',
+                                            method: (opts || {}).method || 'GET' });
+                      return { target: { id: 'x1', name: 'stub', kind: 'webhook',
+                                         host: 'hooks.example', url_tail: 'aaaa',
+                                         active: true, events: 'review_gated',
+                                         min_severity: 5 },
+                               targets: [], deliveries: [], count: 0,
+                               note: 'Stored.' };
+                    };
+                }""")
+            page.evaluate("openCreateNotifier()")
+            page.fill("#notifier-name", "Success path")
+            page.fill("#notifier-url", "https://hooks.example/services/ok")
+            page.evaluate("createNotifier()")
+            page.wait_for_timeout(500)
+            _calls16 = page.evaluate("window.__calls") or []
+            _post16 = next((c for c in _calls16
+                            if c["url"] == "/api/v1/notifications/targets"
+                            and c["method"] == "POST"), None)
+            check("a successful save posts the form to the targets endpoint",
+                  _post16 is not None, str(_calls16)[:300])
+            check("...carrying the name, the URL, the events and the threshold",
+                  _post16 and all(k in (_post16.get("body") or "")
+                                  for k in ("Success path", "hooks.example",
+                                            "review_gated", "min_severity")),
+                  str(_post16.get("body") if _post16 else None)[:240])
+            check("...and then reloads the list, so the new channel is on screen",
+                  any(c["url"] == "/api/v1/notifications/targets" and c["method"] == "GET"
+                      for c in _calls16),
+                  "a save that leaves the old list up reads as a save that did not happen")
+            check("...and the save path itself raises nothing",
+                  not [e for e in console_errors if "ReferenceError" in e],
+                  " | ".join(e for e in console_errors if "ReferenceError" in e))
+            check("...and the URL field is cleared, since it can never be read back",
+                  page.evaluate("document.getElementById('notifier-url').value") == "",
+                  "leaving a credential in a form field after it has been stored "
+                  "encrypted is the one place it stays readable")
+            # Wrapped in a void arrow on purpose: Playwright *calls* the result of an
+            # expression when that result is a function, so a bare assignment here would
+            # hand back `apiFetch` and the driver would invoke it with no arguments.
+            page.evaluate("() => { window.apiFetch = window.__realApiFetch; }")
+
+            page.evaluate("closeCreateNotifier()")
+            check("the form closes again",
+                  page.evaluate(
+                      "document.getElementById('notifier-panel').classList.contains('hidden')"))
+            page.evaluate("loadNotifierDeliveries()")
+            page.wait_for_timeout(600)
+            check("the delivery log renders with nothing in it",
+                  len((page.text_content("#notifier-deliveries") or "").strip()) > 5,
+                  repr(page.text_content("#notifier-deliveries"))[:200])
+
+            # ── 17. Every wired-up name exists ────────────────────────────
+            #
+            # The general form of the defect section 16 found. `showToast` was called on
+            # the *success* path of a save, so navigating the screen, rendering it and
+            # failing a save all pass while the one path that matters throws a
+            # ReferenceError. There is no build step and no linter here, so nothing
+            # otherwise checks that a name in an `onclick` — or a name a handler calls —
+            # is a function that exists.
+            #
+            # Handled in the browser rather than by parsing app.js, because the question is
+            # whether the name resolves *at runtime*, which is exactly what a text search
+            # cannot answer.
+            section("17. Every onclick in the HTML names a function that exists")
+
+            _wired = page.evaluate(
+                """() => {
+                    const names = new Set();
+                    for (const el of document.querySelectorAll('[onclick]')) {
+                      // `[^.\w$]` before the name, so `document.getElementById(` is a
+                      // method call and not a global that must exist on `window`.
+                      for (const m of (el.getAttribute('onclick') || '')
+                            .matchAll(/(?:^|[^.\w$])([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g)) {
+                        names.add(m[1]);
+                      }
+                    }
+                    // Language constructs and built-ins that appear inside a handler body.
+                    const builtin = new Set(['if', 'for', 'while', 'switch', 'return',
+                                             'typeof', 'catch', 'function', 'Number',
+                                             'String', 'Boolean', 'Array', 'Object',
+                                             'parseInt', 'parseFloat', 'alert', 'confirm',
+                                             'prompt', 'encodeURIComponent', 'JSON']);
+                    return [...names].filter(n => !builtin.has(n))
+                                     .filter(n => typeof window[n] !== 'function');
+                }""")
+            check(f"no onclick names a function that does not exist",
+                  not _wired,
+                  "these are wired to nothing and throw a ReferenceError on click: "
+                  + ", ".join(_wired))
+
+            # A name called from *inside* a handler — `showToast`'s shape — is not caught
+            # by the sweep above, because it is nowhere in the HTML. Nothing short of
+            # running that branch catches it, which is why section 16 now stubs `apiFetch`
+            # and runs the save rather than only the refusal.
+
+            # ── 18. The screen explains itself ────────────────────────────
+            #
+            # Both panels are built by JavaScript into a modal that is empty in the markup,
+            # and both chips are `onclick`s generated at render time — so neither is
+            # reachable by the sweep above, and `smoke_render.js` cannot see whether a
+            # click opens anything. This is the only check that presses them.
+            #
+            # The assertions are about the two things that would make the feature worse
+            # than absent: a chip that opens a blank box, and a panel that shows the
+            # reader the API's field names rather than the screen's (D-291).
+            section("18. A compliance chip and the About link explain themselves")
+
+            goto_page(page, "Architecture Review")
+            page.wait_for_timeout(400)
+            _chips = page.query_selector_all("#architecture-about .about-chip-btn")
+            check("the framework chips on an agent screen are buttons",
+                  len(_chips) >= 1, f"{len(_chips)} found in #architecture-about")
+
+            if _chips:
+                _chips[0].click()
+                page.wait_for_timeout(700)
+                check("clicking one opens the panel",
+                      not page.evaluate(
+                          "document.getElementById('agent-info-modal')"
+                          ".classList.contains('hidden')"))
+                _body = (page.text_content("#agent-info-body") or "").strip()
+                check("...with a plain-language explanation rather than an empty box",
+                      len(_body) > 200, f"{len(_body)} chars: {_body[:120]!r}")
+                check("...saying what kind of thing it is",
+                      (page.text_content("#agent-info-subtitle") or "").strip() != "",
+                      "a law, an audit report and a threat-modelling method must not read "
+                      "as the same badge")
+                check("...and that a mapping is not a certification",
+                      "not a certification" in _body,
+                      "a chip reading SOC2 above a Green gate invites exactly the wrong "
+                      "conclusion unless the panel says otherwise")
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(300)
+                check("...and Escape closes it, like every other modal here",
+                      page.evaluate("document.getElementById('agent-info-modal')"
+                                    ".classList.contains('hidden')"),
+                      "the global Escape handler names each modal by id, so a new one has "
+                      "to be added to it by hand")
+
+            _about = page.query_selector("#architecture-about .about-link")
+            check("the screen offers an 'About this agent' link", _about is not None)
+            if _about:
+                _about.click()
+                page.wait_for_timeout(900)
+                _doc = (page.text_content("#agent-info-body") or "")
+                check("...which opens this agent's reference document",
+                      len(_doc.strip()) > 500, f"{len(_doc.strip())} chars")
+                check("...including what makes its verdict Red",
+                      "Gate logic" in _doc,
+                      "the gate rule lives inside the dropped Response section and is "
+                      "lifted out on purpose -- it is what a reader facing an Amber wants")
+                check("...and never the API field reference the screen does not use",
+                      "curl -X POST" not in _doc and "X-API-Key: lmsdlc" not in _doc,
+                      "Request/Response/Example document the /api/v1 endpoint's own field "
+                      "names, and this screen sends different ones (D-291)")
+                page.evaluate("closeAgentInfo()")
+
+            # ── 19. Starting one agent from another's output ──────────────
+            #
+            # The control is injected by JavaScript above a field, and the runs it offers
+            # come from a second API call — so nothing in the markup proves it exists and
+            # `smoke_render.js` cannot see whether choosing a run fills anything in.
+            #
+            # No model is called here: the picker reads stored reviews and writes into a
+            # textarea, and the run button is never pressed. What is being checked is the
+            # wiring and the honesty of the empty state — a project with no requirement
+            # reviews must say so rather than offering a dropdown that does nothing.
+            section("19. One agent's output can start the next")
+
+            goto_page(page, "Architecture Review")
+            page.wait_for_timeout(700)
+            check("the architecture screen offers a previous requirement review",
+                  page.query_selector("#architecture-handoff") is not None,
+                  "the handoff control is injected above the requirements field")
+            _pick = page.query_selector("#architecture-handoff-pick")
+            check("...as a chooser rather than a free-text id",
+                  _pick is not None and _pick.evaluate("el => el.tagName") == "SELECT")
+            if _pick:
+                _opts = page.eval_on_selector_all(
+                    "#architecture-handoff-pick option", "els => els.map(e => e.textContent)")
+                # This examination's database is fresh, so the honest answer is "none yet".
+                # Asserting the empty state is the point: it is what most projects see first.
+                check("...which says so plainly when the project has none yet",
+                      any("No " in o or "choose a run" in o for o in _opts),
+                      str(_opts)[:200])
+                check("...and is not preselected, so nothing is seeded without being chosen",
+                      (_pick.input_value() or "") == "",
+                      "seeding a textarea from a run nobody picked is the charter form's "
+                      "mistake (C-54)")
+
+            check("pressing Use with nothing chosen is refused, not a silent no-op",
+                  page.evaluate("""() => {
+                      let said = null;
+                      const real = window.alert;
+                      window.alert = m => { said = m; };
+                      try { useRunAsInput('architecture'); } finally { window.alert = real; }
+                      return !!said;
+                  }"""),
+                  "the button has to say why nothing happened")
+
+            # The other four screens declare the same wiring; a row that names a field id
+            # that does not exist would inject the control into nothing.
+            _bad_wiring = page.evaluate(
+                """() => Object.entries(RUN_HANDOFFS)
+                     .filter(([screen, w]) => !document.getElementById(w.field)
+                                           || !AGENT_SCREENS[w.from])
+                     .map(([screen]) => screen)""")
+            check("every declared handoff names a field and a source screen that exist",
+                  not _bad_wiring,
+                  f"{_bad_wiring} -- a bad row injects the control above nothing, or reads "
+                  "a source product that is not in AGENT_SCREENS")
+
+            # ── 20. Six screens read a codebase, and generated code gets out ──
+            #
+            # This is the check no other suite can make. `smoke_review_sources` proves the
+            # routes exist and the guards refuse; it cannot see whether a button in
+            # `index.html` names a function that exists, or whether `CODE_SOURCE_CARDS`
+            # points at element ids the markup actually has. That gap is where the defects
+            # reported on 2026-09-02 were, and adding three cards keyed by screen rather
+            # than by product is exactly the kind of change that reopens it — one of the
+            # existing three was already calling `loadAgentRuns` with a key that did not
+            # exist, so its history silently never refreshed.
+            section("20. Every from-code card is wired to markup that exists")
+
+            goto_page(page, "Architecture Review")
+            page.wait_for_timeout(500)
+
+            _card_wiring = page.evaluate(
+                """() => Object.entries(CODE_SOURCE_CARDS).map(([screen, c]) => {
+                     const ids = ['repo-url', 'repo-ref', 'gh-token', 'code-zip',
+                                  'code-run', 'code-preview']
+                       .filter(sfx => !document.getElementById(`${c.prefix}-${sfx}`));
+                     return {
+                       screen,
+                       missingEls: ids,
+                       noScreenRow: !AGENT_SCREENS[screen],
+                       noResultBox: !(AGENT_SCREENS[screen]
+                                      && document.getElementById(AGENT_SCREENS[screen].result)),
+                       noRenderer: !(AGENT_SCREENS[screen]
+                                     && typeof AGENT_SCREENS[screen].render === 'function'),
+                     };
+                   }).filter(r => r.missingEls.length || r.noScreenRow || r.noResultBox
+                                  || r.noRenderer)""")
+            check("every from-code card names elements, a screen row and a renderer that exist",
+                  not _card_wiring,
+                  f"{_card_wiring} -- a card keyed by a screen with no AGENT_SCREENS row "
+                  "cannot find its result box or refresh its history, and the failure is "
+                  "silent")
+
+            check("...and there are six of them",
+                  page.evaluate("() => Object.keys(CODE_SOURCE_CARDS).length") == 6,
+                  "architecture, security, migration, sensitive, cfr21, gxp-generate")
+
+            # Every card's buttons call these three by name from `index.html`.
+            _fns = page.evaluate(
+                """() => ['previewDesignCost', 'runDesignFromCode', 'loadCodebaseContext',
+                          'clearCodebaseContext', 'deliverGeneratedCode',
+                          'openModernizationPR', 'renderGeneratedCodeDelivery',
+                          'renderModernizationDelivery']
+                     .filter(n => typeof window[n] !== 'function')""")
+            check("...and every handler the markup calls is defined",
+                  not _fns,
+                  f"{_fns} -- an onclick naming a function that does not exist is a button "
+                  "that does nothing, and the console says so only when it is pressed")
+
+            # The two doors the regulated screens used to have are gone. One of them read a
+            # zip through an ingester with no secret redaction and no quote in front of it.
+            _dead = page.evaluate(
+                """() => ['uploadCFR21Zip', 'uploadGxPPlanZip']
+                     .filter(n => typeof window[n] === 'function')""")
+            check("...and the two ad-hoc regulated uploaders are gone, not merely unused",
+                  not _dead,
+                  f"{_dead} -- one shared card serves both screens now, and unlike those it "
+                  "quotes the run before spending")
+
+            # Each new screen is visited, because a card can be wired correctly and still be
+            # on a page that never renders it.
+            for _label, _prefix in (("Code Migration", "mg"),
+                                    ("21 CFR Part 11", "cfr"),
+                                    ("GxP Document Generation", "gxg")):
+                try:
+                    goto_page(page, _label)
+                except Exception:
+                    check(f"the {_label} screen opens", False, "nav item not found")
+                    continue
+                page.wait_for_timeout(400)
+                _visible = page.evaluate(
+                    f"""() => {{
+                          const el = document.getElementById('{_prefix}-code-card');
+                          return !!el && el.offsetParent !== null;
+                        }}""")
+                check(f"the {_label} screen shows its from-code card", _visible,
+                      "a card hidden behind an entitlement class or a collapsed parent is "
+                      "a feature nobody can find")
+                _disabled = page.evaluate(
+                    f"() => (document.getElementById('{_prefix}-code-run') || {{}}).disabled")
+                check(f"...with its run button disabled until a quote exists", _disabled is True,
+                      "the run button names a ceiling it was approved against; enabled "
+                      "before the estimate it would spend an unapproved amount")
+
+            # Reading a codebase into the codegen context box is free and must stay separate
+            # from running anything: the whole reason it is a distinct step is that the
+            # brief should be visible before it is sent.
+            goto_page(page, "Code Generation")
+            page.wait_for_timeout(400)
+            check("code generation offers to read an existing codebase",
+                  page.query_selector("#cg-existing") is not None
+                  and page.query_selector("#cg-repo-url") is not None,
+                  "the brief lands in a box that can be read and trimmed, not in a hidden "
+                  "field")
+            check("...and sends nothing until it is asked to",
+                  (page.eval_on_selector("#cg-existing", "el => el.value") or "") == "",
+                  "an empty context box is what makes a run with no repository identical to "
+                  "one from before this existed")
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.

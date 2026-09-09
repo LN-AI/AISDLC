@@ -3,31 +3,31 @@
 Aggregates stats from stored `issue_triage` reviews — new issues by severity/priority, unassigned
 tickets, duplicate rate, confidence distribution, team workload, escalations, and recent reports.
 Pure read/aggregation layer over the existing reviews table; no new scanning logic.
+
+**It was authenticated but not project-scoped.** `project_name` is free text a user typed
+into a form, and `list_reviews_by_type` filtered on nothing else — so omitting it returned
+every project's triage reviews, and any signed-in user could read analytics over every
+customer's defects, owners and teams. Both routes now scope through `backend/scope.py` like
+every other governance surface, and `project_name` is what it always was: a filter applied
+*inside* what the caller may already see, never the thing deciding what that is.
 """
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import backend.database as database
-from backend.services.auth_service import decode_token
+from backend import scope
+from backend.routes.v1_agents import get_caller
 
 router = APIRouter(prefix="/api/v1/issue-triage", tags=["Issue Triage Dashboard"])
-_bearer = HTTPBearer(auto_error=False)
 
 
-def _require_auth(creds: Optional[HTTPAuthorizationCredentials] = Depends(_bearer)) -> dict:
-    if not creds:
-        raise HTTPException(status_code=401, detail="Bearer token required")
-    user = decode_token(creds.credentials)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    return user
-
-
-@router.get("/dashboard", summary="Issue Triage analytics for a project (or all projects)")
-def get_issue_triage_dashboard(project_name: Optional[str] = None, limit: int = 500, user: dict = Depends(_require_auth)):
-    rows = database.list_reviews_by_type("issue_triage", project_name, limit=limit)
+@router.get("/dashboard", summary="Issue Triage analytics for this caller's projects")
+def get_issue_triage_dashboard(project_name: Optional[str] = None, limit: int = 500,
+                               caller: dict = Depends(get_caller)):
+    rows = database.list_reviews_by_type(
+        "issue_triage", project_name, limit=limit,
+        project_ids=scope.visible_from_caller(caller))
 
     severity_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0}
     priority_counts = {"P0 - Immediate": 0, "P1 - Urgent": 0, "P2 - Normal": 0, "P3 - Low priority": 0}
@@ -106,8 +106,13 @@ def get_issue_triage_dashboard(project_name: Optional[str] = None, limit: int = 
 
 
 @router.get("/reviews/{review_id}", summary="Get one issue triage report by review ID")
-def get_issue_triage_review(review_id: str, user: dict = Depends(_require_auth)):
+def get_issue_triage_review(review_id: str, caller: dict = Depends(get_caller)):
     review = database.get_review(review_id)
-    if not review or review.get("review_type") != "issue_triage":
+    visible = scope.visible_from_caller(caller)
+    # 404 rather than 403 on another project's report, matching every other
+    # id-addressed governance route: whether an id exists elsewhere is itself information.
+    if (not review
+            or review.get("review_type") != "issue_triage"
+            or (visible is not None and review.get("project_id") not in visible)):
         raise HTTPException(status_code=404, detail="Issue triage report not found")
     return review
