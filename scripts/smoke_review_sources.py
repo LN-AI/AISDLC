@@ -2864,7 +2864,7 @@ def main():
         # passing because there is nothing left to order — the failure mode that made this
         # comment necessary the first time.
         check("...and the check is looking at the function that actually writes",
-              all(n in _code31 for n in ("gh", "owner", "repo", "get_default_branch")),
+              all(n in _code31 for n in ("gh", "owner", "repo", "resolve_base_branch")),
               "the owner/repo/client resolution is no longer in `_deliver`, so the "
               "ordering check below would pass vacuously -- point it at wherever the "
               "write path went")
@@ -2895,9 +2895,47 @@ def main():
               "read before assignment: " + ", ".join(_offenders31)
               + " -- function-locals, so a read above the assignment is an "
                 "UnboundLocalError and not a fall-through to a global")
-        check("...and the repository client is resolved before the default branch is asked for",
-              _code31.index("gh = orch.github") < _code31.index("get_default_branch("),
-              "the default-branch lookup takes the client and the owner/repo it names")
+        check("...and the repository client is resolved before the base branch is asked for",
+              _code31.index("gh = orch.github") < _code31.index("resolve_base_branch("),
+              "the base-branch resolution takes the client and the owner/repo it names")
+
+        # ── One copy of the base-branch rule, and it checks ───────────────
+        #
+        # Three separate live defects were the same shape: a base branch derived from a
+        # human label and handed straight to GitHub (D-314, D-315, D-364). None was visible
+        # offline because every fix test stops before writing. The rule now lives in one
+        # function shared by `fix_apply` and the generated-code deliveries, which makes this
+        # the single place it can regress -- so it is checked as a property, not by reading
+        # `_deliver`'s text.
+        from backend.services import code_delivery as _cd31
+        _rbb31 = _ast31.unparse(_ast31.parse(_tw31.dedent(_i31.getsource(_cd31.resolve_base_branch))))
+        check("a derived base branch is verified against GitHub before it is used",
+              "branch_exists(" in _rbb31,
+              "a tag, a sha, a deleted branch and a plausible non-branch all fail as an "
+              "identical bare 422 from POST /pulls -- one request tells them apart")
+        check("...and an unusable one falls back to the repository's own default",
+              "get_default_branch(" in _rbb31,
+              "assuming 'main' fails on every repository still on master or develop")
+
+        class _FakeGH31:
+            """Answers `branch_exists` for exactly one name, and records the fallback."""
+            def __init__(self, real): self.real, self.asked_default = real, False
+            def branch_exists(self, o, r, b): return b == self.real
+            def get_default_branch(self, o, r):
+                self.asked_default = True
+                return "trunk"
+
+        _gh_ok31 = _FakeGH31("develop")
+        check("a candidate that is a real branch is kept",
+              _cd31.resolve_base_branch(_gh_ok31, "o", "r", "develop") == "develop"
+              and not _gh_ok31.asked_default,
+              "a verified branch must be used as given, not replaced by the default")
+        for _bad31 in ("", "CB-104: AI visit summary endpoint", "scratch-repo", "61f9b8f"):
+            _gh_bad31 = _FakeGH31("develop")
+            check(f"...and {_bad31 or 'an empty name'!r} falls back rather than reaching GitHub",
+                  _cd31.resolve_base_branch(_gh_bad31, "o", "r", _bad31) == "trunk",
+                  "these are the four shapes that actually reached POST /pulls: nothing, a "
+                  "pull request title, a repository name, and a short sha")
 
         # ── The patch is shown before it is delivered ─────────────────────
         #
@@ -4186,6 +4224,326 @@ def main():
           "the route turns this into a 400 -- reviewing an empty inventory would return a "
           "confident verdict about nothing, which is the degenerate result `attest` exists "
           "to stop reaching a screen")
+
+    # ── 33. The rest of the agents get a codebase, and generated code gets out ──
+    #
+    # Four intakes and one outtake, and again the shapes differ on purpose.
+    #
+    #  * **Migration Assessment** joins Architecture and Security on the structural brief.
+    #    `MIGRATION_ASSESSMENT_TOOL_SCHEMA` returns one `complexity` and one
+    #    `estimated_effort`, so it is the same holistic question and must not chunk.
+    #  * **Part 11 and GxP** get the **real files**, because "is there an audit-trail write
+    #    when a record changes" is a question about code and a summary cannot answer it.
+    #    Part 11 splits when the prompt does not fit (D-354) so it must be chunkable; the
+    #    GxP planner does not split, so it must not be.
+    #  * **The regulated cap is reported, not applied silently.** 60 files / 120,000
+    #    characters bounds what `review_estimate.for_regulated_files` is calibrated on, and
+    #    a repository hits it far more easily than a hand-made zip did. `attest.coverage_claim`
+    #    cannot catch this one: it reconciles the model's claim against *the input it was
+    #    given*, which is already the truncated 60. An FDA-facing report is the last place
+    #    an unstated coverage gap belongs.
+    #  * **Generated code can be pushed**, and `code_delivery` is deliberately narrower than
+    #    `fix_apply`: no existing branch, no commit onto somebody's checkout, and a
+    #    deny-by-default list of which stored runs may be delivered at all.
+    section("33. Codebases into the remaining agents, and generated code back out")
+
+    from backend.services import legacy_guard as _lg33
+    from backend.services import code_delivery as _cd33
+    import backend.main as _m33
+
+    def _refuses(mod, fname, *args, _pre=None, **kw):
+        """True when the call raises `DeliveryError` — the module's own refusal.
+
+        Any other exception propagates: a guard that happens to crash is not a guard, and
+        a bare `except Exception` here would report a TypeError as a successful refusal.
+        """
+        if _pre:
+            _pre()
+        try:
+            getattr(mod, fname)(*args, **kw)
+            return False
+        except mod.DeliveryError:
+            return True
+
+    _chunk33 = set(_lg33._CHUNKABLE_ROUTES)
+    check("a migration assessment of a codebase is one call, not a fan-out",
+          "/api/review/migration-assessment/source" not in _chunk33,
+          "one complexity and one effort estimate have no merge rule across chunks, the "
+          "same reason the two design agents are absent")
+    check("...and a Part 11 verification of one is a fan-out",
+          "/api/review/cfr21-verification/source" in _chunk33,
+          "cfr21_agent.verify splits when the prompt does not fit (D-354) -- unlisted, it "
+          "reserves for one call and makes several (C-77)")
+    check("...and the GxP planner is not, because it does not split",
+          "/api/review/gxp-generate-plan/source" not in _chunk33,
+          "gxp_generator_agent.plan makes a single call; reserving for a fan-out that never "
+          "happens denies calls that would have succeeded")
+    check("every new run door is metered as its own product",
+          all(_lg33.product_for_request("POST", p) == a for p, a in (
+              ("/api/review/migration-assessment/source", "migration-assessment"),
+              ("/api/review/migration-assessment/upload-zip", "migration-assessment"),
+              ("/api/review/cfr21-verification/source", "cfr21-verification"),
+              ("/api/review/gxp-generate-plan/source", "gxp-generate-plan"))),
+          "an unmapped route is entitled to nobody and billed to nothing (D-289)")
+    check("...and no preflight is, because a quote spends nothing",
+          all(_lg33.product_for_request("POST", p) is None for p in (
+              "/api/review/migration-assessment/preflight",
+              "/api/review/cfr21-verification/preflight",
+              "/api/review/gxp-generate-plan/preflight",
+              "/api/review/gxp-generate-plan/preflight-zip",
+              "/api/code-brief")),
+          "refusing to quote somebody near their cap tells them less than the quote would")
+
+    # -- the regulated cap, and saying so ---------------------------------
+    _small33 = source_bundle.from_files(
+        [{"path": f"a{i}.py", "content": "x = 1\n"} for i in range(5)])
+    _b33 = _m33._regulated_files(_small33)
+    check("a source inside the regulated cap reports no gap",
+          _b33["assessed"] == 5 and _b33["considered"] == 5
+          and not _b33["capped"] and _b33["cap_note"] == "",
+          f"{_b33['assessed']}/{_b33['considered']} capped={_b33['capped']}")
+
+    _big33 = source_bundle.from_files(
+        [{"path": f"b{i}.py", "content": "y = 2\n"} for i in range(140)])
+    _c33 = _m33._regulated_files(_big33)
+    check("a source over the file cap is truncated to exactly the cap",
+          _c33["assessed"] == _m33._CFR21_MAX_FILES,
+          f"assessed {_c33['assessed']}, cap {_m33._CFR21_MAX_FILES}")
+    check("...and says how much was left out, with both numbers",
+          _c33["capped"] and str(_c33["considered"]) in _c33["cap_note"]
+          and str(_c33["considered"] - _c33["assessed"]) in _c33["cap_note"],
+          f"{_c33['cap_note'][:200]!r} -- a Part 11 report covering 60 of 140 files that "
+          "does not say so overstates its coverage, and coverage_claim cannot catch it "
+          "because the 60 is all it ever sees")
+    check("...and refuses to let a compliant verdict travel to the unread files",
+          "applies to" in _c33["cap_note"] or "apply to" in _c33["cap_note"],
+          "the note has to say what the conclusion does *not* cover, not only the count")
+    # A whole file or none of it. This was `text[:remaining]`, so the last file that fit was
+    # cut in half and handed to the model with nothing saying so -- and "no audit-trail
+    # write in this file" is then a *wrong* finding in an FDA-facing report whenever the
+    # write was in the discarded half.
+    _huge33 = source_bundle.from_files([
+        {"path": "small.py", "content": "a = 1\n"},
+        {"path": "big.py", "content": "x = 1\n" * (_m33._CFR21_MAX_TOTAL_CHARS // 4)},
+        {"path": "also_small.py", "content": "b = 2\n"},
+    ])
+    _d33 = _m33._regulated_files(_huge33)
+    check("a file is assessed whole or not at all, never half",
+          all(len(f["content"]) == len(o["content"])
+              for f in _d33["files"]
+              for o in _huge33.files if o["path"] == f["path"]),
+          "a partial file the model is not told is partial turns an absent finding into a "
+          "clean verdict over code nobody read")
+    check("...and a file too large for the whole budget is named, not just dropped",
+          _d33["assessed"] == 2 and _d33["oversize"] == ["big.py"]
+          and "never be included by re-running" in _d33["cap_note"],
+          f"{_d33['assessed']} assessed, oversize={_d33['oversize']} -- splitting the "
+          "system does not help with this one, so somebody chasing full coverage has to "
+          "know which case they are in")
+
+    check("...and the same sentence goes to the model",
+          _c33["cap_note"] in _m33._regulated_context(_big33, _c33, ""),
+          "a gap stated on the screen and not in the prompt is a gap the report will not "
+          "mention")
+
+    # -- code_delivery: what it refuses before writing --------------------
+    check("a repository URL is parsed or refused, never half-parsed",
+          _cd33.owner_repo("https://github.com/o/r.git/") == ("o", "r"),
+          "an empty owner produces a 404 from a URL that looks almost right")
+    for _bad33 in ("", "not a url", "https://github.com/onlyowner"):
+        try:
+            _cd33.owner_repo(_bad33)
+            check(f"...and {_bad33!r} is refused", False, "it was accepted")
+        except _cd33.DeliveryError:
+            check(f"...and {_bad33!r} is refused", True)
+
+    check("a generated path that escapes the repository is refused",
+          _refuses(_cd33, "safe_path", "../../etc/passwd"),
+          "generated paths come from a model, which is exactly the input that should not "
+          "be trusted to stay inside the tree")
+    check("...while an ordinary one is normalised, not rejected",
+          _cd33.safe_path("./src//app.py") == "src/app.py")
+
+    check("two generated files claiming one path are refused",
+          _refuses(_cd33, "_check_files",
+                   [{"path": "a.py", "content": "1"}, {"path": "./a.py", "content": "2"}]),
+          "letting the second silently overwrite the first loses a file with no error")
+    check("...and a run that produced nothing is refused",
+          _refuses(_cd33, "_check_files", []),
+          "an empty delivery would create a branch with nothing on it")
+    check("...and more files than one click should push is refused",
+          _refuses(_cd33, "_check_files",
+                   [{"path": f"f{i}.py", "content": "1"} for i in range(_cd33.MAX_FILES + 1)]),
+          "a scaffold is 8-16 files by its own prompt; anything near the cap means "
+          "something else happened")
+
+    class _GH33:
+        """A GitHub that has one branch and remembers what it was asked to do."""
+        token = "t"
+        def __init__(self, existing=("main",)):
+            self.existing, self.created, self.committed = set(existing), [], []
+        def branch_exists(self, o, r, b): return b in self.existing
+        def get_default_branch(self, o, r): return "main"
+        def get_branch_head_sha(self, o, r, b): return "0" * 40
+        def create_branch_at_sha(self, o, r, b, sha): self.created.append(b)
+        def commit_file(self, o, r, b, p, c, m): self.committed.append(p); return {"path": p}
+        def create_pull_request(self, o, r, t, b, h, base):
+            return {"number": 1, "url": "u", "state": "open"}
+
+    _orig_gfr33 = source_bundle.github_for_repo
+    try:
+        _gh33 = _GH33()
+        source_bundle.github_for_repo = lambda url, pid=None: _gh33
+        _files33 = [{"path": "src/app.py", "content": "print(1)\n"}]
+        _url33 = "https://github.com/o/r"
+
+        check("generated code is never committed onto the branch it would merge into",
+              _refuses(_cd33, "deliver", _files33, _url33, branch="main"),
+              "that is `fix_apply`'s `same_pr` delivery, which is opt-in there only because "
+              "a review had already read the branch -- nothing has read this")
+        check("...nor onto a branch that already exists",
+              _refuses(_cd33, "deliver", _files33, _url33, branch="lm-scaffold/x",
+                       _pre=lambda: _gh33.existing.add("lm-scaffold/x")),
+              "re-running a scaffold is cheap and easy to do twice; stacking a second "
+              "generation on the first is not something a person can see before it happens")
+
+        _gh33 = _GH33()
+        source_bundle.github_for_repo = lambda url, pid=None: _gh33
+        _out33 = _cd33.deliver(_files33, _url33, branch="lm-scaffold/abc",
+                               commit_message="m", review_id="r1")
+        check("a clean delivery cuts the branch from the default and commits to it",
+              _out33["branch"] == "lm-scaffold/abc" and _out33["base_branch"] == "main"
+              and _gh33.created == ["lm-scaffold/abc"] and _gh33.committed == ["src/app.py"],
+              f"{_out33} / created={_gh33.created} committed={_gh33.committed}")
+        check("...and opens no pull request unless asked",
+              _out33["pull_request"] is None,
+              "a branch is a proposal somebody can ignore; a pull request asks for a review")
+    finally:
+        source_bundle.github_for_repo = _orig_gfr33
+
+    check("an unreviewed run says so in the pull request body",
+          "NOT reviewed" in _cd33.pr_body_for(
+              "codegen_scaffold", "r1",
+              "NOT reviewed. This run was produced without the pre-release check, so no "
+              "agent has read this code."),
+          "the person merging generated code is entitled to know nothing checked it "
+          "before they read a line")
+
+    check("only runs that actually produce files can be delivered",
+          set(_m33._DELIVERABLE_RUNS) == {"codegen_scaffold", "migration_execute"},
+          "deny by default -- a review type absent from the map cannot be pushed at all, "
+          "rather than the route guessing from the shape of `result`")
+
+    # -- and the whole way through, with the model stubbed ----------------
+    #
+    # The checks above are about shape. These are the only ones that would notice that a
+    # route calls its orchestrator method with an argument it does not take, or that a
+    # single-call agent quietly became a fan-out.
+    from fastapi.testclient import TestClient as _TC33
+    import backend.main as _main33
+    _main33.llm_settings_service.is_llm_configured = lambda: True
+
+    _calls33 = []
+
+    def _fake33(system_prompt, user_content, schema, override=None, max_tokens=None, **kw):
+        name = schema.get("name", "")
+        _calls33.append(name)
+        if "migration" in name:
+            return {"source_stack": "Python/Flask", "target_stack": "FastAPI",
+                    "migration_type": "Framework", "complexity": "Moderate",
+                    "estimated_effort": "3 weeks", "breaking_changes": ["routing"],
+                    "risk_areas": ["sessions"],
+                    "phased_plan": [{"phase": "1", "deliverables": ["x"]}],
+                    "recommended_approach": "incremental", "justification": "small surface",
+                    "rollback_strategy": "keep both", "summary": "A moderate migration."}
+        if "gxp" in name:
+            return {"gxp_classification": "GxP-Supporting", "summary": "Supporting system.",
+                    "system_understanding": "A small data service.", "gamp5_category": "4",
+                    "validation_approach": "risk based",
+                    "applicable_documents": [{"document_type": "URS", "applicable": True,
+                                              "rationale": "needed", "outline": ["scope"]}]}
+        return {"overall_gate_status": "Amber", "overall_risk_score": 40,
+                "summary": "Audit trail partially present.",
+                "files_scanned": ["app/db.py"],
+                "findings": [{"severity": 3, "title": "No audit trail on update",
+                              "control_id": "21CFR11-10e", "file": "app/db.py",
+                              "evidence": "the update path writes no history row",
+                              "recommendation": "write an audit row"}],
+                "audit_trail_assessment": {"applicable": True, "compliant": False,
+                                           "gaps": ["no history table"], "strengths": []},
+                "electronic_signature_assessment": {"applicable": False},
+                "access_control_assessment": {"applicable": True, "compliant": True,
+                                              "gaps": [], "strengths": ["role checks"]},
+                "data_integrity_assessment": {"applicable": True, "compliant": True,
+                                              "gaps": [], "strengths": ["ALCOA ok"]}}
+
+    _prev33 = llm_gateway.call_tool
+    llm_gateway.call_tool = _fake33
+    try:
+        with _TC33(_main33.app, raise_server_exceptions=False) as _c33:
+            _tok33 = _c33.post("/api/auth/login",
+                               json={"username": "admin",
+                                     "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+            _pid33 = _c33.post("/api/v1/projects", json={"name": "S33"},
+                               headers={"Authorization": f"Bearer {_tok33}"}
+                               ).json()["project"]["id"]
+            _H33 = {"Authorization": f"Bearer {_tok33}", "X-Project-Id": _pid33}
+            _files33e = [
+                {"path": "app/db.py",
+                 "content": "import app.util\n\ndef update(row):\n    conn.execute('UPDATE t')\n"},
+                {"path": "app/util.py", "content": "def helper():\n    return 2\n"},
+            ]
+
+            for _agent33, _extra33, _single33 in (
+                    ("migration-assessment", {"migration_target": "Flask to FastAPI"}, True),
+                    ("cfr21-verification", {"system_description": "LIMS"}, True),
+                    ("gxp-generate-plan", {"system_description": "LIMS"}, True)):
+                _body33 = {"files": _files33e, **_extra33}
+                _q33 = _c33.post(f"/api/review/{_agent33}/preflight", json=_body33, headers=_H33)
+                check(f"{_agent33} quotes before it runs", _q33.status_code == 200,
+                      f"{_q33.status_code} {_q33.text[:200]}")
+                _n33 = len(_calls33)
+                check("...and the quote itself calls no model",
+                      _n33 == len(_calls33), "a free preflight that spends is not free")
+                _r33 = _c33.post(f"/api/review/{_agent33}/source", json=_body33, headers=_H33)
+                check(f"...and {_agent33} runs a codebase end to end",
+                      _r33.status_code == 200, f"{_r33.status_code} {_r33.text[:300]}")
+                _made33 = len(_calls33) - _n33
+                check("...in exactly the number of calls it was quoted for",
+                      _made33 == (_q33.json().get("estimate", {}).get("calls")
+                                  if _q33.status_code == 200 else -1),
+                      f"quoted {_q33.json().get('estimate', {}).get('calls')}, made {_made33}"
+                      " -- a quote and an invoice that disagree are worse than no quote")
+                if _r33.status_code == 200:
+                    check("...and the run is stored, so it has a history entry",
+                          bool(_r33.json().get("review_id")), str(_r33.json())[:160])
+
+            # The two things the shape checks above cannot see, both about the target.
+            _q33 = _c33.post("/api/review/migration-assessment/preflight",
+                             json={"files": _files33e}, headers=_H33)
+            check("a migration can be priced before a target is chosen",
+                  _q33.status_code == 200,
+                  f"{_q33.status_code} {_q33.text[:200]} -- pricing the job is how somebody "
+                  "decides whether to commit to a target at all, so requiring one to quote "
+                  "would put the question in the wrong order")
+            _r33 = _c33.post("/api/review/migration-assessment/source",
+                             json={"files": _files33e}, headers=_H33)
+            check("...but not run without one, and it says why in a sentence",
+                  _r33.status_code == 400 and "migration target" in _r33.text.lower(),
+                  f"{_r33.status_code} {_r33.text[:200]} -- a required Pydantic field would "
+                  "answer 422 with a field-path nobody can act on")
+
+            _b33 = _c33.post("/api/code-brief", json={"files": _files33e}, headers=_H33)
+            check("a codebase can be described without being reviewed",
+                  _b33.status_code == 200 and _b33.json().get("markdown"),
+                  f"{_b33.status_code} {_b33.text[:200]} -- Code Generation reads this into "
+                  "its context box, where a person can see it before it is sent")
+            check("...and describing one calls no model either",
+                  _b33.status_code != 200 or "code-brief" not in "".join(_calls33),
+                  "the brief is computed, not generated")
+    finally:
+        llm_gateway.call_tool = _prev33
+
 
     print()
     print("-" * 60)

@@ -643,7 +643,8 @@ def _deliver(orch, review_id: str, output: str, safe: List[Dict[str, Any]],
     except Exception:
         logger.warning("Falling back to the shared GitHub client for %s", repo_url)
 
-    # Which branch a fix pull request should target.
+    # Which branch a fix pull request should target — *choosing* the candidate here,
+    # *validating* it in `code_delivery.resolve_base_branch`.
     #
     # This was `label.split("@")[-1]` for every source. That is right for a repository,
     # whose label is `owner/repo@ref` — and badly wrong for a pull request, whose label is
@@ -652,28 +653,25 @@ def _deliver(orch, review_id: str, output: str, safe: List[Dict[str, Any]],
     # answer is the branch the review read, which is what `_available_outputs` already
     # promises: "a pull request against the branch it came from".
     if source.get("source_type") == "github_pr":
-        base_ref = source.get("head_branch") or ""
+        base_candidate = source.get("head_branch") or ""
     else:
         # **Only when the label actually carries an `@`.** A repository reviewed at its
         # default branch is labelled `scratch-repo` with no `@` at all, and `split("@")[-1]`
         # then returns the *repository name* — a non-empty, entirely plausible-looking
         # string that is not a branch. `POST /pulls` answered a bare 422 and the emptiness
-        # guard below could not see it, because the value was not empty. Same family as
-        # D-315: a branch name must never be derived from a human label without being
-        # checked. Found by `scripts/verify_fix_apply.py` on its first real run (D-364).
+        # guard could not see it, because the value was not empty. Same family as D-315: a
+        # branch name must never be derived from a human label without being checked. Found
+        # by `scripts/verify_fix_apply.py` on its first real run (D-364).
         label = source.get("label") or ""
-        base_ref = label.split("@")[-1] if "@" in label else ""
-    # Asked, not assumed. "main" is a guess that fails on every repository still using
-    # master, or develop, and fails as another opaque 422 rather than as a sentence.
-    # Only needed for the `pr` delivery, but resolved here so the failure is one
-    # sentence about a default branch rather than a 422 thirty lines later.
-    #
-    # The `branch_exists` half matters as much as the emptiness half: what the label
-    # carried after its `@` may be a tag, a sha, or a branch that has since been deleted,
-    # and all three fail identically to a wrong name. One request to find out, against a
-    # delivery that is about to push.
-    if not base_ref or not gh.branch_exists(owner, repo, base_ref):
-        base_ref = gh.get_default_branch(owner, repo)
+        base_candidate = label.split("@")[-1] if "@" in label else ""
+    # The check that turns all three of those defects into one sentence lives in
+    # `code_delivery`, shared with the generated-code deliveries, because a second copy of
+    # it in a second writer is exactly how they come back. It asks GitHub whether the
+    # candidate is a branch — a tag, a sha, a deleted branch and a plausible non-branch all
+    # fail identically otherwise — and falls back to the repository's own default rather
+    # than guessing "main".
+    from backend.services import code_delivery
+    base_ref = code_delivery.resolve_base_branch(gh, owner, repo, base_candidate)
 
     if output == "same_pr":
         # No new branch: the fix is committed onto the pull request's own head branch, which

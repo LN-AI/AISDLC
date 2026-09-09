@@ -68,6 +68,10 @@ from backend.models.schemas import (
     ArchitectureSourceRequest,
     SecuritySourceRequest,
     SensitiveDataSourceRequest,
+    MigrationAssessmentSourceRequest,
+    RegulatedSourceRequest,
+    DeliverGeneratedCodeRequest,
+    CodeBriefRequest,
 )
 from backend.models.api_models import (
     AIProvenanceRequest,
@@ -90,6 +94,7 @@ from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
 from backend.services import code_brief
+from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
                               review_source_store, source_bundle)
 from backend.services.subject_service import resolve_subject
@@ -1841,12 +1846,31 @@ def _brief_context(bundle, brief, context: str) -> str:
 
 
 def _design_review_from_source(bundle, agent: str, req) -> dict:
-    """Shared body for Architecture and Security Review over a codebase."""
+    """Shared body for the three single-call agents that read a whole codebase.
+
+    Architecture Review, Security Review and Migration Assessment are the same shape of
+    question: each returns **one** verdict about the system as a whole, so none of them can
+    be fanned out over chunks and merged. `MIGRATION_ASSESSMENT_TOOL_SCHEMA` has one
+    `complexity` and one `estimated_effort` the way `ARCHITECTURE_TOOL_SCHEMA` has one
+    `quality_scores` — twenty partial answers have no merge rule. All three therefore get
+    the computed structural description and make a single call.
+    """
     _require_llm()
     brief = _brief_for(bundle, agent)
     ctx = _brief_context(bundle, brief, req.context or "")
     project = req.project_name or bundle.label[:60] or "Unnamed Project"
-    if agent == "architecture":
+    if agent == "migration-assessment":
+        target = (getattr(req, "migration_target", "") or "").strip()
+        if not target:
+            raise HTTPException(
+                status_code=400,
+                detail="A migration target is required — 'assess this codebase' has no "
+                       "answer without saying what it is being moved to.")
+        result = orchestrator.assess_migration(
+            source=brief["markdown"], migration_target=target,
+            constraints=getattr(req, "constraints", "") or "",
+            context=ctx, project_name=project)
+    elif agent == "architecture":
         mode = req.review_mode or "review"
         if mode not in ("review", "recommend", "compare"):
             raise HTTPException(status_code=400,
@@ -1919,6 +1943,8 @@ class _FormReq:
         self.requirements = kw.get("requirements", "")
         self.review_mode = kw.get("review_mode", "review")
         self.system_type = kw.get("system_type", "")
+        self.migration_target = kw.get("migration_target", "")
+        self.constraints = kw.get("constraints", "")
 
 
 # Two upload endpoints rather than one taking an `agent` form field, even though the bodies
@@ -2095,6 +2121,38 @@ async def review_security_file(
 
 # ── Code Generation ─────────────────────────────────────────────────────────
 
+@app.post("/api/code-brief")
+def build_code_brief(req: CodeBriefRequest, request: Request,
+                     reader: dict = Depends(require_reader)):
+    """A structural description of a codebase. **Free — calls no model.**
+
+    The same computation the design agents are given, handed back on its own so a screen
+    whose agent is *not* reading the code can still tell it what exists. Code Generation is
+    the case: "build something that fits this repository" is a different request from
+    "build this from scratch", and the difference is entirely in what the prompt knows.
+
+    Unmetered and mapped to no product, for the reason the `/preflight` routes are:
+    it spends nothing, and refusing to describe a repository to somebody near their cap
+    tells them less than the description would.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Code brief source resolution failed")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    brief = _brief_for(bundle, "code-brief")
+    return {
+        "source": bundle.summary(),
+        "markdown": brief["markdown"],
+        "coverage": brief["coverage"],
+        "coverage_note": brief["coverage_note"],
+        "stats": brief["stats"],
+    }
+
+
 @app.post("/api/codegen/advisory")
 def codegen_advisory(req: CodeGenAdvisoryRequest):
     if not req.requirement.strip():
@@ -2177,6 +2235,78 @@ async def codegen_scaffold_download(review_id: str, request: Request,
     )
 
 
+_DELIVERABLE_RUNS = {
+    "codegen_scaffold": {"prefix": "lm-scaffold", "what": "generated starter project"},
+    "migration_execute": {"prefix": "lm-migration", "what": "migrated code"},
+}
+
+
+@app.post("/api/reviews/{review_id}/deliver-code")
+async def deliver_generated_code(review_id: str, req: DeliverGeneratedCodeRequest,
+                                 request: Request, reader: dict = Depends(require_reader)):
+    """Commit a finished run's generated files to a new branch, optionally opening a PR.
+
+    Until this existed, "generate the code for this requirement" ended at a zip somebody had
+    to unpack and copy in by hand, which is most of the value of generating it.
+
+    Scoped exactly like the zip download beside it: generated source is a review, and a
+    credential alone must not reach another project's. Makes **no model call** — the files
+    were produced and stored when the run happened — so nothing is metered here. It is
+    audited, before the write, by `code_delivery.deliver`.
+    """
+    review = database.get_review(review_id)
+    if not review or review.get("review_type") not in _DELIVERABLE_RUNS:
+        raise HTTPException(status_code=404, detail="No deliverable run with that id")
+    visible = _visible_project_ids(reader, request)
+    if visible is not None and review.get("project_id") not in visible:
+        raise HTTPException(status_code=404, detail="No deliverable run with that id")
+
+    spec = _DELIVERABLE_RUNS[review["review_type"]]
+    result = review.get("result") or {}
+    files = result.get("files") or []
+
+    # What checked this code, said plainly, because it goes into the pull request body and
+    # the person merging it is entitled to know before they read a line. A run without
+    # `auto_review` has had nothing look at it at all.
+    gov = result.get("governance_review") or {}
+    if gov:
+        reviewed = (f"Reviewed by the platform's Code Review and Sensitive Data agents — "
+                    f"gate {gov.get('gate_status', 'Unknown')}, "
+                    f"{len(gov.get('findings') or [])} finding(s).")
+    else:
+        reviewed = ("NOT reviewed. This run was produced without the pre-release check, so "
+                    "no agent has read this code.")
+
+    branch = (req.branch or "").strip() or code_delivery.branch_name(spec["prefix"], review_id)
+    project = str(result.get("project_name") or review.get("project_name") or "").strip()
+    message = (req.commit_message or "").strip() or (
+        f"Add {spec['what']}" + (f" for {project}" if project else ""))
+    try:
+        return await asyncio.to_thread(
+            code_delivery.deliver,
+            files, req.github_repo_url,
+            project_id=review.get("project_id"),
+            branch=branch,
+            base_branch=req.base_branch or "",
+            commit_message=message,
+            open_pr=bool(req.open_pr),
+            pr_title=(req.pr_title or "").strip() or message,
+            pr_body=code_delivery.pr_body_for(
+                review["review_type"], review_id, reviewed,
+                result.get("summary") or result.get("migration_summary") or ""),
+            token=(req.github_token or "").strip(),
+            review_id=review_id,
+            review_type=review["review_type"],
+            actor=str(reader.get("username") or reader.get("sub") or "system"),
+        )
+    except code_delivery.DeliveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as e:
+        logger.exception("Could not deliver generated code for %s", review_id)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
 # ── AI Code Provenance & Risk ────────────────────────────────────────────────
 
 @app.post("/api/review/ai-provenance")
@@ -2231,6 +2361,63 @@ def review_migration_assessment(req: MigrationAssessmentRequest):
         raise HTTPException(status_code=status, detail=body)
 
 
+@app.post("/api/review/migration-assessment/source")
+def review_migration_assessment_source(req: MigrationAssessmentSourceRequest, request: Request):
+    """Assess a migration from the codebase rather than from one pasted file.
+
+    Reuses the architecture path wholesale: one holistic question, so a computed structural
+    description and a single call. The **language caveat matters more here than anywhere
+    else** — migration assessment is most wanted for the oldest stacks, and `code_brief`
+    only builds real dependency edges for Python, PHP, Java/Kotlin/Scala, C#/VB.NET and
+    Delphi/Pascal. A COBOL or RPG codebase degrades to an annotated file listing, and the
+    brief's own coverage note says so in the prompt and on the screen.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _design_review_from_source(bundle, "migration-assessment", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/migration-assessment/upload-zip")
+async def review_migration_assessment_zip(
+    file: UploadFile = File(..., description="A zip of the codebase, or a single source file."),
+    project_name: str = Form(""),
+    migration_target: str = Form(""),
+    constraints: str = Form(""),
+    context: str = Form(""),
+):
+    """The archive door for the assessment above — a zip cannot travel on a JSON route."""
+    bundle = _upload_bundle(await file.read(), file.filename or "")
+    req = _FormReq(project_name=project_name, context=context,
+                   migration_target=migration_target, constraints=constraints)
+    try:
+        return await asyncio.to_thread(
+            _design_review_from_source, bundle, "migration-assessment", req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/migration-assessment/preflight")
+def preflight_migration_assessment(req: MigrationAssessmentSourceRequest, request: Request):
+    """What assessing this codebase will cost. Free — neither the brief nor the quote calls
+    a model. Deliberately does not require `migration_target`: someone sizing the job before
+    committing to a target should not have to invent one to get a price."""
+    return _preflight_design(req, request, "migration-assessment")
+
+
 @app.post("/api/review/migration-execute")
 def review_migration_execute(req: MigrationExecutionRequest):
     if not (req.code or "").strip():
@@ -2269,43 +2456,149 @@ _CFR21_MAX_FILES = 60
 _CFR21_MAX_TOTAL_CHARS = 120_000
 
 
-def _extract_zip_files(content: bytes) -> list:
-    """The regulated products' archive intake, on the same ingester as everything else.
+def _regulated_files(bundle) -> dict:
+    """The regulated products' file intake — Part 11 and GxP — with its caps made visible.
 
-    This used to be a second, weaker implementation: a bare `zipfile` walk with an excluded
-    directory list and an extension filter, and **no secret redaction, no path-traversal
-    guard, no symlink guard and no zip-bomb cap**. So a customer uploading their codebase to
-    a 21 CFR Part 11 verification had their hardcoded credentials sent to the model verbatim,
-    while the identical upload to Code Review had them replaced with
-    `__REDACTED_ASSIGNED_CREDENTIAL__` first. One of those is the product's stated behaviour
-    and the other was an accident of having two doors.
-
-    `source_bundle.from_zip_bytes` takes the extension set as a parameter, so the narrower
-    regulated filter is preserved as an argument rather than a fork. Two deliberate changes
-    come with it, both improvements: a credential file (`.env` and friends) is now skipped
-    entirely rather than uploaded, and secrets inside kept files are redacted before the
-    call. Neither costs a Part 11 or GxP assessment anything — a `.env` holds secrets, not
-    evidence of an audit trail.
+    **On the same ingester as everything else.** This used to be a second, weaker
+    implementation: a bare `zipfile` walk with an excluded directory list and an extension
+    filter, and **no secret redaction, no path-traversal guard, no symlink guard and no
+    zip-bomb cap**. So a customer uploading their codebase to a 21 CFR Part 11 verification
+    had their hardcoded credentials sent to the model verbatim, while the identical upload
+    to Code Review had them replaced with `__REDACTED_ASSIGNED_CREDENTIAL__` first. One of
+    those is the product's stated behaviour and the other was an accident of having two
+    doors. Callers now build the `Bundle` through `source_bundle` — from a zip, or from a
+    repository at a ref — and this only applies the regulated bounds to it.
 
     The 60-file / 120,000-character caps stay: they bound what one regulated assessment is
-    priced and split against, and `review_estimate.for_regulated_files` is calibrated on them.
+    priced and split against, and `review_estimate.for_regulated_files` is calibrated on
+    them. A repository makes them much easier to hit than a hand-assembled archive did,
+    which is why the cap is now **reported rather than applied silently**. Before this, a
+    400-file system had 60 files assessed and the report said nothing about the other 340 —
+    and `attest.coverage_claim` could not catch it, because it reconciles the model's claim
+    against *the input it was given*, which was already the truncated 60. So the gap was
+    invisible at exactly the point an FDA-facing report is least allowed to overstate its
+    coverage. The note returned here goes into the prompt and onto the screen, the same
+    sentence in both places.
     """
-    try:
-        bundle = source_bundle.from_zip_bytes(
-            content, label="upload", extensions=_CFR21_ALLOWED_EXTENSIONS)
-    except source_bundle.SourceError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    files, total_chars = [], 0
+    files, total_chars, considered, oversize = [], 0, 0, []
     for entry in bundle.files:
-        if len(files) >= _CFR21_MAX_FILES or total_chars >= _CFR21_MAX_TOTAL_CHARS:
-            break
-        text = (entry.get("content") or "")[:_CFR21_MAX_TOTAL_CHARS - total_chars]
+        text = (entry.get("content") or "")
         if not text.strip():
+            continue
+        considered += 1
+        if len(files) >= _CFR21_MAX_FILES:
+            continue
+        # **A file goes in whole or not at all.** This used to be
+        # `text[:remaining]`, which cut the last file that fit in half and handed the model
+        # a partial file with nothing saying so — and "no audit-trail write in this file" is
+        # then a *wrong* finding in an FDA-facing report whenever the write was in the half
+        # that was dropped. Skipping it instead keeps every file the assessment sees
+        # complete, and the file lands in the coverage note as unread, which is true.
+        if total_chars + len(text) > _CFR21_MAX_TOTAL_CHARS:
+            if len(text) > _CFR21_MAX_TOTAL_CHARS:
+                oversize.append(entry.get("path") or "")
             continue
         files.append({"path": entry.get("path") or "", "content": text})
         total_chars += len(text)
-    return files
+
+    capped = considered > len(files)
+    note = ""
+    if capped:
+        note = (
+            f"Coverage limit: this source holds {considered:,} readable files and this "
+            f"assessment covers {len(files):,} of them "
+            f"({total_chars:,} characters). The remaining {considered - len(files):,} were "
+            f"not read, so no conclusion here — including a compliant one — applies to "
+            f"them. Split the system and assess it in parts to cover all of it.")
+        if oversize:
+            # Named, because this one is not "we ran out of room" — the file is larger than
+            # the whole budget, so it can never be covered by splitting the *system*, only
+            # by splitting the file. Somebody trying to get to full coverage needs to know
+            # which case they are in.
+            note += (
+                f" {len(oversize)} file(s) are individually larger than one assessment's "
+                f"whole budget and can never be included by re-running: "
+                f"{', '.join(oversize[:5])}"
+                f"{'…' if len(oversize) > 5 else ''}.")
+    return {"files": files, "considered": considered, "assessed": len(files),
+            "chars": total_chars, "capped": capped, "cap_note": note,
+            "oversize": oversize}
+
+
+def _regulated_context(bundle, batch: dict, context: str) -> str:
+    """What a regulated assessment is told about where its files came from.
+
+    The cap note is first because it is the one thing that changes how the *report* may be
+    read: an assessment of 60 files out of 400 is not an assessment of the system.
+    """
+    parts = [f"Source: {bundle.source_type} — {bundle.label}"]
+    if batch["cap_note"]:
+        parts.append(batch["cap_note"])
+    if bundle.untrusted_label:
+        parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if bundle.truncated:
+        parts.append(f"The source was truncated before analysis: {bundle.truncation_reason}")
+    if context:
+        parts.append(context)
+    return "\n".join(parts)
+
+
+def _run_regulated_bundle(bundle, agent: str, system_description: str,
+                          project_name: str, context: str) -> dict:
+    """Shared body for a Part 11 verification or a GxP validation plan over a codebase.
+
+    These get the **real files**, not the structural brief the design agents get: "is there
+    an audit-trail write when a record changes" is a question about the code, and a summary
+    of a codebase cannot answer it. That makes them the same shape as Code Review — which is
+    why `cfr21_agent.verify` already fans out over `chunked_review` when the prompt does not
+    fit (D-354) and needed no change to accept a repository.
+    """
+    _require_llm()
+    batch = _regulated_files(bundle)
+    if not batch["files"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input. Check the "
+                   "repository, branch or archive — a regulated assessment reads code, "
+                   "not documentation.")
+    ctx = _regulated_context(bundle, batch, context)
+    project = project_name or bundle.label[:60] or "Unnamed Project"
+    runner = (orchestrator.verify_cfr21 if agent == "cfr21-verification"
+              else orchestrator.plan_gxp_validation_package)
+    result = runner(files=batch["files"], system_description=system_description,
+                    context=ctx, project_name=project)
+    result["source"] = bundle.summary()
+    # The same three numbers the prompt was given and the quote was based on. One account
+    # of how much was read, not three.
+    result["coverage_limit"] = {k: batch[k] for k in
+                                ("considered", "assessed", "chars", "capped", "cap_note")}
+    return result
+
+
+def _preflight_regulated(bundle, agent: str, request: Request) -> dict:
+    """What a regulated assessment of this source will cost. Free — no model call."""
+    batch = _regulated_files(bundle)
+    if not batch["files"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input.")
+    quote = review_estimate.for_regulated_files(batch["files"], agent=agent)
+    subject = _ui_subject(request)
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": agent,
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (
+            None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
+        "coverage_limit": {k: batch[k] for k in
+                           ("considered", "assessed", "chars", "capped", "cap_note")},
+        "files_preview": [f["path"] for f in batch["files"]][:200],
+        "skipped_all": bundle.skipped[:400],
+    }
 
 
 @app.post("/api/review/cfr21-verification")
@@ -2330,33 +2623,28 @@ def review_cfr21_verification(req: CFR21VerificationRequest):
 
 
 @app.post("/api/review/cfr21-verification/preflight-zip")
-async def preflight_cfr21_upload_zip(file: UploadFile = File(...)):
+async def preflight_cfr21_upload_zip(request: Request, file: UploadFile = File(...)):
     """What a Part 11 verification of this zip will cost. **Free — no model call.**
 
     The browser's Part 11 screen uploads a zip, so a quote that existed only on the JSON
     API would be a quote no actual user ever saw. Reads and splits the archive exactly as
     the run will, and stops.
+
+    Now built by `_preflight_regulated`, the same function the repository door uses. It was
+    a second implementation, and it had drifted twice over: no budget line, and no statement
+    of the 60-file cap — so a 400-file archive was quoted as though all of it would be read.
     """
     if not (file.filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
     content = await file.read()
     try:
-        files = await asyncio.to_thread(_extract_zip_files, content)
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, "upload", _CFR21_ALLOWED_EXTENSIONS)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
-    if not files:
-        raise HTTPException(
-            status_code=400,
-            detail="No scannable source files found in the zip (check extensions / excluded dirs)")
-    from backend.services import review_estimate
-    quote = review_estimate.for_regulated_files(files, agent="cfr21-verification")
-    return {
-        "agent": "cfr21-verification",
-        "source": {"files": len(files),
-                   "chars": sum(len(f.get("content") or "") for f in files)},
-        "estimate": quote,
-        "explanation": review_estimate.describe(quote),
-    }
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _preflight_regulated(bundle, "cfr21-verification", request)
 
 
 @app.post("/api/review/cfr21-verification/upload-zip")
@@ -2368,28 +2656,75 @@ async def review_cfr21_verification_upload_zip(
 ):
     if not (file.filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
-    _require_llm()
     content = await file.read()
     try:
-        files = await asyncio.to_thread(_extract_zip_files, content)
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, file.filename or "upload",
+            _CFR21_ALLOWED_EXTENSIONS)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
-    if not files:
-        raise HTTPException(status_code=400, detail="No scannable source files found in the zip (check extensions / excluded dirs)")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     try:
         result = await asyncio.to_thread(
-            orchestrator.verify_cfr21,
-            files=files,
-            system_description=system_description,
-            context=context,
-            project_name=project_name or (file.filename or "Unnamed Project"),
-        )
-        result["files_extracted"] = len(files)
+            _run_regulated_bundle, bundle, "cfr21-verification",
+            system_description, project_name or (file.filename or "Unnamed Project"),
+            context)
+        # Kept as a count for the screen that has always read it as one.
+        result["files_extracted"] = result["coverage_limit"]["assessed"]
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)
         raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/cfr21-verification/source")
+def review_cfr21_source(req: RegulatedSourceRequest, request: Request):
+    """A Part 11 verification of a repository, branch, pull request or file list.
+
+    The archive door has always existed; this is the same assessment reached from a
+    repository at a ref, which is how a validated system is usually kept. Both go through
+    `_regulated_files`, so a repo and a zip of that repo are priced, split and capped
+    identically.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        return _run_regulated_bundle(bundle, "cfr21-verification",
+                                     req.system_description or "",
+                                     req.project_name or "", req.context or "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/cfr21-verification/preflight")
+def preflight_cfr21_source(req: RegulatedSourceRequest, request: Request):
+    """What a Part 11 verification of this repository will cost. Free — no model call.
+
+    Separate from `/preflight-zip` because a zip cannot travel on a JSON route (D-234), not
+    because they answer different questions: both call `_preflight_regulated`.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Part 11 preflight source resolution failed")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    return _preflight_regulated(bundle, "cfr21-verification", request)
 
 
 # ── GxP Document Check ────────────────────────────────────────────────────────
@@ -2479,30 +2814,95 @@ async def review_gxp_generate_plan_upload_zip(
 ):
     if not (file.filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
-    _require_llm()
     content = await file.read()
     try:
-        files = await asyncio.to_thread(_extract_zip_files, content)
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, file.filename or "upload",
+            _CFR21_ALLOWED_EXTENSIONS)
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Not a valid zip file")
-    if not files:
-        raise HTTPException(status_code=400, detail="No scannable source files found in the zip (check extensions / excluded dirs)")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     try:
         result = await asyncio.to_thread(
-            orchestrator.plan_gxp_validation_package,
-            files=files,
-            system_description=system_description,
-            context=context,
-            project_name=project_name or (file.filename or "Unnamed Project"),
-        )
-        # Return the extracted files too, so the frontend can reuse them for gxp-generate-document
-        # calls without re-uploading the zip for every document.
-        result["files_extracted"] = files
+            _run_regulated_bundle, bundle, "gxp-generate-plan",
+            system_description, project_name or (file.filename or "Unnamed Project"),
+            context)
+        # Return the extracted files too, so the frontend can reuse them for
+        # gxp-generate-document calls without re-uploading the zip for every document.
+        result["files_extracted"] = await asyncio.to_thread(
+            lambda: _regulated_files(bundle)["files"])
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)
         raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/gxp-generate-plan/source")
+def review_gxp_plan_source(req: RegulatedSourceRequest, request: Request):
+    """A GxP validation plan built from a repository rather than an uploaded archive.
+
+    Same intake and same caps as the Part 11 twin above — see `_run_regulated_bundle`. This
+    one makes a single model call (`gxp_generator_agent.plan` does not chunk), so it takes
+    no `_CHUNKABLE_ROUTES` entry.
+    """
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    try:
+        result = _run_regulated_bundle(bundle, "gxp-generate-plan",
+                                       req.system_description or "",
+                                       req.project_name or "", req.context or "")
+        # The files travel back for the same reason the zip door returns them: generating
+        # each document is a separate call that needs the same source, and re-reading the
+        # repository per document would be several more GitHub round trips for bytes the
+        # browser already has.
+        result["files_extracted"] = _regulated_files(bundle)["files"]
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+@app.post("/api/review/gxp-generate-plan/preflight")
+def preflight_gxp_plan_source(req: RegulatedSourceRequest, request: Request):
+    """What a GxP validation plan for this repository will cost. Free — no model call."""
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       extensions=_CFR21_ALLOWED_EXTENSIONS,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("GxP plan preflight source resolution failed")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    return _preflight_regulated(bundle, "gxp-generate-plan", request)
+
+
+@app.post("/api/review/gxp-generate-plan/preflight-zip")
+async def preflight_gxp_plan_zip(request: Request, file: UploadFile = File(...)):
+    """The archive twin of the quote above. This screen had no cost preview at all, which
+    made it the one regulated door where the first number a customer saw was the invoice."""
+    if not (file.filename or "").endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    content = await file.read()
+    try:
+        bundle = await asyncio.to_thread(
+            source_bundle.from_zip_bytes, content, "upload", _CFR21_ALLOWED_EXTENSIONS)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid zip file")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _preflight_regulated(bundle, "gxp-generate-plan", request)
 
 
 @app.post("/api/review/gxp-generate-document")

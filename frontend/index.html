@@ -862,6 +862,8 @@ Answer questions about patients based on the provided context."></textarea>
           <h1>Governance Report</h1>
           <p class="subtitle">Synthesise prior reviews into one audit-ready report — executive summary,
             findings by category, controls assessment, and the release decision. Does not re-run any review.</p>
+        
+          <p style="margin-top:6px"><button type="button" class="about-link" onclick="openAgentDoc('governance-report')" title="What this agent looks for, what makes its verdict Red, and what guards the run">About this agent</button></p>
         </div>
         <div class="form-card">
           <div class="form-row">
@@ -1082,6 +1084,17 @@ e.g. 100k users, 99.9% SLA, HIPAA, 5-person team, must deploy on AWS, AI feature
               <input type="text" id="arch-repo-ref" placeholder="main" />
             </div>
           </div>
+          <div class="form-group">
+            <label>GitHub token for this call (optional)</label>
+            <input type="password" id="arch-gh-token" autocomplete="off"
+                   placeholder="ghp_… or a fine-grained token — used once, never stored" />
+            <p class="subtitle" style="margin-top:4px">
+              Only needed for a <b>private</b> repository, or when the deployment token cannot
+              see this one. GitHub answers 404 rather than 403 for a repository a token
+              cannot see, so a private repo, an expired token and a typo all look the
+              same; supplying the right token here is the quickest way to tell them apart.
+            </p>
+          </div>
           <div class="form-actions">
             <button class="btn btn-secondary" onclick="previewDesignCost('architecture')">Estimate cost</button>
             <button class="btn btn-primary btn-arch" id="arch-code-run" onclick="runDesignFromCode('architecture')" disabled>
@@ -1136,6 +1149,52 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             <label>Constraints (optional)</label>
             <textarea id="cg-constraints" rows="3" placeholder="Scale, compliance, team, or technical constraints — e.g. Expect 50k MAU, must be HIPAA compliant, team knows Python, must deploy on AWS"></textarea>
           </div>
+          <!-- ── Fitting an existing codebase ────────────────────────────────
+               Optional and visible on purpose. The brief lands in the box below where it
+               can be read and trimmed, rather than being folded silently into the request:
+               a prompt change is the one kind with no eval to catch a regression (D-344),
+               so a run with no repository has to behave exactly as it did before this
+               existed. Reading the codebase calls no model and costs nothing. -->
+          <details style="margin:12px 0">
+            <summary style="cursor:pointer;color:var(--text-muted);font-size:13px">Fit an existing codebase (optional) — generate code that matches what is already there</summary>
+            <p class="subtitle" style="margin-top:8px">
+              Reads a repository and computes its structure &mdash; the stack, the dependency
+              graph, what each file declares &mdash; and puts that description in the box
+              below, where the advisory and the scaffold both read it. Free: no model is
+              involved in reading the code. Dependency parsing covers Python, PHP,
+              Java/Kotlin/Scala, C#/VB.NET and Delphi/Pascal; other languages are listed
+              without edges and the note says so.
+            </p>
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>GitHub Repository URL</label>
+                <input type="url" id="cg-repo-url" placeholder="https://github.com/owner/repo" />
+              </div>
+              <div class="form-group">
+                <label>Branch, tag or commit (optional)</label>
+                <input type="text" id="cg-repo-ref" placeholder="main" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label>GitHub token for this call (optional)</label>
+              <input type="password" id="cg-gh-token" autocomplete="off"
+                     placeholder="ghp_… or a fine-grained token — used once, never stored" />
+            </div>
+            <div class="form-actions">
+              <button class="btn btn-secondary" onclick="loadCodebaseContext()">Read the codebase</button>
+              <span class="or-divider">or</span>
+              <label class="btn btn-secondary file-upload-btn">
+                <input type="file" id="cg-code-zip" accept=".zip" onchange="loadCodebaseContext()" hidden />
+                Upload codebase zip
+              </label>
+              <button class="btn btn-secondary" onclick="clearCodebaseContext()">Clear</button>
+            </div>
+            <div id="cg-context-note"></div>
+            <div class="form-group">
+              <label>What already exists (sent with both the recommendation and the scaffold)</label>
+              <textarea id="cg-existing" rows="8" placeholder="Filled by “Read the codebase”, or write it yourself. Leave empty to generate from the requirement alone."></textarea>
+            </div>
+          </details>
           <details style="margin:12px 0" open>
             <summary style="cursor:pointer;color:var(--text-muted);font-size:13px">Advanced — pin specific choices (optional)</summary>
             <p class="subtitle" style="margin:8px 0 4px;font-size:12px">Leave anything as "Let AI decide" to have the recommendation choose it for you.</p>
@@ -1273,6 +1332,61 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
             </button>
           </div>
         </div>
+        <!-- ── Assess a whole codebase ──────────────────────────────────────
+             The same structural description Architecture Review is given, for the same
+             reason: the assessment schema returns one complexity and one effort estimate,
+             so it is a holistic question with no merge rule across chunks. The language
+             caveat matters more here than anywhere else on the platform — a migration is
+             most often wanted for the oldest stack in the building, and COBOL and RPG have
+             no parser. The estimate says so before anything is spent. -->
+        <div class="form-card" id="mg-code-card" data-product="migration-assessment">
+          <div class="section-title" style="margin-top:0">Or assess a whole codebase</div>
+          <p class="subtitle" style="margin-top:-6px">
+            Reads the repository and computes its structure &mdash; the dependency graph, what
+            each file declares, what nothing imports &mdash; then assesses the migration from
+            that. The analysis calls no model and costs nothing; estimate first and the quote
+            names the ceiling. Dependency parsing covers Python, PHP, Java/Kotlin/Scala,
+            C#/VB.NET and Delphi/Pascal. <b>COBOL, RPG and other mainframe languages have no
+            parser</b> &mdash; those repositories are listed file by file with no dependency
+            graph, and the estimate says so before you spend.
+          </p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>GitHub Repository URL</label>
+              <input type="url" id="mg-repo-url" placeholder="https://github.com/owner/repo" />
+            </div>
+            <div class="form-group">
+              <label>Branch, tag or commit (optional)</label>
+              <input type="text" id="mg-repo-ref" placeholder="main" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>GitHub token for this call (optional)</label>
+            <input type="password" id="mg-gh-token" autocomplete="off"
+                   placeholder="ghp_… or a fine-grained token — used once, never stored" />
+            <p class="subtitle" style="margin-top:4px">
+              Only needed for a <b>private</b> repository, or when the deployment token cannot
+              see this one. GitHub answers 404 rather than 403 for a repository a token
+              cannot see, so a private repo, an expired token and a typo all look the
+              same; supplying the right token here is the quickest way to tell them apart.
+            </p>
+          </div>
+          <p class="subtitle" style="margin-top:-2px">
+            Uses the <b>Migration Target</b> and <b>Constraints</b> from the form above.
+          </p>
+          <div class="form-actions">
+            <button class="btn btn-secondary" onclick="previewDesignCost('migration')">Estimate cost</button>
+            <button class="btn btn-primary" id="mg-code-run" onclick="runDesignFromCode('migration')" disabled>
+              <span class="btn-icon">&#129517;</span> Assess the codebase
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="mg-code-zip" accept=".zip" onchange="previewDesignCost('migration', this.files[0])" hidden />
+              Upload codebase zip
+            </label>
+          </div>
+          <div id="mg-code-preview"></div>
+        </div>
         <!-- Previous runs. Above the result and height-capped, for the reason in
              the Code Review screen's comment: neither element may push the other off
              the page. Filled by `loadAgentRuns('migration')`, which reads this screen's row
@@ -1324,6 +1438,8 @@ e.g. A patient appointment booking system for a mid-size clinic network. Patient
         <div class="page-header">
           <h1>Legacy Modernization</h1>
           <p class="subtitle">Converts a whole codebase to a target stack as a durable run. It reads the source first — frameworks, entry points, routes, data access — then designs the target architecture, groups the files into components, and prices the work before converting anything. Secrets are redacted before any model call, the output arrives as a real project (solution, project files, host, configuration) rather than loose source, and a run survives a restart: stopped at file 390, it resumes at 391.</p>
+        
+          <p style="margin-top:6px"><button type="button" class="about-link" onclick="openAgentDoc('modernization')" title="What this agent looks for, what makes its verdict Red, and what guards the run">About this agent</button></p>
         </div>
 
         <div class="form-card">
@@ -1778,6 +1894,17 @@ Examples:
               <input type="text" id="sec-repo-ref" placeholder="main" />
             </div>
           </div>
+          <div class="form-group">
+            <label>GitHub token for this call (optional)</label>
+            <input type="password" id="sec-gh-token" autocomplete="off"
+                   placeholder="ghp_… or a fine-grained token — used once, never stored" />
+            <p class="subtitle" style="margin-top:4px">
+              Only needed for a <b>private</b> repository, or when the deployment token cannot
+              see this one. GitHub answers 404 rather than 403 for a repository a token
+              cannot see, so a private repo, an expired token and a typo all look the
+              same; supplying the right token here is the quickest way to tell them apart.
+            </p>
+          </div>
           <div class="form-actions">
             <button class="btn btn-secondary" onclick="previewDesignCost('security')">Estimate cost</button>
             <button class="btn btn-primary btn-security" id="sec-code-run" onclick="runDesignFromCode('security')" disabled>
@@ -1882,14 +2009,25 @@ Examples:
               <input type="text" id="sd-repo-ref" placeholder="main" />
             </div>
           </div>
+          <div class="form-group">
+            <label>GitHub token for this call (optional)</label>
+            <input type="password" id="sd-gh-token" autocomplete="off"
+                   placeholder="ghp_… or a fine-grained token — used once, never stored" />
+            <p class="subtitle" style="margin-top:4px">
+              Only needed for a <b>private</b> repository, or when the deployment token cannot
+              see this one. GitHub answers 404 rather than 403 for a repository a token
+              cannot see, so a private repo, an expired token and a typo all look the
+              same; supplying the right token here is the quickest way to tell them apart.
+            </p>
+          </div>
           <div class="form-actions">
-            <button class="btn btn-secondary" onclick="previewDesignCost('sensitive-data')">Estimate cost</button>
-            <button class="btn btn-primary" id="sd-code-run" onclick="runDesignFromCode('sensitive-data')" disabled>
+            <button class="btn btn-secondary" onclick="previewDesignCost('sensitive')">Estimate cost</button>
+            <button class="btn btn-primary" id="sd-code-run" onclick="runDesignFromCode('sensitive')" disabled>
               <span class="btn-icon">&#128269;</span> Scan the codebase
             </button>
             <span class="or-divider">or</span>
             <label class="btn btn-secondary file-upload-btn">
-              <input type="file" id="sd-code-zip" accept=".zip" onchange="previewDesignCost('sensitive-data', this.files[0])" hidden />
+              <input type="file" id="sd-code-zip" accept=".zip" onchange="previewDesignCost('sensitive', this.files[0])" hidden />
               Upload codebase zip
             </label>
           </div>
@@ -2018,18 +2156,6 @@ Examples:
           </div>
 
           <div class="form-group">
-            <label>Upload Codebase (.zip) — recommended for a real multi-file scan</label>
-            <div style="display:flex;align-items:center;gap:10px">
-              <label class="btn btn-secondary file-upload-btn">
-                <input type="file" id="cfr-zip-input" accept=".zip" onchange="uploadCFR21Zip()" hidden />
-                📦 Upload .zip
-              </label>
-              <span style="font-size:11px;color:var(--text-muted)">Scans up to 60 source files (py/js/ts/java/go/rb/php/cs/sql/yaml/json/env/md/html). node_modules/.git/venv/dist/build etc. are skipped automatically.</span>
-            </div>
-          </div>
-
-          <div class="or-divider" style="margin:14px 0">or paste a single file</div>
-          <div class="form-group">
             <label>Code / File Content</label>
             <textarea id="cfr-code" rows="10" placeholder="Paste a single file to verify — e.g. the module handling record approvals or audit logging."></textarea>
           </div>
@@ -2038,6 +2164,59 @@ Examples:
               <span class="btn-icon">💊</span> Verify Pasted File
             </button>
           </div>
+        </div>
+        <!-- ── Verify a whole codebase ──────────────────────────────────────
+             Unlike the design agents this one is given the **real files**, not a summary:
+             "is there an audit-trail write when a record changes" is a question about the
+             code, and a description of a codebase cannot answer it. So it fans out, and a
+             large system costs several calls — which is exactly why the free estimate is
+             now in front of it. The 60-file cap is stated by the quote when it bites. -->
+        <div class="form-card" id="cfr-code-card" data-product="cfr21-verification">
+          <div class="section-title" style="margin-top:0">Or verify a whole codebase</div>
+          <p class="subtitle" style="margin-top:-6px">
+            Reads every file rather than summarising them, because a summary cannot contain
+            the audit-trail write that is the evidence. Estimate first: the quote is free,
+            names how many calls and the ceiling, and <b>says so if the system is larger than
+            one assessment covers</b> &mdash; at most 60 source files
+            (py/js/ts/java/go/rb/php/cs/sql/yaml/json/md/html) are read, and a report that
+            covered part of a system without saying so would overstate itself.
+            <code>node_modules</code>, <code>.git</code>, <code>venv</code>,
+            <code>dist</code> and similar are skipped; credentials found on the way in are
+            redacted before anything reaches the model.
+          </p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>GitHub Repository URL</label>
+              <input type="url" id="cfr-repo-url" placeholder="https://github.com/owner/repo" />
+            </div>
+            <div class="form-group">
+              <label>Branch, tag or commit (optional)</label>
+              <input type="text" id="cfr-repo-ref" placeholder="main" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>GitHub token for this call (optional)</label>
+            <input type="password" id="cfr-gh-token" autocomplete="off"
+                   placeholder="ghp_… or a fine-grained token — used once, never stored" />
+            <p class="subtitle" style="margin-top:4px">
+              Only needed for a <b>private</b> repository, or when the deployment token cannot
+              see this one. GitHub answers 404 rather than 403 for a repository a token
+              cannot see, so a private repo, an expired token and a typo all look the
+              same; supplying the right token here is the quickest way to tell them apart.
+            </p>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-secondary" onclick="previewDesignCost('cfr21')">Estimate cost</button>
+            <button class="btn btn-primary" id="cfr-code-run" onclick="runDesignFromCode('cfr21')" disabled>
+              <span class="btn-icon">&#128137;</span> Verify the codebase
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="cfr-code-zip" accept=".zip" onchange="previewDesignCost('cfr21', this.files[0])" hidden />
+              Upload codebase zip
+            </label>
+          </div>
+          <div id="cfr-code-preview"></div>
         </div>
         <!-- Previous runs. Above the result and height-capped, for the reason in
              the Code Review screen's comment: neither element may push the other off
@@ -2134,18 +2313,6 @@ Examples:
           </div>
 
           <div class="form-group">
-            <label>Upload Application (.zip) — recommended</label>
-            <div style="display:flex;align-items:center;gap:10px">
-              <label class="btn btn-secondary file-upload-btn">
-                <input type="file" id="gxg-zip-input" accept=".zip" onchange="uploadGxPPlanZip()" hidden />
-                📦 Upload .zip
-              </label>
-              <span style="font-size:11px;color:var(--text-muted)">Same extraction as 21 CFR Part 11 Verification — up to 60 source files, common noise directories skipped.</span>
-            </div>
-          </div>
-
-          <div class="or-divider" style="margin:14px 0">or paste a single file</div>
-          <div class="form-group">
             <label>Code / Application Content</label>
             <textarea id="gxg-code" rows="8" placeholder="Paste representative code, or leave blank and rely on the system description alone."></textarea>
           </div>
@@ -2154,6 +2321,53 @@ Examples:
               <span class="btn-icon">🧭</span> Plan Validation Package
             </button>
           </div>
+        </div>
+        <!-- ── Plan from a whole codebase ───────────────────────────────────
+             Same intake and same caps as the Part 11 screen — see its comment. This one
+             makes a single call rather than fanning out, because the planner asks one
+             question about the system as a whole. -->
+        <div class="form-card" id="gxg-code-card" data-product="gxp-generate-plan">
+          <div class="section-title" style="margin-top:0">Or plan from a whole codebase</div>
+          <p class="subtitle" style="margin-top:-6px">
+            Reads the application's own source to ground the plan in what it actually does.
+            Estimate first: the quote is free, and <b>says so if the application is larger
+            than one plan covers</b> &mdash; at most 60 source files are read, the same bound
+            as 21 CFR Part 11 Verification. Credentials found on the way in are redacted
+            before anything reaches the model.
+          </p>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>GitHub Repository URL</label>
+              <input type="url" id="gxg-repo-url" placeholder="https://github.com/owner/repo" />
+            </div>
+            <div class="form-group">
+              <label>Branch, tag or commit (optional)</label>
+              <input type="text" id="gxg-repo-ref" placeholder="main" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>GitHub token for this call (optional)</label>
+            <input type="password" id="gxg-gh-token" autocomplete="off"
+                   placeholder="ghp_… or a fine-grained token — used once, never stored" />
+            <p class="subtitle" style="margin-top:4px">
+              Only needed for a <b>private</b> repository, or when the deployment token cannot
+              see this one. GitHub answers 404 rather than 403 for a repository a token
+              cannot see, so a private repo, an expired token and a typo all look the
+              same; supplying the right token here is the quickest way to tell them apart.
+            </p>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-secondary" onclick="previewDesignCost('gxp-generate')">Estimate cost</button>
+            <button class="btn btn-primary" id="gxg-code-run" onclick="runDesignFromCode('gxp-generate')" disabled>
+              <span class="btn-icon">&#128203;</span> Plan from the codebase
+            </button>
+            <span class="or-divider">or</span>
+            <label class="btn btn-secondary file-upload-btn">
+              <input type="file" id="gxg-code-zip" accept=".zip" onchange="previewDesignCost('gxp-generate', this.files[0])" hidden />
+              Upload application zip
+            </label>
+          </div>
+          <div id="gxg-code-preview"></div>
         </div>
         <!-- Previous runs. Above the result and height-capped, for the reason in
              the Code Review screen's comment: neither element may push the other off

@@ -93,9 +93,19 @@ LEGACY_PRODUCT_ROUTES = {
     "/api/review/sensitive-data/upload": "sensitive-data",
     "/api/review/ai-provenance": "ai-provenance",
     "/api/review/migration-assessment": "migration-assessment",
+    # Assessing a whole codebase. Same product, same entitlement: the input changed, not
+    # what is being sold. One model call, because it takes the structural brief its two
+    # design siblings take — so no `_CHUNKABLE_ROUTES` entry.
+    "/api/review/migration-assessment/source": "migration-assessment",
+    "/api/review/migration-assessment/upload-zip": "migration-assessment",
     "/api/review/migration-execute": "migration-execute",
     "/api/review/cfr21-verification": "cfr21-verification",
     "/api/review/cfr21-verification/upload-zip": "cfr21-verification",
+    # The regulated products reading a repository. Unlike the design agents these get the
+    # real files, so a Part 11 verification of a large system fans out — see
+    # `_CHUNKABLE_ROUTES` below, without which it would reserve one call and make several.
+    "/api/review/cfr21-verification/source": "cfr21-verification",
+    "/api/review/gxp-generate-plan/source": "gxp-generate-plan",
     "/api/review/gxp-document-check": "gxp-document-check",
     "/api/review/gxp-document-check/upload": "gxp-document-check",
     "/api/review/gxp-generate-plan": "gxp-generate-plan",
@@ -179,6 +189,11 @@ _CHUNKABLE_ROUTES = {
     # send one structural brief and make one call.
     "/api/review/sensitive-data/source": "content",
     "/api/review/sensitive-data/upload-zip": "content",
+    # A Part 11 verification splits when the prompt does not fit (D-354), using the same
+    # `code_chunker.chunk_files` that sizes the reservation here — so the number reserved is
+    # the number made. Bounded either way by the 60-file / 120,000-character regulated cap.
+    # `gxp-generate-plan` is deliberately absent: `gxp_generator_agent.plan` does not chunk.
+    "/api/review/cfr21-verification/source": "code",
     "/api/github/pr": "",
     "/api/github/pr/auto-fix": "",
 }

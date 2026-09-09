@@ -710,6 +710,61 @@ initCodegenDropdowns();
 
 let _lastCodegenAdvisory = null;
 
+// ── Generating code that fits a codebase that already exists ──────────────
+//
+// "Build something that fits this repository" is a different request from "build this from
+// scratch", and the whole difference is what the prompt knows about what is already there.
+//
+// Deliberately **not** a new field on the codegen request, and deliberately not automatic.
+// The brief is fetched by itself, dropped into the existing context box, and left there to
+// be read and trimmed before anything is spent. Two reasons: a prompt change is the one
+// kind of change with no eval here to catch a regression (D-344), so a run with no
+// repository has to stay byte-identical to one from before this existed; and a computed
+// description of somebody's codebase is exactly the sort of thing that should be visible
+// before it is sent, not folded invisibly into a request.
+//
+// `/api/code-brief` calls no model, so this costs nothing and is not metered.
+async function loadCodebaseContext() {
+  const repo = (document.getElementById('cg-repo-url').value || '').trim();
+  const zip = (document.getElementById('cg-code-zip').files || [])[0];
+  const out = document.getElementById('cg-context-note');
+  const box = document.getElementById('cg-existing');
+  if (!repo && !zip) { alert('Give a repository URL, or choose a zip of the codebase.'); return; }
+  out.innerHTML = '<div class="cost-note">Reading the codebase and working out its '
+    + 'structure… this calls no model and costs nothing.</div>';
+  try {
+    const body = {};
+    if (zip) {
+      body.files = await _readZipAsFiles(zip);
+    } else {
+      body.github_repo_url = repo;
+      const ref = (document.getElementById('cg-repo-ref').value || '').trim();
+      if (ref) body.ref = ref;
+      const token = (document.getElementById('cg-gh-token').value || '').trim();
+      if (token) body.github_token = token;
+    }
+    const r = await apiFetch('/api/code-brief', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    box.value = 'The generated code has to fit this existing codebase:\n\n' + r.markdown;
+    const stats = r.stats || {};
+    out.innerHTML = `<div class="cost-note">Read ${Number((r.source || {}).files || 0).toLocaleString()}
+      file(s); ${Number(stats.units || 0).toLocaleString()} unit(s),
+      ${Number(stats.edges || 0).toLocaleString()} dependency edge(s). It is in the box
+      below — read it, trim it, or clear it. Nothing has been spent.</div>
+      ${r.coverage_note ? `<div class="cost-note ${(r.coverage || {}).files_not_analysed ? 'cost-note-warn' : ''}">${esc(r.coverage_note)}</div>` : ''}`;
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note cost-note-bad">Could not read that source —
+      ${esc(e.message)}</div>`;
+  }
+}
+
+function clearCodebaseContext() {
+  document.getElementById('cg-existing').value = '';
+  document.getElementById('cg-context-note').innerHTML = '';
+}
+
 async function runCodegenAdvisory() {
   const requirement = document.getElementById('cg-requirement').value.trim();
   if (!requirement) { alert('Please describe the requirement.'); return; }
@@ -728,6 +783,9 @@ async function runCodegenAdvisory() {
         pin_frontend_framework: document.getElementById('cg-pin-frontend').value.trim() || null,
         pin_database: document.getElementById('cg-pin-database').value.trim() || null,
         pin_architecture_pattern: document.getElementById('cg-pin-pattern').value.trim() || null,
+        // Empty unless somebody read a codebase into it, in which case the recommendation
+        // has to fit what already exists rather than starting from a blank page.
+        context: document.getElementById('cg-existing').value.trim(),
         derived_from: chainedFrom('codegen'),
       }),
     });
@@ -858,6 +916,7 @@ async function runCodegenScaffold() {
         database: document.getElementById('cg-s-database').value.trim() || null,
         architecture_pattern: document.getElementById('cg-s-pattern').value.trim() || 'Modular Monolith',
         requirement: document.getElementById('cg-requirement').value.trim(),
+        context: document.getElementById('cg-existing').value.trim(),
         include_auth: document.getElementById('cg-s-auth').checked,
         include_docker: document.getElementById('cg-s-docker').checked,
         include_tests: document.getElementById('cg-s-tests').checked,
@@ -951,7 +1010,117 @@ function renderCodegenScaffold(targetId, result) {
         <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">${esc(f.path)}${f.purpose ? ` — <span style="color:var(--text-muted);font-family:inherit">${esc(f.purpose)}</span>` : ''}</summary>
         <pre class="api-usage-code" style="margin-top:8px">${esc(f.content || '')}</pre>
       </details>`).join('')}
+
+    ${renderGeneratedCodeDelivery(result, 'generated starter project')}
   `;
+}
+
+// ── Getting generated code out of the platform and into a repository ──────
+//
+// A scaffold and a migrated file were downloadable as a zip and nothing else, so the last
+// step of "generate the code for this requirement" was a person unpacking an archive and
+// copying files in by hand.
+//
+// **This is deliberately not Apply Fixes.** That starts from a review, runs two guardrails
+// and a re-review over every patch, and only then writes — and it can commit onto the pull
+// request being reviewed, because a review had already read that branch. Nothing has read
+// this code unless the run's pre-release check was ticked. So the offer here is narrower on
+// purpose: a new branch that must not already exist, a pull request only if asked for, and
+// the review status stated in the pull request body where whoever merges it will see it.
+// `services/code_delivery` enforces all three server-side; this is the door, not the guard.
+function renderGeneratedCodeDelivery(result, kind) {
+  const files = result.files || [];
+  if (!result.review_id || !files.length) return '';
+  const gov = result.governance_review;
+  const p = `gd-${esc(result.review_id)}`;
+  const status = gov
+    ? `<span class="cost-note">Reviewed before delivery — Code Review
+        ${esc(gov.code_review?.gate_status || '?')}, Sensitive Data
+        ${esc(gov.sensitive_data_scan?.gate_status || '?')}. This is stated in the pull
+        request body too.</span>`
+    : `<span class="cost-note cost-note-warn">This code has <b>not been reviewed</b>: the
+        run was made without the pre-release check, so no agent has read it. The pull
+        request body will say so, because whoever merges it should not have to work that
+        out.</span>`;
+  return `
+    <div class="section-title" style="margin-top:20px">Push to a GitHub repository</div>
+    <p class="subtitle" style="margin-top:-6px">
+      Commits all ${files.length} file(s) to a <b>new</b> branch. It will not write to a
+      branch that already exists, and it never commits onto one somebody may have checked
+      out &mdash; generated code goes somewhere a person can read it first.
+    </p>
+    ${status}
+    <div class="form-row" style="margin-top:10px">
+      <div class="form-group flex1">
+        <label>Repository URL <span class="required">*</span></label>
+        <input type="url" id="${p}-repo" placeholder="https://github.com/owner/repo" />
+      </div>
+      <div class="form-group">
+        <label>Branch (optional)</label>
+        <input type="text" id="${p}-branch" placeholder="named after this run" />
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group flex1">
+        <label>Base branch (optional)</label>
+        <input type="text" id="${p}-base" placeholder="the repository's own default" />
+      </div>
+      <div class="form-group flex1">
+        <label>GitHub token for this call (optional)</label>
+        <input type="password" id="${p}-token" autocomplete="off"
+               placeholder="used once, never stored" />
+      </div>
+    </div>
+    <label style="font-size:13px;display:block;margin-top:4px">
+      <input type="checkbox" id="${p}-pr" /> Also open a pull request from that branch
+    </label>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="deliverGeneratedCode('${esc(result.review_id)}', '${esc(kind)}')">
+        <span class="btn-icon">&#128640;</span> Push to GitHub
+      </button>
+    </div>
+    <div id="${p}-out"></div>`;
+}
+
+async function deliverGeneratedCode(reviewId, kind) {
+  const p = `gd-${reviewId}`;
+  const val = suffix => (document.getElementById(`${p}-${suffix}`) || {}).value || '';
+  const repo = val('repo').trim();
+  const out = document.getElementById(`${p}-out`);
+  if (!repo) { alert('Give the repository URL to push to.'); return; }
+  const openPr = !!(document.getElementById(`${p}-pr`) || {}).checked;
+  if (!confirm(`Commit this ${kind} to ${repo}?`
+             + (openPr ? ' A pull request will be opened from the new branch.' : '')
+             + ' This writes to that repository.')) return;
+  out.innerHTML = '<div class="cost-note">Creating the branch and committing… this calls '
+    + 'no model and costs nothing.</div>';
+  try {
+    const r = await apiFetch(`/api/reviews/${encodeURIComponent(reviewId)}/deliver-code`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        github_repo_url: repo,
+        branch: val('branch').trim() || undefined,
+        base_branch: val('base').trim() || undefined,
+        open_pr: openPr,
+        github_token: val('token').trim() || undefined,
+      }),
+    });
+    const pr = r.pull_request;
+    // A partial delivery is reported as one. The branch exists and some files are on it,
+    // so saying "failed" would send somebody looking for something they would be told is
+    // not there — the same reason `code_delivery` returns what landed rather than raising.
+    const failed = (r.files_failed || []).length;
+    out.innerHTML = `<div class="cost-note${failed ? ' cost-note-warn' : ''}">
+      Committed ${(r.files_committed || []).length} file(s) to
+      <a href="${esc(r.branch_url || '#')}" target="_blank" rel="noopener">${esc(r.branch)}</a>
+      in ${esc(r.repo)}, cut from ${esc(r.base_branch)}.
+      ${failed ? `<b>${failed} file(s) could not be committed</b> — ${esc((r.files_failed[0] || {}).error || '')}.` : ''}
+      ${pr ? ` <a href="${esc(pr.url)}" target="_blank" rel="noopener">Pull request #${esc(String(pr.number))}</a>.` : ''}
+      ${r.pull_request_error ? ` The commits landed but the pull request did not open: ${esc(r.pull_request_error)}` : ''}
+    </div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note cost-note-bad">${esc(e.message)}</div>`;
+  }
 }
 
 // ── Code Migration ───────────────────────────────────────────────────────────
@@ -1187,6 +1356,8 @@ function renderMigrationExecution(targetId, result) {
         <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">${esc(f.path)}${f.purpose ? ` — <span style="color:var(--text-muted);font-family:inherit">${esc(f.purpose)}</span>` : ''}</summary>
         <pre class="api-usage-code" style="margin-top:8px">${esc(f.content || '')}</pre>
       </details>`).join('')}
+
+    ${renderGeneratedCodeDelivery(result, 'migrated code')}
   `;
 }
 
@@ -4673,23 +4844,6 @@ async function runCFR21Verification() {
   finally { hideLoading(); }
 }
 
-async function uploadCFR21Zip() {
-  const file = document.getElementById('cfr-zip-input').files[0];
-  if (!file) return;
-  if (!file.name.endsWith('.zip')) { alert('Only .zip files are accepted.'); return; }
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('system_description', document.getElementById('cfr-system-desc').value.trim());
-  fd.append('project_name', document.getElementById('cfr-project').value.trim());
-  showLoading(`Extracting and verifying ${file.name}… this may take 1-2 minutes for a full codebase`);
-  try {
-    const result = await apiFetch('/api/review/cfr21-verification/upload-zip', { method: 'POST', body: fd });
-    renderCFR21Result('cfr21-result', result);
-    loadDashboard();
-  } catch (e) { showError('cfr21-result', e.message); }
-  finally { hideLoading(); document.getElementById('cfr-zip-input').value = ''; }
-}
-
 function renderCFR21Result(targetId, r) {
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
@@ -4908,30 +5062,6 @@ async function runGxPPlan() {
     renderGxPPlan('gxg-plan-result', result);
   } catch (e) { showError('gxg-plan-result', e.message); }
   finally { hideLoading(); }
-}
-
-async function uploadGxPPlanZip() {
-  const file = document.getElementById('gxg-zip-input').files[0];
-  if (!file) return;
-  if (!file.name.endsWith('.zip')) { alert('Only .zip files are accepted.'); return; }
-  _gxgState.systemDescription = document.getElementById('gxg-system-desc').value.trim();
-  _gxgState.projectName = document.getElementById('gxg-project').value.trim();
-  _gxgState.code = '';
-  _gxgState.generatedDocs = [];
-  document.getElementById('gxg-documents-result').classList.add('hidden');
-
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('system_description', _gxgState.systemDescription);
-  fd.append('project_name', _gxgState.projectName);
-  showLoading(`Extracting ${file.name} and planning the validation package…`);
-  try {
-    const result = await apiFetch('/api/review/gxp-generate-plan/upload-zip', { method: 'POST', body: fd });
-    _gxgState.files = result.files_extracted || [];
-    _gxgState.plan = result;
-    renderGxPPlan('gxg-plan-result', result);
-  } catch (e) { showError('gxg-plan-result', e.message); }
-  finally { hideLoading(); document.getElementById('gxg-zip-input').value = ''; }
 }
 
 function renderGxPPlan(targetId, r) {
@@ -8921,8 +9051,101 @@ function renderModernizationArtifacts(data) {
       </details>`).join('')
       : `<div class="mod-meta" style="margin-top:10px">No file's path contains “${esc(_modArtifactQuery)}”.</div>`}`
     : '<div class="mod-meta" style="margin-top:10px">Nothing has been written yet. Files appear here as components convert.</div>'}
+  </div>
+  ${renderModernizationDelivery(all.length)}`;
+}
+
+
+// ── Pushing a converted codebase, and letting the customer's CI compile it ──
+//
+// `workflows/modernization_pr.py` has existed since the build loop was written and no
+// screen ever offered it, so the only way to reach it was curl. It is not "export, but to
+// GitHub": the pull request carries `.github/workflows/modernization-build.yml`, which
+// compiles the branch on the customer's own runner and POSTs the compiler output back to
+// `POST /runs/{id}/build-results` — where the ingest maps each diagnostic to the unit that
+// produced the file and sets it back to `ready`, so the claim loop re-converts it.
+//
+// Nothing on this platform builds converted code (D-05: building customer source on the API
+// host is arbitrary code execution), so until that loop closes, a type error in generated C#
+// reaches the customer rather than the agent (C-42). This button is how it closes.
+//
+// The target repository is asked for rather than inferred: a PHP → .NET conversion usually
+// belongs in a *new* repository, so guessing from the run's source would be wrong more often
+// than right. The route says the same thing in its own docstring.
+function renderModernizationDelivery(count) {
+  if (!count) return '';
+  return `<div class="mod-panel" style="margin-top:14px">
+    <div class="section-title" style="margin-top:0">Push to GitHub and let your CI compile it</div>
+    <p class="subtitle" style="margin-top:-6px">
+      Commits all ${count} converted file(s) to a branch of a repository you name, opens a
+      pull request, and adds a build workflow that compiles the branch on your own runner
+      and reports the compiler errors back here. Failing units are then re-queued and
+      re-converted automatically &mdash; <b>nothing on this platform compiles your code</b>,
+      so this is the only path that closes that loop. Usually a <b>new</b> repository, not
+      the legacy one.
+    </p>
+    <div class="form-row">
+      <div class="form-group flex1">
+        <label>Owner <span class="required">*</span></label>
+        <input type="text" id="mod-pr-owner" placeholder="github account or organisation" />
+      </div>
+      <div class="form-group flex1">
+        <label>Repository <span class="required">*</span></label>
+        <input type="text" id="mod-pr-repo" placeholder="the target repo, usually a new one" />
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-group flex1">
+        <label>Base branch (optional)</label>
+        <input type="text" id="mod-pr-base" placeholder="defaults to the repository's own default" />
+      </div>
+      <div class="form-group flex1">
+        <label>.NET version for the build workflow</label>
+        <input type="text" id="mod-pr-dotnet" value="8.0.x" />
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="openModernizationPR()">
+        <span class="btn-icon">&#128640;</span> Push and open a pull request
+      </button>
+    </div>
+    <div id="mod-pr-result"></div>
   </div>`;
 }
+
+async function openModernizationPR() {
+  const owner = (document.getElementById('mod-pr-owner').value || '').trim();
+  const repo = (document.getElementById('mod-pr-repo').value || '').trim();
+  const out = document.getElementById('mod-pr-result');
+  if (!owner || !repo) { alert('Name the owner and repository to push to.'); return; }
+  if (!confirm(`Commit this run's converted code to ${owner}/${repo} and open a pull `
+             + `request? This writes to that repository.`)) return;
+  out.innerHTML = '<div class="cost-note">Committing the converted tree and opening the '
+    + 'pull request… this calls no model.</div>';
+  try {
+    const r = await apiFetch(`/api/v1/modernization/runs/${_modRunId}/github-pr`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        owner, repo,
+        base_branch: (document.getElementById('mod-pr-base').value || '').trim(),
+        dotnet_version: (document.getElementById('mod-pr-dotnet').value || '').trim() || '8.0.x',
+      }),
+    });
+    const url = r.pull_request_url || r.pr_url || (r.pull_request || {}).url || '';
+    out.innerHTML = `<div class="cost-note">
+      Pushed ${Number(r.files_committed || r.files || 0).toLocaleString()} file(s) to
+      <b>${esc(r.branch || 'the branch')}</b>.
+      ${url ? `<a href="${esc(url)}" target="_blank" rel="noopener">Open the pull request</a>.` : ''}
+      The build workflow runs on your runner and reports back here; failing units return to
+      <b>ready</b> and are re-converted.</div>`;
+  } catch (e) {
+    // The commonest failure by far is a missing PUBLIC_BASE_URL, and the route answers that
+    // with a sentence explaining why a callback cannot be derived from the request. Showing
+    // it verbatim is more useful than a generic "could not push".
+    out.innerHTML = `<div class="cost-note cost-note-bad">${esc(e.message)}</div>`;
+  }
+}
+
 
 function filterModernizationArtifacts(value, caret) {
   _modArtifactQuery = value || '';
@@ -10582,27 +10805,62 @@ async function attachDocument(fieldId, input, noteId) {
 // element ids are irregular for the same reason `AGENT_SCREENS`' are — they predate any
 // convention — so they are written down rather than derived.
 //
-// `brief` says which kind of run this is, and it is the whole distinction Phase 3 turns on:
-// `true` sends a computed structural description and makes **one** call (Architecture,
-// Security — a holistic question cannot be merged from chunks); `false` fans the real
-// source out over chunks and merges the findings (Sensitive Data — a per-file question).
-// The screen wording differs because the guarantee differs.
+// ── Six screens that can read a whole codebase ────────────────────────────
+//
+// Keyed by **screen**, not by product id, so `AGENT_SCREENS` stays the one place a screen
+// says what it is: the result container, the renderer and the run history all come from
+// there. Keying this table by product id instead was a quiet bug — `runDesignFromCode`
+// finished a Sensitive Data scan and called `loadAgentRuns('sensitive-data')`, but that
+// screen's key is `sensitive`, so the lookup missed and the "Previous runs" list silently
+// never refreshed.
+//
+// `brief` is the whole distinction these intakes turn on, and it is not a style choice:
+//
+//   * `true`  — the agent is sent a **computed structural description** and makes ONE call.
+//               Architecture, Security and Migration Assessment each answer one holistic
+//               question (`ARCHITECTURE_TOOL_SCHEMA` has a single `quality_scores` object;
+//               the migration schema a single `complexity`), so twenty partial answers have
+//               no merge rule. The description costs nothing — no model is involved in
+//               building it.
+//   * `false` — the agent is sent the **real files**, fanned out over as many calls as it
+//               takes. Sensitive Data, Part 11 and the GxP planner all ask questions about
+//               the code itself: a summary of a codebase cannot contain the hardcoded key
+//               that is the finding, or the audit-trail write that is the evidence.
+//
+// The wording on each card differs for the same reason, and so does the quote: a `brief`
+// run is always one call, a fan-out names how many.
+//
+// `after` is for a screen where finishing the run is not the end of it. Only the GxP
+// planner has one: generating each document afterwards is a separate call that needs the
+// same source, so the plan and the files it was built from are held rather than re-read.
 const CODE_SOURCE_CARDS = {
-  architecture: { prefix: 'arch', result: 'arch-result', brief: true,
-                  render: () => renderArchitectureResult },
-  security:     { prefix: 'sec', result: 'security-result', brief: true,
-                  render: () => renderSecurityResult },
-  'sensitive-data': { prefix: 'sd', result: 'sd-result', brief: false,
-                      render: () => renderSensitiveDataResult },
+  architecture:   { prefix: 'arch', agent: 'architecture',        brief: true },
+  security:       { prefix: 'sec',  agent: 'security',            brief: true },
+  migration:      { prefix: 'mg',   agent: 'migration-assessment', brief: true },
+  sensitive:      { prefix: 'sd',   agent: 'sensitive-data',      brief: false },
+  cfr21:          { prefix: 'cfr',  agent: 'cfr21-verification',  brief: false },
+  'gxp-generate': { prefix: 'gxg',  agent: 'gxp-generate-plan',   brief: false,
+                    after: result => {
+                      _gxgState.files = result.files_extracted || [];
+                      _gxgState.plan = result;
+                      _gxgState.code = '';
+                      _gxgState.generatedDocs = [];
+                      _gxgState.systemDescription =
+                        document.getElementById('gxg-system-desc').value.trim();
+                      _gxgState.projectName =
+                        document.getElementById('gxg-project').value.trim();
+                      document.getElementById('gxg-documents-result').classList.add('hidden');
+                    } },
 };
 
-const _designQuote = {};      // agent -> { zip: File|null, quote }
+const _designQuote = {};      // screen -> { zip: File|null, quote }
 
-function _designEls(agent) {
-  const p = CODE_SOURCE_CARDS[agent].prefix;
+function _designEls(screen) {
+  const p = CODE_SOURCE_CARDS[screen].prefix;
   return {
     repo: document.getElementById(`${p}-repo-url`),
     ref: document.getElementById(`${p}-repo-ref`),
+    token: document.getElementById(`${p}-gh-token`),
     zip: document.getElementById(`${p}-code-zip`),
     run: document.getElementById(`${p}-code-run`),
     out: document.getElementById(`${p}-code-preview`),
@@ -10611,34 +10869,51 @@ function _designEls(agent) {
   };
 }
 
-function _designBody(agent, els) {
+function _designBody(screen, els) {
+  const card = CODE_SOURCE_CARDS[screen];
   const body = {
     project_name: (els.project && els.project.value.trim()) || '',
     context: (els.context && els.context.value.trim()) || '',
   };
-  if (agent === 'architecture') {
-    body.requirements = (document.getElementById('arch-requirements') || {}).value || '';
-    body.review_mode = (document.getElementById('arch-mode') || {}).value || 'review';
-  } else if (agent === 'security') {
-    body.system_type = (document.getElementById('sec-type') || {}).value || '';
+  const v = id => ((document.getElementById(id) || {}).value || '').trim();
+  if (card.agent === 'architecture') {
+    body.requirements = v('arch-requirements');
+    body.review_mode = v('arch-mode') || 'review';
+  } else if (card.agent === 'security') {
+    body.system_type = v('sec-type');
+  } else if (card.agent === 'migration-assessment') {
+    body.migration_target = v('mg-target');
+    body.constraints = v('mg-constraints');
+  } else if (card.agent === 'cfr21-verification') {
+    body.system_description = v('cfr-system-desc');
+  } else if (card.agent === 'gxp-generate-plan') {
+    body.system_description = v('gxg-system-desc');
   }
   // A code-derived run can still be chained from an earlier one, where the screen offers
   // it. `chainedFrom` returns null on screens with no handoff, which the backend reads as
   // "no claim" rather than an empty one.
-  if (RUN_HANDOFFS[agent]) body.derived_from = chainedFrom(agent);
+  if (RUN_HANDOFFS[screen]) body.derived_from = chainedFrom(screen);
   const repo = els.repo.value.trim();
   if (repo) { body.github_repo_url = repo; body.ref = els.ref.value.trim() || undefined; }
+  // A token for this call only, never stored — the same override Code Review and VAPT take
+  // (`_UISourceBase.github_token`). Only needed for a private repository, or when the
+  // deployment credential cannot see this one; GitHub answers 404 rather than 403 for a
+  // repository a token cannot see, so a private repo, an expired token and a typo all look
+  // identical without it.
+  const token = (els.token && els.token.value.trim()) || '';
+  if (token) body.github_token = token;
   return body;
 }
 
-async function previewDesignCost(agent, zipFile) {
-  const els = _designEls(agent);
+async function previewDesignCost(screen, zipFile) {
+  const els = _designEls(screen);
+  const card = CODE_SOURCE_CARDS[screen];
   const file = zipFile || null;
   if (!file && !els.repo.value.trim()) {
     alert('Give a repository URL, or choose a zip of the codebase.');
     return;
   }
-  _designQuote[agent] = null;
+  _designQuote[screen] = null;
   els.run.disabled = true;
   els.out.innerHTML = '<div class="cost-note">Reading the source and working out its '
     + 'structure… this calls no model and costs nothing.</div>';
@@ -10649,17 +10924,17 @@ async function previewDesignCost(agent, zipFile) {
       // archive is read here and posted as a file list — the same thing the server would
       // have unpacked, and it keeps one preflight implementation rather than two.
       const files = await _readZipAsFiles(file);
-      quote = await apiFetch(`/api/review/${agent}/preflight`, {
+      quote = await apiFetch(`/api/review/${card.agent}/preflight`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ..._designBody(agent, els), files }),
+        body: JSON.stringify({ ..._designBody(screen, els), files }),
       });
     } else {
-      quote = await apiFetch(`/api/review/${agent}/preflight`, {
+      quote = await apiFetch(`/api/review/${card.agent}/preflight`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(_designBody(agent, els)),
+        body: JSON.stringify(_designBody(screen, els)),
       });
     }
-    _designQuote[agent] = { zip: file, quote };
+    _designQuote[screen] = { zip: file, quote };
     els.run.disabled = false;
     els.out.innerHTML = renderDesignQuote(quote);
   } catch (e) {
@@ -10672,6 +10947,7 @@ function renderDesignQuote(q) {
   const est = q.estimate || {};
   const brief = q.code_brief || {};
   const src = q.source || {};
+  const limit = q.coverage_limit || {};
   const calls = Number(est.calls || 1);
   // The coverage line only exists for the brief-based runs. A fan-out has no analyzer
   // coverage to report — it reads every file directly — so printing an empty box there
@@ -10679,6 +10955,13 @@ function renderDesignQuote(q) {
   const coverage = brief.coverage_note
     ? `<div class="cost-note ${(brief.coverage || {}).files_not_analysed ? 'cost-note-warn' : ''}">
          ${esc(brief.coverage_note)}</div>`
+    : '';
+  // The regulated cap is the other kind of gap, and it is worse to leave unsaid: Part 11
+  // and GxP read at most 60 files, so a larger system is assessed in part. Said here, on
+  // the free quote, because "60 of your 400 files" is a reason to split the system before
+  // paying rather than a footnote to the report afterwards.
+  const capped = limit.capped
+    ? `<div class="cost-note cost-note-warn">${esc(limit.cap_note)}</div>`
     : '';
   return `
     <div class="cost-note">
@@ -10688,7 +10971,7 @@ function renderDesignQuote(q) {
       ${src.files != null ? `${Number(src.files).toLocaleString()} file(s) read.` : ''}
       Estimating was free.
     </div>
-    ${coverage}`;
+    ${coverage}${capped}`;
 }
 
 // A zip is unpacked in the browser purely so the free quote can be a JSON call like the
@@ -10739,40 +11022,49 @@ async function _readZipAsFiles(file) {
   return out;
 }
 
-async function runDesignFromCode(agent) {
-  const els = _designEls(agent);
-  const held = _designQuote[agent];
+async function runDesignFromCode(screen) {
+  const els = _designEls(screen);
+  const held = _designQuote[screen];
   if (!held) { alert('Estimate the cost first — it is free.'); return; }
-  const card = CODE_SOURCE_CARDS[agent];
-  const target = card.result;
-  const render = card.render();
+  const card = CODE_SOURCE_CARDS[screen];
+  const spec = AGENT_SCREENS[screen] || {};
+  const target = spec.result;
+  const render = spec.render;
   const ceiling = Number((held.quote.estimate || {}).ceiling_usd || 0);
-  if (!confirm(`Run this review? It will cost up to $${ceiling.toFixed(4)}.`)) return;
+  // The cap is repeated in the confirmation, not only on the quote above it. Somebody who
+  // scrolled past a warning about 60 of 400 files is about to pay for a partial assessment
+  // and call it a verification of the system.
+  const limit = held.quote.coverage_limit || {};
+  const capWarning = limit.capped
+    ? `\n\n${limit.cap_note}`
+    : '';
+  if (!confirm(`Run this? It will cost up to $${ceiling.toFixed(4)}.${capWarning}`)) return;
 
   showLoading(card.brief
-    ? 'Reading the codebase and reviewing its structure… 30–60 seconds'
-    : 'Scanning every file… a large codebase is split across several calls and can take '
+    ? 'Reading the codebase and working out its structure… 30–60 seconds'
+    : 'Reading every file… a large codebase is split across several calls and can take '
       + 'a few minutes');
   try {
     let result;
     if (held.zip) {
       const fd = new FormData();
       fd.append('file', held.zip);
-      const body = _designBody(agent, els);
+      const body = _designBody(screen, els);
       Object.entries(body).forEach(([k, v]) => {
         if (v !== undefined && v !== null && k !== 'derived_from') fd.append(k, v);
       });
-      result = await apiFetch(`/api/review/${agent}/upload-zip`, { method: 'POST', body: fd });
+      result = await apiFetch(`/api/review/${card.agent}/upload-zip`, { method: 'POST', body: fd });
     } else {
-      result = await apiFetch(`/api/review/${agent}/source`, {
+      result = await apiFetch(`/api/review/${card.agent}/source`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(_designBody(agent, els)),
+        body: JSON.stringify(_designBody(screen, els)),
       });
     }
-    render(target, result);
-    loadAgentRuns(agent);
+    if (card.after) card.after(result);
+    if (render && target) render(target, result);
+    loadAgentRuns(screen);
   } catch (e) {
-    showError(target, e.message);
+    if (target) showError(target, e.message);
   } finally { hideLoading(); }
 }
 
@@ -11062,8 +11354,21 @@ async function openFrameworkInfo(token) {
   `);
 }
 
+// Three screens are deliberately absent from `AGENT_SCREENS` (see its own comment):
+// modernization and the governance report have their own, richer run histories, and the
+// GitHub PR screen is retired. Two of them are still real products with real reference
+// documents, so they name their product directly rather than being denied the link —
+// `renderAgentAbout` cannot run for them, but there is no reason the document cannot open.
+// Keyed by screen, valued by **product id** — and they differ here: the Governance Report
+// screen is `page-governance-report` and its product is `report-generate`.
+const DOC_ONLY_SCREENS = {
+  modernization: 'modernization',
+  'governance-report': 'report-generate',
+};
+
 async function openAgentDoc(page) {
-  const spec = AGENT_SCREENS[page];
+  const spec = AGENT_SCREENS[page]
+    || (DOC_ONLY_SCREENS[page] ? { product: DOC_ONLY_SCREENS[page] } : null);
   if (!spec) return;
   const product = _productCatalogue.find(x => x.id === spec.product);
   const title = (product && product.title) || spec.product;

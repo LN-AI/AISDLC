@@ -87,8 +87,10 @@ node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans scr
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
-Three live drivers sit beside these. They are **not** part of the offline net: all three
-spend real money, and two of them write to a real repository — use a scratch one.
+Four live drivers sit beside these. They are **not** part of the offline net: three of
+them spend real money, and three write to a real repository — use a scratch one.
+`verify_code_delivery.py` is the odd one: it writes but calls no model, because the
+thing it verifies is the push, not the generation.
 
 ```
 python scripts/eval_code_review.py                       # accuracy, 3 runs per case (~$0.55)
@@ -99,6 +101,9 @@ python scripts/verify_pr_review.py <pr-url> --cleanup    # remove what it posted
 python scripts/verify_fix_apply.py <repo-or-pr-url>      # every Apply Fixes delivery, for real
 python scripts/verify_fix_apply.py <url> --dry-run       # ...stopping at the preview
 python scripts/verify_fix_apply.py <url> --cleanup --review-id <id>
+python scripts/verify_code_delivery.py <repo-url>        # pushing generated code, for real
+python scripts/verify_code_delivery.py <url> --dry-run   # ...refusals only, writes nothing
+python scripts/verify_code_delivery.py <url> --cleanup
 ```
 
 `eval_code_review.py` is the only thing that can tell an accuracy improvement from a
@@ -260,6 +265,19 @@ Everything else under `scripts/` is tooling, not tests; don't run it expecting a
   repository, and `smoke_review_sources.py` §31 fails if a delivery is added to
   `fix_apply.OUTPUTS` without a stage in it (D-362). `same_pr` is opt in: it commits onto a
   branch somebody may have checked out.
+
+  **Generated code has its own way out, and it is deliberately narrower.** Codegen Scaffold
+  and Migration Execute store their files on the review row, and
+  `POST /api/reviews/{id}/deliver-code` pushes them through `services/code_delivery.py`: a
+  **new** branch that must not already exist, a pull request only if asked for, and never a
+  commit onto an existing branch. Apply Fixes may do the last of those because a review had
+  already read that branch; nothing has read a scaffold unless `auto_review` was ticked, and
+  the pull request body says so where whoever merges it will see it. `_DELIVERABLE_RUNS` in
+  `main.py` is a deny-by-default list of review types, not a guess from the shape of
+  `result`. The one thing shared with `fix_apply` is `resolve_base_branch`, because that is
+  where D-314, D-315 and D-364 all landed and a second copy in a second writer is how they
+  come back. **`verify_code_delivery.py` is its live driver** — offline tests of a write path
+  stop before writing (D-317), so a new writer starts with exactly that exposure.
 
   **Its first live run found three more, and one of them had left the whole feature
   non-functional for eight commits** — `_available_outputs` called with two arguments

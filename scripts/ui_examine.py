@@ -1531,6 +1531,109 @@ def main():
                   f"{_bad_wiring} -- a bad row injects the control above nothing, or reads "
                   "a source product that is not in AGENT_SCREENS")
 
+            # ── 20. Six screens read a codebase, and generated code gets out ──
+            #
+            # This is the check no other suite can make. `smoke_review_sources` proves the
+            # routes exist and the guards refuse; it cannot see whether a button in
+            # `index.html` names a function that exists, or whether `CODE_SOURCE_CARDS`
+            # points at element ids the markup actually has. That gap is where the defects
+            # reported on 2026-09-02 were, and adding three cards keyed by screen rather
+            # than by product is exactly the kind of change that reopens it — one of the
+            # existing three was already calling `loadAgentRuns` with a key that did not
+            # exist, so its history silently never refreshed.
+            section("20. Every from-code card is wired to markup that exists")
+
+            goto_page(page, "Architecture Review")
+            page.wait_for_timeout(500)
+
+            _card_wiring = page.evaluate(
+                """() => Object.entries(CODE_SOURCE_CARDS).map(([screen, c]) => {
+                     const ids = ['repo-url', 'repo-ref', 'gh-token', 'code-zip',
+                                  'code-run', 'code-preview']
+                       .filter(sfx => !document.getElementById(`${c.prefix}-${sfx}`));
+                     return {
+                       screen,
+                       missingEls: ids,
+                       noScreenRow: !AGENT_SCREENS[screen],
+                       noResultBox: !(AGENT_SCREENS[screen]
+                                      && document.getElementById(AGENT_SCREENS[screen].result)),
+                       noRenderer: !(AGENT_SCREENS[screen]
+                                     && typeof AGENT_SCREENS[screen].render === 'function'),
+                     };
+                   }).filter(r => r.missingEls.length || r.noScreenRow || r.noResultBox
+                                  || r.noRenderer)""")
+            check("every from-code card names elements, a screen row and a renderer that exist",
+                  not _card_wiring,
+                  f"{_card_wiring} -- a card keyed by a screen with no AGENT_SCREENS row "
+                  "cannot find its result box or refresh its history, and the failure is "
+                  "silent")
+
+            check("...and there are six of them",
+                  page.evaluate("() => Object.keys(CODE_SOURCE_CARDS).length") == 6,
+                  "architecture, security, migration, sensitive, cfr21, gxp-generate")
+
+            # Every card's buttons call these three by name from `index.html`.
+            _fns = page.evaluate(
+                """() => ['previewDesignCost', 'runDesignFromCode', 'loadCodebaseContext',
+                          'clearCodebaseContext', 'deliverGeneratedCode',
+                          'openModernizationPR', 'renderGeneratedCodeDelivery',
+                          'renderModernizationDelivery']
+                     .filter(n => typeof window[n] !== 'function')""")
+            check("...and every handler the markup calls is defined",
+                  not _fns,
+                  f"{_fns} -- an onclick naming a function that does not exist is a button "
+                  "that does nothing, and the console says so only when it is pressed")
+
+            # The two doors the regulated screens used to have are gone. One of them read a
+            # zip through an ingester with no secret redaction and no quote in front of it.
+            _dead = page.evaluate(
+                """() => ['uploadCFR21Zip', 'uploadGxPPlanZip']
+                     .filter(n => typeof window[n] === 'function')""")
+            check("...and the two ad-hoc regulated uploaders are gone, not merely unused",
+                  not _dead,
+                  f"{_dead} -- one shared card serves both screens now, and unlike those it "
+                  "quotes the run before spending")
+
+            # Each new screen is visited, because a card can be wired correctly and still be
+            # on a page that never renders it.
+            for _label, _prefix in (("Code Migration", "mg"),
+                                    ("21 CFR Part 11", "cfr"),
+                                    ("GxP Document Generation", "gxg")):
+                try:
+                    goto_page(page, _label)
+                except Exception:
+                    check(f"the {_label} screen opens", False, "nav item not found")
+                    continue
+                page.wait_for_timeout(400)
+                _visible = page.evaluate(
+                    f"""() => {{
+                          const el = document.getElementById('{_prefix}-code-card');
+                          return !!el && el.offsetParent !== null;
+                        }}""")
+                check(f"the {_label} screen shows its from-code card", _visible,
+                      "a card hidden behind an entitlement class or a collapsed parent is "
+                      "a feature nobody can find")
+                _disabled = page.evaluate(
+                    f"() => (document.getElementById('{_prefix}-code-run') || {{}}).disabled")
+                check(f"...with its run button disabled until a quote exists", _disabled is True,
+                      "the run button names a ceiling it was approved against; enabled "
+                      "before the estimate it would spend an unapproved amount")
+
+            # Reading a codebase into the codegen context box is free and must stay separate
+            # from running anything: the whole reason it is a distinct step is that the
+            # brief should be visible before it is sent.
+            goto_page(page, "Code Generation")
+            page.wait_for_timeout(400)
+            check("code generation offers to read an existing codebase",
+                  page.query_selector("#cg-existing") is not None
+                  and page.query_selector("#cg-repo-url") is not None,
+                  "the brief lands in a box that can be read and trimmed, not in a hidden "
+                  "field")
+            check("...and sends nothing until it is asked to",
+                  (page.eval_on_selector("#cg-existing", "el => el.value") or "") == "",
+                  "an empty context box is what makes a run with no repository identical to "
+                  "one from before this existed")
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.
