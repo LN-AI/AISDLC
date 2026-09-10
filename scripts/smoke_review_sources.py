@@ -5521,15 +5521,209 @@ def main():
 
             _loop36 = _c36.get(f"/api/reviews/{_rid36}/runner"
                                f"?callback_url=http://localhost:8000/x", headers=_H36).json()
-            check("a callback a CI runner cannot reach is refused with a reason",
-                  _loop36["workflow_yaml"] is None and "not reachable" in _loop36["blocked_reason"],
-                  f"{str(_loop36.get('blocked_reason'))[:90]} -- it would run, fail to post, "
-                  "and look exactly like a suite nobody triggered")
+            check("a callback a CI runner cannot reach is not used as one",
+                  _loop36["report_mode"] == "artifact"
+                  and "http://localhost:8000/x" not in (_loop36["workflow_yaml"] or ""),
+                  f"{_loop36.get('report_mode')} -- a workflow reporting there would run, "
+                  "fail to post, and look exactly like a suite nobody triggered")
+            check("...but a workflow is still rendered, in the mode that needs no address",
+                  bool(_loop36["workflow_yaml"])
+                  and "artifact" in (_loop36["report_mode_note"] or ""),
+                  "refusing outright is right for the compiler callback, which has no second "
+                  "route home; this one does, so refusing would leave every local deployment "
+                  "with no CI at all")
 
             check("a run that generated no tests has no runner to describe",
                   _c36.get("/api/reviews/nope/runner", headers=_H36).status_code == 404)
         finally:
             llm_gateway.call_tool = _prev36
+
+    # ══ 37. The loop closes without a public address ═══════════════════════
+    #
+    # A CI runner cannot reach a platform on a laptop or behind a firewall, so the results
+    # travel the other way: the workflow saves them as its own artifact and the platform
+    # goes and gets them. Every call is outbound, which is what makes it work at all.
+    #
+    # The checks that matter most here are the two a real GitHub Actions run found, because
+    # neither is visible to a YAML parser: a mapping left empty by commenting out its only
+    # entries, and an artifact that has to be read the same way it was written.
+    section("37. Results fetched from GitHub, and the tests delivered as a pull request")
+
+    import zipfile as _zip37
+
+    _plan37 = _trp.plan_for([{"path": "tests/a.test.js", "framework": "Jest",
+                              "prerequisites": ["none"]}])
+    _cb37 = _trp.render_workflow("r37", "https://sdlc.example.com/x", _plan37)
+    _ar37 = _trp.render_workflow("r37", "", _plan37)
+
+    check("a workflow renders with no address to report to",
+          bool(_ar37) and "      LM_RESULTS_URL:" not in _ar37,
+          "this is the mode for a platform a runner cannot reach -- a laptop, a private "
+          "network, anything behind a firewall")
+    check("...saving its results as the artifact instead of posting them",
+          "lm-merged.xml" in _ar37 and _trp.ARTIFACT_NAME in _ar37,
+          "the artifact IS the report in this mode, not a backup of one")
+    check("...and asking for no API key, because it sends nothing",
+          "secrets." + _trp.API_KEY_SECRET not in _ar37,
+          "a secret nobody needs is a step nobody completes")
+    check("...while the reporting mode still does both",
+          "secrets." + _trp.API_KEY_SECRET in _cb37
+          and "      LM_RESULTS_URL:" in _cb37)
+    check("...and both name the run they belong to",
+          "r37" in _ar37 and "r37" in _cb37)
+
+    # The defect a real Actions run found, and the only check here written from evidence
+    # rather than reasoning. With its examples commented out, `env:` parsed as null; GitHub
+    # rejects a workflow whose `env` is not a mapping *before creating any job*, so the run
+    # came back as a bare failure with no steps, no logs and no artifact -- indistinguishable
+    # at a glance from a suite that failed. `yaml.safe_load` accepts it happily.
+    for _label37, _yaml37 in (("with an address to report to", _cb37),
+                              ("with none", _ar37)):
+        _envs37 = [n for n, l in enumerate(_yaml37.split("\n")) if l.strip() == "env:"]
+        _empty37 = []
+        for _n37 in _envs37:
+            _ind37 = len(_yaml37.split("\n")[_n37]) - len(_yaml37.split("\n")[_n37].lstrip())
+            for _next37 in _yaml37.split("\n")[_n37 + 1:]:
+                if not _next37.strip() or _next37.strip().startswith("#"):
+                    continue
+                if len(_next37) - len(_next37.lstrip()) <= _ind37:
+                    _empty37.append(_n37)
+                break
+        check(f"no env block is left empty by its comments, {_label37}",
+              not _empty37,
+              "C-92: GitHub rejects `env:` with no entries before it creates a job, so the "
+              "run reads as a failed test suite rather than a malformed file")
+    try:
+        _trp._check_mappings(["    env:", "      # only a comment", "    steps:"])
+        check("...and the renderer refuses to emit one", False, "it was allowed")
+    except ValueError:
+        check("...and the renderer refuses to emit one rather than trusting the caller", True)
+    _trp._check_mappings(["on:", "  workflow_dispatch:", "  push:", "    branches: x"])
+    check("...without flagging a key that is legitimately empty",
+          True, "`on: {workflow_dispatch:}` is null on purpose and must stay allowed")
+
+    # Reading the artifact back. Untrusted input from outside the platform.
+    def _zip37f(files):
+        buf = io.BytesIO()
+        with _zip37.ZipFile(buf, "w") as archive:
+            for name, content in files:
+                archive.writestr(name, content)
+        return buf.getvalue()
+
+    _one37 = '<testsuite name="a"><testcase name="t1"/></testsuite>'
+    _mrg37 = ('<testsuites><testsuite name="m"><testcase name="t9"/></testsuite>'
+              '</testsuites>')
+    check("the merged file the workflow wrote is preferred over the parts",
+          "t9" in _trp.read_artifact_zip(_zip37f([("jest.xml", _one37),
+                                                  ("lm-merged.xml", _mrg37)])),
+          "what is filed should be exactly what the run produced, not a second merge of it")
+    check("...and it is not wrapped a second time",
+          _trp.read_artifact_zip(
+              _zip37f([("lm-merged.xml", _mrg37)])).count("<testsuites>") == 1,
+          "nesting testsuites inside testsuites loses every suite for a strict reader")
+    check("...but several parts still merge when there is no merged file",
+          _trp.read_artifact_zip(
+              _zip37f([("a.xml", _one37), ("b.xml", _one37)])).count("<testsuite ") == 2)
+    for _label37, _bad37 in (("something that is not a zip", b"not a zip"),
+                             ("a zip with no XML in it", _zip37f([("build.log", "x")])),
+                             ("a zip whose XML holds no suites",
+                              _zip37f([("a.xml", "<nope")]))):
+        try:
+            _trp.read_artifact_zip(_bad37)
+            check(f"{_label37} is refused", False, "it was accepted")
+        except ValueError:
+            check(f"{_label37} is refused with a reason, not a crash", True)
+    check("an artifact holding more XML than a test report ever does is refused",
+          _trp.MAX_ARTIFACT_UNPACKED <= 20 * 1024 * 1024
+          and _trp.MAX_ARTIFACT_MEMBERS <= 200,
+          "this is a zip from outside the platform; a report is kilobytes")
+
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c37:
+        _t37 = _c37.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p37 = _c37.post("/api/v1/projects", json={"name": "S37"},
+                         headers={"Authorization": f"Bearer {_t37}"}).json()["project"]["id"]
+        _H37 = {"Authorization": f"Bearer {_t37}", "X-Project-Id": _p37}
+        _prev37 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["none"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_a"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                      "test_names": ["test_a"]}],
+            "not_automated": [],
+            "assumptions": [{"assumption": "the login route is POST /login",
+                             "risk_if_wrong": "every auth test fails at setup"}],
+            "summary": "s"}
+        try:
+            _g37 = _c37.post("/api/review/test-automation", headers=_H37, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            _rid37 = _g37.json().get("review_id")
+
+            # With no PUBLIC_BASE_URL set, the runner endpoint used to refuse outright. Now
+            # it renders the mode that needs no address at all -- which is the whole point.
+            _prevbase37 = config.PUBLIC_BASE_URL
+            config.PUBLIC_BASE_URL = ""
+            try:
+                _r37 = _c37.get(f"/api/reviews/{_rid37}/runner", headers=_H37).json()
+                check("a deployment with no public address still gets a workflow",
+                      bool(_r37.get("workflow_yaml")) and not _r37.get("callback_url"),
+                      f"{str(_r37.get('blocked_reason'))[:80]} -- refusing here would leave "
+                      "every local deployment with no CI at all")
+                check("...one that fetches rather than reports",
+                      "lm-merged.xml" in (_r37.get("workflow_yaml") or ""))
+            finally:
+                config.PUBLIC_BASE_URL = _prevbase37
+
+            _n37 = len(_calls34)
+            _f37 = _c37.post(f"/api/reviews/{_rid37}/test-results/from-actions", headers=_H37,
+                             json={"github_repo_url": "https://github.com/o/does-not-exist"})
+            check("fetching from a repository no credential can see fails with a reason",
+                  _f37.status_code in (400, 502),
+                  f"{_f37.status_code} {_f37.text[:160]}")
+            check("...calling no model on the way, because none of this is a generation",
+                  len(_calls34) == _n37, "every door on this loop must stay free")
+            check("...and results cannot be fetched for a run that generated no tests",
+                  _c37.post("/api/reviews/nope/test-results/from-actions", headers=_H37,
+                            json={"github_repo_url": "https://github.com/o/r"}
+                            ).status_code == 404)
+
+            _d37 = _c37.post(f"/api/reviews/{_rid37}/deliver-tests", headers=_H37,
+                             json={"github_repo_url": "not-a-repo-url"})
+            check("delivering to something that is not a repository is refused",
+                  _d37.status_code == 400, f"{_d37.status_code} {_d37.text[:120]}")
+
+            # The pull request body is the last place a reader is told what this is, and the
+            # only one they cannot avoid seeing.
+            _body37 = _m34._tests_pr_body(
+                _rid37,
+                {"test_files": [{"path": "tests/t.py", "test_names": ["test_a"]}],
+                 "requirement_coverage": [{"requirement_ref": "audited", "covered": False,
+                                           "note": "no audit table in the source"}],
+                 "assumptions": [{"assumption": "login is POST /login",
+                                  "risk_if_wrong": "auth tests fail at setup"}],
+                 "summary": "s"},
+                _trp.plan_for([{"path": "tests/t.py", "framework": "pytest",
+                                "prerequisites": ["database"]}]),
+                "saves its results as a workflow artifact")
+            check("the pull request says nobody has run these",
+                  "never run" in _body37.lower()
+          and "Nothing here has been executed" in _body37,
+                  "the failure mode is a reviewer reading a generated test as a verified one")
+            check("...carries the assumptions the model declared",
+                  "login is POST /login" in _body37,
+                  "a risk stated on a screen nobody opens is not stated")
+            check("...names the requirements the suite does not cover",
+                  "no audit table in the source" in _body37,
+                  "counting files and assuming is what this replaces")
+            check("...and what no runner will supply",
+                  "database" in _body37, _body37[:200])
+        finally:
+            llm_gateway.call_tool = _prev37
+
 
 
 

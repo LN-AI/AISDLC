@@ -4,7 +4,8 @@
     python scripts/run_tests.py --review <review_id> --user admin --password ...
     python scripts/run_tests.py --review <review_id> --api-key <key> --into ../their-repo
     python scripts/run_tests.py --review <review_id> --dry-run
-    python scripts/run_tests.py --review <review_id> --workflow --no-run
+    python scripts/run_tests.py --review <review_id> --deliver <repo-url> --open-pr
+    python scripts/run_tests.py --review <review_id> --from-actions <run-url>
 
 This is the shortest path from "the platform generated 19 tests" to "here is what happened
 when they ran", and it needs no GitHub, no Actions secret and no Docker — only the test
@@ -46,6 +47,7 @@ import glob
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -275,19 +277,103 @@ def report(api: str, review_id: str, documents, ran: bool, key: str = "",
     if code:
         return code
 
+    _print_reconciliation(body)
+    return 0
+
+
+# ── The other two doors: deliver the tests, and fetch what CI made of them ──
+
+_RUN_URL = re.compile(r"github\.com/([^/]+)/([^/]+)/actions/runs/(\d+)")
+
+
+def _print_reconciliation(body: dict) -> None:
+    """The one shape every door answers with, printed the one way."""
     summary = body.get("summary") or {}
     print(f"\nReported {summary.get('total', 0)} test(s): {summary.get('passed', 0)} passed, "
           f"{summary.get('failed', 0)} failed, {summary.get('errored', 0)} did not load, "
           f"{summary.get('skipped', 0)} skipped.")
-    print("\nYour requirements, checked against what ran:")
+    print(f"\nYour requirements, checked against what ran:")
     for row in body.get("requirements") or ():
         print(f"  {str(row.get('outcome', '')).upper():<8} {row.get('requirement_ref', '')}")
-    unmatched = body.get("unmatched_results") or 0
-    if unmatched:
-        print(f"  ({unmatched} reported test(s) matched no requirement — your own suite "
-              f"ran alongside the generated one.)")
-    # Said every time. Nothing in the platform witnessed this run; it was told.
-    print("\nThe platform did not run these. This is what was reported to it.")
+    if body.get("unmatched_results"):
+        print(f"  ({body['unmatched_results']} reported test(s) matched no requirement — "
+              f"your own suite ran alongside the generated one.)")
+    print(f"\nThe platform did not run these. This is what was reported to it.")
+
+
+def deliver(api: str, review_id: str, args, auth: dict) -> int:
+    """Push the suite to a branch of the customer's repository, with the workflow that runs it."""
+    payload = {"github_repo_url": args.deliver, "open_pr": bool(args.open_pr),
+               "include_workflow": not args.no_workflow}
+    if args.branch:
+        payload["branch"] = args.branch
+    if args.base_branch:
+        payload["base_branch"] = args.base_branch
+    if args.callback_url:
+        payload["callback_url"] = args.callback_url
+    body, code = _json(*_http(f"{api}/api/reviews/{review_id}/deliver-tests", method="POST",
+                              payload=payload, **auth), "the delivery")
+    if code:
+        return code
+    print(f"Branch {body.get('branch')} in {body.get('repo')}: "
+          f"{len(body.get('files_committed') or [])} file(s) committed")
+    for path in body.get("files_committed") or ():
+        print(f"  + {path}")
+    for row in body.get("files_failed") or ():
+        print(f"  ! {row.get('path')}: {row.get('error')}")
+    if body.get("workflow_warning"):
+        print(f"\n{body['workflow_warning']}")
+    if body.get("pull_request"):
+        print(f"\nPull request: {body['pull_request'].get('url')}")
+    elif body.get("pull_request_error"):
+        print(f"\nThe commits landed but the pull request did not: "
+              f"{body['pull_request_error']}")
+    else:
+        print(f"\nBranch: {body.get('branch_url')}")
+    if body.get("must_supply"):
+        print(f"\nThese tests need something no CI runner has by default: "
+              f"{', '.join(body['must_supply'])}")
+    return 0
+
+
+def from_actions(api: str, review_id: str, args, auth: dict) -> int:
+    """Fetch a finished Actions run's saved report and file it as this run's results.
+
+    The leg that needs no public address: the platform reaches out to GitHub rather than
+    waiting to be reached. `--from-actions` takes the run's URL (what the job itself prints),
+    a bare run id, or `latest` for the most recent completed run of the generated workflow.
+    """
+    target = (args.from_actions or "").strip()
+    repo = (args.repo or "").strip()
+    run_id = ""
+    match = _RUN_URL.search(target)
+    if match:
+        owner, name, run_id = match.groups()
+        repo = repo or f"https://github.com/{owner}/{name}"
+    elif target.isdigit():
+        run_id = target
+    elif target and target != "latest":
+        print(f"Could not read '{target}' as a run. Give the run's URL, its id, or 'latest'.")
+        return 2
+    if not repo:
+        print("Which repository? Pass --repo https://github.com/owner/name, or give the "
+              "run's full URL to --from-actions.")
+        return 2
+
+    payload = {"github_repo_url": repo}
+    if run_id:
+        payload["run_id"] = run_id
+    if args.branch:
+        payload["branch"] = args.branch
+    body, code = _json(*_http(f"{api}/api/reviews/{review_id}/test-results/from-actions",
+                              method="POST", payload=payload, **auth),
+                       "the Actions results")
+    if code:
+        return code
+    run = body.get("actions_run") or {}
+    print(f"Read run {run.get('id')} ({run.get('conclusion') or 'unknown'}) "
+          f"on {run.get('branch') or 'unknown branch'}\n  {run.get('url') or ''}")
+    _print_reconciliation(body)
     return 0
 
 
@@ -423,11 +509,28 @@ def main() -> int:
     parser.add_argument("--no-report", action="store_true",
                         help="run them, print the result, post nothing")
     parser.add_argument("--workflow", action="store_true",
-                        help="also write the generated GitHub Actions workflow")
+                        help="also write the generated GitHub Actions workflow into --into "
+                             "(use --deliver to commit it to a repository instead)")
     parser.add_argument("--callback-url", default="",
                         help="the address the generated workflow should report to, when the "
                              "deployment's PUBLIC_BASE_URL is not one a CI runner can reach")
     parser.add_argument("--label", default="", help="what to call this run in the report")
+    parser.add_argument("--deliver", default="",
+                        help="push the suite to this repository as a new branch, with the "
+                             "workflow that runs it")
+    parser.add_argument("--open-pr", action="store_true",
+                        help="with --deliver, also open a pull request")
+    parser.add_argument("--branch", default="", help="the branch to deliver to, or to search")
+    parser.add_argument("--base-branch", default="",
+                        help="what the pull request targets (default: the repo's default)")
+    parser.add_argument("--no-workflow", action="store_true",
+                        help="with --deliver, commit the tests without the CI workflow")
+    parser.add_argument("--from-actions", default="",
+                        help="fetch a finished Actions run's saved report instead of running "
+                             "anything: its URL, its id, or 'latest'")
+    parser.add_argument("--repo", default="",
+                        help="with --from-actions, the repository, when the run's full URL "
+                             "was not given")
     parser.add_argument("--fixture", action="store_true",
                         help="offline self-check: no server, no key, no network")
     args = parser.parse_args()
@@ -449,6 +552,15 @@ def main() -> int:
             return 2
 
     auth = {"key": args.api_key, "token": token, "project_id": args.project}
+
+    # Both of these are whole jobs on their own — one pushes, one fetches, and neither
+    # writes into a checkout or runs anything. Handled before the download below so
+    # `--from-actions` does not need a local copy of a suite it is not going to run.
+    if args.from_actions:
+        return from_actions(api, args.review, args, auth)
+    if args.deliver:
+        return deliver(api, args.review, args, auth)
+
     review, code = _json(*_http(f"{api}/api/reviews/{args.review}", **auth), "the run")
     if code:
         return code

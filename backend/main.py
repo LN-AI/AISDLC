@@ -70,6 +70,8 @@ from backend.models.schemas import (
     SecuritySourceRequest,
     TestAutomationSourceRequest,
     TestResultsRequest,
+    TestResultsFromActionsRequest,
+    DeliverTestsRequest,
     SensitiveDataSourceRequest,
     MigrationAssessmentSourceRequest,
     RegulatedSourceRequest,
@@ -102,6 +104,7 @@ from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
                               review_source_store, source_bundle, test_results,
                               test_runner_plan)
+from backend.services.github_service import GitHubService
 from backend.services.subject_service import resolve_subject
 from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
@@ -2347,16 +2350,22 @@ def read_test_runner(review_id: str, request: Request, callback_url: str = "",
         if config.PUBLIC_BASE_URL else "")
     workflow = None
     blocked = None
-    if not target:
-        blocked = ("No address for the workflow to report to. A GitHub Actions runner has to "
-                   "reach this deployment, and that address cannot be derived from a request "
-                   "behind a proxy. Set PUBLIC_BASE_URL, or pass ?callback_url=https://...")
-    elif _unreachable_from_ci(target):
-        # The same refusal the modernization build loop makes, and the same reasoning: this
-        # workflow would run, fail to post, and look exactly like a suite nobody triggered.
-        blocked = (f"'{target}' is not reachable from a CI runner, so the job would run and "
-                   f"report nothing. Pass ?callback_url= with an address the runner can reach.")
-    elif not plan["jobs"]:
+    note = ""
+    if target and _unreachable_from_ci(target):
+        # The modernization build loop *refuses* here, and is right to: a compiler callback
+        # has no second route home. This one does. A workflow that reports to an address no
+        # runner can reach would run, fail to post, and look exactly like a suite nobody
+        # triggered — so rather than refuse, it is rendered in the mode that needs no address
+        # at all and saves its results for the platform to come and fetch.
+        note = (f"'{target}' is not an address a CI runner can reach, so the workflow saves "
+                f"its results as an artifact instead of reporting to it. Fetch them with "
+                f"POST /api/reviews/{review_id}/test-results/from-actions.")
+        target = ""
+    elif not target:
+        note = ("This deployment has no address a CI runner can reach (PUBLIC_BASE_URL is "
+                "unset), so the workflow saves its results as an artifact and the platform "
+                "fetches them. Nothing needs to be exposed for that to work.")
+    if not plan["jobs"]:
         blocked = ("None of the generated files declare a framework this can write a run "
                    "command for, so there is nothing to render. The suite still downloads; "
                    "the command is yours to write.")
@@ -2372,6 +2381,11 @@ def read_test_runner(review_id: str, request: Request, callback_url: str = "",
         "callback_url": target,
         "workflow_path": test_runner_plan.WORKFLOW_PATH,
         "workflow_yaml": workflow,
+        # Which direction the results travel. `callback` means the job posts them itself;
+        # `artifact` means it saves them and the platform pulls — the only one that works
+        # when nothing outside can reach this deployment.
+        "report_mode": "callback" if target else "artifact",
+        "report_mode_note": note,
         "api_key_secret": test_runner_plan.API_KEY_SECRET,
         # The local producer. Same contract, no CI, no secret to provision — which is the
         # difference between a loop that gets closed today and one that gets closed once
@@ -2383,6 +2397,243 @@ def read_test_runner(review_id: str, request: Request, callback_url: str = "",
         "must_supply": plan["must_supply"],
         "attested": False,
     }
+
+
+
+@app.post("/api/reviews/{review_id}/test-results/from-actions")
+async def pull_test_results_from_actions(review_id: str, req: TestResultsFromActionsRequest,
+                                         request: Request,
+                                         reader: dict = Depends(require_reader)):
+    """Read a GitHub Actions run's saved report and file it as this run's results.
+
+    **Free — no model call, nothing metered.**
+
+    This is the same contract as `POST .../test-results`, reached from the other side. The
+    posting version needs the runner to be able to see this platform; this one does not,
+    because the platform makes every call itself. That is what makes the loop close on a
+    laptop, on a private network, or behind a firewall — and the generated workflow renders
+    itself in artifact mode precisely so this route has something to come and get.
+
+    What is filed is the artifact's own merged report, unchanged, so a pulled result and a
+    posted result are the same thing recorded the same way — `attested` is `false` for both,
+    because the platform still did not run anything.
+    """
+    review = _results_review(review_id, request, reader)
+    try:
+        owner, repo = code_delivery.owner_repo(req.github_repo_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        if (req.github_token or "").strip():
+            gh = GitHubService.for_project(review.get("project_id"), f"{owner}/{repo}",
+                                           override_token=req.github_token.strip())
+        else:
+            gh = source_bundle.github_for_repo(req.github_repo_url, review.get("project_id"))
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No GitHub credential could be resolved for {owner}/{repo}.")
+
+    def _fetch() -> tuple:
+        run_id = (req.run_id or "").strip()
+        chosen = None
+        if not run_id:
+            runs = gh.list_workflow_runs(owner, repo, branch=(req.branch or "").strip(),
+                                         workflow_file=test_runner_plan.WORKFLOW_FILE)
+            # Newest *completed* run. An in-progress run has no artifact yet, and reporting
+            # "no results" for one that is still running would be read as "it produced none".
+            chosen = next((r for r in runs if r.get("status") == "completed"), None)
+            if not chosen:
+                raise ValueError(
+                    f"No completed run of {test_runner_plan.WORKFLOW_FILE} in {owner}/{repo}"
+                    + (f" on branch '{req.branch}'" if req.branch else "")
+                    + (". One is still running — wait for it and try again."
+                       if runs else ". Has the workflow been committed and triggered yet?"))
+            run_id = str(chosen.get("id"))
+        else:
+            # Named explicitly, so nothing has been looked up yet. Fetched rather than left
+            # blank: a result filed with no branch, no conclusion and no link back to the
+            # job that produced it is most of the way to not being auditable.
+            chosen = gh.get_workflow_run(owner, repo, run_id)
+        artifacts = gh.list_run_artifacts(owner, repo, run_id)
+        match = next((a for a in artifacts
+                      if a.get("name") == test_runner_plan.ARTIFACT_NAME), None)
+        if not match:
+            raise ValueError(
+                f"Run {run_id} saved no '{test_runner_plan.ARTIFACT_NAME}' artifact"
+                + (f" (it saved: {', '.join(a['name'] for a in artifacts)})." if artifacts
+                   else ". The job may have failed before the tests ran."))
+        if match.get("expired"):
+            # A different problem from "there is none", and the only one with a fix.
+            raise ValueError(
+                f"That run's results have expired and GitHub no longer has them. Re-run the "
+                f"workflow — or shorten the gap, since artifacts are kept for a limited "
+                f"time and this is the only copy.")
+        return run_id, chosen, gh.download_artifact(owner, repo, match["id"])
+
+    try:
+        run_id, run_meta, blob = await asyncio.to_thread(_fetch)
+        merged = test_runner_plan.read_artifact_zip(blob)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Could not pull Actions results for %s", review_id)
+        raise HTTPException(status_code=502, detail=f"Could not read that run: {exc}")
+
+    try:
+        payload = test_results.ingest(
+            review,
+            {"junit_xml": merged,
+             "source_label": f"GitHub Actions run {run_id} ({owner}/{repo})"},
+            actor=(reader or {}).get("username") or (reader or {}).get("key_name") or "api")
+    except test_results.TestResultError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    saved = database.save_test_result_run(review_id, review.get("project_id"), payload)
+    return {
+        "run_id": saved,
+        "review_id": review_id,
+        "actions_run": {"id": run_id, "url": (run_meta or {}).get("url"),
+                        "branch": (run_meta or {}).get("branch"),
+                        "conclusion": (run_meta or {}).get("conclusion")},
+        "summary": payload["summary"],
+        "requirements": payload["requirements"],
+        "unmatched_results": payload["unmatched_results"],
+        "reported_by": payload["reported_by"],
+        "reported_at": payload["reported_at"],
+        # Fetched rather than sent changes who carried it, not what it proves.
+        "attested": False,
+    }
+
+
+@app.post("/api/reviews/{review_id}/deliver-tests")
+async def deliver_generated_tests(review_id: str, req: DeliverTestsRequest, request: Request,
+                                  reader: dict = Depends(require_reader)):
+    """Commit a generated suite to a new branch, with the workflow that runs it.
+
+    **Free — no model call.** The files were written when the run happened.
+
+    The last hand-carried step. Until this existed the platform generated tests and then
+    made a person copy them into a repository, which is the same friction the runner
+    endpoint was built to remove, left standing one step later.
+
+    Deliberately the same door as generated code, not a wider one (`code_delivery`): a new
+    branch that must not already exist, a pull request only if asked for, and never a commit
+    onto a branch somebody may have checked out. Generated tests have had no more review
+    than generated code, and the pull request body says so.
+    """
+    review = _results_review(review_id, request, reader)
+    result = review.get("result") or {}
+    files = [{"path": f.get("path"), "content": f.get("content")}
+             for f in (result.get("test_files") or []) if isinstance(f, dict)]
+    if not files:
+        raise HTTPException(status_code=400,
+                            detail="That run produced no test files to deliver.")
+
+    plan = test_runner_plan.plan_for(result.get("test_files") or [])
+    workflow_note = ""
+    if req.include_workflow:
+        try:
+            files.append({
+                "path": test_runner_plan.WORKFLOW_PATH,
+                "content": test_runner_plan.render_workflow(
+                    review_id, (req.callback_url or "").strip(), plan)})
+            workflow_note = (
+                "reports to " + req.callback_url if (req.callback_url or "").strip() else
+                "saves its results as a workflow artifact, because this platform has no "
+                "address a runner can reach — fetch them with POST "
+                f"/api/reviews/{review_id}/test-results/from-actions")
+        except ValueError as exc:
+            # Not fatal: the tests are the deliverable and the workflow is the convenience.
+            workflow_note = f"no workflow was included ({exc})"
+
+    branch = (req.branch or "").strip() or code_delivery.branch_name("lm-tests", review_id)
+    message = (req.commit_message or "").strip() or (
+        f"Add {len(files)} generated test file(s) from run {review_id[:8]}")
+    try:
+        delivery = await asyncio.to_thread(
+            code_delivery.deliver,
+            files, req.github_repo_url,
+            project_id=review.get("project_id"),
+            branch=branch,
+            base_branch=(req.base_branch or ""),
+            commit_message=message,
+            open_pr=bool(req.open_pr),
+            pr_title=(req.pr_title or "").strip() or message,
+            pr_body=_tests_pr_body(review_id, result, plan, workflow_note),
+            token=(req.github_token or "").strip(),
+            review_id=review_id,
+            review_type=review["review_type"],
+            actor=str(reader.get("username") or reader.get("sub") or "system"),
+        )
+    except code_delivery.DeliveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Could not deliver generated tests for %s", review_id)
+        status, body = format_error_response(exc)
+        raise HTTPException(status_code=status, detail=body)
+
+    # GitHub refuses to write .github/workflows/ without the Workflows permission, and the
+    # per-file failure list is the only place that shows up. Said plainly rather than left
+    # in an array nobody reads: the tests landed, the automation did not.
+    failed = {f["path"] for f in delivery.get("files_failed") or []}
+    if test_runner_plan.WORKFLOW_PATH in failed:
+        delivery["workflow_warning"] = (
+            "The tests were committed but the workflow file was refused. GitHub requires "
+            "'Workflows: Read and Write' on the token to write .github/workflows/ — add it, "
+            "or commit that one file by hand. Everything else landed.")
+    delivery["workflow_included"] = (req.include_workflow
+                                     and test_runner_plan.WORKFLOW_PATH not in failed)
+    delivery["must_supply"] = plan["must_supply"]
+    return delivery
+
+
+def _tests_pr_body(review_id: str, result: dict, plan: dict, workflow_note: str) -> str:
+    """What the pull request says about a suite nobody has run.
+
+    The failure mode this is written against is a reviewer reading a generated test as a
+    verified one. A test that passes proves something only if it asserts the right thing, and
+    nothing here has checked that — so the assumptions the model declared go in the body,
+    where whoever merges it will see them, rather than staying on a screen they will not open.
+    """
+    files = result.get("test_files") or []
+    coverage = result.get("requirement_coverage") or []
+    uncovered = [c for c in coverage if isinstance(c, dict) and not c.get("covered")]
+    lines = [
+        "## Generated tests — never run, not reviewed",
+        "",
+        f"Written by the LM AI-SDLC platform from run `{review_id}`. "
+        f"{len(files)} file(s), "
+        f"{sum(len(f.get('test_names') or []) for f in files if isinstance(f, dict))} test(s).",
+        "",
+        "**Nothing here has been executed.** The platform does not run the code it writes. "
+        "A generated test that passes is not evidence until someone runs it and reads the "
+        "result — which is what the workflow in this branch is for.",
+        "",
+    ]
+    if workflow_note:
+        lines += [f"The included workflow {workflow_note}.", ""]
+    if plan.get("must_supply"):
+        lines += [f"**These tests need something no CI runner has by default:** "
+                  f"{', '.join(plan['must_supply'])}. Until that is supplied the job will "
+                  f"fail for a reason that has nothing to do with your code.", ""]
+    for row in (result.get("assumptions") or [])[:10]:
+        if isinstance(row, dict):
+            lines.append(f"- **Assumed:** {row.get('assumption', '')} — "
+                         f"*if wrong:* {row.get('risk_if_wrong', '')}")
+    if result.get("assumptions"):
+        lines.append("")
+    if uncovered:
+        lines += ["**Requirements this suite does not cover:**", ""]
+        lines += [f"- {c.get('requirement_ref', '')} — {c.get('note', 'not covered')}"
+                  for c in uncovered[:10]]
+        lines.append("")
+    if plan.get("unknown_frameworks"):
+        lines += [f"Files written for {', '.join(plan['unknown_frameworks'])} are not in the "
+                  f"workflow's run command — the platform has no command for those.", ""]
+    if result.get("summary"):
+        lines += ["---", "", str(result["summary"])]
+    return "\n".join(lines)
 
 
 _DELIVERABLE_RUNS = {

@@ -107,6 +107,8 @@ python scripts/verify_code_delivery.py <url> --cleanup
 python scripts/run_tests.py --fixture                    # offline: no server, no key, no network
 python scripts/run_tests.py --review <id> --into ../repo # write, run and report a generated suite
 python scripts/run_tests.py --review <id> --dry-run      # ...printing every path and command only
+python scripts/run_tests.py --review <id> --deliver <repo-url> --open-pr   # tests + CI workflow as a PR
+python scripts/run_tests.py --review <id> --from-actions <run-url>         # pull what CI made of them
 ```
 
 `eval_code_review.py` is the only thing that can tell an accuracy improvement from a
@@ -130,7 +132,19 @@ which also renders the GitHub Actions workflow — so a local green and a CI gre
 same thing. `--fixture` is a real offline check and belongs in the net above in spirit: it
 drives the write, run and merge path against a synthetic suite and compiles the report
 script embedded in the generated workflow, which nothing else can see until a customer's
-runner executes it (C-91).
+runner executes it — and even that is not enough on its own: two generated workflows were
+rejected by GitHub before a single job started, for a reason no parser objects to (C-92).
+
+`--deliver` and `--from-actions` are the two ends of the loop as it works **with no public
+address**, which is the normal case for this deployment. `--deliver` pushes the tests *and*
+the CI workflow to a new branch and opens a pull request; the workflow then saves its results
+as its own artifact rather than posting them, and `--from-actions` fetches that artifact and
+files it. Every call in that direction is outbound, so nothing has to be exposed and no
+Actions secret has to be provisioned. Reading artifacts needs **"Actions: Read"** on the
+token and writing `.github/workflows/` needs **"Workflows: Read and Write"** — both separate
+from the Contents and Pull requests permissions everything else here uses, and a missing one
+looks like a missing repository, because GitHub answers 404 for anything a credential cannot
+see.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

@@ -46,7 +46,9 @@ Stdlib only, and it imports nothing from `backend`. `scripts/run_tests.py` and t
 smoke suite both read it, and a plan that needed a database connection to describe a shell
 command would be a strange thing.
 """
+import io
 import re
+import zipfile
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -55,6 +57,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 RESULTS_DIR = "lm-test-results"
 
 WORKFLOW_PATH = ".github/workflows/lm-generated-tests.yml"
+WORKFLOW_FILE = "lm-generated-tests.yml"
+
+# The artifact the workflow saves, and the one file inside it the platform prefers. Named
+# here because this module is what writes them: the reader below and the workflow above have
+# to agree, and two string literals in two files is how they stop agreeing.
+ARTIFACT_NAME = "lm-test-results"
+MERGED_NAME = "lm-merged.xml"
+
+# Bounds on an artifact zip. Not technical limits — a JUnit report for a large suite is a
+# few hundred kilobytes, so anything near these means the zip is not what we asked for.
+MAX_ARTIFACT_MEMBERS = 200
+MAX_ARTIFACT_UNPACKED = 20 * 1024 * 1024
 
 # An API key rather than a JWT, for the reason the modernization workflow records: a bearer
 # token expires, and a callback that quietly starts 401ing looks like a suite that stopped
@@ -425,6 +439,57 @@ def merge_junit(documents) -> str:
     return ET.tostring(merged, encoding="unicode") if found else ""
 
 
+
+def read_artifact_zip(blob: bytes) -> str:
+    """The `lm-test-results` artifact zip -> one JUnit document. Raises `ValueError`.
+
+    This is the return leg of the loop for a platform with no public address: the workflow
+    could not post its report, so it saved it here and we fetched it. What comes back must be
+    exactly what would have been posted, which is why the workflow writes `lm-merged.xml`
+    and this prefers it — merging the parts again would work, but "the report we received is
+    the report the run produced" is worth being able to say without qualification.
+
+    Everything here is untrusted input from outside the platform, so: only `.xml` members are
+    read, the member count and unpacked size are capped, and no member is ever written to
+    disk (the traversal question does not arise because nothing is extracted).
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"That artifact is not a readable zip: {exc}") from exc
+
+    members = [m for m in archive.infolist()
+               if not m.is_dir() and m.filename.lower().endswith(".xml")]
+    if not members:
+        raise ValueError(
+            "The artifact holds no XML, so there is no test report in it. The job saved "
+            "something, but not results — check whether the runner actually ran.")
+    if len(members) > MAX_ARTIFACT_MEMBERS:
+        raise ValueError(f"That artifact holds {len(members)} XML files, over the "
+                         f"{MAX_ARTIFACT_MEMBERS} this will read.")
+    if sum(m.file_size for m in members) > MAX_ARTIFACT_UNPACKED:
+        raise ValueError("That artifact unpacks to more than 20MB of XML. A test report is "
+                         "kilobytes; something else is in it.")
+
+    preferred = [m for m in members
+                 if m.filename.rsplit("/", 1)[-1].lower() == MERGED_NAME]
+    documents = []
+    for member in (preferred or members):
+        with archive.open(member) as handle:
+            documents.append(handle.read().decode("utf-8", errors="replace"))
+    if preferred:
+        # Already one document, written by the workflow from the same merge this module
+        # performs. Re-wrapping it would nest <testsuites> inside <testsuites>.
+        merged = documents[0]
+    else:
+        merged = merge_junit(documents)
+    if not (merged or "").strip():
+        raise ValueError(
+            "The XML in that artifact held no test suites. That usually means the runner "
+            "started and produced an empty report rather than not running at all.")
+    return merged
+
+
 # ── The workflow ────────────────────────────────────────────────────────────
 
 # The report step. Python rather than `jq` + `curl`, unlike the modernization build
@@ -437,9 +502,7 @@ _REPORT_STEP = r"""python3 - <<'LM_REPORT_PY'
 import glob, json, os, sys, urllib.error, urllib.request
 import xml.etree.ElementTree as ET
 
-key = os.environ.get("LM_API_KEY", "")
-if not key:
-    sys.exit("No API key. Add your LM AI-SDLC key as the repository secret __LM_SECRET__.")
+url = os.environ.get("LM_RESULTS_URL", "")
 
 merged = ET.Element("testsuites")
 found = 0
@@ -469,8 +532,29 @@ else:
     }]}
 payload["source_label"] = "GitHub Actions run " + os.environ.get("GITHUB_RUN_ID", "?")
 
+# No address to report to. That is the normal case for a platform running on a laptop or
+# behind a firewall: a runner cannot reach it, so the results travel the other way — this
+# job saves them as the workflow artifact below, and the platform pulls them afterwards.
+# Written as one merged file so what is fetched is exactly what would have been posted.
+if not url:
+    with open("__LM_RESULTS_DIR__/lm-merged.xml", "w", encoding="utf-8") as handle:
+        handle.write(payload.get("junit_xml") or "<testsuites/>")
+    with open("__LM_RESULTS_DIR__/lm-report.json", "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+    print(f"Saved {found} test suite(s) as the 'lm-test-results' artifact of this run.")
+    print("This run has no address to report to, so nothing was sent. Pull it with:")
+    print(f"  python scripts/run_tests.py --review __LM_REVIEW_ID__ --from-actions "
+          f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+          f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/"
+          f"{os.environ.get('GITHUB_RUN_ID', '')}")
+    sys.exit(0)
+
+key = os.environ.get("LM_API_KEY", "")
+if not key:
+    sys.exit("No API key. Add your LM AI-SDLC key as the repository secret __LM_SECRET__.")
+
 req = urllib.request.Request(
-    os.environ["LM_RESULTS_URL"], data=json.dumps(payload).encode("utf-8"),
+    url, data=json.dumps(payload).encode("utf-8"),
     headers={"Content-Type": "application/json", "X-API-Key": key}, method="POST")
 try:
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -486,19 +570,61 @@ for row in body.get("requirements") or []:
 LM_REPORT_PY"""
 
 
+
+# The keys where YAML's "a bare `key:` is null" is a *rejection* rather than a shorthand.
+# `on: {workflow_dispatch:}` is legitimately null and must stay allowed, so this is a named
+# list rather than a rule about empty mappings in general.
+_MUST_HAVE_ENTRIES = ("env", "with", "jobs", "steps")
+
+
+def _check_mappings(lines: Sequence[str]) -> None:
+    """Refuse to return a workflow with an empty `env`, `with`, `jobs` or `steps`.
+
+    GitHub rejects those before it creates a single job, which surfaces as a run with a
+    `failure` conclusion, no steps, no logs and no artifact — indistinguishable at a glance
+    from a suite that failed. A parse check cannot see it (`yaml.safe_load` is perfectly
+    happy with `env: None`) and neither can a human skim, because what makes the block empty
+    is that everything in it is *commented out*.
+    """
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.endswith(":") or stripped.startswith("#"):
+            continue
+        if stripped[:-1].strip("- ") not in _MUST_HAVE_ENTRIES:
+            continue
+        indent = len(line) - len(line.lstrip())
+        for following in lines[index + 1:]:
+            if not following.strip() or following.strip().startswith("#"):
+                continue
+            if len(following) - len(following.lstrip()) <= indent:
+                raise ValueError(
+                    f"Refusing to render a workflow whose '{stripped}' has no entries — "
+                    f"GitHub rejects that before running anything, and the run looks like a "
+                    f"failed test suite rather than a malformed file.")
+            break
+
 def _indent(lines: Sequence[str], spaces: int) -> List[str]:
     pad = " " * spaces
     return [(pad + line) if line else "" for line in lines]
 
 
 def render_workflow(review_id: str, callback_url: str, plan: Dict[str, Any]) -> str:
-    """The GitHub Actions workflow that runs this suite and posts the result back.
+    """The GitHub Actions workflow that runs this suite and gets the result back here.
 
-    `callback_url` is fully qualified and supplied by the caller: the platform cannot derive
-    its own public address from a request behind a proxy, which is the trap
-    `routes/modernization.py:512` records.
+    Two ways, and the difference is which direction the results travel:
+
+    * **`callback_url` given** — the job posts the report itself. Fully qualified and
+      supplied by the caller, because the platform cannot derive its own public address from
+      a request behind a proxy, which is the trap `routes/modernization.py:512` records.
+    * **`callback_url` empty** — the job saves the report as its workflow artifact and the
+      platform *pulls* it afterwards. This is the mode that works when there is no public
+      address at all: a laptop, a private network, a deployment behind a firewall. Nothing
+      inbound is needed, because every call is one we make.
+
+    The second is not a lesser mode. It is the same file, the same run, the same merged
+    report — only the courier changes, which is D-62 applied one level down.
     """
-    url = safe_url(callback_url)
+    url = safe_url(callback_url) if (callback_url or "").strip() else ""
     if not _SAFE_LABEL.match((review_id or "").strip()):
         raise ValueError(f"review id is not a safe identifier: {review_id!r}")
     jobs = plan.get("jobs") or []
@@ -516,9 +642,16 @@ def render_workflow(review_id: str, callback_url: str, plan: Dict[str, Any]) -> 
         "# itself; this job does, and posts the result back so the coverage the generation",
         "# claimed can be checked against what actually ran.",
         "#",
-        f"# Before this passes, add your platform API key as the repository secret "
-        f"{API_KEY_SECRET}.",
     ]
+    out += ([f"# Before this passes, add your platform API key as the repository secret "
+             f"{API_KEY_SECRET}."] if url else
+            ["# This platform has no address a runner can reach, so this job does not report",
+             "# home — it saves the results as its own artifact and the platform fetches them:",
+             "#",
+             f"#   python scripts/run_tests.py --review {review_id} --from-actions <run url>",
+             "#",
+             "# Nothing inbound is needed and no secret is required. Give it a callback URL",
+             "# instead and it will report by itself."])
     if plan.get("must_supply"):
         out += [
             "#",
@@ -553,10 +686,15 @@ def render_workflow(review_id: str, callback_url: str, plan: Dict[str, Any]) -> 
         "    #     ports: ['5432:5432']",
         "",
         "    env:",
+        # A real entry, always. With only the commented examples below, `env:` parses as
+        # null — and GitHub rejects a workflow whose `env` is not a mapping *before it
+        # creates any job*, so the run appears as a bare failure with no steps, no logs and
+        # no artifact. That cost a real Actions run (C-92); it is not a hypothetical.
+        f"      LM_REVIEW_ID: '{review_id}'",
         "      # The application under test. Fill in what your tests read.",
         "      # BASE_URL: http://localhost:8000",
         "      # DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres",
-        "      LM_RESULTS_URL: '" + url + "'",
+    ] + (["      LM_RESULTS_URL: '" + url + "'"] if url else []) + [
         "",
         "    steps:",
         "      - uses: actions/checkout@v4",
@@ -599,21 +737,25 @@ def render_workflow(review_id: str, callback_url: str, plan: Dict[str, Any]) -> 
         "      # `always()`, because the failing run IS the payload. A workflow that stops",
         "      # at the first red step reports nothing, which is the one outcome worse than",
         "      # a red result.",
-        "      - name: Report results to LM AI-SDLC",
+        "      - name: " + ("Report results to LM AI-SDLC" if url else "Merge the results for the platform to fetch"),
         "        if: always()",
+    ] + ([
         "        env:",
         "          # Never echoed and never written to a file. Used only as the X-API-Key",
         "          # header by the script below.",
         f"          {API_KEY_SECRET}: " + "${{ secrets." + API_KEY_SECRET + " }}",
+    ] if url else []) + [
         "        run: |",
     ]
     report = (_REPORT_STEP
               .replace("__LM_RESULTS_DIR__", RESULTS_DIR)
+              .replace("__LM_REVIEW_ID__", review_id)
               .replace("__LM_SECRET__", API_KEY_SECRET))
     out += _indent(report.split("\n"), 10)
     out += [
         "",
-        "      # When the callback itself fails, this is the only copy of what ran.",
+        "      # With no callback this artifact IS the report — it is what the platform",
+        "      # pulls. With one, it is the only copy of what ran when the callback fails.",
         "      - name: Upload the raw reports",
         "        if: always()",
         "        uses: actions/upload-artifact@v4",
@@ -623,4 +765,5 @@ def render_workflow(review_id: str, callback_url: str, plan: Dict[str, Any]) -> 
         "          if-no-files-found: warn",
         "",
     ]
+    _check_mappings(out)
     return "\n".join(out)

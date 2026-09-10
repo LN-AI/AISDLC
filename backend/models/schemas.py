@@ -418,6 +418,50 @@ class TestResultsRequest(BaseModel):
                           "run 412', 'laptop'. Stored beside the counts because a pass with "
                           "no attribution is not evidence of anything.")
 
+
+class TestResultsFromActionsRequest(BaseModel):
+    """Fetch a run's results out of GitHub instead of waiting to be sent them.
+
+    The direction matters. Every other way into `/test-results` is something reaching *in*;
+    this one reaches *out*, which is the only version that works when a CI runner cannot
+    see this platform at all — a laptop, a private network, a deployment behind a firewall.
+    """
+    github_repo_url: str = Field(
+        ..., description="The repository whose Actions run to read, e.g. "
+                         "https://github.com/owner/repo")
+    run_id: Optional[str] = Field(
+        None, description="A specific Actions run. Omit to take the most recent completed "
+                          "run of the generated workflow.")
+    branch: Optional[str] = Field(
+        None, description="Narrow the search to one branch — usually the branch the tests "
+                          "were delivered to.")
+    github_token: Optional[str] = Field(
+        None, description="A token for this call only, never stored. Needs 'Actions: Read', "
+                          "which is a separate permission from Contents and Pull requests.")
+
+
+class DeliverTestsRequest(BaseModel):
+    """Put a generated suite into a repository as a branch, and optionally a pull request."""
+    github_repo_url: str = Field(..., description="Where the tests should go")
+    branch: Optional[str] = Field(None, description="Defaults to lm-tests-<run id>")
+    base_branch: Optional[str] = Field(
+        None, description="What the pull request targets. Defaults to the repository's "
+                          "default branch.")
+    open_pr: bool = Field(False, description="Open a pull request from the new branch")
+    include_workflow: bool = Field(
+        True, description="Also commit the generated GitHub Actions workflow, so the suite "
+                          "runs on push and its results come back without anyone asking. "
+                          "Needs 'Workflows: Read and Write' on the token — GitHub refuses "
+                          "to write .github/workflows/ without it, and the tests are "
+                          "committed regardless if it does.")
+    callback_url: Optional[str] = Field(
+        None, description="The address that workflow should report to. Omit when there is "
+                          "none a runner could reach: it will save its results as an "
+                          "artifact for the platform to fetch instead.")
+    commit_message: Optional[str] = None
+    pr_title: Optional[str] = None
+    github_token: Optional[str] = Field(None, description="For this call only, never stored")
+
 class TestAutomationSourceRequest(_UISourceBase, DerivedFromMixin):
     """Generate runnable automated tests from a requirement *and* the code under test.
 

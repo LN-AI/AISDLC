@@ -140,9 +140,49 @@ It writes model-written files into a real repository, so: a path that is absolut
 
 ### The workflow
 
-One job, one step per framework, and a report step that runs `if: always()` — the failing run *is* the payload, and a workflow that stops at the first red step reports nothing. It needs your platform API key as the repository secret `LM_API_KEY` (a key rather than a bearer token, which expires; a callback that quietly starts returning 401 looks like a suite that stopped failing).
+One job, one step per framework, and a report step that runs `if: always()` — the failing run *is* the payload, and a workflow that stops at the first red step reports nothing.
 
-**A suite that never ran still reports.** If no JUnit XML was produced, the workflow posts one `errored` row saying so. Silence would leave every requirement holding its unchallenged claim of coverage, which is the thing this whole loop exists to end.
+**A suite that never ran still reports.** If no JUnit XML was produced, the report says so as one `errored` row. Silence would leave every requirement holding its unchallenged claim of coverage, which is the thing this whole loop exists to end.
+
+### Two ways the results come home, and you do not need a public address
+
+`report_mode` on the runner endpoint says which one you get.
+
+| `report_mode` | What the job does | When |
+|---|---|---|
+| `callback` | Posts the report itself, using your platform API key from the repository secret `LM_API_KEY` | The platform has an address a GitHub runner can reach |
+| `artifact` | Saves the report as its own workflow artifact and sends nothing | Anything else — a laptop, a private network, a deployment behind a firewall |
+
+**`artifact` is not a lesser mode.** Same file, same run, same merged report — only the courier changes. Nothing inbound is needed and no secret has to be provisioned, because every call is one the platform makes:
+
+```
+POST /api/reviews/{review_id}/test-results/from-actions
+{"github_repo_url": "https://github.com/owner/repo", "run_id": "optional", "branch": "optional"}
+```
+
+Omit `run_id` and it takes the most recent **completed** run of the generated workflow — an in-progress run has no artifact yet, and reporting "no results" for one still running would read as "it produced none". From the command line:
+
+```
+python scripts/run_tests.py --review <id> --from-actions <run url>
+python scripts/run_tests.py --review <id> --from-actions latest --repo https://github.com/owner/repo
+```
+
+Needs **"Actions: Read"** on the GitHub token — a separate permission from the Contents and Pull requests ones everything else uses. Without it GitHub answers 404, the same as it does for anything a credential cannot see, so the error message names it.
+
+Artifacts expire (90 days by default, and a repository can disable them). That is the one failure this mode has and the direct callback does not: the report is only retrievable while GitHub still holds it. The refusal says so rather than reporting an empty result.
+
+### Putting the tests in the repository
+
+```
+POST /api/reviews/{review_id}/deliver-tests
+{"github_repo_url": "...", "open_pr": true, "include_workflow": true}
+```
+
+**Free — no model call.** A **new** branch that must not already exist, a pull request only if asked for, and never a commit onto a branch somebody may have checked out. That is the same door generated code goes through and deliberately not a wider one: generated tests have had no more review than generated code.
+
+The workflow is committed alongside by default, so the suite runs on push and its results come back without anyone remembering to ask. Writing `.github/workflows/` needs **"Workflows: Read and Write"** on the token; without it GitHub refuses that one file, the tests are committed anyway, and the response says which happened rather than leaving it in an array nobody reads.
+
+The pull request body leads with **"never run, not reviewed"**, lists the assumptions the model declared with their stated risk, names the requirements the suite does not cover, and states what no CI runner will supply. The failure mode being designed against is a reviewer reading a generated test as a verified one.
 
 ### What it cannot do for you
 

@@ -128,6 +128,10 @@ class GitHubService:
                     f"revoked; it belongs to a different account or organisation; or the "
                     f"owner/repository name is wrong. Check the URL first, then add a GitHub "
                     f"credential for this project under Settings."
+                    + (" This path also needs 'Actions: Read' on the token, which is a "
+                       "separate permission from Contents and Pull requests — a token "
+                       "without it gets this same 404."
+                       if "/actions/" in resp.request.url.path else "")
                 ) from e
 
             if status in (401, 403):
@@ -241,6 +245,96 @@ class GitHubService:
             "deletions": pr_data.get("deletions", 0),
             "url": pr_url,
         }
+
+    # ── Workflow runs and their artifacts ───────────────────────────────────
+    #
+    # The one direction of the test-results loop that does not need a public address. When
+    # a runner cannot reach this platform — a laptop, a private network, a deployment behind
+    # a firewall — the workflow saves its report as an artifact and we come and get it.
+    # Every call here is outbound, which is the whole point.
+    #
+    # These need "Actions: Read" on a fine-grained token, which is a *different* permission
+    # from the Contents and Pull requests ones everything else here uses. A token without it
+    # gets GitHub's usual 404-for-anything-you-cannot-see, so `_raise_friendly` names it.
+
+    ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
+
+    def list_workflow_runs(self, owner: str, repo: str, branch: str = "",
+                           workflow_file: str = "", limit: int = 20) -> List[Dict[str, Any]]:
+        """Recent Actions runs, newest first. `workflow_file` is a file name, not a path.
+
+        Filtered server-side by branch where one is given, because the interesting question
+        is almost always "what happened on the branch I just pushed".
+        """
+        params: Dict[str, Any] = {"per_page": max(1, min(int(limit or 20), 100))}
+        if branch:
+            params["branch"] = branch
+        path = (f"/repos/{owner}/{repo}/actions/workflows/{workflow_file}/runs"
+                if workflow_file else f"/repos/{owner}/{repo}/actions/runs")
+        with httpx.Client(headers=self.headers, timeout=30) as client:
+            resp = self._get_with_retry(client, f"{self.BASE_URL}{path}", params)
+            self._raise_friendly(resp)
+            runs = (resp.json() or {}).get("workflow_runs") or []
+        return [{"id": r.get("id"), "name": r.get("name"), "status": r.get("status"),
+                 "conclusion": r.get("conclusion"), "branch": r.get("head_branch"),
+                 "commit_sha": r.get("head_sha"), "created_at": r.get("created_at"),
+                 "url": r.get("html_url")} for r in runs if isinstance(r, dict)]
+
+    def get_workflow_run(self, owner: str, repo: str, run_id) -> Dict[str, Any]:
+        """One run's own record. Needed when the caller names a run rather than searching
+        for one: without it a fetched result is filed with no branch, no conclusion and no
+        link back to the job that produced it, which is most of what makes it auditable."""
+        with httpx.Client(headers=self.headers, timeout=30) as client:
+            resp = self._get_with_retry(
+                client, f"{self.BASE_URL}/repos/{owner}/{repo}/actions/runs/{run_id}")
+            self._raise_friendly(resp)
+            r = resp.json() or {}
+        return {"id": r.get("id"), "name": r.get("name"), "status": r.get("status"),
+                "conclusion": r.get("conclusion"), "branch": r.get("head_branch"),
+                "commit_sha": r.get("head_sha"), "created_at": r.get("created_at"),
+                "url": r.get("html_url")}
+
+    def list_run_artifacts(self, owner: str, repo: str, run_id) -> List[Dict[str, Any]]:
+        """What one run saved. Expired artifacts are included, flagged rather than hidden —
+        "it expired" is a different problem from "the job never produced one", and only the
+        first has a fix (re-run it)."""
+        with httpx.Client(headers=self.headers, timeout=30) as client:
+            resp = self._get_with_retry(
+                client, f"{self.BASE_URL}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+                {"per_page": 100})
+            self._raise_friendly(resp)
+            items = (resp.json() or {}).get("artifacts") or []
+        return [{"id": a.get("id"), "name": a.get("name"), "size": a.get("size_in_bytes"),
+                 "expired": bool(a.get("expired"))}
+                for a in items if isinstance(a, dict)]
+
+    def download_artifact(self, owner: str, repo: str, artifact_id) -> bytes:
+        """One artifact, as the zip GitHub stores it.
+
+        Two requests on purpose. GitHub answers this path with a 302 to a signed storage URL,
+        and that second request must go **without** our Authorization header: the signature
+        is the credential there, and sending a bearer token to a storage host is both
+        unnecessary and a way to leak it somewhere it was never meant to go. So redirects are
+        not followed automatically — the location is read and fetched clean.
+        """
+        with httpx.Client(headers=self.headers, timeout=60, follow_redirects=False) as client:
+            resp = client.get(f"{self.BASE_URL}/repos/{owner}/{repo}/actions/artifacts/"
+                              f"{artifact_id}/zip")
+            if resp.status_code in (301, 302, 307, 308):
+                location = resp.headers.get("location") or ""
+                if not location.startswith("https://"):
+                    raise ValueError("GitHub redirected the artifact download somewhere "
+                                     "other than https, which it should never do.")
+                with httpx.Client(timeout=120, follow_redirects=True) as plain:
+                    resp = plain.get(location)
+            self._raise_friendly(resp)
+            blob = resp.content or b""
+        if len(blob) > self.ARTIFACT_MAX_BYTES:
+            raise ValueError(
+                f"That artifact is {len(blob) // (1024 * 1024)}MB, over the "
+                f"{self.ARTIFACT_MAX_BYTES // (1024 * 1024)}MB this will read. A test report "
+                f"is kilobytes; something else is in it.")
+        return blob
 
     def parse_pr_url(self, pr_url: str) -> tuple[str, str, int]:
         """Public wrapper for _parse_pr_url — owner, repo, pr_number."""

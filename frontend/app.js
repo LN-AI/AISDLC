@@ -2475,17 +2475,123 @@ async function loadTestRunner(reviewId) {
 
     <div class="field-label" style="margin-top:14px">On every push, from CI</div>
     ${d.workflow_yaml ? `
-      <p class="field-hint">Commit this beside the tests and add your platform API key as the
-        repository secret <code>${esc(d.api_key_secret || '')}</code>. It reports to
-        <code>${esc(d.callback_url || '')}</code> whether the suite passes or fails — a run
-        that never happens still reports, because silence and success look identical.</p>
+      <p class="field-hint">${d.callback_url
+        ? `Commit this beside the tests and add your platform API key as the repository
+           secret <code>${esc(d.api_key_secret || '')}</code>. It reports to
+           <code>${esc(d.callback_url)}</code> whether the suite passes or fails — a run
+           that never happens still reports, because silence and success look identical.`
+        : `<b>This platform has no address a CI runner can reach</b>, so the workflow does not
+           report home — it saves its results as its own artifact and the platform fetches
+           them. Nothing needs to be exposed, and no secret is needed. Use
+           <b>Fetch from GitHub Actions</b> below once the job has finished.`}</p>
       <button class="btn-secondary btn-sm" onclick="downloadTestWorkflow()">
         Download ${esc(d.workflow_path || 'workflow')}</button>
       <details style="margin-top:8px">
         <summary>Read it first (${(d.workflow_yaml || '').split('\n').length} lines)</summary>
         <pre class="code-block" style="max-height:340px;overflow:auto"><code>${esc(d.workflow_yaml)}</code></pre>
       </details>`
-    : `<div class="cost-note">${esc(d.blocked_reason || 'No workflow could be rendered for this run.')}</div>`}`;
+    : `<div class="cost-note">${esc(d.blocked_reason || 'No workflow could be rendered for this run.')}</div>`}
+
+    <!-- The last hand-carried step. Without this the platform writes tests and then asks a
+         person to copy them into a repository, which is the same friction the command above
+         exists to remove, left standing one step later. -->
+    <div class="field-label" style="margin-top:16px">Put them in a repository</div>
+    <p class="field-hint">A <b>new</b> branch, never an existing one, with the workflow above
+      committed alongside — so the tests run on push and their results come back. The pull
+      request says plainly that nothing has run these and lists what the model assumed.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="text" id="test-deliver-repo" style="flex:1;min-width:280px"
+             placeholder="https://github.com/owner/repo" />
+      <label class="field-hint" style="margin:0"><input type="checkbox" id="test-deliver-pr" checked />
+        open a pull request</label>
+      <button class="btn-secondary btn-sm" onclick="deliverGeneratedTests('${esc(reviewId)}')">
+        Deliver</button>
+    </div>
+    <div id="test-deliver-out" style="margin-top:8px"></div>
+
+    <div class="field-label" style="margin-top:16px">Fetch from GitHub Actions</div>
+    <p class="field-hint">Reads a finished run's saved results and files them here. This
+      direction is the one that works with no public address — the platform calls GitHub, not
+      the other way round. Leave the run blank for the most recent completed one.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="text" id="test-actions-repo" style="flex:1;min-width:240px"
+             placeholder="https://github.com/owner/repo" />
+      <input type="text" id="test-actions-run" style="flex:1;min-width:160px"
+             placeholder="run URL or id (optional)" />
+      <button class="btn-secondary btn-sm" onclick="fetchActionsResults('${esc(reviewId)}')">
+        Fetch</button>
+    </div>
+    <div id="test-actions-out" style="margin-top:8px"></div>`;
+}
+
+/** Push the suite to a repository. No model call, so nothing is metered — but it writes to
+ *  somebody's repository, so what it did is reported line by line rather than as "done". */
+async function deliverGeneratedTests(reviewId) {
+  const repo = (document.getElementById('test-deliver-repo') || {}).value || '';
+  const out = document.getElementById('test-deliver-out');
+  if (!out) return;
+  if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
+  out.innerHTML = '<div class="cost-note">Committing…</div>';
+  try {
+    const d = await apiFetch(`/api/reviews/${reviewId}/deliver-tests`, {
+      method: 'POST',
+      body: JSON.stringify({
+        github_repo_url: repo.trim(),
+        open_pr: !!(document.getElementById('test-deliver-pr') || {}).checked,
+        include_workflow: true,
+      }),
+    });
+    const pr = d.pull_request && d.pull_request.url;
+    out.innerHTML = `
+      <div class="cost-note" style="border-left:3px solid var(--green)">
+        <div><b>${(d.files_committed || []).length} file(s)</b> committed to
+          <code>${esc(d.branch || '')}</code> in ${esc(d.repo || '')}</div>
+        ${pr ? `<div style="margin-top:4px"><a href="${esc(pr)}" target="_blank" rel="noopener">${esc(pr)}</a></div>`
+             : `<div style="margin-top:4px"><a href="${esc(d.branch_url || '')}" target="_blank" rel="noopener">${esc(d.branch_url || '')}</a></div>`}
+        ${d.pull_request_error ? `<div style="margin-top:4px">The commits landed but the pull
+          request did not: ${esc(d.pull_request_error)}</div>` : ''}
+        ${d.workflow_warning ? `<div style="margin-top:6px">${esc(d.workflow_warning)}</div>` : ''}
+        ${(d.files_failed || []).length ? `<div style="margin-top:6px">Not committed:
+          ${(d.files_failed || []).map(f => `<code>${esc(f.path)}</code>`).join(', ')}</div>` : ''}
+      </div>`;
+    // The repository is now the obvious place to fetch results from, so it is filled in
+    // rather than typed twice.
+    const echo = document.getElementById('test-actions-repo');
+    if (echo && !echo.value) echo.value = repo.trim();
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
+  }
+}
+
+/** Pull a finished Actions run's results in. Refreshes the results panel above on success,
+ *  because the answer to "what happened" belongs where the answer already lives. */
+async function fetchActionsResults(reviewId) {
+  const repo = (document.getElementById('test-actions-repo') || {}).value || '';
+  const run = ((document.getElementById('test-actions-run') || {}).value || '').trim();
+  const out = document.getElementById('test-actions-out');
+  if (!out) return;
+  if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
+  out.innerHTML = '<div class="cost-note">Reading GitHub…</div>';
+  const body = { github_repo_url: repo.trim() };
+  // Accepts what the job itself prints, which is a URL, as well as a bare id.
+  const id = (run.match(/actions\/runs\/(\d+)/) || [])[1] || (/^\d+$/.test(run) ? run : '');
+  if (id) body.run_id = id;
+  try {
+    const d = await apiFetch(`/api/reviews/${reviewId}/test-results/from-actions`, {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    const a = d.actions_run || {};
+    const s = d.summary || {};
+    out.innerHTML = `
+      <div class="cost-note" style="border-left:3px solid var(--green)">
+        Read run ${esc(String(a.id || ''))} (${esc(a.conclusion || 'unknown')}) on
+        ${esc(a.branch || 'unknown branch')} — ${s.passed} of ${s.total} passed.
+        ${a.url ? `<a href="${esc(a.url)}" target="_blank" rel="noopener">the run</a>` : ''}
+      </div>`;
+    loadTestResults(reviewId);
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
+  }
 }
 
 function downloadTestWorkflow() {
