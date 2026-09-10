@@ -87,10 +87,10 @@ node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans scr
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
-Four live drivers sit beside these. They are **not** part of the offline net: three of
-them spend real money, and three write to a real repository — use a scratch one.
-`verify_code_delivery.py` is the odd one: it writes but calls no model, because the
-thing it verifies is the push, not the generation.
+Five live drivers sit beside these. They are **not** part of the offline net: three of
+them spend real money, and four write to a real repository — use a scratch one.
+`verify_code_delivery.py` and `run_tests.py` are the odd ones: both write but call no
+model, because the thing they verify is the delivery, not the generation.
 
 ```
 python scripts/eval_code_review.py                       # accuracy, 3 runs per case (~$0.55)
@@ -104,6 +104,9 @@ python scripts/verify_fix_apply.py <url> --cleanup --review-id <id>
 python scripts/verify_code_delivery.py <repo-url>        # pushing generated code, for real
 python scripts/verify_code_delivery.py <url> --dry-run   # ...refusals only, writes nothing
 python scripts/verify_code_delivery.py <url> --cleanup
+python scripts/run_tests.py --fixture                    # offline: no server, no key, no network
+python scripts/run_tests.py --review <id> --into ../repo # write, run and report a generated suite
+python scripts/run_tests.py --review <id> --dry-run      # ...printing every path and command only
 ```
 
 `eval_code_review.py` is the only thing that can tell an accuracy improvement from a
@@ -116,6 +119,18 @@ cannot answer. `verify_pr_review.py` exists because the offline
 suites stub the model and never touch GitHub: they cannot tell you that an inline comment
 landed on the line intended, and the worst defect of the session was invisible until a real
 diff went through it (D-244).
+
+`run_tests.py` is the local half of the test-automation loop and the only driver that
+runs *generated* code — on a developer's machine, never on the API host, which is the tier
+D-05 named. It writes the generated files into a checkout (refusing any path a shell would
+read, never overwriting without `--force`), runs them, and posts the JUnit XML to
+`POST /api/reviews/{id}/test-results`, where the coverage the model claimed is checked
+against what actually ran. The command it runs comes from `services/test_runner_plan.py`,
+which also renders the GitHub Actions workflow — so a local green and a CI green mean the
+same thing. `--fixture` is a real offline check and belongs in the net above in spirit: it
+drives the write, run and merge path against a synthetic suite and compiles the report
+script embedded in the generated workflow, which nothing else can see until a customer's
+runner executes it (C-91).
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

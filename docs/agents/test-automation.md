@@ -106,6 +106,53 @@ Nothing in the platform witnessed the run. A report is posted with your key, and
 
 A suite of nothing but skips is not a pass. A report with no test cases is refused rather than stored as an empty success.
 
+## Getting them run in the first place
+
+```
+GET /api/reviews/{review_id}/runner
+```
+
+**Free.** Everything it returns is a lookup from the framework each generated file declared — no model call, nothing metered.
+
+The endpoint above will take a result from anyone. That is not the same as anyone sending one: "run them and post the result" is three unstated decisions — which command, which JUnit flag, which URL — and each one is a reason it does not happen. The platform knows all three, so it answers them.
+
+| Field | What it is |
+|---|---|
+| `local_command` | `python scripts/run_tests.py --review <id>` — writes the files into a checkout, runs them, posts the result |
+| `workflow_yaml` | A GitHub Actions workflow to commit beside the tests. Runs on every push and reports back |
+| `plan.jobs[]` | Per framework: the exact `argv`, the shell form, where its JUnit report lands |
+| `must_supply` | What no CI runner has by default and you must provide |
+| `blocked_reason` | Why no workflow could be rendered, when none could |
+
+Pass `?callback_url=https://...` when the deployment's `PUBLIC_BASE_URL` is not an address a CI runner can reach. A loopback or private address is **refused** rather than rendered: the job would run, fail to post, and look exactly like a suite nobody triggered.
+
+### The local command
+
+```
+python scripts/run_tests.py --review <id> --into ../their-repo --user admin --password ...
+python scripts/run_tests.py --review <id> --dry-run        # prints every path and command, touches nothing
+python scripts/run_tests.py --review <id> --install        # also installs the reporter packages
+python scripts/run_tests.py --review <id> --workflow       # also writes the CI workflow
+python scripts/run_tests.py --fixture                      # offline self-check, no server, no key
+```
+
+It writes model-written files into a real repository, so: a path that is absolute, contains `..`, or carries anything a shell would read is **refused rather than sanitised**; every write is re-checked to land inside `--into`; and an existing file is never overwritten without `--force`. The run command is executed with **no shell**, because the one model-written part of it is the file paths.
+
+### The workflow
+
+One job, one step per framework, and a report step that runs `if: always()` — the failing run *is* the payload, and a workflow that stops at the first red step reports nothing. It needs your platform API key as the repository secret `LM_API_KEY` (a key rather than a bearer token, which expires; a callback that quietly starts returning 401 looks like a suite that stopped failing).
+
+**A suite that never ran still reports.** If no JUnit XML was produced, the workflow posts one `errored` row saying so. Silence would leave every requirement holding its unchallenged claim of coverage, which is the thing this whole loop exists to end.
+
+### What it cannot do for you
+
+A workflow cannot conjure a running application, a database, credentials or seeded rows. Those are listed in `must_supply`, stated at the top of the generated file, and left as marked places for you to fill in — a commented `services:` block and an `env:` section. A guessed database version with guessed credentials fails on run one and is harder to debug than an absent one.
+
+Two more things are named rather than guessed at:
+
+- **A framework nothing here knows** is reported in `unknown_frameworks` and left out of the command. Those files still run your own way, and the results endpoint takes them either way.
+- **JUnit XML is not free in every framework.** Jest, Go, RSpec and .NET need an extra reporter package (`extra_packages` says which). Without it the runner works, writes nothing, and the suite reads as never run.
+
 ## What the agent is shown, and why it matters
 
 Two deterministic descriptions are assembled before the call. Both are free — no model, no cost — and both are also returned by the preflight so their limits are visible *before* deciding to spend.

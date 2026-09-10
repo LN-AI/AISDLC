@@ -37,7 +37,8 @@ from backend.routes.findings import router as findings_router
 from backend.routes.notifications import router as notifications_router
 from backend.routes.github_credentials import router as github_credentials_router
 from backend.routes.github_webhook import router as github_webhook_router
-from backend.routes.modernization import router as modernization_router
+from backend.routes.modernization import (router as modernization_router,
+                                          _unreachable_from_ci)
 from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.frameworks import router as frameworks_router
 from backend.routes.api_keys import router as api_keys_router
@@ -99,7 +100,8 @@ from backend.services import code_brief
 from backend.services import test_context_brief
 from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
-                              review_source_store, source_bundle, test_results)
+                              review_source_store, source_bundle, test_results,
+                              test_runner_plan)
 from backend.services.subject_service import resolve_subject
 from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
@@ -2315,6 +2317,73 @@ def read_test_results(review_id: str, request: Request,
     return {"review_id": review_id, "runs": runs, "latest": latest,
             "execution_status": "reported" if runs else "not_executed",
             "attested": False}
+
+
+@app.get("/api/reviews/{review_id}/runner")
+def read_test_runner(review_id: str, request: Request, callback_url: str = "",
+                     reader: dict = Depends(require_reader)):
+    """How to run this generation's tests, as a CI workflow and as a local command.
+
+    **Free — no model call, nothing metered.** Everything here is a lookup from the
+    framework each generated file declared (`services/test_runner_plan.py`).
+
+    Phase 3, and it exists because Phase 2 was unreachable in practice: the endpoint that
+    receives results was open for anybody to post to, and "run them and post the result" is
+    three unstated decisions — which command, which JUnit flag, which URL. This answers all
+    three. Two producers, one contract (D-62): a workflow the customer commits beside the
+    tests, and `scripts/run_tests.py` for a developer who would rather not wait for CI.
+
+    `callback_url` overrides the address the workflow reports to. Without it the platform
+    uses `PUBLIC_BASE_URL`, which is the only address it knows a runner can reach — it
+    cannot be derived from this request, because behind a proxy that resolves to localhost
+    and the job would run and silently report nothing.
+    """
+    review = _results_review(review_id, request, reader)
+    result = review.get("result") or {}
+    plan = test_runner_plan.plan_for(result.get("test_files") or [])
+
+    target = (callback_url or "").strip() or (
+        f"{config.PUBLIC_BASE_URL}/api/reviews/{review_id}/test-results"
+        if config.PUBLIC_BASE_URL else "")
+    workflow = None
+    blocked = None
+    if not target:
+        blocked = ("No address for the workflow to report to. A GitHub Actions runner has to "
+                   "reach this deployment, and that address cannot be derived from a request "
+                   "behind a proxy. Set PUBLIC_BASE_URL, or pass ?callback_url=https://...")
+    elif _unreachable_from_ci(target):
+        # The same refusal the modernization build loop makes, and the same reasoning: this
+        # workflow would run, fail to post, and look exactly like a suite nobody triggered.
+        blocked = (f"'{target}' is not reachable from a CI runner, so the job would run and "
+                   f"report nothing. Pass ?callback_url= with an address the runner can reach.")
+    elif not plan["jobs"]:
+        blocked = ("None of the generated files declare a framework this can write a run "
+                   "command for, so there is nothing to render. The suite still downloads; "
+                   "the command is yours to write.")
+    else:
+        try:
+            workflow = test_runner_plan.render_workflow(review_id, target, plan)
+        except ValueError as exc:
+            blocked = str(exc)
+
+    return {
+        "review_id": review_id,
+        "plan": plan,
+        "callback_url": target,
+        "workflow_path": test_runner_plan.WORKFLOW_PATH,
+        "workflow_yaml": workflow,
+        "api_key_secret": test_runner_plan.API_KEY_SECRET,
+        # The local producer. Same contract, no CI, no secret to provision — which is the
+        # difference between a loop that gets closed today and one that gets closed once
+        # somebody finds time to configure Actions.
+        "local_command": f"python scripts/run_tests.py --review {review_id}",
+        "blocked_reason": blocked,
+        # Said here as well as in the workflow's own comments, because a screen renders this
+        # object and a reader who is told late is told after the job has gone red.
+        "must_supply": plan["must_supply"],
+        "attested": False,
+    }
+
 
 _DELIVERABLE_RUNS = {
     "codegen_scaffold": {"prefix": "lm-scaffold", "what": "generated starter project"},

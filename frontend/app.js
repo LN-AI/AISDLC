@@ -646,6 +646,11 @@ function _runPageLoader(page) {
     if (page === 'gate') loadReviewPicker();
     if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
     if (page === 'findings') {
+      // Twice on purpose. The text filters go in immediately, so a shared link shows what
+      // it filtered by rather than an empty form for as long as the products call takes —
+      // which is a race the browser check lost. The product *select* has no options until
+      // that call returns, so its value can only be set afterwards.
+      _applyFindingHashFilters();
       _fillFindingProducts().then(() => { _applyFindingHashFilters(); loadFindings(0); });
     }
     if (page === 'inventory') loadInventory();
@@ -2404,10 +2409,98 @@ async function loadTestResults(reviewId) {
     </details>`;
 }
 
+/** How to actually run this suite. Phase 3.
+ *
+ *  Phase 2 opened the endpoint that receives results and nobody posted to it, because
+ *  "run them and post the result" is three unstated decisions — which command, which
+ *  JUnit flag, which URL. The platform knows all three (it knows the framework of every
+ *  file it wrote), so it says them here rather than leaving them to be worked out.
+ *
+ *  Everything below is a lookup, not a model call: nothing here costs anything. */
+let _lastRunnerPlan = null;
+
+async function loadTestRunner(reviewId) {
+  const box = document.getElementById('test-automation-runner');
+  if (!box || !reviewId) return;
+  let d;
+  try {
+    d = await apiFetch(`/api/reviews/${reviewId}/runner`);
+  } catch (e) {
+    return;
+  }
+  _lastRunnerPlan = d;
+  const plan = d.plan || {};
+  const jobs = plan.jobs || [];
+
+  // The warnings come first, and each one names what it costs. A reader who finds out
+  // afterwards that three files had no runner has already read a report that was quietly
+  // narrower than it looked.
+  const warn = [];
+  (plan.unknown_frameworks || []).forEach(f => warn.push(
+    `<b>${esc(f)}</b> is a framework this does not know a run command for, so those files
+     are not in the command below. Run them your own way — the results endpoint takes them
+     either way.`));
+  (plan.unsafe_paths || []).forEach(f => warn.push(
+    `<code>${esc(f)}</code> was left out: a path with a space or a shell character in it is
+     refused rather than quoted, because this text ends up in a command on your machine.`));
+  (plan.extra_packages || []).forEach(f => warn.push(
+    `<b>${esc(f)}</b> has to be installed before the runner will write a JUnit report at
+     all. Without it the tests run and nothing comes back.`));
+  jobs.filter(j => j.runs_whole_suite).forEach(j => warn.push(
+    `<b>${esc(j.label)}</b> runs the project, not a file list, so your own tests run too and
+     come back counted as unmatched rather than as ours.`));
+
+  box.innerHTML = `
+    <div class="section-title" style="margin-top:20px">How to run them</div>
+
+    ${(plan.must_supply || []).length ? `
+    <div class="cost-note" style="border-left:3px solid var(--red);margin-bottom:10px">
+      <b>These tests need something no CI runner has by default:</b>
+      ${esc((plan.must_supply || []).join(', '))}.
+      Nothing here can conjure a running application, a database, credentials or seeded
+      rows — that is yours to supply, and until you do the run will fail for a reason that
+      has nothing to do with your code.
+    </div>` : ''}
+
+    <div class="field-label">On your machine, right now</div>
+    <p class="field-hint">Writes the files into a checkout, runs them, and posts the result
+      back. Nothing is overwritten without <code>--force</code>, and <code>--dry-run</code>
+      prints every path and command without touching anything.</p>
+    <pre class="code-block"><code>${esc(d.local_command || '')}</code></pre>
+    ${jobs.length ? `<p class="field-hint">It will run:
+      ${jobs.map(j => `<code>${esc(j.shell)}</code>`).join(' and ')}</p>` : ''}
+
+    ${warn.length ? `<ul class="field-hint" style="margin-top:8px">
+      ${warn.map(w => `<li style="margin-bottom:4px">${w}</li>`).join('')}</ul>` : ''}
+
+    <div class="field-label" style="margin-top:14px">On every push, from CI</div>
+    ${d.workflow_yaml ? `
+      <p class="field-hint">Commit this beside the tests and add your platform API key as the
+        repository secret <code>${esc(d.api_key_secret || '')}</code>. It reports to
+        <code>${esc(d.callback_url || '')}</code> whether the suite passes or fails — a run
+        that never happens still reports, because silence and success look identical.</p>
+      <button class="btn-secondary btn-sm" onclick="downloadTestWorkflow()">
+        Download ${esc(d.workflow_path || 'workflow')}</button>
+      <details style="margin-top:8px">
+        <summary>Read it first (${(d.workflow_yaml || '').split('\n').length} lines)</summary>
+        <pre class="code-block" style="max-height:340px;overflow:auto"><code>${esc(d.workflow_yaml)}</code></pre>
+      </details>`
+    : `<div class="cost-note">${esc(d.blocked_reason || 'No workflow could be rendered for this run.')}</div>`}`;
+}
+
+function downloadTestWorkflow() {
+  const d = _lastRunnerPlan;
+  if (!d || !d.workflow_yaml) return;
+  _downloadTextAsFile((d.workflow_path || 'workflow.yml').split('/').pop(), d.workflow_yaml);
+}
+
 function renderTestAutomation(targetId, r) {
   _lastTestAutomation = r;
-  // Fired after the innerHTML below lands, since it writes into a div that markup creates.
-  if (r && r.review_id) setTimeout(() => loadTestResults(r.review_id), 0);
+  // Fired after the innerHTML below lands, since both write into divs that markup creates.
+  if (r && r.review_id) setTimeout(() => {
+    loadTestResults(r.review_id);
+    loadTestRunner(r.review_id);
+  }, 0);
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const files = r.test_files || [];
@@ -2436,11 +2529,12 @@ function renderTestAutomation(targetId, r) {
       <b>Nothing here has been run.</b> These files were generated, not executed — the platform
       does not compile or run the code it produces. A generated test that passes is not evidence
       until someone runs it and reads the result.
-      <div style="margin-top:6px">Run them and post the result back to
-        <code>POST /api/reviews/${esc(r.review_id || '')}/test-results</code> and this screen will
-        show which of your requirements actually hold.</div>
+      <div style="margin-top:6px"><b>How to run them</b> is below — one command, or a CI
+        workflow that reports back on every push. This screen then shows which of your
+        requirements actually hold.</div>
     </div>
     <div id="test-automation-results"></div>
+    <div id="test-automation-runner"></div>
 
     <div class="summary-box">${esc(r.summary || '')}</div>
     ${renderAutomationInputMode(r)}
