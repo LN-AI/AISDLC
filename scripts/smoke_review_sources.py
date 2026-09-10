@@ -4796,6 +4796,57 @@ def main():
     check("a camelCase filename matches a two-word requirement phrase",
           set(_tcb34._split_identifier("taskOwnership")) == {"task", "ownership"},
           str(_tcb34._split_identifier("taskOwnership")))
+    # -- rarity: a common word must not outrank a precise one ------------
+    #
+    # Found on a live preflight against this repository. Asked for "a truncated **model**
+    # response must not be stored as a clean Green gate", the flat scorer put
+    # `models/api_models.py` and `models/swarm_models.py` first -- "model" matched the
+    # `models/` directory -- when the requirement meant an LLM and the file meant a schema.
+    # A word in half the files cannot discriminate; a word in two files almost always can.
+    _idf34 = [
+        {"path": "src/models/user.js", "content": "// model model model\nclass User {}\n"},
+        {"path": "src/models/order.js", "content": "// model\nclass Order {}\n"},
+        {"path": "src/models/cart.js", "content": "// model\nclass Cart {}\n"},
+        {"path": "src/billing/refund.js", "content": "// model\nfunction refund() {}\n"},
+    ]
+    _w34 = _tcb34.term_weights(_idf34, {"model", "refund"})
+    check("a word in every file is worth less than a word in one",
+          _w34["refund"] > _w34["model"] * 3,
+          f"model={_w34['model']:.2f} refund={_w34['refund']:.2f} -- flat scoring let the "
+          "commonest word in the codebase decide which files the money was spent on")
+    check("...so the precise file outranks the one that merely shares the common word",
+          _tcb34.select_files(_idf34, "issue a refund to the customer",
+                              budget=100_000)["selected_paths"][:1]
+          == ["src/billing/refund.js"],
+          str(_tcb34.select_files(_idf34, "issue a refund", budget=100_000)["selected_paths"]))
+    check("a word this codebase never uses is not a search term at all",
+          "refunds" not in _tcb34.term_weights(_idf34, {"refunds"}),
+          "`requirement_terms` pluralises everything to bridge prose and code, which invents "
+          "words: 'empty' produced 'emptys'. Scored as maximally rare they head the rarity "
+          "table a user is shown, which is nonsense presented as evidence")
+
+    # -- no single file may crowd out the rest ----------------------------
+    #
+    # Also live: a 66,000-character file ranked second on a filename match and took 55% of
+    # the budget, pushing out four smaller files closer to the requirement.
+    _fat34 = [
+        {"path": "idempotent.js", "content": "// idempotent checkout guard\nexport const k=1;\n"},
+        {"path": "audit.js", "content": "x" * 63_000},
+        {"path": "notify.js", "content": "export function notify() {}\n"},
+    ]
+    _cap34 = _tcb34.select_files(
+        _fat34, "a repeated checkout must be idempotent; every attempt is written to audit "
+                "and the customer is sent a notify message",
+        budget=30_000)
+    check("one large file cannot take the whole budget",
+          "notify.js" in _cap34["selected_paths"] and "audit.js" not in _cap34["selected_paths"],
+          f"{_cap34['selected_paths']} -- a big mediocre match must not crowd out several "
+          "small precise ones")
+    check("...and a file left out for size is named, not silently dropped",
+          "audit.js" in _cap34["omitted_for_budget"],
+          f"{_cap34['omitted_for_budget']} -- a reader who can see what was left out can "
+          "narrow the source; one who cannot just gets worse tests")
+
     check("a third-party import resolves to nothing rather than a wrong file",
           _tcb34.referenced_paths(
               "src/a.js", "const express = require('express');\n",

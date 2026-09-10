@@ -76,11 +76,17 @@ A suite generated from a description is a weaker artifact than one from source. 
 
 ### How the files are ranked
 
-Deterministically, with no model: filename and directory matches against the requirement's own words (split on camelCase and snake_case, and pluralised, because requirements say "task" and files are called `tasks.js`), route literals pulled apart so `PUT /tasks/:id` contributes `tasks`, capped body-term frequency so a long file cannot outrank a short one by length alone, a bonus for the application entry point a test needs to make a request against, and a penalty for existing tests, which `pick_exemplars` already quotes.
+Deterministically, with no model. Each requirement word is first weighted by **how rare it is in this codebase** (normalised inverse document frequency): a word in half the files cannot tell one from another, a word in two files almost always can. That is measured per codebase rather than kept as a stop list — "model" is uninformative in a platform that calls an LLM on every route and highly informative in an app about fashion photography. Words the codebase never uses are dropped entirely rather than scored as rare.
+
+On top of that weighting: filename and directory matches against the requirement's own words (split on camelCase and snake_case, and pluralised, because requirements say "task" and files are called `tasks.js`), route literals pulled apart so `PUT /tasks/:id` contributes `tasks`, capped body-term frequency so a long file cannot outrank a short one by length alone, a bonus for the application entry point a test needs to make a request against, and a penalty for existing tests, which `pick_exemplars` already quotes.
 
 **Then one dependency hop.** Whatever a selected file imports comes with it, resolved textually against the bundle's own paths. This is the half that matters most: the middleware a route file imports usually matches no word in the requirement and scores zero, and it is exactly the file whose absence makes a generated import line a guess (D-316). Resolution is textual rather than parsed on purpose — `code_brief`'s dependency graph has real edges for Python, PHP, Java, C# and Delphi and **none for JavaScript** (C-24).
 
+**No single file may take more than 40% of the budget**, the top-ranked file excepted — measured here, a 66,000-character file ranked second on a filename match and took 55% of the budget, pushing out four smaller files that were closer to the requirement. Anything skipped is named in `omitted_for_budget`.
+
 Whole files only. A truncated file is worse than an absent one: the model cannot tell it is reading half of something, so it reasons about the missing half as though it had seen it.
+
+**What ranking cannot do.** It matches words. A requirement whose vocabulary does not appear in the code — "stored as an error" when the file is called `attest.py` — will rank the right file low however the weights are set, and this is a measured limit rather than a tuning problem (C-90). For an abstract requirement, pass an explicit `files[]` list: you choose, instead of a heuristic choosing.
 
 `input_selection` returns the ranking — every file, its score and the reason it was picked — on the **free preflight** as well as the result, so a wrong pick is visible before any spend rather than inferred from bad tests afterwards.
 

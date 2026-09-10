@@ -35,8 +35,9 @@ established idiom" is the useful answer; describing a pytest layout that is not 
 """
 import json
 import logging
+import math
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -730,14 +731,64 @@ def _stem(path: str) -> str:
     return name.lower()
 
 
-def score_file(path: str, content: str, terms: set) -> Tuple[float, List[str]]:
+def term_weights(files: List[Dict[str, Any]], terms: set) -> Dict[str, float]:
+    """How much each requirement word is worth, by how rare it is in *this* codebase.
+
+    Found live, and it is the difference between a useful ranking and a plausible-looking
+    one. Asked for "a truncated **model** response must not be stored as a clean gate", the
+    flat scorer picked `models/api_models.py` and `models/swarm_models.py` — because "model"
+    matched the `models/` directory — and missed `attest.py`, the file that implements
+    exactly that behaviour. The requirement meant an LLM; the filename meant a data schema.
+
+    A word in half the files cannot tell those apart, and a word in two files almost always
+    can. So each term is weighted by inverse document frequency, normalised to 0..1: a term
+    in every file scores ~0 and stops deciding anything, a term in one file scores ~1. This
+    is not a tuned constant, it is the standard measure of how much a word discriminates,
+    and it needs no per-codebase list of words to ignore — "model" is uninformative in this
+    repository and highly informative in a repository about fashion photography.
+    """
+    total = len(files) or 1
+    ceiling = math.log(total + 1)
+    haystacks = [((f.get("path") or "") + "\n" + (f.get("content") or "")).lower()
+                 for f in files]
+    weights: Dict[str, float] = {}
+    for term in terms:
+        seen = sum(1 for hay in haystacks if term in hay)
+        # A word this codebase never uses is not a search term. `requirement_terms`
+        # pluralises everything to bridge prose ("task") and code ("tasks.js"), which
+        # necessarily invents words: "empty" produced "emptys", "never" produced
+        # "nevers". They match no file, so they cannot change a score -- but left in they
+        # are scored as maximally rare, which puts nonsense at the top of the rarity
+        # table a reader is shown and wastes the term budget. Dropping them here means
+        # only real vocabulary is ever ranked, reported or counted.
+        if not seen:
+            continue
+        weights[term] = (math.log((total + 1) / (seen + 1)) / ceiling) if ceiling else 1.0
+    return weights
+
+
+def score_file(path: str, content: str, terms: set,
+               weights: Optional[Dict[str, float]] = None) -> Tuple[float, List[str]]:
     """How much this file looks like what the requirement is about, and why.
 
     Every point is attributable to a stated reason, because the reasons are shown to the
     user. A ranking nobody can inspect is a ranking nobody can correct.
+
+    `weights` is `term_weights` for the codebase being ranked. Absent — a caller scoring one
+    file with no corpus to compare against — every term counts fully, which is the same
+    behaviour as before rarity was measured.
     """
     if not terms:
         return 0.0, []
+    w = weights or {}
+
+    def weight(term: str) -> float:
+        return w.get(term, 1.0)
+
+    def named(hits: set) -> str:
+        """The matched words, rarest first — the rare one is why the file is here."""
+        return ", ".join(sorted(hits, key=lambda t: (-weight(t), t))[:3])
+
     p = (path or "").replace("\\", "/")
     lowered = p.lower()
     score = 0.0
@@ -745,34 +796,50 @@ def score_file(path: str, content: str, terms: set) -> Tuple[float, List[str]]:
 
     name_hits = set(_split_identifier(_stem(p))) & terms
     if name_hits:
-        score += 10.0
-        reasons.append("filename matches " + ", ".join(sorted(name_hits)[:3]))
+        # The rarest matching word decides, rather than the count of matches: two vague
+        # matches are not worth more than one precise one, and summing them is how
+        # `swarm_models.py` beat `attest.py`.
+        best = max(weight(t) for t in name_hits)
+        if best > 0.01:
+            score += 10.0 * best
+            reasons.append(f"filename matches {named(name_hits)}")
 
     directory_hits: set = set()
     for segment in lowered.split("/")[:-1]:
         directory_hits |= set(_split_identifier(segment)) & terms
     if directory_hits:
-        score += min(6.0, 3.0 * len(directory_hits))
-        reasons.append("directory matches " + ", ".join(sorted(directory_hits)[:3]))
+        gained = min(6.0, sum(3.0 * weight(t) for t in directory_hits))
+        if gained > 0.05:
+            score += gained
+            reasons.append(f"directory matches {named(directory_hits)}")
 
     body = (content or "").lower()
     if body:
-        matched = 0
-        occurrences = 0
+        matched: set = set()
+        weighted = 0.0
         for term in terms:
             count = body.count(term)
             if count:
-                matched += 1
+                matched.add(term)
                 # Capped per term on purpose. Without it a 2,000-line file that says "task"
                 # two hundred times outranks the fifty-line route file that defines the
                 # endpoint — length would be doing the selecting, not relevance.
-                occurrences += min(count, 8)
+                weighted += min(count, 8) * weight(term)
         if matched:
-            score += min(12.0, 0.4 * occurrences)
-            reasons.append(f"body mentions {matched} requirement term(s)")
+            gained = min(12.0, 0.4 * weighted)
+            if gained > 0.05:
+                score += gained
+                reasons.append(
+                    f"body mentions {len(matched)} requirement term(s), notably "
+                    f"{named(matched)}")
 
     if _stem(p) in _ENTRY_STEMS and lowered.count("/") <= 2:
-        score += 5.0
+        # Deliberately small, and smaller than it was. Every other signal is scaled by how
+        # rare its word is; a flat bonus that ignores rarity outranked them all on a small
+        # codebase, so `app.js` displaced the route file the requirement named. The entry
+        # point is *support* -- a test needs something to make a request against -- and never
+        # the subject of the requirement, so it must be worth less than a real match.
+        score += 2.0
         reasons.append("application entry point")
 
     if is_test_path(p):
@@ -871,12 +938,19 @@ def select_files(files: List[Dict[str, Any]], requirement: str, budget: int,
         if p:
             by_path[p] = f
 
+    # Rarity is a property of this codebase, so it is measured once here and shared by every
+    # file rather than recomputed per file.
+    weights = term_weights(files, terms)
+    # Only vocabulary this codebase actually uses. If that is nothing, no file is
+    # relevant and `for_automation` says so rather than picking arbitrarily.
+    terms = set(weights)
+
     ranked: List[Tuple[float, str, Dict[str, Any], List[str]]] = []
     for f in files:
         p = (f.get("path") or "").replace("\\", "/")
         if not p or p in skip or not (f.get("content") or "").strip():
             continue
-        score, why = score_file(p, f.get("content") or "", terms)
+        score, why = score_file(p, f.get("content") or "", terms, weights)
         if score > 0:
             ranked.append((score, p, f, why))
     ranked.sort(key=lambda row: (-row[0], row[1]))
@@ -887,9 +961,21 @@ def select_files(files: List[Dict[str, Any]], requirement: str, budget: int,
     omitted: List[str] = []
     used = 0
 
-    def take(f: Dict[str, Any], p: str, why: List[str], score: float) -> bool:
+    def take(f: Dict[str, Any], p: str, why: List[str], score: float,
+             top: bool = False) -> bool:
         nonlocal used
         size = len(f.get("content") or "") + len(p) + 8
+        # No single file may crowd out the rest. Measured on this repository: a 66,000
+        # character file ranked second on a filename match and took 55% of the budget,
+        # pushing out four smaller files that were closer to the requirement -- including
+        # the one that actually implemented it. The highest-ranked file is exempt,
+        # because if the best match is also the biggest, dropping it would be worse than
+        # anything it crowds out; everything else is capped and named in
+        # `omitted_for_budget` so the reader can narrow the source and try again.
+        if not top and size > budget * MAX_ONE_FILE_SHARE:
+            if p not in omitted:
+                omitted.append(p)
+            return False
         if used + size > budget:
             if p not in omitted:
                 omitted.append(p)
@@ -900,21 +986,29 @@ def select_files(files: List[Dict[str, Any]], requirement: str, budget: int,
         used += size
         return True
 
-    for score, p, f, why in ranked:
+    for rank, (score, p, f, why) in enumerate(ranked):
         if p in chosen_paths:
             continue
-        if not take(f, p, why, score):
+        if not take(f, p, why, score, top=(rank == 0)):
             continue
-        # One hop, taken immediately rather than in a second pass, so a high-scoring file's
-        # imports inherit its priority instead of competing with the whole tail. A test that
-        # imports the route file also needs what the route file imports, or its own import
-        # line is a guess.
-        for dep in referenced_paths(p, f.get("content") or "", index):
-            if dep in chosen_paths or dep in skip:
-                continue
-            dep_file = by_path.get(dep)
-            if dep_file and (dep_file.get("content") or "").strip():
-                take(dep_file, dep, [f"imported by {p}"], score * 0.5)
+        # Imports are followed from a worklist rather than from the ranked file alone.
+        # A file pulled in *as* a dependency used to contribute none of its own: when
+        # `app.js` outranked `routes/tasks.js`, tasks.js arrived as app.js's import, was
+        # already in `chosen_paths` when the loop reached it, and so never offered up
+        # `middleware/auth.js` -- the file the generated test would have imported. The
+        # budget is the bound; nothing else needs to be, because a test that cannot
+        # import what it calls proves nothing (D-316).
+        worklist = [(p, f, score)]
+        while worklist:
+            from_path, from_file, from_score = worklist.pop(0)
+            for dep in referenced_paths(from_path, from_file.get("content") or "", index):
+                if dep in chosen_paths or dep in skip:
+                    continue
+                dep_file = by_path.get(dep)
+                if not (dep_file and (dep_file.get("content") or "").strip()):
+                    continue
+                if take(dep_file, dep, [f"imported by {from_path}"], from_score * 0.5):
+                    worklist.append((dep, dep_file, from_score * 0.5))
 
     return {
         "selected": chosen,
@@ -940,6 +1034,10 @@ MAX_HYBRID_SOURCE_CHARS = 120_000
 # When the caller asks to narrow deliberately. Smaller again, because the point of asking is
 # to spend less — a "focus" that saved nothing would be a control that lies.
 MAX_FOCUS_SOURCE_CHARS = 60_000
+
+# The most of one budget a single file may take, so one large mediocre match cannot
+# crowd out several small precise ones. The top-ranked file is exempt.
+MAX_ONE_FILE_SHARE = 0.4
 
 # How much narrowing must actually save before it is worth the completeness it costs.
 # Measured against a real 12-file repository: the ranking picked every file its tests
