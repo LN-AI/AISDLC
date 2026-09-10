@@ -1859,13 +1859,41 @@ def _automation_inputs(req, caller: dict):
     that runs — and a quote is believed.
     """
     bundle = _bundle(req, "test-automation", caller)
-    inputs = test_context_brief.for_automation(bundle)
+    # Both fields, because both say what to test: a prior test-case catalogue names the same
+    # routes and entities the requirement does, in more words. A caller who supplies only
+    # `cases_context` still gets the relevant files quoted rather than a description of
+    # everything.
+    selector = "\n".join(part for part in (
+        (getattr(req, "requirement", None) or "").strip(),
+        (getattr(req, "cases_context", None) or "").strip(),
+    ) if part)
+    inputs = test_context_brief.for_automation(
+        bundle, requirement=selector, focus=bool(getattr(req, "focus", False)))
     if not (inputs["markdown"] or "").strip():
         raise HTTPException(
             400,
             "No readable source files were found in that input, so there is nothing to write "
             "tests against. Check the repository, branch or archive.")
     return bundle, inputs
+
+
+def _automation_selection(inputs: dict) -> dict:
+    """Which files were quoted in full, and why each one. On the quote and on the result.
+
+    The ranking is a heuristic, so it is shown rather than hidden: a caller who can see that
+    the wrong file was picked can narrow the source and run again, and one who cannot see it
+    just gets worse tests for no stated reason.
+    """
+    sel = inputs.get("selection") or {}
+    return {
+        "selected": sel.get("selected") or [],
+        "selected_paths": sel.get("selected_paths") or [],
+        "selected_chars": sel.get("selected_chars") or 0,
+        "considered": sel.get("considered") or 0,
+        "omitted_for_budget": sel.get("omitted_for_budget") or [],
+        "source_chars": inputs.get("source_chars") or 0,
+        "prompt_chars": inputs.get("prompt_chars") or 0,
+    }
 
 
 def _automation_requirement(req) -> str:
@@ -1947,6 +1975,8 @@ def run_test_automation(req: TestAutomationRequest, caller: dict = Depends(get_c
         # How much the agent could actually see, and how this project already tests itself.
         # Returned so the caller reads the same account of coverage the prompt was given.
         "input_mode": inputs["mode"],
+        "input_mode_note": inputs["mode_note"],
+        "input_selection": _automation_selection(inputs),
         "test_conventions": {k: inputs["conventions"][k] for k in
                              ("note", "has_tests", "test_files", "test_paths",
                               "frameworks", "located_by", "exemplar_paths")},
@@ -1969,8 +1999,11 @@ review would name a figure for a run that never happens.
 
 Also returns, for free and before any spend:
 
-- `input_mode` — `source` if your codebase is small enough to send verbatim, `description` if it is too large
-  and a computed structural summary goes instead. Tests generated from a description need more correction.
+- `input_mode` — `source` (whole codebase sent verbatim), `hybrid` (the files this requirement is about sent
+  verbatim, beside a structural description of the rest) or `description` (structural description alone,
+  because nothing could be selected). Tests drawn from a description need more correction.
+- `input_selection` — exactly which files were quoted in full and the reason each was picked, so a wrong
+  pick is visible before you spend rather than inferred from bad tests afterwards
 - `test_conventions` — which framework and fixtures were found, and whether any tests were found at all
 """,
 )
@@ -2005,6 +2038,7 @@ def preflight_test_automation(req: TestAutomationRequest, caller: dict = Depends
             else quote["ceiling_usd"] <= headroom["remaining_usd"]),
         "input_mode": inputs["mode"],
         "input_mode_note": inputs["mode_note"],
+        "input_selection": _automation_selection(inputs),
         "test_conventions": {k: inputs["conventions"][k] for k in
                              ("note", "has_tests", "test_files", "test_paths",
                               "frameworks", "located_by", "exemplar_paths")},

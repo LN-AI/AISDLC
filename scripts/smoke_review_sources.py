@@ -4549,6 +4549,7 @@ def main():
     section("34. Test automation: four doors, and the honesty that makes it worth having")
 
     from backend.services import test_context_brief as _tcb34
+    from backend.services import source_bundle as _sb34
     from backend.services import legacy_guard as _lg34
     from backend.agents.qa_intelligence import test_automation_agent as _taa34
     import backend.main as _m34
@@ -4682,18 +4683,149 @@ def main():
     check("...and is told to declare its assumptions instead",
           "assumption" in _none34["note"].lower())
 
-    # -- the two input modes, and saying which one happened ---------------
+    # -- the three input modes, and saying which one happened -------------
     _src34 = _tcb34.for_automation(_real34)
     check("a small source is sent verbatim, so tests can name real functions",
           _src34["mode"] == "source" and "===== FILE: conftest.py =====" in _src34["markdown"],
           f"mode={_src34['mode']}")
     _desc34 = _tcb34.for_automation(_real34, max_inline_source=10)
-    check("...and one too large is described instead",
+    check("a codebase too large to send, with no requirement to rank by, is described alone",
           _desc34["mode"] == "description", f"mode={_desc34['mode']}")
+    check("...and says so, rather than letting the caller assume it was read",
+          "no requirement was supplied" in _desc34["mode_note"],
+          f"{_desc34['mode_note'][:160]!r} -- a caller who supplies the requirement gets the "
+          "files it names quoted verbatim, and that is worth telling them")
     check("...and the described mode says the difference out loud",
           "guess" in _desc34["markdown"] and "assumptions" in _desc34["markdown"],
           "a suite built from a description is a weaker artifact than one built from "
           "source, and a reader who cannot tell them apart trusts both equally")
+
+    # -- relevance ranking: which files a requirement is actually about ---
+    #
+    # The property under test is the one D-384 exists for: a codebase too large to send used
+    # to send *nothing* verbatim, so the agent guessed exactly the route paths and signatures
+    # a test asserts on. Ranking has to put the requirement's own files first and drag in
+    # what they import -- the imported file is the one that scores zero on its own and
+    # matters most, because a test's import line is a guess without it.
+    _rank34 = [
+        {"path": "src/app.js",
+         "content": "const tasks = require('./routes/tasks');\napp.use('/tasks', tasks);\n"},
+        {"path": "src/routes/tasks.js",
+         "content": "const auth = require('../middleware/auth');\n"
+                    "router.put('/:id', auth, (req, res) => res.json(task));\n"},
+        {"path": "src/middleware/auth.js",
+         "content": "module.exports = (req, res, next) => "
+                    "{ req.headers.authorization.split(' ')[1]; };\n"},
+        {"path": "src/routes/billing.js", "content": "router.post('/invoice', () => {});\n"},
+        {"path": "docs/notes.md", "content": "# notes\n"},
+    ]
+    _req34 = ("A task may only be updated or deleted by the user who created it. "
+              "PUT /tasks/:id returns 403 for anyone else.")
+    _sel34 = _tcb34.select_files(_rank34, _req34, budget=100_000)
+    check("the file the requirement names ranks first",
+          _sel34["selected_paths"][:1] == ["src/routes/tasks.js"],
+          f"{_sel34['selected_paths']} -- if the route file is not first, the budget is spent "
+          "on files the requirement is not about")
+    check("...and what it imports comes with it, though it matches no requirement word",
+          "src/middleware/auth.js" in _sel34["selected_paths"],
+          f"{_sel34['selected_paths']} -- auth.js scores zero on its own; without the "
+          "dependency hop the generated test imports a file the agent never saw (D-316)")
+    check("...and the entry point too, because a test needs the app to make a request against",
+          "src/app.js" in _sel34["selected_paths"], str(_sel34["selected_paths"]))
+    check("...and an unrelated file is left out",
+          "src/routes/billing.js" not in _sel34["selected_paths"],
+          f"{_sel34['selected_paths']} -- selecting everything is what this replaces")
+    check("every selected file carries the reason it was selected",
+          all(row.get("why") for row in _sel34["selected"]),
+          "a ranking nobody can inspect is a ranking nobody can correct, and this one is "
+          "shown on the quote before any spend")
+    check("a prose requirement matches a plural filename",
+          "tasks" in _tcb34.requirement_terms("the task must be deleted"),
+          "requirements are written in the singular and files are named in the plural; "
+          "matching one form only is how the most relevant file in a repository scores zero")
+    check("a camelCase filename matches a two-word requirement phrase",
+          set(_tcb34._split_identifier("taskOwnership")) == {"task", "ownership"},
+          str(_tcb34._split_identifier("taskOwnership")))
+    check("a third-party import resolves to nothing rather than a wrong file",
+          _tcb34.referenced_paths(
+              "src/a.js", "const express = require('express');\n",
+              _tcb34._path_index(_rank34)) == [],
+          "`express` is not a file in this repository, and resolving it to one would spend "
+          "the budget on a file the author never wrote")
+
+    # -- hybrid: the map of everything, plus the code that matters --------
+    _big34 = _B34(_rank34 + [{"path": f"src/pad{i}.js", "content": "filler " * 3000}
+                             for i in range(8)])
+    _hyb34 = _tcb34.for_automation(_big34, requirement=_req34,
+                                   max_inline_source=5_000, max_hybrid_source=4_000)
+    check("a codebase too large to send whole still sends the files that matter",
+          _hyb34["mode"] == "hybrid", f"mode={_hyb34['mode']}")
+    check("...quoting them verbatim",
+          "===== FILE: src/routes/tasks.js =====" in _hyb34["markdown"],
+          "the point of the mode is that the tests can name a real route")
+    check("...alongside a structural description of everything else",
+          "Every file, what it declares" in _hyb34["markdown"],
+          "without the map the agent cannot tell what it was not shown")
+    check("...and says plainly that what it did not see is a guess",
+          "guess" in _hyb34["markdown"] and "assumptions" in _hyb34["markdown"])
+    check("...and costs a fraction of the whole codebase",
+          _hyb34["prompt_chars"] < _hyb34["source_chars"] / 4,
+          f"{_hyb34['prompt_chars']:,} of {_hyb34['source_chars']:,}")
+
+    # -- focus: the cost lever, and the case where it must decline --------
+    #
+    # A control that raises the cost is a control that lies. On a small codebase the
+    # structural description is longer than the source it would replace, so narrowing sends
+    # *more* characters and shows *less* code -- the worst of both, and silently.
+    _focus34 = _tcb34.for_automation(_real34, requirement="checkout", focus=True)
+    check("narrowing a codebase that already fits, and would not save, is declined",
+          _focus34["mode"] == "source",
+          f"mode={_focus34['mode']} -- a cost control that raises the cost is a lie")
+    check("...and says why, rather than silently ignoring the request",
+          "Narrowing was requested" in _focus34["mode_note"],
+          f"{_focus34['mode_note'][-160:]!r} -- there are two reasons to decline (nothing "
+          "rankable, or no saving) and either is fine; silence is not")
+    # A pasted artifact has no filename (`from_text` gives it an empty path), so nothing can
+    # be ranked against the requirement. Falling to `description` there would throw away
+    # source that fits — the same class of defect that once made a paste report "no readable
+    # files were found", arriving through a new door.
+    _paste34 = _tcb34.for_automation(
+        _sb34.from_text("from fastapi import FastAPI\napp = FastAPI()\n", "pasted"),
+        requirement="only the owner may export", focus=True)
+    check("narrowing a pasted artifact sends it whole rather than describing it",
+          _paste34["mode"] == "source",
+          f"mode={_paste34['mode']} -- a paste has no filename to rank, and dropping the one "
+          "file the user actually supplied is the worst available answer")
+    check("...and no mode ever claims a small source was too large",
+          "too large" not in _paste34["mode_note"], _paste34["mode_note"][:160])
+
+    _focusbig34 = _tcb34.for_automation(_big34, requirement=_req34, focus=True,
+                                        max_focus_source=4_000)
+    check("...but a codebase where it does save is narrowed as asked",
+          _focusbig34["mode"] == "hybrid"
+          and _focusbig34["prompt_chars"] < _focusbig34["source_chars"],
+          f"mode={_focusbig34['mode']} "
+          f"{_focusbig34['prompt_chars']:,} of {_focusbig34['source_chars']:,}")
+    check("...and never sends a half file, whatever the budget",
+          all(row["chars"] == len(next(f["content"] for f in _rank34
+                                       if f["path"] == row["path"]))
+              for row in _focusbig34["selection"]["selected"]
+              if any(f["path"] == row["path"] for f in _rank34)),
+          "a model cannot tell it is reading half of something, so it reasons about the "
+          "missing half as though it had seen it -- which is D-316 exactly")
+
+    # The exemplars are already quoted verbatim by the conventions brief; spending the source
+    # budget to say the same thing twice is the one duplication that costs accuracy.
+    _dup34 = _tcb34.for_automation(
+        _B34(_rank34 + [{"path": "tests/test_tasks.py",
+                         "content": "def test_task(client):\n    assert client.put('/tasks/1')\n"}]
+             + [{"path": f"src/pad{i}.js", "content": "filler " * 3000} for i in range(8)]),
+        requirement=_req34, max_inline_source=5_000, max_hybrid_source=6_000)
+    check("a file already quoted as an exemplar is not quoted a second time",
+          all(p not in _dup34["selection"]["selected_paths"]
+              for p in _dup34["conventions"]["exemplar_paths"]),
+          f"selected={_dup34['selection']['selected_paths']} "
+          f"exemplars={_dup34['conventions']['exemplar_paths']}")
 
     # -- the four doors, driven for real, with the gateway stubbed --------
     _calls34 = []
@@ -4769,6 +4901,39 @@ def main():
                             headers=_H34).status_code == 200,
                   "pricing the job is how you decide whether to write the requirement")
 
+            # `focus` on the wire, priced free, before anything is spent. The screen shows
+            # which files it picked and why, so a wrong pick is visible on the quote rather
+            # than inferred from bad tests an hour later.
+            _n34 = len(_calls34)
+            _f34 = _c34.post("/api/review/test-automation/preflight",
+                             json={**_body34, "focus": True}, headers=_H34)
+            check("narrowing is accepted on the quote", _f34.status_code == 200,
+                  f"{_f34.status_code} {_f34.text[:200]}")
+            check("...and still calls no model", len(_calls34) == _n34)
+            _fj34 = _f34.json() if _f34.status_code == 200 else {}
+            check("...and reports what narrowing did, not just that it was asked for",
+                  isinstance(_fj34.get("input_selection"), dict)
+                  and "selected_paths" in _fj34["input_selection"],
+                  str(_fj34.get("input_selection"))[:200])
+            check("...declining on a codebase where narrowing cannot help, and saying so",
+                  _fj34.get("input_mode") == "source"
+                  and "Narrowing was requested" in (_fj34.get("input_mode_note") or ""),
+                  f"{_fj34.get('input_mode')} {(_fj34.get('input_mode_note') or '')[-120:]!r} "
+                  "-- the source fits, so throwing it away for a description would be the "
+                  "worst available answer whatever the reason narrowing failed")
+
+            # The quote must describe the prompt the run will send. A requirement changes
+            # which files are quoted verbatim, so a quote that ignored it would price a
+            # different call from the one that happens -- and a quote is believed.
+            _sel_q34 = _c34.post(
+                "/api/review/test-automation/preflight",
+                json={**_body34, "focus": True,
+                      "requirement": "checkout must reject an expired card"},
+                headers=_H34).json()
+            check("the requirement reaches the ranking, not just the prompt",
+                  isinstance((_sel_q34.get("input_selection") or {}).get("considered"), int),
+                  str(_sel_q34.get("input_selection"))[:200])
+
             _n34 = len(_calls34)
             _r34 = _c34.post("/api/review/test-automation", json=_body34, headers=_H34)
             check("the run answers", _r34.status_code == 200,
@@ -4781,6 +4946,12 @@ def main():
                   str(_rj34)[:200])
             check("...counting the tests itself rather than trusting the model",
                   _rj34.get("total_tests") == 1, str(_rj34.get("total_tests")))
+            check("...and the result records what the agent was actually shown",
+                  isinstance(_rj34.get("input_selection"), dict)
+                  and _rj34.get("input_mode") in ("source", "hybrid", "description"),
+                  f"mode={_rj34.get('input_mode')} sel={str(_rj34.get('input_selection'))[:120]} "
+                  "-- a stored suite is read months later by somebody who cannot re-run the "
+                  "quote, and how much code the agent saw is how much the suite is worth")
             check("...and reporting the requirement it did NOT cover",
                   _rj34.get("uncovered_count") == 1,
                   f"{_rj34.get('uncovered_count')} -- a suite that lists only its successes "

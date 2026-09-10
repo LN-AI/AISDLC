@@ -473,6 +473,14 @@ class TestAutomationRequest(_CodeSourceBase):
                     "not a unit test.",
         examples=[["API/Integration", "UI/End-to-End"]],
     )
+    focus: bool = Field(
+        False,
+        description="Send only the files this requirement is about, plus what they import, "
+                    "rather than the whole codebase. Cheaper and less complete: a file that "
+                    "turns out to matter and was not selected is visible to the agent only "
+                    "in the structural description. Ignored when narrowing would not save "
+                    "anything. `input_selection` in the response says what was picked.",
+    )
 
 
 class CodeGenAdvisoryRequest(LLMOverrideFields):

@@ -1700,6 +1700,27 @@ def main():
                           for line in NETLOG),
                   f"recent: {NETLOG[-6:]}")
 
+            # Narrowing the source is a control the user is offered, so it has to be
+            # reachable and it has to change the quote's account of what was read. A
+            # checkbox `buildTestAutomationBody` reads by an id `index.html` never defines
+            # is silently always-off, and no offline test can see that.
+            check("the narrowing control is on the screen",
+                  page.locator("#test-automation-focus").count() == 1,
+                  "app.js reads this id; if index.html does not define it the option is "
+                  "permanently off and nobody is told")
+            page.check("#test-automation-focus")
+            ok_focus, text_focus = estimate(page, "test-automation", base=base)
+            check("...and a narrowed run can still be priced", ok_focus, text_focus)
+            check("...and the quote says what narrowing actually did",
+                  "verbatim" in text_focus or "would not have saved" in text_focus,
+                  f"{text_focus[:250]!r} -- a control whose effect is invisible is a control "
+                  "the user cannot judge, and this one trades completeness for money")
+            check("...still with no model call",
+                  not any("/api/review/test-automation" in line and "preflight" not in line
+                          for line in NETLOG),
+                  f"recent: {NETLOG[-6:]}")
+            page.uncheck("#test-automation-focus")
+
             # Switching the source must invalidate the quote, the same rule Code Review
             # follows: a price belongs to the source that produced it.
             pick_source(page, "test-automation", "GitHub repo")

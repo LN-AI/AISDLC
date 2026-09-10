@@ -611,31 +611,377 @@ def build(bundle, max_chars: int = MAX_BRIEF_CHARS) -> Dict[str, Any]:
     }
 
 
+# ══ Which files a requirement is actually about ══════════════════════════════
+#
+# `for_automation` used to make one binary choice: every file verbatim, or none of them.
+# Over the threshold a 300,000-character repository sent nothing but a structural map — even
+# when the requirement was about three of its files — so the agent had to guess exactly the
+# route paths, signatures and fixture names a test asserts on. That is D-316's failure mode
+# arriving through a different door: not "one file and no context", but "all the context and
+# no code".
+#
+# So the files are ranked against the requirement and a source budget is spent on the top of
+# that ranking, beside the map of everything else. Deterministic, no model, no cost — the
+# same discipline as the rest of this module, and it runs before the free quote as well as
+# before the paid call.
+#
+# The ranking is a heuristic and is not claimed to be more. What keeps it honest is that the
+# prompt names the files it sent in full and says in as many words that everything else is
+# description only, so a file that was not selected is **visibly** absent rather than
+# silently missing — the same principle as `code_brief.coverage_note` and
+# `attest.coverage_claim`.
+
+# Words that appear in every requirement ever written and select nothing. Deliberately short:
+# an over-eager stop list drops domain nouns ("order", "state", "record") that are exactly
+# what a filename match should fire on.
+_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "from", "into", "when", "then", "than",
+    "must", "should", "shall", "will", "can", "may", "any", "all", "not", "but", "are",
+    "was", "were", "been", "being", "have", "has", "had", "does", "did", "done", "only",
+    "who", "what", "which", "their", "there", "them", "they", "its", "his", "her",
+    "get", "gets", "give", "gives", "make", "makes", "use", "uses", "used", "using",
+    "test", "tests", "testing", "case", "cases", "verify", "verifies", "check", "checks",
+    "ensure", "ensures", "given", "expect", "expects", "expected", "should", "able",
+    "user", "users",  # too common in requirements to discriminate between files
+    "system", "application", "app", "code", "file", "files", "please", "also", "each",
+    "other", "another", "same", "different", "new", "old", "one", "two", "some", "such",
+})
+
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_PATH_LITERAL_RE = re.compile(r"/[A-Za-z0-9_\-./:{}]+")
+_CAMEL_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+# A file called `app.js`, `main.py` or `server.ts` near the root is how a test gets hold of
+# the application to make a request against it. It is rarely named in a requirement and is
+# almost always needed, which is the one place a fixed bonus beats term matching.
+_ENTRY_STEMS = frozenset({
+    "app", "main", "index", "server", "application", "wsgi", "asgi", "manage",
+    "routes", "router", "urls", "api",
+})
+
+# Enough terms to describe any one requirement; past this the tail is plurals and noise, and
+# every term costs a substring scan over every file.
+MAX_TERMS = 160
+
+
+def _split_identifier(word: str) -> List[str]:
+    """`taskOwnership` / `task_ownership` / `task-ownership` → `['task', 'ownership']`.
+
+    A requirement says "task ownership" and the file is `taskOwnership.js`; without this the
+    two never meet.
+    """
+    out: List[str] = []
+    for part in re.split(r"[_\-.]+", word or ""):
+        out.extend(m.group(0).lower() for m in _CAMEL_RE.finditer(part))
+    return [o for o in out if o]
+
+
+def requirement_terms(text: str) -> set:
+    """The words worth matching filenames and file bodies against.
+
+    Route literals are pulled apart as well as kept whole, because a requirement that says
+    `PUT /tasks/:id` is naming `tasks` — and `tasks` is what the file is called.
+    """
+    terms: set = set()
+    for raw in _WORD_RE.findall(text or ""):
+        low = raw.lower()
+        if len(low) >= 3 and low not in _STOPWORDS:
+            terms.add(low)
+        for piece in _split_identifier(raw):
+            if len(piece) >= 3 and piece not in _STOPWORDS:
+                terms.add(piece)
+    for literal in _PATH_LITERAL_RE.findall(text or ""):
+        for segment in literal.strip("/").split("/"):
+            segment = segment.strip(":{}<>").lower()
+            if len(segment) >= 3 and segment not in _STOPWORDS:
+                terms.add(segment)
+    # Requirements are written in prose ("a task may only be deleted by...") and code is
+    # named in both numbers ("tasks.js", "Task"). Matching one form and not the other is
+    # how the single most relevant file in a repository scores zero.
+    for term in list(terms):
+        if term.endswith("s") and len(term) > 3:
+            terms.add(term[:-1])
+        elif len(term) >= 3:
+            terms.add(term + "s")
+    if len(terms) > MAX_TERMS:
+        # Longest first: a long token is more specific, and specificity is the whole job.
+        terms = set(sorted(terms, key=lambda t: (-len(t), t))[:MAX_TERMS])
+    return terms
+
+
+def _stem(path: str) -> str:
+    """`tests/auth.test.js` → `auth`. Two extensions, because `.test.js`, `.spec.ts` and
+    `.tar.gz` are all one file type wearing two suffixes."""
+    name = (path or "").replace("\\", "/").rsplit("/", 1)[-1]
+    for _ in range(2):
+        if "." in name[1:]:
+            name = name.rsplit(".", 1)[0]
+    return name.lower()
+
+
+def score_file(path: str, content: str, terms: set) -> Tuple[float, List[str]]:
+    """How much this file looks like what the requirement is about, and why.
+
+    Every point is attributable to a stated reason, because the reasons are shown to the
+    user. A ranking nobody can inspect is a ranking nobody can correct.
+    """
+    if not terms:
+        return 0.0, []
+    p = (path or "").replace("\\", "/")
+    lowered = p.lower()
+    score = 0.0
+    reasons: List[str] = []
+
+    name_hits = set(_split_identifier(_stem(p))) & terms
+    if name_hits:
+        score += 10.0
+        reasons.append("filename matches " + ", ".join(sorted(name_hits)[:3]))
+
+    directory_hits: set = set()
+    for segment in lowered.split("/")[:-1]:
+        directory_hits |= set(_split_identifier(segment)) & terms
+    if directory_hits:
+        score += min(6.0, 3.0 * len(directory_hits))
+        reasons.append("directory matches " + ", ".join(sorted(directory_hits)[:3]))
+
+    body = (content or "").lower()
+    if body:
+        matched = 0
+        occurrences = 0
+        for term in terms:
+            count = body.count(term)
+            if count:
+                matched += 1
+                # Capped per term on purpose. Without it a 2,000-line file that says "task"
+                # two hundred times outranks the fifty-line route file that defines the
+                # endpoint — length would be doing the selecting, not relevance.
+                occurrences += min(count, 8)
+        if matched:
+            score += min(12.0, 0.4 * occurrences)
+            reasons.append(f"body mentions {matched} requirement term(s)")
+
+    if _stem(p) in _ENTRY_STEMS and lowered.count("/") <= 2:
+        score += 5.0
+        reasons.append("application entry point")
+
+    if is_test_path(p):
+        # Not excluded: an existing test can still be the best description of the behaviour
+        # under change. Just outranked, because `pick_exemplars` already quotes the two that
+        # teach the idiom and a third mostly repeats them.
+        score -= 6.0
+        reasons.append("existing test")
+
+    return score, reasons
+
+
+_IMPORT_RE = re.compile(
+    r"""(?:from\s+['"]([^'"\n]+)['"]          # JS/TS:  from './auth'
+        |require\(\s*['"]([^'"\n]+)['"]       # CommonJS: require('../db')
+        |import\s+['"]([^'"\n]+)['"]          # side-effect import
+        |from\s+([.\w]+)\s+import             # Python: from .auth import x
+        |^\s*import\s+([.\w]+)                # Python: import app.auth
+        )""",
+    re.VERBOSE | re.MULTILINE,
+)
+
+
+def _path_index(files: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Lookup keys → real path, for resolving an import specifier to a file in this bundle."""
+    index: Dict[str, str] = {}
+    for f in files:
+        p = (f.get("path") or "").replace("\\", "/")
+        if not p:
+            continue
+        without_ext = re.sub(r"\.[A-Za-z0-9]+$", "", p).lower()
+        for key in (without_ext, without_ext.lstrip("./"),
+                    without_ext + "/index", (without_ext + "/index").lstrip("./")):
+            index.setdefault(key, p)
+    return index
+
+
+def referenced_paths(path: str, content: str, index: Dict[str, str]) -> List[str]:
+    """The files in this bundle that this one imports. Text matching, not a parser.
+
+    Deliberately textual. `code_brief`'s dependency graph has real edges for Python, PHP,
+    Java/Kotlin/Scala, C#/VB.NET and Delphi and **none at all** for JavaScript (C-24) —
+    which is the ecosystem this product has actually been run against. A weaker method that
+    works everywhere beats a stronger one that is blank for the common case, and the only
+    thing this decides is which files to show; nothing it concludes is stated in the brief
+    as a fact.
+
+    A specifier that resolves to nothing is a third-party package, and dropping it silently
+    is correct: `express` is not a file in this repository.
+    """
+    import posixpath
+
+    here = posixpath.dirname((path or "").replace("\\", "/"))
+    found: List[str] = []
+    seen: set = set()
+    for match in _IMPORT_RE.finditer(content or ""):
+        spec = next((g for g in match.groups() if g), "")
+        if not spec:
+            continue
+        if spec.startswith("."):
+            if "/" in spec or spec.startswith("./") or spec.startswith("../"):
+                candidate = posixpath.normpath(posixpath.join(here, spec))
+            else:
+                # Python relative: `.auth` is a sibling module, `..db` one package up.
+                depth = len(spec) - len(spec.lstrip("."))
+                base = here
+                for _ in range(depth - 1):
+                    base = posixpath.dirname(base)
+                candidate = posixpath.normpath(
+                    posixpath.join(base, spec[depth:].replace(".", "/")))
+        else:
+            candidate = spec.replace(".", "/")
+        hit = index.get(candidate.lower()) or index.get(candidate.lower().lstrip("./"))
+        if hit and hit not in seen:
+            seen.add(hit)
+            found.append(hit)
+    return found
+
+
+def select_files(files: List[Dict[str, Any]], requirement: str, budget: int,
+                 exclude: Any = ()) -> Dict[str, Any]:
+    """Which files to quote in full, in a fixed character budget.
+
+    Whole files only. A truncated file is worse than an absent one: the model cannot tell it
+    is reading half of something, so it reasons about the missing half as though it had
+    seen it — which is precisely the invented-helper failure D-316 records.
+
+    `exclude` is the exemplar test files, already quoted verbatim by the conventions brief.
+    Sending them twice spends budget to say the same thing.
+    """
+    terms = requirement_terms(requirement)
+    skip = {(p or "").replace("\\", "/") for p in (exclude or ())}
+    by_path: Dict[str, Dict[str, Any]] = {}
+    for f in files:
+        p = (f.get("path") or "").replace("\\", "/")
+        if p:
+            by_path[p] = f
+
+    ranked: List[Tuple[float, str, Dict[str, Any], List[str]]] = []
+    for f in files:
+        p = (f.get("path") or "").replace("\\", "/")
+        if not p or p in skip or not (f.get("content") or "").strip():
+            continue
+        score, why = score_file(p, f.get("content") or "", terms)
+        if score > 0:
+            ranked.append((score, p, f, why))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+
+    index = _path_index(files)
+    chosen: List[Dict[str, Any]] = []
+    chosen_paths: set = set()
+    omitted: List[str] = []
+    used = 0
+
+    def take(f: Dict[str, Any], p: str, why: List[str], score: float) -> bool:
+        nonlocal used
+        size = len(f.get("content") or "") + len(p) + 8
+        if used + size > budget:
+            if p not in omitted:
+                omitted.append(p)
+            return False
+        chosen.append({"path": p, "chars": len(f.get("content") or ""),
+                       "score": round(score, 1), "why": why})
+        chosen_paths.add(p)
+        used += size
+        return True
+
+    for score, p, f, why in ranked:
+        if p in chosen_paths:
+            continue
+        if not take(f, p, why, score):
+            continue
+        # One hop, taken immediately rather than in a second pass, so a high-scoring file's
+        # imports inherit its priority instead of competing with the whole tail. A test that
+        # imports the route file also needs what the route file imports, or its own import
+        # line is a guess.
+        for dep in referenced_paths(p, f.get("content") or "", index):
+            if dep in chosen_paths or dep in skip:
+                continue
+            dep_file = by_path.get(dep)
+            if dep_file and (dep_file.get("content") or "").strip():
+                take(dep_file, dep, [f"imported by {p}"], score * 0.5)
+
+    return {
+        "selected": chosen,
+        "selected_paths": [c["path"] for c in chosen],
+        "selected_chars": used,
+        "considered": len(ranked),
+        "omitted_for_budget": omitted[:20],
+        "terms": sorted(terms)[:40],
+    }
+
+
+# ══ What the agent is shown about the codebase ═══════════════════════════════
+
 # How much real source may travel beside the briefs. Well under `MAX_AGENT_INPUT_CHARS`
 # (400,000): the requirement, the conventions brief and the project knowledge base all go in
 # the same request, and an input that only just fits leaves no room for them.
 MAX_INLINE_SOURCE_CHARS = 220_000
 
+# In hybrid mode the structural map travels too, so the source budget is smaller than the
+# whole-codebase threshold rather than equal to it.
+MAX_HYBRID_SOURCE_CHARS = 120_000
 
-def for_automation(bundle, max_inline_source: int = MAX_INLINE_SOURCE_CHARS) -> Dict[str, Any]:
+# When the caller asks to narrow deliberately. Smaller again, because the point of asking is
+# to spend less — a "focus" that saved nothing would be a control that lies.
+MAX_FOCUS_SOURCE_CHARS = 60_000
+
+# How much narrowing must actually save before it is worth the completeness it costs.
+# Measured against a real 12-file repository: the ranking picked every file its tests
+# needed but saved 8%, because a structural description of what was dropped cost almost
+# as much as the source it replaced. Trading "a file that mattered might be invisible"
+# for 8% is a bad deal, and not one a user can evaluate from a checkbox — so it is
+# declined here, with the arithmetic stated, rather than honoured because it was asked
+# for.
+MIN_FOCUS_SAVING = 0.25
+
+
+def _quote_files(files: List[Dict[str, Any]], paths: Any = None) -> str:
+    from backend.services.source_bundle import file_header
+    wanted = None if paths is None else list(paths)
+    ordered = files if wanted is None else [
+        f for p in wanted
+        for f in files if (f.get("path") or "").replace("\\", "/") == p
+    ]
+    return "".join(f"{file_header(f.get('path') or '')}{f.get('content') or ''}\n"
+                   for f in ordered)
+
+
+def for_automation(bundle, requirement: str = "", focus: bool = False,
+                   max_inline_source: int = MAX_INLINE_SOURCE_CHARS,
+                   max_hybrid_source: int = MAX_HYBRID_SOURCE_CHARS,
+                   max_focus_source: int = MAX_FOCUS_SOURCE_CHARS) -> Dict[str, Any]:
     """Everything the test-automation agent is told about the codebase. Free, no model.
 
-    Why this decides between two modes rather than always sending a description
-    ---------------------------------------------------------------------------
-    `code_brief` exists because a repository does not fit in one call and a holistic
-    question cannot be chunked. Both are still true here. But writing a *test* needs
-    something an architecture review does not: the actual signature of the function under
-    test, the actual route path, the actual response shape. A dependency graph cannot supply
-    those, and an agent that has to invent them will (D-316).
+    Three modes, not two
+    --------------------
+    `code_brief` exists because a repository does not fit in one call and a holistic question
+    cannot be chunked. Still true. But writing a *test* needs what an architecture review
+    does not: the actual signature of the function under test, the actual route path, the
+    actual response shape. A dependency graph cannot supply those, and an agent that has to
+    invent them will (D-316).
 
-    So when the source is small enough to send — one feature's files, an explicit `files[]`
-    list, a small service — it is sent verbatim and the scripts can be real. When it is not,
-    the structural description goes instead and the agent is told, in as many words, that it
-    is working from a description and must record what it could not see in `assumptions`.
+    - **`source`** — the whole codebase fits, so all of it goes verbatim. Strongest, and the
+      default whenever it is available: narrowing a codebase that already fits would trade
+      accuracy for a saving nobody asked for.
+    - **`hybrid`** — it does not fit, so the files this requirement is about (and what they
+      import) go verbatim inside a budget, beside a structural map of everything else. This
+      costs more than a map alone and is worth it: the alternative was guessing the routes
+      and signatures the tests assert on.
+    - **`description`** — nothing could be selected, because no requirement was supplied to
+      select against or nothing scored. The map alone, and the agent is told so.
 
-    The mode is returned so the screen and the stored result can state which happened. A
-    suite generated from a description is a weaker artifact than one generated from source,
-    and a reader who cannot tell them apart will trust both equally.
+    `focus=True` asks for `hybrid` even when everything would fit. That is the cost lever,
+    and it is opt-in rather than automatic because it is a real trade: a file that turns out
+    to matter and was not selected is invisible except in the description.
+
+    The mode is returned so the screen, the quote and the stored result can all state which
+    happened. A suite generated from a description is a weaker artifact than one generated
+    from source, and a reader who cannot tell them apart will trust both equally.
     """
     # Lazy: `code_brief` pulls in the modernization analyzers and the tree-sitter grammars,
     # and a free quote must not be the thing that makes a route fail to import.
@@ -644,25 +990,107 @@ def for_automation(bundle, max_inline_source: int = MAX_INLINE_SOURCE_CHARS) -> 
     conventions = build(bundle)
     files = list(getattr(bundle, "files", None) or [])
     total = sum(len(f.get("content") or "") for f in files)
-    inline = bool(files) and total <= max_inline_source
+    fits = bool(files) and total <= max_inline_source
 
-    if inline:
-        from backend.services.source_bundle import file_header
-        body = "".join(f"{file_header(f.get('path') or '')}{f.get('content') or ''}\n"
-                       for f in files)
+    def whole_source(extra_note: str = "") -> Dict[str, Any]:
         markdown = (
             "You have been shown the **real source** of this codebase below. Import from "
             "these modules by their real paths, call these functions by their real "
             "signatures, and target these routes by their real paths. Anything you assert "
-            "must be checkable against what is here.\n\n" + body
+            "must be checkable against what is here.\n\n" + _quote_files(files)
         )
-        structural = {"coverage": {}, "coverage_note": "", "stats": {}, "files": len(files)}
-        mode_note = (
-            f"The full source of {len(files)} file(s) was supplied to the agent, so the "
-            f"generated tests can reference real functions and routes."
+        return {
+            "markdown": markdown,
+            "mode": "source",
+            "mode_note": (f"The full source of {len(files)} file(s) was supplied to the "
+                          f"agent, so the generated tests can reference real functions and "
+                          f"routes." + extra_note),
+            "source_chars": total,
+            "prompt_chars": total,
+            "selection": {"selected": [], "selected_paths": [], "selected_chars": total,
+                          "considered": len(files), "omitted_for_budget": [], "terms": []},
+            "conventions": conventions,
+            "code_brief": {"coverage": {}, "coverage_note": "", "stats": {},
+                           "files": len(files)},
+        }
+
+    if fits and not focus:
+        return whole_source()
+
+    budget = max_focus_source if fits else max_hybrid_source
+    selection = select_files(files, requirement, budget,
+                             exclude=conventions.get("exemplar_paths") or ())
+    structural = code_brief.build(bundle)
+    chosen = selection["selected_paths"]
+
+    # Narrowing is only ever worth doing if it leaves the agent better off. Two ways it
+    # does not, and both used to end in `description` mode — which is the worst possible
+    # answer here, because the source *fits*: it was available and was thrown away.
+    #
+    #   - Nothing could be ranked. A pasted artifact has no filename to match a requirement
+    #     against (`source_bundle.from_text` gives it an empty path), so the one file the
+    #     user actually supplied scored nothing and was dropped. That is the same defect
+    #     that once made a paste report "no readable files were found", arriving through a
+    #     new door.
+    #   - Narrowing would not save. On a small codebase the structural description is longer
+    #     than the source it replaces, so the request sends *more* characters and shows
+    #     *less* code. A cost control that raises the cost is a control that lies.
+    #
+    # Either way: send the whole source, and say which of the two happened rather than
+    # quietly ignoring the request.
+    if fits:
+        described = len(structural.get("markdown") or "")
+        if not chosen:
+            return whole_source(
+                " Narrowing was requested, but nothing in this source could be ranked "
+                "against the requirement — a pasted artifact has no filename to match — so "
+                "the whole source was sent instead, which is both cheaper and complete.")
+        narrowed = selection["selected_chars"] + described
+        if narrowed >= total * (1 - MIN_FOCUS_SAVING):
+            return whole_source(
+                f" Narrowing was requested but would have saved little: {narrowed:,} "
+                f"characters against {total:,} for the whole source — under the "
+                f"{int(MIN_FOCUS_SAVING * 100)}% that is worth trading completeness for. "
+                f"The whole source was sent instead.")
+    if chosen:
+        markdown = (
+            "You have been shown **part** of this codebase in full, and a computed "
+            "structural description of **all** of it.\n\n"
+            f"The {len(chosen)} file(s) quoted in full below are the ones this requirement "
+            "appears to be about, plus what they import. Import from these by their real "
+            "paths, call these functions by their real signatures, target these routes by "
+            "their real paths.\n\n"
+            "**Every other file appears only in the structural description that follows.** "
+            "You can rely on the files, declarations and dependencies it states and on "
+            "nothing it does not. A route path, function signature, response shape or "
+            "selector you need from a file you cannot see in full is a **guess** — do not "
+            "assume a file behaves as its name suggests — and every guess goes in "
+            "`assumptions` with what breaks if it is wrong.\n\n"
+            "## The files this requirement is about, in full\n\n"
+            + _quote_files(files, chosen)
+            + "\n## Structural description of the whole codebase\n\n"
+            + (structural.get("markdown") or "")
         )
+        mode = "hybrid"
+        if fits:
+            mode_note = (
+                f"Narrowed deliberately: the whole codebase ({total:,} characters) would "
+                f"have fit, but focus was requested, so the {len(chosen)} file(s) most "
+                f"relevant to the requirement were sent verbatim "
+                f"({selection['selected_chars']:,} characters) alongside a computed "
+                f"structural description of the rest. Cheaper and less complete — a file "
+                f"that turns out to matter and was not selected is invisible except in the "
+                f"description.")
+        else:
+            mode_note = (
+                f"The codebase was too large to send in full ({total:,} characters over the "
+                f"{max_inline_source:,} limit), so the {len(chosen)} file(s) most relevant "
+                f"to the requirement were sent verbatim ({selection['selected_chars']:,} "
+                f"characters) alongside a computed structural description of the rest. "
+                f"Tests against the quoted files can name real functions and routes; "
+                f"anything drawn from the description is a guess and belongs in "
+                f"`assumptions`.")
     else:
-        structural = code_brief.build(bundle)
         markdown = (
             "You were **not** shown this codebase's source — it is too large for one "
             "request. What follows is a computed structural description of it. You can rely "
@@ -672,18 +1100,29 @@ def for_automation(bundle, max_inline_source: int = MAX_INLINE_SOURCE_CHARS) -> 
             "`assumptions` with what breaks if it is wrong.\n\n"
             + (structural.get("markdown") or "")
         )
-        mode_note = (
-            f"The codebase was too large to send ({total:,} characters over the "
-            f"{max_inline_source:,} limit), so the agent was given a computed structural "
-            f"description instead of the source. Generated tests are more likely to need "
-            f"correction, and the agent's `assumptions` list is the place to look first."
-        )
+        mode = "description"
+        if not (requirement or "").strip():
+            mode_note = (
+                f"The codebase was too large to send ({total:,} characters over the "
+                f"{max_inline_source:,} limit) and **no requirement was supplied to select "
+                f"against**, so no file could be quoted in full. Supplying the requirement "
+                f"would let the files it is about travel verbatim, which is the difference "
+                f"between a test that names a real route and one that guesses it.")
+        else:
+            mode_note = (
+                f"The codebase was too large to send ({total:,} characters over the "
+                f"{max_inline_source:,} limit) and no file scored as relevant to the "
+                f"requirement, so the agent was given a computed structural description "
+                f"alone. Generated tests are more likely to need correction, and the "
+                f"agent's `assumptions` list is the place to look first.")
 
     return {
         "markdown": markdown,
-        "mode": "source" if inline else "description",
+        "mode": mode,
         "mode_note": mode_note,
         "source_chars": total,
+        "prompt_chars": selection["selected_chars"] + len(structural.get("markdown") or ""),
+        "selection": selection,
         "conventions": conventions,
         "code_brief": {k: structural.get(k) for k in
                        ("coverage", "coverage_note", "stats", "files")},

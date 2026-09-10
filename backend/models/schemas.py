@@ -426,6 +426,12 @@ class TestAutomationSourceRequest(_UISourceBase, DerivedFromMixin):
     levels: Optional[List[str]] = Field(
         None, description="Any of: Unit, API/Integration, UI/End-to-End. Omit to let the "
                           "agent choose and justify the choice.")
+    focus: bool = Field(
+        False, description="Send only the files this requirement is about, plus what they "
+                           "import, instead of the whole codebase. Cheaper and less "
+                           "complete — a file that turns out to matter and was not selected "
+                           "is invisible except in the structural description. Ignored when "
+                           "narrowing would not actually save anything.")
 
 
 class SensitiveDataSourceRequest(_UISourceBase, DerivedFromMixin):

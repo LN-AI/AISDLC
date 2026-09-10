@@ -24,6 +24,7 @@ Supply either:
 | `requirement` | string | one of requirement/cases_context | What the tests must verify |
 | `cases_context` | string | " | A prior manual catalogue (the `test_cases` array from [`test-case`](test-case.md), JSON-stringified) to automate. Generated tests reference its `test_case_id` values in `covers` |
 | `levels` | string[] | no | Any of `Unit`, `API/Integration`, `UI/End-to-End`. Omit to let the agent choose and justify in `levels_chosen` |
+| `focus` | bool | no | Send only the files the requirement is about, plus what they import, instead of the whole codebase. Cheaper and less complete. Ignored when narrowing would not save anything, or when there is nothing to rank (a paste has no filename) |
 | `files[]` | object[] | one source required | Explicit `{path, content}` list — highest precedence, and the best way to keep a run cheap and in `source` mode |
 | `github_repo_url` + `ref` | string | " | Repository at a branch, tag or commit |
 | `github_pr_url` | string | " | Generate tests for what a PR changed |
@@ -47,9 +48,10 @@ Custom envelope, fields returned at the top level:
 | `not_automated[]` | Each: `requirement_ref`, `reason` — what needs a human, and what they would have to do |
 | `assumptions[]` | Each: `assumption`, `why_unverifiable`, `risk_if_wrong`. **Read this first** — it is where a guessed route or selector is declared |
 | `setup_instructions` | Install steps, the exact command, env vars, how to bring the app up and seed data |
-| `input_mode` | `source` if the codebase was sent verbatim, `description` if it was too large and a computed structural summary went instead |
+| `input_mode` | `source` (whole codebase verbatim), `hybrid` (the files the requirement is about verbatim, beside a structural description of the rest) or `description` (structural description alone) |
+| `input_selection` | Which files were quoted in full and **why each one was picked** — `selected[]` (`path`, `chars`, `score`, `why[]`), `selected_paths`, `selected_chars`, `considered`, `omitted_for_budget[]`, `source_chars`, `prompt_chars` |
 | `test_conventions` | What was found about how this project already tests itself: `note`, `has_tests`, `test_files`, `test_paths`, `frameworks`, `located_by`, `exemplar_paths` |
-| `code_brief` | Coverage facts from the structural analysis, present when `input_mode` is `description` |
+| `code_brief` | Coverage facts from the structural analysis, present when `input_mode` is `hybrid` or `description` |
 | `total_files`, `total_tests`, `levels_present`, `prerequisites_present`, `uncovered_count`, `assumption_count`, `not_automated_count` | Counted server-side from the returned arrays, not taken from the model |
 | `execution_status` | Always `not_executed` — see below |
 | `summary`, `_budget_stats`, `llm_used`, `created_at` | Standard |
@@ -65,9 +67,24 @@ So the honest claim is **"these were generated"**, never "these pass", and `exec
 Two deterministic descriptions are assembled before the call. Both are free — no model, no cost — and both are also returned by the preflight so their limits are visible *before* deciding to spend.
 
 - **`test_context_brief`** — how this project already tests itself: framework, runner config, shared fixtures, where the client is constructed, and **one or two of its real test files quoted verbatim**. This is the D-316 mitigation. A generated test that imports a helper the project does not have fails at collection time and proves nothing, and the strongest defence against that is showing the agent a test that already works.
-- **The codebase itself, in one of two modes.** Small enough to send and the real source goes, so scripts can reference real signatures and routes (`input_mode: source`). Too large and `code_brief`'s computed structural description goes instead (`input_mode: description`), and the agent is told in as many words that anything the description does not state is a guess belonging in `assumptions`.
+- **The codebase itself, in one of three modes.**
+  - **`source`** — it fits, so all of it goes verbatim and the scripts can reference real signatures and routes. The default whenever it is available: narrowing a codebase that already fits would trade accuracy for a saving nobody asked for.
+  - **`hybrid`** — it does not fit, so the files the requirement is about **and what they import** go verbatim inside a budget, beside `code_brief`'s structural description of everything else. The agent is told plainly that a route, signature, response shape or selector it needs from a file it cannot see in full is a guess belonging in `assumptions`.
+  - **`description`** — nothing could be ranked, so the structural description travels alone. Reachable only when the source genuinely does not fit; when it fits, it is sent.
 
-A suite generated from a description is a weaker artifact than one from source. `input_mode` exists so a reader can tell them apart instead of trusting both equally. **Narrowing the source — an explicit `files[]` list, or a PR — is the cheapest way to get the stronger mode.**
+A suite generated from a description is a weaker artifact than one from source. `input_mode` exists so a reader can tell them apart instead of trusting both equally.
+
+### How the files are ranked
+
+Deterministically, with no model: filename and directory matches against the requirement's own words (split on camelCase and snake_case, and pluralised, because requirements say "task" and files are called `tasks.js`), route literals pulled apart so `PUT /tasks/:id` contributes `tasks`, capped body-term frequency so a long file cannot outrank a short one by length alone, a bonus for the application entry point a test needs to make a request against, and a penalty for existing tests, which `pick_exemplars` already quotes.
+
+**Then one dependency hop.** Whatever a selected file imports comes with it, resolved textually against the bundle's own paths. This is the half that matters most: the middleware a route file imports usually matches no word in the requirement and scores zero, and it is exactly the file whose absence makes a generated import line a guess (D-316). Resolution is textual rather than parsed on purpose — `code_brief`'s dependency graph has real edges for Python, PHP, Java, C# and Delphi and **none for JavaScript** (C-24).
+
+Whole files only. A truncated file is worse than an absent one: the model cannot tell it is reading half of something, so it reasons about the missing half as though it had seen it.
+
+`input_selection` returns the ranking — every file, its score and the reason it was picked — on the **free preflight** as well as the result, so a wrong pick is visible before any spend rather than inferred from bad tests afterwards.
+
+**`focus` is the cost lever**, and it is opt-in rather than automatic because it is a real trade: a file that turns out to matter and was not selected is invisible except in the description. It is declined, with the reason stated in `input_mode_note`, when narrowing would not actually save anything — a structural description can be longer than the small codebase it replaces, and a cost control that raises the cost is a control that lies. **An explicit `files[]` list or a PR source is still the sharpest way to narrow**, because you choose the files rather than a heuristic choosing them.
 
 ## Guardrails applied
 

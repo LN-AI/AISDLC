@@ -2167,15 +2167,17 @@ function buildTestAutomationBody() {
     return null;
   }
   const levels = _testAutomationLevels();
+  const focus = !!document.getElementById('test-automation-focus')?.checked;
   if (built.kind === 'form') {
     // Multipart has no array type, so levels travel comma-separated and the server splits
     // them. Empty means "let the agent choose", which is a real option and not a gap.
     built.body.append('requirement', requirement);
     built.body.append('cases_context', cases);
     built.body.append('levels', levels.join(','));
+    built.body.append('focus', focus ? 'true' : 'false');
   } else {
     Object.assign(built.body, {
-      requirement, cases_context: cases,
+      requirement, cases_context: cases, focus,
       ...(levels.length ? { levels } : {}),
     });
   }
@@ -2228,11 +2230,34 @@ function renderAutomationInputMode(q) {
   const mode = q.input_mode;
   if (!mode) return '';
   const conv = q.test_conventions || {};
-  const strong = mode === 'source';
+  const sel = q.input_selection || {};
+  const picked = sel.selected || [];
+  const HEADLINE = {
+    source: 'Your source will be sent verbatim',
+    hybrid: 'The files this requirement is about will be sent verbatim',
+    description: 'Your codebase is too large to send',
+  };
+  // The ranking that chose these files is a heuristic, so it is shown rather than hidden.
+  // A user who can see that the wrong file was picked can narrow the source and run again;
+  // one who cannot see it just gets worse tests and no stated reason why.
+  const chosen = picked.length ? `
+    <details style="margin-top:6px">
+      <summary>${picked.length} file${picked.length === 1 ? '' : 's'} quoted in full
+        (${(sel.selected_chars || 0).toLocaleString()} of
+        ${(sel.source_chars || 0).toLocaleString()} characters), and why</summary>
+      <ul style="margin:6px 0 0 18px">
+        ${picked.map(f => `<li><code>${esc(f.path)}</code>
+          <span class="muted">— ${esc((f.why || []).join('; '))}</span></li>`).join('')}
+      </ul>
+      ${(sel.omitted_for_budget || []).length ? `<div class="muted" style="margin-top:6px">
+        Ranked but left out for lack of room:
+        ${sel.omitted_for_budget.map(p => `<code>${esc(p)}</code>`).join(', ')}.
+        Narrow the source to bring them in.</div>` : ''}
+    </details>` : '';
   return `
     <div class="cost-note" style="margin-top:8px">
-      <div><b>${strong ? 'Your source will be sent verbatim' : 'Your codebase is too large to send'}</b>
-        — ${esc(q.input_mode_note || '')}</div>
+      <div><b>${HEADLINE[mode] || esc(mode)}</b> — ${esc(q.input_mode_note || '')}</div>
+      ${chosen}
       <div style="margin-top:6px">${esc(conv.note || '')}</div>
       ${(conv.exemplar_paths || []).length ? `<div style="margin-top:6px">Following the idiom of
         ${conv.exemplar_paths.map(p => `<code>${esc(p)}</code>`).join(', ')}.</div>` : ''}

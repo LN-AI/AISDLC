@@ -2423,9 +2423,15 @@ async def review_migration_assessment_zip(
 # user ever sees. It cannot share the generic `/api/review/zip/preflight` either, because
 # that prices with `for_bundle` — twenty chunks for an agent that makes one call.
 
-def _automation_briefs(bundle) -> dict:
-    """The two free briefs for a bundle, or a 400 saying there was nothing to read."""
-    inputs = test_context_brief.for_automation(bundle)
+def _automation_briefs(bundle, requirement: str = "", focus: bool = False) -> dict:
+    """The two free briefs for a bundle, or a 400 saying there was nothing to read.
+
+    `requirement` is what the relevance ranking selects against when the codebase is too
+    large to send whole — without it there is nothing to rank by and the agent gets the
+    structural description alone. It is threaded through every door for that reason, and the
+    quote is assembled from the same call so it prices the prompt that will actually run.
+    """
+    inputs = test_context_brief.for_automation(bundle, requirement=requirement, focus=focus)
     if not (inputs["markdown"] or "").strip():
         raise HTTPException(
             status_code=400,
@@ -2446,10 +2452,12 @@ def _automation_from_source(req, request: Request) -> tuple:
     except Exception as exc:
         logger.exception("Source resolution failed for test-automation")
         raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
-    return bundle, _automation_briefs(bundle)
+    return bundle, _automation_briefs(bundle, _automation_selector(req),
+                                      bool(getattr(req, "focus", False)))
 
 
-def _automation_zip(content: bytes, filename: str):
+def _automation_zip(content: bytes, filename: str, requirement: str = "",
+                    focus: bool = False):
     """Resolve an uploaded archive to (bundle, briefs)."""
     if not (filename or "").endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
@@ -2459,7 +2467,7 @@ def _automation_zip(content: bytes, filename: str):
         raise HTTPException(status_code=400, detail="Not a valid zip file")
     except source_bundle.SourceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return bundle, _automation_briefs(bundle)
+    return bundle, _automation_briefs(bundle, requirement, focus)
 
 
 def _automation_conventions(inputs: dict) -> dict:
@@ -2467,6 +2475,38 @@ def _automation_conventions(inputs: dict) -> dict:
     return {k: inputs["conventions"][k] for k in
             ("note", "has_tests", "test_files", "test_paths", "frameworks",
              "located_by", "exemplar_paths")}
+
+
+def _automation_selector(req) -> str:
+    """What the relevance ranking reads. Both fields, because both say what to test.
+
+    A prior test-case catalogue names the same routes and entities the requirement does, in
+    more words — so a caller who supplies only `cases_context` still gets relevant files
+    selected rather than a structural description of everything.
+    """
+    return "\n".join(part for part in (
+        (getattr(req, "requirement", None) or "").strip(),
+        (getattr(req, "cases_context", None) or "").strip(),
+    ) if part)
+
+
+def _automation_selection(inputs: dict) -> dict:
+    """Which files were quoted in full, and why each one. Shown on the quote and the result.
+
+    The ranking is a heuristic, so it is displayed rather than hidden: a user who can see
+    that the wrong file was picked can narrow the source and run again, and one who cannot
+    see it just gets worse tests for no stated reason.
+    """
+    sel = inputs.get("selection") or {}
+    return {
+        "selected": sel.get("selected") or [],
+        "selected_paths": sel.get("selected_paths") or [],
+        "selected_chars": sel.get("selected_chars") or 0,
+        "considered": sel.get("considered") or 0,
+        "omitted_for_budget": sel.get("omitted_for_budget") or [],
+        "source_chars": inputs.get("source_chars") or 0,
+        "prompt_chars": inputs.get("prompt_chars") or 0,
+    }
 
 
 def _automation_quote(bundle, inputs: dict, requirement: str, cases: str,
@@ -2501,6 +2541,7 @@ def _automation_quote(bundle, inputs: dict, requirement: str, cases: str,
         # works from a structural summary and its `assumptions` list does more of the work.
         "input_mode": inputs["mode"],
         "input_mode_note": inputs["mode_note"],
+        "input_selection": _automation_selection(inputs),
         "test_conventions": _automation_conventions(inputs),
         "code_brief": inputs["code_brief"],
         "files_preview": _files_preview(bundle),
@@ -2552,6 +2593,7 @@ def _run_automation(bundle, inputs: dict, requirement: str, cases: str,
     # too many.
     result["input_mode"] = inputs["mode"]
     result["input_mode_note"] = inputs["mode_note"]
+    result["input_selection"] = _automation_selection(inputs)
     result["test_conventions"] = _automation_conventions(inputs)
     result["code_brief"] = inputs["code_brief"]
     return result
@@ -2571,10 +2613,13 @@ async def preflight_test_automation_zip(
     file: UploadFile = File(...),
     requirement: str = Form(""),
     cases_context: str = Form(""),
+    focus: bool = Form(False),
 ):
     """The same quote for an uploaded archive. **Free — no model call.**"""
     content = await file.read()
-    bundle, inputs = await asyncio.to_thread(_automation_zip, content, file.filename or "")
+    selector = "\n".join(p for p in (requirement.strip(), cases_context.strip()) if p)
+    bundle, inputs = await asyncio.to_thread(
+        _automation_zip, content, file.filename or "", selector, focus)
     return _automation_quote(bundle, inputs, requirement.strip(), cases_context.strip(), request)
 
 
@@ -2600,6 +2645,7 @@ async def review_test_automation_upload_zip(
     levels: str = Form(""),
     project_name: str = Form(""),
     context: str = Form(""),
+    focus: bool = Form(False),
 ):
     """Generate the suite from an uploaded archive.
 
@@ -2609,7 +2655,9 @@ async def review_test_automation_upload_zip(
     and not a missing value.
     """
     content = await file.read()
-    bundle, inputs = await asyncio.to_thread(_automation_zip, content, file.filename or "")
+    selector = "\n".join(p for p in (requirement.strip(), cases_context.strip()) if p)
+    bundle, inputs = await asyncio.to_thread(
+        _automation_zip, content, file.filename or "", selector, focus)
     chosen = [part.strip() for part in (levels or "").split(",") if part.strip()]
     return await asyncio.to_thread(
         _run_automation, bundle, inputs, requirement.strip(), cases_context.strip(),

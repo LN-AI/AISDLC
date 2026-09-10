@@ -522,6 +522,19 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
               <b>UI/End-to-End</b>, not a unit test &mdash; unit tests check code, not acceptance
               criteria.</div>
           </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="test-automation-focus">
+              Send only the code this requirement is about
+            </label>
+            <div class="field-hint">Cheaper. The files your requirement names &mdash; plus what
+              they import &mdash; are sent in full, and everything else only as a structural
+              description. <b>Less complete:</b> a file that turns out to matter and was not
+              picked is invisible to the agent except in that description. The estimate shows
+              exactly which files were chosen and why, before you spend anything. Ignored when
+              narrowing would not actually save anything. A codebase too large to send whole is
+              narrowed this way regardless.</div>
+          </div>
 
           <div class="section-title">2. Which code should it write tests against?</div>
           <div id="test-automation-source-picker"></div>
