@@ -810,7 +810,36 @@ class SDLCOrchestrator:
             context=context,
             llm_override=llm_override,
         )
-        files = result.get("test_files") or []
+        # Every array below is written by the model, and a schema is a request rather than a
+        # guarantee. A live run against a large codebase returned `test_files` as a list of
+        # **strings** instead of objects; the next line called `.get()` on a string and the
+        # caller received an HTTP 500 carrying an `AttributeError` — after the call had been
+        # made and billed. So each row is checked before it is used, non-conforming rows are
+        # dropped rather than coerced (a string cannot supply a path, a framework or a list
+        # of test names, and inventing them would be a claim nothing supports), and what was
+        # dropped is reported rather than silently discarded.
+        def _rows(value):
+            items = value if isinstance(value, list) else []
+            return [row for row in items if isinstance(row, dict)], sum(
+                1 for row in items if not isinstance(row, dict))
+
+        files, dropped_files = _rows(result.get("test_files"))
+        coverage, dropped_coverage = _rows(result.get("requirement_coverage"))
+        assumptions, dropped_assumptions = _rows(result.get("assumptions"))
+        not_automated, dropped_not_automated = _rows(result.get("not_automated"))
+        malformed = (dropped_files + dropped_coverage + dropped_assumptions
+                     + dropped_not_automated)
+        if malformed:
+            logger.warning(
+                "test-automation: discarded %d response row(s) that were not objects "
+                "(test_files=%d, requirement_coverage=%d, assumptions=%d, not_automated=%d)",
+                malformed, dropped_files, dropped_coverage, dropped_assumptions,
+                dropped_not_automated)
+            result["malformed_rows"] = malformed
+        result["test_files"] = files
+        result["requirement_coverage"] = coverage
+        result["assumptions"] = assumptions
+        result["not_automated"] = not_automated
 
         # The same guard `generate_test_cases` carries, and for the same reason: neither QA
         # agent goes through `BaseAgent.review()`, so `attest`'s degeneracy check never runs
@@ -818,6 +847,10 @@ class SDLCOrchestrator:
         # and a truncated response here loses `test_files` while a summary written earlier
         # in the stream survives. Storing that reads as "we generated a suite" when nothing
         # runnable came back.
+        #
+        # Reached with `files` already filtered, so a response whose every entry was the
+        # wrong shape lands here — which is right: it is malformed, not empty, and this is
+        # the error that says so.
         if not files and not (result.get("summary") or "").strip():
             raise RuntimeError(
                 "Test automation generation returned no test files (no test_files and no "
@@ -832,7 +865,6 @@ class SDLCOrchestrator:
         # what the reader will quote, and a model that miscounts its own array would put a
         # wrong number on a screen next to the right files.
         test_names = [n for f in files for n in (f.get("test_names") or [])]
-        coverage = result.get("requirement_coverage") or []
         result["total_files"] = len(files)
         result["total_tests"] = len(test_names)
         result["levels_present"] = sorted({f.get("level") or "" for f in files} - {""})
@@ -840,8 +872,8 @@ class SDLCOrchestrator:
             {p for f in files for p in (f.get("prerequisites") or []) if p and p != "none"}
         )
         result["uncovered_count"] = sum(1 for row in coverage if not row.get("covered"))
-        result["assumption_count"] = len(result.get("assumptions") or [])
-        result["not_automated_count"] = len(result.get("not_automated") or [])
+        result["assumption_count"] = len(assumptions)
+        result["not_automated_count"] = len(not_automated)
         # The claim this product must never make silently. Nothing in the review pipeline
         # compiles or runs what it produces (D-05), so a stored suite is "generated", never
         # "passing" — and the field says so rather than leaving a reader to infer it from

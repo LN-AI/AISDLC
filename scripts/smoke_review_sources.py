@@ -5114,6 +5114,50 @@ def main():
                   _c34.post("/api/review/test-automation", json=_body34,
                             headers=_H34).status_code >= 500,
                   "storing it reads as 'we generated a suite' when nothing came back")
+
+            # A schema is a request, not a guarantee. On a live run against a large
+            # codebase the model returned `test_files` as a list of **strings**; the
+            # orchestrator called `.get()` on a string and the caller received an HTTP 500
+            # carrying an AttributeError -- after the call had been made and billed. A row
+            # of the wrong shape must not be able to reach the arithmetic.
+            llm_gateway.call_tool = lambda *a, **k: {
+                "test_files": ["tests/test_thing.py", {"path": "tests/test_real.py",
+                                                       "framework": "pytest", "level": "Unit",
+                                                       "content": "def test_x():\n    assert 1\n",
+                                                       "test_names": ["test_x"], "covers": ["r1"],
+                                                       "prerequisites": ["none"]}],
+                "requirement_coverage": ["not an object", {"requirement_ref": "r1",
+                                                           "covered": False}],
+                "assumptions": ["bare string"],
+                "not_automated": ["bare string"],
+                "summary": "one real file and several malformed rows",
+            }
+            _mal34 = _c34.post("/api/review/test-automation", json=_body34, headers=_H34)
+            check("a model row of the wrong shape is dropped, not crashed on",
+                  _mal34.status_code == 200,
+                  f"{_mal34.status_code} {_mal34.text[:220]} -- the call is already paid for "
+                  "by the time the response is parsed, so a malformed row must not turn a "
+                  "spent generation into a 500")
+            _mj34 = _mal34.json() if _mal34.status_code == 200 else {}
+            check("...and only the well-formed rows are counted",
+                  _mj34.get("total_files") == 1 and _mj34.get("total_tests") == 1,
+                  f"files={_mj34.get('total_files')} tests={_mj34.get('total_tests')}")
+            check("...and the arithmetic over the other arrays survives it too",
+                  _mj34.get("uncovered_count") == 1
+                  and _mj34.get("assumption_count") == 0
+                  and _mj34.get("not_automated_count") == 0,
+                  f"uncovered={_mj34.get('uncovered_count')} "
+                  f"assumptions={_mj34.get('assumption_count')} "
+                  f"not_automated={_mj34.get('not_automated_count')}")
+            check("...and what was discarded is reported rather than silently dropped",
+                  _mj34.get("malformed_rows") == 4, str(_mj34.get("malformed_rows")))
+
+            # All rows malformed is malformed, not empty -- and the degeneracy error is the
+            # one that says so.
+            llm_gateway.call_tool = lambda *a, **k: {"test_files": ["a", "b"], "summary": ""}
+            check("a response whose every row is the wrong shape is an error, not an empty suite",
+                  _c34.post("/api/review/test-automation", json=_body34,
+                            headers=_H34).status_code >= 500)
     finally:
         llm_gateway.call_tool = _prev34
 

@@ -252,6 +252,13 @@ test files. Follow them:
   is the single most common way generated tests fail: the file does not import, so nothing in it ever runs and
   the whole suite proves nothing.
 - Match the existing file naming, directory and assertion style, so the project's runner collects your files.
+- **Patch a name where it is looked up, not where it is defined, and never patch a name that is imported
+  inside a function.** A module that does `from x import y` at the top has `y` as a module attribute and it
+  can be patched there; a module that imports inside a function binds a *local* name that is never a module
+  attribute, so patching it raises `AttributeError: module has no attribute` every time — patch the source
+  module's own symbol instead. This is measured, not hypothetical: a live run correctly spotted a lazy
+  import, quoted the docstring that confirmed it, and still patched the importing module — four tests
+  failed at setup and asserted nothing.
 
 If the project has no tests at all, you were told so explicitly. In that case pick the framework that matches
 the language and stack you can see, and record every convention you had to choose in `assumptions`.
