@@ -4545,6 +4545,306 @@ def main():
         llm_gateway.call_tool = _prev33
 
 
+    # ── 34 ────────────────────────────────────────────────────────────────
+    section("34. Test automation: four doors, and the honesty that makes it worth having")
+
+    from backend.services import test_context_brief as _tcb34
+    from backend.services import legacy_guard as _lg34
+    from backend.agents.qa_intelligence import test_automation_agent as _taa34
+    import backend.main as _m34
+
+    # -- the reserved-field collision, which broke a renderer and hid a warning ----
+    #
+    # `result.coverage` is chunk coverage platform-wide (`{chunks_total, ...}`) and the
+    # shared `renderReviewTransparency` reads it. This agent's per-requirement coverage
+    # shadowed it: the screen crashed on a partial run, and — worse — a Green gate over an
+    # incomplete review stopped saying it was incomplete. Asserted as a property so the
+    # name cannot drift back.
+    _props34 = _taa34.TEST_AUTOMATION_TOOL_SCHEMA["input_schema"]["properties"]
+    check("the suite's coverage does not shadow the platform's coverage field",
+          "coverage" not in _props34 and "requirement_coverage" in _props34,
+          f"{sorted(_props34)} -- `coverage` is chunk coverage read by "
+          "renderReviewTransparency; shadowing it silences the partial-review warning")
+    check("...and every requirement is asked for, covered or not",
+          "requirement_coverage" in _taa34.TEST_AUTOMATION_TOOL_SCHEMA["input_schema"]["required"],
+          "a suite that lists only what it covered cannot be read for gaps")
+    check("...and the two honesty fields are required, not optional",
+          {"assumptions", "not_automated"} <=
+          set(_taa34.TEST_AUTOMATION_TOOL_SCHEMA["input_schema"]["required"]),
+          "an assumptions list the model may omit is the C-66 failure mode: a green suite "
+          "that proves nothing, with nothing saying which guesses it rests on")
+
+    # -- metering: runs billed, quotes free -------------------------------
+    check("both run doors are metered as the product",
+          all(_lg34.product_for_request("POST", p) == "test-automation" for p in (
+              "/api/review/test-automation",
+              "/api/review/test-automation/upload-zip")),
+          "an unmapped route is entitled to nobody and billed to nothing (D-289)")
+    check("...and neither quote door is, because a quote spends nothing",
+          all(_lg34.product_for_request("POST", p) is None for p in (
+              "/api/review/test-automation/preflight",
+              "/api/review/test-automation/preflight-zip")),
+          "refusing to quote somebody near their cap tells them less than the quote would")
+    check("...and it is not a fan-out, because it makes one call",
+          "/api/review/test-automation" not in set(_lg34._CHUNKABLE_ROUTES),
+          "one coherent suite has no merge rule across chunks; listed here it would "
+          "reserve for twenty calls and make one, denying calls that would have succeeded")
+
+    # -- the conventions brief: the D-316 mitigation ----------------------
+    class _B34:
+        def __init__(self, files):
+            self.files = files
+            self.source_type, self.label, self.ref = "files", "s34", ""
+            self.truncated, self.truncation_reason = False, ""
+            self.untrusted_label, self.skipped, self.stats = "", [], {}
+            self.is_diff, self.suppression, self.meta = False, None, {}
+
+        def summary(self):
+            return {"source_type": "files", "files_reviewed": len(self.files)}
+
+    _real34 = _B34([
+        {"path": "conftest.py",
+         "content": "import pytest\nfrom fastapi.testclient import TestClient\n"
+                    "from app.main import app\n\n@pytest.fixture\ndef client():\n"
+                    "    return TestClient(app)\n"},
+        {"path": "tests/test_checkout.py",
+         "content": "import pytest\n\ndef test_ok(client):\n"
+                    "    assert client.post('/checkout').status_code == 200\n"},
+        {"path": "tests/test_slug.py", "content": "def test_slug():\n    assert 1\n"},
+    ])
+    _brief34 = _tcb34.build(_real34)
+    check("the brief finds the project's own tests",
+          _brief34["has_tests"] and _brief34["test_files"] == 2,
+          f"{_brief34['test_files']} found -- without them the agent invents an idiom (D-316)")
+    check("...and the framework they actually use",
+          _brief34["frameworks"] == {"pytest": 1}, str(_brief34["frameworks"]))
+    check("...and where the client is built, which is usually not in a test file",
+          any(r["idiom"] == "FastAPI/Starlette TestClient" and r["path"] == "conftest.py"
+              for r in _brief34["client_idioms"]),
+          f"{_brief34['client_idioms']} -- scanning only test files reported no idiom at "
+          "all for a textbook pytest project, blanking the most useful section")
+    check("...and quotes the integration test before the unit test",
+          _brief34["exemplar_paths"][:1] == ["tests/test_checkout.py"],
+          f"{_brief34['exemplar_paths']} -- a test that goes through a client teaches the "
+          "idiom a requirement-driven test needs; a two-line unit test does not")
+
+    # A file named like a pytest test that is not one. Three product files in this very
+    # repository satisfy the naming convention (`test_context_brief.py` and the two QA
+    # agents), and reporting them as the project's suite is how a brief comes to describe
+    # a convention that does not exist.
+    check("a file named like a test but declaring none is not counted",
+          _tcb34.build(_B34([{"path": "svc/test_helpers.py",
+                              "content": "def build():\n    return 1\n"}]))["test_files"] == 0,
+          "pytest's test_*.py convention is legal for any module")
+    check("...but one that declares a test is",
+          _tcb34.build(_B34([{"path": "test_orders.py",
+                              "content": "def test_total():\n    assert 1\n"}]))["test_files"] == 1)
+    # Found by running the brief against a real Jest repository (taskflow-api): `describe`,
+    # `it` and `expect` are **globals** under Jest, Mocha and Vitest, so an ordinary suite
+    # imports nothing any text marker can see and the brief reported "no framework is
+    # confirmed" for a project whose package.json plainly said `jest`. The manifest is the
+    # exact answer where a pattern was a guess.
+    _js34 = _tcb34.build(_B34([
+        {"path": "package.json", "content": '{"scripts":{"test":"jest"},'
+                                            '"devDependencies":{"jest":"^29.7.0",'
+                                            '"supertest":"^6.3.3"}}'},
+        {"path": "tests/tasks.test.js",
+         "content": "const request = require('supertest');\nconst app = require('../src/app');\n"
+                    "describe('tasks', () => {\n  it('creates a task', async () => {\n"
+                    "    const r = await request(app).get('/tasks');\n"
+                    "    expect(r.status).toBe(200);\n  });\n});\n"},
+    ]))
+    check("a JavaScript runner is read from the manifest, not guessed from imports",
+          "Jest" in (_js34["declared_frameworks"] or []),
+          f"{_js34['declared_frameworks']} -- Jest/Mocha/Vitest inject describe/it/expect as "
+          "globals, so no import-based marker can ever fire for an ordinary suite")
+    check("...and the note says which claim is which",
+          "manifest declares" in _js34["note"] and "globals" in _js34["note"],
+          f"{_js34['note'][:200]!r} -- 'declared in package.json' is an exact claim and "
+          "'imported by three files' is an inferred one; collapsing them loses that")
+    check("...while a project declaring nothing still says so",
+          "no framework is confirmed" in _tcb34.build(_B34([
+              {"path": "tests/t.js",
+               "content": "describe('x', () => { it('y', () => {}); });\n"}]))["note"])
+
+    check("a framework is claimed only on an import or a call, never a mention",
+          not _tcb34.build(_B34([{"path": "tests/t.py",
+                                  "content": "# we should use cypress and rspec one day\n"
+                                             "def test_x():\n    assert 1\n"}]))["frameworks"],
+          "bare substrings matched this module's own marker table and reported a "
+          "Python/SQLite application as using Cypress and RSpec")
+
+    _none34 = _tcb34.build(_B34([{"path": "app/main.py", "content": "print(1)\n"}]))
+    check("a project with no tests gets an honest blank, not a guess",
+          not _none34["has_tests"] and "no established idiom" in _none34["note"],
+          f"{_none34['note'][:160]!r} -- this is the case where a generated suite is least "
+          "likely to run, so it is the case that must say so")
+    check("...and is told to declare its assumptions instead",
+          "assumption" in _none34["note"].lower())
+
+    # -- the two input modes, and saying which one happened ---------------
+    _src34 = _tcb34.for_automation(_real34)
+    check("a small source is sent verbatim, so tests can name real functions",
+          _src34["mode"] == "source" and "===== FILE: conftest.py =====" in _src34["markdown"],
+          f"mode={_src34['mode']}")
+    _desc34 = _tcb34.for_automation(_real34, max_inline_source=10)
+    check("...and one too large is described instead",
+          _desc34["mode"] == "description", f"mode={_desc34['mode']}")
+    check("...and the described mode says the difference out loud",
+          "guess" in _desc34["markdown"] and "assumptions" in _desc34["markdown"],
+          "a suite built from a description is a weaker artifact than one built from "
+          "source, and a reader who cannot tell them apart trusts both equally")
+
+    # -- the four doors, driven for real, with the gateway stubbed --------
+    _calls34 = []
+
+    def _fake34(system_prompt, user_content, schema, override=None, max_tokens=None, **kw):
+        _calls34.append(schema.get("name", ""))
+        return {
+            "levels_chosen": [{"level": "API/Integration", "rationale": "an HTTP route"}],
+            "test_files": [{
+                "path": "tests/test_export_authz.py", "framework": "pytest",
+                "level": "API/Integration", "prerequisites": ["running application", "database"],
+                "content": "def test_denied(client):\n    assert client.get('/x').status_code == 403\n",
+                "test_names": ["test_denied"], "covers": ["treating-clinician-only export"],
+            }],
+            "requirement_coverage": [
+                {"requirement_ref": "treating-clinician-only export", "covered": True,
+                 "test_names": ["test_denied"]},
+                {"requirement_ref": "the button is hidden", "covered": False,
+                 "note": "needs the markup"},
+            ],
+            "not_automated": [{"requirement_ref": "the button is hidden",
+                               "reason": "a visual assertion with no markup supplied"}],
+            "assumptions": [{"assumption": "client fixture exists",
+                             "why_unverifiable": "conftest was supplied, so low risk",
+                             "risk_if_wrong": "every test fails at setup"}],
+            "setup_instructions": "pip install -r requirements.txt && pytest",
+            "summary": "One integration test file.",
+        }
+
+    _prev34 = llm_gateway.call_tool
+    llm_gateway.call_tool = _fake34
+    _m34.llm_settings_service.is_llm_configured = lambda: True
+    try:
+        from fastapi.testclient import TestClient as _TC34
+        with _TC34(_m34.app, raise_server_exceptions=False) as _c34:
+            _tok34 = _c34.post("/api/auth/login",
+                               json={"username": "admin",
+                                     "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+            _pid34 = _c34.post("/api/v1/projects", json={"name": "S34"},
+                               headers={"Authorization": f"Bearer {_tok34}"}
+                               ).json()["project"]["id"]
+            _H34 = {"Authorization": f"Bearer {_tok34}", "X-Project-Id": _pid34}
+            _body34 = {
+                "requirement": "Only the treating clinician may export a visit history.",
+                "files": [{"path": p["path"], "content": p["content"]} for p in _real34.files],
+                "levels": ["API/Integration"],
+            }
+
+            _n34 = len(_calls34)
+            _q34 = _c34.post("/api/review/test-automation/preflight",
+                             json=_body34, headers=_H34)
+            check("the quote answers", _q34.status_code == 200,
+                  f"{_q34.status_code} {_q34.text[:200]}")
+            check("...and calls no model", len(_calls34) == _n34,
+                  "a free preflight that spends is not free")
+            _qj34 = _q34.json() if _q34.status_code == 200 else {}
+            check("...and names a ceiling a person can approve against",
+                  (_qj34.get("estimate") or {}).get("ceiling_usd", 0) > 0,
+                  str(_qj34.get("estimate"))[:160])
+            check("...and says which input mode the money buys",
+                  _qj34.get("input_mode") == "source",
+                  f"{_qj34.get('input_mode')} -- it changes how good the tests can be, so "
+                  "it belongs on the quote and not only on the result")
+            check("...and how this project already tests itself, before any spend",
+                  (_qj34.get("test_conventions") or {}).get("has_tests") is True,
+                  str(_qj34.get("test_conventions"))[:160])
+
+            # A quote does not require the requirement, on purpose: someone pricing the job
+            # before writing it should not have to invent one to get a number.
+            check("a quote is given without a requirement",
+                  _c34.post("/api/review/test-automation/preflight",
+                            json={k: v for k, v in _body34.items() if k != "requirement"},
+                            headers=_H34).status_code == 200,
+                  "pricing the job is how you decide whether to write the requirement")
+
+            _n34 = len(_calls34)
+            _r34 = _c34.post("/api/review/test-automation", json=_body34, headers=_H34)
+            check("the run answers", _r34.status_code == 200,
+                  f"{_r34.status_code} {_r34.text[:300]}")
+            check("...in exactly one model call",
+                  len(_calls34) - _n34 == 1, f"{len(_calls34) - _n34} calls")
+            _rj34 = _r34.json() if _r34.status_code == 200 else {}
+            check("...storing a review of its own type",
+                  _rj34.get("review_id") and _rj34.get("total_files") == 1,
+                  str(_rj34)[:200])
+            check("...counting the tests itself rather than trusting the model",
+                  _rj34.get("total_tests") == 1, str(_rj34.get("total_tests")))
+            check("...and reporting the requirement it did NOT cover",
+                  _rj34.get("uncovered_count") == 1,
+                  f"{_rj34.get('uncovered_count')} -- a suite that lists only its successes "
+                  "reads as complete coverage")
+            check("...and never claiming the tests were run",
+                  _rj34.get("execution_status") == "not_executed",
+                  f"{_rj34.get('execution_status')} -- nothing in this pipeline compiles or "
+                  "runs what it produces (D-05), and silence would let a reader assume it did")
+
+            # A codebase with nothing to say what to test is a 400, not a suite invented
+            # from whatever the repository happened to contain.
+            check("a codebase with no requirement and no cases is refused",
+                  _c34.post("/api/review/test-automation",
+                            json={k: v for k, v in _body34.items() if k != "requirement"},
+                            headers=_H34).status_code == 400,
+                  "a codebase on its own does not say what to test")
+            check("...and a source with nothing readable in it is too",
+                  _c34.post("/api/review/test-automation",
+                            json={"requirement": "x", "files": []},
+                            headers=_H34).status_code == 400)
+
+            # The zip pair. It exists because the browser screen uploads an archive, and a
+            # quote available only on the JSON API is a quote no actual user ever sees.
+            _zip34 = io.BytesIO()
+            with zipfile.ZipFile(_zip34, "w") as _zf34:
+                for _f34 in _real34.files:
+                    _zf34.writestr(_f34["path"], _f34["content"])
+            _bytes34 = _zip34.getvalue()
+
+            _n34 = len(_calls34)
+            _zq34 = _c34.post("/api/review/test-automation/preflight-zip",
+                              files={"file": ("src.zip", _bytes34, "application/zip")},
+                              data={"requirement": "Only the treating clinician may export."},
+                              headers=_H34)
+            check("an uploaded archive can be quoted too",
+                  _zq34.status_code == 200, f"{_zq34.status_code} {_zq34.text[:200]}")
+            check("...still calling no model", len(_calls34) == _n34)
+
+            _n34 = len(_calls34)
+            _zr34 = _c34.post("/api/review/test-automation/upload-zip",
+                              files={"file": ("src.zip", _bytes34, "application/zip")},
+                              data={"requirement": "Only the treating clinician may export.",
+                                    "levels": "API/Integration"},
+                              headers=_H34)
+            check("...and run", _zr34.status_code == 200,
+                  f"{_zr34.status_code} {_zr34.text[:300]}")
+            check("...in one call, like the JSON door",
+                  len(_calls34) - _n34 == 1, f"{len(_calls34) - _n34} calls")
+            check("a non-zip upload is refused rather than parsed",
+                  _c34.post("/api/review/test-automation/upload-zip",
+                            files={"file": ("notes.txt", b"hello", "text/plain")},
+                            data={"requirement": "x"}, headers=_H34).status_code == 400)
+
+            # The degeneracy guard. Neither QA agent goes through `attest`, so a truncated
+            # response returning no files must raise rather than store an empty suite as a
+            # successful generation.
+            llm_gateway.call_tool = lambda *a, **k: {"test_files": [], "summary": ""}
+            check("a response with no files and no summary is an error, not a clean result",
+                  _c34.post("/api/review/test-automation", json=_body34,
+                            headers=_H34).status_code >= 500,
+                  "storing it reads as 'we generated a suite' when nothing came back")
+    finally:
+        llm_gateway.call_tool = _prev34
+
     print()
     print("-" * 60)
     if FAILED:

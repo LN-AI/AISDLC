@@ -397,6 +397,37 @@ class SecuritySourceRequest(_UISourceBase, DerivedFromMixin):
     system_type: Optional[str] = None
 
 
+class TestAutomationSourceRequest(_UISourceBase, DerivedFromMixin):
+    """Generate runnable automated tests from a requirement *and* the code under test.
+
+    The one QA screen that takes a source. It sits with the design agents above rather than
+    with the other two QA screens because it shares their shape — one call over a whole
+    codebase, priced from the assembled prompt rather than a chunk count — but it differs
+    from them in one way worth knowing: when the source is small enough it is sent
+    **verbatim** instead of as a structural description, because a test has to name a real
+    function signature and a dependency graph does not carry one. `test_context_brief`
+    decides which, and reports the mode either way.
+
+    `derived_from` is inherited so a suite can be chained from the manual test cases it
+    automates, the way `test-case` chains from `test-scenario`.
+    """
+    requirement: Optional[str] = Field(
+        None, description="What the tests must verify. Required to run; **not** required to "
+                          "get a quote, because the quote is how you decide whether to run "
+                          "at all.")
+    code: Optional[str] = Field(
+        None, description="The code under test, pasted. A separate field from `requirement` "
+                          "on purpose: `source_bundle.resolve` treats `code`/`artifact`/"
+                          "`text`/`content` as the source, so a requirement in one of those "
+                          "names would be read as the code to write tests against.")
+    cases_context: Optional[str] = Field(
+        None, description="A prior manual test-case catalogue to automate (the `test_cases` "
+                          "array from a Test Case Generation run, JSON-stringified)")
+    levels: Optional[List[str]] = Field(
+        None, description="Any of: Unit, API/Integration, UI/End-to-End. Omit to let the "
+                          "agent choose and justify the choice.")
+
+
 class SensitiveDataSourceRequest(_UISourceBase, DerivedFromMixin):
     """A sensitive-data scan over any source. Fans out over chunks like Code Review, unlike
     the two design agents above — see `SensitiveDataAgent.scan` for why."""

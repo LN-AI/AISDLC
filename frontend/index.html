@@ -107,6 +107,9 @@
             <li class="nav-item" data-page="test-case" data-product="test-case">
               <span class="nav-icon">📝</span> Test Case Generation
             </li>
+            <li class="nav-item" data-page="test-automation" data-product="test-automation">
+              <span class="nav-icon">⚙️</span> Test Automation Generation
+            </li>
           </ul>
         </li>
 
@@ -476,6 +479,167 @@ As a clinician, I want to export a patient's full medical history to CSV so I ca
           <div id="test-case-runs" class="run-history-scroll"></div>
         </div>
         <div id="test-case-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Test Automation Generation Page.
+           The one QA screen that takes a source, because a line of test code has to name a
+           real route, function or fixture and a manual step does not. Reuses the shared
+           source picker (`renderSourcePicker`) rather than a private copy, so the six ways
+           in stay the same across every screen that reads code. -->
+      <div id="page-test-automation" class="page">
+        <div class="page-header">
+          <h1>Test Automation Generation</h1>
+          <p class="subtitle">Runnable automated tests written against your codebase &mdash; in your
+            project's own framework, reusing your own fixtures</p>
+          <p class="subtitle">Generates real test files, not manual steps: pytest, Playwright, Jest,
+            JUnit, xUnit, whatever this project already uses. It reads your existing tests first and
+            follows their idiom, tells you what a script genuinely <b>cannot</b> verify instead of
+            faking it, and lists every fact it had to guess along with what breaks if the guess is
+            wrong. <b>Nothing is executed</b> &mdash; you get a suite to run, not a result. You are
+            shown the cost before anything is spent.</p>
+        </div>
+        <div class="form-card">
+          <div class="section-title" style="margin-top:0">1. What should the tests verify?</div>
+          <div class="form-group">
+            <label>Requirement / user story / acceptance criteria <span class="required">*</span></label>
+            <textarea id="test-automation-requirement" rows="6" placeholder="What behaviour must the tests prove?
+
+e.g. A clinician may export a patient's visit history to CSV only if they are the treating clinician. Anyone else gets 403 and the attempt is written to the audit log."></textarea>
+            <div class="field-hint">Or paste a prior Test Case catalogue below and leave this empty
+              &mdash; either one is enough.</div>
+          </div>
+          <div class="form-group">
+            <label>Manual test cases to automate (optional)</label>
+            <textarea id="test-automation-cases" rows="4" placeholder="Paste the test_cases array from a Test Case Generation run, or use the button below."></textarea>
+            <button type="button" class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
+                    onclick="useLastTestCaseResult()">&#8627; Use last Test Case result</button>
+          </div>
+          <div class="form-group">
+            <label>Test levels (optional)</label>
+            <div id="test-automation-levels" class="checkbox-row"></div>
+            <div class="field-hint">Leave all unchecked to let the agent choose and explain why.
+              A requirement about user-visible behaviour is usually <b>API/Integration</b> or
+              <b>UI/End-to-End</b>, not a unit test &mdash; unit tests check code, not acceptance
+              criteria.</div>
+          </div>
+
+          <div class="section-title">2. Which code should it write tests against?</div>
+          <div id="test-automation-source-picker"></div>
+
+          <div id="test-automation-src-paste">
+            <div class="form-group">
+              <label>Code under test</label>
+              <textarea id="test-automation-code" rows="14" placeholder="Paste the code the tests should exercise — the route, the service, the component."></textarea>
+            </div>
+          </div>
+
+          <div id="test-automation-src-file" class="hidden">
+            <div class="form-group">
+              <label>Source file</label>
+              <input type="file" id="test-automation-file-input" accept=".txt,.py,.js,.ts,.tsx,.jsx,.java,.go,.php,.rb,.cs,.vb,.c,.h,.cpp,.sql,.yaml,.yml,.json,.xml,.html,.md" />
+              <div class="field-hint">One file. For a whole codebase use <b>Upload zip</b>.</div>
+            </div>
+          </div>
+
+          <div id="test-automation-src-zip" class="hidden">
+            <div class="form-group">
+              <label>Zip of the codebase</label>
+              <input type="file" id="test-automation-zip-input" accept=".zip" />
+              <div class="field-hint">Build output, binaries, <code>node_modules</code> and credential
+                files are skipped, and hardcoded secrets are redacted before anything reaches a model.
+                A large archive is described structurally rather than sent whole &mdash; the estimate
+                tells you which, because it changes how good the tests can be.</div>
+            </div>
+          </div>
+
+          <div id="test-automation-src-pr" class="hidden">
+            <div class="form-group">
+              <label>GitHub pull request URL</label>
+              <input type="url" id="test-automation-pr-url" placeholder="https://github.com/owner/repo/pull/123" />
+              <div class="field-hint">Writes tests for what the pull request changed.</div>
+            </div>
+          </div>
+
+          <div id="test-automation-src-repo" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>GitHub repository URL</label>
+                <input type="url" id="test-automation-repo-url" placeholder="https://github.com/owner/repo" />
+              </div>
+              <div class="form-group">
+                <label>Branch / tag / commit (optional)</label>
+                <input type="text" id="test-automation-repo-ref" placeholder="main" />
+              </div>
+            </div>
+            <div class="field-hint">Narrowing the source is the cheapest way to get better tests: a
+              small, relevant slice is sent <b>verbatim</b>, so the generated code can name real
+              function signatures. A whole large repository is described instead.</div>
+          </div>
+
+          <div id="test-automation-src-compare" class="hidden">
+            <div class="form-row">
+              <div class="form-group flex1">
+                <label>Base branch</label>
+                <input type="text" id="test-automation-base-ref" placeholder="main" />
+              </div>
+              <div class="form-group flex1">
+                <label>Branch being proposed</label>
+                <input type="text" id="test-automation-head-ref" placeholder="feature/new-auth" />
+              </div>
+            </div>
+            <div class="field-hint">Writes tests for what changed between the two branches.</div>
+          </div>
+
+          <div id="test-automation-src-auth" class="hidden">
+            <div id="test-automation-cred-status"></div>
+            <div class="form-group">
+              <label>GitHub token for this call (optional)</label>
+              <input type="password" id="test-automation-gh-token" autocomplete="off"
+                     placeholder="ghp_… or a fine-grained token — used once, never stored" />
+              <div class="field-hint">
+                Only needed for a <b>private</b> repository. GitHub answers <b>404 "not found"</b>
+                for anything a token cannot see, so a private repo, an expired token and a typo all
+                look the same.
+                <button type="button" class="btn-link" onclick="saveGithubCredential('test-automation')">
+                  Save it for this project instead
+                </button>
+                &mdash; stored encrypted, never shown again.
+              </div>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project</label>
+              <!-- Hidden, not deleted: the project *name* still has to reach the request or
+                   project-scoped Knowledge Base docs are silently not found. -->
+              <input type="hidden" id="test-automation-project" class="project-bound" />
+              <div class="project-caption" data-for="test-automation-project"></div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="test-automation-context" placeholder="e.g. FastAPI service, Postgres, tests run against a seeded test database" />
+          </div>
+
+          <div class="section-title">3. See what it will cost</div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="previewTestAutomationCost()">
+              <span class="btn-icon">$</span> Estimate cost
+            </button>
+          </div>
+          <div class="field-hint">Reading the source, working out how this project already tests
+            itself and pricing the work is free &mdash; no model is called. You are asked again before
+            anything is spent.</div>
+          <div id="test-automation-cost-preview" class="hidden"></div>
+        </div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <p class="subtitle" style="margin-top:-6px">Every suite this project has generated, newest
+            first. Opening one costs nothing and calls no model.</p>
+          <div id="test-automation-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="test-automation-result" class="result-area hidden"></div>
       </div>
 
       <!-- Code Review Page -->

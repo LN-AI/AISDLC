@@ -22,6 +22,7 @@ from backend.agents.governance_intelligence.release_gate import ReleaseGateAgent
 from backend.agents.governance_intelligence.report_generator import ReportGeneratorAgent
 from backend.agents.qa_intelligence.test_scenario_agent import TestScenarioAgent
 from backend.agents.qa_intelligence.test_case_agent import TestCaseAgent
+from backend.agents.qa_intelligence.test_automation_agent import TestAutomationAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
 from backend.services import cost_optimization_service
@@ -90,6 +91,7 @@ class SDLCOrchestrator:
         self.issue_triage_agent = IssueTriageAgent()
         self.test_scenario_agent = TestScenarioAgent()
         self.test_case_agent = TestCaseAgent()
+        self.test_automation_agent = TestAutomationAgent()
         self.github = GitHubService()
 
     @staticmethod
@@ -771,6 +773,94 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         result["total_test_cases"] = len(test_cases)
         result["critical_count"] = sum(1 for tc in test_cases if tc.get("priority") == "Critical")
+        return result
+
+    @_log_call
+    def generate_test_automation(
+        self,
+        requirement: str,
+        code_context: str = "",
+        test_conventions: str = "",
+        cases_context: str = "",
+        levels: Optional[List[str]] = None,
+        context: str = "",
+        project_name: str = "Unnamed Project",
+        llm_override: Optional[Dict[str, Any]] = None,
+        source: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Runnable tests from a requirement plus a codebase. One call.
+
+        The two briefs arrive already built (`code_brief`, `test_context_brief`), the way
+        `main._design_review_from_source` builds them for the other three agents that read a
+        whole codebase — they are free, deterministic and needed by the *free* estimate as
+        well as by this call, so the route owns them rather than this method.
+
+        Only the requirement is compressed. The briefs are computed output, already dense,
+        and `_compress` is documented to no-op on anything that reads as prose anyway — so
+        running it over them would spend time to change nothing.
+        """
+        context = self._kb("qa", context, requirement, project_name)
+        compressed_requirement, cost_stats = self._compress(requirement)
+        result = self.test_automation_agent.generate(
+            requirement=compressed_requirement,
+            code_context=code_context,
+            test_conventions=test_conventions,
+            cases_context=cases_context,
+            levels=levels,
+            context=context,
+            llm_override=llm_override,
+        )
+        files = result.get("test_files") or []
+
+        # The same guard `generate_test_cases` carries, and for the same reason: neither QA
+        # agent goes through `BaseAgent.review()`, so `attest`'s degeneracy check never runs
+        # on them. It cannot be delegated to `attest` either — that asks about `findings`,
+        # and a truncated response here loses `test_files` while a summary written earlier
+        # in the stream survives. Storing that reads as "we generated a suite" when nothing
+        # runnable came back.
+        if not files and not (result.get("summary") or "").strip():
+            raise RuntimeError(
+                "Test automation generation returned no test files (no test_files and no "
+                "summary) — this usually means the LLM response was truncated or malformed "
+                "rather than a genuine empty result. Try again, narrow the source to the "
+                "files this requirement touches, or reduce the number of levels requested."
+            )
+        if cost_stats:
+            result["_cost_stats"] = cost_stats
+
+        # Derived counts, computed here rather than trusted from the model: `total_tests` is
+        # what the reader will quote, and a model that miscounts its own array would put a
+        # wrong number on a screen next to the right files.
+        test_names = [n for f in files for n in (f.get("test_names") or [])]
+        coverage = result.get("requirement_coverage") or []
+        result["total_files"] = len(files)
+        result["total_tests"] = len(test_names)
+        result["levels_present"] = sorted({f.get("level") or "" for f in files} - {""})
+        result["prerequisites_present"] = sorted(
+            {p for f in files for p in (f.get("prerequisites") or []) if p and p != "none"}
+        )
+        result["uncovered_count"] = sum(1 for row in coverage if not row.get("covered"))
+        result["assumption_count"] = len(result.get("assumptions") or [])
+        result["not_automated_count"] = len(result.get("not_automated") or [])
+        # The claim this product must never make silently. Nothing in the review pipeline
+        # compiles or runs what it produces (D-05), so a stored suite is "generated", never
+        # "passing" — and the field says so rather than leaving a reader to infer it from
+        # the absence of results. Phase 2's results contract is what will change this.
+        result["execution_status"] = "not_executed"
+        if source:
+            result["source"] = source
+
+        review_id = database.save_review(
+            review_type="test_automation",
+            project_name=project_name,
+            input_summary=(
+                f"Test automation — {len(files)} file(s), {len(test_names)} test(s) from: "
+                f"{requirement[:120]}{'...' if len(requirement) > 120 else ''}"
+            ),
+            input_content=requirement[:5000],
+            result=result,
+        )
+        result["review_id"] = review_id
         return result
 
     @_log_call

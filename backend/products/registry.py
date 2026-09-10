@@ -394,6 +394,34 @@ PRODUCTS: List[Product] = [
         }),
     ),
 
+    Product(
+        id="test-automation",
+        kind=AGENT,
+        title="Test Automation Generation",
+        module="qa_intelligence",
+        description="Generates runnable automated tests — pytest, Playwright, Jest, JUnit, xUnit — against "
+                    "a real codebase, following the project's own test conventions and fixtures. Declares "
+                    "what a script cannot verify and every fact it had to assume. Nothing is executed: the "
+                    "output is a suite to run, not a result.",
+        endpoint="POST /api/v1/agents/test-automation",
+        # The only QA product that reads source, hence the code sources. `cases_context`
+        # chains it behind `test-case` the way `scenarios_context` chains that behind
+        # `test-scenario`.
+        sources=("files", "zip", "github_repo_url", "github_pr_url", "github_file_url",
+                 "text", "cases_context"),
+        review_type="test_automation",
+        invoke=_adapter("generate_test_automation", {
+            "requirement": ("requirement",) + _ARTIFACT,
+            "code_context": "code_context",
+            "test_conventions": "test_conventions",
+            "cases_context": "cases_context",
+            "levels": "levels",
+            "context": _CTX,
+            "project_name": _PROJECT,
+            "source": "source",
+        }),
+    ),
+
     # ── Workflows (multi-agent / multi-stage composites) ───────────────────
     Product(
         # The ID stays `full` even though the title no longer says "Full": IDs are

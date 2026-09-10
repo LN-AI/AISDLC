@@ -67,6 +67,7 @@ from backend.models.schemas import (
     VAPTSourceRequest,
     ArchitectureSourceRequest,
     SecuritySourceRequest,
+    TestAutomationSourceRequest,
     SensitiveDataSourceRequest,
     MigrationAssessmentSourceRequest,
     RegulatedSourceRequest,
@@ -94,6 +95,7 @@ from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
 from backend.services import code_brief
+from backend.services import test_context_brief
 from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
                               review_source_store, source_bundle)
@@ -2408,6 +2410,210 @@ async def review_migration_assessment_zip(
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)
         raise HTTPException(status_code=status, detail=body)
+
+
+# ── Test automation: four doors, one path ────────────────────────────────────
+#
+# A quote and a run, each reachable with JSON or with a zip. All four go through
+# `_automation_briefs` and the two functions under it, because a quote that describes a
+# different prompt from the one that runs is worse than no quote — a quote is believed.
+#
+# The zip pair exists for the reason `cfr21-verification/preflight-zip` does: the browser
+# screen uploads an archive, and a quote available only on the JSON API is a quote no actual
+# user ever sees. It cannot share the generic `/api/review/zip/preflight` either, because
+# that prices with `for_bundle` — twenty chunks for an agent that makes one call.
+
+def _automation_briefs(bundle) -> dict:
+    """The two free briefs for a bundle, or a 400 saying there was nothing to read."""
+    inputs = test_context_brief.for_automation(bundle)
+    if not (inputs["markdown"] or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input, so there is nothing "
+                   "to write tests against. Check the repository, branch or archive.")
+    return inputs
+
+
+def _automation_from_source(req, request: Request) -> tuple:
+    """Resolve a JSON request to (bundle, briefs)."""
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Source resolution failed for test-automation")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    return bundle, _automation_briefs(bundle)
+
+
+def _automation_zip(content: bytes, filename: str):
+    """Resolve an uploaded archive to (bundle, briefs)."""
+    if not (filename or "").endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    try:
+        bundle = source_bundle.from_zip_bytes(content, filename or "upload")
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid zip file")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return bundle, _automation_briefs(bundle)
+
+
+def _automation_conventions(inputs: dict) -> dict:
+    """The subset of the conventions brief a screen prints. One definition, four routes."""
+    return {k: inputs["conventions"][k] for k in
+            ("note", "has_tests", "test_files", "test_paths", "frameworks",
+             "located_by", "exemplar_paths")}
+
+
+def _automation_quote(bundle, inputs: dict, requirement: str, cases: str,
+                      request: Request) -> dict:
+    """Price the run. Free — neither brief nor quote calls a model.
+
+    Priced from the assembled prompt rather than the bundle, for the reason
+    `_preflight_design` gives: this agent makes **one** call, and `for_bundle` would chunk
+    the source and quote twenty. The requirement and any prior test-case catalogue are
+    included because for this agent they can be the larger half of the input, and a quote
+    that ignored them would understate — the direction that hurts.
+
+    Deliberately does not require `requirement`: someone pricing the job before writing the
+    requirement should not have to invent one to get a number.
+    """
+    priced = "\n".join([requirement or "", cases or "",
+                        inputs["conventions"]["markdown"], inputs["markdown"]])
+    quote = review_estimate.for_text(priced, agent="test-automation")
+    subject = _ui_subject(request)
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": "test-automation",
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (
+            None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
+        # `input_mode` travels with the price because it changes what the money buys:
+        # `source` means the tests can name real functions, `description` means the agent
+        # works from a structural summary and its `assumptions` list does more of the work.
+        "input_mode": inputs["mode"],
+        "input_mode_note": inputs["mode_note"],
+        "test_conventions": _automation_conventions(inputs),
+        "code_brief": inputs["code_brief"],
+        "files_preview": _files_preview(bundle),
+        "skipped_all": bundle.skipped[:400],
+        # No retention block, for the reason `_preflight_design` states: this product stores
+        # no source and has no inventory, so offering a retention choice nothing honours
+        # would be a promise about data handling that no code keeps.
+    }
+
+
+def _run_automation(bundle, inputs: dict, requirement: str, cases: str,
+                    levels, project_name: str, context: str) -> dict:
+    """Generate the suite. One model call."""
+    _require_llm()
+    if not requirement and not cases:
+        raise HTTPException(
+            status_code=400,
+            detail="Describe what the tests must verify, or supply a prior test-case "
+                   "catalogue to automate. A codebase on its own does not say what to test.")
+
+    ctx_parts = [f"Source: {bundle.source_type} — {bundle.label}", inputs["mode_note"]]
+    if bundle.untrusted_label:
+        ctx_parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if bundle.truncated:
+        ctx_parts.append(f"The source was truncated before analysis: {bundle.truncation_reason}")
+    if context:
+        ctx_parts.append(context)
+
+    try:
+        result = orchestrator.generate_test_automation(
+            requirement=requirement or "Automate the manual test cases supplied below.",
+            code_context=inputs["markdown"],
+            test_conventions=inputs["conventions"]["markdown"],
+            cases_context=cases,
+            levels=levels,
+            context="\n".join(ctx_parts),
+            project_name=project_name or bundle.label[:60] or "Unnamed Project",
+            source=bundle.summary(),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+    # The same account of what was read that the prompt was given and the quote showed.
+    # Three different sentences about coverage across quote, prompt and result would be two
+    # too many.
+    result["input_mode"] = inputs["mode"]
+    result["input_mode_note"] = inputs["mode_note"]
+    result["test_conventions"] = _automation_conventions(inputs)
+    result["code_brief"] = inputs["code_brief"]
+    return result
+
+
+@app.post("/api/review/test-automation/preflight")
+def preflight_test_automation_ui(req: TestAutomationSourceRequest, request: Request):
+    """What generating this suite will cost. Free — no model call, nothing metered."""
+    bundle, inputs = _automation_from_source(req, request)
+    return _automation_quote(bundle, inputs, (req.requirement or "").strip(),
+                             (req.cases_context or "").strip(), request)
+
+
+@app.post("/api/review/test-automation/preflight-zip")
+async def preflight_test_automation_zip(
+    request: Request,
+    file: UploadFile = File(...),
+    requirement: str = Form(""),
+    cases_context: str = Form(""),
+):
+    """The same quote for an uploaded archive. **Free — no model call.**"""
+    content = await file.read()
+    bundle, inputs = await asyncio.to_thread(_automation_zip, content, file.filename or "")
+    return _automation_quote(bundle, inputs, requirement.strip(), cases_context.strip(), request)
+
+
+@app.post("/api/review/test-automation")
+def review_test_automation_ui(req: TestAutomationSourceRequest, request: Request):
+    """Generate runnable automated tests for a requirement against a codebase.
+
+    Metered by `legacy_product_guard` like every other `/api/review/*` route, and
+    deliberately **not** in `_CHUNKABLE_ROUTES`: one model call, so a reservation sized
+    from a chunk count would be wrong in the expensive direction.
+    """
+    bundle, inputs = _automation_from_source(req, request)
+    return _run_automation(bundle, inputs, (req.requirement or "").strip(),
+                           (req.cases_context or "").strip(), req.levels,
+                           req.project_name or "", req.context or "")
+
+
+@app.post("/api/review/test-automation/upload-zip")
+async def review_test_automation_upload_zip(
+    file: UploadFile = File(...),
+    requirement: str = Form(""),
+    cases_context: str = Form(""),
+    levels: str = Form(""),
+    project_name: str = Form(""),
+    context: str = Form(""),
+):
+    """Generate the suite from an uploaded archive.
+
+    Separate from `/preflight-zip` for the reason D-234 records: a zip cannot travel on a
+    JSON route. `levels` arrives as a comma-separated string because multipart form fields
+    have no array type — empty means "let the agent choose", which is a real option here
+    and not a missing value.
+    """
+    content = await file.read()
+    bundle, inputs = await asyncio.to_thread(_automation_zip, content, file.filename or "")
+    chosen = [part.strip() for part in (levels or "").split(",") if part.strip()]
+    return await asyncio.to_thread(
+        _run_automation, bundle, inputs, requirement.strip(), cases_context.strip(),
+        chosen or None, project_name or (file.filename or ""), context)
 
 
 @app.post("/api/review/migration-assessment/preflight")

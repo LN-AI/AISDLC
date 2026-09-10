@@ -56,13 +56,14 @@ from backend.models.api_models import (
     RequirementReviewRequest,
     SecurityReviewRequest,
     SensitiveDataRequest,
+    TestAutomationRequest,
     TestCaseRequest,
     TestScenarioRequest,
     VAPTRequest,
 )
 from backend.services import (
     agent_guard, code_chunker, guardrail_service, llm_gateway, job_service, subject_service,
-    review_estimate, source_bundle,
+    review_estimate, source_bundle, test_context_brief,
 )
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
@@ -1825,6 +1826,189 @@ def run_test_case(req: TestCaseRequest, caller: dict = Depends(get_caller)):
         "_budget_stats": result.get("_budget_stats"),
         "llm_used": llm_gateway.describe(override),
         "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ── 21b. Test Automation Generation ──────────────────────────────────────────
+
+_AUTOMATION_DESCRIPTION = """Generates **runnable automated tests** against a real codebase — not manual steps.
+
+Unlike `test-scenario` and `test-case`, which take prose, this reads your source: a repository at a ref, an
+archive, a pull request, or an explicit `files[]` list. That is the whole point — a manual step can say "click
+Submit", but a line of code has to name a route, a function or a fixture that really exists.
+
+- Follows **your** project's test conventions: its framework, its directory layout, its existing fixtures and
+  client, taken from the tests you already have
+- `levels` picks Unit / API+Integration / UI+End-to-End, or omit it and the agent chooses and justifies
+- `not_automated` names what a script genuinely cannot verify, rather than producing a hollow test for it
+- `assumptions` records every fact it had to guess with what breaks if the guess is wrong — read this first
+- `requirement_coverage` has a row per requirement including the ones it could not reach
+
+**Nothing is executed.** The response is a suite to run, not a result: `execution_status` is always
+`not_executed`. Price the run first with `POST /api/v1/agents/test-automation/preflight`, which is free.
+
+**Sources:** `files` · `github_repo_url` (+`ref`) · `github_pr_url` · `github_file_url` · zip upload ·
+`cases_context` (the `test_cases` array from `POST /api/v1/agents/test-case`, JSON-stringified)
+"""
+
+
+def _automation_inputs(req, caller: dict):
+    """The bundle and the two free briefs, shared by the run and its preflight.
+
+    Both need the identical assembly or the quote describes a different call from the one
+    that runs — and a quote is believed.
+    """
+    bundle = _bundle(req, "test-automation", caller)
+    inputs = test_context_brief.for_automation(bundle)
+    if not (inputs["markdown"] or "").strip():
+        raise HTTPException(
+            400,
+            "No readable source files were found in that input, so there is nothing to write "
+            "tests against. Check the repository, branch or archive.")
+    return bundle, inputs
+
+
+def _automation_requirement(req) -> str:
+    """What the tests must verify. Either field alone is enough; neither is not."""
+    requirement = (getattr(req, "requirement", None) or "").strip()
+    cases = (getattr(req, "cases_context", None) or "").strip()
+    if not requirement and not cases:
+        raise HTTPException(
+            400,
+            "Supply `requirement` (what the tests must verify) or `cases_context` (a prior "
+            "test-case catalogue to automate). A codebase on its own does not say what to test.")
+    return requirement or "Automate the manual test cases supplied below."
+
+
+@router.post(
+    "/test-automation",
+    summary="Generate runnable automated tests against a codebase",
+    description=_AUTOMATION_DESCRIPTION,
+)
+def run_test_automation(req: TestAutomationRequest, caller: dict = Depends(get_caller)):
+    bundle, inputs = _automation_inputs(req, caller)
+    requirement = _automation_requirement(req)
+    override = _effective_llm_override(req, caller, "test-automation")
+
+    notice = guardrail_service.untrusted_notice(bundle.untrusted_label) \
+        if bundle.untrusted_label else ""
+    ctx_parts = [f"Source: {bundle.source_type} — {bundle.label}", inputs["mode_note"]]
+    if notice:
+        ctx_parts.append(notice)
+    if bundle.truncated:
+        ctx_parts.append(f"The source was truncated before analysis: {bundle.truncation_reason}")
+    if req.context:
+        ctx_parts.append(req.context)
+
+    # One call, so no `expect_calls` override — unlike a chunked code review, which has to
+    # size its reservation from the chunk count. `bind_source` still applies: a suite
+    # generated from a repository is placed against it the same way a review is.
+    with request_context.bind_source(bundle.source_ref()):
+        result = agent_guard.guarded_call(
+            caller, "test-automation", override,
+            lambda: _orch.generate_test_automation(
+                requirement=requirement,
+                code_context=inputs["markdown"],
+                test_conventions=inputs["conventions"]["markdown"],
+                cases_context=req.cases_context or "",
+                levels=req.levels,
+                context="\n".join(ctx_parts),
+                project_name=req.project_name or bundle.label[:60] or "Unnamed Project",
+                llm_override=override,
+                source=bundle.summary(),
+            ),
+        )
+    pb = _do_postback(bundle.source_type, bundle.ref, result) if req.post_back else "not_requested"
+    return {
+        "success": True,
+        "agent": "test-automation",
+        "agent_title": "Test Automation Generation",
+        "review_id": result.get("review_id"),
+        "project_name": req.project_name or "",
+        "source_type": bundle.source_type,
+        "source": result.get("source"),
+        "post_back": pb,
+        "levels_chosen": result.get("levels_chosen", []),
+        "test_files": result.get("test_files", []),
+        "requirement_coverage": result.get("requirement_coverage", []),
+        "not_automated": result.get("not_automated", []),
+        "assumptions": result.get("assumptions", []),
+        "setup_instructions": result.get("setup_instructions", ""),
+        "total_files": result.get("total_files", 0),
+        "total_tests": result.get("total_tests", 0),
+        "levels_present": result.get("levels_present", []),
+        "prerequisites_present": result.get("prerequisites_present", []),
+        "uncovered_count": result.get("uncovered_count", 0),
+        "assumption_count": result.get("assumption_count", 0),
+        "not_automated_count": result.get("not_automated_count", 0),
+        # Always `not_executed`. Stated rather than omitted, because a suite with no result
+        # attached reads as untested only if somebody says so.
+        "execution_status": result.get("execution_status", "not_executed"),
+        # How much the agent could actually see, and how this project already tests itself.
+        # Returned so the caller reads the same account of coverage the prompt was given.
+        "input_mode": inputs["mode"],
+        "test_conventions": {k: inputs["conventions"][k] for k in
+                             ("note", "has_tests", "test_files", "test_paths",
+                              "frameworks", "located_by", "exemplar_paths")},
+        "code_brief": inputs["code_brief"],
+        "summary": result.get("summary", ""),
+        "_budget_stats": result.get("_budget_stats"),
+        "llm_used": llm_gateway.describe(override),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.post(
+    "/test-automation/preflight",
+    summary="Cost estimate for test automation generation (free, no model call)",
+    description="""Price a test-automation run before making it. **Free — no model call, nothing metered.**
+
+Reads the source, assembles the exact prompt the run will send, and prices that. Priced from the assembled
+prompt rather than from a chunked bundle because this agent makes **one** call — quoting it like a chunked
+review would name a figure for a run that never happens.
+
+Also returns, for free and before any spend:
+
+- `input_mode` — `source` if your codebase is small enough to send verbatim, `description` if it is too large
+  and a computed structural summary goes instead. Tests generated from a description need more correction.
+- `test_conventions` — which framework and fixtures were found, and whether any tests were found at all
+""",
+)
+def preflight_test_automation(req: TestAutomationRequest, caller: dict = Depends(get_caller)):
+    subject = subject_from_caller(caller)
+    agent_guard.check_scope(subject, "test-automation")
+    bundle, inputs = _automation_inputs(req, caller)
+    requirement = _automation_requirement(req)
+    override = _effective_llm_override(req, caller, "test-automation")
+    model = (override or {}).get("model") or ""
+    # The whole prompt, not just the brief: for this agent the requirement and the prior
+    # test-case catalogue can be the larger half of the input, and a quote that ignored them
+    # would understate — the direction that hurts.
+    priced = "\n".join([
+        requirement, req.cases_context or "",
+        inputs["conventions"]["markdown"], inputs["markdown"],
+    ])
+    quote = review_estimate.for_text(priced, agent="test-automation", model=model)
+    headroom = review_estimate.budget_headroom(subject)
+    return {
+        "agent": "test-automation",
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (
+            None if headroom is None
+            else quote["expected_usd"] <= headroom["remaining_usd"]),
+        "ceiling_within_budget": (
+            None if headroom is None
+            else quote["ceiling_usd"] <= headroom["remaining_usd"]),
+        "input_mode": inputs["mode"],
+        "input_mode_note": inputs["mode_note"],
+        "test_conventions": {k: inputs["conventions"][k] for k in
+                             ("note", "has_tests", "test_files", "test_paths",
+                              "frameworks", "located_by", "exemplar_paths")},
+        "code_brief": inputs["code_brief"],
     }
 
 

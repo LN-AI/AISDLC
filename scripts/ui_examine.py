@@ -1634,6 +1634,79 @@ def main():
                   "an empty context box is what makes a run with no repository identical to "
                   "one from before this existed")
 
+            # ── 21. Test automation, the one QA screen that reads code ────
+            #
+            # `smoke_render.js` can check the renderer against a fixture and
+            # `smoke_review_sources.py` §34 can drive all four routes, but neither can see
+            # whether the Estimate button on this screen reaches the server, whether the
+            # source picker it shares with Code Review actually works on a third screen, or
+            # whether the levels checkboxes exist at all. That gap is the whole reason this
+            # script exists.
+            section("21. Test automation prices a run before it spends anything")
+            goto_page(page, "Test Automation Generation")
+            page.wait_for_timeout(300)
+
+            _modes = page.evaluate("SOURCE_MODES.length")
+            check("the screen offers every shared source mode",
+                  page.locator("#test-automation-source-picker .source-tab").count() == _modes,
+                  f"{page.locator('#test-automation-source-picker .source-tab').count()} tabs "
+                  f"for {_modes} modes -- a third screen on the shared picker must offer the "
+                  "same ways in, or the six sources are only true of two screens")
+            check("...and the test levels it can be asked for",
+                  page.locator("#test-automation-levels input[type=checkbox]").count() == 3,
+                  "the agent chooses when none is checked, which is only a real option if "
+                  "the boxes render at all")
+
+            # The requirement is what makes this different from every other from-code
+            # screen: a codebase alone does not say what to test, and the refusal has to
+            # happen in the browser rather than as a 400 after an upload.
+            ta_dialogs = []
+            page.on("dialog", lambda d: (ta_dialogs.append(d.message), d.dismiss()))
+            pick_source(page, "test-automation", "Paste")
+            page.fill("#test-automation-requirement", "")
+            page.fill("#test-automation-code", "def export(u):\n    return 1\n")
+            before_ta = len(ta_dialogs)
+            page.click("#page-test-automation button:has-text('Estimate cost')")
+            page.wait_for_timeout(400)
+            check("a codebase with no requirement is refused before any request",
+                  len(ta_dialogs) > before_ta,
+                  f"no dialog; dialogs so far: {ta_dialogs}")
+
+            page.fill("#test-automation-requirement",
+                      "Only the treating clinician may export a visit history.")
+            page.fill("#test-automation-code",
+                      "from fastapi import FastAPI\napp = FastAPI()\n\n"
+                      "@app.get('/patients/{pid}/export')\ndef export(pid):\n    return {}\n")
+            ok_ta, text_ta = estimate(page, "test-automation", base=base)
+            check("a pasted codebase can be priced", ok_ta, text_ta)
+            check("...naming a ceiling, not just an estimate",
+                  "ceiling" in text_ta.lower(), text_ta[:200])
+            check("...and saying whether the source will be sent or described",
+                  "verbatim" in text_ta or "too large" in text_ta,
+                  f"{text_ta[:250]!r} -- it decides how good the tests can be, so it belongs "
+                  "on the quote and not only on the result")
+            check("...and how this project already tests itself",
+                  "no established idiom" in text_ta or "existing test file" in text_ta,
+                  f"{text_ta[:250]!r} -- a pasted file has no tests, and saying so is what "
+                  "stops the agent presenting an invented convention as the project's own")
+            check("the run button appears only once a quote exists",
+                  page.locator("#test-automation-cost-preview "
+                               "button:has-text('Generate the tests')").count() == 1,
+                  "a run button that works before a quote is a run nobody approved a price for")
+            # `NETLOG` holds formatted strings, not tuples -- unpacking it raised
+            # ValueError rather than failing the check, which is worse than a wrong answer.
+            check("...and no model was called to produce the quote",
+                  not any("/api/review/test-automation" in line and "preflight" not in line
+                          for line in NETLOG),
+                  f"recent: {NETLOG[-6:]}")
+
+            # Switching the source must invalidate the quote, the same rule Code Review
+            # follows: a price belongs to the source that produced it.
+            pick_source(page, "test-automation", "GitHub repo")
+            check("changing the source discards the quote it was taken for",
+                  page.locator("#test-automation-cost-preview .cost-preview").count() == 0,
+                  "a quote for the previous source survived and could be acted on")
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.

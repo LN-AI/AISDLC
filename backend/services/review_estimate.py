@@ -59,6 +59,11 @@ MAX_OUTPUT_TOKENS = {
     # half what the run could actually produce.
     "cfr21-verification": 16000,
     "gxp-document-check": 16000,
+    # 32000 for the same reason `auto-fix` is: an entry in `test_files` is a whole file, not
+    # a findings row, so this is the widest response shape in the codebase alongside a fix.
+    # At the 8000 default the ceiling — the number a person approves the run against — would
+    # be a quarter of what the call can actually emit.
+    "test-automation": 32000,
 }
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 

@@ -615,9 +615,10 @@ function _runPageLoader(page) {
     // The source pickers are built on first visit rather than at load: they are two of
     // thirty-seven screens, and building every screen's controls up front is what makes a
     // no-build-step SPA slow to open.
-    if (page === 'code' || page === 'vapt') {
+    if (page === 'code' || page === 'vapt' || page === 'test-automation') {
       renderSourcePicker(page);
     }
+    if (page === 'test-automation') renderTestAutomationLevels();
     // Every agent screen loads its own history, scoped to this agent and this project.
     // Refreshed on every visit rather than built once: the sidebar project selector can
     // change between visits, and a history list showing another project's runs is worse
@@ -2062,7 +2063,24 @@ async function runTestCaseGeneration() {
   }
 }
 
+// Armed by the renderer rather than by `runTestCaseGeneration`, so reopening a stored run
+// arms it too. D-369 recorded this exact bug for the other three in-page handoffs.
+let _lastTestCaseResult = null;
+
+/** Carry a manual catalogue into the automation screen, so tests are written against the
+ *  cases somebody already reviewed rather than re-derived from the requirement. JSON, not
+ *  markdown, for the reason `#tc-scenarios-context` is: the next agent parses it. */
+function useLastTestCaseResult() {
+  if (!_lastTestCaseResult) {
+    alert('Run Test Case Generation first, or open one of its previous runs.');
+    return;
+  }
+  document.getElementById('test-automation-cases').value =
+    JSON.stringify(_lastTestCaseResult.test_cases || [], null, 2);
+}
+
 function renderTestCases(targetId, r) {
+  _lastTestCaseResult = r;
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const cases = r.test_cases || [];
@@ -2106,6 +2124,290 @@ function renderTestCases(targetId, r) {
           <div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Traces to: ${esc(tc.requirement_ref || '')}</div>
         </div>
       </details>`).join('')}
+
+    <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
+  `;
+}
+
+// ── QA Intelligence — Test Automation Generation ───────────────────────────
+//
+// The only QA screen that reads code, so it is the only one with a cost quote. It reuses the
+// shared source picker and `buildSourceBody`, but not `previewCost`/`runReviewFromQuote`:
+// those route a zip through `/api/review/zip/preflight`, which prices with `for_bundle` and
+// would quote twenty calls for an agent that makes one. It has its own pair of doors
+// (`/preflight-zip`, `/upload-zip`) for that reason.
+
+const TEST_LEVELS = ['Unit', 'API/Integration', 'UI/End-to-End'];
+
+function renderTestAutomationLevels() {
+  const wrap = document.getElementById('test-automation-levels');
+  if (!wrap || wrap.dataset.built) return;
+  wrap.dataset.built = '1';
+  wrap.innerHTML = TEST_LEVELS.map((lvl, i) => `
+    <label class="checkbox-inline">
+      <input type="checkbox" id="ta-level-${i}" value="${esc(lvl)}" /> ${esc(lvl)}
+    </label>`).join('');
+}
+
+function _testAutomationLevels() {
+  return TEST_LEVELS
+    .map((lvl, i) => (document.getElementById(`ta-level-${i}`)?.checked ? lvl : null))
+    .filter(Boolean);
+}
+
+/** The source body plus the three fields only this screen sends. */
+function buildTestAutomationBody() {
+  const built = buildSourceBody('test-automation');
+  if (!built) return null;
+  const v = id => (document.getElementById(id)?.value || '').trim();
+  const requirement = v('test-automation-requirement');
+  const cases = v('test-automation-cases');
+  if (!requirement && !cases) {
+    alert('Describe what the tests must verify, or paste a prior test-case catalogue to automate.');
+    return null;
+  }
+  const levels = _testAutomationLevels();
+  if (built.kind === 'form') {
+    // Multipart has no array type, so levels travel comma-separated and the server splits
+    // them. Empty means "let the agent choose", which is a real option and not a gap.
+    built.body.append('requirement', requirement);
+    built.body.append('cases_context', cases);
+    built.body.append('levels', levels.join(','));
+  } else {
+    Object.assign(built.body, {
+      requirement, cases_context: cases,
+      ...(levels.length ? { levels } : {}),
+    });
+  }
+  return built;
+}
+
+async function previewTestAutomationCost() {
+  const built = buildTestAutomationBody();
+  if (!built) return;
+  const box = document.getElementById('test-automation-cost-preview');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="cost-preview-loading">Reading the source, working out how this project tests itself, and pricing the run…</div>';
+  try {
+    let quote;
+    if (built.kind === 'form') {
+      quote = await apiFetch('/api/review/test-automation/preflight-zip',
+                             { method: 'POST', body: built.body });
+    } else {
+      quote = await apiFetch('/api/review/test-automation/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(built.body),
+      });
+    }
+    _pendingQuote['test-automation'] = built;
+    _approvedQuote['test-automation'] = {
+      ceiling_usd: (quote.estimate || {}).ceiling_usd,
+      expected_usd: (quote.estimate || {}).expected_usd,
+      calls: (quote.estimate || {}).calls,
+    };
+    box.innerHTML = renderCostPreview('test-automation', quote)
+      + renderAutomationInputMode(quote)
+      + `<div class="form-actions" style="margin-top:10px">
+           <button class="btn btn-primary" onclick="runTestAutomationFromQuote()">
+             <span class="btn-icon">⚙️</span> Generate the tests
+           </button>
+         </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="cost-preview-error">Could not price this run — ${esc(e.message)}</div>`;
+  }
+}
+
+/** What the agent will actually be able to see, before any money is spent.
+ *
+ *  Drawn on the quote and again on the result, from the same two fields, because it changes
+ *  what the money buys: `source` means the tests can name real function signatures,
+ *  `description` means the agent works from a structural summary and guesses more. A reader
+ *  who cannot tell those apart will trust both equally. */
+function renderAutomationInputMode(q) {
+  const mode = q.input_mode;
+  if (!mode) return '';
+  const conv = q.test_conventions || {};
+  const strong = mode === 'source';
+  return `
+    <div class="cost-note" style="margin-top:8px">
+      <div><b>${strong ? 'Your source will be sent verbatim' : 'Your codebase is too large to send'}</b>
+        — ${esc(q.input_mode_note || '')}</div>
+      <div style="margin-top:6px">${esc(conv.note || '')}</div>
+      ${(conv.exemplar_paths || []).length ? `<div style="margin-top:6px">Following the idiom of
+        ${conv.exemplar_paths.map(p => `<code>${esc(p)}</code>`).join(', ')}.</div>` : ''}
+    </div>`;
+}
+
+async function runTestAutomationFromQuote() {
+  const built = _pendingQuote['test-automation'];
+  if (!built) { alert('Get an estimate first.'); return; }
+  clearCostPreview('test-automation');
+  const target = 'test-automation-result';
+  showLoading('Writing the tests…');
+  try {
+    const result = built.kind === 'form'
+      ? await apiFetch('/api/review/test-automation/upload-zip',
+                       { method: 'POST', body: built.body })
+      : await apiFetch('/api/review/test-automation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(built.body),
+        });
+    renderTestAutomation(target, result);
+    loadAgentRuns('test-automation');
+    loadDashboard();
+  } catch (e) {
+    showError(target, e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// The generated files of whichever suite is on screen, so a download button has something
+// to read. Set by the renderer, so reopening a stored run arms the downloads too — the bug
+// D-369 recorded for the three in-page handoffs was exactly this, set in the run function
+// instead of where the result is drawn.
+let _lastTestAutomation = null;
+
+function downloadGeneratedTest(index) {
+  const f = (_lastTestAutomation || {}).test_files?.[index];
+  if (!f || !f.content) return;
+  _downloadTextAsFile((f.path || `test_${index}`).split('/').pop(), f.content);
+}
+
+function downloadAllGeneratedTests() {
+  const files = (_lastTestAutomation || {}).test_files || [];
+  if (!files.length) return;
+  // One text file rather than a zip: building a real archive in the browser needs a library
+  // the CSP does not allow, and a single file with clear path headers is honest about being
+  // a transcript rather than pretending to be a tree you can unpack. `setup_instructions`
+  // leads, because a suite nobody can run is not a deliverable.
+  const parts = [
+    '# Generated test suite',
+    '',
+    '## Nothing here has been executed',
+    'These tests were generated and never run. Read the assumptions below before trusting them.',
+    '',
+  ];
+  if (_lastTestAutomation.setup_instructions) {
+    parts.push('## How to run them', '', _lastTestAutomation.setup_instructions, '');
+  }
+  (_lastTestAutomation.assumptions || []).forEach(a => {
+    parts.push(`## Assumption: ${a.assumption || ''}`,
+               `Risk if wrong: ${a.risk_if_wrong || ''}`, '');
+  });
+  files.forEach(f => {
+    parts.push(`${'='.repeat(70)}`, `FILE: ${f.path || ''}  (${f.framework || ''}, ${f.level || ''})`,
+               `${'='.repeat(70)}`, '', f.content || '', '');
+  });
+  _downloadTextAsFile('generated-tests.txt', parts.join('\n'));
+}
+
+function renderTestAutomation(targetId, r) {
+  _lastTestAutomation = r;
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const files = r.test_files || [];
+  // `requirement_coverage`, not `coverage`: that name is already taken platform-wide for
+  // chunk coverage (`{chunks_total, chunks_succeeded, failures}`) and is read by the shared
+  // `renderReviewTransparency`. Shadowing it broke this renderer on a partial run *and*
+  // silently suppressed the "this review was incomplete" warning — the worse of the two.
+  const cov = Array.isArray(r.requirement_coverage) ? r.requirement_coverage : [];
+  const assumptions = r.assumptions || [];
+  const notAuto = r.not_automated || [];
+  const uncovered = cov.filter(c => !c.covered);
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Generated Test Suite</h2>
+      <span style="color:var(--text-muted);font-size:13px">${r.total_files || files.length} file(s) ·
+        ${r.total_tests || 0} test(s)${(r.levels_present || []).length ? ' · ' + r.levels_present.map(esc).join(', ') : ''}</span>
+    </div>
+    ${renderReviewTransparency(r)}
+
+    <!-- Said first and said plainly. A suite with no results attached reads as untested only
+         if somebody says so, and this product is the one most likely to be mistaken for
+         evidence that the code works. -->
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>Nothing here has been run.</b> These files were generated, not executed — the platform
+      does not compile or run the code it produces. A generated test that passes is not evidence
+      until someone runs it and reads the result.
+    </div>
+
+    <div class="summary-box">${esc(r.summary || '')}</div>
+    ${renderAutomationInputMode(r)}
+
+    ${assumptions.length ? `
+    <div class="section-title" style="margin-top:20px">⚠ What it had to assume (${assumptions.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">Read these first. Each one is a
+      fact the agent could not verify in your source — if any is wrong, the tests that rest on it
+      fail during setup rather than reporting a real defect.</p>
+    ${assumptions.map(a => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(a.assumption || '')}</div>
+        ${a.why_unverifiable ? `<div class="antipattern-desc">Could not confirm: ${esc(a.why_unverifiable)}</div>` : ''}
+        <div class="antipattern-impact">If wrong: ${esc(a.risk_if_wrong || '')}</div>
+      </div>`).join('')}` : `
+    <div class="section-title" style="margin-top:20px">Assumptions</div>
+    <p class="field-hint">The agent reported none — it says everything the tests rely on was
+      visible in the source it was given.</p>`}
+
+    ${notAuto.length ? `
+    <div class="section-title" style="margin-top:20px">Not automated (${notAuto.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">Named rather than given a hollow
+      script. These still need a person.</p>
+    ${notAuto.map(n => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(n.requirement_ref || '')}</div>
+        <div class="antipattern-desc">${esc(n.reason || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${(r.prerequisites_present || []).length ? `
+    <div class="section-title" style="margin-top:20px">Before these can run</div>
+    <div class="compliance-chips">${r.prerequisites_present.map(p => `<span class="compliance-chip">${esc(p)}</span>`).join('')}</div>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Test files (${files.length})</div>
+    ${files.length ? `
+    <div class="form-actions" style="margin-bottom:8px">
+      <button class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
+              onclick="downloadAllGeneratedTests()">⬇ Download all</button>
+    </div>` : ''}
+    ${files.map((f, i) => `
+      <details style="margin-bottom:10px" ${files.length === 1 ? 'open' : ''}>
+        <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">
+          ${esc(f.path || '')}
+          <span style="color:var(--text-muted);font-family:inherit;font-size:11px">
+            ${esc(f.framework || '')} · ${esc(f.level || '')} · ${(f.test_names || []).length} test(s)</span>
+        </summary>
+        <div style="margin-top:8px">
+          ${(f.prerequisites || []).length ? `<div class="field-hint">Needs: ${f.prerequisites.map(esc).join(', ')}</div>` : ''}
+          ${(f.covers || []).length ? `<div class="field-hint">Covers: ${f.covers.map(esc).join(' · ')}</div>` : ''}
+          <pre class="api-usage-code">${esc(f.content || '')}</pre>
+          <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px"
+                  onclick="downloadGeneratedTest(${i})">⬇ Download this file</button>
+        </div>
+      </details>`).join('')}
+
+    ${(r.levels_chosen || []).length ? `
+    <div class="section-title" style="margin-top:20px">Why these levels</div>
+    <ul class="rec-list">${r.levels_chosen.map(l => `<li><b>${esc(l.level || '')}</b> — ${esc(l.rationale || '')}</li>`).join('')}</ul>` : ''}
+
+    ${cov.length ? `
+    <div class="section-title" style="margin-top:20px">Coverage${uncovered.length ? ` — ${uncovered.length} not covered` : ''}</div>
+    <table class="data-table">
+      <thead><tr><th>Requirement</th><th>Tests</th><th>Status</th></tr></thead>
+      <tbody>${cov.map(c => `
+        <tr>
+          <td>${esc(c.requirement_ref || '')}${c.note ? `<div class="field-hint">${esc(c.note)}</div>` : ''}</td>
+          <td style="font-family:monospace;font-size:11px">${(c.test_names || []).map(esc).join('<br>') || '—'}</td>
+          <td>${c.covered ? '<span style="color:var(--green)">✓ Covered</span>' : '<span style="color:var(--amber)">✗ Not covered</span>'}</td>
+        </tr>`).join('')}</tbody>
+    </table>` : ''}
+
+    ${r.setup_instructions ? `
+    <div class="section-title" style="margin-top:20px">How to run them</div>
+    <div class="summary-box">${esc(r.setup_instructions)}</div>` : ''}
 
     <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
   `;
@@ -10239,7 +10541,7 @@ const SOURCE_MODES = [
 
 // Which mode each screen is currently on. Module-level rather than read from the DOM so the
 // two screens cannot interfere with each other.
-const _sourceMode = { code: 'paste', vapt: 'paste' };
+const _sourceMode = { code: 'paste', vapt: 'paste', 'test-automation': 'paste' };
 
 /** Render the source picker for one screen into its container. */
 function renderSourcePicker(agent) {
@@ -10325,9 +10627,16 @@ function buildSourceBody(agent) {
   if (agent === 'vapt') base.scope = v('vapt-scope');
 
   if (mode === 'paste') {
-    const text = v(agent === 'code' ? 'code-content' : 'vapt-artifact');
+    // Table rather than a chain of ternaries: the id and the body field differ per screen
+    // and a third screen made the nested conditional unreadable. `test-automation` sends
+    // `code` because `source_bundle.resolve` reads that name as the source -- its
+    // `requirement` field is deliberately not one of the source names, or the requirement
+    // itself would be treated as the code under test.
+    const PASTE_FIELD = { code: 'code-content', vapt: 'vapt-artifact' };
+    const PASTE_KEY = { code: 'code', vapt: 'artifact' };
+    const text = v(PASTE_FIELD[agent] || `${agent}-code`);
     if (!text) { alert('Paste something to review first.'); return null; }
-    return { kind: 'json', body: { ...base, [agent === 'code' ? 'code' : 'artifact']: text } };
+    return { kind: 'json', body: { ...base, [PASTE_KEY[agent] || 'code']: text } };
   }
   // A one-off token, when there is one. Sent for this call only and never stored — the
   // durable answer is a credential saved against the project, which is what the link beside
@@ -10679,6 +10988,13 @@ const AGENT_SCREENS = {
                     noun: 'generations',            gated: false },
   'test-case':    { product: 'test-case',           reviewType: 'test_cases',
                     result: 'test-case-result',     render: renderTestCases,
+                    noun: 'generations',            gated: false },
+  // `inventory: false` (by omission) on purpose: this route stores no source, so the
+  // retention control must not appear -- `renderRetentionControl` gates on that flag, and a
+  // retention promise nothing honours is worse than none.
+  'test-automation':
+                  { product: 'test-automation',     reviewType: 'test_automation',
+                    result: 'test-automation-result', render: renderTestAutomation,
                     noun: 'generations',            gated: false },
   vapt:           { product: 'vapt',                reviewType: 'vapt',
                     result: 'vapt-result',          render: renderVAPTResult,

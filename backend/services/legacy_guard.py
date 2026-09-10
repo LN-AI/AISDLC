@@ -115,6 +115,12 @@ LEGACY_PRODUCT_ROUTES = {
     "/api/review/issue-triage/batch-github": "issue-triage-batch-github",
     "/api/review/test-scenario": "test-scenario",
     "/api/review/test-case": "test-case",
+    # The one QA product that reads a codebase. Both routes, because the screen quotes
+    # before it runs and the quote is free -- only the run is metered. Deliberately not
+    # in `_CHUNKABLE_ROUTES`: one model call, so a reservation sized from a chunk count
+    # would over-reserve.
+    "/api/review/test-automation": "test-automation",
+    "/api/review/test-automation/upload-zip": "test-automation",
     "/api/github/pr": "github-pr-review",
     "/api/github/pr/auto-fix": "auto-fix",
     "/api/release-gate": "release-gate",
