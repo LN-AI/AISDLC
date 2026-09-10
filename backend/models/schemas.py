@@ -397,6 +397,27 @@ class SecuritySourceRequest(_UISourceBase, DerivedFromMixin):
     system_type: Optional[str] = None
 
 
+
+class TestResultsRequest(BaseModel):
+    """What a producer reports after running a generated suite.
+
+    `junit_xml` or `results`, never both: two reports of one run cannot be reconciled here,
+    and guessing which is authoritative is how a green result gets stored over a red one.
+    """
+    junit_xml: Optional[str] = Field(
+        None, description="A JUnit XML report — the format pytest (`--junitxml`), Jest "
+                          "(`jest-junit`), JUnit, Playwright and most other runners already "
+                          "emit. The easiest thing for a CI job to send.")
+    results: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Structured rows instead of XML: each `{name, status}` plus "
+                          "optional `file`, `classname`, `duration_ms`, `message`. `status` "
+                          "is passed/failed/errored/skipped; an unrecognised value is read "
+                          "as `errored`, never as a pass.")
+    source_label: Optional[str] = Field(
+        None, description="Where this ran, in the producer's own words — 'GitHub Actions "
+                          "run 412', 'laptop'. Stored beside the counts because a pass with "
+                          "no attribution is not evidence of anything.")
+
 class TestAutomationSourceRequest(_UISourceBase, DerivedFromMixin):
     """Generate runnable automated tests from a requirement *and* the code under test.
 

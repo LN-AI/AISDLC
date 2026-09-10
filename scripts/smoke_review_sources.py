@@ -5161,6 +5161,194 @@ def main():
     finally:
         llm_gateway.call_tool = _prev34
 
+    # ══ 35. Results come back, and the claim is checked against them ═══════
+    #
+    # Phase 2. Until this existed, `requirement_coverage` was the model's *claim* that a
+    # rule was covered and nothing could contradict it. The verdict that matters most is
+    # the one that could not exist before: `not_run` -- a requirement the generation said
+    # it covered, for which nothing that actually ran can be found.
+    #
+    # Nothing here runs a test (D-05). These rows are claims by whoever posted them, and
+    # the checks below assert that the platform says so rather than presenting a reported
+    # pass as proof.
+    section("35. Test results come back, and check the coverage the model claimed")
+
+    from backend.services import test_results as _tr35
+
+    _xml35 = ("<testsuites><testsuite name=\"pytest\" tests=\"4\">"
+              "<testcase classname=\"t\" name=\"test_owner_can_update\" time=\"0.01\"/>"
+              "<testcase classname=\"t\" name=\"test_non_owner_gets_403\">"
+              "<failure message=\"assert 200 == 403\">boom</failure></testcase>"
+              "<testcase classname=\"t\" name=\"test_unauth_401\">"
+              "<error message=\"TypeError\">crash</error></testcase>"
+              "<testcase classname=\"t\" name=\"test_theirs\"><skipped/></testcase>"
+              "</testsuite></testsuites>")
+    _rows35 = _tr35.parse_junit(_xml35)
+    check("a JUnit report parses into one row per test case",
+          len(_rows35) == 4, str(len(_rows35)))
+    check("...reading the outcome from the child element, not from an attribute",
+          [r["status"] for r in _rows35] == ["passed", "failed", "errored", "skipped"],
+          str([r["status"] for r in _rows35]))
+    check("a failed assertion and a test that never loaded are counted apart",
+          _tr35.summarise(_rows35)["failed"] == 1
+          and _tr35.summarise(_rows35)["errored"] == 1,
+          "an error usually means a missing import or fixture -- D-316's signature, and "
+          "the number this whole phase exists to make visible")
+    check("an unrecognised status reads as errored, never as a pass",
+          _tr35.normalise_status("weird") == "errored"
+          and _tr35.normalise_status("ok") == "passed",
+          "a producer that invents a status must not be able to make a suite look green")
+    check("a suite of nothing but skips is not a pass",
+          _tr35.summarise([{"status": "skipped", "duration_ms": 0}])["outcome"] == "failed",
+          "this is the field a badge or a CI gate would read")
+
+    # The reconciliation, which is the point of the phase.
+    _gen35 = {"requirement_coverage": [
+        {"requirement_ref": "owner may update", "covered": True,
+         "test_names": ["test_owner_can_update"]},
+        {"requirement_ref": "non-owner blocked", "covered": True,
+         "test_names": ["test_non_owner_gets_403"]},
+        {"requirement_ref": "attempt is audited", "covered": True,
+         "test_names": ["test_audit_row_written"]}]}
+    _map35, _unmatched35 = _tr35.map_to_requirements(_gen35, _rows35)
+    _by35 = {row["requirement_ref"]: row["outcome"] for row in _map35}
+    check("a requirement whose tests passed is reported passed",
+          _by35.get("owner may update") == "passed", str(_by35))
+    check("...one whose test failed is reported failed",
+          _by35.get("non-owner blocked") == "failed", str(_by35))
+    check("...and one the model CLAIMED to cover, that nothing ran, is not_run",
+          _by35.get("attempt is audited") == "not_run",
+          f"{_by35} -- this is the verdict that did not exist before results came back, and "
+          "the reason the phase is worth building: a claim nobody could contradict")
+    check("...while the claim itself is still shown beside the outcome",
+          all(row["claimed_covered"] is True for row in _map35),
+          "the disagreement between claimed and observed is the finding")
+    check("the customer's own tests are counted, not mistaken for ours",
+          _unmatched35 == 2,
+          f"{_unmatched35} -- their suite runs alongside the generated one; dropping those "
+          "silently would make a broad report look narrow")
+
+    # Names never match character for character: pytest reports `test_x`, Jest reports the
+    # whole `describe > it` sentence. A missed match understates coverage, which is the
+    # direction that makes a reader distrust a real result -- so matching is deliberately
+    # loose, and this is the check that keeps it that way.
+    _loose35, _ = _tr35.map_to_requirements(
+        {"requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                   "test_names": ["owner can update their own task"]}]},
+        [{"name": "Task ownership > PUT > owner can update their own task",
+          "status": "passed", "duration_ms": 1}])
+    check("a Jest sentence matches the test name the generation recorded",
+          _loose35[0]["outcome"] == "passed", str(_loose35))
+
+    # Refusals. Everything arriving here is untrusted HTTP input.
+    for _label35, _bad35 in (
+            ("not XML at all", {"junit_xml": "<nope"}),
+            ("an empty report", {"junit_xml": "   "}),
+            ("a report with no test cases", {"junit_xml": "<testsuite/>"}),
+            ("both forms at once", {"junit_xml": "<testsuite/>",
+                                    "results": [{"name": "x", "status": "passed"}]}),
+            ("neither form", {}),
+            ("results that are not a list", {"results": "passed"}),
+            ("a result with no name", {"results": [{"status": "passed"}]})):
+        try:
+            _tr35.ingest({"review_type": "test_automation", "result": {}}, _bad35, "t")
+            check(f"{_label35} is refused", False, "it was accepted")
+        except _tr35.TestResultError:
+            check(f"{_label35} is refused with a reason, not a crash", True)
+
+    try:
+        _tr35.ingest({"review_type": "code", "result": {}},
+                     {"results": [{"name": "x", "status": "passed"}]}, "t")
+        check("results cannot be attached to a run that generated no tests", False)
+    except _tr35.TestResultError:
+        check("results cannot be attached to a run that generated no tests", True,
+              "deny-by-default on review_type, the same shape as _DELIVERABLE_RUNS")
+
+    from fastapi.testclient import TestClient as _TC35
+    _m34.llm_settings_service.is_llm_configured = lambda: True
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c35:
+        _t35 = _c35.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p35 = _c35.post("/api/v1/projects", json={"name": "S35"},
+                         headers={"Authorization": f"Bearer {_t35}"}).json()["project"]["id"]
+        _H35 = {"Authorization": f"Bearer {_t35}", "X-Project-Id": _p35}
+        _prev35 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["none"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_owner_can_update"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "owner may update", "covered": True,
+                                      "test_names": ["test_owner_can_update"]}],
+            "not_automated": [], "assumptions": [], "summary": "s"}
+        try:
+            _g35 = _c35.post("/api/review/test-automation", headers=_H35, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            check("a generation to report against", _g35.status_code == 200,
+                  f"{_g35.status_code} {_g35.text[:200]}")
+            _rid35 = _g35.json().get("review_id")
+            check("...which starts life saying nothing was executed",
+                  _g35.json().get("execution_status") == "not_executed")
+
+            _pre35 = _c35.get(f"/api/reviews/{_rid35}/test-results", headers=_H35).json()
+            check("...and reads back as not_executed before any report",
+                  _pre35["execution_status"] == "not_executed" and not _pre35["runs"],
+                  str(_pre35)[:160])
+
+            _n35 = len(_calls34)
+            _rep35 = _c35.post(f"/api/reviews/{_rid35}/test-results", headers=_H35,
+                               json={"junit_xml": _xml35, "source_label": "Actions run 1"})
+            check("a report is accepted", _rep35.status_code == 200,
+                  f"{_rep35.status_code} {_rep35.text[:220]}")
+            check("...calling no model, because recording an outcome is not a generation",
+                  len(_calls34) == _n35, "reporting a result must never be billable")
+            _rj35 = _rep35.json()
+            check("...and answering with the reconciliation, not an acknowledgement",
+                  [r["outcome"] for r in _rj35["requirements"]] == ["passed"],
+                  str(_rj35.get("requirements"))[:200])
+            check("...never claiming the platform verified any of it",
+                  _rj35.get("attested") is False,
+                  "this endpoint is the one place the platform could be mistaken for having "
+                  "checked something, and it did not: it was told")
+
+            _post35 = _c35.get(f"/api/reviews/{_rid35}/test-results", headers=_H35).json()
+            check("the run now reads as reported rather than not executed",
+                  _post35["execution_status"] == "reported", str(_post35)[:120])
+            check("...with the failures listed first",
+                  [r["status"] for r in _post35["latest"]["results"]][:2]
+                  == ["failed", "errored"],
+                  f"{[r['status'] for r in _post35['latest']['results']]} -- a reader of 400 "
+                  "tests wants the broken ones, and making them scroll is how red gets ignored")
+            check("...and who reported it, because a pass with no attribution proves nothing",
+                  _post35["latest"]["reported_by"] and _post35["latest"]["source_label"],
+                  str(_post35["latest"])[:160])
+
+            _c35.post(f"/api/reviews/{_rid35}/test-results", headers=_H35,
+                      json={"results": [{"name": "test_owner_can_update", "status": "passed"}]})
+            _hist35 = _c35.get(f"/api/reviews/{_rid35}/test-results", headers=_H35).json()
+            check("a second report is kept beside the first, not written over it",
+                  len(_hist35["runs"]) == 2,
+                  f"{len(_hist35['runs'])} -- 'this used to pass' is a fact one snapshot "
+                  "cannot express")
+            check("...newest first",
+                  _hist35["runs"][0]["outcome"] == "passed"
+                  and _hist35["runs"][1]["outcome"] == "failed",
+                  str([r["outcome"] for r in _hist35["runs"]]))
+
+            check("results cannot be filed against a run that does not exist",
+                  _c35.post("/api/reviews/nope/test-results", headers=_H35,
+                            json={"results": [{"name": "x", "status": "passed"}]}
+                            ).status_code == 404)
+            _bad35 = _c35.post(f"/api/reviews/{_rid35}/test-results", headers=_H35,
+                               json={"junit_xml": "<nope"})
+            check("...and a malformed report is a 400 with a reason, never a 500",
+                  _bad35.status_code == 400, f"{_bad35.status_code} {_bad35.text[:150]}")
+        finally:
+            llm_gateway.call_tool = _prev35
+
+
     print()
     print("-" * 60)
     if FAILED:

@@ -53,14 +53,58 @@ Custom envelope, fields returned at the top level:
 | `test_conventions` | What was found about how this project already tests itself: `note`, `has_tests`, `test_files`, `test_paths`, `frameworks`, `located_by`, `exemplar_paths` |
 | `code_brief` | Coverage facts from the structural analysis, present when `input_mode` is `hybrid` or `description` |
 | `total_files`, `total_tests`, `levels_present`, `prerequisites_present`, `uncovered_count`, `assumption_count`, `not_automated_count` | Counted server-side from the returned arrays, not taken from the model |
-| `execution_status` | Always `not_executed` — see below |
+| `execution_status` | `not_executed` on the generation itself. `GET .../test-results` reports `reported` once somebody has filed a result |
 | `summary`, `_budget_stats`, `llm_used`, `created_at` | Standard |
 
 ## Why nothing is executed
 
 D-05 forbids compiling or running code on the API host: executing model-written code derived from customer source is arbitrary code execution, and no human has reviewed it. Running a generated suite also needs things the platform does not have — the application up, a database in the state the test assumes, and credentials (C-63).
 
-So the honest claim is **"these were generated"**, never "these pass", and `execution_status` says so rather than leaving a reader to infer it from the absence of results. When execution arrives it will follow D-62 — a results contract that the customer's CI, a local script or a sandbox worker can all fill, exactly as `build_results.py` already does for compiler diagnostics.
+So the honest claim is **"these were generated"**, never "these pass", and `execution_status` says so rather than leaving a reader to infer it from the absence of results.
+
+## Reporting what happened when you ran them
+
+Run the suite wherever you can run it, then post the result back. This follows D-62 — the results contract is the interface, not the producer: a developer on a laptop, a GitHub Actions job and a future sandbox worker all fill the same one, and none of them appear in the platform's code.
+
+```
+POST /api/reviews/{review_id}/test-results
+GET  /api/reviews/{review_id}/test-results
+```
+
+**Free.** Recording an outcome is not a generation: no model call, nothing metered.
+
+| Field | Description |
+|---|---|
+| `junit_xml` | A JUnit XML report — what pytest (`--junitxml`), Jest (`jest-junit`), JUnit, Playwright and most runners already emit |
+| `results[]` | Structured rows instead: `{name, status}` plus optional `file`, `classname`, `duration_ms`, `message` |
+| `source_label` | Where it ran, in your words — "GitHub Actions run 412". Stored beside the counts |
+
+Send one or the other, never both: two reports of one run cannot be reconciled, and guessing which is authoritative is how a green result gets stored over a red one.
+
+`status` is `passed` / `failed` / `errored` / `skipped`. **`errored` is kept apart from `failed` on purpose** — a failed assertion means the code is wrong, an error means the test never got far enough to find out, which is usually a missing import or fixture. That is D-316's signature and the single most useful number this endpoint produces. An unrecognised status reads as `errored`, never as a pass.
+
+### What comes back is the reconciliation, not an acknowledgement
+
+Every requirement the generation reported, with what actually ran against it:
+
+| `outcome` | Meaning |
+|---|---|
+| `passed` | Its tests ran and passed |
+| `failed` | At least one failed or never loaded |
+| `skipped` | Its tests ran but every one was skipped |
+| **`not_run`** | **The generation claimed to cover it, and nothing in this report matches.** Read this one first |
+
+`not_run` is the verdict that could not exist before. Until results came back, `requirement_coverage` was the model's *claim* that a rule was covered and nothing could contradict it.
+
+Test names never match character for character — pytest reports `test_x`, Jest reports the whole `describe > it` sentence — so matching is deliberately loose. A missed match understates coverage, which is the direction that makes a reader distrust a real result.
+
+Results that match no requirement are **counted, not dropped**: your own suite runs alongside the generated one, and a report broader than this generation should read as broader rather than as noise.
+
+### These are claims, not proof
+
+Nothing in the platform witnessed the run. A report is posted with your key, and `attested` is always `false`. Every report is stored with who filed it and where it ran, because a pass with nobody's name on it is not evidence of anything, and reports are **kept rather than overwritten** — "this used to pass" is a fact one snapshot cannot express.
+
+A suite of nothing but skips is not a pass. A report with no test cases is refused rather than stored as an empty success.
 
 ## What the agent is shown, and why it matters
 

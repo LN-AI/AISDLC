@@ -3,7 +3,7 @@ import os
 import sqlite3
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 from backend import config, context
 from backend.config import DATABASE_PATH, JOB_STALE_MINUTES, SQLITE_BUSY_TIMEOUT_MS
@@ -708,6 +708,55 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_fp_reports_created
             ON false_positive_reports(created_at DESC);
+
+        -- What happened when somebody ran a generated suite. One row per report, so a
+        -- suite reported three times keeps three rows: the trend is the interesting part,
+        -- and overwriting would lose "this used to pass".
+        --
+        -- Nothing here witnessed the run (D-05). These are claims by whoever posted them,
+        -- which is why `reported_by` and `source_label` are stored beside the counts and
+        -- never dropped -- a pass with no attribution is not evidence of anything.
+        CREATE TABLE IF NOT EXISTS test_result_runs (
+            id             TEXT PRIMARY KEY,
+            review_id      TEXT NOT NULL,
+            project_id     TEXT DEFAULT NULL,
+            total          INTEGER DEFAULT 0,
+            passed         INTEGER DEFAULT 0,
+            failed         INTEGER DEFAULT 0,
+            errored        INTEGER DEFAULT 0,
+            skipped        INTEGER DEFAULT 0,
+            duration_ms    INTEGER DEFAULT 0,
+            outcome        TEXT DEFAULT '',
+            -- The reconciliation against what the generation claimed to cover, and the
+            -- count of reported tests that belong to none of it (the customer's own suite
+            -- runs alongside ours).
+            requirements   TEXT DEFAULT '[]',
+            unmatched      INTEGER DEFAULT 0,
+            source_label   TEXT DEFAULT '',
+            reported_by    TEXT DEFAULT '',
+            created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_test_runs_review
+            ON test_result_runs(review_id, created_at DESC);
+
+        -- The individual tests. `errored` is stored separately from `failed` because a
+        -- failed assertion means the code is wrong and an error usually means the test
+        -- never loaded -- which is D-316's signature and the number this whole phase
+        -- exists to make visible.
+        CREATE TABLE IF NOT EXISTS test_results (
+            id             TEXT PRIMARY KEY,
+            run_id         TEXT NOT NULL,
+            review_id      TEXT NOT NULL,
+            name           TEXT DEFAULT '',
+            file           TEXT DEFAULT '',
+            classname      TEXT DEFAULT '',
+            status         TEXT DEFAULT '',
+            duration_ms    INTEGER DEFAULT NULL,
+            message        TEXT DEFAULT '',
+            created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_test_results_run
+            ON test_results(run_id);
     """)
 
     # Modernization owns six tables of its own. Their DDL lives with the code that queries
@@ -4399,3 +4448,86 @@ def set_github_webhook_secret(credential_id: str, secret: str) -> bool:
     conn.commit()
     conn.close()
     return updated
+
+
+# ── Test results: what happened when somebody ran a generated suite ─────────
+#
+# Read the module docstring of `services/test_results.py` first. Nothing here runs a test;
+# these rows are what a producer reported, and they are stored as claims with an attribution
+# rather than as facts.
+
+def save_test_result_run(review_id: str, project_id: Optional[str],
+                         payload: Dict[str, Any]) -> str:
+    """Persist one report: the run summary, its per-requirement verdict, and every test.
+
+    One transaction, because a summary without its rows would show counts nothing supports
+    and rows without a summary would never be found.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    summary = payload.get("summary") or {}
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO test_result_runs
+               (id, review_id, project_id, total, passed, failed, errored, skipped,
+                duration_ms, outcome, requirements, unmatched, source_label, reported_by,
+                created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, review_id, project_id, summary.get("total", 0),
+             summary.get("passed", 0), summary.get("failed", 0), summary.get("errored", 0),
+             summary.get("skipped", 0), summary.get("duration_ms", 0),
+             summary.get("outcome", ""), json.dumps(payload.get("requirements") or []),
+             payload.get("unmatched_results", 0), payload.get("source_label", ""),
+             payload.get("reported_by", ""), now))
+        cursor.executemany(
+            """INSERT INTO test_results
+               (id, run_id, review_id, name, file, classname, status, duration_ms,
+                message, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [(str(uuid.uuid4()), run_id, review_id, row.get("name", ""),
+              row.get("file", ""), row.get("classname", ""), row.get("status", ""),
+              row.get("duration_ms"), row.get("message", ""), now)
+             for row in (payload.get("results") or [])])
+        conn.commit()
+    finally:
+        conn.close()
+    return run_id
+
+
+def get_test_result_runs(review_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Every report for this review, newest first. The trend is the point of keeping them."""
+    conn = get_connection()
+    try:
+        rows = conn.cursor().execute(
+            """SELECT * FROM test_result_runs WHERE review_id = ?
+               ORDER BY created_at DESC LIMIT ?""", (review_id, limit)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        record = dict(row)
+        try:
+            record["requirements"] = json.loads(record.get("requirements") or "[]")
+        except (TypeError, ValueError):
+            record["requirements"] = []
+        out.append(record)
+    return out
+
+
+def get_test_results(run_id: str, limit: int = 5000) -> List[Dict[str, Any]]:
+    """The individual tests of one report."""
+    conn = get_connection()
+    try:
+        rows = conn.cursor().execute(
+            """SELECT name, file, classname, status, duration_ms, message
+               FROM test_results WHERE run_id = ?
+               ORDER BY CASE status WHEN 'failed' THEN 0 WHEN 'errored' THEN 1
+                                    WHEN 'skipped' THEN 2 ELSE 3 END, name
+               LIMIT ?""", (run_id, limit)).fetchall()
+    finally:
+        conn.close()
+    # Failures first, deliberately: a reader opening a report of 400 tests is looking for
+    # the ones that broke, and making them scroll for it is how a red build gets ignored.
+    return [dict(row) for row in rows]

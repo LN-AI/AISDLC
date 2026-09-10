@@ -68,6 +68,7 @@ from backend.models.schemas import (
     ArchitectureSourceRequest,
     SecuritySourceRequest,
     TestAutomationSourceRequest,
+    TestResultsRequest,
     SensitiveDataSourceRequest,
     MigrationAssessmentSourceRequest,
     RegulatedSourceRequest,
@@ -98,7 +99,7 @@ from backend.services import code_brief
 from backend.services import test_context_brief
 from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
-                              review_source_store, source_bundle)
+                              review_source_store, source_bundle, test_results)
 from backend.services.subject_service import resolve_subject
 from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
@@ -2236,6 +2237,84 @@ async def codegen_scaffold_download(review_id: str, request: Request,
         headers={"Content-Disposition": f'attachment; filename="{project}.zip"'},
     )
 
+
+
+# ── Test results: the half of the loop that lives here ───────────────────────
+#
+# `services/test_results.py` has the reasoning. The short version: nothing here runs a
+# suite, so the suite runs wherever the customer can run it and reports back, and this pair
+# of routes is the contract that makes the producer interchangeable (D-62). Until this
+# existed, "generate the tests" ended at a download and the platform never found out whether
+# a single one of them passed.
+
+def _results_review(review_id: str, request: Request, reader: dict) -> dict:
+    """The generation these results belong to, or a 404 that reveals nothing.
+
+    404 rather than 403 for a review outside the caller's projects, the same way
+    `GET /api/reviews/{id}` does it: whether a review exists is itself information.
+    """
+    review = database.get_review(review_id)
+    if not review or review.get("review_type") not in test_results.ACCEPTS_RESULTS:
+        raise HTTPException(
+            status_code=404,
+            detail="No test-generation run with that id. Results attach to the run that "
+                   "produced the tests, so the id is the one that generated them.")
+    visible = _visible_project_ids(reader, request)
+    if visible is not None and review.get("project_id") not in visible:
+        raise HTTPException(status_code=404, detail="No test-generation run with that id")
+    return review
+
+
+@app.post("/api/reviews/{review_id}/test-results")
+def report_test_results(review_id: str, req: TestResultsRequest, request: Request,
+                        reader: dict = Depends(require_reader)):
+    """Report what happened when this run's generated tests were executed.
+
+    **Free — no model call, nothing metered.** Recording an outcome is not a generation.
+
+    The response is the reconciliation, not an acknowledgement: every requirement the
+    generation claimed, with what actually ran against it. `not_run` is the verdict that did
+    not exist before — a requirement the model said it covered, for which nothing that ran
+    can be found — and it is the one worth reading first.
+    """
+    review = _results_review(review_id, request, reader)
+    try:
+        payload = test_results.ingest(
+            review, req.model_dump(exclude_none=True),
+            actor=(reader or {}).get("username") or (reader or {}).get("key_name") or "api")
+    except test_results.TestResultError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    run_id = database.save_test_result_run(review_id, review.get("project_id"), payload)
+    return {
+        "run_id": run_id,
+        "review_id": review_id,
+        "summary": payload["summary"],
+        "requirements": payload["requirements"],
+        "unmatched_results": payload["unmatched_results"],
+        "reported_by": payload["reported_by"],
+        "reported_at": payload["reported_at"],
+        # Never omitted. This endpoint is the one place the platform could be mistaken for
+        # having verified something, and it did not: it was told.
+        "attested": False,
+    }
+
+
+@app.get("/api/reviews/{review_id}/test-results")
+def read_test_results(review_id: str, request: Request,
+                      reader: dict = Depends(require_reader)):
+    """Every report filed against this generation, newest first, with the latest expanded.
+
+    The history is kept rather than overwritten because the trend is the interesting part:
+    "this used to pass" is a fact a single current snapshot cannot express.
+    """
+    _results_review(review_id, request, reader)
+    runs = database.get_test_result_runs(review_id)
+    latest = dict(runs[0]) if runs else None
+    if latest:
+        latest["results"] = database.get_test_results(latest["id"])
+    return {"review_id": review_id, "runs": runs, "latest": latest,
+            "execution_status": "reported" if runs else "not_executed",
+            "attested": False}
 
 _DELIVERABLE_RUNS = {
     "codegen_scaffold": {"prefix": "lm-scaffold", "what": "generated starter project"},

@@ -2329,8 +2329,85 @@ function downloadAllGeneratedTests() {
   _downloadTextAsFile('generated-tests.txt', parts.join('\n'));
 }
 
+/** What happened when somebody ran this suite — or nothing, said plainly.
+ *
+ *  Phase 2. Before this the screen could only ever say "generated"; `requirement_coverage`
+ *  was the model's claim that a rule was covered and nothing could contradict it. The row
+ *  worth reading is `not_run`: a requirement the generation said it covered, for which
+ *  nothing that actually ran can be found.
+ *
+ *  Fetched separately from the review rather than folded into it, because results arrive
+ *  long after the generation and a stored run must not have to be rewritten to carry them. */
+async function loadTestResults(reviewId) {
+  const box = document.getElementById('test-automation-results');
+  if (!box || !reviewId) return;
+  let data;
+  try {
+    data = await apiFetch(`/api/reviews/${reviewId}/test-results`);
+  } catch (e) {
+    return;   // no results is the normal case, not an error worth a red box
+  }
+  const latest = data && data.latest;
+  if (!latest) return;
+  const s = latest;
+  const reqs = latest.requirements || [];
+  const rows = latest.results || [];
+  const LABEL = {
+    passed: ['✔', 'var(--green)', 'passing'],
+    failed: ['✘', 'var(--red)', 'failing'],
+    skipped: ['−', 'var(--text-muted)', 'skipped'],
+    not_run: ['?', 'var(--amber)', 'claimed, never ran'],
+  };
+  const notRun = reqs.filter(x => x.outcome === 'not_run').length;
+  box.innerHTML = `
+    <div class="cost-note" style="border-left:3px solid ${s.outcome === 'passed' ? 'var(--green)' : 'var(--red)'};margin-bottom:12px">
+      <div><b>${s.passed} of ${s.total} reported tests passed</b>
+        ${s.failed ? `· ${s.failed} failed` : ''}${s.errored ? ` · ${s.errored} did not load` : ''}${s.skipped ? ` · ${s.skipped} skipped` : ''}</div>
+      <!-- Attribution is not decoration. Nothing here witnessed the run, and a pass with
+           nobody's name on it is not evidence of anything. -->
+      <div class="muted" style="margin-top:6px">Reported by ${esc(s.reported_by || 'unknown')}${s.source_label ? ` from ${esc(s.source_label)}` : ''}
+        on ${esc((s.created_at || '').slice(0, 16).replace('T', ' '))}. The platform did not run these —
+        this is what was reported to it.${data.runs.length > 1 ? ` ${data.runs.length} reports so far.` : ''}</div>
+      ${s.errored ? `<div style="margin-top:6px">${s.errored} test(s) <b>did not load</b> — usually a missing
+        import or fixture, which means they asserted nothing rather than found nothing.</div>` : ''}
+    </div>
+
+    <div class="section-title">Your requirements, checked against what ran</div>
+    ${notRun ? `<p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${notRun} requirement(s) the
+      generation said it covered had no matching test in this report. That gap is the reason to read this
+      table rather than the counts above.</p>` : ''}
+    <table class="data-table">
+      <thead><tr><th>Requirement</th><th>Claimed</th><th>Actually</th><th>P / F / S</th></tr></thead>
+      <tbody>${reqs.map(x => {
+        const [icon, colour, word] = LABEL[x.outcome] || ['?', 'var(--text-muted)', x.outcome];
+        return `<tr>
+          <td>${esc(x.requirement_ref || '')}</td>
+          <td>${x.claimed_covered ? 'covered' : 'not covered'}</td>
+          <td style="color:${colour}"><b>${icon} ${esc(word)}</b></td>
+          <td>${x.passed} / ${x.failed} / ${x.skipped}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>
+    ${latest.unmatched ? `<p class="field-hint">${latest.unmatched} reported test(s) belong to no requirement
+      here — your own suite runs alongside the generated one.</p>` : ''}
+
+    <details style="margin-top:10px">
+      <summary>Every reported test (${rows.length}), failures first</summary>
+      <table class="data-table" style="margin-top:6px">
+        <thead><tr><th>Test</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody>${rows.map(x => `<tr>
+          <td><code>${esc(x.name || '')}</code></td>
+          <td style="color:${(LABEL[x.status] || [])[1] || 'var(--text-muted)'}">${esc(x.status)}</td>
+          <td>${esc((x.message || '').slice(0, 300))}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </details>`;
+}
+
 function renderTestAutomation(targetId, r) {
   _lastTestAutomation = r;
+  // Fired after the innerHTML below lands, since it writes into a div that markup creates.
+  if (r && r.review_id) setTimeout(() => loadTestResults(r.review_id), 0);
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const files = r.test_files || [];
@@ -2353,12 +2430,17 @@ function renderTestAutomation(targetId, r) {
 
     <!-- Said first and said plainly. A suite with no results attached reads as untested only
          if somebody says so, and this product is the one most likely to be mistaken for
-         evidence that the code works. -->
+         evidence that the code works. Replaced by the real outcome once somebody reports
+         one — but never by a claim that the platform checked it. -->
     <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
       <b>Nothing here has been run.</b> These files were generated, not executed — the platform
       does not compile or run the code it produces. A generated test that passes is not evidence
       until someone runs it and reads the result.
+      <div style="margin-top:6px">Run them and post the result back to
+        <code>POST /api/reviews/${esc(r.review_id || '')}/test-results</code> and this screen will
+        show which of your requirements actually hold.</div>
     </div>
+    <div id="test-automation-results"></div>
 
     <div class="summary-box">${esc(r.summary || '')}</div>
     ${renderAutomationInputMode(r)}
