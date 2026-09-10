@@ -54,6 +54,7 @@ from typing import Any, Callable, Dict, Optional
 from backend import config, context, database
 from backend.products import registry
 from backend.services import llm_gateway
+from backend.services import pricing as customer_pricing
 from backend.services.cost_optimization_service import DEFAULT_PRICING, MODEL_PRICING_PER_MILLION_TOKENS
 from backend.services.entitlement_service import (
     QuotaExceededError,
@@ -473,7 +474,12 @@ def guarded_call(
 
     model = effective_llm.get("model") or config.MODEL
     provider = effective_llm.get("provider") or "anthropic"
-    cost_usd = _price_usage(usage, model) if usage["calls"] else 0.0
+    model_cost_usd = _price_usage(usage, model) if usage["calls"] else 0.0
+    # The same conversion `legacy_guard` makes, at the other door. Both surfaces have to
+    # charge the same amount for the same product or the price depends on which route a
+    # customer happened to use.
+    charge = customer_pricing.price(agent_name, model_cost_usd, usage["calls"])
+    cost_usd = charge["total_usd"]
 
     # A caller-supplied api_key means the caller's own LLM account paid for this call, not
     # the platform's. The spend is still recorded for visibility, but it must not consume
@@ -537,6 +543,7 @@ def guarded_call(
         key_id=key_id, caller_type=caller_type, caller_ref=caller_ref,
         product_id=agent_name, product_kind=product_kind, usage=usage,
         cost_usd=cost_usd, model=model, provider=provider, billable=billable,
+        model_cost_usd=model_cost_usd,
         cost_estimated=bool(usage["calls"]) and _is_estimated(model),
         project_id=project_id, project_name=project_name, result=result, status=status,
     )
@@ -590,7 +597,8 @@ def _record_failed_usage(usage, subject, key_id, caller_id, agent_name, product_
 
 def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_kind,
                         usage, cost_usd, model, provider, billable, cost_estimated,
-                        project_id, project_name, result, status) -> None:
+                        project_id, project_name, result, status,
+                        model_cost_usd=None) -> None:
     """Write the billing-ledger row. Never lets a metering failure break the response —
     the caller already has a valid result at this point."""
     try:
@@ -604,6 +612,9 @@ def _record_usage_event(*, key_id, caller_type, caller_ref, product_id, product_
             input_tokens=usage.get("input_tokens", 0),
             output_tokens=usage.get("output_tokens", 0),
             cost_usd=cost_usd,
+            # What it cost us, beside what the customer owes. Defaults to `cost_usd` in
+            # `record_usage_event`, which is right for every pass-through product.
+            model_cost_usd=model_cost_usd,
             model=model,
             provider=provider,
             billable=billable,

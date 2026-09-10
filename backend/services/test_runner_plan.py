@@ -176,6 +176,27 @@ _RUNNERS: Tuple[Dict[str, Any], ...] = (
         "junit_needs": "mocha-junit-reporter",
     },
     {
+        # Node's own runner, since 18. Worth its own row because it is the only JavaScript
+        # entry here that needs **no install at all** — no package.json, no node_modules, no
+        # reporter package — and it emits JUnit natively. A project already using it is a
+        # project whose generated suite runs on a bare runner.
+        #
+        # Paths must be passed as files rather than a directory: given a directory it emits
+        # one testcase per *file* and the per-test names are lost, which is most of what a
+        # results report is for.
+        "key": "node-test",
+        "label": "node:test",
+        "aliases": ("node test", "node builtin test", "node built in test", "nodejs test",
+                    "node s built in test runner", "node s test runner"),
+        "language": "node",
+        "supports_paths": True,
+        "install": [],
+        "argv": ["node", "--test", "--test-reporter=junit",
+                 "--test-reporter-destination=" + RESULTS_DIR + "/node-test.xml", "{paths}"],
+        "results": RESULTS_DIR + "/node-test.xml",
+        "junit_needs": "",
+    },
+    {
         "key": "playwright",
         "label": "Playwright",
         "aliases": ("playwright", "playwright test", "@playwright/test"),
@@ -433,8 +454,24 @@ def merge_junit(documents) -> str:
             root = ET.fromstring(text)
         except ET.ParseError:
             continue          # an unreadable file is not a reason to lose the readable ones
-        for suite in ([root] if root.tag == "testsuite" else list(root.iter("testsuite"))):
+        suites = [root] if root.tag == "testsuite" else list(root.iter("testsuite"))
+        for suite in suites:
             merged.append(suite)
+            found += 1
+        if suites:
+            continue
+        # A report whose <testcase> elements sit directly under the root with no <testsuite>
+        # wrapper at all. That is not malformed — it is what **Node's own junit reporter
+        # emits** — and the first version of this dropped every case in such a file and
+        # reported "no results", which reads as a suite that never ran. Found by the first
+        # run of `eval_test_automation.py`, on a suite that had in fact run and failed
+        # exactly as it should have (C-93). Wrapped rather than discarded.
+        loose = [child for child in root if child.tag == "testcase"]
+        if loose:
+            suite = ET.SubElement(merged, "testsuite")
+            suite.set("name", root.get("name") or "tests")
+            for case in loose:
+                suite.append(case)
             found += 1
     return ET.tostring(merged, encoding="unicode") if found else ""
 
@@ -516,6 +553,16 @@ for path in sorted(glob.glob("__LM_RESULTS_DIR__/**/*.xml", recursive=True)):
     for suite in suites:
         merged.append(suite)
         found += 1
+    if not suites:
+        # Testcases directly under the root, with no <testsuite> wrapper — what Node's own
+        # junit reporter emits. Dropping them reports a suite that ran as one that did not.
+        loose = [child for child in root if child.tag == "testcase"]
+        if loose:
+            suite = ET.SubElement(merged, "testsuite")
+            suite.set("name", root.get("name") or "tests")
+            for case in loose:
+                suite.append(case)
+            found += 1
 
 if found:
     payload = {"junit_xml": ET.tostring(merged, encoding="unicode")}

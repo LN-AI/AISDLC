@@ -2353,7 +2353,24 @@ async function loadTestResults(reviewId) {
     return;   // no results is the normal case, not an error worth a red box
   }
   const latest = data && data.latest;
-  if (!latest) return;
+  if (!latest) {
+    // No results yet. Silent when nothing was delivered — but once something was, "waiting
+    // for CI" is a different state from "nobody has run these", and only this can say so.
+    if (data && data.delivery) {
+      box.innerHTML = `
+        <div class="cost-note" style="margin-bottom:12px">
+          <b>Waiting for CI.</b> These tests are on
+          ${data.delivery.pull_request
+            ? `<a href="${esc(data.delivery.pull_request)}" target="_blank" rel="noopener">a pull request</a>`
+            : `<code>${esc(data.delivery.branch || '')}</code>`}
+          in ${esc((data.delivery.repo_url || '').replace('https://github.com/', ''))}.
+          Results are collected each time this screen is opened.
+          ${data.delivery.last_error ? `<div style="margin-top:4px">Last look:
+            ${esc(data.delivery.last_error)}</div>` : ''}
+        </div>`;
+    }
+    return;
+  }
   const s = latest;
   const reqs = latest.requirements || [];
   const rows = latest.results || [];
@@ -2373,6 +2390,19 @@ async function loadTestResults(reviewId) {
       <div class="muted" style="margin-top:6px">Reported by ${esc(s.reported_by || 'unknown')}${s.source_label ? ` from ${esc(s.source_label)}` : ''}
         on ${esc((s.created_at || '').slice(0, 16).replace('T', ' '))}. The platform did not run these —
         this is what was reported to it.${data.runs.length > 1 ? ` ${data.runs.length} reports so far.` : ''}</div>
+      ${data.delivery ? `
+      <!-- Why results keep appearing without anyone fetching them, said once. A reader who
+           does not know this is watching a number change for no visible reason. -->
+      <div class="muted" style="margin-top:6px">Watching
+        ${data.delivery.pull_request
+          ? `<a href="${esc(data.delivery.pull_request)}" target="_blank" rel="noopener">the pull request</a>`
+          : `<code>${esc(data.delivery.branch || '')}</code>`}
+        in ${esc((data.delivery.repo_url || '').replace('https://github.com/', ''))} — new CI
+        results are collected when this screen is opened.
+        ${data.delivery.last_fetch_at ? `Last looked
+          ${esc(data.delivery.last_fetch_at.slice(0, 16).replace('T', ' '))}.` : ''}
+        ${data.delivery.last_error ? `<span style="color:var(--amber)">Last look:
+          ${esc(data.delivery.last_error)}</span>` : ''}</div>` : ''}
       ${s.errored ? `<div style="margin-top:6px">${s.errored} test(s) <b>did not load</b> — usually a missing
         import or fixture, which means they asserted nothing rather than found nothing.</div>` : ''}
     </div>
@@ -12366,8 +12396,17 @@ function renderCostPreview(agent, q) {
       <div class="cost-preview-head">
         <span class="cost-preview-title">Before you spend anything</span>
         <span class="cost-figure">
-          est. <b>$${Number(e.expected_usd || 0).toFixed(2)}</b>
-          <span class="cost-ceiling">ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}</span>
+          ${q.billing ? `
+            <!-- A priced product: the figure a customer is shown has to be what they will be
+                 charged, not what the tokens cost us. The token estimate stays visible
+                 underneath, because a price nobody can decompose is a price nobody can
+                 dispute. -->
+            est. <b>$${Number((q.billing.expected || {}).total_usd || 0).toFixed(2)}</b>
+            <span class="cost-ceiling">ceiling $${Number((q.billing.ceiling || {}).total_usd || 0).toFixed(2)}</span>
+          ` : `
+            est. <b>$${Number(e.expected_usd || 0).toFixed(2)}</b>
+            <span class="cost-ceiling">ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}</span>
+          `}
         </span>
       </div>
       <div class="cost-grid">
@@ -12379,6 +12418,8 @@ function renderCostPreview(agent, q) {
         <div><span class="cost-label">Vulnerable deps found</span><b>${q.vulnerable_dependencies_found || 0}</b></div>
       </div>
       ${renderDependencyNote(q.dependency_scan)}
+      ${q.billing && q.billing.explanation ? `<div class="cost-explanation">
+        <b>You are charged ${esc(q.billing.explanation)}</b></div>` : ''}
       <div class="cost-explanation">${esc(q.explanation || '')}</div>
       ${s.secrets_redacted ? `<div class="cost-note">${s.secrets_redacted} hardcoded secret(s) were redacted at ingest — the values are not stored here and will not be sent to a model. They are reported as findings by the free scanner, not by the model.</div>` : ''}
       ${s.truncated ? `<div class="cost-warn">${esc(s.truncation_reason || 'This source is larger than one scan covers.')}</div>` : ''}

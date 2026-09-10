@@ -5444,6 +5444,27 @@ def main():
           "t1" in _merged36, _merged36[:120])
     check("...with nothing to merge reported as nothing, not as an empty pass",
           _trp.merge_junit(["<nope"]) == "")
+
+    # Node's own junit reporter puts <testcase> directly under the root with no <testsuite>
+    # wrapper at all. The first version of the merge collected only <testsuite> elements, so
+    # every case in such a file was dropped and the run reported "no results" -- which reads
+    # as a suite that never ran. Found by the first run of `eval_test_automation.py`, on a
+    # suite that had run and failed exactly as it should have (C-93).
+    _node37 = ('<testsuites><testcase name="owner may update" time="0.01" classname="test"/>'
+               '<testcase name="non-owner blocked" classname="test">'
+               '<failure type="testCodeFailure" message="200 !== 403">x</failure>'
+               '</testcase></testsuites>')
+    _nm37 = _trp.merge_junit([_node37])
+    check("a report with no <testsuite> wrapper is wrapped, not discarded",
+          _nm37.count("<testsuite ") == 1 and "non-owner blocked" in _nm37,
+          "Node emits this shape; dropping it reports a suite that ran as one that did not")
+    _nr37 = _tr35.parse_junit(_nm37)
+    check("...and reads back as the tests it holds",
+          [r["status"] for r in _nr37] == ["passed", "failed"],
+          str([(r["name"], r["status"]) for r in _nr37]))
+    check("...while a genuinely empty report is still nothing",
+          _trp.merge_junit(["<testsuites></testsuites>"]) == "",
+          "no cases and no suites is not a pass")
     _ET36 = __import__("xml.etree.ElementTree", fromlist=["ElementTree"])
     _ci36 = _ET36.Element("testsuites")
     for _t36 in _docs36[:2]:
@@ -5723,6 +5744,124 @@ def main():
                   "database" in _body37, _body37[:200])
         finally:
             llm_gateway.call_tool = _prev37
+
+    # ══ 38. Nobody has to remember to fetch ════════════════════════════════
+    #
+    # A pull nobody performs is not a loop. Phase 2's promise was a *trend* -- reports kept
+    # rather than overwritten so "this used to pass" is expressible -- and a trend needs the
+    # reports to arrive while GitHub still holds them, because artifacts expire.
+    #
+    # There is no scheduler in this deployment, so this runs where the other time-based
+    # passes run: on the read that depends on it. What is checked here is that it never
+    # makes the read worse -- no double filing, no repeated pointless calls, and no GitHub
+    # problem turned into something the reader has to think about.
+    section("38. New CI results are collected without being asked for")
+
+    from backend.services import test_results_pull as _tp38
+
+    _c38 = None
+    check("a run nothing was delivered from is left alone",
+          _tp38.pull_latest("no-such-review")["why"] == "nothing was delivered from this run",
+          "no delivery means no repository to look in, and guessing one would be a write to "
+          "somebody's account on a hunch")
+
+    _now38 = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    check("a delivery looked at moments ago is not looked at again",
+          not _tp38._due({"last_fetch_at": _now38.isoformat()}),
+          "a screen somebody is clicking around must not start a thread per render")
+    check("...one never looked at is due immediately",
+          _tp38._due({}), "the first read after a delivery is the interesting one")
+    check("...and an unreadable timestamp counts as due, not as recent",
+          _tp38._due({"last_fetch_at": "not a date"}),
+          "failing closed here would mean never looking again")
+
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c38:
+        _t38 = _c38.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p38 = _c38.post("/api/v1/projects", json={"name": "S38"},
+                         headers={"Authorization": f"Bearer {_t38}"}).json()["project"]["id"]
+        _H38 = {"Authorization": f"Bearer {_t38}", "X-Project-Id": _p38}
+        _prev38 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["none"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_a"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                      "test_names": ["test_a"]}],
+            "not_automated": [], "assumptions": [], "summary": "s"}
+        try:
+            _g38 = _c38.post("/api/review/test-automation", headers=_H38, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            _rid38 = _g38.json().get("review_id")
+
+            _r38 = _c38.get(f"/api/reviews/{_rid38}/test-results", headers=_H38).json()
+            check("a run with no delivery says so rather than inventing one",
+                  _r38["delivery"] is None, str(_r38.get("delivery")))
+
+            database.save_test_delivery(_rid38, _p38, "https://github.com/o/r", "br",
+                                        "https://github.com/o/r/pull/1")
+            _r38 = _c38.get(f"/api/reviews/{_rid38}/test-results", headers=_H38).json()
+            check("once delivered, the screen is told where results will come from",
+                  (_r38["delivery"] or {}).get("branch") == "br"
+                  and "pull/1" in ((_r38["delivery"] or {}).get("pull_request") or ""),
+                  "results appearing on their own with no stated source is a number changing "
+                  "for no visible reason")
+            check("...and the read still answers immediately",
+                  _r38["execution_status"] == "not_executed",
+                  "the pull is a daemon thread; a GitHub call a reader waits for would be a "
+                  "worse product than a report that arrives a moment later")
+
+            # Failure is the normal case here -- the repository above does not exist -- and
+            # what matters is that it stays invisible to the reader and is not retried on
+            # every single render.
+            _out38 = _tp38.pull_latest(_rid38)
+            check("a GitHub problem is recorded against the delivery, not raised",
+                  _out38["pulled"] is False and bool(_out38.get("why")),
+                  str(_out38)[:140])
+            _row38 = database.get_test_delivery(_rid38)
+            check("...with the reason kept where the screen can explain itself",
+                  bool(_row38.get("last_error")), str(_row38.get("last_error"))[:100])
+            check("...and the attempt timestamped, so it is not retried on every read",
+                  bool(_row38.get("last_fetch_at")),
+                  "without this an expired artifact would be re-requested forever")
+            check("...so the very next read declines",
+                  _tp38.pull_latest(_rid38)["why"] == "looked recently")
+
+            _r38 = _c38.get(f"/api/reviews/{_rid38}/test-results", headers=_H38).json()
+            check("the failed look reaches the screen as a note, not as an error",
+                  bool((_r38["delivery"] or {}).get("last_error"))
+                  and _r38["execution_status"] == "not_executed",
+                  "a background convenience that could not run must not become a red box")
+
+            # Filing the same CI run twice would show a suite passing twice as often as it
+            # ran, and the history is what a customer reads to decide whether their code
+            # works. Deduped on the record, not the bookkeeping, because a re-delivery
+            # deliberately clears the bookkeeping.
+            database.save_test_result_run(_rid38, _p38, {
+                "summary": {"total": 1, "passed": 1, "failed": 0, "errored": 0,
+                            "skipped": 0, "duration_ms": 1, "outcome": "passed"},
+                "results": [{"name": "test_a", "status": "passed", "duration_ms": 1}],
+                "requirements": [], "unmatched_results": 0, "reported_by": "auto-fetch",
+                "reported_at": "now", "source_label": "GitHub Actions run 999 (o/r)"})
+            check("a report already filed for a CI run is recognised",
+                  _tp38._already_filed(_rid38, "999"),
+                  "keyed on the stored report rather than on a cursor, because a "
+                  "re-delivery resets the cursor on purpose")
+            check("...and one from a different run is not",
+                  not _tp38._already_filed(_rid38, "1000"))
+
+            database.save_test_delivery(_rid38, _p38, "https://github.com/o/other", "br2")
+            _reset38 = database.get_test_delivery(_rid38)
+            check("re-delivering somewhere else clears the cursor",
+                  not _reset38.get("last_run_id") and not _reset38.get("last_fetch_at"),
+                  "a new target is a new place to look, and the last run seen at the old one "
+                  "must not suppress the first look at this one")
+        finally:
+            llm_gateway.call_tool = _prev38
+
 
 
 

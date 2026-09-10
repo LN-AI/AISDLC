@@ -416,6 +416,11 @@ def init_db():
             input_tokens INTEGER DEFAULT 0,
             output_tokens INTEGER DEFAULT 0,
             cost_usd REAL DEFAULT 0,
+            -- What the tokens cost *us*, beside what the customer owes. Both, because
+            -- storing only the price makes margin unanswerable and storing only the cost
+            -- makes the invoice a derivation nobody can check. Equal for every
+            -- pass-through product, which is all of them but one.
+            model_cost_usd REAL DEFAULT 0,
             model TEXT,
             provider TEXT,
             billable INTEGER DEFAULT 1,
@@ -468,6 +473,10 @@ def init_db():
         ("provider", "TEXT", "NULL"),
         ("billable", "INTEGER", 1),
         ("cost_estimated", "INTEGER", 0),
+        # What the tokens cost *us*, beside `cost_usd` which is what the customer owes.
+        # Equal for every pass-through product; different only where `services/pricing.py`
+        # sets a policy.
+        ("model_cost_usd", "REAL", 0),
     ):
         try:
             cursor.execute(
@@ -757,6 +766,23 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_test_results_run
             ON test_results(run_id);
+
+        -- Where a generated suite was delivered, so its results can be fetched without
+        -- anyone remembering to ask. One row per run, latest delivery wins: what this
+        -- answers is "where do I look now", not "where has this ever been sent" — the
+        -- audit trail already answers the second, and answering both here would mean
+        -- choosing between several places to poll.
+        CREATE TABLE IF NOT EXISTS test_deliveries (
+            review_id     TEXT PRIMARY KEY,
+            project_id    TEXT,
+            repo_url      TEXT NOT NULL,
+            branch        TEXT,
+            pull_request  TEXT,
+            delivered_at  TEXT,
+            last_fetch_at TEXT,
+            last_run_id   TEXT,
+            last_error    TEXT
+        );
     """)
 
     # Modernization owns six tables of its own. Their DDL lives with the code that queries
@@ -3072,6 +3098,7 @@ def record_usage_event(
     model: str = "",
     provider: str = "",
     billable: bool = True,
+    model_cost_usd: Optional[float] = None,
     cost_estimated: bool = False,
     project_id: Optional[str] = None,
     project_name: str = "",
@@ -3079,17 +3106,26 @@ def record_usage_event(
     status: str = "ok",
 ) -> str:
     """`billable` is False when the caller supplied their own LLM credentials — the row is
-    still recorded, but that spend must not count against the platform's budget caps."""
+    still recorded, but that spend must not count against the platform's budget caps.
+
+    `cost_usd` is what the **customer owes**; `model_cost_usd` is what the tokens cost
+    **us**. They differ only for a product with a row in `services/pricing.py`, and it
+    defaults to `cost_usd` so every pass-through product records the same number twice
+    rather than a zero that would read as free."""
     event_id = str(uuid.uuid4())
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO usage_events (id, key_id, caller_type, caller_ref, product_id, product_kind, "
-        "project_id, project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model, "
+        "project_id, project_name, review_id, calls, input_tokens, output_tokens, cost_usd, "
+        "model_cost_usd, model, "
         "provider, billable, cost_estimated, status, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (event_id, key_id, caller_type, caller_ref, product_id, product_kind, project_id,
-         project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model,
+         project_name, review_id, calls, input_tokens, output_tokens, cost_usd,
+         # Defaults to the charged amount, which is correct for every pass-through product:
+         # what it cost us and what it costs them are the same number there.
+         cost_usd if model_cost_usd is None else model_cost_usd, model,
          provider, 1 if billable else 0, 1 if cost_estimated else 0,
          status, datetime.utcnow().isoformat()),
     )
@@ -4494,6 +4530,69 @@ def save_test_result_run(review_id: str, project_id: Optional[str],
     finally:
         conn.close()
     return run_id
+
+
+
+def save_test_delivery(review_id: str, project_id: str, repo_url: str, branch: str = "",
+                       pull_request: str = "") -> None:
+    """Record where a run's tests were delivered. Replaces any earlier target for that run.
+
+    Deliberately not history. This exists to answer "where should the background pull look",
+    and a run delivered twice has one current answer; `audit_event` already holds the record
+    of every delivery that was attempted, which is the question an auditor asks.
+    """
+    conn = get_connection()
+    try:
+        conn.cursor().execute(
+            """INSERT INTO test_deliveries
+                   (review_id, project_id, repo_url, branch, pull_request, delivered_at,
+                    last_fetch_at, last_run_id, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+               ON CONFLICT(review_id) DO UPDATE SET
+                   project_id = excluded.project_id,
+                   repo_url = excluded.repo_url,
+                   branch = excluded.branch,
+                   pull_request = excluded.pull_request,
+                   delivered_at = excluded.delivered_at,
+                   -- A new delivery is a new place to look, so the last run seen at the old
+                   -- one must not suppress the first pull from this one.
+                   last_fetch_at = NULL,
+                   last_run_id = NULL,
+                   last_error = NULL""",
+            (review_id, project_id, repo_url, branch or "", pull_request or "",
+             datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_test_delivery(review_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        row = conn.cursor().execute(
+            "SELECT * FROM test_deliveries WHERE review_id = ?", (review_id,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def mark_test_fetch(review_id: str, run_id: str = "", error: str = "") -> None:
+    """Record that a pull was attempted, and what came of it.
+
+    Written on failure as well as success, and that is the point: without it a delivery whose
+    artifact has expired would be retried on every single read, forever.
+    """
+    conn = get_connection()
+    try:
+        conn.cursor().execute(
+            """UPDATE test_deliveries
+                  SET last_fetch_at = ?, last_run_id = ?, last_error = ?
+                WHERE review_id = ?""",
+            (datetime.now(timezone.utc).isoformat(), run_id or "", (error or "")[:500],
+             review_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_test_result_runs(review_id: str, limit: int = 20) -> List[Dict[str, Any]]:

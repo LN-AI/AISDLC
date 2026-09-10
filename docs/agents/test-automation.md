@@ -123,6 +123,7 @@ The endpoint above will take a result from anyone. That is not the same as anyon
 | `plan.jobs[]` | Per framework: the exact `argv`, the shell form, where its JUnit report lands |
 | `must_supply` | What no CI runner has by default and you must provide |
 | `blocked_reason` | Why no workflow could be rendered, when none could |
+| `report_mode` | `callback` if the job posts results itself, `artifact` if the platform must fetch them |
 
 Pass `?callback_url=https://...` when the deployment's `PUBLIC_BASE_URL` is not an address a CI runner can reach. A loopback or private address is **refused** rather than rendered: the job would run, fail to post, and look exactly like a suite nobody triggered.
 
@@ -170,6 +171,32 @@ python scripts/run_tests.py --review <id> --from-actions latest --repo https://g
 Needs **"Actions: Read"** on the GitHub token — a separate permission from the Contents and Pull requests ones everything else uses. Without it GitHub answers 404, the same as it does for anything a credential cannot see, so the error message names it.
 
 Artifacts expire (90 days by default, and a repository can disable them). That is the one failure this mode has and the direct callback does not: the report is only retrievable while GitHub still holds it. The refusal says so rather than reporting an empty result.
+
+### Nobody has to remember
+
+Once a run's tests have been delivered to a repository, **opening its results collects any new ones**. There is no scheduler in this deployment, so this runs where the platform's other time-based work runs — on the read that depends on it. Three properties, each about not making that read worse:
+
+- It never blocks. The results you see are the ones already stored; a pull that finds something new shows on the next read.
+- It never files the same CI run twice, deduped on the run id *and* on the stored history — so a re-delivery, which deliberately clears the cursor, cannot double-count.
+- A GitHub problem never becomes a red box. An expired artifact or a revoked token is recorded against the delivery and shown as a note beside the results.
+
+What it does not buy is anything happening while nobody looks. A truly unattended trend needs an address a runner can reach, and then the direct callback is the better answer.
+
+## What a run costs
+
+| | |
+|---|---|
+| **$0.50 per run** | charged once, only if the run actually reached the model |
+| **2x the model spend** | what the tokens cost, doubled |
+| **$5.00 ceiling** | no single run is charged more, whatever it read |
+
+Measured examples: a small app generation costs about $0.07 of model time, so **$0.64**. A 173-file hybrid run measured $0.27, so **$1.04**.
+
+The preflight is free and always was. So is everything on the results side — reporting, fetching and the runner plan are lookups, not generations, and none of them is metered.
+
+**Why not per test or per file.** The count is decided by the model *during* the run, so a preflight could not quote what the invoice would say — and every screen here quotes a ceiling before it spends. Revenue per test also pays the agent to pad, in the one product whose value is that it does not. And the cost driver is *input* size: a run that reads a large codebase and honestly reports that two tests were possible is the expensive one, and per-test pricing charges least for it.
+
+A run that reaches the model and then fails is recorded but **not invoiced**: the tokens are logged for visibility and you are not asked to pay for an answer you did not get.
 
 ### Putting the tests in the repository
 

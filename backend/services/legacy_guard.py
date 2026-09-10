@@ -38,6 +38,7 @@ from starlette.responses import JSONResponse
 
 from backend import config, context, database
 from backend.products import registry
+from backend.services import pricing
 from backend.services import agent_guard, code_chunker, llm_gateway
 from backend.services.subject_service import project_warning
 from backend.services.agent_guard import (
@@ -433,7 +434,13 @@ async def legacy_product_guard(request, call_next):
     effective_llm = llm_gateway.resolve_override(None) or {}
     model = effective_llm.get("model") or config.MODEL
     provider = effective_llm.get("provider") or "anthropic"
-    cost_usd = agent_guard._price_usage(usage, model)
+    model_cost_usd = agent_guard._price_usage(usage, model)
+    # What the customer owes, which is not always what the tokens cost. One product has a
+    # policy today and every other is pass-through, so this is a no-op everywhere else —
+    # but it has to happen *here*, before the headers and the ledger below, because those
+    # two disagreeing is the failure this whole block was written to prevent.
+    charge = pricing.price(product_id, model_cost_usd, usage["calls"])
+    cost_usd = charge["total_usd"]
 
     # ── What it cost, back to the caller ─────────────────────────────────────
     #
@@ -453,6 +460,15 @@ async def legacy_product_guard(request, call_next):
     # below. Deriving them any other way would let the number on screen and the number
     # billed drift apart, which is worse than showing nothing.
     response.headers["X-Spend-Cost-USD"] = f"{cost_usd:.6f}"
+    if charge["priced"]:
+        # Sent only for a priced product, so the screen can decompose a total that is not
+        # simply the model spend. A charge nobody can break down is a charge nobody can
+        # dispute, and the flat fee is the part most likely to be queried.
+        response.headers["X-Spend-Model-Cost-USD"] = f"{model_cost_usd:.6f}"
+        response.headers["X-Spend-Fee-USD"] = f"{charge['fee_usd']:.6f}"
+        response.headers["X-Spend-Markup"] = f"{charge['markup']:g}"
+        if charge["capped"]:
+            response.headers["X-Spend-Capped"] = "1"
     response.headers["X-Spend-Calls"] = str(usage["calls"])
     response.headers["X-Spend-Tokens-In"] = str(usage["input_tokens"])
     response.headers["X-Spend-Tokens-Out"] = str(usage["output_tokens"])
@@ -481,6 +497,7 @@ async def legacy_product_guard(request, call_next):
             input_tokens=usage["input_tokens"],
             output_tokens=usage["output_tokens"],
             cost_usd=cost_usd,
+        model_cost_usd=model_cost_usd,
             model=model,
             provider=provider,
             billable=True,

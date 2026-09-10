@@ -87,7 +87,7 @@ node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans scr
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
-Five live drivers sit beside these. They are **not** part of the offline net: three of
+Six live drivers sit beside these. They are **not** part of the offline net: four of
 them spend real money, and four write to a real repository — use a scratch one.
 `verify_code_delivery.py` and `run_tests.py` are the odd ones: both write but call no
 model, because the thing they verify is the delivery, not the generation.
@@ -95,6 +95,8 @@ model, because the thing they verify is the delivery, not the generation.
 ```
 python scripts/eval_code_review.py                       # accuracy, 3 runs per case (~$0.55)
 python scripts/eval_code_review.py --repeat 1            # cheaper; cannot measure variance
+python scripts/eval_test_automation.py                   # do the generated tests work (~$0.21)
+python scripts/eval_test_automation.py --repeat 1        # cheaper; cannot measure variance
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
 python scripts/verify_pr_review.py <pr-url> --dry-run    # ...the same, writing nothing
 python scripts/verify_pr_review.py <pr-url> --cleanup    # remove what it posted
@@ -121,6 +123,16 @@ cannot answer. `verify_pr_review.py` exists because the offline
 suites stub the model and never touch GitHub: they cannot tell you that an inline comment
 landed on the line intended, and the worst defect of the session was invisible until a real
 diff went through it (D-244).
+
+`eval_test_automation.py` is the only thing that can tell whether generated *tests* got
+better or worse, and it asks the only question that means anything for a test generator:
+does the suite go **red on broken code and green once it is fixed**. Every case therefore
+ships twice — `source/` with a real bug, `fixed/` with the smallest correct fix — and the
+same generated suite is run against both. Counting files rewards padding and diffing against
+a reference suite rewards imitation; neither says whether the tests work. It needs a real key
+and runs generated code, so it belongs on the same tier as `run_tests.py`, never the API
+host. The floors are measured, not guessed (D-403), and it found a defect on its first run
+that nothing offline could see (C-93).
 
 `run_tests.py` is the local half of the test-automation loop and the only driver that
 runs *generated* code — on a developer's machine, never on the API host, which is the tier

@@ -103,7 +103,7 @@ from backend.services import test_context_brief
 from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
                               review_source_store, source_bundle, test_results,
-                              test_runner_plan)
+                              test_runner_plan, test_results_pull, pricing)
 from backend.services.github_service import GitHubService
 from backend.services.subject_service import resolve_subject
 from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
@@ -585,6 +585,8 @@ def _preflight_design(req, request: Request, agent: str) -> dict:
         "budget": headroom,
         "explanation": review_estimate.describe(
             quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        # What the run costs the customer, said in one sentence beside the token estimate.
+        "billing": quote.get("billing"),
         "within_budget": (
             None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
         "code_brief": {k: brief[k] for k in ("coverage", "coverage_note", "stats", "files")},
@@ -2313,12 +2315,29 @@ def read_test_results(review_id: str, request: Request,
     "this used to pass" is a fact a single current snapshot cannot express.
     """
     _results_review(review_id, request, reader)
+    # There is no scheduler in this deployment, so this runs where the other time-based
+    # passes run: on the read that depends on it (`lapse_expired_waivers` before a baseline
+    # lookup, `sweep_expired` on an inventory read). It never blocks — the results below are
+    # whatever is already stored, and a pull that finds something new shows on the next read.
+    # What it does not buy is anything happening while nobody looks.
+    delivery = database.get_test_delivery(review_id)
+    if delivery:
+        test_results_pull.kick(review_id)
     runs = database.get_test_result_runs(review_id)
     latest = dict(runs[0]) if runs else None
     if latest:
         latest["results"] = database.get_test_results(latest["id"])
     return {"review_id": review_id, "runs": runs, "latest": latest,
             "execution_status": "reported" if runs else "not_executed",
+            # Where this run's tests were delivered, and how the last look for results went.
+            # Shown rather than hidden: a fetch that keeps failing because an artifact
+            # expired is something the reader can act on, and silence about it reads as
+            # "the tests were never run".
+            "delivery": ({"repo_url": delivery.get("repo_url"),
+                          "branch": delivery.get("branch"),
+                          "pull_request": delivery.get("pull_request"),
+                          "last_fetch_at": delivery.get("last_fetch_at"),
+                          "last_error": delivery.get("last_error")} if delivery else None),
             "attested": False}
 
 
@@ -2435,67 +2454,30 @@ async def pull_test_results_from_actions(review_id: str, req: TestResultsFromAct
             status_code=400,
             detail=f"No GitHub credential could be resolved for {owner}/{repo}.")
 
-    def _fetch() -> tuple:
-        run_id = (req.run_id or "").strip()
-        chosen = None
-        if not run_id:
-            runs = gh.list_workflow_runs(owner, repo, branch=(req.branch or "").strip(),
-                                         workflow_file=test_runner_plan.WORKFLOW_FILE)
-            # Newest *completed* run. An in-progress run has no artifact yet, and reporting
-            # "no results" for one that is still running would be read as "it produced none".
-            chosen = next((r for r in runs if r.get("status") == "completed"), None)
-            if not chosen:
-                raise ValueError(
-                    f"No completed run of {test_runner_plan.WORKFLOW_FILE} in {owner}/{repo}"
-                    + (f" on branch '{req.branch}'" if req.branch else "")
-                    + (". One is still running — wait for it and try again."
-                       if runs else ". Has the workflow been committed and triggered yet?"))
-            run_id = str(chosen.get("id"))
-        else:
-            # Named explicitly, so nothing has been looked up yet. Fetched rather than left
-            # blank: a result filed with no branch, no conclusion and no link back to the
-            # job that produced it is most of the way to not being auditable.
-            chosen = gh.get_workflow_run(owner, repo, run_id)
-        artifacts = gh.list_run_artifacts(owner, repo, run_id)
-        match = next((a for a in artifacts
-                      if a.get("name") == test_runner_plan.ARTIFACT_NAME), None)
-        if not match:
-            raise ValueError(
-                f"Run {run_id} saved no '{test_runner_plan.ARTIFACT_NAME}' artifact"
-                + (f" (it saved: {', '.join(a['name'] for a in artifacts)})." if artifacts
-                   else ". The job may have failed before the tests ran."))
-        if match.get("expired"):
-            # A different problem from "there is none", and the only one with a fix.
-            raise ValueError(
-                f"That run's results have expired and GitHub no longer has them. Re-run the "
-                f"workflow — or shorten the gap, since artifacts are kept for a limited "
-                f"time and this is the only copy.")
-        return run_id, chosen, gh.download_artifact(owner, repo, match["id"])
-
     try:
-        run_id, run_meta, blob = await asyncio.to_thread(_fetch)
-        merged = test_runner_plan.read_artifact_zip(blob)
-    except ValueError as exc:
+        outcome = await asyncio.to_thread(
+            test_results_pull.pull_and_store, review, gh, owner, repo,
+            (req.run_id or "").strip(), (req.branch or "").strip(),
+            (reader or {}).get("username") or (reader or {}).get("key_name") or "api")
+    except test_results_pull.PullError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         logger.exception("Could not pull Actions results for %s", review_id)
         raise HTTPException(status_code=502, detail=f"Could not read that run: {exc}")
 
-    try:
-        payload = test_results.ingest(
-            review,
-            {"junit_xml": merged,
-             "source_label": f"GitHub Actions run {run_id} ({owner}/{repo})"},
-            actor=(reader or {}).get("username") or (reader or {}).get("key_name") or "api")
-    except test_results.TestResultError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    saved = database.save_test_result_run(review_id, review.get("project_id"), payload)
+    # A run fetched by hand is also the answer to "where should the background pass look",
+    # so the cursor moves with it. Without this a manual fetch would be re-fetched moments
+    # later by the automatic one and filed a second time.
+    if database.get_test_delivery(review_id):
+        database.mark_test_fetch(review_id, outcome["actions_run_id"], "")
+
+    payload = outcome["payload"]
+    meta = outcome["actions_run"] or {}
     return {
-        "run_id": saved,
+        "run_id": outcome["run_id"],
         "review_id": review_id,
-        "actions_run": {"id": run_id, "url": (run_meta or {}).get("url"),
-                        "branch": (run_meta or {}).get("branch"),
-                        "conclusion": (run_meta or {}).get("conclusion")},
+        "actions_run": {"id": outcome["actions_run_id"], "url": meta.get("url"),
+                        "branch": meta.get("branch"), "conclusion": meta.get("conclusion")},
         "summary": payload["summary"],
         "requirements": payload["requirements"],
         "unmatched_results": payload["unmatched_results"],
@@ -2585,6 +2567,16 @@ async def deliver_generated_tests(review_id: str, req: DeliverTestsRequest, requ
     delivery["workflow_included"] = (req.include_workflow
                                      and test_runner_plan.WORKFLOW_PATH not in failed)
     delivery["must_supply"] = plan["must_supply"]
+
+    # Remembered so the results can be fetched later without anyone naming the repository
+    # again — which is the difference between a loop that closes by itself and one that
+    # closes when somebody remembers. Recorded only once files actually landed: a delivery
+    # that committed nothing is not somewhere to go looking.
+    if delivery.get("files_committed"):
+        database.save_test_delivery(
+            review_id, review.get("project_id"), req.github_repo_url,
+            delivery.get("branch") or "",
+            ((delivery.get("pull_request") or {}) or {}).get("url") or "")
     return delivery
 
 
@@ -2923,7 +2915,11 @@ def _automation_quote(bundle, inputs: dict, requirement: str, cases: str,
     """
     priced = "\n".join([requirement or "", cases or "",
                         inputs["conventions"]["markdown"], inputs["markdown"]])
-    quote = review_estimate.for_text(priced, agent="test-automation")
+    # The token estimate, then what it will actually be *charged* at. Both, because they
+    # answer different questions and a quote showing only the first understates the invoice
+    # — the direction that loses trust (`services/pricing.py`).
+    quote = pricing.apply_to_quote(
+        review_estimate.for_text(priced, agent="test-automation"), "test-automation")
     subject = _ui_subject(request)
     headroom = agent_guard.remaining_budget(subject) if subject is not None else None
     return {

@@ -1,0 +1,8 @@
+{
+  "name": "ownership-node",
+  "language": "javascript",
+  "requirement": "A task may only be updated or deleted by the user who created it. When any other authenticated user attempts to update or delete a task they do not own, the request must be rejected with 403 and the task must be left unchanged. An unauthenticated request to update or delete must be rejected with 401.",
+  "bug": "PUT /tasks/:id and DELETE /tasks/:id check that the caller is authenticated but never that the caller owns the task, so any signed-in user can edit or delete anyone else's task.",
+  "fix": "src/app.js gains an ownership check before the write in both handlers, returning 403 when task.ownerId is not the caller.",
+  "notes": "The unauthenticated 401 case behaves identically in both variants, on purpose: a suite that only asserts that is green on both and so does not discriminate. It is the control."
+}
