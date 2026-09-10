@@ -503,7 +503,18 @@ def build(bundle, max_chars: int = MAX_BRIEF_CHARS) -> Dict[str, Any]:
 
     Returns the markdown to put in front of the agent plus the same facts as data, so a
     screen can print the identical statement without re-deriving it from prose.
+
+    Memoized on the content it reads — 2.6 seconds on this repository's own backend, and
+    computed once for the free preflight and again for the run on identical input. See
+    `brief_cache`.
     """
+    from backend.services import brief_cache
+    return brief_cache.memoize(
+        "test_conventions", list(getattr(bundle, "files", None) or []), (max_chars,),
+        lambda: _build(bundle, max_chars))
+
+
+def _build(bundle, max_chars: int) -> Dict[str, Any]:
     facts = detect(list(getattr(bundle, "files", None) or []))
     exemplars = pick_exemplars(facts.pop("_tests", []) or [])
     configs = facts.pop("_configs", []) or []

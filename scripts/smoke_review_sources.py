@@ -4700,6 +4700,56 @@ def main():
           "a suite built from a description is a weaker artifact than one built from "
           "source, and a reader who cannot tell them apart trusts both equally")
 
+    # -- the briefs are computed once per codebase, not once per request --
+    #
+    # Both builders are pure functions of the file paths and contents they read, and both
+    # are slow on a real repository: 2.6s and 9.3s on this repo's own backend. Every
+    # code-reading product computes them twice for one generation -- once for the free
+    # preflight, which is how a user decides whether to spend, and again for the run, on
+    # byte-identical input. The cache removes a wait that was never doing any work; it
+    # changes no answer, and these checks are here to prove that rather than assert it.
+    from backend.services import brief_cache as _bc34
+    _bc34.clear()
+    _fresh34 = _tcb34.build(_real34)
+    _n0 = _bc34.stats()
+    _cached34 = _tcb34.build(_real34)
+    _n1 = _bc34.stats()
+    check("the same codebase is not analysed twice",
+          _n1["hits"] == _n0["hits"] + 1, f"{_n0} then {_n1}")
+    check("...and the cached brief is identical to a freshly computed one",
+          _cached34 == _fresh34,
+          "a cache that returns a different answer is worse than no cache")
+    check("...and a different codebase is analysed rather than guessed at",
+          (_tcb34.build(_B34([{"path": "other.py", "content": "def f():\n    pass\n"}]))
+           and _bc34.stats()["misses"] > _n1["misses"]),
+          f"{_bc34.stats()} -- the key is a content hash, so different content must miss")
+
+    # `repo_ingest` promises no file order, and the brief does not depend on one. Keying on
+    # order would mean a re-clone of the same commit missed its own entry.
+    _rev34 = _B34(list(reversed(_real34.files)))
+    _n2 = _bc34.stats()
+    _tcb34.build(_rev34)
+    check("...while the same files in a different order share one entry",
+          _bc34.stats()["hits"] == _n2["hits"] + 1, f"{_n2} then {_bc34.stats()}")
+
+    # The size limit changes the brief, so it has to change the key. Colliding here would
+    # serve a 40,000-character brief to a caller who asked for 200.
+    _n3 = _bc34.stats()
+    _tcb34.build(_real34, max_chars=200)
+    check("...but a different size limit is a different brief, not a collision",
+          _bc34.stats()["misses"] == _n3["misses"] + 1, f"{_n3} then {_bc34.stats()}")
+
+    # Entries are shared, so a caller that mutates what it got back would corrupt every
+    # later reader. The top level is copied on the way out for exactly that reason.
+    _mine34 = _tcb34.build(_real34)
+    _mine34["has_tests"] = "tampered"
+    check("...and one caller cannot corrupt the entry for the next",
+          _tcb34.build(_real34)["has_tests"] is True,
+          "a shared cache handing out its own dict is one bad caller away from a wrong brief")
+    _bc34.clear()
+    check("the cache can be emptied, so one test cannot inherit another's entries",
+          _bc34.stats() == {"hits": 0, "misses": 0, "entries": 0}, str(_bc34.stats()))
+
     # -- relevance ranking: which files a requirement is actually about ---
     #
     # The property under test is the one D-384 exists for: a codebase too large to send used
