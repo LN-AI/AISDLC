@@ -32,7 +32,7 @@ Custom envelope, fields returned at the top level:
 | Field | Description |
 |---|---|
 | `test_cases[]` | Each: `test_case_id` (e.g. `TC-001`), `title`, `type` (`Functional`\|`Negative`\|`Boundary Value`\|`Role-Based`\|`Integration`\|`Regression`\|`Exception/Error Handling`), `priority`, `preconditions[]`, `steps[]` (each `{step_number, action, expected_result}` — concrete actions, never "verify it works"), `test_data[]` (specific synthetic values), `dependencies[]`, `requirement_ref` (the requirement text or `scenario_id` this validates) |
-| `traceability[]` | Each: `requirement_or_scenario_ref`, `test_case_ids[]` |
+| `traceability[]` | Each: `requirement_or_scenario_ref`, `test_case_ids[]`. Returned as the model wrote it. The screen **reconciles** it against `test_cases[]` before showing it, and an integrator should too: a row citing an id that no test case carries is claimed coverage resting on a test case nobody generated, and a case in no row at all traces to nothing |
 | `untestable_items[]` | Anything too vague to turn into an executable case, named rather than guessed |
 | `total_test_cases`, `critical_count` | Added by the orchestrator |
 | `summary` | — |

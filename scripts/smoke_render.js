@@ -3555,11 +3555,129 @@ async function runProjectWarningChecks() {
   });
 }
 
+// -- Test cases: the coverage map that was generated and thrown away ---------
+//
+// `traceability` is a required field of the test-case schema, produced on every run, stored
+// and served by the API -- and the renderer dropped it, so whatever it cost to generate was
+// paid for and never seen. It is also the only part of the result that answers "is every
+// requirement covered", which a long list of test cases cannot answer by being long.
+//
+// It is rendered reconciled rather than as-is, the rule `attest.coverage_claim` applies to a
+// model's own file list: the map can name a test case that was never generated, and a
+// generated case can appear in no row at all. Both are invisible unless something checks.
+function runTestCaseChecks() {
+section('Test case traceability');
+
+const CASES = [
+  { test_case_id: 'TC-001', title: 'expired blocks checkout', type: 'Negative',
+    priority: 'Critical', preconditions: ['subscription expired yesterday'],
+    steps: [{ step_number: 1, action: 'Click Checkout', expected_result: '402' }],
+    requirement_ref: 'REQ-1' },
+  { test_case_id: 'TC-002', title: 'active can check out', type: 'Functional',
+    priority: 'High', preconditions: [], steps: [], requirement_ref: 'REQ-1' },
+];
+
+check('the coverage map reaches the screen at all', () => {
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, total_test_cases: 2, critical_count: 1, summary: 'Two cases.',
+    traceability: [{ requirement_or_scenario_ref: 'REQ-1', test_case_ids: ['TC-001', 'TC-002'] }],
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(html.includes('Requirement Coverage'), 'the traceability map is still being dropped');
+  assert(html.includes('REQ-1'), 'the requirement it traces to is not shown');
+  assert(html.includes('TC-002'), 'the cases covering it are not shown');
+});
+
+check('a requirement nothing covers is called out, not shown as a blank', () => {
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, summary: 's',
+    traceability: [
+      { requirement_or_scenario_ref: 'REQ-1', test_case_ids: ['TC-001', 'TC-002'] },
+      { requirement_or_scenario_ref: 'REQ-2', test_case_ids: [] },
+    ],
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(html.includes('nothing covers this'), 'an uncovered requirement reads as covered');
+  assert(html.includes('1 requirement has no test case at all'),
+    'the gap must be stated where a reader skimming the top will see it');
+});
+
+check('an id in the map that no test case carries is surfaced', () => {
+  // The D-316 failure in a different agent: a model referring to something it never made.
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, summary: 's',
+    traceability: [{ requirement_or_scenario_ref: 'REQ-1',
+                     test_case_ids: ['TC-001', 'TC-002', 'TC-099'] }],
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(html.includes('TC-099'), 'the invented id is not shown');
+  assert(html.includes('match no generated test case'),
+    'claimed coverage that rests on a test case nobody generated must not read as coverage');
+});
+
+check('a test case that traces to nothing is surfaced too', () => {
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, summary: 's',
+    traceability: [{ requirement_or_scenario_ref: 'REQ-1', test_case_ids: ['TC-001'] }],
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(html.includes('trace back to no requirement'),
+    'a case nobody can say the purpose of is work with no stated reason');
+  assert(html.includes('TC-002'), 'the untraced case is not named');
+});
+
+check('a clean map says nothing extra', () => {
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, summary: 's',
+    traceability: [{ requirement_or_scenario_ref: 'REQ-1', test_case_ids: ['TC-001', 'TC-002'] }],
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(!html.includes('trace-reconcile'),
+    'a reconciliation with nothing to report is noise beside one that has something');
+});
+
+check('a result with no map at all says so rather than staying silent', () => {
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, summary: 's',
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(!html.includes('Requirement Coverage'), 'there is no map to draw');
+  assert(html.includes('cannot be reconciled'),
+    'an absent map must not look the same as a map that found no problems');
+  assert(html.includes('TC-001'), 'the cases themselves must still render');
+});
+
+check('a junk row in the map loses the row, not the whole result', () => {
+  // D-392's rule at the renderer: `traceability` is model-written, and a null in it would
+  // throw inside the template and blank every test case on the screen.
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, summary: 's',
+    traceability: [null, 'REQ-1', { requirement_or_scenario_ref: 'REQ-1', test_case_ids: ['TC-001'] }],
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(html.includes('TC-001'), 'the good row was lost with the bad ones');
+  assert(html.includes('Click Checkout'), 'the cases themselves were lost');
+});
+
+check('the rest of the result still renders around it', () => {
+  sandbox.renderTestCases('test-case-result', {
+    test_cases: CASES, total_test_cases: 2, critical_count: 1, summary: 'Two cases.',
+    untestable_items: ['"works well" is not testable'],
+    traceability: [{ requirement_or_scenario_ref: 'REQ-1', test_case_ids: ['TC-001'] }],
+    review_id: 'rev-17',
+  });
+  const html = document.getElementById('test-case-result').innerHTML;
+  assert(html.includes('Untestable Items'), 'untestable items lost');
+  assert(html.includes('Click Checkout'), 'the steps table lost');
+  assert(html.includes('rev-17'), 'the review id lost');
+});
+}
+
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
   .then(runReviewSourceChecks).then(runScreenIsolationChecks)
   .then(runNavigationChecks).then(runProjectWarningChecks)
   .then(runApprovalCardChecks).then(runDashboardChecks)
-  .then(runCommandPaletteChecks).then(() => {
+  .then(runCommandPaletteChecks).then(runTestCaseChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

@@ -1,8 +1,8 @@
 """Measure the Test Automation agent by running what it writes.
 
-    python scripts/eval_test_automation.py                 # every case, 3 runs each (~$0.30)
+    python scripts/eval_test_automation.py                 # every case, 3 runs each (~$0.43)
     python scripts/eval_test_automation.py --repeat 1       # cheaper; cannot measure variance
-    python scripts/eval_test_automation.py ownership-node   # one case
+    python scripts/eval_test_automation.py ownership-node   # one case (~$0.21)
     python scripts/eval_test_automation.py --keep DIR       # leave the workdirs to look at
 
 UNLIKE `scripts/smoke_review_sources.py`, this calls the real model and therefore COSTS
@@ -40,12 +40,21 @@ Three supporting measures, each watching a specific way this can go wrong:
 Results go to `evals/test_automation/results/<label>.json` with `PROMPT_VERSION` recorded, so
 two runs can be compared rather than remembered.
 
-Why the corpus is Node with no dependencies
--------------------------------------------
-So that a red result means the tests failed, not that `npm install` did. The subject app uses
-`node:test` and the standard library only; nothing is fetched, nothing is compiled, and the
-eval measures the generator instead of a package manager. The cost is that one case cannot
-tell you anything about Python or Java — `n=1` on one language, said out loud.
+Why the corpus has no dependencies
+----------------------------------
+So that a red result means the tests failed, not that `npm install` did. Each subject app
+uses its language's own test runner and its standard library: `node:test` for
+`ownership-node`, pytest and nothing else for `cancellation-python`. Nothing is fetched and
+nothing is compiled, so the eval measures the generator rather than a package manager.
+
+**What each case can and cannot tell you.** They are deliberately different in more than
+language: `ownership-node` is an HTTP API with an authorisation bug, `cancellation-python` a
+service layer with a state-machine bug. Two cases still cannot tell you that a *third*
+language works, and neither is large — a percentage over two cases is really a count.
+
+`cancellation-python` needs **pytest in whatever environment you run this from**, which is
+the one dependency in the corpus and is checked for before anything is spent rather than
+discovered as a suite that mysteriously produced no report. `pip install pytest`.
 """
 import argparse
 import io
@@ -87,8 +96,16 @@ PROMPT_VERSION = "2026-09-10.1"
 # `ran` has the same floor as `discriminates` deliberately, because it is the more basic
 # failure: a suite that does not execute cannot discriminate, and D-316 is exactly that
 # failure arriving in production.
+#
+# `cancellation-python` measured 2026-09-11, same discipline, same model, three runs, all
+# three identical in the way that matters: **16-17 tests in one file, 3 failing on the broken
+# app and every one passing on the fixed one**, all 13 claimed requirements verified by a test
+# that really ran, no errors at all. `discriminates` 100%, `ran` 100%, ~$0.072 of model time
+# per run. Its floor is 0.66 for the same reason as the row above and not because anyone
+# judged the two cases to be equally hard.
 FLOORS = {
     "ownership-node": {"discriminates": 0.66, "ran": 0.66},
+    "cancellation-python": {"discriminates": 0.66, "ran": 0.66},
 }
 
 _SOURCE_SUFFIXES = (".js", ".json", ".md", ".ts", ".py")
@@ -122,11 +139,62 @@ def cases() -> list:
     return out
 
 
+_JUNK_DIRS = ("node_modules", ".git", "lm-test-results", "__pycache__", ".pytest_cache")
+
+
+def _use_this_interpreter() -> None:
+    """Make `python` in the runner table mean the interpreter running this eval.
+
+    `test_runner_plan`'s pytest row starts `python -m pytest`, and `run_tests._executable`
+    resolves that with `shutil.which` — which finds whatever is first on PATH. Run as
+    `venv/Scripts/python.exe scripts/eval_test_automation.py` on Windows, that is the
+    *system* interpreter, which has none of this project's dependencies and (usually) no
+    pytest: the suite then reports "did not run" for a reason that has nothing to do with the
+    tests. Putting this interpreter's directory first is what activating the virtualenv would
+    have done, and it is the difference between measuring the generator and measuring PATH.
+    """
+    bindir = os.path.dirname(os.path.abspath(sys.executable))
+    if bindir and bindir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+
+
+def missing_runners(specs: list) -> list:
+    """Which of the corpus's runners are not installed here. -> list of (case, how to fix).
+
+    Checked before the model is called rather than after, because a missing runner and a
+    generated suite that does not execute produce the *same* score — `ran: false` — and only
+    one of them is the agent's fault. Spending $0.20 to learn that pytest is not installed is
+    the kind of result that quietly gets averaged into a baseline.
+    """
+    import subprocess
+
+    probes = {"python": [sys.executable, "-m", "pytest", "--version"],
+              "javascript": [shutil.which("node") or "node", "--version"]}
+    hints = {"python": "pip install pytest",
+             "javascript": "install Node 18 or newer"}
+    missing, checked = [], {}
+    for spec in specs:
+        language = (spec.get("language") or "").lower()
+        argv = probes.get(language)
+        if not argv:
+            continue
+        if language not in checked:
+            try:
+                checked[language] = subprocess.run(
+                    argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=60).returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                checked[language] = False
+        if not checked[language]:
+            missing.append((spec["name"], language, hints.get(language, "")))
+    return missing
+
+
 def read_source(directory: str) -> list:
     """The case's app, as the intake shape every code-reading product takes."""
     files = []
     for root, dirs, names in os.walk(directory):
-        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "lm-test-results")]
+        dirs[:] = [d for d in dirs if d not in _JUNK_DIRS]
         for name in sorted(names):
             if not name.endswith(_SOURCE_SUFFIXES):
                 continue
@@ -161,6 +229,31 @@ def generate(client, headers: dict, requirement: str, files: list) -> tuple:
     return result, _spend_from(resp, result.get("review_id")), seconds, None
 
 
+def _model_cost(review_id: str) -> float:
+    """What the tokens cost us for this run, read straight from `usage_events`.
+
+    **Not `get_review_spend`, and not by adding a field to it.** Since D-404 that function's
+    `cost_usd` is what the *customer* would be charged — model spend times a markup, plus a
+    flat fee — and it is served to customers by `GET /api/reviews`. Putting our cost basis
+    into that response would publish the margin. The column exists for exactly this reader,
+    so this reads the column.
+
+    It matters here more than anywhere: this eval is what the price was set from. Reporting
+    the price back would make the next baseline comparison nine times the last one for a
+    reason that has nothing to do with the agent.
+    """
+    from backend import database
+
+    conn = database.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT SUM(COALESCE(model_cost_usd, cost_usd)) AS c FROM usage_events "
+            "WHERE review_id = ?", (review_id,)).fetchone()
+        return round(float((row["c"] if row else 0) or 0), 6)
+    finally:
+        conn.close()
+
+
 def _spend_from(resp, review_id) -> dict:
     """What that call cost, from the billing ledger — never from a counter of our own.
 
@@ -171,6 +264,10 @@ def _spend_from(resp, review_id) -> dict:
     `database.get_review_spend` reads `usage_events` — the row the invoice is built from.
     Deriving a cost any other way is how an eval and an invoice start disagreeing.
 
+    Both numbers are kept: `model_cost_usd` is what the run cost us and is what a baseline
+    should be compared on, `cost_usd` is what a customer would be billed for it. They are the
+    same figure for every product without a pricing policy.
+
     A run with no ledger row reports `source: unknown` and zero, and the summary says the
     total is a floor. "$0.00" as a claim is worse than an admitted gap.
     """
@@ -180,21 +277,26 @@ def _spend_from(resp, review_id) -> dict:
         ledger = (database.get_review_spend([review_id]) or {}).get(review_id) or {}
         if ledger:
             return {"cost_usd": float(ledger.get("cost_usd") or 0),
+                    "model_cost_usd": _model_cost(review_id),
                     "input_tokens": int(ledger.get("input_tokens") or 0),
                     "output_tokens": int(ledger.get("output_tokens") or 0),
                     "calls": int(ledger.get("calls") or 0), "source": "ledger"}
     header = resp.headers.get("X-Spend-Cost-USD")
     if header:
         try:
+            # `X-Spend-Model-Cost-USD` is sent only for a priced product; for every other one
+            # the two are the same number and the fallback is correct rather than lazy.
             return {"cost_usd": float(header),
+                    "model_cost_usd": float(
+                        resp.headers.get("X-Spend-Model-Cost-USD") or header),
                     "input_tokens": int(resp.headers.get("X-Spend-Tokens-In") or 0),
                     "output_tokens": int(resp.headers.get("X-Spend-Tokens-Out") or 0),
                     "calls": int(resp.headers.get("X-Spend-Calls") or 0),
                     "source": "headers"}
         except ValueError:
             pass
-    return {"cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "calls": 0,
-            "source": "unknown"}
+    return {"cost_usd": 0.0, "model_cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0,
+            "calls": 0, "source": "unknown"}
 
 
 
@@ -285,7 +387,10 @@ def run_case(client, headers: dict, spec: dict, keep: str = "") -> dict:
     workdir = (os.path.join(keep, f"{spec['name']}-{int(time.time())}") if keep
                else tempfile.mkdtemp(prefix=f"lm-eval-{spec['name']}-"))
     shutil.rmtree(workdir, ignore_errors=True)
-    shutil.copytree(source, workdir)
+    # Nothing generated or compiled comes along. A stale `__pycache__` copied in beside a
+    # source tree that is about to be overwritten by `fixed/` is the kind of thing that makes
+    # one run of an eval disagree with the next for a reason nobody can see.
+    shutil.copytree(source, workdir, ignore=shutil.ignore_patterns(*_JUNK_DIRS))
 
     files = read_source(source)
     result, usage, seconds, error = generate(client, headers, spec["requirement"], files)
@@ -320,6 +425,17 @@ def run_case(client, headers: dict, spec: dict, keep: str = "") -> dict:
 
 # ── Reporting ───────────────────────────────────────────────────────────────
 
+def pricing_note() -> str:
+    """The policy in words, read from the one place it is defined rather than restated."""
+    try:
+        from backend.services import pricing
+        rule = pricing.policy_for("test-automation")
+        return (f"${rule['fee_usd']:.2f} per run plus {rule['markup']:g}x model spend, "
+                f"capped at ${rule['ceiling_usd']:.2f}")
+    except Exception:                                               # noqa: BLE001
+        return "see backend/services/pricing.py"
+
+
 def report(records: list, repeat: int) -> int:
     """Print the table and return an exit code. Non-zero when a measured floor is missed."""
     print()
@@ -330,9 +446,11 @@ def report(records: list, repeat: int) -> int:
 
     failures = []
     spend = 0.0
+    billed = 0.0
     for name, runs in by_case.items():
         good = [r for r in runs if "score" in r]
-        spend += sum((r.get("usage") or {}).get("cost_usd", 0) or 0 for r in runs)
+        spend += sum((r.get("usage") or {}).get("model_cost_usd", 0) or 0 for r in runs)
+        billed += sum((r.get("usage") or {}).get("cost_usd", 0) or 0 for r in runs)
         unknown = sum(1 for r in runs
                       if (r.get("usage") or {}).get("source", "unknown") == "unknown")
         print(f"\n{name}  ({len(good)} of {len(runs)} run(s) produced a suite)")
@@ -364,6 +482,9 @@ def report(records: list, repeat: int) -> int:
             ran = sum(1 for r in good if r["score"]["ran"]) / len(good)
             print(f"   ── discriminates in {rate:.0%} of runs; ran at all in {ran:.0%}")
             floor = (FLOORS.get(name) or {})
+            if not floor:
+                print("   ── no measured floor for this case yet, so nothing here can fail "
+                      "it. Set one from this run rather than from judgement (D-245).")
             for key, minimum in floor.items():
                 actual = {"discriminates": rate, "ran": ran}.get(key)
                 if actual is not None and actual + 1e-9 < minimum:
@@ -371,9 +492,15 @@ def report(records: list, repeat: int) -> int:
 
     print()
     print("-" * 78)
-    print(f"Spent ${spend:.4f} over {len(records)} run(s), {repeat} per case"
+    print(f"Spent ${spend:.4f} of model time over {len(records)} run(s), {repeat} per case"
           + (f" — {unknown} run(s) had no ledger row, so that is a floor."
              if unknown else "."))
+    if billed > spend + 1e-9:
+        # Two different questions, and conflating them is how a baseline set before D-404
+        # would look nine times cheaper than one set after it. This line is the cost; the
+        # other is the price, which is what `pricing.POLICY` turns the cost into.
+        print(f"At today's prices the same work would bill a customer ${billed:.2f} "
+              f"({pricing_note()}).")
     if repeat < 2:
         print("With --repeat 1 this cannot measure variance: one run that discriminates and "
               "one that does not are the same score.")
@@ -403,6 +530,16 @@ def main() -> int:
     chosen = [c for c in cases() if not args.case or c["name"] == args.case]
     if not chosen:
         print(f"No cases found in {CORPUS}" + (f" matching {args.case!r}" if args.case else ""))
+        return 2
+
+    _use_this_interpreter()
+    absent = missing_runners(chosen)
+    if absent:
+        print("This machine cannot run part of the corpus, so the score would be wrong "
+              "rather than low:")
+        for name, language, hint in absent:
+            print(f"  {name} ({language}) — {hint}")
+        print("Install those, or name a single case that does run here.")
         return 2
 
     total_runs = len(chosen) * max(1, args.repeat)

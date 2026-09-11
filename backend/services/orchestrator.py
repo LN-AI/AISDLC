@@ -69,6 +69,39 @@ def _log_call(method):
     return _wrapper
 
 
+def _refuse_degenerate(product: str, produced: Any, result: Dict[str, Any],
+                      field: str, remedy: str) -> None:
+    """Raise when a QA generator came back with nothing at all, rather than storing it.
+
+    None of the three QA generators goes through `BaseAgent.review()`, so `attest`'s
+    degeneracy check never runs on them — they call `llm_gateway.call_tool` directly. And
+    `attest` could not be delegated to even if they did: it asks about `findings`, which
+    none of these produce. The signature it looks for is the same one
+    `finding_gate.looks_degenerate` describes, applied to a different noun: **an empty
+    payload together with an empty summary is a truncated or malformed tool call, not a
+    genuine "nothing to say"**, because a model that had nothing to generate says so in the
+    summary it was also asked for.
+
+    Stored instead of raised, that shape reads as "we generated a catalogue" on a screen
+    that then shows an empty list — the reader cannot tell it apart from a requirement too
+    thin to test, which is the one distinction these products exist to make.
+
+    One rule in one place, because two of these three had a hand-written copy and the third
+    had none — which is how the third ended up silent.
+
+    `attest`'s 200-character floor is deliberately *not* applied here. That floor exists so a
+    caller probing a code-review endpoint with a one-liner is not refused; a requirement is
+    prose a person wrote on purpose, and "login must work" is short but entirely testable.
+    """
+    if produced or (result.get("summary") or "").strip():
+        return
+    raise RuntimeError(
+        f"{product} returned no {field} and no summary — this usually means the LLM "
+        f"response was truncated or malformed rather than a genuine empty result. "
+        f"Try again{remedy}."
+    )
+
+
 class SDLCOrchestrator:
     def __init__(self):
         self.req_agent = RequirementReviewAgent()
@@ -731,6 +764,8 @@ class SDLCOrchestrator:
         if cost_stats:
             result["_cost_stats"] = cost_stats
         scenarios = result.get("scenarios", [])
+        _refuse_degenerate("Test scenario generation", scenarios, result, "scenarios",
+                           " or split the requirement into smaller pieces")
         review_id = database.save_review(
             review_type="test_scenarios",
             project_name=project_name,
@@ -755,12 +790,8 @@ class SDLCOrchestrator:
         compressed_requirement, cost_stats = self._compress(requirement)
         result = self.test_case_agent.generate(compressed_requirement, scenarios_context, context)
         test_cases = result.get("test_cases", [])
-        if not test_cases and not (result.get("summary") or "").strip():
-            raise RuntimeError(
-                "Test case generation returned no test cases (no test_cases and no summary) — "
-                "this usually means the LLM response was truncated or malformed rather than "
-                "a genuine empty result. Try again or reduce scope (e.g. fewer scenarios at once)."
-            )
+        _refuse_degenerate("Test case generation", test_cases, result, "test cases",
+                           " or reduce scope (e.g. fewer scenarios at once)")
         if cost_stats:
             result["_cost_stats"] = cost_stats
         review_id = database.save_review(
@@ -841,23 +872,12 @@ class SDLCOrchestrator:
         result["assumptions"] = assumptions
         result["not_automated"] = not_automated
 
-        # The same guard `generate_test_cases` carries, and for the same reason: neither QA
-        # agent goes through `BaseAgent.review()`, so `attest`'s degeneracy check never runs
-        # on them. It cannot be delegated to `attest` either — that asks about `findings`,
-        # and a truncated response here loses `test_files` while a summary written earlier
-        # in the stream survives. Storing that reads as "we generated a suite" when nothing
-        # runnable came back.
-        #
-        # Reached with `files` already filtered, so a response whose every entry was the
-        # wrong shape lands here — which is right: it is malformed, not empty, and this is
-        # the error that says so.
-        if not files and not (result.get("summary") or "").strip():
-            raise RuntimeError(
-                "Test automation generation returned no test files (no test_files and no "
-                "summary) — this usually means the LLM response was truncated or malformed "
-                "rather than a genuine empty result. Try again, narrow the source to the "
-                "files this requirement touches, or reduce the number of levels requested."
-            )
+        # The shared guard, for the reason `_refuse_degenerate` gives. Reached with `files`
+        # already filtered, so a response whose every entry was the wrong shape lands here —
+        # which is right: it is malformed, not empty, and this is the error that says so.
+        _refuse_degenerate("Test automation generation", files, result, "test files",
+                           ", narrow the source to the files this requirement touches, or "
+                           "reduce the number of levels requested")
         if cost_stats:
             result["_cost_stats"] = cost_stats
 

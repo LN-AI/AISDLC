@@ -12,7 +12,8 @@
     "input_tokens": 3638,
     "output_tokens": 3486,
     "calls": 1,
-    "source": "ledger"
+    "source": "ledger",
+    "model_cost_usd": 0.063204
    },
    "written": [
     "tests/task_ownership.test.js"
@@ -79,7 +80,8 @@
     "input_tokens": 3638,
     "output_tokens": 4205,
     "calls": 1,
-    "source": "ledger"
+    "source": "ledger",
+    "model_cost_usd": 0.073989
    },
    "written": [
     "tests/task_ownership.test.js"
@@ -146,7 +148,8 @@
     "input_tokens": 3638,
     "output_tokens": 4268,
     "calls": 1,
-    "source": "ledger"
+    "source": "ledger",
+    "model_cost_usd": 0.074934
    },
    "written": [
     "tests/task-auth.test.js"
@@ -205,5 +208,6 @@
    ],
    "workdir": ""
   }
- ]
+ ],
+ "note": "Measured 2026-09-10, BEFORE test-automation was priced (D-404), so `usage.cost_usd` here is the model cost and `model_cost_usd` is a copy of it rather than a second measurement. Later result files record the two separately: cost_usd is what a customer would be billed, model_cost_usd is what the tokens cost us. Compare baselines on model_cost_usd."
 }

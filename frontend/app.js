@@ -2091,6 +2091,28 @@ function renderTestCases(targetId, r) {
   const cases = r.test_cases || [];
   const priorityColor = { Critical: 'var(--red)', High: 'var(--amber)', Medium: '#84cc16', Low: 'var(--green)' };
 
+  // Traceability is a required field of `TEST_CASE_TOOL_SCHEMA`, generated on every run,
+  // stored, and returned by the API — and until now dropped on the floor here. It answers
+  // the one question a list of test cases cannot answer by being long: is every requirement
+  // actually covered by something.
+  //
+  // Reconciled rather than believed, which is the rule `attest.coverage_claim` applies to a
+  // model's own file list. Two things the map can be wrong about, and both are invisible
+  // unless something checks: an id in the map that no generated test case carries (an
+  // invented reference — the same failure D-316 named in a different agent), and a test case
+  // that appears in no row at all (work that traces back to nothing, so nobody can say what
+  // it is for).
+  // Filtered to objects before anything reads a field off a row, which is D-392's rule: this
+  // array is model-written, and a `null` in it would throw inside the renderer and blank the
+  // whole result rather than lose one row.
+  const trace = (r.traceability || []).filter(t => t && typeof t === 'object');
+  const caseIds = new Set(cases.map(tc => tc.test_case_id));
+  const traced = new Set();
+  trace.forEach(t => (t.test_case_ids || []).forEach(id => traced.add(id)));
+  const inventedIds = [...traced].filter(id => !caseIds.has(id));
+  const untracedIds = cases.filter(tc => !traced.has(tc.test_case_id)).map(tc => tc.test_case_id);
+  const uncoveredRefs = trace.filter(t => !(t.test_case_ids || []).length).length;
+
   wrap.innerHTML = `
     <div class="result-header">
       <h2>Test Cases</h2>
@@ -2102,6 +2124,31 @@ function renderTestCases(targetId, r) {
     ${(r.untestable_items || []).length ? `
     <div class="section-title" style="margin-top:20px">⚠ Untestable Items</div>
     <ul class="rec-list">${r.untestable_items.map(m => `<li>${esc(m)}</li>`).join('')}</ul>` : ''}
+
+    ${trace.length ? `
+    <div class="section-title" style="margin-top:20px">Requirement Coverage (${trace.length})</div>
+    <table class="users-table">
+      <thead><tr><th>Requirement / Scenario</th><th style="width:70px">Tests</th><th>Covered by</th></tr></thead>
+      <tbody>
+        ${trace.map(t => {
+          const ids = t.test_case_ids || [];
+          return `<tr>
+            <td>${esc(t.requirement_or_scenario_ref || '')}</td>
+            <td style="font-weight:700;color:${ids.length ? 'var(--green)' : 'var(--red)'}">${ids.length || 0}</td>
+            <td>${ids.length
+              ? ids.map(id => `<code${caseIds.has(id) ? '' : ' style="color:var(--amber)" title="No generated test case carries this id"'}>${esc(id)}</code>`).join(' ')
+              : '<span style="color:var(--red)">nothing covers this</span>'}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+    ${(uncoveredRefs || inventedIds.length || untracedIds.length) ? `
+    <div class="trace-reconcile" style="margin-top:8px;font-size:12px;color:var(--amber)">
+      ${uncoveredRefs ? `<div>${uncoveredRefs} requirement${uncoveredRefs === 1 ? ' has' : 's have'} no test case at all.</div>` : ''}
+      ${inventedIds.length ? `<div>${inventedIds.length} id${inventedIds.length === 1 ? '' : 's'} in this map (${inventedIds.map(esc).join(', ')}) match no generated test case — treat the coverage they claim as unproven.</div>` : ''}
+      ${untracedIds.length ? `<div>${untracedIds.length} test case${untracedIds.length === 1 ? '' : 's'} (${untracedIds.map(esc).join(', ')}) trace back to no requirement.</div>` : ''}
+    </div>` : ''}` : `
+    ${cases.length ? `<div class="trace-reconcile" style="margin-top:20px;font-size:12px;color:var(--text-muted)">The agent returned no traceability map, so requirement coverage cannot be reconciled — the cases below trace individually, but nothing states which requirements they add up to.</div>` : ''}`}
 
     <div class="section-title" style="margin-top:20px">Test Cases (${cases.length})</div>
     ${cases.map(tc => `

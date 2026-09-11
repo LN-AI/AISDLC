@@ -72,7 +72,7 @@ python run.py
 
 ## Tests: smoke scripts, no framework
 
-There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
+There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. **`pytest` is now installed in `venv`, and that is not an invitation**: it is there because `eval_test_automation.py`'s Python case needs a runner to execute the suite the model wrote for it. Nothing in this repo is a pytest test, and writing one would be the wrong shape (D-09). Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
 
 ```
 python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
@@ -95,7 +95,7 @@ model, because the thing they verify is the delivery, not the generation.
 ```
 python scripts/eval_code_review.py                       # accuracy, 3 runs per case (~$0.55)
 python scripts/eval_code_review.py --repeat 1            # cheaper; cannot measure variance
-python scripts/eval_test_automation.py                   # do the generated tests work (~$0.21)
+python scripts/eval_test_automation.py                   # do the generated tests work (~$0.43)
 python scripts/eval_test_automation.py --repeat 1        # cheaper; cannot measure variance
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
 python scripts/verify_pr_review.py <pr-url> --dry-run    # ...the same, writing nothing
@@ -133,6 +133,14 @@ a reference suite rewards imitation; neither says whether the tests work. It nee
 and runs generated code, so it belongs on the same tier as `run_tests.py`, never the API
 host. The floors are measured, not guessed (D-403), and it found a defect on its first run
 that nothing offline could see (C-93).
+
+Two cases, two languages: `ownership-node` (an HTTP API, an authorisation bug, `node:test`)
+and `cancellation-python` (a service layer, a state-machine bug, pytest). The Python one
+needs **pytest installed where you run the eval** — it is checked for before anything is
+spent, because a missing runner and a suite that will not execute score the same. The spend
+line reports **model cost, not what a customer would be billed**: since D-404
+`usage_events.cost_usd` is the price, so comparing a baseline taken before that change with
+one taken after would read as a nine-fold regression that never happened.
 
 `run_tests.py` is the local half of the test-automation loop and the only driver that
 runs *generated* code — on a developer's machine, never on the API host, which is the tier

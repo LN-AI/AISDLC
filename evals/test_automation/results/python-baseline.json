@@ -1,0 +1,213 @@
+{
+ "prompt_version": "2026-09-10.1",
+ "model": "",
+ "at": "2026-09-11T06:08:27.728262+00:00",
+ "repeat": 3,
+ "records": [
+  {
+   "case": "cancellation-python",
+   "seconds": 58.2,
+   "usage": {
+    "cost_usd": 0.638762,
+    "input_tokens": 3497,
+    "output_tokens": 3926,
+    "calls": 1,
+    "source": "ledger",
+    "model_cost_usd": 0.069381
+   },
+   "written": [
+    "tests/test_orders_cancel.py"
+   ],
+   "refused": [],
+   "score": {
+    "files": 1,
+    "tests_declared": 16,
+    "frameworks": [
+     "pytest"
+    ],
+    "framework_runnable": true,
+    "unknown_frameworks": [],
+    "input_mode": "source",
+    "ran": true,
+    "broken": {
+     "total": 16,
+     "passed": 13,
+     "failed": 3,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 16,
+     "outcome": "failed"
+    },
+    "fixed": {
+     "total": 16,
+     "passed": 16,
+     "failed": 0,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 16,
+     "outcome": "passed"
+    },
+    "red_on_broken": true,
+    "green_on_fixed": true,
+    "discriminates": true,
+    "claimed_covered": 13,
+    "coverage_honest": 13,
+    "assumptions": 2,
+    "not_automated": 1,
+    "malformed_rows": 0
+   },
+   "broken_exits": [
+    {
+     "framework": "pytest",
+     "exit": 1,
+     "tail": "     Use -v to get more diff\n\ntests\\test_orders_cancel.py:88: AssertionError\n- generated xml file: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-efydp_pm\\lm-test-results\\pytest.xml -\n=========================== short test summary info ===========================\nFAILED tests/test_orders_cancel.py::test_cancel_shipped_raises_cannot_cancel\nFAILED tests/test_orders_cancel.py::test_cancel_shipped_leaves_status_unchanged\nFAILED tests/test_orders_cancel.py::test_cancel_shipped_sends_no_notice - Ass...\n======================== 3 failed, 13 passed in 0.24s =========================\n"
+    }
+   ],
+   "fixed_exits": [
+    {
+     "framework": "pytest",
+     "exit": 0,
+     "tail": "============================= test session starts =============================\nplatform win32 -- Python 3.12.6, pytest-9.1.1, pluggy-1.6.0\nrootdir: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-efydp_pm\nplugins: anyio-4.14.2\ncollected 16 items\n\ntests\\test_orders_cancel.py ................                             [100%]\n\n- generated xml file: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-efydp_pm\\lm-test-results\\pytest.xml -\n============================= 16 passed in 0.13s ==============================\n"
+    }
+   ],
+   "workdir": ""
+  },
+  {
+   "case": "cancellation-python",
+   "seconds": 67.5,
+   "usage": {
+    "cost_usd": 0.645992,
+    "input_tokens": 3497,
+    "output_tokens": 4167,
+    "calls": 1,
+    "source": "ledger",
+    "model_cost_usd": 0.072996
+   },
+   "written": [
+    "tests/test_order_cancellation.py"
+   ],
+   "refused": [],
+   "score": {
+    "files": 1,
+    "tests_declared": 16,
+    "frameworks": [
+     "pytest"
+    ],
+    "framework_runnable": true,
+    "unknown_frameworks": [],
+    "input_mode": "source",
+    "ran": true,
+    "broken": {
+     "total": 16,
+     "passed": 13,
+     "failed": 3,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 16,
+     "outcome": "failed"
+    },
+    "fixed": {
+     "total": 16,
+     "passed": 16,
+     "failed": 0,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 15,
+     "outcome": "passed"
+    },
+    "red_on_broken": true,
+    "green_on_fixed": true,
+    "discriminates": true,
+    "claimed_covered": 13,
+    "coverage_honest": 13,
+    "assumptions": 3,
+    "not_automated": 1,
+    "malformed_rows": 0
+   },
+   "broken_exits": [
+    {
+     "framework": "pytest",
+     "exit": 1,
+     "tail": "cancellation.py:88: AssertionError\n- generated xml file: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-xrcdbqsm\\lm-test-results\\pytest.xml -\n=========================== short test summary info ===========================\nFAILED tests/test_order_cancellation.py::test_cancelling_a_shipped_order_raises_cannot_cancel\nFAILED tests/test_order_cancellation.py::test_cancelling_a_shipped_order_leaves_status_unchanged\nFAILED tests/test_order_cancellation.py::test_cancelling_a_shipped_order_sends_no_notice\n======================== 3 failed, 13 passed in 0.55s =========================\n"
+    }
+   ],
+   "fixed_exits": [
+    {
+     "framework": "pytest",
+     "exit": 0,
+     "tail": "============================= test session starts =============================\nplatform win32 -- Python 3.12.6, pytest-9.1.1, pluggy-1.6.0\nrootdir: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-xrcdbqsm\nplugins: anyio-4.14.2\ncollected 16 items\n\ntests\\test_order_cancellation.py ................                        [100%]\n\n- generated xml file: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-xrcdbqsm\\lm-test-results\\pytest.xml -\n============================= 16 passed in 0.13s ==============================\n"
+    }
+   ],
+   "workdir": ""
+  },
+  {
+   "case": "cancellation-python",
+   "seconds": 59.1,
+   "usage": {
+    "cost_usd": 0.644642,
+    "input_tokens": 3497,
+    "output_tokens": 4122,
+    "calls": 1,
+    "source": "ledger",
+    "model_cost_usd": 0.072321
+   },
+   "written": [
+    "tests/test_orders_cancel.py"
+   ],
+   "refused": [],
+   "score": {
+    "files": 1,
+    "tests_declared": 17,
+    "frameworks": [
+     "pytest"
+    ],
+    "framework_runnable": true,
+    "unknown_frameworks": [],
+    "input_mode": "source",
+    "ran": true,
+    "broken": {
+     "total": 17,
+     "passed": 14,
+     "failed": 3,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 17,
+     "outcome": "failed"
+    },
+    "fixed": {
+     "total": 17,
+     "passed": 17,
+     "failed": 0,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 15,
+     "outcome": "passed"
+    },
+    "red_on_broken": true,
+    "green_on_fixed": true,
+    "discriminates": true,
+    "claimed_covered": 13,
+    "coverage_honest": 13,
+    "assumptions": 2,
+    "not_automated": 1,
+    "malformed_rows": 0
+   },
+   "broken_exits": [
+    {
+     "framework": "pytest",
+     "exit": 1,
+     "tail": "f\n\ntests\\test_orders_cancel.py:51: AssertionError\n- generated xml file: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-bet9i91p\\lm-test-results\\pytest.xml -\n=========================== short test summary info ===========================\nFAILED tests/test_orders_cancel.py::test_cancelling_a_shipped_order_raises_cannot_cancel\nFAILED tests/test_orders_cancel.py::test_cancelling_a_shipped_order_leaves_status_unchanged\nFAILED tests/test_orders_cancel.py::test_cancelling_a_shipped_order_sends_no_notice\n======================== 3 failed, 14 passed in 0.31s =========================\n"
+    }
+   ],
+   "fixed_exits": [
+    {
+     "framework": "pytest",
+     "exit": 0,
+     "tail": "============================= test session starts =============================\nplatform win32 -- Python 3.12.6, pytest-9.1.1, pluggy-1.6.0\nrootdir: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-bet9i91p\nplugins: anyio-4.14.2\ncollected 17 items\n\ntests\\test_orders_cancel.py .................                            [100%]\n\n- generated xml file: C:\\Users\\RAFEAT~1\\AppData\\Local\\Temp\\lm-eval-cancellation-python-bet9i91p\\lm-test-results\\pytest.xml -\n============================= 17 passed in 0.13s ==============================\n"
+    }
+   ],
+   "workdir": ""
+  }
+ ],
+ "note": "Measured 2026-09-11. `usage.cost_usd` is what a customer would be BILLED; `usage.model_cost_usd` is what the tokens cost us and is the number to compare baselines on. This run predates the fix that records both, so model_cost_usd here is derived exactly from the policy in backend/services/pricing.py (model = (total - 0.5) / 2), not measured separately. Every later run records it directly."
+}

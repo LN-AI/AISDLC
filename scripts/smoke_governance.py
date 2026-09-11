@@ -1175,6 +1175,103 @@ def main_():
     check("...and refuses a caller with no credential",
           _un16.status_code in (401, 403), str(_un16.status_code))
 
+
+    # == 17. The three QA generators refuse an empty answer =================
+    #
+    # Sections 11 and 12 are about the agents `attest` reaches. These three it does not:
+    # they call `llm_gateway.call_tool` directly and produce no `findings`, so nothing in
+    # `attest` would have anything to look at even if they went through `BaseAgent.review`.
+    #
+    # Two of them carried a hand-written copy of the same rule and the third -- test
+    # scenarios -- had none, so a truncated response was stored as a successful run with an
+    # empty catalogue. On the screen that is indistinguishable from a requirement too thin
+    # to test, which is the one distinction these products exist to make. One shared guard
+    # now, checked here behaviourally rather than by reading the source, because a wrong
+    # argument would leave the text in place and the protection gone.
+    section("17. A QA generator with nothing to show is an error, not a result")
+
+    from backend.services.orchestrator import SDLCOrchestrator as _Orc17
+
+    _reply17 = {}
+
+    def _stub17(system_prompt, user_content, tool_schema, llm_override=None, max_tokens=None):
+        return dict(_reply17)
+
+    _orc17 = _Orc17()
+    _REQ17 = ("A subscriber whose plan expired yesterday must not be able to check out, and "
+              "must see the message 'Your subscription has expired'. " * 3)
+
+    _real17, llm_gateway.call_tool = llm_gateway.call_tool, _stub17
+    try:
+        # -- The one that was silent ----------------------------------------
+        _reply17 = {"scenarios": [], "requirement_coverage": [],
+                    "missing_acceptance_criteria": [], "test_data_requirements": [],
+                    "summary": ""}
+        def _stored17():
+            _c = database.get_connection()
+            try:
+                return _c.execute("SELECT COUNT(*) AS n FROM reviews WHERE review_type = ?",
+                                  ("test_scenarios",)).fetchone()["n"]
+            finally:
+                _c.close()
+
+        _before17 = _stored17()
+        try:
+            _orc17.generate_test_scenarios(_REQ17, project_name="Degen17")
+            check("a truncated scenario catalogue is not stored as a successful run", False,
+                  "this is the defect: an empty catalogue saved as a result")
+        except RuntimeError as _e17:
+            check("a truncated scenario catalogue is not stored as a successful run", True)
+            check("...and the error says what probably happened and what to try",
+                  "truncated or malformed" in str(_e17) and "Try again" in str(_e17),
+                  str(_e17)[:160])
+        check("...and nothing reached the database on the way out",
+              _stored17() == _before17,
+              "raising after `save_review` would leave the empty catalogue in the history "
+              "and only hide it from the caller")
+
+        # A model with nothing to generate says so, and that is a real answer. The guard
+        # must not turn a thin requirement into a crash.
+        _reply17 = {"scenarios": [], "requirement_coverage": [],
+                    "missing_acceptance_criteria": ["no acceptance criteria given"],
+                    "test_data_requirements": [],
+                    "summary": "Nothing here is specific enough to test."}
+        _out17 = _orc17.generate_test_scenarios(_REQ17, project_name="Degen17")
+        check("a stated 'nothing to test' is kept, because that is an answer",
+              _out17["total_scenarios"] == 0 and _out17.get("review_id"),
+              str(_out17.get("review_id")))
+
+        _reply17 = {"scenarios": [{"scenario_id": "TS-001", "title": "expired blocks checkout",
+                                   "type": "Negative", "description": "d",
+                                   "priority": "Critical", "linked_requirement": "r"}],
+                    "requirement_coverage": [], "missing_acceptance_criteria": [],
+                    "test_data_requirements": [], "summary": "One scenario."}
+        _ok17 = _orc17.generate_test_scenarios(_REQ17, project_name="Degen17")
+        check("a real catalogue is unaffected", _ok17["total_scenarios"] == 1
+              and _ok17["critical_count"] == 1, str(_ok17.get("total_scenarios")))
+
+        # -- The two that already had the rule keep it ----------------------
+        _reply17 = {"test_cases": [], "traceability": [], "summary": ""}
+        try:
+            _orc17.generate_test_cases(_REQ17, project_name="Degen17")
+            check("a truncated test-case response is still refused", False)
+        except RuntimeError:
+            check("a truncated test-case response is still refused", True)
+
+        _reply17 = {"test_files": [], "requirement_coverage": [], "summary": ""}
+        try:
+            _orc17.generate_test_automation(_REQ17, code_context="x = 1; " * 200,
+                                            project_name="Degen17")
+            check("a truncated test-automation response is still refused", False)
+        except RuntimeError as _e17b:
+            check("a truncated test-automation response is still refused", True)
+            check("...naming the remedies that are specific to it",
+                  "narrow the source" in str(_e17b) and "levels" in str(_e17b),
+                  "one shared guard must not flatten three different pieces of advice "
+                  "into one -- the caller of each has different things they can do")
+    finally:
+        llm_gateway.call_tool = _real17
+
     print("\n" + "-" * 60)
     if _failures:
         print(f"FAILED: {len(_failures)} of {_checks} checks")
