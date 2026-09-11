@@ -2222,6 +2222,87 @@ def main_():
           + " -- an auditor asking where an assessment's input came from should be able to "
             "answer it from the trail alone")
 
+
+    # ══ 22. What a run costs the customer ══════════════════════════════════
+    #
+    # Every product was billed at pass-through model cost until D-404: whatever the tokens
+    # cost is what appeared on the invoice. One product now has a price instead, and the two
+    # things that can go wrong are both checked here -- that the priced product is priced
+    # consistently at every door, and that **no other product moved**.
+    section("22. Pricing: a platform fee, a markup, and a ceiling")
+
+    from backend.services import pricing as _pr22
+
+    _small22 = _pr22.price("test-automation", 0.0707)
+    check("a priced product is charged a fee plus marked-up model spend",
+          abs(_small22["total_usd"] - (0.50 + 2 * 0.0707)) < 1e-6,
+          f"${_small22['total_usd']:.4f} on ${0.0707:.4f} of model time")
+    check("...and every component is returned, not just the total",
+          all(k in _small22 for k in ("fee_usd", "markup", "marked_up_usd", "model_cost_usd")),
+          "a total nobody can decompose is a total nobody can dispute")
+    _big22 = _pr22.price("test-automation", 4.00)
+    check("...under a ceiling, so one run cannot bill without limit",
+          _big22["capped"] and _big22["total_usd"] == 5.00,
+          f"${_big22['total_usd']:.2f} on $4.00 of model time")
+    check("...and the cap is stated rather than silently applied",
+          "capped at" in _pr22.describe(_big22), _pr22.describe(_big22))
+
+    check("a run that never reached the model is charged nothing at all",
+          _pr22.price("test-automation", 0.0, calls=0)["total_usd"] == 0.0,
+          "charging a fee for a request that did no work makes failing the cheapest way to "
+          "bill somebody")
+
+    # The check that matters most for everything else in this file.
+    for _pid22 in ("code", "vapt", "test-case", "codegen-scaffold", "cfr21-verification"):
+        _pt22 = _pr22.price(_pid22, 0.1234)
+        check(f"{_pid22} is unchanged, still pass-through",
+              _pt22["total_usd"] == 0.1234 and not _pt22["priced"],
+              "one product's pricing, not a platform-wide repricing nobody asked for")
+    check("...and a pass-through product gets no pricing sentence at all",
+          _pr22.describe(_pr22.price("code", 0.5)) == "",
+          "'no markup applied' on a product that was never marked up is noise")
+
+    _q22 = _pr22.apply_to_quote({"expected_usd": 0.10, "ceiling_usd": 0.60},
+                                "test-automation")
+    check("a quote says what will be charged, not only what the tokens cost",
+          abs(_q22["billing"]["expected"]["total_usd"] - 0.70) < 1e-6
+          and abs(_q22["billing"]["ceiling"]["total_usd"] - 1.70) < 1e-6,
+          str(_q22.get("billing", {}).get("expected", {}).get("total_usd")))
+    check("...while leaving the token estimate intact beside it",
+          _q22["expected_usd"] == 0.10,
+          "both numbers answer different questions and the screen shows both")
+    check("...and a pass-through quote is returned untouched",
+          "billing" not in _pr22.apply_to_quote({"expected_usd": 0.10}, "code"))
+
+    # The ledger keeps both, because storing only the price makes margin unanswerable and
+    # storing only the cost makes the invoice a derivation nobody can check.
+    _ev22 = database.record_usage_event(
+        None, "ui", "smoke22", "test-automation", "qa", calls=1,
+        input_tokens=100, output_tokens=200, cost_usd=0.64, model_cost_usd=0.07)
+    _conn22 = database.get_connection()
+    try:
+        _row22 = _conn22.cursor().execute(
+            "SELECT cost_usd, model_cost_usd FROM usage_events WHERE id = ?",
+            (_ev22,)).fetchone()
+    finally:
+        _conn22.close()
+    check("the ledger records what the customer owes and what it cost us",
+          abs(_row22["cost_usd"] - 0.64) < 1e-9
+          and abs(_row22["model_cost_usd"] - 0.07) < 1e-9,
+          f"{dict(_row22)}")
+    _ev22b = database.record_usage_event(
+        None, "ui", "smoke22", "code", "review", calls=1, cost_usd=0.5)
+    _conn22 = database.get_connection()
+    try:
+        _row22b = _conn22.cursor().execute(
+            "SELECT cost_usd, model_cost_usd FROM usage_events WHERE id = ?",
+            (_ev22b,)).fetchone()
+    finally:
+        _conn22.close()
+    check("...and a pass-through product records the same number twice, never a zero",
+          abs(_row22b["model_cost_usd"] - 0.5) < 1e-9,
+          f"{dict(_row22b)} -- a zero there would read as free")
+
     stack.close()
 
     print(f"\n{'-' * 60}")

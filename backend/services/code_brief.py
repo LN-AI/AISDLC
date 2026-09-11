@@ -39,6 +39,7 @@ states it in the brief itself and the screen prints it, on the same principle as
 import logging
 from typing import Any, Dict, List
 
+from backend.services import brief_cache
 from backend.services.modernization import analyzers, architecture, evidence, graph, playbooks
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,19 @@ def build(bundle, max_inventory_chars: int = MAX_INVENTORY_CHARS) -> Dict[str, A
 
     Returns the markdown to put in front of an agent plus the same facts as data, so a
     screen can print the coverage statement without re-deriving it from prose.
+
+    Memoized on the content it reads, not on the bundle object. This runs the language
+    analyzers and the dependency graph over every file — 9.3 seconds on this repository's
+    own backend — and every code-reading product computes it twice for one generation: once
+    for the free preflight and again for the run, on byte-identical input. See
+    `brief_cache` for why the key is a content hash rather than a commit sha.
     """
+    return brief_cache.memoize(
+        "code_brief", bundle.files or [], (max_inventory_chars,),
+        lambda: _build(bundle, max_inventory_chars))
+
+
+def _build(bundle, max_inventory_chars: int) -> Dict[str, Any]:
     files = [{"path": f.get("path") or "", "content": f.get("content") or ""}
              for f in (bundle.files or []) if (f.get("path") or "").strip()]
     if not files:

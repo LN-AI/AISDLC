@@ -1,0 +1,213 @@
+{
+ "prompt_version": "2026-09-10.1",
+ "model": "",
+ "at": "2026-09-10T14:32:10.420811+00:00",
+ "repeat": 3,
+ "records": [
+  {
+   "case": "ownership-node",
+   "seconds": 53.6,
+   "usage": {
+    "cost_usd": 0.063204,
+    "input_tokens": 3638,
+    "output_tokens": 3486,
+    "calls": 1,
+    "source": "ledger",
+    "model_cost_usd": 0.063204
+   },
+   "written": [
+    "tests/task_ownership.test.js"
+   ],
+   "refused": [],
+   "score": {
+    "files": 1,
+    "tests_declared": 8,
+    "frameworks": [
+     "node:test"
+    ],
+    "framework_runnable": true,
+    "unknown_frameworks": [],
+    "input_mode": "source",
+    "ran": true,
+    "broken": {
+     "total": 8,
+     "passed": 4,
+     "failed": 4,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 136,
+     "outcome": "failed"
+    },
+    "fixed": {
+     "total": 8,
+     "passed": 8,
+     "failed": 0,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 116,
+     "outcome": "passed"
+    },
+    "red_on_broken": true,
+    "green_on_fixed": true,
+    "discriminates": true,
+    "claimed_covered": 8,
+    "coverage_honest": 8,
+    "assumptions": 2,
+    "not_automated": 1,
+    "malformed_rows": 0
+   },
+   "broken_exits": [
+    {
+     "framework": "node-test",
+     "exit": 1,
+     "tail": ""
+    }
+   ],
+   "fixed_exits": [
+    {
+     "framework": "node-test",
+     "exit": 0,
+     "tail": ""
+    }
+   ],
+   "workdir": ""
+  },
+  {
+   "case": "ownership-node",
+   "seconds": 63.6,
+   "usage": {
+    "cost_usd": 0.073989,
+    "input_tokens": 3638,
+    "output_tokens": 4205,
+    "calls": 1,
+    "source": "ledger",
+    "model_cost_usd": 0.073989
+   },
+   "written": [
+    "tests/task_ownership.test.js"
+   ],
+   "refused": [],
+   "score": {
+    "files": 1,
+    "tests_declared": 8,
+    "frameworks": [
+     "node:test"
+    ],
+    "framework_runnable": true,
+    "unknown_frameworks": [],
+    "input_mode": "source",
+    "ran": true,
+    "broken": {
+     "total": 8,
+     "passed": 4,
+     "failed": 4,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 135,
+     "outcome": "failed"
+    },
+    "fixed": {
+     "total": 8,
+     "passed": 8,
+     "failed": 0,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 153,
+     "outcome": "passed"
+    },
+    "red_on_broken": true,
+    "green_on_fixed": true,
+    "discriminates": true,
+    "claimed_covered": 8,
+    "coverage_honest": 8,
+    "assumptions": 2,
+    "not_automated": 2,
+    "malformed_rows": 0
+   },
+   "broken_exits": [
+    {
+     "framework": "node-test",
+     "exit": 1,
+     "tail": ""
+    }
+   ],
+   "fixed_exits": [
+    {
+     "framework": "node-test",
+     "exit": 0,
+     "tail": ""
+    }
+   ],
+   "workdir": ""
+  },
+  {
+   "case": "ownership-node",
+   "seconds": 70.2,
+   "usage": {
+    "cost_usd": 0.074934,
+    "input_tokens": 3638,
+    "output_tokens": 4268,
+    "calls": 1,
+    "source": "ledger",
+    "model_cost_usd": 0.074934
+   },
+   "written": [
+    "tests/task-auth.test.js"
+   ],
+   "refused": [],
+   "score": {
+    "files": 1,
+    "tests_declared": 8,
+    "frameworks": [
+     "node:test"
+    ],
+    "framework_runnable": true,
+    "unknown_frameworks": [],
+    "input_mode": "source",
+    "ran": true,
+    "broken": {
+     "total": 8,
+     "passed": 4,
+     "failed": 4,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 117,
+     "outcome": "failed"
+    },
+    "fixed": {
+     "total": 8,
+     "passed": 8,
+     "failed": 0,
+     "errored": 0,
+     "skipped": 0,
+     "duration_ms": 122,
+     "outcome": "passed"
+    },
+    "red_on_broken": true,
+    "green_on_fixed": true,
+    "discriminates": true,
+    "claimed_covered": 8,
+    "coverage_honest": 8,
+    "assumptions": 3,
+    "not_automated": 2,
+    "malformed_rows": 0
+   },
+   "broken_exits": [
+    {
+     "framework": "node-test",
+     "exit": 1,
+     "tail": ""
+    }
+   ],
+   "fixed_exits": [
+    {
+     "framework": "node-test",
+     "exit": 0,
+     "tail": ""
+    }
+   ],
+   "workdir": ""
+  }
+ ],
+ "note": "Measured 2026-09-10, BEFORE test-automation was priced (D-404), so `usage.cost_usd` here is the model cost and `model_cost_usd` is a copy of it rather than a second measurement. Later result files record the two separately: cost_usd is what a customer would be billed, model_cost_usd is what the tokens cost us. Compare baselines on model_cost_usd."
+}

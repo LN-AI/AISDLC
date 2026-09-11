@@ -72,7 +72,7 @@ python run.py
 
 ## Tests: smoke scripts, no framework
 
-There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
+There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. **`pytest` is now installed in `venv`, and that is not an invitation**: it is there because `eval_test_automation.py`'s Python case needs a runner to execute the suite the model wrote for it. Nothing in this repo is a pytest test, and writing one would be the wrong shape (D-09). Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
 
 ```
 python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
@@ -87,14 +87,16 @@ node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans scr
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
-Four live drivers sit beside these. They are **not** part of the offline net: three of
-them spend real money, and three write to a real repository — use a scratch one.
-`verify_code_delivery.py` is the odd one: it writes but calls no model, because the
-thing it verifies is the push, not the generation.
+Six live drivers sit beside these. They are **not** part of the offline net: four of
+them spend real money, and four write to a real repository — use a scratch one.
+`verify_code_delivery.py` and `run_tests.py` are the odd ones: both write but call no
+model, because the thing they verify is the delivery, not the generation.
 
 ```
 python scripts/eval_code_review.py                       # accuracy, 3 runs per case (~$0.55)
 python scripts/eval_code_review.py --repeat 1            # cheaper; cannot measure variance
+python scripts/eval_test_automation.py                   # do the generated tests work (~$0.43)
+python scripts/eval_test_automation.py --repeat 1        # cheaper; cannot measure variance
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
 python scripts/verify_pr_review.py <pr-url> --dry-run    # ...the same, writing nothing
 python scripts/verify_pr_review.py <pr-url> --cleanup    # remove what it posted
@@ -104,6 +106,11 @@ python scripts/verify_fix_apply.py <url> --cleanup --review-id <id>
 python scripts/verify_code_delivery.py <repo-url>        # pushing generated code, for real
 python scripts/verify_code_delivery.py <url> --dry-run   # ...refusals only, writes nothing
 python scripts/verify_code_delivery.py <url> --cleanup
+python scripts/run_tests.py --fixture                    # offline: no server, no key, no network
+python scripts/run_tests.py --review <id> --into ../repo # write, run and report a generated suite
+python scripts/run_tests.py --review <id> --dry-run      # ...printing every path and command only
+python scripts/run_tests.py --review <id> --deliver <repo-url> --open-pr   # tests + CI workflow as a PR
+python scripts/run_tests.py --review <id> --from-actions <run-url>         # pull what CI made of them
 ```
 
 `eval_code_review.py` is the only thing that can tell an accuracy improvement from a
@@ -116,6 +123,48 @@ cannot answer. `verify_pr_review.py` exists because the offline
 suites stub the model and never touch GitHub: they cannot tell you that an inline comment
 landed on the line intended, and the worst defect of the session was invisible until a real
 diff went through it (D-244).
+
+`eval_test_automation.py` is the only thing that can tell whether generated *tests* got
+better or worse, and it asks the only question that means anything for a test generator:
+does the suite go **red on broken code and green once it is fixed**. Every case therefore
+ships twice — `source/` with a real bug, `fixed/` with the smallest correct fix — and the
+same generated suite is run against both. Counting files rewards padding and diffing against
+a reference suite rewards imitation; neither says whether the tests work. It needs a real key
+and runs generated code, so it belongs on the same tier as `run_tests.py`, never the API
+host. The floors are measured, not guessed (D-403), and it found a defect on its first run
+that nothing offline could see (C-93).
+
+Two cases, two languages: `ownership-node` (an HTTP API, an authorisation bug, `node:test`)
+and `cancellation-python` (a service layer, a state-machine bug, pytest). The Python one
+needs **pytest installed where you run the eval** — it is checked for before anything is
+spent, because a missing runner and a suite that will not execute score the same. The spend
+line reports **model cost, not what a customer would be billed**: since D-404
+`usage_events.cost_usd` is the price, so comparing a baseline taken before that change with
+one taken after would read as a nine-fold regression that never happened.
+
+`run_tests.py` is the local half of the test-automation loop and the only driver that
+runs *generated* code — on a developer's machine, never on the API host, which is the tier
+D-05 named. It writes the generated files into a checkout (refusing any path a shell would
+read, never overwriting without `--force`), runs them, and posts the JUnit XML to
+`POST /api/reviews/{id}/test-results`, where the coverage the model claimed is checked
+against what actually ran. The command it runs comes from `services/test_runner_plan.py`,
+which also renders the GitHub Actions workflow — so a local green and a CI green mean the
+same thing. `--fixture` is a real offline check and belongs in the net above in spirit: it
+drives the write, run and merge path against a synthetic suite and compiles the report
+script embedded in the generated workflow, which nothing else can see until a customer's
+runner executes it — and even that is not enough on its own: two generated workflows were
+rejected by GitHub before a single job started, for a reason no parser objects to (C-92).
+
+`--deliver` and `--from-actions` are the two ends of the loop as it works **with no public
+address**, which is the normal case for this deployment. `--deliver` pushes the tests *and*
+the CI workflow to a new branch and opens a pull request; the workflow then saves its results
+as its own artifact rather than posting them, and `--from-actions` fetches that artifact and
+files it. Every call in that direction is outbound, so nothing has to be exposed and no
+Actions secret has to be provisioned. Reading artifacts needs **"Actions: Read"** on the
+token and writing `.github/workflows/` needs **"Workflows: Read and Write"** — both separate
+from the Contents and Pull requests permissions everything else here uses, and a missing one
+looks like a missing repository, because GitHub answers 404 for anything a credential cannot
+see.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

@@ -397,6 +397,108 @@ class SecuritySourceRequest(_UISourceBase, DerivedFromMixin):
     system_type: Optional[str] = None
 
 
+
+class TestResultsRequest(BaseModel):
+    """What a producer reports after running a generated suite.
+
+    `junit_xml` or `results`, never both: two reports of one run cannot be reconciled here,
+    and guessing which is authoritative is how a green result gets stored over a red one.
+    """
+    junit_xml: Optional[str] = Field(
+        None, description="A JUnit XML report — the format pytest (`--junitxml`), Jest "
+                          "(`jest-junit`), JUnit, Playwright and most other runners already "
+                          "emit. The easiest thing for a CI job to send.")
+    results: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Structured rows instead of XML: each `{name, status}` plus "
+                          "optional `file`, `classname`, `duration_ms`, `message`. `status` "
+                          "is passed/failed/errored/skipped; an unrecognised value is read "
+                          "as `errored`, never as a pass.")
+    source_label: Optional[str] = Field(
+        None, description="Where this ran, in the producer's own words — 'GitHub Actions "
+                          "run 412', 'laptop'. Stored beside the counts because a pass with "
+                          "no attribution is not evidence of anything.")
+
+
+class TestResultsFromActionsRequest(BaseModel):
+    """Fetch a run's results out of GitHub instead of waiting to be sent them.
+
+    The direction matters. Every other way into `/test-results` is something reaching *in*;
+    this one reaches *out*, which is the only version that works when a CI runner cannot
+    see this platform at all — a laptop, a private network, a deployment behind a firewall.
+    """
+    github_repo_url: str = Field(
+        ..., description="The repository whose Actions run to read, e.g. "
+                         "https://github.com/owner/repo")
+    run_id: Optional[str] = Field(
+        None, description="A specific Actions run. Omit to take the most recent completed "
+                          "run of the generated workflow.")
+    branch: Optional[str] = Field(
+        None, description="Narrow the search to one branch — usually the branch the tests "
+                          "were delivered to.")
+    github_token: Optional[str] = Field(
+        None, description="A token for this call only, never stored. Needs 'Actions: Read', "
+                          "which is a separate permission from Contents and Pull requests.")
+
+
+class DeliverTestsRequest(BaseModel):
+    """Put a generated suite into a repository as a branch, and optionally a pull request."""
+    github_repo_url: str = Field(..., description="Where the tests should go")
+    branch: Optional[str] = Field(None, description="Defaults to lm-tests-<run id>")
+    base_branch: Optional[str] = Field(
+        None, description="What the pull request targets. Defaults to the repository's "
+                          "default branch.")
+    open_pr: bool = Field(False, description="Open a pull request from the new branch")
+    include_workflow: bool = Field(
+        True, description="Also commit the generated GitHub Actions workflow, so the suite "
+                          "runs on push and its results come back without anyone asking. "
+                          "Needs 'Workflows: Read and Write' on the token — GitHub refuses "
+                          "to write .github/workflows/ without it, and the tests are "
+                          "committed regardless if it does.")
+    callback_url: Optional[str] = Field(
+        None, description="The address that workflow should report to. Omit when there is "
+                          "none a runner could reach: it will save its results as an "
+                          "artifact for the platform to fetch instead.")
+    commit_message: Optional[str] = None
+    pr_title: Optional[str] = None
+    github_token: Optional[str] = Field(None, description="For this call only, never stored")
+
+class TestAutomationSourceRequest(_UISourceBase, DerivedFromMixin):
+    """Generate runnable automated tests from a requirement *and* the code under test.
+
+    The one QA screen that takes a source. It sits with the design agents above rather than
+    with the other two QA screens because it shares their shape — one call over a whole
+    codebase, priced from the assembled prompt rather than a chunk count — but it differs
+    from them in one way worth knowing: when the source is small enough it is sent
+    **verbatim** instead of as a structural description, because a test has to name a real
+    function signature and a dependency graph does not carry one. `test_context_brief`
+    decides which, and reports the mode either way.
+
+    `derived_from` is inherited so a suite can be chained from the manual test cases it
+    automates, the way `test-case` chains from `test-scenario`.
+    """
+    requirement: Optional[str] = Field(
+        None, description="What the tests must verify. Required to run; **not** required to "
+                          "get a quote, because the quote is how you decide whether to run "
+                          "at all.")
+    code: Optional[str] = Field(
+        None, description="The code under test, pasted. A separate field from `requirement` "
+                          "on purpose: `source_bundle.resolve` treats `code`/`artifact`/"
+                          "`text`/`content` as the source, so a requirement in one of those "
+                          "names would be read as the code to write tests against.")
+    cases_context: Optional[str] = Field(
+        None, description="A prior manual test-case catalogue to automate (the `test_cases` "
+                          "array from a Test Case Generation run, JSON-stringified)")
+    levels: Optional[List[str]] = Field(
+        None, description="Any of: Unit, API/Integration, UI/End-to-End. Omit to let the "
+                          "agent choose and justify the choice.")
+    focus: bool = Field(
+        False, description="Send only the files this requirement is about, plus what they "
+                           "import, instead of the whole codebase. Cheaper and less "
+                           "complete — a file that turns out to matter and was not selected "
+                           "is invisible except in the structural description. Ignored when "
+                           "narrowing would not actually save anything.")
+
+
 class SensitiveDataSourceRequest(_UISourceBase, DerivedFromMixin):
     """A sensitive-data scan over any source. Fans out over chunks like Code Review, unlike
     the two design agents above — see `SensitiveDataAgent.scan` for why."""

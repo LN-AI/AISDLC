@@ -37,7 +37,8 @@ from backend.routes.findings import router as findings_router
 from backend.routes.notifications import router as notifications_router
 from backend.routes.github_credentials import router as github_credentials_router
 from backend.routes.github_webhook import router as github_webhook_router
-from backend.routes.modernization import router as modernization_router
+from backend.routes.modernization import (router as modernization_router,
+                                          _unreachable_from_ci)
 from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.frameworks import router as frameworks_router
 from backend.routes.api_keys import router as api_keys_router
@@ -67,6 +68,10 @@ from backend.models.schemas import (
     VAPTSourceRequest,
     ArchitectureSourceRequest,
     SecuritySourceRequest,
+    TestAutomationSourceRequest,
+    TestResultsRequest,
+    TestResultsFromActionsRequest,
+    DeliverTestsRequest,
     SensitiveDataSourceRequest,
     MigrationAssessmentSourceRequest,
     RegulatedSourceRequest,
@@ -94,9 +99,12 @@ from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
 from backend.services import code_brief
+from backend.services import test_context_brief
 from backend.services import code_delivery
 from backend.services import (fix_apply, guardrail_service, review_estimate,
-                              review_source_store, source_bundle)
+                              review_source_store, source_bundle, test_results,
+                              test_runner_plan, test_results_pull, pricing)
+from backend.services.github_service import GitHubService
 from backend.services.subject_service import resolve_subject
 from backend.services.agent_guard import BudgetExceededError, QuotaExceededError, ScopeDeniedError
 from backend.services.api_key_service import (
@@ -577,6 +585,8 @@ def _preflight_design(req, request: Request, agent: str) -> dict:
         "budget": headroom,
         "explanation": review_estimate.describe(
             quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        # What the run costs the customer, said in one sentence beside the token estimate.
+        "billing": quote.get("billing"),
         "within_budget": (
             None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
         "code_brief": {k: brief[k] for k in ("coverage", "coverage_note", "stats", "files")},
@@ -2235,6 +2245,389 @@ async def codegen_scaffold_download(review_id: str, request: Request,
     )
 
 
+
+# ── Test results: the half of the loop that lives here ───────────────────────
+#
+# `services/test_results.py` has the reasoning. The short version: nothing here runs a
+# suite, so the suite runs wherever the customer can run it and reports back, and this pair
+# of routes is the contract that makes the producer interchangeable (D-62). Until this
+# existed, "generate the tests" ended at a download and the platform never found out whether
+# a single one of them passed.
+
+def _results_review(review_id: str, request: Request, reader: dict) -> dict:
+    """The generation these results belong to, or a 404 that reveals nothing.
+
+    404 rather than 403 for a review outside the caller's projects, the same way
+    `GET /api/reviews/{id}` does it: whether a review exists is itself information.
+    """
+    review = database.get_review(review_id)
+    if not review or review.get("review_type") not in test_results.ACCEPTS_RESULTS:
+        raise HTTPException(
+            status_code=404,
+            detail="No test-generation run with that id. Results attach to the run that "
+                   "produced the tests, so the id is the one that generated them.")
+    visible = _visible_project_ids(reader, request)
+    if visible is not None and review.get("project_id") not in visible:
+        raise HTTPException(status_code=404, detail="No test-generation run with that id")
+    return review
+
+
+@app.post("/api/reviews/{review_id}/test-results")
+def report_test_results(review_id: str, req: TestResultsRequest, request: Request,
+                        reader: dict = Depends(require_reader)):
+    """Report what happened when this run's generated tests were executed.
+
+    **Free — no model call, nothing metered.** Recording an outcome is not a generation.
+
+    The response is the reconciliation, not an acknowledgement: every requirement the
+    generation claimed, with what actually ran against it. `not_run` is the verdict that did
+    not exist before — a requirement the model said it covered, for which nothing that ran
+    can be found — and it is the one worth reading first.
+    """
+    review = _results_review(review_id, request, reader)
+    try:
+        payload = test_results.ingest(
+            review, req.model_dump(exclude_none=True),
+            actor=(reader or {}).get("username") or (reader or {}).get("key_name") or "api")
+    except test_results.TestResultError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    run_id = database.save_test_result_run(review_id, review.get("project_id"), payload)
+    return {
+        "run_id": run_id,
+        "review_id": review_id,
+        "summary": payload["summary"],
+        "requirements": payload["requirements"],
+        "unmatched_results": payload["unmatched_results"],
+        "reported_by": payload["reported_by"],
+        "reported_at": payload["reported_at"],
+        # Never omitted. This endpoint is the one place the platform could be mistaken for
+        # having verified something, and it did not: it was told.
+        "attested": False,
+    }
+
+
+@app.get("/api/reviews/{review_id}/test-results")
+def read_test_results(review_id: str, request: Request,
+                      reader: dict = Depends(require_reader)):
+    """Every report filed against this generation, newest first, with the latest expanded.
+
+    The history is kept rather than overwritten because the trend is the interesting part:
+    "this used to pass" is a fact a single current snapshot cannot express.
+    """
+    _results_review(review_id, request, reader)
+    # There is no scheduler in this deployment, so this runs where the other time-based
+    # passes run: on the read that depends on it (`lapse_expired_waivers` before a baseline
+    # lookup, `sweep_expired` on an inventory read). It never blocks — the results below are
+    # whatever is already stored, and a pull that finds something new shows on the next read.
+    # What it does not buy is anything happening while nobody looks.
+    delivery = database.get_test_delivery(review_id)
+    if delivery:
+        test_results_pull.kick(review_id)
+    runs = database.get_test_result_runs(review_id)
+    latest = dict(runs[0]) if runs else None
+    if latest:
+        latest["results"] = database.get_test_results(latest["id"])
+    return {"review_id": review_id, "runs": runs, "latest": latest,
+            "execution_status": "reported" if runs else "not_executed",
+            # Where this run's tests were delivered, and how the last look for results went.
+            # Shown rather than hidden: a fetch that keeps failing because an artifact
+            # expired is something the reader can act on, and silence about it reads as
+            # "the tests were never run".
+            "delivery": ({"repo_url": delivery.get("repo_url"),
+                          "branch": delivery.get("branch"),
+                          "pull_request": delivery.get("pull_request"),
+                          "last_fetch_at": delivery.get("last_fetch_at"),
+                          "last_error": delivery.get("last_error")} if delivery else None),
+            "attested": False}
+
+
+@app.get("/api/reviews/{review_id}/runner")
+def read_test_runner(review_id: str, request: Request, callback_url: str = "",
+                     reader: dict = Depends(require_reader)):
+    """How to run this generation's tests, as a CI workflow and as a local command.
+
+    **Free — no model call, nothing metered.** Everything here is a lookup from the
+    framework each generated file declared (`services/test_runner_plan.py`).
+
+    Phase 3, and it exists because Phase 2 was unreachable in practice: the endpoint that
+    receives results was open for anybody to post to, and "run them and post the result" is
+    three unstated decisions — which command, which JUnit flag, which URL. This answers all
+    three. Two producers, one contract (D-62): a workflow the customer commits beside the
+    tests, and `scripts/run_tests.py` for a developer who would rather not wait for CI.
+
+    `callback_url` overrides the address the workflow reports to. Without it the platform
+    uses `PUBLIC_BASE_URL`, which is the only address it knows a runner can reach — it
+    cannot be derived from this request, because behind a proxy that resolves to localhost
+    and the job would run and silently report nothing.
+    """
+    review = _results_review(review_id, request, reader)
+    result = review.get("result") or {}
+    plan = test_runner_plan.plan_for(result.get("test_files") or [])
+
+    target = (callback_url or "").strip() or (
+        f"{config.PUBLIC_BASE_URL}/api/reviews/{review_id}/test-results"
+        if config.PUBLIC_BASE_URL else "")
+    workflow = None
+    blocked = None
+    note = ""
+    if target and _unreachable_from_ci(target):
+        # The modernization build loop *refuses* here, and is right to: a compiler callback
+        # has no second route home. This one does. A workflow that reports to an address no
+        # runner can reach would run, fail to post, and look exactly like a suite nobody
+        # triggered — so rather than refuse, it is rendered in the mode that needs no address
+        # at all and saves its results for the platform to come and fetch.
+        note = (f"'{target}' is not an address a CI runner can reach, so the workflow saves "
+                f"its results as an artifact instead of reporting to it. Fetch them with "
+                f"POST /api/reviews/{review_id}/test-results/from-actions.")
+        target = ""
+    elif not target:
+        note = ("This deployment has no address a CI runner can reach (PUBLIC_BASE_URL is "
+                "unset), so the workflow saves its results as an artifact and the platform "
+                "fetches them. Nothing needs to be exposed for that to work.")
+    if not plan["jobs"]:
+        blocked = ("None of the generated files declare a framework this can write a run "
+                   "command for, so there is nothing to render. The suite still downloads; "
+                   "the command is yours to write.")
+    else:
+        try:
+            workflow = test_runner_plan.render_workflow(review_id, target, plan)
+        except ValueError as exc:
+            blocked = str(exc)
+
+    return {
+        "review_id": review_id,
+        "plan": plan,
+        "callback_url": target,
+        "workflow_path": test_runner_plan.WORKFLOW_PATH,
+        "workflow_yaml": workflow,
+        # Which direction the results travel. `callback` means the job posts them itself;
+        # `artifact` means it saves them and the platform pulls — the only one that works
+        # when nothing outside can reach this deployment.
+        "report_mode": "callback" if target else "artifact",
+        "report_mode_note": note,
+        "api_key_secret": test_runner_plan.API_KEY_SECRET,
+        # The local producer. Same contract, no CI, no secret to provision — which is the
+        # difference between a loop that gets closed today and one that gets closed once
+        # somebody finds time to configure Actions.
+        "local_command": f"python scripts/run_tests.py --review {review_id}",
+        "blocked_reason": blocked,
+        # Said here as well as in the workflow's own comments, because a screen renders this
+        # object and a reader who is told late is told after the job has gone red.
+        "must_supply": plan["must_supply"],
+        "attested": False,
+    }
+
+
+
+@app.post("/api/reviews/{review_id}/test-results/from-actions")
+async def pull_test_results_from_actions(review_id: str, req: TestResultsFromActionsRequest,
+                                         request: Request,
+                                         reader: dict = Depends(require_reader)):
+    """Read a GitHub Actions run's saved report and file it as this run's results.
+
+    **Free — no model call, nothing metered.**
+
+    This is the same contract as `POST .../test-results`, reached from the other side. The
+    posting version needs the runner to be able to see this platform; this one does not,
+    because the platform makes every call itself. That is what makes the loop close on a
+    laptop, on a private network, or behind a firewall — and the generated workflow renders
+    itself in artifact mode precisely so this route has something to come and get.
+
+    What is filed is the artifact's own merged report, unchanged, so a pulled result and a
+    posted result are the same thing recorded the same way — `attested` is `false` for both,
+    because the platform still did not run anything.
+    """
+    review = _results_review(review_id, request, reader)
+    try:
+        owner, repo = code_delivery.owner_repo(req.github_repo_url)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    try:
+        if (req.github_token or "").strip():
+            gh = GitHubService.for_project(review.get("project_id"), f"{owner}/{repo}",
+                                           override_token=req.github_token.strip())
+        else:
+            gh = source_bundle.github_for_repo(req.github_repo_url, review.get("project_id"))
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No GitHub credential could be resolved for {owner}/{repo}.")
+
+    try:
+        outcome = await asyncio.to_thread(
+            test_results_pull.pull_and_store, review, gh, owner, repo,
+            (req.run_id or "").strip(), (req.branch or "").strip(),
+            (reader or {}).get("username") or (reader or {}).get("key_name") or "api")
+    except test_results_pull.PullError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Could not pull Actions results for %s", review_id)
+        raise HTTPException(status_code=502, detail=f"Could not read that run: {exc}")
+
+    # A run fetched by hand is also the answer to "where should the background pass look",
+    # so the cursor moves with it. Without this a manual fetch would be re-fetched moments
+    # later by the automatic one and filed a second time.
+    if database.get_test_delivery(review_id):
+        database.mark_test_fetch(review_id, outcome["actions_run_id"], "")
+
+    payload = outcome["payload"]
+    meta = outcome["actions_run"] or {}
+    return {
+        "run_id": outcome["run_id"],
+        "review_id": review_id,
+        "actions_run": {"id": outcome["actions_run_id"], "url": meta.get("url"),
+                        "branch": meta.get("branch"), "conclusion": meta.get("conclusion")},
+        "summary": payload["summary"],
+        "requirements": payload["requirements"],
+        "unmatched_results": payload["unmatched_results"],
+        "reported_by": payload["reported_by"],
+        "reported_at": payload["reported_at"],
+        # Fetched rather than sent changes who carried it, not what it proves.
+        "attested": False,
+    }
+
+
+@app.post("/api/reviews/{review_id}/deliver-tests")
+async def deliver_generated_tests(review_id: str, req: DeliverTestsRequest, request: Request,
+                                  reader: dict = Depends(require_reader)):
+    """Commit a generated suite to a new branch, with the workflow that runs it.
+
+    **Free — no model call.** The files were written when the run happened.
+
+    The last hand-carried step. Until this existed the platform generated tests and then
+    made a person copy them into a repository, which is the same friction the runner
+    endpoint was built to remove, left standing one step later.
+
+    Deliberately the same door as generated code, not a wider one (`code_delivery`): a new
+    branch that must not already exist, a pull request only if asked for, and never a commit
+    onto a branch somebody may have checked out. Generated tests have had no more review
+    than generated code, and the pull request body says so.
+    """
+    review = _results_review(review_id, request, reader)
+    result = review.get("result") or {}
+    files = [{"path": f.get("path"), "content": f.get("content")}
+             for f in (result.get("test_files") or []) if isinstance(f, dict)]
+    if not files:
+        raise HTTPException(status_code=400,
+                            detail="That run produced no test files to deliver.")
+
+    plan = test_runner_plan.plan_for(result.get("test_files") or [])
+    workflow_note = ""
+    if req.include_workflow:
+        try:
+            files.append({
+                "path": test_runner_plan.WORKFLOW_PATH,
+                "content": test_runner_plan.render_workflow(
+                    review_id, (req.callback_url or "").strip(), plan)})
+            workflow_note = (
+                "reports to " + req.callback_url if (req.callback_url or "").strip() else
+                "saves its results as a workflow artifact, because this platform has no "
+                "address a runner can reach — fetch them with POST "
+                f"/api/reviews/{review_id}/test-results/from-actions")
+        except ValueError as exc:
+            # Not fatal: the tests are the deliverable and the workflow is the convenience.
+            workflow_note = f"no workflow was included ({exc})"
+
+    branch = (req.branch or "").strip() or code_delivery.branch_name("lm-tests", review_id)
+    message = (req.commit_message or "").strip() or (
+        f"Add {len(files)} generated test file(s) from run {review_id[:8]}")
+    try:
+        delivery = await asyncio.to_thread(
+            code_delivery.deliver,
+            files, req.github_repo_url,
+            project_id=review.get("project_id"),
+            branch=branch,
+            base_branch=(req.base_branch or ""),
+            commit_message=message,
+            open_pr=bool(req.open_pr),
+            pr_title=(req.pr_title or "").strip() or message,
+            pr_body=_tests_pr_body(review_id, result, plan, workflow_note),
+            token=(req.github_token or "").strip(),
+            review_id=review_id,
+            review_type=review["review_type"],
+            actor=str(reader.get("username") or reader.get("sub") or "system"),
+        )
+    except code_delivery.DeliveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.exception("Could not deliver generated tests for %s", review_id)
+        status, body = format_error_response(exc)
+        raise HTTPException(status_code=status, detail=body)
+
+    # GitHub refuses to write .github/workflows/ without the Workflows permission, and the
+    # per-file failure list is the only place that shows up. Said plainly rather than left
+    # in an array nobody reads: the tests landed, the automation did not.
+    failed = {f["path"] for f in delivery.get("files_failed") or []}
+    if test_runner_plan.WORKFLOW_PATH in failed:
+        delivery["workflow_warning"] = (
+            "The tests were committed but the workflow file was refused. GitHub requires "
+            "'Workflows: Read and Write' on the token to write .github/workflows/ — add it, "
+            "or commit that one file by hand. Everything else landed.")
+    delivery["workflow_included"] = (req.include_workflow
+                                     and test_runner_plan.WORKFLOW_PATH not in failed)
+    delivery["must_supply"] = plan["must_supply"]
+
+    # Remembered so the results can be fetched later without anyone naming the repository
+    # again — which is the difference between a loop that closes by itself and one that
+    # closes when somebody remembers. Recorded only once files actually landed: a delivery
+    # that committed nothing is not somewhere to go looking.
+    if delivery.get("files_committed"):
+        database.save_test_delivery(
+            review_id, review.get("project_id"), req.github_repo_url,
+            delivery.get("branch") or "",
+            ((delivery.get("pull_request") or {}) or {}).get("url") or "")
+    return delivery
+
+
+def _tests_pr_body(review_id: str, result: dict, plan: dict, workflow_note: str) -> str:
+    """What the pull request says about a suite nobody has run.
+
+    The failure mode this is written against is a reviewer reading a generated test as a
+    verified one. A test that passes proves something only if it asserts the right thing, and
+    nothing here has checked that — so the assumptions the model declared go in the body,
+    where whoever merges it will see them, rather than staying on a screen they will not open.
+    """
+    files = result.get("test_files") or []
+    coverage = result.get("requirement_coverage") or []
+    uncovered = [c for c in coverage if isinstance(c, dict) and not c.get("covered")]
+    lines = [
+        "## Generated tests — never run, not reviewed",
+        "",
+        f"Written by the LM AI-SDLC platform from run `{review_id}`. "
+        f"{len(files)} file(s), "
+        f"{sum(len(f.get('test_names') or []) for f in files if isinstance(f, dict))} test(s).",
+        "",
+        "**Nothing here has been executed.** The platform does not run the code it writes. "
+        "A generated test that passes is not evidence until someone runs it and reads the "
+        "result — which is what the workflow in this branch is for.",
+        "",
+    ]
+    if workflow_note:
+        lines += [f"The included workflow {workflow_note}.", ""]
+    if plan.get("must_supply"):
+        lines += [f"**These tests need something no CI runner has by default:** "
+                  f"{', '.join(plan['must_supply'])}. Until that is supplied the job will "
+                  f"fail for a reason that has nothing to do with your code.", ""]
+    for row in (result.get("assumptions") or [])[:10]:
+        if isinstance(row, dict):
+            lines.append(f"- **Assumed:** {row.get('assumption', '')} — "
+                         f"*if wrong:* {row.get('risk_if_wrong', '')}")
+    if result.get("assumptions"):
+        lines.append("")
+    if uncovered:
+        lines += ["**Requirements this suite does not cover:**", ""]
+        lines += [f"- {c.get('requirement_ref', '')} — {c.get('note', 'not covered')}"
+                  for c in uncovered[:10]]
+        lines.append("")
+    if plan.get("unknown_frameworks"):
+        lines += [f"Files written for {', '.join(plan['unknown_frameworks'])} are not in the "
+                  f"workflow's run command — the platform has no command for those.", ""]
+    if result.get("summary"):
+        lines += ["---", "", str(result["summary"])]
+    return "\n".join(lines)
+
+
 _DELIVERABLE_RUNS = {
     "codegen_scaffold": {"prefix": "lm-scaffold", "what": "generated starter project"},
     "migration_execute": {"prefix": "lm-migration", "what": "migrated code"},
@@ -2408,6 +2801,262 @@ async def review_migration_assessment_zip(
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)
         raise HTTPException(status_code=status, detail=body)
+
+
+# ── Test automation: four doors, one path ────────────────────────────────────
+#
+# A quote and a run, each reachable with JSON or with a zip. All four go through
+# `_automation_briefs` and the two functions under it, because a quote that describes a
+# different prompt from the one that runs is worse than no quote — a quote is believed.
+#
+# The zip pair exists for the reason `cfr21-verification/preflight-zip` does: the browser
+# screen uploads an archive, and a quote available only on the JSON API is a quote no actual
+# user ever sees. It cannot share the generic `/api/review/zip/preflight` either, because
+# that prices with `for_bundle` — twenty chunks for an agent that makes one call.
+
+def _automation_briefs(bundle, requirement: str = "", focus: bool = False) -> dict:
+    """The two free briefs for a bundle, or a 400 saying there was nothing to read.
+
+    `requirement` is what the relevance ranking selects against when the codebase is too
+    large to send whole — without it there is nothing to rank by and the agent gets the
+    structural description alone. It is threaded through every door for that reason, and the
+    quote is assembled from the same call so it prices the prompt that will actually run.
+    """
+    inputs = test_context_brief.for_automation(bundle, requirement=requirement, focus=focus)
+    if not (inputs["markdown"] or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No readable source files were found in that input, so there is nothing "
+                   "to write tests against. Check the repository, branch or archive.")
+    return inputs
+
+
+def _automation_from_source(req, request: Request) -> tuple:
+    """Resolve a JSON request to (bundle, briefs)."""
+    try:
+        bundle = source_bundle.resolve(req, orchestrator.github,
+                                       project_id=_project_id_for(request))
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Source resolution failed for test-automation")
+        raise HTTPException(status_code=502, detail=f"Could not read that source: {exc}")
+    return bundle, _automation_briefs(bundle, _automation_selector(req),
+                                      bool(getattr(req, "focus", False)))
+
+
+def _automation_zip(content: bytes, filename: str, requirement: str = "",
+                    focus: bool = False):
+    """Resolve an uploaded archive to (bundle, briefs)."""
+    if not (filename or "").endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+    try:
+        bundle = source_bundle.from_zip_bytes(content, filename or "upload")
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Not a valid zip file")
+    except source_bundle.SourceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return bundle, _automation_briefs(bundle, requirement, focus)
+
+
+def _automation_conventions(inputs: dict) -> dict:
+    """The subset of the conventions brief a screen prints. One definition, four routes."""
+    return {k: inputs["conventions"][k] for k in
+            ("note", "has_tests", "test_files", "test_paths", "frameworks",
+             "located_by", "exemplar_paths")}
+
+
+def _automation_selector(req) -> str:
+    """What the relevance ranking reads. Both fields, because both say what to test.
+
+    A prior test-case catalogue names the same routes and entities the requirement does, in
+    more words — so a caller who supplies only `cases_context` still gets relevant files
+    selected rather than a structural description of everything.
+    """
+    return "\n".join(part for part in (
+        (getattr(req, "requirement", None) or "").strip(),
+        (getattr(req, "cases_context", None) or "").strip(),
+    ) if part)
+
+
+def _automation_selection(inputs: dict) -> dict:
+    """Which files were quoted in full, and why each one. Shown on the quote and the result.
+
+    The ranking is a heuristic, so it is displayed rather than hidden: a user who can see
+    that the wrong file was picked can narrow the source and run again, and one who cannot
+    see it just gets worse tests for no stated reason.
+    """
+    sel = inputs.get("selection") or {}
+    return {
+        "selected": sel.get("selected") or [],
+        "selected_paths": sel.get("selected_paths") or [],
+        "selected_chars": sel.get("selected_chars") or 0,
+        "considered": sel.get("considered") or 0,
+        "omitted_for_budget": sel.get("omitted_for_budget") or [],
+        "source_chars": inputs.get("source_chars") or 0,
+        "prompt_chars": inputs.get("prompt_chars") or 0,
+    }
+
+
+def _automation_quote(bundle, inputs: dict, requirement: str, cases: str,
+                      request: Request) -> dict:
+    """Price the run. Free — neither brief nor quote calls a model.
+
+    Priced from the assembled prompt rather than the bundle, for the reason
+    `_preflight_design` gives: this agent makes **one** call, and `for_bundle` would chunk
+    the source and quote twenty. The requirement and any prior test-case catalogue are
+    included because for this agent they can be the larger half of the input, and a quote
+    that ignored them would understate — the direction that hurts.
+
+    Deliberately does not require `requirement`: someone pricing the job before writing the
+    requirement should not have to invent one to get a number.
+    """
+    priced = "\n".join([requirement or "", cases or "",
+                        inputs["conventions"]["markdown"], inputs["markdown"]])
+    # The token estimate, then what it will actually be *charged* at. Both, because they
+    # answer different questions and a quote showing only the first understates the invoice
+    # — the direction that loses trust (`services/pricing.py`).
+    quote = pricing.apply_to_quote(
+        review_estimate.for_text(priced, agent="test-automation"), "test-automation")
+    subject = _ui_subject(request)
+    headroom = agent_guard.remaining_budget(subject) if subject is not None else None
+    return {
+        "agent": "test-automation",
+        "source": bundle.summary(),
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(
+            quote, cap_usd=(headroom or {}).get("remaining_usd")),
+        "within_budget": (
+            None if headroom is None else quote["expected_usd"] <= headroom["remaining_usd"]),
+        # `input_mode` travels with the price because it changes what the money buys:
+        # `source` means the tests can name real functions, `description` means the agent
+        # works from a structural summary and its `assumptions` list does more of the work.
+        "input_mode": inputs["mode"],
+        "input_mode_note": inputs["mode_note"],
+        "input_selection": _automation_selection(inputs),
+        "test_conventions": _automation_conventions(inputs),
+        "code_brief": inputs["code_brief"],
+        "files_preview": _files_preview(bundle),
+        "skipped_all": bundle.skipped[:400],
+        # No retention block, for the reason `_preflight_design` states: this product stores
+        # no source and has no inventory, so offering a retention choice nothing honours
+        # would be a promise about data handling that no code keeps.
+    }
+
+
+def _run_automation(bundle, inputs: dict, requirement: str, cases: str,
+                    levels, project_name: str, context: str) -> dict:
+    """Generate the suite. One model call."""
+    _require_llm()
+    if not requirement and not cases:
+        raise HTTPException(
+            status_code=400,
+            detail="Describe what the tests must verify, or supply a prior test-case "
+                   "catalogue to automate. A codebase on its own does not say what to test.")
+
+    ctx_parts = [f"Source: {bundle.source_type} — {bundle.label}", inputs["mode_note"]]
+    if bundle.untrusted_label:
+        ctx_parts.append(guardrail_service.untrusted_notice(bundle.untrusted_label))
+    if bundle.truncated:
+        ctx_parts.append(f"The source was truncated before analysis: {bundle.truncation_reason}")
+    if context:
+        ctx_parts.append(context)
+
+    try:
+        result = orchestrator.generate_test_automation(
+            requirement=requirement or "Automate the manual test cases supplied below.",
+            code_context=inputs["markdown"],
+            test_conventions=inputs["conventions"]["markdown"],
+            cases_context=cases,
+            levels=levels,
+            context="\n".join(ctx_parts),
+            project_name=project_name or bundle.label[:60] or "Unnamed Project",
+            source=bundle.summary(),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+    # The same account of what was read that the prompt was given and the quote showed.
+    # Three different sentences about coverage across quote, prompt and result would be two
+    # too many.
+    result["input_mode"] = inputs["mode"]
+    result["input_mode_note"] = inputs["mode_note"]
+    result["input_selection"] = _automation_selection(inputs)
+    result["test_conventions"] = _automation_conventions(inputs)
+    result["code_brief"] = inputs["code_brief"]
+    return result
+
+
+@app.post("/api/review/test-automation/preflight")
+def preflight_test_automation_ui(req: TestAutomationSourceRequest, request: Request):
+    """What generating this suite will cost. Free — no model call, nothing metered."""
+    bundle, inputs = _automation_from_source(req, request)
+    return _automation_quote(bundle, inputs, (req.requirement or "").strip(),
+                             (req.cases_context or "").strip(), request)
+
+
+@app.post("/api/review/test-automation/preflight-zip")
+async def preflight_test_automation_zip(
+    request: Request,
+    file: UploadFile = File(...),
+    requirement: str = Form(""),
+    cases_context: str = Form(""),
+    focus: bool = Form(False),
+):
+    """The same quote for an uploaded archive. **Free — no model call.**"""
+    content = await file.read()
+    selector = "\n".join(p for p in (requirement.strip(), cases_context.strip()) if p)
+    bundle, inputs = await asyncio.to_thread(
+        _automation_zip, content, file.filename or "", selector, focus)
+    return _automation_quote(bundle, inputs, requirement.strip(), cases_context.strip(), request)
+
+
+@app.post("/api/review/test-automation")
+def review_test_automation_ui(req: TestAutomationSourceRequest, request: Request):
+    """Generate runnable automated tests for a requirement against a codebase.
+
+    Metered by `legacy_product_guard` like every other `/api/review/*` route, and
+    deliberately **not** in `_CHUNKABLE_ROUTES`: one model call, so a reservation sized
+    from a chunk count would be wrong in the expensive direction.
+    """
+    bundle, inputs = _automation_from_source(req, request)
+    return _run_automation(bundle, inputs, (req.requirement or "").strip(),
+                           (req.cases_context or "").strip(), req.levels,
+                           req.project_name or "", req.context or "")
+
+
+@app.post("/api/review/test-automation/upload-zip")
+async def review_test_automation_upload_zip(
+    file: UploadFile = File(...),
+    requirement: str = Form(""),
+    cases_context: str = Form(""),
+    levels: str = Form(""),
+    project_name: str = Form(""),
+    context: str = Form(""),
+    focus: bool = Form(False),
+):
+    """Generate the suite from an uploaded archive.
+
+    Separate from `/preflight-zip` for the reason D-234 records: a zip cannot travel on a
+    JSON route. `levels` arrives as a comma-separated string because multipart form fields
+    have no array type — empty means "let the agent choose", which is a real option here
+    and not a missing value.
+    """
+    content = await file.read()
+    selector = "\n".join(p for p in (requirement.strip(), cases_context.strip()) if p)
+    bundle, inputs = await asyncio.to_thread(
+        _automation_zip, content, file.filename or "", selector, focus)
+    chosen = [part.strip() for part in (levels or "").split(",") if part.strip()]
+    return await asyncio.to_thread(
+        _run_automation, bundle, inputs, requirement.strip(), cases_context.strip(),
+        chosen or None, project_name or (file.filename or ""), context)
 
 
 @app.post("/api/review/migration-assessment/preflight")

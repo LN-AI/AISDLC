@@ -444,6 +444,45 @@ class TestCaseRequest(_SourceBase):
     github_issue_url: Optional[str] = Field(None, description="GitHub issue URL", examples=["https://github.com/owner/repo/issues/45"])
 
 
+class TestAutomationRequest(_CodeSourceBase):
+    """Generate runnable automated tests against a real codebase.
+
+    The only QA request that inherits `_CodeSourceBase` rather than `_SourceBase`, and that
+    is the whole difference between this product and `test-case`: a manual step can say
+    "click Submit", a line of code has to name a route, a function or a fixture that really
+    exists. So this one takes a repository, an archive or an explicit file list, and the
+    requirement travels beside the source instead of being the only input.
+    """
+    requirement: Optional[str] = Field(
+        None,
+        description="The requirement, user story or acceptance criteria the tests must verify. "
+                    "Required unless `cases_context` carries a prior test-case catalogue.",
+        examples=["As a clinician I want to export patient data to CSV so that I can share it with another provider."],
+    )
+    cases_context: Optional[str] = Field(
+        None,
+        description="A prior manual test-case catalogue (e.g. from POST /api/v1/agents/test-case) "
+                    "to automate, instead of deriving tests directly from the requirement. The "
+                    "generated tests reference its test_case_id values in `covers`.",
+    )
+    levels: Optional[List[str]] = Field(
+        None,
+        description="Which test levels to write: any of `Unit`, `API/Integration`, "
+                    "`UI/End-to-End`. Omit to let the agent choose and justify its choice in "
+                    "`levels_chosen` — a requirement about user-visible behaviour is usually "
+                    "not a unit test.",
+        examples=[["API/Integration", "UI/End-to-End"]],
+    )
+    focus: bool = Field(
+        False,
+        description="Send only the files this requirement is about, plus what they import, "
+                    "rather than the whole codebase. Cheaper and less complete: a file that "
+                    "turns out to matter and was not selected is visible to the agent only "
+                    "in the structural description. Ignored when narrowing would not save "
+                    "anything. `input_selection` in the response says what was picked.",
+    )
+
+
 class CodeGenAdvisoryRequest(LLMOverrideFields):
     """Recommend language, stack, architecture pattern, and design patterns for a new system."""
     requirement: str = Field(

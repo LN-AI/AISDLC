@@ -3,7 +3,7 @@ import os
 import sqlite3
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 from backend import config, context
 from backend.config import DATABASE_PATH, JOB_STALE_MINUTES, SQLITE_BUSY_TIMEOUT_MS
@@ -416,6 +416,11 @@ def init_db():
             input_tokens INTEGER DEFAULT 0,
             output_tokens INTEGER DEFAULT 0,
             cost_usd REAL DEFAULT 0,
+            -- What the tokens cost *us*, beside what the customer owes. Both, because
+            -- storing only the price makes margin unanswerable and storing only the cost
+            -- makes the invoice a derivation nobody can check. Equal for every
+            -- pass-through product, which is all of them but one.
+            model_cost_usd REAL DEFAULT 0,
             model TEXT,
             provider TEXT,
             billable INTEGER DEFAULT 1,
@@ -468,6 +473,10 @@ def init_db():
         ("provider", "TEXT", "NULL"),
         ("billable", "INTEGER", 1),
         ("cost_estimated", "INTEGER", 0),
+        # What the tokens cost *us*, beside `cost_usd` which is what the customer owes.
+        # Equal for every pass-through product; different only where `services/pricing.py`
+        # sets a policy.
+        ("model_cost_usd", "REAL", 0),
     ):
         try:
             cursor.execute(
@@ -708,6 +717,72 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_fp_reports_created
             ON false_positive_reports(created_at DESC);
+
+        -- What happened when somebody ran a generated suite. One row per report, so a
+        -- suite reported three times keeps three rows: the trend is the interesting part,
+        -- and overwriting would lose "this used to pass".
+        --
+        -- Nothing here witnessed the run (D-05). These are claims by whoever posted them,
+        -- which is why `reported_by` and `source_label` are stored beside the counts and
+        -- never dropped -- a pass with no attribution is not evidence of anything.
+        CREATE TABLE IF NOT EXISTS test_result_runs (
+            id             TEXT PRIMARY KEY,
+            review_id      TEXT NOT NULL,
+            project_id     TEXT DEFAULT NULL,
+            total          INTEGER DEFAULT 0,
+            passed         INTEGER DEFAULT 0,
+            failed         INTEGER DEFAULT 0,
+            errored        INTEGER DEFAULT 0,
+            skipped        INTEGER DEFAULT 0,
+            duration_ms    INTEGER DEFAULT 0,
+            outcome        TEXT DEFAULT '',
+            -- The reconciliation against what the generation claimed to cover, and the
+            -- count of reported tests that belong to none of it (the customer's own suite
+            -- runs alongside ours).
+            requirements   TEXT DEFAULT '[]',
+            unmatched      INTEGER DEFAULT 0,
+            source_label   TEXT DEFAULT '',
+            reported_by    TEXT DEFAULT '',
+            created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_test_runs_review
+            ON test_result_runs(review_id, created_at DESC);
+
+        -- The individual tests. `errored` is stored separately from `failed` because a
+        -- failed assertion means the code is wrong and an error usually means the test
+        -- never loaded -- which is D-316's signature and the number this whole phase
+        -- exists to make visible.
+        CREATE TABLE IF NOT EXISTS test_results (
+            id             TEXT PRIMARY KEY,
+            run_id         TEXT NOT NULL,
+            review_id      TEXT NOT NULL,
+            name           TEXT DEFAULT '',
+            file           TEXT DEFAULT '',
+            classname      TEXT DEFAULT '',
+            status         TEXT DEFAULT '',
+            duration_ms    INTEGER DEFAULT NULL,
+            message        TEXT DEFAULT '',
+            created_at     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_test_results_run
+            ON test_results(run_id);
+
+        -- Where a generated suite was delivered, so its results can be fetched without
+        -- anyone remembering to ask. One row per run, latest delivery wins: what this
+        -- answers is "where do I look now", not "where has this ever been sent" — the
+        -- audit trail already answers the second, and answering both here would mean
+        -- choosing between several places to poll.
+        CREATE TABLE IF NOT EXISTS test_deliveries (
+            review_id     TEXT PRIMARY KEY,
+            project_id    TEXT,
+            repo_url      TEXT NOT NULL,
+            branch        TEXT,
+            pull_request  TEXT,
+            delivered_at  TEXT,
+            last_fetch_at TEXT,
+            last_run_id   TEXT,
+            last_error    TEXT
+        );
     """)
 
     # Modernization owns six tables of its own. Their DDL lives with the code that queries
@@ -3023,6 +3098,7 @@ def record_usage_event(
     model: str = "",
     provider: str = "",
     billable: bool = True,
+    model_cost_usd: Optional[float] = None,
     cost_estimated: bool = False,
     project_id: Optional[str] = None,
     project_name: str = "",
@@ -3030,17 +3106,26 @@ def record_usage_event(
     status: str = "ok",
 ) -> str:
     """`billable` is False when the caller supplied their own LLM credentials — the row is
-    still recorded, but that spend must not count against the platform's budget caps."""
+    still recorded, but that spend must not count against the platform's budget caps.
+
+    `cost_usd` is what the **customer owes**; `model_cost_usd` is what the tokens cost
+    **us**. They differ only for a product with a row in `services/pricing.py`, and it
+    defaults to `cost_usd` so every pass-through product records the same number twice
+    rather than a zero that would read as free."""
     event_id = str(uuid.uuid4())
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO usage_events (id, key_id, caller_type, caller_ref, product_id, product_kind, "
-        "project_id, project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model, "
+        "project_id, project_name, review_id, calls, input_tokens, output_tokens, cost_usd, "
+        "model_cost_usd, model, "
         "provider, billable, cost_estimated, status, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (event_id, key_id, caller_type, caller_ref, product_id, product_kind, project_id,
-         project_name, review_id, calls, input_tokens, output_tokens, cost_usd, model,
+         project_name, review_id, calls, input_tokens, output_tokens, cost_usd,
+         # Defaults to the charged amount, which is correct for every pass-through product:
+         # what it cost us and what it costs them are the same number there.
+         cost_usd if model_cost_usd is None else model_cost_usd, model,
          provider, 1 if billable else 0, 1 if cost_estimated else 0,
          status, datetime.utcnow().isoformat()),
     )
@@ -4399,3 +4484,149 @@ def set_github_webhook_secret(credential_id: str, secret: str) -> bool:
     conn.commit()
     conn.close()
     return updated
+
+
+# ── Test results: what happened when somebody ran a generated suite ─────────
+#
+# Read the module docstring of `services/test_results.py` first. Nothing here runs a test;
+# these rows are what a producer reported, and they are stored as claims with an attribution
+# rather than as facts.
+
+def save_test_result_run(review_id: str, project_id: Optional[str],
+                         payload: Dict[str, Any]) -> str:
+    """Persist one report: the run summary, its per-requirement verdict, and every test.
+
+    One transaction, because a summary without its rows would show counts nothing supports
+    and rows without a summary would never be found.
+    """
+    run_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    summary = payload.get("summary") or {}
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO test_result_runs
+               (id, review_id, project_id, total, passed, failed, errored, skipped,
+                duration_ms, outcome, requirements, unmatched, source_label, reported_by,
+                created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (run_id, review_id, project_id, summary.get("total", 0),
+             summary.get("passed", 0), summary.get("failed", 0), summary.get("errored", 0),
+             summary.get("skipped", 0), summary.get("duration_ms", 0),
+             summary.get("outcome", ""), json.dumps(payload.get("requirements") or []),
+             payload.get("unmatched_results", 0), payload.get("source_label", ""),
+             payload.get("reported_by", ""), now))
+        cursor.executemany(
+            """INSERT INTO test_results
+               (id, run_id, review_id, name, file, classname, status, duration_ms,
+                message, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [(str(uuid.uuid4()), run_id, review_id, row.get("name", ""),
+              row.get("file", ""), row.get("classname", ""), row.get("status", ""),
+              row.get("duration_ms"), row.get("message", ""), now)
+             for row in (payload.get("results") or [])])
+        conn.commit()
+    finally:
+        conn.close()
+    return run_id
+
+
+
+def save_test_delivery(review_id: str, project_id: str, repo_url: str, branch: str = "",
+                       pull_request: str = "") -> None:
+    """Record where a run's tests were delivered. Replaces any earlier target for that run.
+
+    Deliberately not history. This exists to answer "where should the background pull look",
+    and a run delivered twice has one current answer; `audit_event` already holds the record
+    of every delivery that was attempted, which is the question an auditor asks.
+    """
+    conn = get_connection()
+    try:
+        conn.cursor().execute(
+            """INSERT INTO test_deliveries
+                   (review_id, project_id, repo_url, branch, pull_request, delivered_at,
+                    last_fetch_at, last_run_id, last_error)
+               VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+               ON CONFLICT(review_id) DO UPDATE SET
+                   project_id = excluded.project_id,
+                   repo_url = excluded.repo_url,
+                   branch = excluded.branch,
+                   pull_request = excluded.pull_request,
+                   delivered_at = excluded.delivered_at,
+                   -- A new delivery is a new place to look, so the last run seen at the old
+                   -- one must not suppress the first pull from this one.
+                   last_fetch_at = NULL,
+                   last_run_id = NULL,
+                   last_error = NULL""",
+            (review_id, project_id, repo_url, branch or "", pull_request or "",
+             datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_test_delivery(review_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    try:
+        row = conn.cursor().execute(
+            "SELECT * FROM test_deliveries WHERE review_id = ?", (review_id,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def mark_test_fetch(review_id: str, run_id: str = "", error: str = "") -> None:
+    """Record that a pull was attempted, and what came of it.
+
+    Written on failure as well as success, and that is the point: without it a delivery whose
+    artifact has expired would be retried on every single read, forever.
+    """
+    conn = get_connection()
+    try:
+        conn.cursor().execute(
+            """UPDATE test_deliveries
+                  SET last_fetch_at = ?, last_run_id = ?, last_error = ?
+                WHERE review_id = ?""",
+            (datetime.now(timezone.utc).isoformat(), run_id or "", (error or "")[:500],
+             review_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_test_result_runs(review_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Every report for this review, newest first. The trend is the point of keeping them."""
+    conn = get_connection()
+    try:
+        rows = conn.cursor().execute(
+            """SELECT * FROM test_result_runs WHERE review_id = ?
+               ORDER BY created_at DESC LIMIT ?""", (review_id, limit)).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        record = dict(row)
+        try:
+            record["requirements"] = json.loads(record.get("requirements") or "[]")
+        except (TypeError, ValueError):
+            record["requirements"] = []
+        out.append(record)
+    return out
+
+
+def get_test_results(run_id: str, limit: int = 5000) -> List[Dict[str, Any]]:
+    """The individual tests of one report."""
+    conn = get_connection()
+    try:
+        rows = conn.cursor().execute(
+            """SELECT name, file, classname, status, duration_ms, message
+               FROM test_results WHERE run_id = ?
+               ORDER BY CASE status WHEN 'failed' THEN 0 WHEN 'errored' THEN 1
+                                    WHEN 'skipped' THEN 2 ELSE 3 END, name
+               LIMIT ?""", (run_id, limit)).fetchall()
+    finally:
+        conn.close()
+    # Failures first, deliberately: a reader opening a report of 400 tests is looking for
+    # the ones that broke, and making them scroll for it is how a red build gets ignored.
+    return [dict(row) for row in rows]

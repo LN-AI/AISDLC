@@ -615,9 +615,10 @@ function _runPageLoader(page) {
     // The source pickers are built on first visit rather than at load: they are two of
     // thirty-seven screens, and building every screen's controls up front is what makes a
     // no-build-step SPA slow to open.
-    if (page === 'code' || page === 'vapt') {
+    if (page === 'code' || page === 'vapt' || page === 'test-automation') {
       renderSourcePicker(page);
     }
+    if (page === 'test-automation') renderTestAutomationLevels();
     // Every agent screen loads its own history, scoped to this agent and this project.
     // Refreshed on every visit rather than built once: the sidebar project selector can
     // change between visits, and a history list showing another project's runs is worse
@@ -645,6 +646,11 @@ function _runPageLoader(page) {
     if (page === 'gate') loadReviewPicker();
     if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
     if (page === 'findings') {
+      // Twice on purpose. The text filters go in immediately, so a shared link shows what
+      // it filtered by rather than an empty form for as long as the products call takes —
+      // which is a race the browser check lost. The product *select* has no options until
+      // that call returns, so its value can only be set afterwards.
+      _applyFindingHashFilters();
       _fillFindingProducts().then(() => { _applyFindingHashFilters(); loadFindings(0); });
     }
     if (page === 'inventory') loadInventory();
@@ -2062,11 +2068,50 @@ async function runTestCaseGeneration() {
   }
 }
 
+// Armed by the renderer rather than by `runTestCaseGeneration`, so reopening a stored run
+// arms it too. D-369 recorded this exact bug for the other three in-page handoffs.
+let _lastTestCaseResult = null;
+
+/** Carry a manual catalogue into the automation screen, so tests are written against the
+ *  cases somebody already reviewed rather than re-derived from the requirement. JSON, not
+ *  markdown, for the reason `#tc-scenarios-context` is: the next agent parses it. */
+function useLastTestCaseResult() {
+  if (!_lastTestCaseResult) {
+    alert('Run Test Case Generation first, or open one of its previous runs.');
+    return;
+  }
+  document.getElementById('test-automation-cases').value =
+    JSON.stringify(_lastTestCaseResult.test_cases || [], null, 2);
+}
+
 function renderTestCases(targetId, r) {
+  _lastTestCaseResult = r;
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
   const cases = r.test_cases || [];
   const priorityColor = { Critical: 'var(--red)', High: 'var(--amber)', Medium: '#84cc16', Low: 'var(--green)' };
+
+  // Traceability is a required field of `TEST_CASE_TOOL_SCHEMA`, generated on every run,
+  // stored, and returned by the API — and until now dropped on the floor here. It answers
+  // the one question a list of test cases cannot answer by being long: is every requirement
+  // actually covered by something.
+  //
+  // Reconciled rather than believed, which is the rule `attest.coverage_claim` applies to a
+  // model's own file list. Two things the map can be wrong about, and both are invisible
+  // unless something checks: an id in the map that no generated test case carries (an
+  // invented reference — the same failure D-316 named in a different agent), and a test case
+  // that appears in no row at all (work that traces back to nothing, so nobody can say what
+  // it is for).
+  // Filtered to objects before anything reads a field off a row, which is D-392's rule: this
+  // array is model-written, and a `null` in it would throw inside the renderer and blank the
+  // whole result rather than lose one row.
+  const trace = (r.traceability || []).filter(t => t && typeof t === 'object');
+  const caseIds = new Set(cases.map(tc => tc.test_case_id));
+  const traced = new Set();
+  trace.forEach(t => (t.test_case_ids || []).forEach(id => traced.add(id)));
+  const inventedIds = [...traced].filter(id => !caseIds.has(id));
+  const untracedIds = cases.filter(tc => !traced.has(tc.test_case_id)).map(tc => tc.test_case_id);
+  const uncoveredRefs = trace.filter(t => !(t.test_case_ids || []).length).length;
 
   wrap.innerHTML = `
     <div class="result-header">
@@ -2079,6 +2124,31 @@ function renderTestCases(targetId, r) {
     ${(r.untestable_items || []).length ? `
     <div class="section-title" style="margin-top:20px">⚠ Untestable Items</div>
     <ul class="rec-list">${r.untestable_items.map(m => `<li>${esc(m)}</li>`).join('')}</ul>` : ''}
+
+    ${trace.length ? `
+    <div class="section-title" style="margin-top:20px">Requirement Coverage (${trace.length})</div>
+    <table class="users-table">
+      <thead><tr><th>Requirement / Scenario</th><th style="width:70px">Tests</th><th>Covered by</th></tr></thead>
+      <tbody>
+        ${trace.map(t => {
+          const ids = t.test_case_ids || [];
+          return `<tr>
+            <td>${esc(t.requirement_or_scenario_ref || '')}</td>
+            <td style="font-weight:700;color:${ids.length ? 'var(--green)' : 'var(--red)'}">${ids.length || 0}</td>
+            <td>${ids.length
+              ? ids.map(id => `<code${caseIds.has(id) ? '' : ' style="color:var(--amber)" title="No generated test case carries this id"'}>${esc(id)}</code>`).join(' ')
+              : '<span style="color:var(--red)">nothing covers this</span>'}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+    ${(uncoveredRefs || inventedIds.length || untracedIds.length) ? `
+    <div class="trace-reconcile" style="margin-top:8px;font-size:12px;color:var(--amber)">
+      ${uncoveredRefs ? `<div>${uncoveredRefs} requirement${uncoveredRefs === 1 ? ' has' : 's have'} no test case at all.</div>` : ''}
+      ${inventedIds.length ? `<div>${inventedIds.length} id${inventedIds.length === 1 ? '' : 's'} in this map (${inventedIds.map(esc).join(', ')}) match no generated test case — treat the coverage they claim as unproven.</div>` : ''}
+      ${untracedIds.length ? `<div>${untracedIds.length} test case${untracedIds.length === 1 ? '' : 's'} (${untracedIds.map(esc).join(', ')}) trace back to no requirement.</div>` : ''}
+    </div>` : ''}` : `
+    ${cases.length ? `<div class="trace-reconcile" style="margin-top:20px;font-size:12px;color:var(--text-muted)">The agent returned no traceability map, so requirement coverage cannot be reconciled — the cases below trace individually, but nothing states which requirements they add up to.</div>` : ''}`}
 
     <div class="section-title" style="margin-top:20px">Test Cases (${cases.length})</div>
     ${cases.map(tc => `
@@ -2106,6 +2176,622 @@ function renderTestCases(targetId, r) {
           <div style="margin-top:8px;font-size:12px;color:var(--text-muted)">Traces to: ${esc(tc.requirement_ref || '')}</div>
         </div>
       </details>`).join('')}
+
+    <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
+  `;
+}
+
+// ── QA Intelligence — Test Automation Generation ───────────────────────────
+//
+// The only QA screen that reads code, so it is the only one with a cost quote. It reuses the
+// shared source picker and `buildSourceBody`, but not `previewCost`/`runReviewFromQuote`:
+// those route a zip through `/api/review/zip/preflight`, which prices with `for_bundle` and
+// would quote twenty calls for an agent that makes one. It has its own pair of doors
+// (`/preflight-zip`, `/upload-zip`) for that reason.
+
+const TEST_LEVELS = ['Unit', 'API/Integration', 'UI/End-to-End'];
+
+function renderTestAutomationLevels() {
+  const wrap = document.getElementById('test-automation-levels');
+  if (!wrap || wrap.dataset.built) return;
+  wrap.dataset.built = '1';
+  wrap.innerHTML = TEST_LEVELS.map((lvl, i) => `
+    <label class="checkbox-inline">
+      <input type="checkbox" id="ta-level-${i}" value="${esc(lvl)}" /> ${esc(lvl)}
+    </label>`).join('');
+}
+
+function _testAutomationLevels() {
+  return TEST_LEVELS
+    .map((lvl, i) => (document.getElementById(`ta-level-${i}`)?.checked ? lvl : null))
+    .filter(Boolean);
+}
+
+/** The source body plus the three fields only this screen sends. */
+function buildTestAutomationBody() {
+  const built = buildSourceBody('test-automation');
+  if (!built) return null;
+  const v = id => (document.getElementById(id)?.value || '').trim();
+  const requirement = v('test-automation-requirement');
+  const cases = v('test-automation-cases');
+  if (!requirement && !cases) {
+    alert('Describe what the tests must verify, or paste a prior test-case catalogue to automate.');
+    return null;
+  }
+  const levels = _testAutomationLevels();
+  const focus = !!document.getElementById('test-automation-focus')?.checked;
+  if (built.kind === 'form') {
+    // Multipart has no array type, so levels travel comma-separated and the server splits
+    // them. Empty means "let the agent choose", which is a real option and not a gap.
+    built.body.append('requirement', requirement);
+    built.body.append('cases_context', cases);
+    built.body.append('levels', levels.join(','));
+    built.body.append('focus', focus ? 'true' : 'false');
+  } else {
+    Object.assign(built.body, {
+      requirement, cases_context: cases, focus,
+      ...(levels.length ? { levels } : {}),
+    });
+  }
+  return built;
+}
+
+async function previewTestAutomationCost() {
+  const built = buildTestAutomationBody();
+  if (!built) return;
+  const box = document.getElementById('test-automation-cost-preview');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="cost-preview-loading">Reading the source, working out how this project tests itself, and pricing the run…</div>';
+  try {
+    let quote;
+    if (built.kind === 'form') {
+      quote = await apiFetch('/api/review/test-automation/preflight-zip',
+                             { method: 'POST', body: built.body });
+    } else {
+      quote = await apiFetch('/api/review/test-automation/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(built.body),
+      });
+    }
+    _pendingQuote['test-automation'] = built;
+    _approvedQuote['test-automation'] = {
+      ceiling_usd: (quote.estimate || {}).ceiling_usd,
+      expected_usd: (quote.estimate || {}).expected_usd,
+      calls: (quote.estimate || {}).calls,
+    };
+    box.innerHTML = renderCostPreview('test-automation', quote)
+      + renderAutomationInputMode(quote)
+      + `<div class="form-actions" style="margin-top:10px">
+           <button class="btn btn-primary" onclick="runTestAutomationFromQuote()">
+             <span class="btn-icon">⚙️</span> Generate the tests
+           </button>
+         </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="cost-preview-error">Could not price this run — ${esc(e.message)}</div>`;
+  }
+}
+
+/** What the agent will actually be able to see, before any money is spent.
+ *
+ *  Drawn on the quote and again on the result, from the same two fields, because it changes
+ *  what the money buys: `source` means the tests can name real function signatures,
+ *  `description` means the agent works from a structural summary and guesses more. A reader
+ *  who cannot tell those apart will trust both equally. */
+function renderAutomationInputMode(q) {
+  const mode = q.input_mode;
+  if (!mode) return '';
+  const conv = q.test_conventions || {};
+  const sel = q.input_selection || {};
+  const picked = sel.selected || [];
+  const HEADLINE = {
+    source: 'Your source will be sent verbatim',
+    hybrid: 'The files this requirement is about will be sent verbatim',
+    description: 'Your codebase is too large to send',
+  };
+  // The ranking that chose these files is a heuristic, so it is shown rather than hidden.
+  // A user who can see that the wrong file was picked can narrow the source and run again;
+  // one who cannot see it just gets worse tests and no stated reason why.
+  const chosen = picked.length ? `
+    <details style="margin-top:6px">
+      <summary>${picked.length} file${picked.length === 1 ? '' : 's'} quoted in full
+        (${(sel.selected_chars || 0).toLocaleString()} of
+        ${(sel.source_chars || 0).toLocaleString()} characters), and why</summary>
+      <ul style="margin:6px 0 0 18px">
+        ${picked.map(f => `<li><code>${esc(f.path)}</code>
+          <span class="muted">— ${esc((f.why || []).join('; '))}</span></li>`).join('')}
+      </ul>
+      ${(sel.omitted_for_budget || []).length ? `<div class="muted" style="margin-top:6px">
+        Ranked but left out for lack of room:
+        ${sel.omitted_for_budget.map(p => `<code>${esc(p)}</code>`).join(', ')}.
+        Narrow the source to bring them in.</div>` : ''}
+    </details>` : '';
+  return `
+    <div class="cost-note" style="margin-top:8px">
+      <div><b>${HEADLINE[mode] || esc(mode)}</b> — ${esc(q.input_mode_note || '')}</div>
+      ${chosen}
+      <div style="margin-top:6px">${esc(conv.note || '')}</div>
+      ${(conv.exemplar_paths || []).length ? `<div style="margin-top:6px">Following the idiom of
+        ${conv.exemplar_paths.map(p => `<code>${esc(p)}</code>`).join(', ')}.</div>` : ''}
+    </div>`;
+}
+
+async function runTestAutomationFromQuote() {
+  const built = _pendingQuote['test-automation'];
+  if (!built) { alert('Get an estimate first.'); return; }
+  clearCostPreview('test-automation');
+  const target = 'test-automation-result';
+  showLoading('Writing the tests…');
+  try {
+    const result = built.kind === 'form'
+      ? await apiFetch('/api/review/test-automation/upload-zip',
+                       { method: 'POST', body: built.body })
+      : await apiFetch('/api/review/test-automation', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(built.body),
+        });
+    renderTestAutomation(target, result);
+    loadAgentRuns('test-automation');
+    loadDashboard();
+  } catch (e) {
+    showError(target, e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// The generated files of whichever suite is on screen, so a download button has something
+// to read. Set by the renderer, so reopening a stored run arms the downloads too — the bug
+// D-369 recorded for the three in-page handoffs was exactly this, set in the run function
+// instead of where the result is drawn.
+let _lastTestAutomation = null;
+
+function downloadGeneratedTest(index) {
+  const f = (_lastTestAutomation || {}).test_files?.[index];
+  if (!f || !f.content) return;
+  _downloadTextAsFile((f.path || `test_${index}`).split('/').pop(), f.content);
+}
+
+function downloadAllGeneratedTests() {
+  const files = (_lastTestAutomation || {}).test_files || [];
+  if (!files.length) return;
+  // One text file rather than a zip: building a real archive in the browser needs a library
+  // the CSP does not allow, and a single file with clear path headers is honest about being
+  // a transcript rather than pretending to be a tree you can unpack. `setup_instructions`
+  // leads, because a suite nobody can run is not a deliverable.
+  const parts = [
+    '# Generated test suite',
+    '',
+    '## Nothing here has been executed',
+    'These tests were generated and never run. Read the assumptions below before trusting them.',
+    '',
+  ];
+  if (_lastTestAutomation.setup_instructions) {
+    parts.push('## How to run them', '', _lastTestAutomation.setup_instructions, '');
+  }
+  (_lastTestAutomation.assumptions || []).forEach(a => {
+    parts.push(`## Assumption: ${a.assumption || ''}`,
+               `Risk if wrong: ${a.risk_if_wrong || ''}`, '');
+  });
+  files.forEach(f => {
+    parts.push(`${'='.repeat(70)}`, `FILE: ${f.path || ''}  (${f.framework || ''}, ${f.level || ''})`,
+               `${'='.repeat(70)}`, '', f.content || '', '');
+  });
+  _downloadTextAsFile('generated-tests.txt', parts.join('\n'));
+}
+
+/** What happened when somebody ran this suite — or nothing, said plainly.
+ *
+ *  Phase 2. Before this the screen could only ever say "generated"; `requirement_coverage`
+ *  was the model's claim that a rule was covered and nothing could contradict it. The row
+ *  worth reading is `not_run`: a requirement the generation said it covered, for which
+ *  nothing that actually ran can be found.
+ *
+ *  Fetched separately from the review rather than folded into it, because results arrive
+ *  long after the generation and a stored run must not have to be rewritten to carry them. */
+async function loadTestResults(reviewId) {
+  const box = document.getElementById('test-automation-results');
+  if (!box || !reviewId) return;
+  let data;
+  try {
+    data = await apiFetch(`/api/reviews/${reviewId}/test-results`);
+  } catch (e) {
+    return;   // no results is the normal case, not an error worth a red box
+  }
+  const latest = data && data.latest;
+  if (!latest) {
+    // No results yet. Silent when nothing was delivered — but once something was, "waiting
+    // for CI" is a different state from "nobody has run these", and only this can say so.
+    if (data && data.delivery) {
+      box.innerHTML = `
+        <div class="cost-note" style="margin-bottom:12px">
+          <b>Waiting for CI.</b> These tests are on
+          ${data.delivery.pull_request
+            ? `<a href="${esc(data.delivery.pull_request)}" target="_blank" rel="noopener">a pull request</a>`
+            : `<code>${esc(data.delivery.branch || '')}</code>`}
+          in ${esc((data.delivery.repo_url || '').replace('https://github.com/', ''))}.
+          Results are collected each time this screen is opened.
+          ${data.delivery.last_error ? `<div style="margin-top:4px">Last look:
+            ${esc(data.delivery.last_error)}</div>` : ''}
+        </div>`;
+    }
+    return;
+  }
+  const s = latest;
+  const reqs = latest.requirements || [];
+  const rows = latest.results || [];
+  const LABEL = {
+    passed: ['✔', 'var(--green)', 'passing'],
+    failed: ['✘', 'var(--red)', 'failing'],
+    skipped: ['−', 'var(--text-muted)', 'skipped'],
+    not_run: ['?', 'var(--amber)', 'claimed, never ran'],
+  };
+  const notRun = reqs.filter(x => x.outcome === 'not_run').length;
+  box.innerHTML = `
+    <div class="cost-note" style="border-left:3px solid ${s.outcome === 'passed' ? 'var(--green)' : 'var(--red)'};margin-bottom:12px">
+      <div><b>${s.passed} of ${s.total} reported tests passed</b>
+        ${s.failed ? `· ${s.failed} failed` : ''}${s.errored ? ` · ${s.errored} did not load` : ''}${s.skipped ? ` · ${s.skipped} skipped` : ''}</div>
+      <!-- Attribution is not decoration. Nothing here witnessed the run, and a pass with
+           nobody's name on it is not evidence of anything. -->
+      <div class="muted" style="margin-top:6px">Reported by ${esc(s.reported_by || 'unknown')}${s.source_label ? ` from ${esc(s.source_label)}` : ''}
+        on ${esc((s.created_at || '').slice(0, 16).replace('T', ' '))}. The platform did not run these —
+        this is what was reported to it.${data.runs.length > 1 ? ` ${data.runs.length} reports so far.` : ''}</div>
+      ${data.delivery ? `
+      <!-- Why results keep appearing without anyone fetching them, said once. A reader who
+           does not know this is watching a number change for no visible reason. -->
+      <div class="muted" style="margin-top:6px">Watching
+        ${data.delivery.pull_request
+          ? `<a href="${esc(data.delivery.pull_request)}" target="_blank" rel="noopener">the pull request</a>`
+          : `<code>${esc(data.delivery.branch || '')}</code>`}
+        in ${esc((data.delivery.repo_url || '').replace('https://github.com/', ''))} — new CI
+        results are collected when this screen is opened.
+        ${data.delivery.last_fetch_at ? `Last looked
+          ${esc(data.delivery.last_fetch_at.slice(0, 16).replace('T', ' '))}.` : ''}
+        ${data.delivery.last_error ? `<span style="color:var(--amber)">Last look:
+          ${esc(data.delivery.last_error)}</span>` : ''}</div>` : ''}
+      ${s.errored ? `<div style="margin-top:6px">${s.errored} test(s) <b>did not load</b> — usually a missing
+        import or fixture, which means they asserted nothing rather than found nothing.</div>` : ''}
+    </div>
+
+    <div class="section-title">Your requirements, checked against what ran</div>
+    ${notRun ? `<p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${notRun} requirement(s) the
+      generation said it covered had no matching test in this report. That gap is the reason to read this
+      table rather than the counts above.</p>` : ''}
+    <table class="data-table">
+      <thead><tr><th>Requirement</th><th>Claimed</th><th>Actually</th><th>P / F / S</th></tr></thead>
+      <tbody>${reqs.map(x => {
+        const [icon, colour, word] = LABEL[x.outcome] || ['?', 'var(--text-muted)', x.outcome];
+        return `<tr>
+          <td>${esc(x.requirement_ref || '')}</td>
+          <td>${x.claimed_covered ? 'covered' : 'not covered'}</td>
+          <td style="color:${colour}"><b>${icon} ${esc(word)}</b></td>
+          <td>${x.passed} / ${x.failed} / ${x.skipped}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table>
+    ${latest.unmatched ? `<p class="field-hint">${latest.unmatched} reported test(s) belong to no requirement
+      here — your own suite runs alongside the generated one.</p>` : ''}
+
+    <details style="margin-top:10px">
+      <summary>Every reported test (${rows.length}), failures first</summary>
+      <table class="data-table" style="margin-top:6px">
+        <thead><tr><th>Test</th><th>Status</th><th>Message</th></tr></thead>
+        <tbody>${rows.map(x => `<tr>
+          <td><code>${esc(x.name || '')}</code></td>
+          <td style="color:${(LABEL[x.status] || [])[1] || 'var(--text-muted)'}">${esc(x.status)}</td>
+          <td>${esc((x.message || '').slice(0, 300))}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </details>`;
+}
+
+/** How to actually run this suite. Phase 3.
+ *
+ *  Phase 2 opened the endpoint that receives results and nobody posted to it, because
+ *  "run them and post the result" is three unstated decisions — which command, which
+ *  JUnit flag, which URL. The platform knows all three (it knows the framework of every
+ *  file it wrote), so it says them here rather than leaving them to be worked out.
+ *
+ *  Everything below is a lookup, not a model call: nothing here costs anything. */
+let _lastRunnerPlan = null;
+
+async function loadTestRunner(reviewId) {
+  const box = document.getElementById('test-automation-runner');
+  if (!box || !reviewId) return;
+  let d;
+  try {
+    d = await apiFetch(`/api/reviews/${reviewId}/runner`);
+  } catch (e) {
+    return;
+  }
+  _lastRunnerPlan = d;
+  const plan = d.plan || {};
+  const jobs = plan.jobs || [];
+
+  // The warnings come first, and each one names what it costs. A reader who finds out
+  // afterwards that three files had no runner has already read a report that was quietly
+  // narrower than it looked.
+  const warn = [];
+  (plan.unknown_frameworks || []).forEach(f => warn.push(
+    `<b>${esc(f)}</b> is a framework this does not know a run command for, so those files
+     are not in the command below. Run them your own way — the results endpoint takes them
+     either way.`));
+  (plan.unsafe_paths || []).forEach(f => warn.push(
+    `<code>${esc(f)}</code> was left out: a path with a space or a shell character in it is
+     refused rather than quoted, because this text ends up in a command on your machine.`));
+  (plan.extra_packages || []).forEach(f => warn.push(
+    `<b>${esc(f)}</b> has to be installed before the runner will write a JUnit report at
+     all. Without it the tests run and nothing comes back.`));
+  jobs.filter(j => j.runs_whole_suite).forEach(j => warn.push(
+    `<b>${esc(j.label)}</b> runs the project, not a file list, so your own tests run too and
+     come back counted as unmatched rather than as ours.`));
+
+  box.innerHTML = `
+    <div class="section-title" style="margin-top:20px">How to run them</div>
+
+    ${(plan.must_supply || []).length ? `
+    <div class="cost-note" style="border-left:3px solid var(--red);margin-bottom:10px">
+      <b>These tests need something no CI runner has by default:</b>
+      ${esc((plan.must_supply || []).join(', '))}.
+      Nothing here can conjure a running application, a database, credentials or seeded
+      rows — that is yours to supply, and until you do the run will fail for a reason that
+      has nothing to do with your code.
+    </div>` : ''}
+
+    <div class="field-label">On your machine, right now</div>
+    <p class="field-hint">Writes the files into a checkout, runs them, and posts the result
+      back. Nothing is overwritten without <code>--force</code>, and <code>--dry-run</code>
+      prints every path and command without touching anything.</p>
+    <pre class="code-block"><code>${esc(d.local_command || '')}</code></pre>
+    ${jobs.length ? `<p class="field-hint">It will run:
+      ${jobs.map(j => `<code>${esc(j.shell)}</code>`).join(' and ')}</p>` : ''}
+
+    ${warn.length ? `<ul class="field-hint" style="margin-top:8px">
+      ${warn.map(w => `<li style="margin-bottom:4px">${w}</li>`).join('')}</ul>` : ''}
+
+    <div class="field-label" style="margin-top:14px">On every push, from CI</div>
+    ${d.workflow_yaml ? `
+      <p class="field-hint">${d.callback_url
+        ? `Commit this beside the tests and add your platform API key as the repository
+           secret <code>${esc(d.api_key_secret || '')}</code>. It reports to
+           <code>${esc(d.callback_url)}</code> whether the suite passes or fails — a run
+           that never happens still reports, because silence and success look identical.`
+        : `<b>This platform has no address a CI runner can reach</b>, so the workflow does not
+           report home — it saves its results as its own artifact and the platform fetches
+           them. Nothing needs to be exposed, and no secret is needed. Use
+           <b>Fetch from GitHub Actions</b> below once the job has finished.`}</p>
+      <button class="btn-secondary btn-sm" onclick="downloadTestWorkflow()">
+        Download ${esc(d.workflow_path || 'workflow')}</button>
+      <details style="margin-top:8px">
+        <summary>Read it first (${(d.workflow_yaml || '').split('\n').length} lines)</summary>
+        <pre class="code-block" style="max-height:340px;overflow:auto"><code>${esc(d.workflow_yaml)}</code></pre>
+      </details>`
+    : `<div class="cost-note">${esc(d.blocked_reason || 'No workflow could be rendered for this run.')}</div>`}
+
+    <!-- The last hand-carried step. Without this the platform writes tests and then asks a
+         person to copy them into a repository, which is the same friction the command above
+         exists to remove, left standing one step later. -->
+    <div class="field-label" style="margin-top:16px">Put them in a repository</div>
+    <p class="field-hint">A <b>new</b> branch, never an existing one, with the workflow above
+      committed alongside — so the tests run on push and their results come back. The pull
+      request says plainly that nothing has run these and lists what the model assumed.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="text" id="test-deliver-repo" style="flex:1;min-width:280px"
+             placeholder="https://github.com/owner/repo" />
+      <label class="field-hint" style="margin:0"><input type="checkbox" id="test-deliver-pr" checked />
+        open a pull request</label>
+      <button class="btn-secondary btn-sm" onclick="deliverGeneratedTests('${esc(reviewId)}')">
+        Deliver</button>
+    </div>
+    <div id="test-deliver-out" style="margin-top:8px"></div>
+
+    <div class="field-label" style="margin-top:16px">Fetch from GitHub Actions</div>
+    <p class="field-hint">Reads a finished run's saved results and files them here. This
+      direction is the one that works with no public address — the platform calls GitHub, not
+      the other way round. Leave the run blank for the most recent completed one.</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <input type="text" id="test-actions-repo" style="flex:1;min-width:240px"
+             placeholder="https://github.com/owner/repo" />
+      <input type="text" id="test-actions-run" style="flex:1;min-width:160px"
+             placeholder="run URL or id (optional)" />
+      <button class="btn-secondary btn-sm" onclick="fetchActionsResults('${esc(reviewId)}')">
+        Fetch</button>
+    </div>
+    <div id="test-actions-out" style="margin-top:8px"></div>`;
+}
+
+/** Push the suite to a repository. No model call, so nothing is metered — but it writes to
+ *  somebody's repository, so what it did is reported line by line rather than as "done". */
+async function deliverGeneratedTests(reviewId) {
+  const repo = (document.getElementById('test-deliver-repo') || {}).value || '';
+  const out = document.getElementById('test-deliver-out');
+  if (!out) return;
+  if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
+  out.innerHTML = '<div class="cost-note">Committing…</div>';
+  try {
+    const d = await apiFetch(`/api/reviews/${reviewId}/deliver-tests`, {
+      method: 'POST',
+      body: JSON.stringify({
+        github_repo_url: repo.trim(),
+        open_pr: !!(document.getElementById('test-deliver-pr') || {}).checked,
+        include_workflow: true,
+      }),
+    });
+    const pr = d.pull_request && d.pull_request.url;
+    out.innerHTML = `
+      <div class="cost-note" style="border-left:3px solid var(--green)">
+        <div><b>${(d.files_committed || []).length} file(s)</b> committed to
+          <code>${esc(d.branch || '')}</code> in ${esc(d.repo || '')}</div>
+        ${pr ? `<div style="margin-top:4px"><a href="${esc(pr)}" target="_blank" rel="noopener">${esc(pr)}</a></div>`
+             : `<div style="margin-top:4px"><a href="${esc(d.branch_url || '')}" target="_blank" rel="noopener">${esc(d.branch_url || '')}</a></div>`}
+        ${d.pull_request_error ? `<div style="margin-top:4px">The commits landed but the pull
+          request did not: ${esc(d.pull_request_error)}</div>` : ''}
+        ${d.workflow_warning ? `<div style="margin-top:6px">${esc(d.workflow_warning)}</div>` : ''}
+        ${(d.files_failed || []).length ? `<div style="margin-top:6px">Not committed:
+          ${(d.files_failed || []).map(f => `<code>${esc(f.path)}</code>`).join(', ')}</div>` : ''}
+      </div>`;
+    // The repository is now the obvious place to fetch results from, so it is filled in
+    // rather than typed twice.
+    const echo = document.getElementById('test-actions-repo');
+    if (echo && !echo.value) echo.value = repo.trim();
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
+  }
+}
+
+/** Pull a finished Actions run's results in. Refreshes the results panel above on success,
+ *  because the answer to "what happened" belongs where the answer already lives. */
+async function fetchActionsResults(reviewId) {
+  const repo = (document.getElementById('test-actions-repo') || {}).value || '';
+  const run = ((document.getElementById('test-actions-run') || {}).value || '').trim();
+  const out = document.getElementById('test-actions-out');
+  if (!out) return;
+  if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
+  out.innerHTML = '<div class="cost-note">Reading GitHub…</div>';
+  const body = { github_repo_url: repo.trim() };
+  // Accepts what the job itself prints, which is a URL, as well as a bare id.
+  const id = (run.match(/actions\/runs\/(\d+)/) || [])[1] || (/^\d+$/.test(run) ? run : '');
+  if (id) body.run_id = id;
+  try {
+    const d = await apiFetch(`/api/reviews/${reviewId}/test-results/from-actions`, {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    const a = d.actions_run || {};
+    const s = d.summary || {};
+    out.innerHTML = `
+      <div class="cost-note" style="border-left:3px solid var(--green)">
+        Read run ${esc(String(a.id || ''))} (${esc(a.conclusion || 'unknown')}) on
+        ${esc(a.branch || 'unknown branch')} — ${s.passed} of ${s.total} passed.
+        ${a.url ? `<a href="${esc(a.url)}" target="_blank" rel="noopener">the run</a>` : ''}
+      </div>`;
+    loadTestResults(reviewId);
+  } catch (e) {
+    out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
+  }
+}
+
+function downloadTestWorkflow() {
+  const d = _lastRunnerPlan;
+  if (!d || !d.workflow_yaml) return;
+  _downloadTextAsFile((d.workflow_path || 'workflow.yml').split('/').pop(), d.workflow_yaml);
+}
+
+function renderTestAutomation(targetId, r) {
+  _lastTestAutomation = r;
+  // Fired after the innerHTML below lands, since both write into divs that markup creates.
+  if (r && r.review_id) setTimeout(() => {
+    loadTestResults(r.review_id);
+    loadTestRunner(r.review_id);
+  }, 0);
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const files = r.test_files || [];
+  // `requirement_coverage`, not `coverage`: that name is already taken platform-wide for
+  // chunk coverage (`{chunks_total, chunks_succeeded, failures}`) and is read by the shared
+  // `renderReviewTransparency`. Shadowing it broke this renderer on a partial run *and*
+  // silently suppressed the "this review was incomplete" warning — the worse of the two.
+  const cov = Array.isArray(r.requirement_coverage) ? r.requirement_coverage : [];
+  const assumptions = r.assumptions || [];
+  const notAuto = r.not_automated || [];
+  const uncovered = cov.filter(c => !c.covered);
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Generated Test Suite</h2>
+      <span style="color:var(--text-muted);font-size:13px">${r.total_files || files.length} file(s) ·
+        ${r.total_tests || 0} test(s)${(r.levels_present || []).length ? ' · ' + r.levels_present.map(esc).join(', ') : ''}</span>
+    </div>
+    ${renderReviewTransparency(r)}
+
+    <!-- Said first and said plainly. A suite with no results attached reads as untested only
+         if somebody says so, and this product is the one most likely to be mistaken for
+         evidence that the code works. Replaced by the real outcome once somebody reports
+         one — but never by a claim that the platform checked it. -->
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>Nothing here has been run.</b> These files were generated, not executed — the platform
+      does not compile or run the code it produces. A generated test that passes is not evidence
+      until someone runs it and reads the result.
+      <div style="margin-top:6px"><b>How to run them</b> is below — one command, or a CI
+        workflow that reports back on every push. This screen then shows which of your
+        requirements actually hold.</div>
+    </div>
+    <div id="test-automation-results"></div>
+    <div id="test-automation-runner"></div>
+
+    <div class="summary-box">${esc(r.summary || '')}</div>
+    ${renderAutomationInputMode(r)}
+
+    ${assumptions.length ? `
+    <div class="section-title" style="margin-top:20px">⚠ What it had to assume (${assumptions.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">Read these first. Each one is a
+      fact the agent could not verify in your source — if any is wrong, the tests that rest on it
+      fail during setup rather than reporting a real defect.</p>
+    ${assumptions.map(a => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(a.assumption || '')}</div>
+        ${a.why_unverifiable ? `<div class="antipattern-desc">Could not confirm: ${esc(a.why_unverifiable)}</div>` : ''}
+        <div class="antipattern-impact">If wrong: ${esc(a.risk_if_wrong || '')}</div>
+      </div>`).join('')}` : `
+    <div class="section-title" style="margin-top:20px">Assumptions</div>
+    <p class="field-hint">The agent reported none — it says everything the tests rely on was
+      visible in the source it was given.</p>`}
+
+    ${notAuto.length ? `
+    <div class="section-title" style="margin-top:20px">Not automated (${notAuto.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">Named rather than given a hollow
+      script. These still need a person.</p>
+    ${notAuto.map(n => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(n.requirement_ref || '')}</div>
+        <div class="antipattern-desc">${esc(n.reason || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${(r.prerequisites_present || []).length ? `
+    <div class="section-title" style="margin-top:20px">Before these can run</div>
+    <div class="compliance-chips">${r.prerequisites_present.map(p => `<span class="compliance-chip">${esc(p)}</span>`).join('')}</div>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Test files (${files.length})</div>
+    ${files.length ? `
+    <div class="form-actions" style="margin-bottom:8px">
+      <button class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
+              onclick="downloadAllGeneratedTests()">⬇ Download all</button>
+    </div>` : ''}
+    ${files.map((f, i) => `
+      <details style="margin-bottom:10px" ${files.length === 1 ? 'open' : ''}>
+        <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">
+          ${esc(f.path || '')}
+          <span style="color:var(--text-muted);font-family:inherit;font-size:11px">
+            ${esc(f.framework || '')} · ${esc(f.level || '')} · ${(f.test_names || []).length} test(s)</span>
+        </summary>
+        <div style="margin-top:8px">
+          ${(f.prerequisites || []).length ? `<div class="field-hint">Needs: ${f.prerequisites.map(esc).join(', ')}</div>` : ''}
+          ${(f.covers || []).length ? `<div class="field-hint">Covers: ${f.covers.map(esc).join(' · ')}</div>` : ''}
+          <pre class="api-usage-code">${esc(f.content || '')}</pre>
+          <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px"
+                  onclick="downloadGeneratedTest(${i})">⬇ Download this file</button>
+        </div>
+      </details>`).join('')}
+
+    ${(r.levels_chosen || []).length ? `
+    <div class="section-title" style="margin-top:20px">Why these levels</div>
+    <ul class="rec-list">${r.levels_chosen.map(l => `<li><b>${esc(l.level || '')}</b> — ${esc(l.rationale || '')}</li>`).join('')}</ul>` : ''}
+
+    ${cov.length ? `
+    <div class="section-title" style="margin-top:20px">Coverage${uncovered.length ? ` — ${uncovered.length} not covered` : ''}</div>
+    <table class="data-table">
+      <thead><tr><th>Requirement</th><th>Tests</th><th>Status</th></tr></thead>
+      <tbody>${cov.map(c => `
+        <tr>
+          <td>${esc(c.requirement_ref || '')}${c.note ? `<div class="field-hint">${esc(c.note)}</div>` : ''}</td>
+          <td style="font-family:monospace;font-size:11px">${(c.test_names || []).map(esc).join('<br>') || '—'}</td>
+          <td>${c.covered ? '<span style="color:var(--green)">✓ Covered</span>' : '<span style="color:var(--amber)">✗ Not covered</span>'}</td>
+        </tr>`).join('')}</tbody>
+    </table>` : ''}
+
+    ${r.setup_instructions ? `
+    <div class="section-title" style="margin-top:20px">How to run them</div>
+    <div class="summary-box">${esc(r.setup_instructions)}</div>` : ''}
 
     <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
   `;
@@ -10239,7 +10925,7 @@ const SOURCE_MODES = [
 
 // Which mode each screen is currently on. Module-level rather than read from the DOM so the
 // two screens cannot interfere with each other.
-const _sourceMode = { code: 'paste', vapt: 'paste' };
+const _sourceMode = { code: 'paste', vapt: 'paste', 'test-automation': 'paste' };
 
 /** Render the source picker for one screen into its container. */
 function renderSourcePicker(agent) {
@@ -10325,9 +11011,16 @@ function buildSourceBody(agent) {
   if (agent === 'vapt') base.scope = v('vapt-scope');
 
   if (mode === 'paste') {
-    const text = v(agent === 'code' ? 'code-content' : 'vapt-artifact');
+    // Table rather than a chain of ternaries: the id and the body field differ per screen
+    // and a third screen made the nested conditional unreadable. `test-automation` sends
+    // `code` because `source_bundle.resolve` reads that name as the source -- its
+    // `requirement` field is deliberately not one of the source names, or the requirement
+    // itself would be treated as the code under test.
+    const PASTE_FIELD = { code: 'code-content', vapt: 'vapt-artifact' };
+    const PASTE_KEY = { code: 'code', vapt: 'artifact' };
+    const text = v(PASTE_FIELD[agent] || `${agent}-code`);
     if (!text) { alert('Paste something to review first.'); return null; }
-    return { kind: 'json', body: { ...base, [agent === 'code' ? 'code' : 'artifact']: text } };
+    return { kind: 'json', body: { ...base, [PASTE_KEY[agent] || 'code']: text } };
   }
   // A one-off token, when there is one. Sent for this call only and never stored — the
   // durable answer is a credential saved against the project, which is what the link beside
@@ -10679,6 +11372,13 @@ const AGENT_SCREENS = {
                     noun: 'generations',            gated: false },
   'test-case':    { product: 'test-case',           reviewType: 'test_cases',
                     result: 'test-case-result',     render: renderTestCases,
+                    noun: 'generations',            gated: false },
+  // `inventory: false` (by omission) on purpose: this route stores no source, so the
+  // retention control must not appear -- `renderRetentionControl` gates on that flag, and a
+  // retention promise nothing honours is worse than none.
+  'test-automation':
+                  { product: 'test-automation',     reviewType: 'test_automation',
+                    result: 'test-automation-result', render: renderTestAutomation,
                     noun: 'generations',            gated: false },
   vapt:           { product: 'vapt',                reviewType: 'vapt',
                     result: 'vapt-result',          render: renderVAPTResult,
@@ -11743,8 +12443,17 @@ function renderCostPreview(agent, q) {
       <div class="cost-preview-head">
         <span class="cost-preview-title">Before you spend anything</span>
         <span class="cost-figure">
-          est. <b>$${Number(e.expected_usd || 0).toFixed(2)}</b>
-          <span class="cost-ceiling">ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}</span>
+          ${q.billing ? `
+            <!-- A priced product: the figure a customer is shown has to be what they will be
+                 charged, not what the tokens cost us. The token estimate stays visible
+                 underneath, because a price nobody can decompose is a price nobody can
+                 dispute. -->
+            est. <b>$${Number((q.billing.expected || {}).total_usd || 0).toFixed(2)}</b>
+            <span class="cost-ceiling">ceiling $${Number((q.billing.ceiling || {}).total_usd || 0).toFixed(2)}</span>
+          ` : `
+            est. <b>$${Number(e.expected_usd || 0).toFixed(2)}</b>
+            <span class="cost-ceiling">ceiling $${Number(e.ceiling_usd || 0).toFixed(2)}</span>
+          `}
         </span>
       </div>
       <div class="cost-grid">
@@ -11756,6 +12465,8 @@ function renderCostPreview(agent, q) {
         <div><span class="cost-label">Vulnerable deps found</span><b>${q.vulnerable_dependencies_found || 0}</b></div>
       </div>
       ${renderDependencyNote(q.dependency_scan)}
+      ${q.billing && q.billing.explanation ? `<div class="cost-explanation">
+        <b>You are charged ${esc(q.billing.explanation)}</b></div>` : ''}
       <div class="cost-explanation">${esc(q.explanation || '')}</div>
       ${s.secrets_redacted ? `<div class="cost-note">${s.secrets_redacted} hardcoded secret(s) were redacted at ingest — the values are not stored here and will not be sent to a model. They are reported as findings by the free scanner, not by the model.</div>` : ''}
       ${s.truncated ? `<div class="cost-warn">${esc(s.truncation_reason || 'This source is larger than one scan covers.')}</div>` : ''}

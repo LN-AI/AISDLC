@@ -1,0 +1,10 @@
+{
+  "name": "task-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A tiny task API used as a subject for the test-automation eval",
+  "main": "src/app.js",
+  "scripts": {
+    "test": "node --test tests/"
+  }
+}

@@ -22,6 +22,7 @@ from backend.agents.governance_intelligence.release_gate import ReleaseGateAgent
 from backend.agents.governance_intelligence.report_generator import ReportGeneratorAgent
 from backend.agents.qa_intelligence.test_scenario_agent import TestScenarioAgent
 from backend.agents.qa_intelligence.test_case_agent import TestCaseAgent
+from backend.agents.qa_intelligence.test_automation_agent import TestAutomationAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
 from backend.services import cost_optimization_service
@@ -68,6 +69,39 @@ def _log_call(method):
     return _wrapper
 
 
+def _refuse_degenerate(product: str, produced: Any, result: Dict[str, Any],
+                      field: str, remedy: str) -> None:
+    """Raise when a QA generator came back with nothing at all, rather than storing it.
+
+    None of the three QA generators goes through `BaseAgent.review()`, so `attest`'s
+    degeneracy check never runs on them — they call `llm_gateway.call_tool` directly. And
+    `attest` could not be delegated to even if they did: it asks about `findings`, which
+    none of these produce. The signature it looks for is the same one
+    `finding_gate.looks_degenerate` describes, applied to a different noun: **an empty
+    payload together with an empty summary is a truncated or malformed tool call, not a
+    genuine "nothing to say"**, because a model that had nothing to generate says so in the
+    summary it was also asked for.
+
+    Stored instead of raised, that shape reads as "we generated a catalogue" on a screen
+    that then shows an empty list — the reader cannot tell it apart from a requirement too
+    thin to test, which is the one distinction these products exist to make.
+
+    One rule in one place, because two of these three had a hand-written copy and the third
+    had none — which is how the third ended up silent.
+
+    `attest`'s 200-character floor is deliberately *not* applied here. That floor exists so a
+    caller probing a code-review endpoint with a one-liner is not refused; a requirement is
+    prose a person wrote on purpose, and "login must work" is short but entirely testable.
+    """
+    if produced or (result.get("summary") or "").strip():
+        return
+    raise RuntimeError(
+        f"{product} returned no {field} and no summary — this usually means the LLM "
+        f"response was truncated or malformed rather than a genuine empty result. "
+        f"Try again{remedy}."
+    )
+
+
 class SDLCOrchestrator:
     def __init__(self):
         self.req_agent = RequirementReviewAgent()
@@ -90,6 +124,7 @@ class SDLCOrchestrator:
         self.issue_triage_agent = IssueTriageAgent()
         self.test_scenario_agent = TestScenarioAgent()
         self.test_case_agent = TestCaseAgent()
+        self.test_automation_agent = TestAutomationAgent()
         self.github = GitHubService()
 
     @staticmethod
@@ -729,6 +764,8 @@ class SDLCOrchestrator:
         if cost_stats:
             result["_cost_stats"] = cost_stats
         scenarios = result.get("scenarios", [])
+        _refuse_degenerate("Test scenario generation", scenarios, result, "scenarios",
+                           " or split the requirement into smaller pieces")
         review_id = database.save_review(
             review_type="test_scenarios",
             project_name=project_name,
@@ -753,12 +790,8 @@ class SDLCOrchestrator:
         compressed_requirement, cost_stats = self._compress(requirement)
         result = self.test_case_agent.generate(compressed_requirement, scenarios_context, context)
         test_cases = result.get("test_cases", [])
-        if not test_cases and not (result.get("summary") or "").strip():
-            raise RuntimeError(
-                "Test case generation returned no test cases (no test_cases and no summary) — "
-                "this usually means the LLM response was truncated or malformed rather than "
-                "a genuine empty result. Try again or reduce scope (e.g. fewer scenarios at once)."
-            )
+        _refuse_degenerate("Test case generation", test_cases, result, "test cases",
+                           " or reduce scope (e.g. fewer scenarios at once)")
         if cost_stats:
             result["_cost_stats"] = cost_stats
         review_id = database.save_review(
@@ -771,6 +804,115 @@ class SDLCOrchestrator:
         result["review_id"] = review_id
         result["total_test_cases"] = len(test_cases)
         result["critical_count"] = sum(1 for tc in test_cases if tc.get("priority") == "Critical")
+        return result
+
+    @_log_call
+    def generate_test_automation(
+        self,
+        requirement: str,
+        code_context: str = "",
+        test_conventions: str = "",
+        cases_context: str = "",
+        levels: Optional[List[str]] = None,
+        context: str = "",
+        project_name: str = "Unnamed Project",
+        llm_override: Optional[Dict[str, Any]] = None,
+        source: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Runnable tests from a requirement plus a codebase. One call.
+
+        The two briefs arrive already built (`code_brief`, `test_context_brief`), the way
+        `main._design_review_from_source` builds them for the other three agents that read a
+        whole codebase — they are free, deterministic and needed by the *free* estimate as
+        well as by this call, so the route owns them rather than this method.
+
+        Only the requirement is compressed. The briefs are computed output, already dense,
+        and `_compress` is documented to no-op on anything that reads as prose anyway — so
+        running it over them would spend time to change nothing.
+        """
+        context = self._kb("qa", context, requirement, project_name)
+        compressed_requirement, cost_stats = self._compress(requirement)
+        result = self.test_automation_agent.generate(
+            requirement=compressed_requirement,
+            code_context=code_context,
+            test_conventions=test_conventions,
+            cases_context=cases_context,
+            levels=levels,
+            context=context,
+            llm_override=llm_override,
+        )
+        # Every array below is written by the model, and a schema is a request rather than a
+        # guarantee. A live run against a large codebase returned `test_files` as a list of
+        # **strings** instead of objects; the next line called `.get()` on a string and the
+        # caller received an HTTP 500 carrying an `AttributeError` — after the call had been
+        # made and billed. So each row is checked before it is used, non-conforming rows are
+        # dropped rather than coerced (a string cannot supply a path, a framework or a list
+        # of test names, and inventing them would be a claim nothing supports), and what was
+        # dropped is reported rather than silently discarded.
+        def _rows(value):
+            items = value if isinstance(value, list) else []
+            return [row for row in items if isinstance(row, dict)], sum(
+                1 for row in items if not isinstance(row, dict))
+
+        files, dropped_files = _rows(result.get("test_files"))
+        coverage, dropped_coverage = _rows(result.get("requirement_coverage"))
+        assumptions, dropped_assumptions = _rows(result.get("assumptions"))
+        not_automated, dropped_not_automated = _rows(result.get("not_automated"))
+        malformed = (dropped_files + dropped_coverage + dropped_assumptions
+                     + dropped_not_automated)
+        if malformed:
+            logger.warning(
+                "test-automation: discarded %d response row(s) that were not objects "
+                "(test_files=%d, requirement_coverage=%d, assumptions=%d, not_automated=%d)",
+                malformed, dropped_files, dropped_coverage, dropped_assumptions,
+                dropped_not_automated)
+            result["malformed_rows"] = malformed
+        result["test_files"] = files
+        result["requirement_coverage"] = coverage
+        result["assumptions"] = assumptions
+        result["not_automated"] = not_automated
+
+        # The shared guard, for the reason `_refuse_degenerate` gives. Reached with `files`
+        # already filtered, so a response whose every entry was the wrong shape lands here —
+        # which is right: it is malformed, not empty, and this is the error that says so.
+        _refuse_degenerate("Test automation generation", files, result, "test files",
+                           ", narrow the source to the files this requirement touches, or "
+                           "reduce the number of levels requested")
+        if cost_stats:
+            result["_cost_stats"] = cost_stats
+
+        # Derived counts, computed here rather than trusted from the model: `total_tests` is
+        # what the reader will quote, and a model that miscounts its own array would put a
+        # wrong number on a screen next to the right files.
+        test_names = [n for f in files for n in (f.get("test_names") or [])]
+        result["total_files"] = len(files)
+        result["total_tests"] = len(test_names)
+        result["levels_present"] = sorted({f.get("level") or "" for f in files} - {""})
+        result["prerequisites_present"] = sorted(
+            {p for f in files for p in (f.get("prerequisites") or []) if p and p != "none"}
+        )
+        result["uncovered_count"] = sum(1 for row in coverage if not row.get("covered"))
+        result["assumption_count"] = len(assumptions)
+        result["not_automated_count"] = len(not_automated)
+        # The claim this product must never make silently. Nothing in the review pipeline
+        # compiles or runs what it produces (D-05), so a stored suite is "generated", never
+        # "passing" — and the field says so rather than leaving a reader to infer it from
+        # the absence of results. Phase 2's results contract is what will change this.
+        result["execution_status"] = "not_executed"
+        if source:
+            result["source"] = source
+
+        review_id = database.save_review(
+            review_type="test_automation",
+            project_name=project_name,
+            input_summary=(
+                f"Test automation — {len(files)} file(s), {len(test_names)} test(s) from: "
+                f"{requirement[:120]}{'...' if len(requirement) > 120 else ''}"
+            ),
+            input_content=requirement[:5000],
+            result=result,
+        )
+        result["review_id"] = review_id
         return result
 
     @_log_call
