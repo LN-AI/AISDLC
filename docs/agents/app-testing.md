@@ -114,38 +114,64 @@ field. A password box reports only that something has been typed into it — whi
 because an explorer that cannot tell its own typing landed types it again instead of pressing
 Sign In.
 
-> **What the page says does reach us, and is kept for the life of the session.** That is a
-> real change from "we only see button names", and it is what makes an assertion about a
-> value possible at all. The digest is landmark elements only and capped in both length and
-> number, but nothing about it understands *content*: if your test environment is a copy of
-> production, a page showing a customer's name will send that name. Seed test environments
-> with synthetic data — which is the same advice the attestation is asking you to confirm.
+> **What the page says does reach us**, and that is a real change from "we only see button
+> names". It is what makes an assertion about a value possible at all. The digest is landmark
+> elements only and capped in both length and number, but nothing about it understands
+> *content*: if your test environment is a copy of production, a page showing a customer's
+> name will send that name.
+
+Three things bound it, and you control two of them:
+
+- **Encrypted where it rests**, the same way customer source code is.
+- **Deleted on a clock you set** — 7 days by default, up to 90, and **0 means "wipe it the
+  moment the tests are written"**. Nothing needs it after that, so zero costs you nothing but
+  the ability to look back later at why a particular test exists.
+- **Refusable entirely.** Turn it off and no page text leaves your machine at all. The
+  driver stops sending it and the service drops it if sent anyway.
+
+If you turn it off, the tests can check that a control is *there* and cannot check that a
+value is *right*. The finished suite says so on its face rather than leaving whoever inherits
+it to wonder why it only ever checks that buttons exist.
 
 ---
 
-## The field that decides what the suite is worth
+## What decides whether the suite is worth anything
 
-Supplying `requirement` is optional and it changes the product.
+**A session will not start without something to check the application against.** That is not
+bureaucracy; it is the difference between a test that checks behaviour and one that checks
+furniture. A session opened with nothing supplied produced eleven tests of which nine were
+some form of *"the button is visible"* — and a test like that passes just as happily when the
+feature behind the button is completely broken.
 
-**Without it**, the explorer has only the application to go on, so it can only assert *what it
-saw*. That produces **characterization tests**: "this is what the app does today". They catch
-a regression well and catch a pre-existing bug not at all — if the application was wrong on
-the day it was explored, the suite now asserts the wrong behaviour and goes green forever.
+Any **one** of three is enough:
 
-**With it**, an assertion can be checked against something.
+| Source | How to supply it |
+|---|---|
+| **A requirement in your own words** | The field on the screen, or `requirement` on the API |
+| **A document** | Upload to Knowledge Base against this project, filed as **Requirement Review** or **QA / Test Standards**. Both shelves are read. |
+| **An earlier Test Scenario or Test Case run** | `source_review_ids`, or the picker on the screen. Optional — most sessions will not have one. |
 
-Every test therefore declares its basis in `assertion_basis`:
+The third is the strongest brief when it exists, because a generated test case already carries
+numbered steps with an expected result on each, which is most of a test. It is also the one
+that needs care, which is why there are three words rather than two:
 
 | `basis` | Means |
 |---|---|
-| `specified` | It checks a requirement you supplied, and names which one |
-| `observed` | It records what the application did during exploration |
+| `stated` | It checks something **a person wrote** — your requirement, or your document |
+| `derived` | It checks a scenario or case **this platform generated** from what a person wrote |
+| `observed` | Nothing said this should be true; it records what the application did |
 
-A `specified` claim made when **no requirement was supplied at all** is downgraded to
-`observed` in code, not merely discouraged in the prompt, and the count of downgrades is
-reported as `assertions_downgraded`. Requirement-coverage rows claimed with no requirement
-behind them are dropped entirely. This is `attest.coverage_claim`'s rule — a model's claim
-about its own output is not evidence — applied to a new noun.
+**Why `derived` is separate from `stated`.** Our own test-case agent writes excellent briefs,
+but it wrote them from somebody's requirement and nobody has checked that it understood. If a
+test matching such a case could call itself `stated`, a machine's guess would become a
+verified fact in two hops, and somebody would make a release decision on it. The word keeps
+the chain visible.
+
+**All of this is enforced in code, not asked for in the prompt.** What the session actually
+had sets a ceiling, and any claim above that ceiling is pushed down to it with the reason
+recorded on the row; the count is reported as `assertions_downgraded`. Requirement-coverage
+rows claimed with nothing behind them are dropped entirely. This is `attest.coverage_claim`'s
+rule — a model's claim about its own output is not evidence — applied to a new noun.
 
 ---
 

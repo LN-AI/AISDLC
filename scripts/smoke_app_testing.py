@@ -104,9 +104,17 @@ def section(title):
 
 
 def _open_session(client, headers, **overrides):
+    """A normal session. Carries a requirement because a session now needs *some* basis.
+
+    That is the ordinary case rather than a special one: since a session must have something
+    to check the application against before it may start, a helper that opened one without
+    would be testing the product through a door that no longer exists. Section 2 drives the
+    refusal itself.
+    """
     body = {
         "target_label": "staging.example.com",
         "goal": "Cover signing in and browsing.",
+        "requirement": "A signed-in user sees the item list and can open an item.",
         "max_steps": 10,
         "attested_test_env": True,
     }
@@ -192,7 +200,7 @@ def main_():
 
     # ── 2. The attestation ────────────────────────────────────────────────
     # The one condition here that is about somebody else's data rather than bookkeeping.
-    section("2. A session cannot start without the test-environment attestation")
+    section("2. A session cannot start without an attestation, or without a basis")
     denied = _open_session(client, scoped, attested_test_env=False)
     check("a session without the attestation is refused", denied.status_code == 400,
           denied.text[:200])
@@ -205,8 +213,41 @@ def main_():
         conn.close()
     check("nothing was written for the refused session", count == 0, count)
 
+    # The second door, and the reason the product is worth anything. A session with nothing
+    # to check the application against can only describe what it saw, which is how a live run
+    # produced eleven tests of which nine were "the button is visible". Refused at the door
+    # rather than discovered after a paid session and a suite nobody should trust.
+    nothing = _open_session(client, scoped, requirement="")
+    check("a session with nothing to check against is refused",
+          nothing.status_code == 400, "%s %s" % (nothing.status_code, nothing.text[:200]))
+    check("the refusal says what would fix it",
+          all(w in nothing.text for w in ("requirement", "document", "Test Case")),
+          nothing.text[:400])
+    conn = database.get_connection()
+    try:
+        count_now = conn.execute("SELECT COUNT(*) FROM app_sessions").fetchone()[0]
+    finally:
+        conn.close()
+    check("nothing was written for it", count_now == 0, count_now)
+
+    # A prior run that is not a brief cannot become one by being named. Skipped and reported
+    # rather than silently ignored — believing your cases are covered when the reference was
+    # dropped is worse than being told the reference was no good (D-316's shape).
+    wrong_kind = database.save_review(
+        review_type="code", project_name="App Testing Smoke",
+        input_summary="x", input_content="x", result={"findings": [], "summary": "x"})
+    not_a_brief = _open_session(client, scoped, requirement="",
+                                source_review_ids=[wrong_kind])
+    check("a code review cannot serve as a brief", not_a_brief.status_code == 400,
+          not_a_brief.status_code)
+    missing = _open_session(client, scoped, requirement="",
+                            source_review_ids=["no-such-review"])
+    check("neither can a run that does not exist", missing.status_code == 400,
+          missing.status_code)
+
     opened = _open_session(client, scoped)
-    check("an attested session opens", opened.status_code == 200, opened.text[:300])
+    check("an attested session with a requirement opens",
+          opened.status_code == 200, opened.text[:300])
     session_id = opened.json()["session"]["id"]
     check("the session reports its budget",
           opened.json()["session"]["max_steps"] == 10, opened.json()["session"])
@@ -325,53 +366,81 @@ def main_():
           "had not already seen" in (results[stopped_at].get("reason") or ""),
           results[stopped_at] if stopped_at is not None else None)
 
-    # ── 7. Honesty when there is no requirement ───────────────────────────
-    # The rule that keeps this product from overclaiming. A model may *say* a test checks a
-    # requirement; with no requirement supplied there is nothing it could have checked, so
-    # the claim is downgraded in code rather than believed.
-    section("7. A suite generated with no requirement claims nothing it cannot support")
-    gen_session = _open_session(client, scoped, max_steps=5).json()["session"]["id"]
+    # ── 7. A machine-written brief cannot become a person's requirement ──
+    # The rule that keeps this product from overclaiming, now with a middle rung. A session
+    # whose only basis is scenarios or test cases *this platform generated* has real material
+    # to test against -- but nobody has checked that material against what the customer
+    # actually wanted, so a test matching it may say 'derived' and may not say 'stated'.
+    # Enforced in code: a model may claim anything, and a claim is not evidence (D-406).
+    section("7. A generated brief supports 'derived', never 'stated'")
+    prior = database.save_review(
+        review_type="test_cases", project_name="App Testing Smoke",
+        input_summary="cases", input_content="cases",
+        result={"test_cases": [{"test_case_id": "TC-1", "title": "Open an item",
+                                "steps": [{"step_number": 1, "action": "click Items",
+                                           "expected_result": "the item list appears"}]}],
+                "summary": "one case"},
+    )
+    # `save_review` takes the project from the request context, which a direct call has none
+    # of, so it is set here. Not a workaround for the product: a run belonging to no project
+    # is correctly refused as a brief, and section 7b below drives exactly that.
+    _c = database.get_connection()
+    try:
+        _c.execute("UPDATE reviews SET project_id = ? WHERE id = ?", (project_id, prior))
+        _c.commit()
+    finally:
+        _c.close()
+    derived_only = _open_session(client, scoped, max_steps=5, requirement="",
+                                 source_review_ids=[prior]).json()["session"]["id"]
     _next_action.update({"action_kind": "click", "candidate_index": 0, "journey": "Browse"})
-    _step(client, scoped, gen_session, [{"role": "link", "name": "Items"}], url_path="/items")
+    _step(client, scoped, derived_only, [{"role": "link", "name": "Items"}], url_path="/items")
     _next_suite.clear()
-    overclaim = dict(SAFE_SUITE)
-    overclaim["assertion_basis"] = [{"test_name": "signs in", "basis": "specified",
+    overclaim = copy.deepcopy(SAFE_SUITE)
+    overclaim["assertion_basis"] = [{"test_name": "signs in", "basis": "stated",
                                      "requirement_ref": "REQ-1",
                                      "what_it_checks": "the dashboard appears"}]
     overclaim["requirement_coverage"] = [{"requirement_ref": "REQ-1", "covered": True,
                                           "test_names": ["signs in"]}]
-    _next_suite.update(overclaim)
-    g = client.post(f"/api/v1/app-testing/sessions/{gen_session}/generate",
+    _next_suite.update(copy.deepcopy(overclaim))
+    g = client.post(f"/api/v1/app-testing/sessions/{derived_only}/generate",
                     json={}, headers=scoped)
     check("the suite is generated", g.status_code == 200, g.text[:300])
     gb = g.json() if g.status_code == 200 else {}
-    check("the 'specified' claim was downgraded", gb.get("specified_count") == 0, gb.get("specified_count"))
-    check("it is counted as observed instead", gb.get("observed_count") == 1,
+    check("the cases were sent to the model as a brief",
+          "TC-1" in _llm_calls[-1]["content"], _llm_calls[-1]["content"][:400])
+    check("the 'stated' claim was downgraded", gb.get("stated_count") == 0,
+          gb.get("stated_count"))
+    check("it is counted as derived instead", gb.get("derived_count") == 1,
+          gb.get("derived_count"))
+    check("not pushed all the way down to observed", gb.get("observed_count") == 0,
           gb.get("observed_count"))
     check("the downgrade is reported, not silent", gb.get("assertions_downgraded") == 1,
           gb.get("assertions_downgraded"))
-    check("coverage claimed with no requirement is dropped",
-          gb.get("requirement_coverage") == [], gb.get("requirement_coverage"))
-    check("the run records that it had no requirement", gb.get("had_requirement") is False,
-          gb.get("had_requirement"))
+    check("the reason names what was missing",
+          "person wrote" in str((gb.get("assertion_basis") or [{}])[0].get(
+              "downgraded_because", "")),
+          gb.get("assertion_basis"))
+    check("the session records the ceiling it was held to",
+          gb.get("strongest_basis") == "derived", gb.get("strongest_basis"))
     check("a reviews row was written", bool(gb.get("review_id")), gb)
     check("it is filed as app_testing",
           (database.get_review(gb.get("review_id")) or {}).get("review_type") == "app_testing")
     check("nothing claims to have been executed",
           gb.get("execution_status") == "not_executed", gb.get("execution_status"))
 
-    # ── 8. ...and the claim stands when it is supportable ─────────────────
-    section("8. A requirement supplied lets a 'specified' claim stand")
+    # ── 8. ...and a person's requirement supports 'stated' ──────────────
+    section("8. A requirement a person wrote lets a 'stated' claim stand")
     with_req = _open_session(client, scoped, max_steps=5,
                              requirement="A signed-in user sees their own dashboard."
                              ).json()["session"]["id"]
     _step(client, scoped, with_req, [{"role": "link", "name": "Items"}], url_path="/items")
     _next_suite.clear()
-    _next_suite.update(overclaim)
+    _next_suite.update(copy.deepcopy(overclaim))
     g8 = client.post(f"/api/v1/app-testing/sessions/{with_req}/generate",
                      json={}, headers=scoped)
     g8b = g8.json() if g8.status_code == 200 else {}
-    check("the specified claim survives", g8b.get("specified_count") == 1,
+    check("the stated claim survives", g8b.get("stated_count") == 1, g8b.get("stated_count"))
+    check("the old count name still answers", g8b.get("specified_count") == 1,
           g8b.get("specified_count"))
     check("nothing was downgraded", not g8b.get("assertions_downgraded"),
           g8b.get("assertions_downgraded"))
@@ -379,6 +448,46 @@ def main_():
           g8b.get("requirement_coverage"))
     check("the requirement was sent to the model",
           "own dashboard" in _llm_calls[-1]["content"], _llm_calls[-1]["content"][:300])
+
+    # ...and so does a document somebody uploaded. A specification is filed under Requirements
+    # because that is where it belongs, and it is simultaneously the most useful thing a test
+    # writer could be handed — so this product reads that shelf as well as the QA one. The
+    # document store is stubbed here the way the model is: what is under test is that the
+    # route consults it, not that markdown parses.
+    from backend.services import app_basis, knowledge_base as kb_module
+    _real_ctx = kb_module.knowledge_base.get_context
+    shelves_read = []
+
+    def _fake_ctx(category, query="", project_name="", max_chars=0):
+        shelves_read.append(category)
+        if category == "requirement":
+            return "REQ-9: an archived item must not appear in the default list."
+        return ""
+
+    kb_module.knowledge_base.get_context = _fake_ctx
+    app_basis.knowledge_base.get_context = _fake_ctx
+    try:
+        docs_only = _open_session(client, scoped, max_steps=5, requirement="")
+        check("a project document is enough to start a session",
+              docs_only.status_code == 200, docs_only.text[:250])
+        check("both shelves are consulted, not just QA",
+              set(app_basis.DOC_CATEGORIES) <= set(shelves_read), shelves_read)
+        docs_id = docs_only.json()["session"]["id"]
+        _step(client, scoped, docs_id, [{"role": "link", "name": "Items"}], url_path="/items")
+        _next_suite.clear()
+        _next_suite.update(copy.deepcopy(overclaim))
+        gd = client.post(f"/api/v1/app-testing/sessions/{docs_id}/generate",
+                         json={}, headers=scoped)
+        gdb = gd.json() if gd.status_code == 200 else {}
+        check("the document reached the model", "REQ-9" in _llm_calls[-1]["content"],
+              _llm_calls[-1]["content"][:400])
+        check("and a document counts as something a person stated",
+              gdb.get("stated_count") == 1, gdb.get("stated_count"))
+        check("so nothing was downgraded", not gdb.get("assertions_downgraded"),
+              gdb.get("assertions_downgraded"))
+    finally:
+        kb_module.knowledge_base.get_context = _real_ctx
+        app_basis.knowledge_base.get_context = _real_ctx
 
     # ── 9. An empty generation is an error ────────────────────────────────
     # D-405's guard, reached through this product. A truncated response stored as a
@@ -440,6 +549,43 @@ def main_():
     kept = client.post(f"/api/v1/app-testing/sessions/{empty_session}/generate",
                        json={}, headers=scoped)
     check("a suite with files is kept", kept.status_code == 200, kept.text[:200])
+
+    # A generation that comes back empty is retried once, because the cost of not retrying is
+    # the whole session: every exploration step the customer already paid for produces
+    # nothing. Reported rather than hidden — a silent retry turns a one-in-three defect into
+    # a one-in-nine defect nobody measures.
+    empty_then_good = {"n": 0}
+    _real_stub = llm_gateway.call_tool
+
+    def _empty_first(system_prompt, user_content, tool_schema, llm_override=None,
+                     max_tokens=None):
+        if tool_schema.get("name") == "submit_app_test_suite":
+            empty_then_good["n"] += 1
+            if empty_then_good["n"] == 1:
+                _llm_calls.append({"name": "submit_app_test_suite", "content": user_content})
+                llm_gateway._record_usage("anthropic", config.MODEL, 1000, 100)
+                return {"test_files": [], "assertion_basis": [],
+                        "summary": "Two journeys were covered by a full suite."}
+        return _real_stub(system_prompt, user_content, tool_schema, llm_override, max_tokens)
+
+    retry_session = _open_session(client, scoped, max_steps=5).json()["session"]["id"]
+    _step(client, scoped, retry_session, [{"role": "link", "name": "Items"}], url_path="/items")
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    llm_gateway.call_tool = _empty_first
+    try:
+        rg = client.post(f"/api/v1/app-testing/sessions/{retry_session}/generate",
+                         json={}, headers=scoped)
+    finally:
+        llm_gateway.call_tool = _real_stub
+    rgb = rg.json() if rg.status_code == 200 else {}
+    check("an empty generation is retried rather than wasting the session",
+          rg.status_code == 200, "%s %s" % (rg.status_code, rg.text[:200]))
+    check("the retry produced the suite", rgb.get("total_files") == 1,
+          rgb.get("total_files"))
+    check("and the retry is reported, not hidden", rgb.get("generation_retried") is True,
+          rgb.get("generation_retried"))
+    check("both calls were made", empty_then_good["n"] == 2, empty_then_good["n"])
 
     # ── 10. Results come home ─────────────────────────────────────────────
     # The whole reason for reusing the code-based result shape: the existing contract works
@@ -585,8 +731,107 @@ def main_():
     check("the suite writer can see the value to assert",
           "Total: GBP 8.00" in _llm_calls[-1]["content"], _llm_calls[-1]["content"][-900:])
 
-    # ── 13. The product agrees with itself ────────────────────────────────
-    section("13. The registry row, the estimator and the screen table agree")
+    # ── 13. The page-text promise is kept in code, not in a sentence ──────
+    # What a page displays is the customer's own content. Three promises are made about it
+    # and each is checked behaviourally here: it can be refused entirely, it is encrypted
+    # where it rests, and it is deleted when its window passes.
+    section("13. Page text can be refused, is encrypted at rest, and expires")
+
+    off = _open_session(client, scoped, max_steps=5, collect_page_text=False
+                        ).json()["session"]["id"]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Look around", "rationale": "see the list"})
+    # The driver sends it anyway. A setting a client can defeat by ignoring it is not a
+    # setting, so the refusal has to happen here rather than out there.
+    r13 = _step(client, scoped, off, [{"role": "link", "name": "Items"}],
+                url_path="/items", page_texts=["status: Total: GBP 8.00", "heading: Basket"])
+    check("the step is accepted", r13.status_code == 200, r13.text[:200])
+    sent = _llm_calls[-1]["content"]
+    check("page text a refusing session was sent never reaches the model",
+          "GBP 8.00" not in sent, sent[-400:])
+    conn = database.get_connection()
+    try:
+        stored_off = app_session.steps(conn, off)
+    finally:
+        conn.close()
+    check("and is not stored either", stored_off[-1]["page_texts"] == [],
+          stored_off[-1]["page_texts"])
+
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    g13 = client.post(f"/api/v1/app-testing/sessions/{off}/generate", json={}, headers=scoped)
+    check("the suite is generated", g13.status_code == 200, g13.text[:200])
+    body13 = g13.json() if g13.status_code == 200 else {}
+    check("the result says it could not see values",
+          body13.get("read_page_text") is False, body13.get("read_page_text"))
+    check("and says so in words a reader will understand",
+          "control is present" in (body13.get("page_text_note") or ""),
+          body13.get("page_text_note"))
+
+    # Encrypted at rest. Checked by reading the raw column, because "we encrypt it" is the
+    # kind of claim that survives the code that implemented it being removed.
+    on = _open_session(client, scoped, max_steps=5).json()["session"]["id"]
+    _step(client, scoped, on, [{"role": "link", "name": "Items"}], url_path="/items",
+          page_texts=["status: Total: GBP 8.00"])
+    conn = database.get_connection()
+    try:
+        raw13 = conn.execute(
+            "SELECT page_texts FROM app_steps WHERE session_id = ?", (on,)).fetchone()[0]
+        readable = app_session.steps(conn, on)[-1]["page_texts"]
+    finally:
+        conn.close()
+    check("what is on disk is not the text", "GBP 8.00" not in str(raw13), str(raw13)[:120])
+    check("but it decrypts back to the text",
+          any("GBP 8.00" in t for t in readable), readable)
+
+    # Retention 0 means gone the moment the suite exists — the tightest setting that still
+    # produces tests about values.
+    zero = _open_session(client, scoped, max_steps=5,
+                         page_text_retention_days=0).json()["session"]["id"]
+    _step(client, scoped, zero, [{"role": "link", "name": "Items"}], url_path="/items",
+          page_texts=["status: Total: GBP 8.00"])
+    conn = database.get_connection()
+    try:
+        check("it is held while the session is still running",
+              app_session.steps(conn, zero)[-1]["page_texts"] != [])
+    finally:
+        conn.close()
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    client.post(f"/api/v1/app-testing/sessions/{zero}/generate", json={}, headers=scoped)
+    conn = database.get_connection()
+    try:
+        after_zero = app_session.steps(conn, zero)[-1]["page_texts"]
+        kept_steps = len(app_session.steps(conn, zero))
+    finally:
+        conn.close()
+    check("and wiped as soon as the suite is written", after_zero == [], after_zero)
+    check("the rest of the session survives the wipe", kept_steps > 0, kept_steps)
+
+    # A window that has passed is swept without a scheduler, which this deployment does not
+    # have — so the sweep runs on the read path as well as at startup.
+    conn = database.get_connection()
+    try:
+        conn.execute("UPDATE app_sessions SET page_text_expires_at = ? WHERE id = ?",
+                     ("2000-01-01T00:00:00+00:00", on))
+        conn.commit()
+        check("an expired digest is still there until something sweeps",
+              app_session.steps(conn, on)[-1]["page_texts"] != [])
+    finally:
+        conn.close()
+    reread = client.get(f"/api/v1/app-testing/sessions/{on}", headers=scoped)
+    check("reading the session sweeps it", reread.status_code == 200, reread.text[:200])
+    conn = database.get_connection()
+    try:
+        check("and the digest is gone",
+              app_session.steps(conn, on)[-1]["page_texts"] == [],
+              app_session.steps(conn, on)[-1]["page_texts"])
+    finally:
+        conn.close()
+
+    # ── 14. The product agrees with itself ────────────────────────────────
+    section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)
     check("its review type matches what the orchestrator writes",

@@ -105,20 +105,28 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 CORPUS = os.path.join(REPO, "evals", "app_testing")
 RESULTS = os.path.join(CORPUS, "results")
 
-PROMPT_VERSION = "2026-09-15.2"
+PROMPT_VERSION = "2026-09-15.3"
 
 # Floors are set one run below the measurement, never at it (D-403): a floor set at the
 # measurement fails on a flake and then gets quietly lowered, which is how a regression gate
 # turns into a rubber stamp. Three runs per case, so one run below 100% is 0.66.
 #
-# **Measured 2026-09-15, PROMPT_VERSION 2026-09-15.2, 9 sessions (3 per case), $1.15 total
-# and $0.128 a session.** `discriminates` **9 of 9**, `detects_break` 9 of 9, `ran` 9 of 9,
-# and **no test failed on the working application in any run**.
+# **Measured 2026-09-15, PROMPT_VERSION 2026-09-15.3, 9 sessions (3 per case), $1.30 total
+# and $0.144 a session.** `discriminates` **8 of 9**, and **no test failed on the working
+# application in any session that produced one**.
 #
-#   task-ownership   11-19 steps, 3 journeys, 8-11 tests, 1-3 of them separating
-#   basket-total      6-7 steps, 1 journey, 6-7 tests, 5-6 of them separating, 6-7 controls
-#                     withheld -- the first scored runs in which the denylist did anything
-#   signup-wizard     7 steps, 1 journey, 4 tests, 2-3 of them separating
+#   task-ownership   3/3 -- 14-25 steps, 3 journeys, 6-10 tests, 1-2 of them separating
+#   basket-total     3/3 -- 7-8 steps, 1 journey, 7-8 tests, 5-7 separating, 7-8 controls
+#                    withheld: the first scored runs in which the denylist did anything
+#   signup-wizard    2/3 -- 7 steps, 1 journey, 3-6 tests. The missing one is not a bad
+#                    suite but *no* suite: the generation returned a confident summary and
+#                    an empty `test_files` (D-421). Measured before the retry that now
+#                    recovers it, so the next measurement should be better and this one
+#                    should not be quoted as though it already were.
+#
+# The denominator is every session **attempted**, which is why this reads 8 of 9 rather than
+# the 8 of 8 a "produced a suite" denominator would give. A session that returns nothing has
+# failed from the only point of view that matters.
 #
 # The first baseline on this corpus was `discriminates` **33%** on the one case that then
 # existed (`results/2026-09-15-first-baseline-one-case.json`), and the gap between the two is
@@ -130,9 +138,12 @@ PROMPT_VERSION = "2026-09-15.2"
 # carry the detail.
 #
 # A floor is now worth setting, which it was not at 33% -- one run below that measurement is
-# zero and gates nothing. Read them as "this has stopped working" detectors, not as a claim
-# that the product is finished: three cases is a count and not a percentage (C-95), and none
-# of them exercises the collector work these numbers depend on (C-97).
+# zero and gates nothing. 0.66 is one session below a measured 3/3 and exactly at
+# `signup-wizard`'s measured 2/3, which is deliberate: that case's miss has a known cause and
+# a fix already in place, so a floor it currently sits on is a floor that will catch the fix
+# failing to take. Read them as "this has stopped working" detectors, not as a claim that the
+# product is finished: three cases is a count and not a percentage (C-95), and none of them
+# exercises the collector work these numbers depend on (C-97).
 FLOORS = {
     "task-ownership": {"ran": 0.66, "detects_break": 0.66, "discriminates": 0.66},
     "basket-total": {"ran": 0.66, "detects_break": 0.66, "discriminates": 0.66},
@@ -652,11 +663,19 @@ def report(runs, repeat, spend):
                       % (bad["name"], bad["why"][:120]))
             if not r["ran"] and r.get("broken_tail"):
                 print("     runner said: " + r["broken_tail"][-200:])
-        rate_disc = sum(1 for r in produced if r["discriminates"]) / len(produced)
-        rate_ran = sum(1 for r in produced if r["ran"]) / len(produced)
-        rate_break = sum(1 for r in produced if r.get("detects_break")) / len(produced)
+        # Divided by every session attempted, not by the ones that produced something. A
+        # session that came back with no suite at all is a failure from the only point of
+        # view that matters -- the customer paid for the exploration and received nothing --
+        # and excluding it from the denominator reports "100%" for a case that failed a
+        # third of the time. That is the flattering-number failure this whole file exists to
+        # avoid (C-66), committed by the scoreboard rather than by the agent.
+        attempted = len(rows) or 1
+        rate_disc = sum(1 for r in produced if r["discriminates"]) / attempted
+        rate_ran = sum(1 for r in produced if r["ran"]) / attempted
+        rate_break = sum(1 for r in produced if r.get("detects_break")) / attempted
         print("   -- discriminates in %.0f%%; saw the break in %.0f%%; ran at all in %.0f%%"
-              % (rate_disc * 100, rate_break * 100, rate_ran * 100))
+              "  (of %d session(s) attempted)"
+              % (rate_disc * 100, rate_break * 100, rate_ran * 100, attempted))
         floor = FLOORS.get(name)
         if floor:
             if rate_disc < floor.get("discriminates", 0):

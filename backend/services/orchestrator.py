@@ -108,6 +108,20 @@ def _refuse_degenerate(product: str, produced: Any, result: Dict[str, Any],
     if (produced or (result.get("summary") or "").strip()) and not (require_payload
                                                                    and not produced):
         return
+    # What came back instead, named before the error is raised. An empty result is rare and
+    # intermittent, which is the worst combination to diagnose: by the time somebody asks why,
+    # the response is gone and reproducing it costs another paid run. Keys and shapes only --
+    # the content is the customer's.
+    keys = sorted(str(k) for k in (result or {}).keys())
+    raw = (result or {}).get("test_files")
+    logger.warning(
+        "%s produced no %s. Keys returned: %s. Raw test_files: %s. "
+        "(Absent means the model skipped the field; present-but-empty after filtering means "
+        "its entries were the wrong shape.)",
+        product, field, keys[:25],
+        "absent" if raw is None else f"{type(raw).__name__} of length {len(raw)}"
+        if hasattr(raw, "__len__") else type(raw).__name__,
+    )
     if require_payload and not produced:
         raise RuntimeError(
             f"{product} returned no {field}. The suite *is* the files, so a summary "
@@ -957,8 +971,15 @@ class SDLCOrchestrator:
         and accessible names -- and `_compress` is documented to no-op on anything that does
         not read as prose, so running it would spend time to change nothing.
         """
+        # Documents and any generated brief arrive on `session`, resolved when the session
+        # opened so the suite is written against the same basis the session was allowed to
+        # start with. `_kb("qa", ...)` still runs for the shared QA standards that are not
+        # project material -- those are style, not specification, and belong in `context`.
+        session_basis = (session or {}).get("basis") or {}
         context = self._kb("qa", context, goal or requirement, project_name)
         result = self.app_explorer_agent.generate_suite(
+            documents=session_basis.get("documents", ""),
+            brief_markdown=session_basis.get("brief_markdown", ""),
             journeys_markdown=journeys_markdown,
             goal=goal,
             requirement=requirement,
@@ -1004,18 +1025,42 @@ class SDLCOrchestrator:
         # This is `attest.coverage_claim`'s rule aimed at a different noun, and it is
         # enforced in code rather than asked for in the prompt for the reason D-406 gives:
         # a claim the model makes about its own output is not evidence.
-        had_requirement = bool((requirement or "").strip())
+        # The honesty pass, and it is a *ceiling* rather than a correction. What the session
+        # actually had decides the strongest label any assertion in it may carry, and
+        # anything above that ceiling is pushed down to it -- enforced here rather than asked
+        # for in the prompt, because a model's claim about its own output is not evidence
+        # (D-406). What this cannot do is verify that a row labelled `derived` really traces
+        # to the case it names; it only stops a claim the session could not support at all.
+        session_basis = (session or {}).get("basis") or {}
+        had_stated = bool(session_basis.get("has_stated", bool((requirement or "").strip())))
+        had_derived = bool(session_basis.get("has_derived"))
+        had_requirement = had_stated
+
+        # Weakest sufficient label, and why it was not allowed to stand higher.
+        if had_stated:
+            ceiling, ceiling_reason = "stated", ""
+        elif had_derived:
+            ceiling, ceiling_reason = (
+                "derived",
+                "this session had generated scenarios or cases to cover, but nothing a "
+                "person wrote, so no assertion here can claim to check a stated requirement",
+            )
+        else:
+            ceiling, ceiling_reason = (
+                "observed",
+                "nothing was supplied to check this application against, so every assertion "
+                "here rests on what the application did during exploration",
+            )
+        rank = {"stated": 0, "derived": 1, "observed": 2}
         downgraded = 0
         for row in basis:
-            if str(row.get("basis") or "").strip() != "specified":
-                row["basis"] = "observed"
+            claimed = str(row.get("basis") or "").strip()
+            if claimed not in rank:
+                row["basis"] = "observed"   # an unrecognised word is not a claim we honour
                 continue
-            if not had_requirement:
-                row["basis"] = "observed"
-                row["downgraded_because"] = (
-                    "no requirement was supplied to this session, so nothing here can be "
-                    "checked against one"
-                )
+            if rank[claimed] < rank[ceiling]:
+                row["basis"] = ceiling
+                row["downgraded_because"] = ceiling_reason
                 downgraded += 1
         if not had_requirement:
             # A coverage row with no requirement behind it is D-316's shape again: a model
@@ -1054,11 +1099,33 @@ class SDLCOrchestrator:
 
         # The split a reader has to see before trusting any of it. Counted here rather than
         # taken from the model, for the same reason `total_tests` is.
-        specified = [r for r in basis if str(r.get("basis") or "") == "specified"]
-        result["specified_count"] = len(specified)
-        result["observed_count"] = len(basis) - len(specified)
+        stated = [r for r in basis if str(r.get("basis") or "") == "stated"]
+        derived = [r for r in basis if str(r.get("basis") or "") == "derived"]
+        result["stated_count"] = len(stated)
+        result["derived_count"] = len(derived)
+        result["observed_count"] = len(basis) - len(stated) - len(derived)
+        result["strongest_basis"] = ceiling
+        # Kept under its old name as well. The renderer, the smoke checks and the eval all
+        # read `specified_count`, and a count that silently becomes zero because a word
+        # changed reads as a collapse in quality rather than as a rename.
+        result["specified_count"] = len(stated)
         result["assertion_basis_missing"] = max(0, len(test_names) - len(basis))
         result["had_requirement"] = had_requirement
+
+        # Whether this suite could see values at all, stated on the result rather than left
+        # to be inferred from its contents. A customer who turned page text off gets a suite
+        # of presence checks, which is a legitimate choice and an illegitimate surprise --
+        # and six months later, whoever inherits the suite has no other way to find out why
+        # it only ever checks that buttons exist.
+        read_page_text = bool((session or {}).get("collect_page_text", True))
+        result["read_page_text"] = read_page_text
+        if not read_page_text:
+            result["page_text_note"] = (
+                "This session did not read what the pages displayed, so every test here "
+                "checks that a control is present rather than that a value is correct. A "
+                "test of that kind passes even when the feature behind the control is "
+                "broken. Re-run with page text enabled for assertions about values."
+            )
 
         # Same claim, same words, same reason as the code-based product: nothing in this
         # pipeline runs what it produced (D-05), so a stored suite is "generated", never

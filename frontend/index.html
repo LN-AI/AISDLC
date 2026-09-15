@@ -694,17 +694,44 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
             <input type="text" id="app-testing-goal" oninput="renderAppTestingCommand()"
                    placeholder="e.g. Cover signing in, searching, and adding an item to the cart" />
           </div>
+          <div class="section-title">2. Say what the application is supposed to do</div>
+          <div class="field-hint" style="margin-bottom:10px">
+            <b>A session needs at least one of the three below, and this is why.</b> With
+            nothing to compare the application to, the tests can only record what it happens
+            to do today &mdash; they catch a later change and cannot catch a mistake that is
+            already there. Any one of these is enough; use more than one if you have it.</div>
+
           <div class="form-group">
-            <label for="app-testing-requirement">What the application is supposed to do (optional)</label>
+            <label for="app-testing-requirement">In your own words</label>
             <textarea id="app-testing-requirement" rows="4" oninput="renderAppTestingCommand()"
                       placeholder="e.g. A task may only be edited by the user who created it. Any other signed-in user attempting to edit it must be refused."></textarea>
-            <div class="field-hint"><b>This is the field that decides how much the suite is worth.</b>
-              Without it the explorer can only assert what the application already does, which
-              catches a change and cannot catch a mistake. With it, assertions can be checked
-              against something.</div>
+            <div class="field-hint">A sentence or two is enough. Tests that check it are
+              labelled <b>stated</b> &mdash; traced to something a person wrote.</div>
           </div>
 
-          <div class="section-title">2. Confirm where it is pointed</div>
+          <div class="form-group">
+            <label>Documents held for this project</label>
+            <div id="app-testing-docs" class="field-hint">Requirements and QA documents
+              uploaded against this project are read automatically &mdash; a specification,
+              acceptance criteria, a test policy. Add them under
+              <b>Knowledge Base</b>, filed as <b>Requirement Review</b> or
+              <b>QA / Test Standards</b>. Tests that check them are also
+              <b>stated</b>.</div>
+          </div>
+
+          <div class="form-group">
+            <label for="app-testing-sources">Cover an earlier Test Scenario or Test Case run
+              (optional)</label>
+            <select id="app-testing-sources" multiple size="4"
+                    onchange="renderAppTestingCommand()"></select>
+            <div class="field-hint">Only if those agents have already run for this system
+              &mdash; most sessions will not have them, and that is fine. A test case already
+              carries steps and expected results, so it is the closest thing to a plan for the
+              suite. Tests that check one are labelled <b>derived</b> rather than stated,
+              because this platform wrote that case rather than a person.</div>
+          </div>
+
+          <div class="section-title">3. Confirm where it is pointed</div>
           <div class="form-group">
             <label class="checkbox-label">
               <input type="checkbox" id="app-testing-attest" onchange="renderAppTestingCommand()" />
@@ -714,10 +741,37 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
               Controls whose labels suggest they destroy data, spend money, contact real people or
               end the session are withheld before the model ever sees them &mdash; but that is a
               filter on button labels, not a guarantee, so point it at an environment you can
-              afford to have changed. Your address and your password never leave your machine,
-              but a short digest of <em>what each page displays</em> is sent here and kept with
-              the session &mdash; it is what lets a test check a value rather than only that a
-              button exists. Seed the environment with data you would not mind us holding.</div>
+              afford to have changed.</div>
+          </div>
+
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="app-testing-page-text" checked
+                     onchange="renderAppTestingCommand()" />
+              Let it read what each page displays (recommended)
+            </label>
+            <div class="field-hint">Your address and your password never leave your machine
+              either way. This is about the rest: a short digest of the text each page shows
+              &mdash; a heading, a total, an error message.
+              <b>With it on</b>, a test can check that your total is <em>right</em>.
+              <b>With it off</b>, a test can only check that a control is <em>there</em>,
+              which passes just as happily when the feature behind it is broken. If the target
+              is a copy of live data, that digest will contain it, so this is a real choice
+              and not a formality &mdash; the finished suite states which of the two it was.</div>
+          </div>
+
+          <div class="form-group">
+            <label>Keep that digest for</label>
+            <select id="app-testing-retention" onchange="renderAppTestingCommand()">
+              <option value="0">No time at all &mdash; wipe it as soon as the tests are written</option>
+              <option value="7" selected>7 days (default)</option>
+              <option value="30">30 days</option>
+              <option value="90">90 days</option>
+            </select>
+            <div class="field-hint">Stored encrypted, and deleted automatically when the time
+              is up. Nothing needs it once the tests exist, so
+              <b>&ldquo;no time at all&rdquo; costs you nothing</b> except the ability to look
+              back later at why a particular test was written.</div>
           </div>
 
           <div class="form-row">
@@ -728,7 +782,7 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
             </div>
           </div>
 
-          <div class="section-title">3. See what it will cost</div>
+          <div class="section-title">4. See what it will cost</div>
           <div class="form-actions">
             <button class="btn btn-primary" onclick="previewAppTestingCost()">
               <span class="btn-icon">$</span> Estimate cost
@@ -739,7 +793,7 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
             price knowable in advance. Replaying the suite afterwards calls no model at all.</div>
           <div id="app-testing-cost-preview" class="hidden"></div>
 
-          <div class="section-title">4. Run it</div>
+          <div class="section-title">5. Run it</div>
           <div id="app-testing-command"></div>
         </div>
         <div class="run-history">

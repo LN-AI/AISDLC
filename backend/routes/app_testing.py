@@ -42,6 +42,7 @@ from backend import database, scope
 from backend.routes.v1_agents import _effective_llm_override, _orch, get_caller
 from backend.services import (
     action_policy,
+    app_basis,
     agent_guard,
     app_session,
     review_estimate,
@@ -114,6 +115,30 @@ class SessionRequest(BaseModel):
         app_session.DEFAULT_MAX_STEPS,
         description=f"Step budget. Clamped to {app_session.MAX_STEPS_CEILING}. Every step is "
                     f"a model call, so this is what makes a session's cost knowable.",
+    )
+    source_review_ids: List[str] = Field(
+        default_factory=list,
+        description="Optional. Finished Test Scenario or Test Case runs whose output this "
+                    "session should try to cover. Use it when those agents have already run "
+                    "for this system; most sessions will not have them, and that is fine — "
+                    "a typed requirement or project documents do the same job. What it "
+                    "changes is honesty: a test tracing to a generated case is labelled "
+                    "'derived', not 'stated', because the platform wrote that case.",
+    )
+    collect_page_text: bool = Field(
+        True,
+        description="Whether the explorer may send a digest of what each page displays. "
+                    "Leave it on unless the target holds data you would rather this service "
+                    "never saw: with it off, a test can check that a control is present and "
+                    "cannot check that a value is correct, because the value was never "
+                    "observed. The finished suite says which of the two it is.",
+    )
+    page_text_retention_days: int = Field(
+        app_session.DEFAULT_PAGE_TEXT_RETENTION_DAYS,
+        description="How long that digest is kept, encrypted, after the suite is written. "
+                    f"Clamped to {app_session.MAX_PAGE_TEXT_RETENTION_DAYS}. **0 wipes it "
+                    "the moment the suite exists**, which is the tightest setting that still "
+                    "produces tests about values.",
     )
     attested_test_env: bool = Field(
         False,
@@ -361,6 +386,20 @@ def open_session(req: SessionRequest, caller: dict = Depends(get_caller)):
         raise HTTPException(403, str(exc))
 
     project_id = _project_for(caller, req.project_id)
+
+    # What this session can check the application against, resolved before it opens. Three
+    # places it can come from and the session needs at least one: without any, the suite can
+    # only describe what it saw, which is the "green suite that proves nothing" this product
+    # most has to avoid. Resolved here rather than at generation time so the refusal costs an
+    # error message instead of a whole paid run.
+    basis = app_basis.collect(
+        requirement=req.requirement,
+        project_id=project_id,
+        source_review_ids=req.source_review_ids,
+        visible_project_ids=scope.visible_from_caller(caller),
+    )
+    basis["refusal"] = app_basis.NOTHING_TO_CHECK_AGAINST
+
     conn = database.get_connection()
     try:
         session = app_session.create(
@@ -372,6 +411,9 @@ def open_session(req: SessionRequest, caller: dict = Depends(get_caller)):
             max_steps=req.max_steps,
             attested_test_env=req.attested_test_env,
             created_by=(caller.get("username") or caller.get("key_name") or "api"),
+            collect_page_text=req.collect_page_text,
+            page_text_retention_days=req.page_text_retention_days,
+            basis=basis,
         )
     except SessionError as exc:
         raise HTTPException(400, str(exc))
@@ -418,7 +460,11 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
             raise HTTPException(400, str(exc))
 
         raw = [c.model_dump() for c in req.candidates]
-        texts = app_session.clip_texts(req.page_texts)
+        # Dropped here rather than trusted from the driver. A customer who turned this off
+        # is making a statement about what this service may hold, and a setting a client can
+        # defeat by sending the field anyway is not a setting.
+        texts = (app_session.clip_texts(req.page_texts)
+                 if session.get("collect_page_text", 1) else [])
         allowed, refused = action_policy.screen(raw)
         signature = action_policy.page_signature(req.url_path, raw, texts)
 
@@ -589,7 +635,17 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
                 llm_override=override,
                 session={"session_id": session_id,
                          "steps": len(recorded),
-                         "target_label": session.get("target_label", "")},
+                         "target_label": session.get("target_label", ""),
+                         "collect_page_text": bool(session.get("collect_page_text", 1)),
+                         # Re-resolved from what the session recorded, rather than carried in
+                         # memory: a session is a conversation spread over minutes and the
+                         # process that generates may not be the one that opened it.
+                         "basis": app_basis.collect(
+                             requirement=session.get("requirement", ""),
+                             project_id=session.get("project_id"),
+                             source_review_ids=app_session.source_review_ids(session),
+                             visible_project_ids=scope.visible_from_caller(caller),
+                         )},
             ),
         )
     except BudgetExceededError as exc:
@@ -604,6 +660,10 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
     conn = database.get_connection()
     try:
         app_session.attach_review(conn, session_id, result.get("review_id"))
+        # The digest has now done its work, so the clock starts here rather than at `finish`
+        # -- and at a retention of 0 this is where it is wiped, which is the whole point of
+        # that setting being 0 rather than "off".
+        app_session.start_page_text_retention(conn, session_id)
         public = app_session.public(conn, session_id)
     finally:
         conn.close()
@@ -617,6 +677,12 @@ def read_session(session_id: str, caller: dict = Depends(get_caller)):
     _visible_session(session_id, caller)
     conn = database.get_connection()
     try:
+        # Swept on the read path as well as at startup, for the reason the header of
+        # `notify.py` gives about this deployment having no scheduler: a process that has
+        # been up for three weeks would otherwise still be holding digests it promised to
+        # delete after seven days. This is the read that depends on them, so this is where
+        # it belongs.
+        app_session.sweep_expired_page_text(conn)
         return {
             "session": app_session.public(conn, session_id),
             "steps": app_session.steps(conn, session_id),

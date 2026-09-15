@@ -99,6 +99,7 @@ from backend.services import job_service
 from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
+from backend.services import app_session
 from backend.services import code_brief
 from backend.services import test_context_brief
 from backend.services import code_delivery
@@ -155,9 +156,17 @@ async def lifespan(app: FastAPI):
     try:
         lapsed = database.lapse_expired_waivers()
         swept = review_source_store.sweep_expired()
-        if lapsed or swept:
-            logger.info("Housekeeping: %d risk acceptance(s) lapsed, %d source(s) expired",
-                        lapsed, swept)
+        # The same rule for the page-text digest an app-testing session collects: it is the
+        # customer's own page content, kept encrypted only until its window passes, and a
+        # retention promise that depends on a restart is not one.
+        conn = database.get_connection()
+        try:
+            cleared = app_session.sweep_expired_page_text(conn)
+        finally:
+            conn.close()
+        if lapsed or swept or cleared:
+            logger.info("Housekeeping: %d risk acceptance(s) lapsed, %d source(s) expired, "
+                        "%d page-text digest(s) cleared", lapsed, swept, cleared)
     except Exception:
         # Never allowed to stop the app coming up. A missed sweep is a stale row; a failed
         # startup is an outage.

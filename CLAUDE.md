@@ -192,6 +192,19 @@ requirement supplied a suite can only describe what the application already does
 `specified` claim made without one is downgraded to `observed` in code and the count is
 reported.
 
+**A session will not start without something to check the application against** (D-419):
+a typed requirement, a Requirements or QA document on the project, or a finished Test
+Scenario / Test Case run to cover — any one, and the third is optional and usually absent.
+`services/app_basis.py` resolves it and `app_session.create` refuses beside the attestation.
+Without this the product writes furniture tests: a live session opened with nothing supplied
+produced eleven tests of which nine were "the button is visible". The same module decides
+what a finished test may *claim* — `stated` for something a person wrote, `derived` for a
+case this platform generated, `observed` for nothing (D-420) — applied as a ceiling in code,
+because a machine-written case laundered into "we verified your requirement" is D-406 at one
+remove. **What a page displays is encrypted, expires and can be refused** (D-418): the
+`review_source_store` treatment, with 0 days meaning "wipe it when the suite is written", and
+the consequence of refusing it stated on the screen *and* on the finished suite.
+
 **And an observation is what a page offers *and* what it says, in both cases read off the
 DOM rather than inferred.** Three parts of `COLLECT_JS`/`TEXTS_JS` in `scripts/explore_app.py`
 each exist because of a specific failure, so none of them is decoration. A page's landmark
@@ -227,11 +240,16 @@ page that is wrong. Still a count and not a percentage (C-95), and note what non
 measures: all three are ordinary semantic HTML, so the collector work in D-414 has the
 fixture and a live run as its only evidence (C-97).
 
-**The measured baseline is 9 of 9, and how it got there matters more than the number.**
-2026-09-15, PROMPT_VERSION 2026-09-15.2, three cases x three runs: `discriminates` 9/9,
-`detects_break` 9/9, `ran` 9/9, **no test failed on the working application in any run**, at
-**$0.128 a session**. Floors are 0.66 on all three measures for all three cases — one run
-below the measurement, per D-403.
+**The measured baseline is 8 of 9, and how it got there matters more than the number.**
+2026-09-15, PROMPT_VERSION 2026-09-15.3, three cases x three runs: `discriminates` **8/9** at
+**$0.144 a session**, with **no test failing on the working application in any session that
+produced one**. The miss is not a weak suite but *no* suite — a generation returning a
+confident summary and an empty `test_files` (D-421), measured before the retry that now
+recovers it. **The denominator is every session attempted**, deliberately: counting only the
+sessions that produced something reports 8 of 8, which is the scoreboard committing the
+flattering-number error the eval exists to catch. Floors are 0.66 on all three measures for
+all three cases — one session below a measured 3/3, and exactly on `signup-wizard`'s 2/3 so
+that a failure of the retry to take is caught.
 
 The first baseline that morning was **33%**, and the gap is the work rather than a prompt
 tidy-up. Each defect between the two was found by a run and none was visible offline: a

@@ -35,7 +35,9 @@ import json
 import logging
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+from backend.services import crypto_service
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,18 @@ MAX_JOURNEY_CHARS = 120
 # cost control on it, so keep them small.
 MAX_PAGE_TEXTS = 18
 MAX_PAGE_TEXT_CHARS = 160
+
+# How long a session's page-text digest is kept, in days. Seven matches
+# `review_source_store`'s default for customer source, which is the nearest thing to it
+# already in the platform: both are the customer's own content, held only because a later
+# step needs it.
+#
+# **Zero is a real setting, not a disabled one.** It means "wipe it the moment the suite is
+# written", which is honest because after that moment nothing needs it -- the tests exist and
+# the text that produced them does not have to. It is the tightest position a customer can
+# take while still getting assertions about values.
+DEFAULT_PAGE_TEXT_RETENTION_DAYS = 7
+MAX_PAGE_TEXT_RETENTION_DAYS = 90
 
 
 class SessionError(Exception):
@@ -108,6 +122,20 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             -- start without it, and it is the protection the denylist is only a backstop to.
             attested_test_env  INTEGER DEFAULT 0,
             refused_total      INTEGER DEFAULT 0,
+            -- Whether this session may read what pages *say*, and for how long that is
+            -- kept. Off is a supported choice and not a degraded mode to be hidden: it
+            -- produces a suite that can check a control exists and not that a value is
+            -- right, and the result says so rather than leaving the reader to wonder.
+            collect_page_text  INTEGER DEFAULT 1,
+            page_text_retention_days INTEGER DEFAULT 7,
+            page_text_expires_at TEXT DEFAULT NULL,
+            -- What this session may check the application against, resolved when it opened
+            -- and kept so the suite is written against the same basis the session started
+            -- with. A JSON list of review ids, plus the two flags that decide what an
+            -- assertion may claim: something a person wrote, or something we generated.
+            source_review_ids  TEXT DEFAULT '',
+            has_stated_basis   INTEGER DEFAULT 0,
+            has_derived_basis  INTEGER DEFAULT 0,
             started_at         TEXT NOT NULL,
             finished_at        TEXT DEFAULT NULL,
             last_error         TEXT DEFAULT '',
@@ -149,7 +177,13 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
     # the DDL above is missing on every database created before it. Same pattern and same
     # reason as `database.init_db`'s ALTERs.
     for _col, _type in (("refused_total", "INTEGER DEFAULT 0"),
-                        ("stop_reason", "TEXT DEFAULT ''")):
+                        ("stop_reason", "TEXT DEFAULT ''"),
+                        ("collect_page_text", "INTEGER DEFAULT 1"),
+                        ("page_text_retention_days", "INTEGER DEFAULT 7"),
+                        ("page_text_expires_at", "TEXT DEFAULT NULL"),
+                        ("source_review_ids", "TEXT DEFAULT ''"),
+                        ("has_stated_basis", "INTEGER DEFAULT 0"),
+                        ("has_derived_basis", "INTEGER DEFAULT 0")):
         try:
             cursor.execute(f"ALTER TABLE app_sessions ADD COLUMN {_col} {_type}")
         except sqlite3.OperationalError:
@@ -177,7 +211,8 @@ def normalise_max_steps(value) -> int:
 
 
 def create(conn, *, project_id, target_label, goal, requirement, max_steps,
-           attested_test_env, created_by=""):
+           attested_test_env, created_by="", collect_page_text=True,
+           page_text_retention_days=DEFAULT_PAGE_TEXT_RETENTION_DAYS, basis=None):
     """Open a session. Refuses without the attestation, before anything else is checked.
 
     The attestation is first deliberately. Everything below it is bookkeeping; this is the
@@ -190,6 +225,13 @@ def create(conn, *, project_id, target_label, goal, requirement, max_steps,
             "real actions in it. Confirm the target is a test environment -- not production "
             "-- before starting one."
         )
+    # Second, and refused at the door for the same reason the attestation is: a session with
+    # nothing to check against can only describe what it saw, and the cost of finding that
+    # out is a whole paid run plus a suite somebody has to be talked out of trusting.
+    basis = basis or {}
+    if not basis.get("has_any", True):
+        raise SessionError(basis.get("refusal") or "This session has nothing to check "
+                                                   "the application against.")
     session_id = str(uuid.uuid4())
     row = {
         "id": session_id,
@@ -200,17 +242,27 @@ def create(conn, *, project_id, target_label, goal, requirement, max_steps,
         "max_steps": normalise_max_steps(max_steps),
         "status": "exploring",
         "attested_test_env": 1,
+        "collect_page_text": 1 if collect_page_text else 0,
+        "page_text_retention_days": normalise_retention(page_text_retention_days),
+        "source_review_ids": json.dumps(
+            [str(r.get("review_id")) for r in (basis.get("source_reviews") or [])]),
+        "has_stated_basis": 1 if basis.get("has_stated") else 0,
+        "has_derived_basis": 1 if basis.get("has_derived") else 0,
         "started_at": _now(),
         "created_by": str(created_by or "")[:MAX_LABEL_CHARS],
     }
     conn.execute(
         """INSERT INTO app_sessions
                (id, project_id, target_label, goal, requirement, max_steps, steps_used,
-                status, attested_test_env, refused_total, started_at, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?)""",
+                status, attested_test_env, refused_total, collect_page_text,
+                page_text_retention_days, source_review_ids, has_stated_basis,
+                has_derived_basis, started_at, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
         (row["id"], row["project_id"], row["target_label"], row["goal"], row["requirement"],
-         row["max_steps"], row["status"], row["attested_test_env"], row["started_at"],
-         row["created_by"]),
+         row["max_steps"], row["status"], row["attested_test_env"],
+         row["collect_page_text"], row["page_text_retention_days"],
+         row["source_review_ids"], row["has_stated_basis"], row["has_derived_basis"],
+         row["started_at"], row["created_by"]),
     )
     conn.commit()
     return get(conn, session_id)
@@ -274,6 +326,55 @@ def stalled(conn, session_id, signature, limit=NO_PROGRESS_LIMIT):
     return all(sig == signature for sig in recent)
 
 
+def normalise_retention(value) -> int:
+    """Clamp a retention window rather than refuse it, the way `review_source_store` does.
+
+    Zero is kept, because zero is the point: it is the setting that says "wipe it as soon as
+    the suite exists", not a missing value to be replaced by a default.
+    """
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_PAGE_TEXT_RETENTION_DAYS
+    return max(0, min(days, MAX_PAGE_TEXT_RETENTION_DAYS))
+
+
+def _seal(texts) -> str:
+    """Encrypt a step's text digest for storage.
+
+    This is the customer's own page content, so it is held the way the platform holds every
+    other piece of customer content it must keep for a while: encrypted at rest with
+    `crypto_service`, exactly as `review_source_store` holds source. An empty digest is
+    stored as an empty string rather than as ciphertext of `[]`, so "collected nothing" and
+    "collection was off" both read as empty without a key being needed to find that out.
+    """
+    rows = clip_texts(texts)
+    if not rows:
+        return ""
+    return crypto_service.encrypt(json.dumps(rows))
+
+
+def _unseal(blob) -> list:
+    """Decrypt a step's digest, tolerating a row written before this was encrypted.
+
+    A wiped row is an empty string and comes back as an empty list, which is the same answer
+    a caller gets for a session that never collected any -- deliberately, because after the
+    retention window the platform genuinely cannot tell you what the page said, and should
+    not pretend the distinction is still available.
+    """
+    text = str(blob or "")
+    if not text:
+        return []
+    try:
+        decoded = json.loads(crypto_service.decrypt(text))
+    except Exception:
+        try:
+            decoded = json.loads(text)   # written before this column was encrypted
+        except (ValueError, TypeError):
+            return []
+    return [str(t) for t in decoded] if isinstance(decoded, list) else []
+
+
 def clip_texts(texts):
     """A page's text digest, bounded on both axes before it is stored or prompted with.
 
@@ -310,7 +411,7 @@ def record_step(conn, session_id, *, step_index, journey, url_path, page_signatu
          str(journey or "")[:MAX_JOURNEY_CHARS], str(url_path or "")[:MAX_LABEL_CHARS],
          page_signature or "", json.dumps(action or {}), int(observation_chars or 0),
          int(candidates_offered or 0), int(candidates_refused or 0),
-         json.dumps(clip_texts(page_texts)),
+         _seal(page_texts),
          str(outcome or "")[:MAX_LABEL_CHARS], _now()),
     )
     conn.execute(
@@ -344,6 +445,90 @@ def attach_review(conn, session_id, review_id):
     conn.commit()
 
 
+def source_review_ids(session) -> list:
+    """The prior runs a session was opened against, decoded.
+
+    A row read straight from the table carries this as the JSON string it is stored as, and
+    only `public()` decodes it -- so a caller that reached for the raw row got a string,
+    iterated it character by character, and found no reviews at all while reporting no error.
+    One decoder, used by both.
+    """
+    raw = (session or {}).get("source_review_ids")
+    if isinstance(raw, list):
+        return [str(r) for r in raw]
+    try:
+        decoded = json.loads(raw or "[]")
+    except (ValueError, TypeError):
+        return []
+    return [str(r) for r in decoded] if isinstance(decoded, list) else []
+
+
+def wipe_page_text(conn, session_id) -> int:
+    """Forget what the pages said, keeping every other record of the session.
+
+    The same shape `review_source_store` uses for expired source: the inventory row survives
+    and only the content goes, so a person can still see that a session ran, how far it got
+    and what it refused, after the thing this deletes is gone.
+    """
+    cur = conn.execute(
+        "UPDATE app_steps SET page_texts = '' WHERE session_id = ? AND page_texts != ''",
+        (session_id,))
+    conn.execute("UPDATE app_sessions SET page_text_expires_at = NULL WHERE id = ?",
+                 (session_id,))
+    conn.commit()
+    return cur.rowcount or 0
+
+
+def start_page_text_retention(conn, session_id) -> None:
+    """Begin the clock once the suite exists -- or wipe now, if the window is zero.
+
+    Called from suite generation rather than from `finish`, because generation is the moment
+    the digest stops being needed: the tests are written and the text that produced them has
+    done its work. A session abandoned before generating is swept by its start time instead,
+    so walking away does not mean keeping it for ever.
+    """
+    session = get(conn, session_id)
+    if not session:
+        return
+    days = normalise_retention(session.get("page_text_retention_days"))
+    if days <= 0:
+        wipe_page_text(conn, session_id)
+        return
+    expires = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+    conn.execute("UPDATE app_sessions SET page_text_expires_at = ? WHERE id = ?",
+                 (expires, session_id))
+    conn.commit()
+
+
+def sweep_expired_page_text(conn) -> int:
+    """Wipe every digest whose window has passed. Returns how many sessions were cleared.
+
+    **There is no scheduler in this deployment**, so this runs at startup *and* on the read
+    path that depends on it, the way `review_source_store.sweep_expired` and
+    `lapse_expired_waivers` do. A retention promise that only holds while the process happens
+    to have been restarted is not a retention promise.
+
+    A session that was abandoned before generating has no expiry set, so it is swept on the
+    same window measured from when it started -- otherwise closing the browser half way
+    through would be a way of keeping the digest indefinitely.
+    """
+    now = datetime.now(timezone.utc)
+    stale = now.isoformat()
+    abandoned = (now - timedelta(days=MAX_PAGE_TEXT_RETENTION_DAYS)).isoformat()
+    rows = conn.execute(
+        "SELECT id FROM app_sessions WHERE "
+        "  (page_text_expires_at IS NOT NULL AND page_text_expires_at < ?) "
+        "  OR (page_text_expires_at IS NULL AND status != 'exploring' AND started_at < ?)",
+        (stale, abandoned)).fetchall()
+    cleared = 0
+    for row in rows:
+        if wipe_page_text(conn, row["id"]):
+            cleared += 1
+    if cleared:
+        logger.info("app-testing: cleared the page-text digest for %d session(s)", cleared)
+    return cleared
+
+
 def steps(conn, session_id, limit=MAX_STEPS_CEILING):
     """Every step of a session, in order, with its action decoded."""
     cur = conn.execute(
@@ -358,11 +543,7 @@ def steps(conn, session_id, limit=MAX_STEPS_CEILING):
         except (ValueError, TypeError):
             item["action"] = {}
         item.pop("action_json", None)
-        try:
-            decoded = json.loads(item.get("page_texts") or "[]")
-        except (ValueError, TypeError):
-            decoded = []
-        item["page_texts"] = [str(t) for t in decoded] if isinstance(decoded, list) else []
+        item["page_texts"] = _unseal(item.get("page_texts"))
         out.append(item)
     return out
 
@@ -406,6 +587,26 @@ def public(conn, session_id):
     row["steps_remaining"] = max(0, row["max_steps"] - row["steps_used"])
     row["attested_test_env"] = bool(row.get("attested_test_env"))
     row["has_requirement"] = bool((row.get("requirement") or "").strip())
+    row["has_stated_basis"] = bool(row.get("has_stated_basis"))
+    row["has_derived_basis"] = bool(row.get("has_derived_basis"))
+    row["strongest_basis"] = ("stated" if row["has_stated_basis"]
+                              else "derived" if row["has_derived_basis"] else "observed")
+    row["source_review_ids"] = source_review_ids(row)
+    row["collect_page_text"] = bool(row.get("collect_page_text", 1))
+    row["page_text_retention_days"] = normalise_retention(
+        row.get("page_text_retention_days"))
+    # Said in a sentence rather than left to be inferred from two flags, because this is the
+    # thing a reader most needs to know about a finished suite and the least likely to work
+    # out for themselves.
+    row["page_text_note"] = (
+        "This session did not read what pages displayed, so its tests can check that a "
+        "control is there and cannot check that a value is right."
+        if not row["collect_page_text"] else
+        ("What pages displayed was read and is wiped as soon as the suite is written."
+         if row["page_text_retention_days"] <= 0 else
+         "What pages displayed was read, is stored encrypted, and is deleted after "
+         f"{row['page_text_retention_days']} day(s).")
+    )
     # The requirement is echoed back because a screen shows it; the goal too. Neither is a
     # secret. There is no URL here because there is no URL in the table.
     return row

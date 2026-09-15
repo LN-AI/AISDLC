@@ -451,8 +451,14 @@ def login(base, user, password):
 # ── The loop ──────────────────────────────────────────────────────────────
 
 def explore(page, api, session_id, base_url, credentials_note, max_steps, shots_dir,
-            verbose=True):
-    """Observe, ask, screen, act -- until the platform says stop or the budget runs out."""
+            verbose=True, send_page_text=True):
+    """Observe, ask, screen, act -- until the platform says stop or the budget runs out.
+
+    `send_page_text=False` stops the page's own words leaving this machine at all. The
+    platform drops them too when the session was opened that way -- both sides, because a
+    setting only one side honours is a setting a bug can undo, and this one is a promise
+    about somebody's data rather than a preference.
+    """
     last_outcome = ""
     taken = 0
     refusals = 0
@@ -467,7 +473,7 @@ def explore(page, api, session_id, base_url, credentials_note, max_steps, shots_
             "url_path": path,
             "page_title": title,
             "candidates": candidate_payload(raw),
-            "page_texts": texts,
+            "page_texts": texts if send_page_text else [],
             "last_outcome": last_outcome,
             "credentials_note": credentials_note,
         }
@@ -732,6 +738,16 @@ def main():
     ap.add_argument("--shots", default="", help="Save a screenshot per step into this dir.")
     ap.add_argument("--video", default="", help="Record video into this dir.")
     ap.add_argument("--trace", default="", help="Write a Playwright trace zip to this path.")
+    ap.add_argument("--cover-review", action="append", default=[], metavar="REVIEW_ID",
+                    help="A finished Test Scenario or Test Case run whose output this "
+                         "session should cover. Repeatable. Optional -- a requirement or "
+                         "a project document does the same job.")
+    ap.add_argument("--no-page-text", action="store_true",
+                    help="Never send what pages display. The suite can then check that "
+                         "a control is present and cannot check that a value is right.")
+    ap.add_argument("--keep-page-text-days", type=int, default=7,
+                    help="How long the platform keeps that digest, encrypted, after the "
+                         "suite is written. 0 wipes it the moment the suite exists.")
     ap.add_argument("--no-generate", action="store_true",
                     help="Explore and stop, without writing a suite.")
     ap.add_argument("--dry-run", action="store_true",
@@ -805,6 +821,9 @@ def main():
         # The platform refuses a session without it.
         "attested_test_env": True,
         "project_id": args.project or None,
+        "source_review_ids": args.cover_review,
+        "collect_page_text": not args.no_page_text,
+        "page_text_retention_days": args.keep_page_text_days,
     })
     session_id = opened["session"]["id"]
     quote = opened.get("estimate") or {}
@@ -835,7 +854,8 @@ def main():
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
             taken, refusals = explore(page, api, session_id, args.url, credentials_note,
-                                      args.max_steps, args.shots)
+                                      args.max_steps, args.shots,
+                                      send_page_text=not args.no_page_text)
         except KeyboardInterrupt:
             print("\n  interrupted — the session is closed and what was walked is kept")
         except Exception as exc:

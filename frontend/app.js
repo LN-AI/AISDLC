@@ -629,6 +629,10 @@ function _runPageLoader(page) {
     // agent's output. Rebuilt per visit for the same reason the history list is: the run
     // it offers must belong to the project selected now, not the one selected last time.
     if (RUN_HANDOFFS[page]) renderRunHandoff(page);
+    // App testing offers the same handoff in a different shape — many runs, not one, because
+    // a session can cover several earlier case runs at once. Rebuilt per visit for the same
+    // reason: the runs offered must belong to the project selected now.
+    if (page === 'app-testing') loadAppTestingSources();
     // The mode select drives which fields exist, so the screen has to be put in
     // the selected mode on arrival as well as on change.
     if (page === 'architecture') onArchModeChange();
@@ -2805,14 +2809,52 @@ let _lastAppTesting = null;
 // browser runs where the application is reachable -- a developer machine, a CI runner, or a
 // box inside the customer's network -- and saying so plainly is better than a Run button
 // that works for public URLs and mystifies everyone behind a VPN.
+// Which earlier Test Scenario / Test Case runs this session should cover. Empty is the
+// normal case: those agents may never have run for this system, and a typed requirement or a
+// project document does the same job.
+function appTestingSources() {
+  const picker = document.getElementById('app-testing-sources');
+  if (!picker) return [];
+  return Array.from(picker.selectedOptions || []).map(o => o.value).filter(Boolean);
+}
+
+// Fills that picker from the project's own history. Only the two upstream QA products are
+// offered, because they are the only ones whose output is a brief — a code review is not a
+// statement about what the application should do, and the API refuses one.
+async function loadAppTestingSources() {
+  const picker = document.getElementById('app-testing-sources');
+  if (!picker) return;
+  try {
+    const res = await apiFetch('/api/reviews?limit=50');
+    const runs = ((res && res.reviews) || []).filter(
+      r => r.review_type === 'test_cases' || r.review_type === 'test_scenarios');
+    picker.innerHTML = runs.length
+      ? runs.map(r => `<option value="${esc(r.id)}">${
+          r.review_type === 'test_cases' ? 'Test cases' : 'Scenarios'} — ${
+          esc((r.input_summary || r.project_name || r.id).slice(0, 70))}</option>`).join('')
+      : '';
+    picker.parentElement.querySelector('.field-hint').style.opacity = runs.length ? '' : '0.7';
+  } catch (e) {
+    picker.innerHTML = '';
+  }
+}
+
 function appTestingCommand() {
   const url = (document.getElementById('app-testing-url') || {}).value || '<url>';
   const steps = (document.getElementById('app-testing-steps') || {}).value || '40';
   const goal = ((document.getElementById('app-testing-goal') || {}).value || '').trim();
   const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
+  const readsText = (document.getElementById('app-testing-page-text') || {}).checked;
+  const keepDays = (document.getElementById('app-testing-retention') || {}).value || '7';
   const parts = ['python scripts/explore_app.py', '--url ' + url, '--max-steps ' + steps];
   if (goal) parts.push('--goal "' + goal.replace(/"/g, '\\"').slice(0, 120) + '"');
   if (req) parts.push('--requirement-file requirement.txt');
+  // Both choices are written into the command rather than left to the driver's defaults, so
+  // what the person ticked on this screen is what the machine running the browser actually
+  // does. A privacy choice that lives only in the browser is not a choice.
+  if (!readsText) parts.push('--no-page-text');
+  if (String(keepDays) !== '7') parts.push('--keep-page-text-days ' + keepDays);
+  appTestingSources().forEach(id => parts.push('--cover-review ' + id));
   parts.push('--shots out/');
   return parts.join(' ');
 }
@@ -2821,11 +2863,16 @@ function renderAppTestingCommand() {
   const box = document.getElementById('app-testing-command');
   if (!box) return;
   const attested = (document.getElementById('app-testing-attest') || {}).checked;
+  const readsText = (document.getElementById('app-testing-page-text') || {}).checked;
   box.innerHTML = attested
     ? `<div class="field-hint">Run this where the application is reachable. Your credentials and
          the URL stay on that machine — the platform is sent page descriptions and answers with
          one action at a time.</div>
-       <pre class="api-usage-code">${esc(appTestingCommand())}</pre>`
+       <pre class="api-usage-code">${esc(appTestingCommand())}</pre>
+       ${readsText ? '' : `<div class="cost-note" style="border-left:3px solid var(--amber)">
+         This session will not read what pages display, so its tests will be able to check that
+         a control is present and will not be able to check that a value is correct — a test
+         like that passes even when the feature behind the button is broken.</div>`}`
     : `<div class="cost-note" style="border-left:3px solid var(--amber)">
          Confirm the target is a test environment first. This explorer clicks, types and submits
          in a live system; controls that look destructive are withheld, but that is a filter on
@@ -2881,9 +2928,12 @@ async function previewAppTestingCost() {
           ${body.max_steps} exploration step(s) plus one to write the suite. A step that gets
           refused is not charged against the budget. Replaying the finished suite calls no
           model at all.</div>
-        ${hasReq ? '' : `<div class="field-hint" style="margin-top:6px;color:var(--amber)">
-          No requirement supplied &mdash; the suite will describe what the application does
-          rather than check what it should do.</div>`}
+        ${(hasReq || appTestingSources().length) ? '' :
+          `<div class="field-hint" style="margin-top:6px;color:var(--amber)">
+          Nothing supplied to check against yet. A session needs at least one of: a
+          requirement in your own words, a requirements or QA document uploaded against this
+          project, or an earlier Test Scenario / Test Case run to cover &mdash; otherwise the
+          suite can only describe what the application does today.</div>`}
       </div>`;
   } catch (e) {
     box.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--amber)">
@@ -2910,7 +2960,8 @@ function renderAppTesting(targetId, r) {
   const cov = Array.isArray(r.requirement_coverage) ? r.requirement_coverage : [];
   const assumptions = r.assumptions || [];
   const journeys = (r.session_detail || {}).journeys || [];
-  const specified = r.specified_count || 0;
+  const stated = r.stated_count || r.specified_count || 0;
+  const derived = r.derived_count || 0;
   const observed = r.observed_count || 0;
 
   wrap.innerHTML = `
@@ -2926,18 +2977,32 @@ function renderAppTesting(targetId, r) {
          which catches a regression and cannot catch a bug that was already there. Saying
          that once, at the top, is the difference between a useful regression suite and a
          false claim of verification. -->
-    ${r.had_requirement ? `
-    <div class="cost-note" style="border-left:3px solid var(--green);margin-bottom:12px">
-      <b>${specified} assertion(s) check your requirement, ${observed} record what the app does today.</b>
-      The first kind can catch behaviour that is wrong. The second catches changes to it.
+    ${(stated || derived) ? `
+    <div class="cost-note" style="border-left:3px solid var(--${stated ? 'green' : 'amber'});margin-bottom:12px">
+      <b>${stated} assertion(s) check something a person wrote${derived ?
+        `, ${derived} check a case this platform generated` : ''}, ${observed} record what the
+      app does today.</b>
+      ${derived && !stated ? `The middle kind is real material, but nobody has checked it
+        against what you actually wanted — this platform wrote those cases.` : ''}
+      The last kind catches a change to the behaviour, not a mistake in it.
+      ${r.assertions_downgraded ? `<div style="margin-top:6px">${r.assertions_downgraded}
+        assertion(s) claimed more than this session could support and were relabelled.</div>` : ''}
     </div>` : `
     <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
-      <b>No requirement was supplied, so all ${observed} assertion(s) describe what the application
-      did today.</b> This suite will catch a regression. It cannot catch behaviour that was already
-      wrong, because nothing told it what "right" is. Supply a requirement to change that.
+      <b>Nothing was supplied to check against, so all ${observed} assertion(s) describe what the
+      application did today.</b> This suite will catch a regression. It cannot catch behaviour that
+      was already wrong, because nothing told it what "right" is.
       ${r.assertions_downgraded ? `<div style="margin-top:6px">${r.assertions_downgraded}
         assertion(s) claimed to check a requirement and were relabelled — there was none to check.</div>` : ''}
     </div>`}
+
+    ${r.read_page_text === false ? `
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>This session did not read what the pages displayed.</b> Every test here checks that a
+      control is present rather than that a value is correct — and a test like that passes even
+      when the feature behind the control is broken. Re-run with page text enabled to get
+      assertions about values.
+    </div>` : ''}
 
     <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
       <b>Nothing here has been run.</b> These files were generated from what the explorer saw,
