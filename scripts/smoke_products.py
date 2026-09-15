@@ -172,16 +172,23 @@ def main_():
     check("every declared review_type is one the code really writes",
           declared <= written, f"orphaned: {sorted(declared - written)}")
 
-    # `swarm` and `modernization` are the two products whose own service owns dispatch:
-    # neither is a single orchestrator call a flat params dict could drive. Everything else
-    # must have an adapter, or it is entitleable and meterable but not runnable.
-    SERVICE_DISPATCHED = {"swarm", "modernization"}
+    # `swarm`, `modernization` and `app-testing` are the products whose own service owns
+    # dispatch: none is a single orchestrator call a flat params dict could drive.
+    # Everything else must have an adapter, or it is entitleable and meterable but not
+    # runnable.
+    #
+    # `app-testing` is the third for a different reason than the other two. It is not one
+    # long call -- it is a *conversation*: dozens of separate requests, minutes apart,
+    # driven by a browser on somebody else's machine, each one metered on its own. There is
+    # no single params dict that could express it, so `routes/app_testing.py` owns dispatch
+    # and the registry row carries the entitlement, the quota and the price basis.
+    SERVICE_DISPATCHED = {"swarm", "modernization", "app-testing"}
     every_invocable = all(p.invoke is not None
                           for p in registry.PRODUCTS if p.id not in SERVICE_DISPATCHED)
     check("every product except the service-dispatched ones has an invoke adapter",
           every_invocable,
           f"missing: {sorted(p.id for p in registry.PRODUCTS if p.invoke is None) }")
-    check("only swarm and modernization are service-dispatched",
+    check("only the three service-dispatched products have no adapter",
           {p.id for p in registry.PRODUCTS if p.invoke is None} == SERVICE_DISPATCHED)
 
     # ── 2. back-compat: an existing key keeps working ──────────────────────

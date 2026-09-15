@@ -2797,6 +2797,224 @@ function renderTestAutomation(targetId, r) {
   `;
 }
 
+// ── Application testing ───────────────────────────────────────────────────
+
+let _lastAppTesting = null;
+
+// Builds the command that actually explores, because this screen cannot do it itself. The
+// browser runs where the application is reachable -- a developer machine, a CI runner, or a
+// box inside the customer's network -- and saying so plainly is better than a Run button
+// that works for public URLs and mystifies everyone behind a VPN.
+function appTestingCommand() {
+  const url = (document.getElementById('app-testing-url') || {}).value || '<url>';
+  const steps = (document.getElementById('app-testing-steps') || {}).value || '40';
+  const goal = ((document.getElementById('app-testing-goal') || {}).value || '').trim();
+  const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
+  const parts = ['python scripts/explore_app.py', '--url ' + url, '--max-steps ' + steps];
+  if (goal) parts.push('--goal "' + goal.replace(/"/g, '\\"').slice(0, 120) + '"');
+  if (req) parts.push('--requirement-file requirement.txt');
+  parts.push('--shots out/');
+  return parts.join(' ');
+}
+
+function renderAppTestingCommand() {
+  const box = document.getElementById('app-testing-command');
+  if (!box) return;
+  const attested = (document.getElementById('app-testing-attest') || {}).checked;
+  box.innerHTML = attested
+    ? `<div class="field-hint">Run this where the application is reachable. Your credentials and
+         the URL stay on that machine — the platform is sent page descriptions and answers with
+         one action at a time.</div>
+       <pre class="api-usage-code">${esc(appTestingCommand())}</pre>`
+    : `<div class="cost-note" style="border-left:3px solid var(--amber)">
+         Confirm the target is a test environment first. This explorer clicks, types and submits
+         in a live system; controls that look destructive are withheld, but that is a filter on
+         button labels, not a guarantee.</div>`;
+}
+
+// One row per journey, which is the unit a person judges this product by: were these real
+// user flows, or noise? The count of distinct pages is there because a "journey" that never
+// left one page is usually the latter.
+function renderAppJourneys(journeys) {
+  if (!journeys || !journeys.length) return '';
+  return `
+    <div class="section-title" style="margin-top:20px">Journeys walked (${journeys.length})</div>
+    <table class="data-table">
+      <thead><tr><th>Journey</th><th>Steps</th><th>Pages</th><th>Actions</th></tr></thead>
+      <tbody>${journeys.map(j => `
+        <tr>
+          <td>${esc(j.name || '')}</td>
+          <td>${j.step_count || 0}</td>
+          <td>${j.distinct_pages || 0}${(j.distinct_pages || 0) <= 1 ? ' <span class="field-hint">(never left one page)</span>' : ''}</td>
+          <td style="font-family:monospace;font-size:11px">${(j.actions || []).map(esc).join(' → ')}</td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+// The free quote. There is deliberately no "Run" button beside it: this screen cannot drive
+// the browser, because the browser has to run where the application is reachable. Pretending
+// otherwise would produce a control that works for public URLs and silently fails for every
+// internal one, which is most of them.
+async function previewAppTestingCost() {
+  const box = document.getElementById('app-testing-cost-preview');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="field-hint">Pricing a session&hellip;</div>';
+  const body = {
+    max_steps: parseInt((document.getElementById('app-testing-steps') || {}).value || '40', 10),
+    goal: ((document.getElementById('app-testing-goal') || {}).value || ''),
+    requirement: ((document.getElementById('app-testing-requirement') || {}).value || ''),
+  };
+  try {
+    const res = await apiFetch('/api/v1/app-testing/preflight', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const q = (res && res.estimate) || {};
+    const hasReq = (body.requirement || '').trim().length > 0;
+    box.innerHTML = `
+      <div class="cost-note">
+        <div><b>About $${(q.expected_usd || 0).toFixed(4)}</b> expected, up to
+          <b>$${(q.ceiling_usd || 0).toFixed(4)}</b> if every call runs to its limit.</div>
+        <div class="field-hint" style="margin-top:6px">${esc(res.explanation || '')}</div>
+        <div class="field-hint" style="margin-top:6px">${q.calls || 0} call(s):
+          ${body.max_steps} exploration step(s) plus one to write the suite. A step that gets
+          refused is not charged against the budget. Replaying the finished suite calls no
+          model at all.</div>
+        ${hasReq ? '' : `<div class="field-hint" style="margin-top:6px;color:var(--amber)">
+          No requirement supplied &mdash; the suite will describe what the application does
+          rather than check what it should do.</div>`}
+      </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--amber)">
+      Could not price a session: ${esc((e && e.message) || String(e))}</div>`;
+  }
+  renderAppTestingCommand();
+}
+
+function renderAppTesting(targetId, r) {
+  _lastAppTesting = r;
+  _lastTestAutomation = r;   // the download helpers read this; the result shape is the same
+  // Fired after the innerHTML lands, since both write into divs this markup creates. The
+  // container ids are the test-automation ones on purpose: the suite this product writes has
+  // the same shape, so the same two loaders serve it with no branch in them, and only one
+  // agent screen is ever visible at a time.
+  if (r && r.review_id) setTimeout(() => {
+    loadTestResults(r.review_id);
+    loadTestRunner(r.review_id);
+  }, 0);
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const files = r.test_files || [];
+  const basis = Array.isArray(r.assertion_basis) ? r.assertion_basis : [];
+  const cov = Array.isArray(r.requirement_coverage) ? r.requirement_coverage : [];
+  const assumptions = r.assumptions || [];
+  const journeys = (r.session_detail || {}).journeys || [];
+  const specified = r.specified_count || 0;
+  const observed = r.observed_count || 0;
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Generated Application Suite</h2>
+      <span style="color:var(--text-muted);font-size:13px">${r.total_files || files.length} file(s) ·
+        ${r.total_tests || 0} test(s)${(r.session || {}).steps ? ' · ' + r.session.steps + ' step(s) explored' : ''}</span>
+    </div>
+    ${renderReviewTransparency(r)}
+
+    <!-- The single most important thing on this screen. A suite written from an application
+         with no specification asserts what the application did on the day it was explored,
+         which catches a regression and cannot catch a bug that was already there. Saying
+         that once, at the top, is the difference between a useful regression suite and a
+         false claim of verification. -->
+    ${r.had_requirement ? `
+    <div class="cost-note" style="border-left:3px solid var(--green);margin-bottom:12px">
+      <b>${specified} assertion(s) check your requirement, ${observed} record what the app does today.</b>
+      The first kind can catch behaviour that is wrong. The second catches changes to it.
+    </div>` : `
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>No requirement was supplied, so all ${observed} assertion(s) describe what the application
+      did today.</b> This suite will catch a regression. It cannot catch behaviour that was already
+      wrong, because nothing told it what "right" is. Supply a requirement to change that.
+      ${r.assertions_downgraded ? `<div style="margin-top:6px">${r.assertions_downgraded}
+        assertion(s) claimed to check a requirement and were relabelled — there was none to check.</div>` : ''}
+    </div>`}
+
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>Nothing here has been run.</b> These files were generated from what the explorer saw,
+      not executed. A generated test that passes is not evidence until someone runs it.
+    </div>
+    <div id="test-automation-results"></div>
+    <div id="test-automation-runner"></div>
+
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${renderAppJourneys(journeys)}
+
+    ${basis.length ? `
+    <div class="section-title" style="margin-top:20px">What each test actually checks (${basis.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">A row that can only say
+      "the page loaded" is telling you that test is worth nothing — which is worth knowing before
+      it goes into a pipeline.</p>
+    <table class="data-table">
+      <thead><tr><th>Test</th><th>Basis</th><th>Checks</th></tr></thead>
+      <tbody>${basis.map(b => `
+        <tr>
+          <td style="font-family:monospace;font-size:11px">${esc(b.test_name || '')}</td>
+          <td>${b.basis === 'specified'
+                ? '<span style="color:var(--green)">✓ Requirement</span>'
+                : '<span style="color:var(--text-muted)">Observed</span>'}
+              ${b.requirement_ref ? `<div class="field-hint">${esc(b.requirement_ref)}</div>` : ''}
+              ${b.downgraded_because ? `<div class="field-hint">relabelled: ${esc(b.downgraded_because)}</div>` : ''}</td>
+          <td>${esc(b.what_it_checks || '')}</td>
+        </tr>`).join('')}</tbody>
+    </table>` : ''}
+    ${r.assertion_basis_missing ? `
+    <p class="field-hint">${r.assertion_basis_missing} generated test(s) declared no basis at all.
+      Treat those as observed.</p>` : ''}
+
+    ${assumptions.length ? `
+    <div class="section-title" style="margin-top:20px">⚠ What it had to assume (${assumptions.length})</div>
+    ${assumptions.map(a => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(a.assumption || '')}</div>
+        <div class="antipattern-impact">If wrong: ${esc(a.risk_if_wrong || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${(r.prerequisites_present || []).length ? `
+    <div class="section-title" style="margin-top:20px">Before these can run</div>
+    <div class="compliance-chips">${r.prerequisites_present.map(p => `<span class="compliance-chip">${esc(p)}</span>`).join('')}</div>` : ''}
+
+    ${cov.length ? `
+    <div class="section-title" style="margin-top:20px">Requirement coverage</div>
+    <table class="data-table">
+      <thead><tr><th>Requirement</th><th>Tests</th><th>Status</th></tr></thead>
+      <tbody>${cov.map(c => `
+        <tr>
+          <td>${esc(c.requirement_ref || '')}</td>
+          <td style="font-family:monospace;font-size:11px">${(c.test_names || []).map(esc).join('<br>') || '—'}</td>
+          <td>${c.covered ? '<span style="color:var(--green)">✓ Covered</span>' : '<span style="color:var(--amber)">✗ Not covered</span>'}</td>
+        </tr>`).join('')}</tbody>
+    </table>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Test files (${files.length})</div>
+    ${files.map((f, i) => `
+      <details style="margin-bottom:10px" ${files.length === 1 ? 'open' : ''}>
+        <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">
+          ${esc(f.path || '')}
+          <span style="color:var(--text-muted);font-family:inherit;font-size:11px">
+            ${esc(f.framework || '')} · ${(f.test_names || []).length} test(s)</span>
+        </summary>
+        <div style="margin-top:8px">
+          <pre class="api-usage-code">${esc(f.content || '')}</pre>
+          <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px"
+                  onclick="downloadGeneratedTest(${i})">⬇ Download this file</button>
+        </div>
+      </details>`).join('')}
+
+    <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
+  `;
+}
+
 // ── Code Review ───────────────────────────────────────────────────────────
 
 
@@ -11380,6 +11598,12 @@ const AGENT_SCREENS = {
                   { product: 'test-automation',     reviewType: 'test_automation',
                     result: 'test-automation-result', render: renderTestAutomation,
                     noun: 'generations',            gated: false },
+  // `inventory: false` by omission, like test-automation: this product stores no source
+  // because it never reads any -- the application under test is the input, and the session
+  // record holds page paths and control names, not code.
+  'app-testing':  { product: 'app-testing',         reviewType: 'app_testing',
+                    result: 'app-testing-result',   render: renderAppTesting,
+                    noun: 'sessions',               gated: false },
   vapt:           { product: 'vapt',                reviewType: 'vapt',
                     result: 'vapt-result',          render: renderVAPTResult,
                     noun: 'assessments',            gated: true, inventory: true },

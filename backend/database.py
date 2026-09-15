@@ -799,6 +799,12 @@ def init_db():
     from backend.services.review_source_store import init_schema as _init_review_sources
     _init_review_sources(cursor)
 
+    # Exploration sessions for application-based testing. Two tables, same reasoning again:
+    # the DDL lives beside the code that queries it, and every table in this deployment
+    # still comes into existence in exactly one place.
+    from backend.services.app_session import init_schema as _init_app_sessions
+    _init_app_sessions(cursor)
+
     conn.commit()
     conn.close()
     logger.info("Database ready")

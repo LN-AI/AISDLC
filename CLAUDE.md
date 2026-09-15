@@ -72,7 +72,7 @@ python run.py
 
 ## Tests: smoke scripts, no framework
 
-There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. **`pytest` is now installed in `venv`, and that is not an invitation**: it is there because `eval_test_automation.py`'s Python case needs a runner to execute the suite the model wrote for it. Nothing in this repo is a pytest test, and writing one would be the wrong shape (D-09). Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
+There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. **`pytest` is now installed in `venv`, and that is not an invitation**: it is there because `eval_test_automation.py`'s Python case needs a runner to execute the suite the model wrote for it. Nothing in this repo is a pytest test, and writing one would be the wrong shape (D-09). Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These ten scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
 
 ```
 python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
@@ -84,6 +84,7 @@ python scripts/smoke_llm_providers.py   # admin LLM connections: key never retur
 python scripts/smoke_cli.py             # scripts/lmsdlc.py driven as a subprocess against a real server
 node   scripts/smoke_render.js          # frontend result rendering (DOM-stubbed, no deps)
 node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans screen product picker
+python scripts/smoke_app_testing.py     # app-testing: the action policy, step caps, assertion honesty
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
@@ -97,6 +98,11 @@ python scripts/eval_code_review.py                       # accuracy, 3 runs per 
 python scripts/eval_code_review.py --repeat 1            # cheaper; cannot measure variance
 python scripts/eval_test_automation.py                   # do the generated tests work (~$0.43)
 python scripts/eval_test_automation.py --repeat 1        # cheaper; cannot measure variance
+python scripts/eval_app_testing.py                       # explore an app, does the suite guard it
+python scripts/eval_app_testing.py --self-check          # free: proves the harness, calls no model
+python scripts/explore_app.py --url <app> --max-steps 40 # explore a running app, write a suite
+python scripts/explore_app.py --url <app> --dry-run      # ...what it would be offered, spends nothing
+python scripts/explore_app.py --fixture                  # offline: no server, no key, no model
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
 python scripts/verify_pr_review.py <pr-url> --dry-run    # ...the same, writing nothing
 python scripts/verify_pr_review.py <pr-url> --cleanup    # remove what it posted
@@ -165,6 +171,43 @@ token and writing `.github/workflows/` needs **"Workflows: Read and Write"** —
 from the Contents and Pull requests permissions everything else here uses, and a missing one
 looks like a missing repository, because GitHub answers 404 for anything a credential cannot
 see.
+
+**Application-based testing is the sibling product, and it inverts the intake.**
+`test_runner_plan.CANNOT_SUPPLY` names `running application` as a prerequisite the code-based
+generator cannot conjure; `app-testing` is the case where that is the *input* and there is no
+source at all. An explorer drives a real browser, the platform chooses one action per step,
+and a Playwright suite is written from the journeys walked. The result has the same shape as
+a code-generated suite on purpose — same renderer, same `plan_for`, same `deliver-tests`,
+same results contract — so nothing downstream has a branch for it.
+
+Three things to know before changing any of it. **The browser never runs here** (D-407): the
+platform is sent page descriptions and answers with one action, so it never learns the URL,
+never holds a credential, and an application behind a VPN works — which a hosted browser
+fleet could not do. **The model picks from a screened list and never writes a selector**
+(D-408): `services/action_policy.py` removes dangerous controls before the model sees them,
+re-checks its choice, and is imported by the driver so the same rule applies where the click
+lands; read that module before touching the denylist, because its first version allowed a
+button called *Cancel subscription*. **An assertion says what it rests on** (D-409): with no
+requirement supplied a suite can only describe what the application already does, so a
+`specified` claim made without one is downgraded to `observed` in code and the count is
+reported.
+
+`eval_app_testing.py` asks the same question `eval_test_automation.py` does, aimed at the
+narrower claim this product actually makes: explore the **working** application, then replay
+the suite against both it and a broken build — green on one, red on the other. Its
+`--self-check` runs a hand-written reference suite through the whole harness for free, so
+"the harness cannot separate these variants" is never discovered after paying for three
+sessions. Unlike the code-based corpus it is **not** dependency-free (a browser suite needs
+`@playwright/test`), and it is **one case** — a count, not a percentage (C-95).
+
+**The measured baseline is not flattering, and the number to quote is the low one.** Three
+runs on 2026-09-15: 8 steps and 3 journeys every time, 5-6 tests, every assertion checking
+behaviour rather than that a page loaded, $0.12 a session — but **`discriminates` 33%**,
+because in two runs of three one test also failed on the *working* application. The suite saw
+the regression every single time (`detects_break` 100%); it was not clean on the build it was
+written from. That is a bad-assertion problem, not an exploration one, and it is the first
+thing to fix before this product is worth selling. D-411 has the detail, and there is
+deliberately **no `discriminates` floor** until the number is worth gating on.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —
@@ -399,5 +442,11 @@ per-project credentials live in the `github_credentials` table (encrypted, manag
 see D-236. Optional: `GITHUB_TOKEN` (fine-grained PAT, "Pull requests: Read and Write" — needed for GitHub PR/Auto-Fix features; public repos/PRs/issues work without it. **Also "Contents: Read and Write"** if you use the modernization PR workflow, which pushes a converted tree to a branch rather than only commenting), `DATABASE_PATH` (default `sdlc_agent.db`), `CLAUDE_MODEL` (default `claude-sonnet-4-6`), `MAX_TOKENS`, `APP_ENV`, `SECRET_KEY` (JWT/crypto — must be changed for production). Also present in `backend/config.py` but not in `.env.example`: `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`/`JIRA_PROJECT` (optional Jira integration), `DEFAULT_ADMIN_PASSWORD` (defaults to a hardcoded value — flag this if touching real deployment config), `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` (optional — the only credential GitHub accepts for a **check run**, which is the only way a finding lands on a diff line; unset means the commit-status path, unchanged. `docs/github-app.md`, D-343), `INCREMENTAL_PR_REVIEW` (default **true** — a push to an open pull request reviews only the commits since the last review; see D-341 for the trade it makes and why the gate stays correct), `COST_OPTIMIZATION_ENABLED`, `MAX_AGENT_INPUT_CHARS`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `PUBLIC_BASE_URL` (only for the modernization build loop — the address a GitHub Actions runner posts diagnostics back to; it cannot be derived from the request behind a proxy).
 
 ## Windows-specific note
+
+`requirements-explorer.txt` holds Playwright and is **deliberately separate from**
+`requirements.txt`: `backend/` imports none of it, and installing a browser toolchain on
+the API host would be paying for a capability D-05 forbids that host from using. It covers
+`scripts/explore_app.py` and `scripts/ui_examine.py`, which had the same undeclared
+dependency long before the first of those existed.
 
 `requirements.txt` deliberately pins `litellm<1.92.0` — from 1.92.0 onward litellm ships a Rust extension with no prebuilt Windows wheel, which would otherwise require an MSVC toolchain to install. Don't bump this pin without checking Windows wheel availability. `headroom-ai` (cost optimization) also compiles a Rust extension; if it fails to install, cost-optimization compression fails open (no-ops) rather than breaking the app.

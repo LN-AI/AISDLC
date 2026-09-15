@@ -35,6 +35,7 @@ from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
 from backend.routes.findings import router as findings_router
 from backend.routes.notifications import router as notifications_router
+from backend.routes.app_testing import router as app_testing_router
 from backend.routes.github_credentials import router as github_credentials_router
 from backend.routes.github_webhook import router as github_webhook_router
 from backend.routes.modernization import (router as modernization_router,
@@ -324,6 +325,7 @@ app.include_router(inventory_router)
 app.include_router(v1_agents_router)
 app.include_router(findings_router)
 app.include_router(notifications_router)
+app.include_router(app_testing_router)
 app.include_router(github_credentials_router)
 app.include_router(github_webhook_router)
 app.include_router(modernization_router)

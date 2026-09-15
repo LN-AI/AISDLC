@@ -422,6 +422,27 @@ PRODUCTS: List[Product] = [
         }),
     ),
 
+    Product(
+        id="app-testing",
+        kind=AGENT,
+        title="Application Test Generation",
+        module="qa_intelligence",
+        description="Explores a running application in a real browser and writes a Playwright suite "
+                    "from the journeys it walked. Needs no source code — the application itself is the "
+                    "input. Every assertion declares whether it checks a supplied requirement or only "
+                    "what was observed. Nothing is executed here: the output is a suite to run.",
+        endpoint="POST /api/v1/app-testing/sessions",
+        # `running_app` is a source no other product takes, and that is the whole point:
+        # `test_runner_plan.CANNOT_SUPPLY` names "running application" as a prerequisite the
+        # code-based generator cannot fill, and here it is the thing the customer supplies.
+        sources=("running_app",),
+        review_type="app_testing",
+        # No `invoke`: dispatch is owned by `routes/app_testing.py`, because a session is a
+        # conversation across many requests rather than one call the generic adapter could
+        # make. Same exemption `swarm` takes, for the same structural reason.
+        invoke=None,
+    ),
+
     # ── Workflows (multi-agent / multi-stage composites) ───────────────────
     Product(
         # The ID stays `full` even though the title no longer says "Full": IDs are

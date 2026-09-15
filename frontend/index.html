@@ -110,6 +110,9 @@
             <li class="nav-item" data-page="test-automation" data-product="test-automation">
               <span class="nav-icon">⚙️</span> Test Automation Generation
             </li>
+            <li class="nav-item" data-page="app-testing" data-product="app-testing">
+              <span class="nav-icon">🧭</span> Application Test Generation
+            </li>
           </ul>
         </li>
 
@@ -653,6 +656,96 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
           <div id="test-automation-runs" class="run-history-scroll"></div>
         </div>
         <div id="test-automation-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Application Test Generation Page -->
+      <div id="page-app-testing" class="page">
+        <div class="page-header">
+          <h1>Application Test Generation</h1>
+          <p class="subtitle">Point it at a running application and it explores in a real browser,
+            then writes a Playwright suite from the journeys it walked. <b>No source code
+            required</b> &mdash; the application itself is the input, which is the one thing the
+            code-based generator cannot work without.</p>
+          <p class="subtitle">Exploration runs <b>where the application is reachable</b>: your
+            machine, a CI runner, or a box inside your network. The platform is never sent the URL
+            or your credentials &mdash; it receives descriptions of what is on screen and answers
+            with one action at a time. That is also why an internal application behind a VPN works
+            here at all.</p>
+        </div>
+        <div class="form-card">
+          <div class="section-title">1. What should it explore?</div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label for="app-testing-url">Application URL</label>
+              <input type="text" id="app-testing-url" placeholder="https://staging.example.com"
+                     oninput="renderAppTestingCommand()" />
+              <div class="field-hint">Used only to build the command below. It is not sent to the
+                platform and is not stored.</div>
+            </div>
+            <div class="form-group" style="max-width:150px">
+              <label for="app-testing-steps">Step budget</label>
+              <input type="number" id="app-testing-steps" value="40" min="1" max="200"
+                     oninput="renderAppTestingCommand()" />
+              <div class="field-hint">Each step is one model call.</div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="app-testing-goal">Goal (optional)</label>
+            <input type="text" id="app-testing-goal" oninput="renderAppTestingCommand()"
+                   placeholder="e.g. Cover signing in, searching, and adding an item to the cart" />
+          </div>
+          <div class="form-group">
+            <label for="app-testing-requirement">What the application is supposed to do (optional)</label>
+            <textarea id="app-testing-requirement" rows="4" oninput="renderAppTestingCommand()"
+                      placeholder="e.g. A task may only be edited by the user who created it. Any other signed-in user attempting to edit it must be refused."></textarea>
+            <div class="field-hint"><b>This is the field that decides how much the suite is worth.</b>
+              Without it the explorer can only assert what the application already does, which
+              catches a change and cannot catch a mistake. With it, assertions can be checked
+              against something.</div>
+          </div>
+
+          <div class="section-title">2. Confirm where it is pointed</div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="app-testing-attest" onchange="renderAppTestingCommand()" />
+              This is a test environment, not production.
+            </label>
+            <div class="field-hint">The explorer clicks, types and submits in a live system.
+              Controls whose labels suggest they destroy data, spend money, contact real people or
+              end the session are withheld before the model ever sees them &mdash; but that is a
+              filter on button labels, not a guarantee, so point it at an environment you can
+              afford to have changed.</div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project</label>
+              <input type="hidden" id="app-testing-project" class="project-bound" />
+              <div class="project-caption" data-for="app-testing-project"></div>
+            </div>
+          </div>
+
+          <div class="section-title">3. See what it will cost</div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="previewAppTestingCost()">
+              <span class="btn-icon">$</span> Estimate cost
+            </button>
+          </div>
+          <div class="field-hint">Free &mdash; no model is called. A session costs one small call
+            per step plus one larger call to write the suite, so the step budget is what makes the
+            price knowable in advance. Replaying the suite afterwards calls no model at all.</div>
+          <div id="app-testing-cost-preview" class="hidden"></div>
+
+          <div class="section-title">4. Run it</div>
+          <div id="app-testing-command"></div>
+        </div>
+        <div class="run-history">
+          <div class="section-title">Previous sessions</div>
+          <p class="subtitle" style="margin-top:-6px">Every suite this project has generated from a
+            running application, newest first. Opening one costs nothing and calls no model.</p>
+          <div id="app-testing-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="app-testing-result" class="result-area hidden"></div>
       </div>
 
       <!-- Code Review Page -->

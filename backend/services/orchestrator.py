@@ -23,6 +23,7 @@ from backend.agents.governance_intelligence.report_generator import ReportGenera
 from backend.agents.qa_intelligence.test_scenario_agent import TestScenarioAgent
 from backend.agents.qa_intelligence.test_case_agent import TestCaseAgent
 from backend.agents.qa_intelligence.test_automation_agent import TestAutomationAgent
+from backend.agents.qa_intelligence.app_explorer_agent import AppExplorerAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
 from backend.services import cost_optimization_service
@@ -125,6 +126,7 @@ class SDLCOrchestrator:
         self.test_scenario_agent = TestScenarioAgent()
         self.test_case_agent = TestCaseAgent()
         self.test_automation_agent = TestAutomationAgent()
+        self.app_explorer_agent = AppExplorerAgent()
         self.github = GitHubService()
 
     @staticmethod
@@ -910,6 +912,153 @@ class SDLCOrchestrator:
                 f"{requirement[:120]}{'...' if len(requirement) > 120 else ''}"
             ),
             input_content=requirement[:5000],
+            result=result,
+        )
+        result["review_id"] = review_id
+        return result
+
+    @_log_call
+    def generate_app_suite(
+        self,
+        journeys_markdown: str,
+        goal: str = "",
+        requirement: str = "",
+        target_label: str = "",
+        context: str = "",
+        project_name: str = "Unnamed Project",
+        llm_override: Optional[Dict[str, Any]] = None,
+        session: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """A Playwright suite written from journeys walked through a running application.
+
+        The sibling of `generate_test_automation`, and deliberately the same shape: one
+        call, the same result keys, the same degeneracy guard, the same `reviews` row. What
+        differs is the input (journeys, not source) and one extra honesty pass below.
+
+        Nothing here is compressed. `journeys_markdown` is computed output -- paths, roles
+        and accessible names -- and `_compress` is documented to no-op on anything that does
+        not read as prose, so running it would spend time to change nothing.
+        """
+        context = self._kb("qa", context, goal or requirement, project_name)
+        result = self.app_explorer_agent.generate_suite(
+            journeys_markdown=journeys_markdown,
+            goal=goal,
+            requirement=requirement,
+            target_label=target_label,
+            context=context,
+            llm_override=llm_override,
+        )
+
+        # Same defence and same reason as `generate_test_automation` (D-392): a schema is a
+        # request, not a guarantee, and a live run has already returned a list of strings
+        # where a list of objects belonged. Rows of the wrong shape are dropped rather than
+        # coerced, and the count of what was dropped is reported.
+        def _rows(value):
+            items = value if isinstance(value, list) else []
+            return [row for row in items if isinstance(row, dict)], sum(
+                1 for row in items if not isinstance(row, dict))
+
+        files, dropped_files = _rows(result.get("test_files"))
+        coverage, dropped_coverage = _rows(result.get("requirement_coverage"))
+        assumptions, dropped_assumptions = _rows(result.get("assumptions"))
+        not_automated, dropped_not_automated = _rows(result.get("not_automated"))
+        basis, dropped_basis = _rows(result.get("assertion_basis"))
+        malformed = (dropped_files + dropped_coverage + dropped_assumptions
+                     + dropped_not_automated + dropped_basis)
+        if malformed:
+            logger.warning(
+                "app-testing: discarded %d response row(s) that were not objects "
+                "(test_files=%d, requirement_coverage=%d, assumptions=%d, "
+                "not_automated=%d, assertion_basis=%d)",
+                malformed, dropped_files, dropped_coverage, dropped_assumptions,
+                dropped_not_automated, dropped_basis)
+            result["malformed_rows"] = malformed
+
+        # The honesty pass, and the reason this product can be sold without overclaiming.
+        #
+        # With no requirement supplied there is no specification, so a model can only assert
+        # what it watched the application do. Such a suite catches a regression and cannot
+        # catch behaviour that was already wrong, and calling it "verified against a
+        # requirement" would be a false claim the customer has no way to check. So a
+        # `specified` basis is *downgraded* here rather than trusted, and any requirement
+        # coverage claimed without a requirement to cover is dropped entirely.
+        #
+        # This is `attest.coverage_claim`'s rule aimed at a different noun, and it is
+        # enforced in code rather than asked for in the prompt for the reason D-406 gives:
+        # a claim the model makes about its own output is not evidence.
+        had_requirement = bool((requirement or "").strip())
+        downgraded = 0
+        for row in basis:
+            if str(row.get("basis") or "").strip() != "specified":
+                row["basis"] = "observed"
+                continue
+            if not had_requirement:
+                row["basis"] = "observed"
+                row["downgraded_because"] = (
+                    "no requirement was supplied to this session, so nothing here can be "
+                    "checked against one"
+                )
+                downgraded += 1
+        if not had_requirement:
+            # A coverage row with no requirement behind it is D-316's shape again: a model
+            # referring to something that was never given to it.
+            if coverage:
+                logger.warning(
+                    "app-testing: dropped %d requirement_coverage row(s) claimed without a "
+                    "requirement", len(coverage))
+            coverage = []
+        if downgraded:
+            result["assertions_downgraded"] = downgraded
+
+        result["test_files"] = files
+        result["requirement_coverage"] = coverage
+        result["assumptions"] = assumptions
+        result["not_automated"] = not_automated
+        result["assertion_basis"] = basis
+
+        # Reached after filtering, deliberately: a response whose every entry was the wrong
+        # shape lands here, which is right -- it is malformed rather than empty, and this is
+        # the error that says so.
+        _refuse_degenerate("Application suite generation", files, result, "test files",
+                           ", explore further before generating, or narrow the goal to one "
+                           "journey at a time")
+
+        test_names = [n for f in files for n in (f.get("test_names") or [])]
+        result["total_files"] = len(files)
+        result["total_tests"] = len(test_names)
+        result["levels_present"] = sorted({f.get("level") or "" for f in files} - {""})
+        result["prerequisites_present"] = sorted(
+            {p for f in files for p in (f.get("prerequisites") or []) if p and p != "none"}
+        )
+        result["uncovered_count"] = sum(1 for row in coverage if not row.get("covered"))
+        result["assumption_count"] = len(assumptions)
+        result["not_automated_count"] = len(not_automated)
+
+        # The split a reader has to see before trusting any of it. Counted here rather than
+        # taken from the model, for the same reason `total_tests` is.
+        specified = [r for r in basis if str(r.get("basis") or "") == "specified"]
+        result["specified_count"] = len(specified)
+        result["observed_count"] = len(basis) - len(specified)
+        result["assertion_basis_missing"] = max(0, len(test_names) - len(basis))
+        result["had_requirement"] = had_requirement
+
+        # Same claim, same words, same reason as the code-based product: nothing in this
+        # pipeline runs what it produced (D-05), so a stored suite is "generated", never
+        # "passing". The results contract is what changes this, once somebody replays it.
+        result["execution_status"] = "not_executed"
+        if session:
+            result["session"] = session
+
+        journey_count = len({(f.get("path") or "") for f in files})
+        review_id = database.save_review(
+            review_type="app_testing",
+            project_name=project_name,
+            input_summary=(
+                f"Application testing — {len(files)} file(s), {len(test_names)} test(s) "
+                f"from {journey_count} journey(s) on "
+                f"{target_label or 'an application'}"
+            ),
+            input_content=(journeys_markdown or "")[:5000],
             result=result,
         )
         result["review_id"] = review_id

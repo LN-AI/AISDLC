@@ -1,0 +1,569 @@
+"""The observation/action contract for application-based testing.
+
+D-62 established that *the results contract is the interface, not the producer* -- one JUnit
+endpoint, and the customer's CI, a local script and a future sandbox worker are three
+interchangeable things that fill it. This module applies the same move one level further
+out, to the exploring rather than the reporting:
+
+    **The observation/action contract is the interface, not the browser.**
+
+A caller sends what a page currently offers and receives one action to take. That is the
+whole protocol. Where the browser runs is then a deployment choice rather than an
+architecture: today it is `scripts/explore_app.py` on somebody's machine, tomorrow it could
+be a worker we operate for publicly reachable applications, and neither requires this file
+to change. It is also why nothing here touches D-05 -- no browser is launched on the API
+host, because no browser is launched by this process at all.
+
+Three consequences of that shape are worth stating, because they are the reasons to prefer
+it over hosting a browser fleet first:
+
+* **There is no SSRF surface.** This platform never fetches the customer's URL and never
+  learns it. A guard like `notify._refuse_private` is what a hosted runner would need; a
+  contract that never makes the request needs nothing.
+* **Credentials never arrive here.** The driver holds them because the driver opens the
+  connection. Nothing in this module accepts a password.
+* **An application behind a VPN works on day one**, because the browser is already inside
+  the network. A hosted fleet could never reach it.
+
+Metering is per step, not per session, which is the opposite of the rule for every other
+product on the `/api/v1` surface and is the same exception modernization makes
+(`modernization/runner.py:17-24`): a session is not one request. It is dozens, spread over
+minutes, that an operator may abandon halfway -- and a reservation held across all of them
+would bill for steps nobody took.
+"""
+import logging
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+
+from backend import database, scope
+from backend.routes.v1_agents import _effective_llm_override, _orch, get_caller
+from backend.services import (
+    action_policy,
+    agent_guard,
+    app_session,
+    review_estimate,
+)
+from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
+from backend.services.app_session import SessionError
+from backend.services.subject_service import subject_from_caller
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1/app-testing", tags=["Application testing"])
+
+PRODUCT = "app-testing"
+
+# Roughly what one step's prompt costs, in characters, for the free quote. A page's
+# accessibility tree is the bulk of it. Measured against nothing yet -- it is a quote, it is
+# labelled as one, and `eval_app_testing.py` is what will replace the guess with a number.
+ASSUMED_STEP_CHARS = 6_000
+
+
+# ── Request models ────────────────────────────────────────────────────────
+
+class Candidate(BaseModel):
+    """One thing the page offers, as the driver read it from the accessibility tree."""
+    role: str = Field("", description="The ARIA role Playwright reported, e.g. 'button'.")
+    name: str = Field("", description="The accessible name, e.g. 'Save changes'.")
+    value: str = Field("", description="Current value, for inputs. Never send a password.")
+    enabled: bool = Field(True, description="False for a disabled control.")
+
+
+class SessionRequest(BaseModel):
+    target_label: str = Field(
+        "",
+        description="A hostname, for telling sessions apart. Never send the full URL: this "
+                    "service does not need it and does not store it.",
+        examples=["staging.example.com"],
+    )
+    goal: str = Field(
+        "", description="What this session should try to cover, in a sentence.",
+        examples=["Cover signing in, searching, and adding an item to the cart."],
+    )
+    requirement: str = Field(
+        "",
+        description="Optional. The behaviour the application is supposed to have. Supplying "
+                    "it is the difference between tests that check a requirement and tests "
+                    "that agree with whatever the application does today.",
+    )
+    max_steps: int = Field(
+        app_session.DEFAULT_MAX_STEPS,
+        description=f"Step budget. Clamped to {app_session.MAX_STEPS_CEILING}. Every step is "
+                    f"a model call, so this is what makes a session's cost knowable.",
+    )
+    attested_test_env: bool = Field(
+        False,
+        description="Required. Confirms the target is a test environment, not production. "
+                    "This explorer takes real actions in a real system.",
+    )
+    project_id: Optional[str] = Field(None, description="Defaults to the caller's project.")
+    llm_connection_id: Optional[str] = None
+
+
+class StepRequest(BaseModel):
+    url_path: str = Field("/", description="Path only, never the full URL.")
+    page_title: str = Field("", description="The document title, for orientation.")
+    candidates: List[Candidate] = Field(
+        default_factory=list,
+        description="Everything interactive on the page. Send them all -- the dangerous ones "
+                    "are removed here, before the model sees them, and counted for the "
+                    "session record.",
+    )
+    last_outcome: str = Field("", description="What happened when the previous action ran.")
+    credentials_note: str = Field(
+        "",
+        description="How to sign in, e.g. a username and which field it goes in. Passed to "
+                    "the model for this step only and never stored.",
+    )
+    llm_connection_id: Optional[str] = None
+
+
+class FinishRequest(BaseModel):
+    stop_reason: str = Field("", description="Why the session ended.")
+    last_error: str = Field("", description="If it ended badly, what went wrong.")
+
+
+class GenerateRequest(BaseModel):
+    context: str = Field("", description="Anything else the suite writer should know.")
+    project_name: str = Field("", description="What to file the resulting run under.")
+    llm_connection_id: Optional[str] = None
+
+
+class PreflightRequest(BaseModel):
+    max_steps: int = Field(app_session.DEFAULT_MAX_STEPS)
+    requirement: str = Field("")
+    goal: str = Field("")
+    llm_connection_id: Optional[str] = None
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _project_for(caller: dict, requested: Optional[str]) -> Optional[str]:
+    """Which project a session may be filed under.
+
+    Same rule as `github_credentials._project_for`: a session drives a browser against
+    somebody's system, so it cannot be filed against a project the caller cannot already
+    see. 404 rather than 403, because naming a project that exists is itself a disclosure.
+    """
+    visible = scope.visible_from_caller(caller)
+    if requested:
+        if visible is not None and requested not in visible:
+            raise HTTPException(404, f"No project with id '{requested}'.")
+        return requested
+    try:
+        return subject_from_caller(caller).project_id
+    except Exception:
+        return None
+
+
+def _visible_session(session_id: str, caller: dict) -> dict:
+    """Fetch a session the caller may act on, or 404.
+
+    404 for "not yours" as well as "not found", deliberately: distinguishing them tells an
+    unauthorised caller that a given session id is real.
+    """
+    conn = database.get_connection()
+    try:
+        session = app_session.get(conn, session_id)
+    finally:
+        conn.close()
+    if not session:
+        raise HTTPException(404, f"No exploration session with id '{session_id}'.")
+    visible = scope.visible_from_caller(caller)
+    if visible is not None and session.get("project_id") not in visible:
+        raise HTTPException(404, f"No exploration session with id '{session_id}'.")
+    return session
+
+
+def _history(steps: List[dict], limit: int = 12) -> str:
+    """The last few steps, as one line each.
+
+    Capped rather than complete: the history is model input that grows with every step, so
+    an uncapped one makes step forty cost several times what step two cost, for context the
+    model mostly does not use. The journey names carry the structure that matters.
+    """
+    lines = []
+    for step in steps[-limit:]:
+        action = step.get("action") or {}
+        kind = action.get("action_kind", "?")
+        detail = action.get("target_name") or action.get("value") or ""
+        lines.append(
+            f"{step.get('step_index')}. [{step.get('journey', '')}] {kind} {detail} "
+            f"on {step.get('url_path', '')} -> {step.get('outcome', '') or 'ok'}"
+        )
+    return "\n".join(lines)
+
+
+def _journeys_markdown(steps: List[dict]) -> str:
+    """The session, rendered for the suite writer.
+
+    Grouped by journey rather than listed chronologically, because a journey is what becomes
+    a test file. Each step carries the role and accessible name it acted on, which is what
+    lets the suite be written in durable locators instead of invented ones.
+    """
+    grouped: dict = {}
+    order: List[str] = []
+    for step in steps:
+        name = step.get("journey") or "Unlabelled"
+        if name not in order:
+            order.append(name)
+            grouped[name] = []
+        grouped[name].append(step)
+
+    out = []
+    for name in order:
+        out.append(f"### Journey: {name}")
+        for step in grouped[name]:
+            action = step.get("action") or {}
+            bits = [f"- `{action.get('action_kind', '?')}`"]
+            if action.get("target_role") or action.get("target_name"):
+                bits.append(
+                    f"{action.get('target_role', '')} named "
+                    f"\"{action.get('target_name', '')}\""
+                )
+            if action.get("value"):
+                bits.append(f"with value `{action['value']}`")
+            bits.append(f"on `{step.get('url_path', '')}`")
+            if action.get("rationale"):
+                bits.append(f"— expected: {action['rationale']}")
+            if step.get("outcome"):
+                bits.append(f"— observed: {step['outcome']}")
+            out.append(" ".join(bits))
+        out.append("")
+    return "\n".join(out).strip()
+
+
+def _quote(max_steps: int, requirement: str, goal: str, model: str = "") -> dict:
+    """Price a whole session before it starts.
+
+    Two different calls with two different shapes, so the two quotes are summed with
+    `review_estimate.combine` -- the helper that exists because Apply Fixes bills a fix call
+    and a re-review call against different agents, and pricing both off one would quote a
+    prompt that is never sent. Here it is N small step calls plus one large generation.
+
+    The step cap is the only reason this is quotable at all. An unbounded exploration has no
+    ceiling, and a quote without a ceiling is not a quote.
+    """
+    steps = app_session.normalise_max_steps(max_steps)
+    step_quote = review_estimate.for_text(
+        "x" * ASSUMED_STEP_CHARS, agent="app-testing-step", model=model,
+        extra_calls=max(0, steps - 1),
+    )
+    suite_quote = review_estimate.for_text(
+        (requirement or "") + (goal or "") + "x" * 4_000, agent=PRODUCT, model=model,
+    )
+    combined = review_estimate.combine(step_quote, suite_quote)
+    combined["max_steps"] = steps
+    return combined
+
+
+# ── Routes ────────────────────────────────────────────────────────────────
+
+@router.post("/sessions", summary="Open an exploration session (free, no model call)")
+def open_session(req: SessionRequest, caller: dict = Depends(get_caller)):
+    """Start a session. Free: nothing is generated until the first step.
+
+    The attestation is checked in `app_session.create` before anything else, because it is
+    the one condition here that is about somebody else's data rather than about bookkeeping.
+    """
+    subject = subject_from_caller(caller)
+    try:
+        agent_guard.check_scope(subject, PRODUCT)
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    project_id = _project_for(caller, req.project_id)
+    conn = database.get_connection()
+    try:
+        session = app_session.create(
+            conn,
+            project_id=project_id,
+            target_label=req.target_label,
+            goal=req.goal,
+            requirement=req.requirement,
+            max_steps=req.max_steps,
+            attested_test_env=req.attested_test_env,
+            created_by=(caller.get("username") or caller.get("key_name") or "api"),
+        )
+    except SessionError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        conn.close()
+
+    return {
+        "session": app_session_public(session["id"]),
+        "policy": action_policy.describe_policy(),
+        "estimate": _quote(session["max_steps"], req.requirement, req.goal),
+        "note": (
+            "This service never receives the application's URL or its credentials. Send "
+            "page observations and it will answer with one action at a time."
+        ),
+    }
+
+
+def app_session_public(session_id: str) -> Optional[dict]:
+    conn = database.get_connection()
+    try:
+        return app_session.public(conn, session_id)
+    finally:
+        conn.close()
+
+
+@router.post("/sessions/{session_id}/step", summary="Send an observation, receive one action")
+def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_caller)):
+    """One decision, metered on its own.
+
+    The order here is the safety design and should not be rearranged: candidates are
+    screened *before* the model is called, the model chooses only from what survived, and
+    its choice is screened *again* on the way out. The driver then screens a third time
+    before touching the browser, because that is the copy running where the consequences
+    are.
+    """
+    _visible_session(session_id, caller)
+    override = _effective_llm_override(req, caller, PRODUCT)
+
+    conn = database.get_connection()
+    try:
+        try:
+            session = app_session.require_open(conn, session_id)
+        except SessionError as exc:
+            raise HTTPException(400, str(exc))
+
+        raw = [c.model_dump() for c in req.candidates]
+        allowed, refused = action_policy.screen(raw)
+        signature = action_policy.page_signature(req.url_path, raw)
+
+        # The cheap stopping rule, evaluated before spending anything: if the last several
+        # steps and this page are all the same signature, the session has stopped finding
+        # anything and another model call would buy nothing.
+        if app_session.stalled(conn, session_id, signature):
+            app_session.finish(
+                conn, session_id, status="finished",
+                stop_reason=f"no new page in {app_session.NO_PROGRESS_LIMIT} steps")
+            return {
+                "done": True,
+                "reason": (
+                    f"The last {app_session.NO_PROGRESS_LIMIT} steps reached no page this "
+                    f"session had not already seen, so exploring further would add nothing."
+                ),
+                "session": app_session.public(conn, session_id),
+            }
+
+        history = _history(app_session.steps(conn, session_id))
+        step_index = session["steps_used"] + 1
+        refused_note = "; ".join(
+            r.get("refused_because", "") for r in refused[:10] if r.get("refused_because")
+        )
+        observation_chars = min(
+            app_session.MAX_OBSERVATION_CHARS,
+            sum(len(str(c)) for c in raw),
+        )
+    finally:
+        conn.close()
+
+    try:
+        decision = agent_guard.guarded_call(
+            caller, PRODUCT, override,
+            lambda: _orch.app_explorer_agent.next_action(
+                goal=session.get("goal", ""),
+                url_path=req.url_path,
+                page_title=req.page_title,
+                candidates=allowed,
+                history=history,
+                requirement=session.get("requirement", ""),
+                refused_note=refused_note,
+                credentials_note=req.credentials_note,
+                llm_override=override,
+            ),
+        )
+    except BudgetExceededError as exc:
+        raise HTTPException(402, str(exc))
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    budget = decision.get("_budget_stats")
+
+    if decision.get("done"):
+        conn = database.get_connection()
+        try:
+            app_session.finish(conn, session_id, status="finished",
+                               stop_reason=(decision.get("done_reason") or "")[:200])
+            public = app_session.public(conn, session_id)
+        finally:
+            conn.close()
+        return {"done": True, "reason": decision.get("done_reason", ""),
+                "session": public, "_budget_stats": budget}
+
+    action = {
+        "action_kind": decision.get("action_kind"),
+        "candidate_index": decision.get("candidate_index"),
+        "value": decision.get("value", ""),
+        "journey": decision.get("journey", ""),
+        "rationale": decision.get("rationale", ""),
+    }
+    ok, reason = action_policy.permits(action, allowed)
+    if not ok:
+        # Refused rather than corrected. Picking a different element on the model's behalf
+        # is how an explorer ends up doing something nobody can account for afterwards; the
+        # driver is told to observe again and the step is not charged to the step budget.
+        logger.warning("app-testing: refused a chosen action (%s)", reason)
+        return {
+            "done": False, "refused": True, "reason": reason,
+            "retry": True, "_budget_stats": budget,
+        }
+
+    chosen = allowed[action["candidate_index"]] if isinstance(
+        action.get("candidate_index"), int) and action["action_kind"] not in ("back", "goto") \
+        else {}
+    action["target_role"] = chosen.get("role", "")
+    action["target_name"] = chosen.get("name", "")
+
+    conn = database.get_connection()
+    try:
+        app_session.record_step(
+            conn, session_id,
+            step_index=step_index,
+            journey=action["journey"],
+            url_path=req.url_path,
+            page_signature=signature,
+            action=action,
+            observation_chars=observation_chars,
+            candidates_offered=len(allowed),
+            candidates_refused=len(refused),
+            outcome=req.last_outcome,
+        )
+        public = app_session.public(conn, session_id)
+    finally:
+        conn.close()
+
+    return {
+        "done": False,
+        "action": action,
+        "withheld": len(refused),
+        "session": public,
+        "_budget_stats": budget,
+    }
+
+
+@router.post("/sessions/{session_id}/finish", summary="Close a session (free)")
+def finish_session(session_id: str, req: FinishRequest, caller: dict = Depends(get_caller)):
+    _visible_session(session_id, caller)
+    conn = database.get_connection()
+    try:
+        status = "failed" if req.last_error else "finished"
+        app_session.finish(conn, session_id, status=status,
+                           stop_reason=req.stop_reason, last_error=req.last_error)
+        return {"session": app_session.public(conn, session_id)}
+    finally:
+        conn.close()
+
+
+@router.post("/sessions/{session_id}/generate", summary="Write a Playwright suite from a session")
+def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends(get_caller)):
+    """The one large call, at the end. Produces an ordinary `reviews` row.
+
+    That row is what puts this product on a screen, through `deliver-tests` and into the
+    results contract with no special case anywhere -- the suite it holds has exactly the
+    shape the code-based generator produces, plus the assertion-basis labels.
+    """
+    session = _visible_session(session_id, caller)
+    override = _effective_llm_override(req, caller, PRODUCT)
+
+    conn = database.get_connection()
+    try:
+        recorded = app_session.steps(conn, session_id)
+    finally:
+        conn.close()
+
+    if not recorded:
+        raise HTTPException(
+            400,
+            "This session took no steps, so there is nothing to write a suite from. A suite "
+            "generated from an empty session would be invented rather than observed.",
+        )
+
+    try:
+        result = agent_guard.guarded_call(
+            caller, PRODUCT, override,
+            lambda: _orch.generate_app_suite(
+                journeys_markdown=_journeys_markdown(recorded),
+                goal=session.get("goal", ""),
+                requirement=session.get("requirement", ""),
+                target_label=session.get("target_label", ""),
+                context=req.context or "",
+                project_name=(req.project_name or session.get("target_label")
+                              or "Unnamed Project"),
+                llm_override=override,
+                session={"session_id": session_id,
+                         "steps": len(recorded),
+                         "target_label": session.get("target_label", "")},
+            ),
+        )
+    except BudgetExceededError as exc:
+        raise HTTPException(402, str(exc))
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+    except RuntimeError as exc:
+        # `_refuse_degenerate` raises this. A 400 rather than a 500: the run happened, the
+        # response was empty or malformed, and the caller can act on the sentence it carries.
+        raise HTTPException(400, str(exc))
+
+    conn = database.get_connection()
+    try:
+        app_session.attach_review(conn, session_id, result.get("review_id"))
+        public = app_session.public(conn, session_id)
+    finally:
+        conn.close()
+
+    result["session_detail"] = public
+    return result
+
+
+@router.get("/sessions/{session_id}", summary="A session's progress, journeys and refusals")
+def read_session(session_id: str, caller: dict = Depends(get_caller)):
+    _visible_session(session_id, caller)
+    conn = database.get_connection()
+    try:
+        return {
+            "session": app_session.public(conn, session_id),
+            "steps": app_session.steps(conn, session_id),
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/preflight", summary="What a session would cost (free, calls no model)")
+def preflight(req: PreflightRequest, caller: dict = Depends(get_caller)):
+    """Free, and entitlement-checked but not budget-enforced.
+
+    Same policy as every other preflight on this surface: refusing to *quote* a caller who
+    is near their cap tells them less than the quote itself would, and the quote is what
+    they need in order to decide.
+    """
+    subject = subject_from_caller(caller)
+    try:
+        agent_guard.check_scope(subject, PRODUCT)
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    quote = _quote(req.max_steps, req.requirement, req.goal)
+    headroom = review_estimate.budget_headroom(subject)
+    return {
+        "agent": PRODUCT,
+        "estimate": quote,
+        "budget": headroom,
+        "explanation": review_estimate.describe(quote),
+        "within_budget": (headroom is None
+                          or quote.get("expected_usd", 0) <= headroom),
+        "ceiling_within_budget": (headroom is None
+                                  or quote.get("ceiling_usd", 0) <= headroom),
+        "policy": action_policy.describe_policy(),
+        "max_steps": quote.get("max_steps"),
+        "note": (
+            "A session costs one small model call per step plus one large call to write the "
+            "suite. The step cap is what bounds it. Replaying the suite afterwards calls no "
+            "model at all."
+        ),
+    }

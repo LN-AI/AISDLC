@@ -64,6 +64,14 @@ MAX_OUTPUT_TOKENS = {
     # At the 8000 default the ceiling — the number a person approves the run against — would
     # be a quarter of what the call can actually emit.
     "test-automation": 32000,
+    # Same ceiling and same reason as the code-based generator: an entry in `test_files` is
+    # a whole test file, and at the 8000 default the quoted ceiling would be a quarter of
+    # what the call can actually emit.
+    "app-testing": 32000,
+    # A step decision is one small object — a verb, an index, a journey name and a sentence.
+    # It is quoted separately from the suite because a session is N of these plus one of the
+    # above, and pricing both off one number would misquote whichever it was not sized for.
+    "app-testing-step": 1500,
 }
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 
@@ -115,6 +123,19 @@ def _frame_tokens(agent: str) -> int:
             from backend.agents.security_intelligence.gxp_document_agent import (
                 GXP_DOCUMENT_TOOL_SCHEMA as schema,
                 SYSTEM_PROMPT as prompt,
+            )
+        elif agent == "app-testing":
+            from backend.agents.qa_intelligence.app_explorer_agent import (
+                APP_SUITE_TOOL_SCHEMA as schema,
+                APP_SUITE_SYSTEM_PROMPT as prompt,
+            )
+        elif agent == "app-testing-step":
+            # The step frame is much the smaller of the two and is paid once per step, so
+            # measuring it separately matters more here than anywhere else on this list: a
+            # forty-step session multiplies whatever error this makes by forty.
+            from backend.agents.qa_intelligence.app_explorer_agent import (
+                NEXT_ACTION_TOOL_SCHEMA as schema,
+                EXPLORER_SYSTEM_PROMPT as prompt,
             )
         else:
             from backend.agents.base_agent import CODE_REVIEW_TOOL_SCHEMA as schema

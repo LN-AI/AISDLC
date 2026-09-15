@@ -81,7 +81,7 @@ MAX_XML_CHARS = 5_000_000
 
 # Only a run that produced tests can receive results for them. Deny-by-default, the same
 # shape as `_DELIVERABLE_RUNS`, rather than inferring from the shape of `result`.
-ACCEPTS_RESULTS = ("test_automation",)
+ACCEPTS_RESULTS = ("test_automation", "app_testing")
 
 
 def normalise_status(value: Any) -> str:
