@@ -1740,6 +1740,16 @@ def main_():
             # The dispatcher runs on a thread. Rather than sleep, drain it here — the
             # thread and this call take the same code path and only one of them is
             # deterministic.
+            #
+            # `recover_sending()` first, because draining alone is *not* deterministic and
+            # this check flaked on roughly one run in three because of it: `save_review`
+            # kicks a daemon thread, `_claim` moves the row to `sending` with
+            # `WHERE status='pending'`, and if that thread wins the race the synchronous
+            # drain below finds nothing to do and the row is still `sending` when it is
+            # asserted on. Putting an in-flight row back to `pending` is exactly what
+            # `notify` itself does at startup for a row whose process died, so this is the
+            # module's own recovery path rather than a trick invented for the test.
+            _n20.recover_sending()
             _n20.dispatch_pending()
             _after = _deliveries(_rid20)
             check("the dispatcher marks it sent", _after and _after[0]["status"] == "sent",
