@@ -81,6 +81,35 @@ DEFAULT_MAX_OUTPUT_TOKENS = 8000
 # the moment that product has five recorded calls.
 FALLBACK_OUTPUT_TOKENS_PER_CALL = 3_000
 
+# Agents the history lookup cannot calibrate, because `get_output_calibration` is keyed on
+# **product id** and these two are not one product with one call shape.
+#
+# `app-testing` bills a session's N small step decisions and its one large suite generation
+# under a single product, so the median over that product's rows is the *step* median --
+# pricing the suite call off it would under-quote that call roughly thirty-fold.
+# `app-testing-step` is an agent key and not a product id at all, so the lookup can only ever
+# come back empty and the quote falls to a default sized for a findings list.
+#
+# This is a property of the product's shape, not a bug in the lookup: calibration by product
+# is sound exactly when one product makes one kind of call.
+CALIBRATION_BY_PRODUCT_IS_INVALID = ("app-testing", "app-testing-step")
+
+# Expected output per call, measured rather than assumed, for agents the history lookup
+# cannot serve. **Measured 2026-09-15** over live runs against three applications --
+# `evals/app_testing`'s two demo apps and this platform's own interface:
+#
+#   choose_next_action     n=45   output median 147, p90 168, max 254
+#   submit_app_test_suite  n=5    output median 5,429, p90 6,018, max 6,349
+#
+# The numbers below sit above p90 rather than at the median, because a forecast that lands
+# under actual is the one direction that matters in a quote. Re-measure them when the prompts
+# change; they are a measurement with a date on it, not a constant.
+MEASURED_OUTPUT_TOKENS_PER_CALL = {
+    "app-testing-step": 250,
+    "app-testing": 6_500,
+}
+MEASURED_OUTPUT_SAMPLE = {"app-testing-step": 45, "app-testing": 5}
+
 # Findings-per-chunk is what actually drives output length, and it is the number a reader
 # will ask about. Recorded here so the quote can explain itself rather than only assert.
 ASSUMED_FINDINGS_PER_CHUNK = 10
@@ -152,20 +181,35 @@ def _frame_tokens(agent: str) -> int:
 
 
 def _expected_output(agent: str) -> Dict[str, Any]:
-    """Expected output tokens per call, and where the number came from."""
-    try:
-        from backend import database
-        calibration = database.get_output_calibration(agent)
-    except Exception:
-        logger.exception("Output calibration lookup failed for %s — using the default", agent)
-        calibration = None
+    """Expected output tokens per call, and where the number came from.
 
-    if calibration:
+    Three sources, in descending order of how much they know about *this* deployment: the
+    caller's own history, a measurement taken off the corpus for agents whose history cannot
+    be read, and a default sized by judgement.
+    """
+    if agent not in CALIBRATION_BY_PRODUCT_IS_INVALID:
+        try:
+            from backend import database
+            calibration = database.get_output_calibration(agent)
+        except Exception:
+            logger.exception("Output calibration lookup failed for %s — using the default",
+                             agent)
+            calibration = None
+        if calibration:
+            return {
+                "tokens": calibration["median_output_tokens_per_call"],
+                "basis": "measured",
+                "sample_size": calibration["sample_size"],
+            }
+
+    measured = MEASURED_OUTPUT_TOKENS_PER_CALL.get(agent)
+    if measured:
         return {
-            "tokens": calibration["median_output_tokens_per_call"],
+            "tokens": measured,
             "basis": "measured",
-            "sample_size": calibration["sample_size"],
+            "sample_size": MEASURED_OUTPUT_SAMPLE.get(agent, 0),
         }
+
     return {
         "tokens": FALLBACK_OUTPUT_TOKENS_PER_CALL,
         "basis": "default",
@@ -189,9 +233,20 @@ def for_chunks(
     frame = _frame_tokens(agent)
     expected = _expected_output(agent)
 
+    # An expected output can never exceed the per-call ceiling, because the call is *made*
+    # with `max_tokens=max_out` and the provider cannot answer with more. Left unclamped the
+    # two numbers come from different places -- the forecast from history or a default, the
+    # ceiling from the declared cap -- and nothing stops the forecast passing the bound it is
+    # supposed to sit under. A live 25-step app-testing session quoted "$1.31 expected,
+    # $1.18 ceiling", which is not a quote: `app-testing-step` caps a call at 1,500 tokens
+    # while the default forecast is 3,000, so every step was priced for twice the output the
+    # request permits. It is the only agent whose declared cap sits below the default, so
+    # this clamp moves no other product's quote.
+    per_call_expected = min(int(expected["tokens"]), max_out)
+
     input_tokens = sum(code_chunker.estimate_tokens(b) for b in chunk_bodies) + frame * len(chunk_bodies)
     calls = len(chunk_bodies) + extra_calls
-    expected_output = expected["tokens"] * calls
+    expected_output = per_call_expected * calls
     # Uncached input for the extra calls too — they carry their own frame.
     if extra_calls:
         input_tokens += frame * extra_calls

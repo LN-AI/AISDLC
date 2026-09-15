@@ -71,7 +71,7 @@ def _log_call(method):
 
 
 def _refuse_degenerate(product: str, produced: Any, result: Dict[str, Any],
-                      field: str, remedy: str) -> None:
+                      field: str, remedy: str, require_payload: bool = False) -> None:
     """Raise when a QA generator came back with nothing at all, rather than storing it.
 
     None of the three QA generators goes through `BaseAgent.review()`, so `attest`'s
@@ -93,9 +93,27 @@ def _refuse_degenerate(product: str, produced: Any, result: Dict[str, Any],
     `attest`'s 200-character floor is deliberately *not* applied here. That floor exists so a
     caller probing a code-review endpoint with a one-liner is not refused; a requirement is
     prose a person wrote on purpose, and "login must work" is short but entirely testable.
+
+    **`require_payload` is for the two generators that emit files rather than a catalogue.**
+    A summary rescuing an empty result is the right rule for a scenario or case list: a model
+    that found nothing to enumerate can say so, and the reader has the sentence explaining
+    why. It is the wrong rule for a *suite*, because the deliverable is the files and no
+    sentence substitutes for them. A live eval run produced exactly that shape — zero test
+    files, three `assertion_basis` rows describing tests that did not exist, and a confident
+    summary — and it was stored as a successful run that `run_tests.py` would then find
+    nothing to execute. So for those two, no files is an error whatever the summary says.
+    Nothing that produced files is affected, which is why this does not move a measured
+    baseline.
     """
-    if produced or (result.get("summary") or "").strip():
+    if (produced or (result.get("summary") or "").strip()) and not (require_payload
+                                                                   and not produced):
         return
+    if require_payload and not produced:
+        raise RuntimeError(
+            f"{product} returned no {field}. The suite *is* the files, so a summary "
+            f"without them is not a result — it usually means the response was truncated "
+            f"mid-object. Try again{remedy}."
+        )
     raise RuntimeError(
         f"{product} returned no {field} and no summary — this usually means the LLM "
         f"response was truncated or malformed rather than a genuine empty result. "
@@ -879,7 +897,7 @@ class SDLCOrchestrator:
         # which is right: it is malformed, not empty, and this is the error that says so.
         _refuse_degenerate("Test automation generation", files, result, "test files",
                            ", narrow the source to the files this requirement touches, or "
-                           "reduce the number of levels requested")
+                           "reduce the number of levels requested", require_payload=True)
         if cost_stats:
             result["_cost_stats"] = cost_stats
 
@@ -1021,7 +1039,7 @@ class SDLCOrchestrator:
         # the error that says so.
         _refuse_degenerate("Application suite generation", files, result, "test files",
                            ", explore further before generating, or narrow the goal to one "
-                           "journey at a time")
+                           "journey at a time", require_payload=True)
 
         test_names = [n for f in files for n in (f.get("test_names") or [])]
         result["total_files"] = len(files)

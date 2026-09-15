@@ -1,0 +1,11 @@
+{
+  "name": "basket-total",
+  "language": "javascript",
+  "framework": "playwright",
+  "entry": "app.py",
+  "requirement": "A basket line costs the item's price multiplied by the quantity in the basket, and the basket total is the sum of its lines. The total shown must update as soon as a quantity changes, in either direction. Taking away the last of an item removes its line from the basket.",
+  "bug": "pricing.js lineTotal() returns the item's price and ignores the quantity, so a basket holding three of a GBP 4.00 item shows GBP 4.00. It is correct at a quantity of one, which is why it survives a demonstration.",
+  "fix": "fixed/pricing.js multiplies the price by the quantity. One line.",
+  "goal": "Add an item to the basket, then change its quantity to more than one and read the total. Do the same for a second item.",
+  "notes": "The client-rendered counterpart to `task-ownership`. The URL never changes and no page is ever loaded twice: the item list, the basket lines and the total are all written into the DOM by script, and every click rewrites part of the page in place.\n\nThree things it puts under test that a server-rendered case cannot. The collector has to read controls that did not exist when the document loaded. The page signature has no new path to work from, so `stalled()` has to be satisfied by new controls and values alone — a basket that grows is progress even though the address bar never moves. And the generated suite has to wait for an asynchronous update rather than reading the total before the click has taken effect.\n\nThe separating behaviour needs a quantity of two or more. At one of anything, a line total that ignores quantity is arithmetically correct, so an explorer that adds a single item and stops writes a suite that is green on both builds. The goal says to change the quantity for exactly that reason: the failure this case is built to catch is a suite that looks thorough and never presses the button that matters.\n\nThe Checkout button is inert and is there to be refused. It is the first control in this corpus that the action policy should withhold — every session in the first measured baseline reported `withheld: 0`, so the safety path had never run against a real page in a scored run."
+}

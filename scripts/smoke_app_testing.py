@@ -15,7 +15,9 @@ Covers, in order:
   8.  A requirement supplied lets a 'specified' claim stand
   9.  An empty generation is an error, not a stored run
   10. Results for an app_testing run are accepted and reconciled
-  11. The registry row, the estimator and the screen table agree
+  11. A form's submit target reaches the suite writer, an origin never does
+  12. What a page says is observed, capped here, and reaches the writer
+  13. The registry row, the estimator and the screen table agree
 
 Same conventions as the suites beside it (D-09): plain script, no framework, exits 0 or 1,
 driven through `TestClient` against a throwaway SQLite file with `llm_gateway.call_tool`
@@ -174,6 +176,20 @@ def main_():
         "/api/v1/app-testing/preflight", json={"max_steps": 40}, headers=scoped
     ).json().get("estimate") or {}).get("calls") == 41)
 
+    # At every step count, not just a small one. A live 25-step session quoted "$1.31
+    # expected, $1.18 ceiling" — a ceiling *below* the forecast, which is not a quote. The
+    # cause was per-call arithmetic: `app-testing-step` caps a call at 1,500 output tokens
+    # while the default forecast is 3,000, so each step was priced for twice the output the
+    # request permits and the sum crossed the bound as the step count grew. Checking one
+    # small session could never see it, because the suite half's slack hid it until there
+    # were enough steps.
+    for cap in (1, 5, 25, 40, app_session.MAX_STEPS_CEILING):
+        q = (client.post("/api/v1/app-testing/preflight", json={"max_steps": cap},
+                         headers=scoped).json().get("estimate") or {})
+        check("at %d step(s) the ceiling is not below the forecast" % cap,
+              (q.get("ceiling_usd") or 0) >= (q.get("expected_usd") or 0),
+              "expected %s, ceiling %s" % (q.get("expected_usd"), q.get("ceiling_usd")))
+
     # ── 2. The attestation ────────────────────────────────────────────────
     # The one condition here that is about somebody else's data rather than bookkeeping.
     section("2. A session cannot start without the test-environment attestation")
@@ -198,6 +214,25 @@ def main_():
           "example.com" not in str(opened.json()["session"].get("target_label", "")).replace(
               "staging.example.com", ""),
           opened.json()["session"])
+
+    # A session opens free, so the project-binding rule ("calls that spend money") would not
+    # normally cover it. It covers it anyway: every step after this one is paid, and a live
+    # run against a real application opened a session, printed a cost estimate, launched a
+    # browser and then had all 25 steps refused for want of a project. The error belongs at
+    # the door.
+    from backend import config as _cfg
+    _was = _cfg.UI_REQUIRE_PROJECT
+    try:
+        _cfg.UI_REQUIRE_PROJECT = True
+        unbound = _open_session(client, admin)          # no X-Project-Id
+        check("an unbound session is refused where a project is required",
+              unbound.status_code == 403, "%s %s" % (unbound.status_code, unbound.text[:200]))
+        check("the refusal says to pick a project",
+              "project" in unbound.text.lower(), unbound.text[:300])
+        still = _open_session(client, scoped)           # with X-Project-Id
+        check("a bound session still opens", still.status_code == 200, still.text[:200])
+    finally:
+        _cfg.UI_REQUIRE_PROJECT = _was
 
     # ── 3. Dangerous controls never reach the model ───────────────────────
     # Checked by reading what the stub was actually sent, which is the only way to prove the
@@ -373,11 +408,38 @@ def main_():
         conn.close()
     check("nothing reached the database", after_rows == before_rows,
           f"{before_rows} -> {after_rows}")
-    # ...but a stated "nothing to test" with a summary is a real answer and is kept.
-    _next_suite.update({"summary": "Nothing on this page can be asserted meaningfully."})
+
+    # A summary does not rescue a suite with no files. For a catalogue it would -- a model
+    # that found nothing to enumerate can say so and the reader has the reason. For a suite
+    # the files *are* the deliverable, and a live eval run produced exactly this shape: zero
+    # test files, three assertion rows describing tests that did not exist, and a confident
+    # summary, stored as a successful run that had nothing to execute.
+    _next_suite.update({
+        "summary": "Two journeys were walked and a full suite was written for both.",
+        "assertion_basis": [{"test_name": "signs in", "basis": "observed",
+                             "what_it_checks": "the dashboard appears"}],
+    })
+    still_bad = client.post(f"/api/v1/app-testing/sessions/{empty_session}/generate",
+                            json={}, headers=scoped)
+    check("a confident summary does not rescue a suite with no files",
+          still_bad.status_code == 400, still_bad.status_code)
+    check("the refusal says the files are the deliverable",
+          "the files" in still_bad.text.lower(), still_bad.text[:400])
+    conn = database.get_connection()
+    try:
+        final_rows = conn.execute(
+            "SELECT COUNT(*) FROM reviews WHERE review_type = 'app_testing'").fetchone()[0]
+    finally:
+        conn.close()
+    check("still nothing reached the database", final_rows == before_rows,
+          f"{before_rows} -> {final_rows}")
+
+    # The positive control: one file and a summary is a real result and is kept.
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
     kept = client.post(f"/api/v1/app-testing/sessions/{empty_session}/generate",
                        json={}, headers=scoped)
-    check("an explained empty result is kept", kept.status_code == 200, kept.text[:200])
+    check("a suite with files is kept", kept.status_code == 200, kept.text[:200])
 
     # ── 10. Results come home ─────────────────────────────────────────────
     # The whole reason for reusing the code-based result shape: the existing contract works
@@ -405,8 +467,126 @@ def main_():
           "browser" not in ((runner.json().get("plan") or {}).get("must_supply") or []),
           (runner.json().get("plan") or {}).get("must_supply"))
 
-    # ── 11. The product agrees with itself ────────────────────────────────
-    section("11. The registry row, the estimator and the screen table agree")
+    # ── 11. What a form sends reaches the suite writer; an origin never does ──
+    # The measured baseline's one recurring defect was a test that drove controls which only
+    # exist on the broken build, so it failed on the working one. The fix needs the request a
+    # form actually sends to be *observed* rather than invented -- and that fact must reach
+    # the writer without carrying the origin with it, because D-407 is the reason this
+    # service never learns where the application lives.
+    section("11. A form's submit target reaches the suite writer, an origin never does")
+    sub_session = _open_session(client, scoped, max_steps=5).json()["session"]["id"]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Rename an item", "rationale": "save the new title"})
+    r11 = _step(client, scoped, sub_session,
+                [{"role": "button", "name": "Rename", "submits": "POST /items/1/rename",
+                  "locator": "getByRole('button', { name: 'Rename' })"}],
+                url_path="/items/1")
+    check("the step is accepted", r11.status_code == 200, r11.text[:300])
+    check("the target is recorded on the action",
+          (r11.json().get("action") or {}).get("submits") == "POST /items/1/rename",
+          r11.json().get("action"))
+    check("so is how to address it",
+          (r11.json().get("action") or {}).get("locator")
+          == "getByRole('button', { name: 'Rename' })", r11.json().get("action"))
+
+    # A locator is advisory text bound for a prompt and is never executed here, but it is
+    # page-controlled, so only the shapes the driver produces are kept.
+    _next_action.update({"candidate_index": 0})
+    junk = _step(client, scoped, sub_session,
+                 [{"role": "button", "name": "Odd",
+                   "locator": "page.evaluate(() => fetch('http://elsewhere'))"}],
+                 url_path="/items/1")
+    check("a locator that is not one is dropped",
+          (junk.json().get("action") or {}).get("locator") == "",
+          junk.json().get("action"))
+
+    _next_action.update({"candidate_index": 0})
+    r11b = _step(client, scoped, sub_session,
+                 [{"role": "button", "name": "Export",
+                   "submits": "POST https://somewhere-else.example.com/items/1"}],
+                 url_path="/items/1")
+    check("an absolute URL is dropped rather than stored",
+          (r11b.json().get("action") or {}).get("submits") == "",
+          r11b.json().get("action"))
+
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    g11 = client.post(f"/api/v1/app-testing/sessions/{sub_session}/generate",
+                      json={}, headers=scoped)
+    check("the suite is generated", g11.status_code == 200, g11.text[:300])
+    written = _llm_calls[-1]["content"]
+    check("the suite writer is told what the form sends",
+          "POST /items/1/rename" in written, written[-800:])
+    check("the suite writer is told how to address the control",
+          "getByRole('button', { name: 'Rename' })" in written, written[-800:])
+    check("no host reached the suite writer",
+          "somewhere-else.example.com" not in written, written[-800:])
+    check("nothing that was not a locator reached it",
+          "page.evaluate" not in written, written[-800:])
+
+    # ── 12. What the page said is observed, bounded, and reaches the writer ──
+    # A suite written from controls alone can assert which buttons exist and nothing about
+    # what the application did, and most defects show as a wrong value rather than a missing
+    # control. This is model input a customer's page decides the size of, so the cap is
+    # enforced here and not trusted from the driver.
+    section("12. What a page says is observed, capped here, and reaches the writer")
+    text_session = _open_session(client, scoped, max_steps=5).json()["session"]["id"]
+    _next_action.update({"action_kind": "click", "candidate_index": 0,
+                         "journey": "Fill the basket"})
+    r12 = _step(client, scoped, text_session,
+                [{"role": "button", "name": "One more Widget"}],
+                url_path="/basket",
+                page_texts=["Your basket", "Widget x2 — GBP 8.00", "Total: GBP 8.00"])
+    check("the step is accepted", r12.status_code == 200, r12.text[:300])
+    seen = _llm_calls[-1]["content"]
+    check("the explorer is told what the page says", "Total: GBP 8.00" in seen, seen[:600])
+
+    flood = ["line number %d with some words after it" % i for i in range(200)]
+    _step(client, scoped, text_session, [{"role": "button", "name": "One more Widget"}],
+          url_path="/basket", page_texts=flood)
+    conn = database.get_connection()
+    try:
+        stored = app_session.steps(conn, text_session)
+    finally:
+        conn.close()
+    check("a flood of page text is capped on arrival",
+          len(stored[-1]["page_texts"]) == app_session.MAX_PAGE_TEXTS,
+          len(stored[-1]["page_texts"]))
+    check("the first step kept what it was sent",
+          "Total: GBP 8.00" in stored[0]["page_texts"], stored[0]["page_texts"])
+
+    # A page that changes only its wording is a page that changed. Without this a
+    # client-rendered application looks stalled while it is still making progress.
+    same_controls = [{"role": "button", "name": "One more Widget"}]
+    check("wording alone changes the page signature",
+          action_policy.page_signature("/basket", same_controls, ["Total: GBP 4.00"])
+          != action_policy.page_signature("/basket", same_controls, ["Total: GBP 8.00"]))
+
+    # Filling in a form is progress and changes nothing else about the page. Without this a
+    # form with more fields than NO_PROGRESS_LIMIT is stopped for making no progress part
+    # way through being filled in, and the button at the bottom is never reached.
+    empty = [{"role": "textbox", "name": "Email", "value": ""},
+             {"role": "textbox", "name": "Street", "value": ""}]
+    typed = [{"role": "textbox", "name": "Email", "value": "alice@example.com"},
+             {"role": "textbox", "name": "Street", "value": ""}]
+    check("filling a field counts as progress",
+          action_policy.page_signature("/signup", empty)
+          != action_policy.page_signature("/signup", typed))
+    check("typing the same thing again does not",
+          action_policy.page_signature("/signup", typed)
+          == action_policy.page_signature("/signup", typed))
+
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    g12 = client.post(f"/api/v1/app-testing/sessions/{text_session}/generate",
+                      json={}, headers=scoped)
+    check("the suite is generated", g12.status_code == 200, g12.text[:300])
+    check("the suite writer can see the value to assert",
+          "Total: GBP 8.00" in _llm_calls[-1]["content"], _llm_calls[-1]["content"][-900:])
+
+    # ── 13. The product agrees with itself ────────────────────────────────
+    section("13. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)
     check("its review type matches what the orchestrator writes",

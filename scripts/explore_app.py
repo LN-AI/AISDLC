@@ -68,6 +68,12 @@ SETTLE_MS = 400
 NAV_TIMEOUT_MS = 15_000
 MAX_CANDIDATES = 60
 
+# How many text landmarks to read off a page. The platform caps this again on arrival
+# (`app_session.clip_texts`) and that is not redundant: a driver is a client, and a limit a
+# client can raise by not honouring it is not a limit. This copy exists so a dense page does
+# not cost a large `page.evaluate` before the request is even made.
+MAX_PAGE_TEXTS = 18
+
 
 def section(title):
     print("\n" + title)
@@ -102,9 +108,66 @@ COLLECT_JS = r"""
   document.querySelectorAll('[data-lm-cand]').forEach(e => e.removeAttribute('data-lm-cand'));
   const SEL = 'a[href], button, input:not([type=hidden]), select, textarea, summary,' +
               '[role=button], [role=link], [role=tab], [role=checkbox], [role=switch], [role=menuitem]';
+
+  // Elements the application has *made* clickable without making them controls: a nav built
+  // from <li> with a click handler, a card that opens a record, a <div> styled as a button.
+  // The selector above cannot see any of them, and the first live run against a real
+  // application is what proved how much that costs -- after signing in, this platform's own
+  // interface offered **two** candidates, because all forty of its navigation items are
+  // `<li data-page=...>` with a click handler and no role. The explorer, with nothing left
+  // to click, spent twenty-two of its twenty-five steps guessing URLs.
+  //
+  // There is no way to ask the DOM whether something has a listener, so this uses the
+  // signals that are actually observable: an inline handler, focusability, or a pointer
+  // cursor. It is the same evidence a person uses, and an element that fails all three is
+  // one a screen-reader user could not operate either.
+  document.querySelectorAll('[data-lm-outer]').forEach(e => e.removeAttribute('data-lm-outer'));
+  const clickable = [];
+  const semantic = new Set(document.querySelectorAll(SEL));
+  // Bounded scan. Detecting a pointer cursor needs `getComputedStyle` per element, so on a
+  // page with tens of thousands of nodes an unbounded walk is a visible pause on every step
+  // of every session. Cheap tests come first below for the same reason.
+  let scanned = 0;
+  for (const el of document.querySelectorAll('body *')) {
+    if (clickable.length >= MAXC || ++scanned > 8000) break;
+    if (semantic.has(el)) continue;
+    const tag = el.tagName.toLowerCase();
+    if (['script', 'style', 'svg', 'path', 'head', 'meta', 'link'].includes(tag)) continue;
+
+    // Inside a clickable already taken. Document order puts ancestors first, so the one
+    // already accepted is the outer one -- and for a nav item built as
+    // `<li><span class=icon>*</span> Code Review</li>` the outer element is the one carrying
+    // the whole label. The inner span inherits the pointer cursor and reads as a second
+    // control called nothing but an emoji, which is a wasted step and an unwritable test.
+    if (el.closest('[data-lm-outer]')) continue;
+
+    const tabindex = el.getAttribute('tabindex');
+    const looks = el.hasAttribute('onclick')
+               || (tabindex !== null && tabindex !== '-1')
+               || window.getComputedStyle(el).cursor === 'pointer';
+    if (!looks) continue;
+
+    // Wraps a real control: that control is the candidate, not the box around it. Checked
+    // after `looks` because it walks a subtree and most elements never get this far.
+    if (el.querySelector(SEL)) continue;
+
+    const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!text || text.length > 120) continue;   // no text is unaddressable; a lot is a region
+    // Words, not only symbols. A control whose whole label is an icon cannot be addressed by
+    // a durable locator and cannot be judged by a denylist that reads names, so offering it
+    // spends a step to learn nothing. Semantic controls are exempt -- they are collected
+    // above, where an icon-only button at least has a role to target.
+    if (!/[a-z0-9]/i.test(text)) continue;
+
+    el.setAttribute('data-lm-outer', '1');
+    clickable.push(el);
+  }
+
+  // Semantic controls first so they always get the budget: a page with two hundred clickable
+  // rows must not crowd out its Save button.
   const out = [];
   let n = 0;
-  for (const el of document.querySelectorAll(SEL)) {
+  for (const el of [...semantic, ...clickable]) {
     if (n >= MAXC) break;
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
@@ -147,20 +210,122 @@ COLLECT_JS = r"""
 
     // A password value is never read out of the page. It cannot be leaked by a transcript
     // that never contained it.
+    //
+    // But *whether one has been typed* must be reported, and this is why: with the field
+    // reported as empty no matter what, an explorer that has just filled it sees a page
+    // identical to the one before, concludes the fill did not happen, and fills it again.
+    // That is not hypothetical -- the first live run against a real application typed the
+    // password four times, never pressed Sign In, and was stopped by the no-progress rule
+    // having never got past the login form. A fixed marker says "there is something in
+    // here" and discloses nothing, not even a length.
     const isPassword = (tag === 'input' && itype === 'password');
     let value = '';
-    if (!isPassword && (tag === 'input' || tag === 'textarea' || tag === 'select')) {
+    if (isPassword) {
+      value = (el.value ? '(a value has been entered)' : '');
+    } else if (tag === 'input' || tag === 'textarea' || tag === 'select') {
       value = String(el.value == null ? '' : el.value).slice(0, 60);
+    }
+
+    // Where this control's form posts to, for a control that submits one. Method and
+    // same-origin path only -- never an absolute URL, because the platform is not told
+    // where the application lives (D-407) and a form action cannot be allowed to be the
+    // thing that tells it. This is what makes a "the server refuses it" test writable: on
+    // a working application the forbidden form is simply absent, so the only honest way to
+    // attempt the forbidden action is to send the request the working form sends.
+    let submits = '';
+    const submitter = (tag === 'button' && (itype === '' || itype === 'submit'))
+                   || (tag === 'input' && (itype === 'submit' || itype === 'image'));
+    if (submitter) {
+      const form = el.form || (el.closest ? el.closest('form') : null);
+      if (form) {
+        const method = (el.getAttribute('formaction') ? el.getAttribute('formmethod') : null)
+                    || form.getAttribute('method') || 'GET';
+        const action = el.getAttribute('formaction') || form.getAttribute('action') || '';
+        try {
+          const u = new URL(action || window.location.href, window.location.href);
+          if (u.origin === window.location.origin) {
+            submits = method.toUpperCase() + ' ' + u.pathname + u.search;
+          }
+        } catch (e) { /* an action attribute that is not a URL at all */ }
+      }
+    }
+
+    // How Playwright should address this element, worked out here from what the element
+    // actually is. The model still never authors a locator (D-408) -- it picks an index, and
+    // this string travels with the candidate so the suite can be written against something
+    // observed rather than assumed.
+    //
+    // The distinction that matters: `getByRole` resolves through the accessibility tree, so
+    // it finds a <button> and does *not* find an <li> that merely behaves like one. Claiming
+    // a role for a non-semantic element would produce a locator that matches nothing, which
+    // is worse than a plain text match -- so those get `getByText` and say so.
+    const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const ROLE_IS_REAL = ['button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio',
+                          'combobox', 'menuitem', 'tab', 'switch', 'option'];
+    const hasRealRole = el.hasAttribute('role')
+                     || (tag === 'a' && el.hasAttribute('href'))
+                     || ['button', 'input', 'select', 'textarea', 'summary'].includes(tag);
+    let locator = '';
+    if (name) {
+      locator = (hasRealRole && ROLE_IS_REAL.includes(role))
+        ? "getByRole('" + role + "', { name: '" + esc(name) + "' })"
+        : "getByText('" + esc(name) + "', { exact: true })";
     }
 
     el.setAttribute('data-lm-cand', String(n));
     out.push({dom_id: n, role: role, name: name, value: value,
-              enabled: !el.disabled, tag: tag, input_type: itype});
+              enabled: !el.disabled, tag: tag, input_type: itype, submits: submits,
+              locator: locator});
     n++;
   }
   return out;
 }
 """.replace("MAXC", str(MAX_CANDIDATES))
+
+
+# What the page *says*, as opposed to what it offers to click. Without this an explorer sees
+# only controls, so it can assert which buttons exist and nothing at all about what the
+# application did -- and most defects show up as wrong text on a screen rather than as a
+# missing button. A basket whose total is wrong offers exactly the same controls as one whose
+# total is right.
+#
+# Landmarks only, never the whole page: headings, live regions, and short identified text.
+# Those are where an application puts the things it wants a person to read, and the
+# restriction is what keeps a dense page from turning every step into a large prompt.
+TEXTS_JS = r"""
+() => {
+  const SEL = 'h1, h2, h3, h4, h5, h6, [role=status], [role=alert], [aria-live], [id]';
+  const out = [];
+  const seen = new Set();
+  for (const el of document.querySelectorAll(SEL)) {
+    if (out.length >= MAXT) break;
+    const tag = el.tagName.toLowerCase();
+    // A control's own text is already reported as its accessible name; repeating it here
+    // would be paying twice for the same words.
+    if (['input', 'button', 'select', 'textarea', 'a', 'form', 'script', 'style'].includes(tag)) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) continue;
+    const style = window.getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') continue;
+    let text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!text || text.length > 200) continue;   // a long one is a container, not a landmark
+    if (seen.has(text)) continue;
+    seen.add(text);
+
+    // How to *address* this text, not only what it says. Without a role the model knows a
+    // page shows "GBP 4.00" and nothing about which element holds it -- and on a page where
+    // an item price, a line total and a basket total are all "GBP 4.00", a getByText for it
+    // matches three elements and Playwright's strict mode fails the test on a correct
+    // application. A role is the durable way to point at one of them, and it is the same
+    // currency the candidate list is already written in.
+    let role = el.getAttribute('role') || '';
+    if (!role && /^h[1-6]$/.test(tag)) role = 'heading';
+    if (!role && el.getAttribute('aria-live')) role = 'status';
+    out.push((role ? role : 'text') + ': ' + text);
+  }
+  return out;
+}
+""".replace("MAXT", str(MAX_PAGE_TEXTS))
 
 
 def observe(page):
@@ -171,8 +336,27 @@ def observe(page):
         pass  # a page that never goes idle (polling, websockets) is still explorable
     page.wait_for_timeout(SETTLE_MS)
     candidates = page.evaluate(COLLECT_JS)
+    try:
+        texts = page.evaluate(TEXTS_JS)
+    except Exception:
+        # A page that will not run the text pass is still explorable on its controls alone,
+        # which is what every session did before this existed. Losing the assertions is a
+        # worse result than losing the session.
+        texts = []
     path = urllib.parse.urlparse(page.url).path or "/"
-    return path, (page.title() or ""), candidates
+    return path, (page.title() or ""), candidates, texts
+
+
+def candidate_payload(raw):
+    """What the platform is told about a page, and the only place that is decided.
+
+    `eval_app_testing.py` drives the same routes through `TestClient` and used to build this
+    list itself. Two copies of "what we send" is how an eval ends up measuring a richer
+    observation than the driver actually sends, so there is one.
+    """
+    return [{"role": c["role"], "name": c["name"], "value": c["value"],
+             "enabled": c["enabled"], "submits": c.get("submits", ""),
+             "locator": c.get("locator", "")} for c in raw]
 
 
 def perform(page, base_url, action, dom_id):
@@ -209,6 +393,13 @@ def perform(page, base_url, action, dom_id):
     after = page.url
     if after != before:
         return f"navigated to {urllib.parse.urlparse(after).path or '/'}"
+    # "stayed on the same page" is the truth about navigation and says nothing about whether
+    # the action worked, which is what the next decision turns on. Typing into a field is
+    # supposed to leave you where you were; reporting only the non-navigation made a
+    # successful fill read as a failed one, and the explorer retyped instead of submitting.
+    if kind in ("fill", "select", "press"):
+        what = action.get("target_name") or "the field"
+        return f"{kind}ed {what}; still on {urllib.parse.urlparse(after).path or '/'}"
     return "stayed on the same page"
 
 
@@ -266,7 +457,7 @@ def explore(page, api, session_id, base_url, credentials_note, max_steps, shots_
     taken = 0
     refusals = 0
     for _ in range(max_steps * 2):  # the *2 is headroom for refused steps, which do not count
-        path, title, raw = observe(page)
+        path, title, raw, texts = observe(page)
         if shots_dir:
             with contextlib.suppress(Exception):
                 page.screenshot(path=os.path.join(shots_dir, f"{taken:03d}-{path.strip('/').replace('/', '_') or 'root'}.png"),
@@ -275,8 +466,8 @@ def explore(page, api, session_id, base_url, credentials_note, max_steps, shots_
         payload = {
             "url_path": path,
             "page_title": title,
-            "candidates": [{"role": c["role"], "name": c["name"], "value": c["value"],
-                            "enabled": c["enabled"]} for c in raw],
+            "candidates": candidate_payload(raw),
+            "page_texts": texts,
             "last_outcome": last_outcome,
             "credentials_note": credentials_note,
         }
@@ -343,6 +534,14 @@ FIXTURE_PAGES = {
     "list.html": """<!doctype html><title>Items</title>
 <h1>Items</h1><ul><li>Widget</li><li>Gadget</li></ul>
 <a href="/index.html">Home</a><button>Place order</button>
+<form method="post" action="/items/1/rename"><label for="t">New title</label>
+<input id="t" name="title"><button type="submit">Rename</button></form>
+<!-- A navigation built the way real applications build one: list items with a click
+     handler and no role at all. Invisible to a selector that looks for controls, which is
+     how a live run against this platform's own interface ended up with two candidates and
+     nothing to do. -->
+<ul class="nav"><li onclick="location.href='/index.html'">Go to shop</li>
+<li style="cursor: pointer">Saved items</li></ul>
 """,
 }
 
@@ -382,7 +581,7 @@ def fixture():
             page = browser.new_page()
             page.goto(base + "/index.html", wait_until="domcontentloaded")
 
-            path, title, raw = observe(page)
+            path, title, raw, texts = observe(page)
             check("the page is observed", path.endswith("index.html") and title == "Fixture shop",
                   f"{path} / {title}")
             names = [c["name"] for c in raw]
@@ -410,20 +609,82 @@ def fixture():
             outcome = perform(page, base, action, allowed[idx]["dom_id"])
             check("the click navigated", "list.html" in outcome, outcome)
 
-            path2, _title2, raw2 = observe(page)
+            path2, _title2, raw2, texts2 = observe(page)
             check("the new page is observed", path2.endswith("list.html"), path2)
-            sig1 = action_policy.page_signature(path, raw)
-            sig2 = action_policy.page_signature(path2, raw2)
+            sig1 = action_policy.page_signature(path, raw, texts)
+            sig2 = action_policy.page_signature(path2, raw2, texts2)
             check("the two pages have different signatures", sig1 != sig2, f"{sig1} / {sig2}")
+
+            # What the page says, which is what an assertion about a *value* is written from.
+            check("the page's own words are read",
+                  any(t.endswith("Items") for t in texts2), texts2)
+            # How to address the text, not only what it says: a value with no role behind it
+            # can only be found with getByText, and getByText fails under strict mode as soon
+            # as the same words appear twice on the page.
+            check("each line says how to address it",
+                  all(":" in t for t in texts2) and any(t.startswith("heading:") for t in texts2),
+                  texts2)
+            check("a control's label is not repeated as page text",
+                  not any(t.endswith("Place order") for t in texts2), texts2)
+            # The basket case turns on this: a client-rendered page can change what it says
+            # while offering exactly the same controls, and a signature blind to text would
+            # call that no progress and stop the session while it was still getting somewhere.
+            check("a change in wording alone counts as a change",
+                  action_policy.page_signature(path2, raw2, texts2)
+                  != action_policy.page_signature(path2, raw2, ["Total: GBP 8.00"]),
+                  "text is not part of the signature")
 
             allowed2, refused2 = action_policy.screen(raw2)
             check("a purchase control is withheld",
                   "Place order" in [r["name"] for r in refused2],
                   [r["name"] for r in refused2])
 
+            # The request a form control actually sends. Without this a test for "the server
+            # refuses that" has to invent a path, and the measured baseline showed what
+            # happens instead: the model drives controls that exist only on the broken build,
+            # and the test fails on the working one.
+            by_name = dict((c["name"], c) for c in raw2)
+
+            # A control an application made clickable without making it a control. Real
+            # applications are full of them, and missing them cost a live run twenty-two of
+            # its twenty-five steps.
+            check("an element with a click handler is found",
+                  "Go to shop" in by_name, sorted(by_name))
+            check("an element merely styled as clickable is found",
+                  "Saved items" in by_name, sorted(by_name))
+            check("it is offered as something that can be clicked",
+                  by_name.get("Go to shop", {}).get("role") == "button",
+                  by_name.get("Go to shop"))
+            # ...and it must not claim a role it does not have: getByRole resolves through
+            # the accessibility tree, where an <li> is a listitem whatever it behaves like,
+            # so a getByRole('button') locator for it would match nothing.
+            check("a non-semantic control is addressed by its text, not a role it lacks",
+                  by_name.get("Go to shop", {}).get("locator")
+                  == "getByText('Go to shop', { exact: true })",
+                  by_name.get("Go to shop", {}).get("locator"))
+            check("a real button is addressed by its role",
+                  by_name.get("Rename", {}).get("locator")
+                  == "getByRole('button', { name: 'Rename' })",
+                  by_name.get("Rename", {}).get("locator"))
+            check("a real link is addressed by its role",
+                  by_name.get("Home", {}).get("locator")
+                  == "getByRole('link', { name: 'Home' })",
+                  by_name.get("Home", {}).get("locator"))
+            check("a submit button carries the request its form sends",
+                  by_name.get("Rename", {}).get("submits") == "POST /items/1/rename",
+                  by_name.get("Rename", {}).get("submits"))
+            check("a link carries none — it submits nothing",
+                  by_name.get("Home", {}).get("submits") == "",
+                  by_name.get("Home", {}).get("submits"))
+            index_submit = [c for c in raw
+                            if c["name"] == "Search" and c["role"] == "button"]
+            check("the method is read from the form rather than assumed",
+                  bool(index_submit) and index_submit[0].get("submits") == "GET /list.html",
+                  index_submit[0].get("submits") if index_submit else "no submit button")
+
             # Fill, to prove the value path works and is bounded.
             page.goto(base + "/index.html", wait_until="domcontentloaded")
-            _p, _t, raw3 = observe(page)
+            _p, _t, raw3, _x3 = observe(page)
             allowed3, _r3 = action_policy.screen(raw3)
             fidx = [a["name"] for a in allowed3].index("Search")
             fill = {"action_kind": "fill", "candidate_index": fidx, "value": "widget",
@@ -512,7 +773,7 @@ def main():
             browser = pw.chromium.launch(headless=not args.headed)
             page = browser.new_page()
             page.goto(args.url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-            path, title, raw = observe(page)
+            path, title, raw, texts = observe(page)
             allowed, refused = action_policy.screen(raw)
             print(f"\n{path}  ({title})\n")
             print(f"Would be offered to the model ({len(allowed)}):")

@@ -32,6 +32,7 @@ minutes, that an operator may abandon halfway -- and a reservation held across a
 would bill for steps nobody took.
 """
 import logging
+import re
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -47,7 +48,11 @@ from backend.services import (
 )
 from backend.services.agent_guard import BudgetExceededError, ScopeDeniedError
 from backend.services.app_session import SessionError
-from backend.services.subject_service import subject_from_caller
+from backend.services.subject_service import (
+    ProjectBindingError,
+    require_project,
+    subject_from_caller,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +74,23 @@ class Candidate(BaseModel):
     name: str = Field("", description="The accessible name, e.g. 'Save changes'.")
     value: str = Field("", description="Current value, for inputs. Never send a password.")
     enabled: bool = Field(True, description="False for a disabled control.")
+    submits: str = Field(
+        "",
+        description="For a control that submits a form: the method and same-origin path it "
+                    "sends, e.g. 'POST /tasks/1/edit'. A path, never an absolute URL — this "
+                    "service is not told where the application lives. Anything else is "
+                    "dropped rather than stored.",
+        examples=["POST /tasks/1/edit"],
+    )
+    locator: str = Field(
+        "",
+        description="How Playwright addresses this element, worked out by the driver from "
+                    "what the element actually is — `getByRole(...)` where the element has "
+                    "that role in the accessibility tree, `getByText(...)` where it only "
+                    "behaves like a control. Carried so the generated suite targets "
+                    "something observed instead of assumed.",
+        examples=["getByRole('button', { name: 'Save changes' })"],
+    )
 
 
 class SessionRequest(BaseModel):
@@ -110,6 +132,15 @@ class StepRequest(BaseModel):
         description="Everything interactive on the page. Send them all -- the dangerous ones "
                     "are removed here, before the model sees them, and counted for the "
                     "session record.",
+    )
+    page_texts: List[str] = Field(
+        default_factory=list,
+        description="What the page says, as short landmark lines — headings, live regions, "
+                    "identified short text. Without it an explorer can only assert which "
+                    "controls exist, and most defects show as wrong text rather than a "
+                    "missing control. Capped on arrival; send no more than a page's "
+                    "landmarks and never its whole body.",
+        examples=[["Your basket", "Total: GBP 8.00"]],
     )
     last_outcome: str = Field("", description="What happened when the previous action ran.")
     credentials_note: str = Field(
@@ -196,6 +227,31 @@ def _history(steps: List[dict], limit: int = 12) -> str:
     return "\n".join(lines)
 
 
+# A submit target is `METHOD /path`, and nothing else is stored. The driver is trusted to
+# observe the page; it is not trusted to decide what this service may hold. An absolute URL
+# would carry the origin, which D-407 says this side never learns -- so one is dropped
+# rather than trimmed, because a value that arrived in the wrong shape is a bug somewhere
+# and silently repairing it hides the bug.
+_SUBMIT_TARGET = re.compile(r"^(GET|POST|PUT|PATCH|DELETE) (/[^\s?#]{0,180}(?:\?[^\s#]{0,60})?)$")
+
+
+def _submit_target(raw: str) -> str:
+    match = _SUBMIT_TARGET.match(str(raw or "").strip())
+    return match.group(0) if match else ""
+
+
+# A locator is advisory text for the suite writer -- nothing here or in the driver ever
+# executes it, because an action is carried out against the stamped candidate and not against
+# a string. It is still page-controlled input on its way into a prompt, so it is accepted only
+# in the two shapes the driver produces and dropped otherwise.
+_LOCATOR = re.compile(r"^getBy(Role|Text|Label)\(.{1,240}\)$", re.S)
+
+
+def _locator(raw: str) -> str:
+    text = " ".join(str(raw or "").split())
+    return text if _LOCATOR.match(text) else ""
+
+
 def _journeys_markdown(steps: List[dict]) -> str:
     """The session, rendered for the suite writer.
 
@@ -226,11 +282,29 @@ def _journeys_markdown(steps: List[dict]) -> str:
             if action.get("value"):
                 bits.append(f"with value `{action['value']}`")
             bits.append(f"on `{step.get('url_path', '')}`")
+            if action.get("locator"):
+                # Worked out from the element itself rather than from its role alone. A nav
+                # item that is an `<li>` with a click handler has no role in the
+                # accessibility tree, so `getByRole('button', ...)` would match nothing --
+                # this says what does match.
+                bits.append(f"— address it with `page.{action['locator']}`")
+            if action.get("submits"):
+                # The request this control actually sends. Without it a test for "the server
+                # refuses this" has to invent a path, which is the guessing D-408 designs
+                # out; with it, the request can be written from something that was observed.
+                bits.append(f"— sends `{action['submits']}`")
             if action.get("rationale"):
                 bits.append(f"— expected: {action['rationale']}")
             if step.get("outcome"):
                 bits.append(f"— observed: {step['outcome']}")
             out.append(" ".join(bits))
+            if step.get("page_texts"):
+                # What the page said when this step was taken. This is where an assertion
+                # about a *value* comes from: without it a suite can only check which
+                # controls exist, and "the total is wrong" looks identical to "the total is
+                # right" when all you can see is buttons.
+                shown = "; ".join(str(t) for t in step["page_texts"][:8])
+                out.append(f"  page showed: {shown}")
         out.append("")
     return "\n".join(out).strip()
 
@@ -272,6 +346,18 @@ def open_session(req: SessionRequest, caller: dict = Depends(get_caller)):
     try:
         agent_guard.check_scope(subject, PRODUCT)
     except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    # Opening a session spends nothing, so by the ordinary rule `require_project` would not
+    # apply to it -- it is reserved for calls that cost money. It applies here anyway,
+    # because a session is not a read: it is the door to a flow in which *every* subsequent
+    # call is a paid one. Without this the deployment that requires project binding lets a
+    # session open, prints a cost estimate, and then refuses all forty steps -- which is how
+    # a live run against a real application actually failed, after the browser had started.
+    # Failing at the door costs an error message; failing after it costs the run.
+    try:
+        require_project(subject)
+    except ProjectBindingError as exc:
         raise HTTPException(403, str(exc))
 
     project_id = _project_for(caller, req.project_id)
@@ -332,8 +418,9 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
             raise HTTPException(400, str(exc))
 
         raw = [c.model_dump() for c in req.candidates]
+        texts = app_session.clip_texts(req.page_texts)
         allowed, refused = action_policy.screen(raw)
-        signature = action_policy.page_signature(req.url_path, raw)
+        signature = action_policy.page_signature(req.url_path, raw, texts)
 
         # The cheap stopping rule, evaluated before spending anything: if the last several
         # steps and this page are all the same signature, the session has stopped finding
@@ -358,7 +445,7 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
         )
         observation_chars = min(
             app_session.MAX_OBSERVATION_CHARS,
-            sum(len(str(c)) for c in raw),
+            sum(len(str(c)) for c in raw) + sum(len(t) for t in texts),
         )
     finally:
         conn.close()
@@ -371,6 +458,7 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
                 url_path=req.url_path,
                 page_title=req.page_title,
                 candidates=allowed,
+                page_texts=texts,
                 history=history,
                 requirement=session.get("requirement", ""),
                 refused_note=refused_note,
@@ -419,6 +507,8 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
         else {}
     action["target_role"] = chosen.get("role", "")
     action["target_name"] = chosen.get("name", "")
+    action["submits"] = _submit_target(chosen.get("submits", ""))
+    action["locator"] = _locator(chosen.get("locator", ""))
 
     conn = database.get_connection()
     try:
@@ -432,6 +522,7 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
             observation_chars=observation_chars,
             candidates_offered=len(allowed),
             candidates_refused=len(refused),
+            page_texts=texts,
             outcome=req.last_outcome,
         )
         public = app_session.public(conn, session_id)

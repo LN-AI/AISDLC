@@ -180,7 +180,7 @@ and a Playwright suite is written from the journeys walked. The result has the s
 a code-generated suite on purpose — same renderer, same `plan_for`, same `deliver-tests`,
 same results contract — so nothing downstream has a branch for it.
 
-Three things to know before changing any of it. **The browser never runs here** (D-407): the
+Four things to know before changing any of it. **The browser never runs here** (D-407): the
 platform is sent page descriptions and answers with one action, so it never learns the URL,
 never holds a credential, and an application behind a VPN works — which a hosted browser
 fleet could not do. **The model picks from a screened list and never writes a selector**
@@ -192,22 +192,63 @@ requirement supplied a suite can only describe what the application already does
 `specified` claim made without one is downgraded to `observed` in code and the count is
 reported.
 
+**And an observation is what a page offers *and* what it says, in both cases read off the
+DOM rather than inferred.** Three parts of `COLLECT_JS`/`TEXTS_JS` in `scripts/explore_app.py`
+each exist because of a specific failure, so none of them is decoration. A page's landmark
+text is collected and capped on arrival (D-416), because a suite written from controls alone
+can assert which buttons exist and nothing about what the application did — a basket whose
+total is wrong offers exactly the same controls as one whose total is right. Each candidate
+carries **how to address it** and, for a submit control, **what request its form sends**
+(D-415), both sanitised by the route, because `getByRole` resolves through the accessibility
+tree and finds nothing for an `<li>` that merely behaves like a button. And a clickable
+element is a candidate even when it is not a control (D-414): pointed at this platform's own
+interface, the explorer was offered **two** controls after signing in — the whole navigation
+is `<li data-page=…>` with a click handler — and spent twenty-two of twenty-five steps
+guessing URLs. Related: a password field reports *that* it holds a value and never what
+(D-413), because an explorer that cannot tell its own typing landed types it again instead of
+pressing Sign In, which is how a live run failed to get past a login form at all.
+
 `eval_app_testing.py` asks the same question `eval_test_automation.py` does, aimed at the
 narrower claim this product actually makes: explore the **working** application, then replay
 the suite against both it and a broken build — green on one, red on the other. Its
 `--self-check` runs a hand-written reference suite through the whole harness for free, so
 "the harness cannot separate these variants" is never discovered after paying for three
-sessions. Unlike the code-based corpus it is **not** dependency-free (a browser suite needs
-`@playwright/test`), and it is **one case** — a count, not a percentage (C-95).
+sessions; it covers **every** case and **fails a case that has none**, so the free proof
+cannot quietly stop covering new ones.
 
-**The measured baseline is not flattering, and the number to quote is the low one.** Three
-runs on 2026-09-15: 8 steps and 3 journeys every time, 5-6 tests, every assertion checking
-behaviour rather than that a page loaded, $0.12 a session — but **`discriminates` 33%**,
-because in two runs of three one test also failed on the *working* application. The suite saw
-the regression every single time (`detects_break` 100%); it was not clean on the build it was
-written from. That is a bad-assertion problem, not an exploration one, and it is the first
-thing to fix before this product is worth selling. D-411 has the detail, and there is
-deliberately **no `discriminates` floor** until the number is worth gating on.
+Three cases, chosen as three *shapes* rather than three samples. `task-ownership` is
+server-rendered with an authorisation bug, and its separating assertions are negative ones —
+"must be refused", "must not be offered". `basket-total` is client-rendered: the URL never
+changes, every click rewrites part of the page, and the arithmetic bug is invisible at a
+quantity of one, so an explorer that adds a single item writes a suite green on both builds.
+`signup-wizard` is the depth case — a three-step form whose defect no single page shows,
+because each step is correct in isolation and only a completed journey reaches the review
+page that is wrong. Still a count and not a percentage (C-95), and note what none of them
+measures: all three are ordinary semantic HTML, so the collector work in D-414 has the
+fixture and a live run as its only evidence (C-97).
+
+**The measured baseline is 9 of 9, and how it got there matters more than the number.**
+2026-09-15, PROMPT_VERSION 2026-09-15.2, three cases x three runs: `discriminates` 9/9,
+`detects_break` 9/9, `ran` 9/9, **no test failed on the working application in any run**, at
+**$0.128 a session**. Floors are 0.66 on all three measures for all three cases — one run
+below the measurement, per D-403.
+
+The first baseline that morning was **33%**, and the gap is the work rather than a prompt
+tidy-up. Each defect between the two was found by a run and none was visible offline: a
+"must be refused" test that drove controls existing only on the *broken* build, so it timed
+out on the good one; an explorer that could see no page text and therefore could not assert
+any value (D-416); a login it could not get past at all, because a password field reported
+itself empty however much had been typed in (D-413); a cleanup hook that signed in again and
+hung; and a suite of **zero test files** stored as a success because its summary was
+confident (D-417). Two more came from pointing it at this platform's own interface rather
+than at the corpus: navigation invisible to the collector (D-414) and a session quote whose
+ceiling sat *below* its own forecast (D-412).
+
+Read the 9/9 as "nothing here is broken", not as a claim the product is finished. Three cases
+is a count and not a percentage (C-95); none of them exercises the collector those numbers
+depend on (C-97); and a live run with no requirement supplied still produced a suite that was
+nine-tenths "the button is visible", which is C-66 wearing a new hat and is why `_HOLLOW` in
+the eval was widened.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

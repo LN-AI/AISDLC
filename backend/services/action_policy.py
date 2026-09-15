@@ -238,7 +238,7 @@ def permits(action, allowed):
     return True, ""
 
 
-def page_signature(url_path, candidates):
+def page_signature(url_path, candidates, texts=None):
     """A stable fingerprint for which page we are on, used to detect *no progress*.
 
     Deciding whether two views are the same page is genuinely hard -- one URL serves many
@@ -263,11 +263,28 @@ def page_signature(url_path, candidates):
             parts.append(segment.lower())
     shape = "/" + "/".join(parts)
 
+    # Role, name *and* current value. The value matters because filling in a form is
+    # progress and changes nothing else: same controls, same words, same address. Without it
+    # a form with more fields than `NO_PROGRESS_LIMIT` is stopped for making no progress
+    # while it is being filled in correctly, and no session ever reaches the button at the
+    # bottom of it. Including the value keeps the rule's real target -- typing the *same*
+    # thing again still produces the same signature, which is what a stuck explorer does.
     pairs = sorted(set(
         normalise(c.get("role")) + "|" + normalise(c.get("name"))
+        + "|" + normalise(c.get("value"))
         for c in (candidates or []) if isinstance(c, dict)
     ))
-    digest = hashlib.sha256("\n".join([shape] + pairs).encode("utf-8")).hexdigest()
+    # What the page says counts as part of "has anything changed?", and on a client-rendered
+    # application it is often the *only* part that changes: pressing "One more Widget" leaves
+    # every control exactly where it was and rewrites a total. Without this such a session
+    # looks stalled after a few steps and is stopped while it is still making progress.
+    #
+    # The cost of including it is the opposite failure: a page with a clock or a live counter
+    # never repeats a signature, so the no-progress rule stops firing for it. That is the
+    # better failure to have, because `max_steps` still bounds the session and a premature
+    # stop wastes the whole run rather than the tail of it.
+    said = sorted(set(normalise(t) for t in (texts or []) if t))
+    digest = hashlib.sha256("\n".join([shape] + pairs + said).encode("utf-8")).hexdigest()
     return shape + "#" + digest[:12]
 
 

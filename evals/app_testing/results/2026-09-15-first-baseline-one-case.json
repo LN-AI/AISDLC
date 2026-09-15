@@ -1,0 +1,138 @@
+{
+  "prompt_version": "2026-09-15.1",
+  "repeat": 3,
+  "max_steps": 25,
+  "spend": {
+    "model_cost_usd": 0.360468,
+    "cost_usd": 0.360468,
+    "calls": 30
+  },
+  "note": "`model_cost_usd` is what the run cost us; `cost_usd` is what a customer would be billed. They are equal while app-testing has no pricing row (see D-404 for why the distinction matters to a baseline comparison).",
+  "runs": {
+    "task-ownership": [
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "discriminates": false,
+        "broken": {
+          "total": 5,
+          "passed": 3,
+          "failed": 2,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 13854,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 5,
+          "passed": 4,
+          "failed": 1,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 4018,
+          "outcome": "failed"
+        },
+        "files": 3,
+        "tests": 5,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 5,
+        "meaningful_assertions": 5,
+        "specified_count": 4,
+        "observed_count": 1,
+        "downgraded": 0,
+        "broken_tail": "or-context.md\n\n\n  2 failed\n    tests\\e2e\\other-user-task.spec.ts:15:7 \u203a Journey: Open task owned by somebody else \u203a other_user_task_shows_no_edit_form \n    tests\\e2e\\other-user-task.spec.ts:31:7 \u203a Journey: Open task owned by somebody else \u203a other_user_task_direct_save_is_refused \n  3 passed (13.9s)\n",
+        "review_id": "84da044d-0f33-4f2b-ba6c-871d7de88b42",
+        "detects_break": true
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "discriminates": false,
+        "broken": {
+          "total": 6,
+          "passed": 3,
+          "failed": 3,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 14774,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 6,
+          "passed": 5,
+          "failed": 1,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 5091,
+          "outcome": "failed"
+        },
+        "files": 3,
+        "tests": 6,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 6,
+        "meaningful_assertions": 6,
+        "specified_count": 5,
+        "observed_count": 1,
+        "downgraded": 0,
+        "broken_tail": "edit_form \n    tests\\journey-open-others-task.spec.ts:40:7 \u203a Journey: Open task owned by somebody else \u203a others_task_offers_no_save_button \n    tests\\journey-open-others-task.spec.ts:50:7 \u203a Journey: Open task owned by somebody else \u203a direct_save_attempt_on_others_task_is_refused \n  3 passed (15.5s)\n",
+        "review_id": "db0d2425-18ea-407c-88ae-88dc0594331c",
+        "detects_break": true
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "discriminates": true,
+        "broken": {
+          "total": 5,
+          "passed": 4,
+          "failed": 1,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 8993,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 5,
+          "passed": 5,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 4220,
+          "outcome": "passed"
+        },
+        "files": 3,
+        "tests": 5,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 5,
+        "meaningful_assertions": 5,
+        "specified_count": 4,
+        "observed_count": 1,
+        "downgraded": 0,
+        "broken_tail": "y-open-others-task.spec.ts:32:7 \u203a Journey: Open task owned by someone else \u203a direct_save_attempt_on_others_task_is_refused\n  1 failed\n    tests\\e2e\\journey-open-others-task.spec.ts:14:7 \u203a Journey: Open task owned by someone else \u203a others_task_shows_no_edit_form_and_no_save_button \n  4 passed (9.1s)\n",
+        "review_id": "4ea038a0-e1dd-4eb6-8bbe-3c3554274250",
+        "detects_break": true
+      }
+    ]
+  },
+  "measured": {
+    "note": "Derived from the summaries already recorded in this file, not from a re-run. `detects_break` separates 'the suite saw the regression' from 'the suite is clean on the build it was written from'; the first baseline showed those two coming apart, which is the finding.",
+    "discriminates": "1 of 3",
+    "detects_break": "3 of 3",
+    "ran": "3 of 3",
+    "steps_per_session": 8,
+    "journeys_per_session": 3,
+    "model_cost_per_session_usd": 0.1202
+  }
+}

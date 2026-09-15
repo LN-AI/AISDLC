@@ -65,6 +65,13 @@ MAX_GOAL_CHARS = 2_000
 MAX_REQUIREMENT_CHARS = 20_000
 MAX_JOURNEY_CHARS = 120
 
+# What a page *said*, as opposed to what it offered to click. A bounded digest: enough lines
+# for an assertion to be written about a value the application displayed, few enough that a
+# dense page cannot turn every step into a large prompt. These two numbers are the entire
+# cost control on it, so keep them small.
+MAX_PAGE_TEXTS = 18
+MAX_PAGE_TEXT_CHARS = 160
+
 
 class SessionError(Exception):
     """A session that cannot proceed, with a sentence for the caller. Always a 400."""
@@ -121,6 +128,13 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             observation_chars INTEGER DEFAULT 0,
             candidates_offered INTEGER DEFAULT 0,
             candidates_refused INTEGER DEFAULT 0,
+            -- What the page said at this step, as a short JSON list of landmark lines
+            -- (headings, live regions, identified short text). Controls alone are not
+            -- enough: an explorer that sees only buttons can assert which buttons exist and
+            -- nothing about what the application *did*, and most defects show up as wrong
+            -- text rather than as a missing control. Capped hard -- this is a digest for
+            -- writing assertions from, not a copy of the page.
+            page_texts      TEXT DEFAULT '',
             outcome         TEXT DEFAULT '',
             created_at      TEXT NOT NULL
         );
@@ -138,6 +152,11 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
                         ("stop_reason", "TEXT DEFAULT ''")):
         try:
             cursor.execute(f"ALTER TABLE app_sessions ADD COLUMN {_col} {_type}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    for _col, _type in (("page_texts", "TEXT DEFAULT ''"),):
+        try:
+            cursor.execute(f"ALTER TABLE app_steps ADD COLUMN {_col} {_type}")
         except sqlite3.OperationalError:
             pass  # column already exists
 
@@ -255,9 +274,26 @@ def stalled(conn, session_id, signature, limit=NO_PROGRESS_LIMIT):
     return all(sig == signature for sig in recent)
 
 
+def clip_texts(texts):
+    """A page's text digest, bounded on both axes before it is stored or prompted with.
+
+    Bounded here rather than trusted from the driver for the same reason the step cap is:
+    this is model input whose size a customer's page decides, and an uncapped observation is
+    an uncapped invoice.
+    """
+    out = []
+    for item in texts or []:
+        line = " ".join(str(item or "").split())[:MAX_PAGE_TEXT_CHARS]
+        if line and line not in out:
+            out.append(line)
+        if len(out) >= MAX_PAGE_TEXTS:
+            break
+    return out
+
+
 def record_step(conn, session_id, *, step_index, journey, url_path, page_signature,
                 action, observation_chars, candidates_offered, candidates_refused,
-                outcome=""):
+                outcome="", page_texts=None):
     """Write one step and advance the counters, in one transaction.
 
     `steps_used` is incremented here rather than by the caller so that the count and the
@@ -267,12 +303,14 @@ def record_step(conn, session_id, *, step_index, journey, url_path, page_signatu
     conn.execute(
         """INSERT INTO app_steps
                (id, session_id, step_index, journey, url_path, page_signature, action_json,
-                observation_chars, candidates_offered, candidates_refused, outcome, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                observation_chars, candidates_offered, candidates_refused, page_texts,
+                outcome, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (str(uuid.uuid4()), session_id, step_index,
          str(journey or "")[:MAX_JOURNEY_CHARS], str(url_path or "")[:MAX_LABEL_CHARS],
          page_signature or "", json.dumps(action or {}), int(observation_chars or 0),
          int(candidates_offered or 0), int(candidates_refused or 0),
+         json.dumps(clip_texts(page_texts)),
          str(outcome or "")[:MAX_LABEL_CHARS], _now()),
     )
     conn.execute(
@@ -320,6 +358,11 @@ def steps(conn, session_id, limit=MAX_STEPS_CEILING):
         except (ValueError, TypeError):
             item["action"] = {}
         item.pop("action_json", None)
+        try:
+            decoded = json.loads(item.get("page_texts") or "[]")
+        except (ValueError, TypeError):
+            decoded = []
+        item["page_texts"] = [str(t) for t in decoded] if isinstance(decoded, list) else []
         out.append(item)
     return out
 

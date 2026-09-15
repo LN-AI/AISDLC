@@ -1,0 +1,179 @@
+{
+  "prompt_version": "2026-09-15.2",
+  "repeat": 3,
+  "max_steps": 25,
+  "spend": {
+    "model_cost_usd": 0.372753,
+    "cost_usd": 0.372753,
+    "calls": 30
+  },
+  "note": "`model_cost_usd` is what the run cost us; `cost_usd` is what a customer would be billed. They are equal while app-testing has no pricing row (see D-404 for why the distinction matters to a baseline comparison).",
+  "runs": {
+    "task-ownership": [
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 7,
+          "passed": 4,
+          "failed": 3,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 15780,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 7,
+          "passed": 7,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 5431,
+          "outcome": "passed"
+        },
+        "files": 3,
+        "tests": 7,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 7,
+        "meaningful_assertions": 7,
+        "specified_count": 6,
+        "observed_count": 1,
+        "downgraded": 0,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Journey: Open task owned by somebody else \u203a other_user_task_has_no_edit_form",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "Journey: Open task owned by somebody else \u203a other_user_task_has_no_save_button",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "Journey: Open task owned by somebody else \u203a direct_post_to_other_user_task_is_refused",
+            "file": "",
+            "why": "expect(received).toBeGreaterThanOrEqual(expected)"
+          }
+        ],
+        "broken_tail": "no_edit_form \n    tests\\e2e\\open-other-user-task.spec.ts:29:7 \u203a Journey: Open task owned by somebody else \u203a other_user_task_has_no_save_button \n    tests\\e2e\\open-other-user-task.spec.ts:41:7 \u203a Journey: Open task owned by somebody else \u203a direct_post_to_other_user_task_is_refused \n  4 passed (17.1s)\n",
+        "fixed_tail": "sk \u203a own_task_save_updates_title\n[6/7] tests\\e2e\\open-other-user-task.spec.ts:41:7 \u203a Journey: Open task owned by somebody else \u203a direct_post_to_other_user_task_is_refused\n[7/7] tests\\e2e\\open-own-task.spec.ts:58:7 \u203a Journey: Open own task \u203a direct_post_to_own_task_edit_is_accepted\n  7 passed (4.5s)\n",
+        "review_id": "e4fe8734-3cea-407f-a8f1-a7b08abf61c8",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260915T154223Z\\task-ownership-run1"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 7,
+          "passed": 5,
+          "failed": 2,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 14853,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 7,
+          "passed": 7,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 5415,
+          "outcome": "passed"
+        },
+        "files": 3,
+        "tests": 7,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 7,
+        "meaningful_assertions": 6,
+        "specified_count": 6,
+        "observed_count": 1,
+        "downgraded": 0,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Journey: Open task owned by somebody else \u203a non_owner_sees_no_edit_form",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "Journey: Open task owned by somebody else \u203a non_owner_sees_no_save_button",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          }
+        ],
+        "broken_tail": "thers_task_is_refused\n  2 failed\n    tests\\journey-open-others-task.spec.ts:27:7 \u203a Journey: Open task owned by somebody else \u203a non_owner_sees_no_edit_form \n    tests\\journey-open-others-task.spec.ts:39:7 \u203a Journey: Open task owned by somebody else \u203a non_owner_sees_no_save_button \n  5 passed (16.2s)\n",
+        "fixed_tail": "n_owner_sees_no_save_button\n[6/7] tests\\journey-open-others-task.spec.ts:51:7 \u203a Journey: Open task owned by somebody else \u203a direct_post_to_others_task_is_refused\n[7/7] tests\\journey-open-own-task.spec.ts:81:7 \u203a Journey: Open own task \u203a direct_post_from_non_owner_session_is_refused\n  7 passed (4.4s)\n",
+        "review_id": "c6c2c076-1d84-4865-8b6c-6c3b1fd3f785",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260915T154223Z\\task-ownership-run2"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 7,
+          "passed": 5,
+          "failed": 2,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 15396,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 7,
+          "passed": 7,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 5334,
+          "outcome": "passed"
+        },
+        "files": 3,
+        "tests": 7,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 7,
+        "meaningful_assertions": 7,
+        "specified_count": 6,
+        "observed_count": 1,
+        "downgraded": 0,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Open task owned by somebody else \u203a non_owner_sees_no_edit_form_on_others_task",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "Open task owned by somebody else \u203a non_owner_sees_no_save_button_on_others_task",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          }
+        ],
+        "broken_tail": "or_others_task_is_refused\n  2 failed\n    tests\\open-others-task.spec.ts:17:7 \u203a Open task owned by somebody else \u203a non_owner_sees_no_edit_form_on_others_task \n    tests\\open-others-task.spec.ts:29:7 \u203a Open task owned by somebody else \u203a non_owner_sees_no_save_button_on_others_task \n  5 passed (16.5s)\n",
+        "fixed_tail": " non_owner_sees_no_save_button_on_others_task\n[6/7] tests\\open-others-task.spec.ts:41:7 \u203a Open task owned by somebody else \u203a direct_save_request_for_others_task_is_refused\n[7/7] tests\\open-own-task.spec.ts:56:7 \u203a Open own task journey \u203a direct_save_request_for_own_task_is_accepted\n  7 passed (4.4s)\n",
+        "review_id": "f76450b6-e4c6-4ec7-af7f-5c591c83d0c0",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260915T154223Z\\task-ownership-run3"
+      }
+    ]
+  }
+}

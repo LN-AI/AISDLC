@@ -61,9 +61,11 @@ bound it, and none of them is "the model was told not to":
 1. **A closed action vocabulary.** Six verbs — `click`, `fill`, `select`, `press`, `goto`,
    `back`. Nothing else is interpreted, so there is nothing to escape into.
 2. **The model never writes a selector.** It is given a numbered list of candidates and
-   returns an *index*. It cannot name an element nobody offered it. This also means every
-   locator in the generated suite is a role-and-accessible-name locator, which survives a
-   redesign where a CSS path does not.
+   returns an *index*. It cannot name an element nobody offered it. The driver also works
+   out how each control should be addressed and sends that along, so the generated suite
+   uses a locator read off the page rather than one inferred from a role — which matters
+   because `getByRole` resolves through the accessibility tree and would find nothing for a
+   nav item built as an `<li>` with a click handler, however much it looks like a button.
 3. **Screened three times.** Dangerous candidates are removed *before* the model sees the
    list, its choice is re-checked on the way out, and `scripts/explore_app.py` checks a third
    time on the machine that will do the clicking. The first two mirror `finding_gate`
@@ -82,6 +84,42 @@ while `Cancel subscription` is not.
 
 `POST /api/v1/app-testing/preflight` returns the full policy, so you can see the list before
 committing to a session.
+
+---
+
+## What it can see
+
+Two things per page, and the second one is what makes an assertion possible.
+
+**What the page offers.** Every interactive element, with the role and accessible name a
+screen reader would read — plus anything the application has *made* clickable without making
+it a control: an element with a click handler, a focusable element, or one styled with a
+pointer cursor. That last part is not a nicety. Applications routinely build navigation from
+plain list items with click handlers, and an explorer that cannot see those has nothing to
+click: pointed at this platform's own interface it was offered two controls after signing in,
+and spent the rest of its budget guessing URLs.
+
+**What the page says.** A short digest of the page's landmarks — headings, live regions and
+short identified text — each labelled with how to address it (`heading:`, `status:`,
+`text:`). Without it a suite can assert which buttons exist and nothing about what the
+application *did*, and most defects show up as a wrong value rather than a missing control: a
+basket whose total is wrong offers exactly the same controls as one whose total is right.
+
+It is a digest, not a copy of the page: capped in both the number of lines and their length,
+by the platform on arrival rather than by the driver, because it is model input whose size
+your application decides.
+
+**Two things it never sends.** The URL of your application, and the value of any password
+field. A password box reports only that something has been typed into it — which it has to,
+because an explorer that cannot tell its own typing landed types it again instead of pressing
+Sign In.
+
+> **What the page says does reach us, and is kept for the life of the session.** That is a
+> real change from "we only see button names", and it is what makes an assertion about a
+> value possible at all. The digest is landmark elements only and capped in both length and
+> number, but nothing about it understands *content*: if your test environment is a copy of
+> production, a page showing a customer's name will send that name. Seed test environments
+> with synthetic data — which is the same advice the attestation is asking you to confirm.
 
 ---
 
@@ -148,7 +186,10 @@ Three bounds, two of which cost nothing to evaluate:
 - **No progress** — if the last five steps reached no page the session had not already seen,
   it stops. The page signature generalises numeric and id-like path segments, so `/orders/41`
   and `/orders/93` are one page. It does not try to answer "is this the same page?"
-  reliably; it answers "has anything changed?", which is enough and is decidable.
+  reliably; it answers "has anything changed?", which is enough and is decidable. "Anything"
+  includes what the page says and what is currently typed into its fields — a form being
+  filled in is progress and changes nothing else, and a page that rewrites a total without
+  reloading would otherwise look stuck while it was working.
 - **The model says `done`.**
 
 A choice that gets refused does **not** consume the step budget.
@@ -164,8 +205,11 @@ CPU.
 
 As of 2026-09-15 this product has **no pricing row**, so it bills as pass-through model cost
 like every other unpriced product. That is deliberate rather than forgotten: D-404 set the
-code-based product's fee and markup against a measured baseline, and the same will be done
-here once `scripts/eval_app_testing.py` has measured what a real session costs.
+code-based product's fee and markup against a measured baseline, and the measurement for this
+one now exists — **$0.128 a session** across nine sessions on three applications, each six to
+nineteen steps. What a session costs is dominated by how many steps you allow, not by how
+large the application is, which is the opposite of the code-based product and is why the step
+cap is the number on the quote.
 
 ---
 

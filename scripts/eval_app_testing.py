@@ -33,6 +33,15 @@ What each supporting number watches
   apart: the suite saw the regression in every run and in two of three *also* failed one test on
   the working application. "Cannot see the bug" and "is not clean on a good build" are different
   defects with different fixes, and one number covering both tells nobody which is wrong.
+* `separating_tests` -- how many tests actually tell the builds apart, rather than whether any
+  does. `discriminates` is satisfied by one; this says how much of the suite is doing
+  regression work. It earned its place immediately: the first suites written after the
+  assertion fix included a direct-request test accepting a `303` as proof of refusal, and a
+  *successful* save redirects too -- so it passed on both builds while looking rigorous.
+* `failed_on_fixed` -- the tests that went red on the working application, by name and with
+  the runner's reason. The measure that matters most on this product, and the one the first
+  baseline could not answer about its own headline result because it kept only the broken
+  build's output and deleted the suite.
 * `journeys` -- how many distinct flows the explorer named. One journey from forty steps means
   it never labelled anything; forty journeys from forty steps means the labels are noise.
 * `steps` / `withheld` -- how far it got, and how much the denylist held back.
@@ -50,7 +59,31 @@ install did. That property cannot be had here: a browser suite needs `@playwrigh
 browser binary. The mitigation is the same shape instead -- the runner is probed *before* a
 model is called (`missing_runners`), and `--self-check` runs a hand-written reference suite
 through the whole harness so that "the harness cannot separate these variants" is discovered
-for free rather than after three paid sessions.
+for free rather than after three paid sessions. It covers **every** case and **fails a case
+that has none**, because a free proof that quietly stops covering new cases still reports
+PASS.
+
+The three cases, and why these three
+------------------------------------
+Three shapes rather than three samples, which is the useful direction when the count is small
+(C-95):
+
+* `task-ownership` -- server-rendered, an authorisation bug, and the separating assertions are
+  *negative*: must be refused, must not be offered. The hard part is writing those without
+  driving controls that exist only on the broken build.
+* `basket-total` -- client-rendered. The URL never changes, every click rewrites part of the
+  page, and the arithmetic bug is invisible at a quantity of one, so an explorer that adds a
+  single item and stops writes a suite that is green on both. It is also the only case
+  offering a control the action policy must withhold.
+* `signup-wizard` -- depth. A three-step form whose defect no single page shows, because each
+  step is correct in isolation and only a completed journey reaches the page that is wrong.
+  It is the one case that punishes wandering, which is an exploring agent's characteristic
+  failure and is invisible in a corpus where every bug sits on one page.
+
+What none of them measures: all three are ordinary semantic HTML with real buttons, labels
+and links, deliberately, so that what they score is the agent rather than the DOM. The
+collector's handling of applications that attach click handlers to plain elements is
+therefore unmeasured here and rests on `explore_app.py --fixture` and a live run (C-97).
 """
 import argparse
 import contextlib
@@ -72,26 +105,38 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 CORPUS = os.path.join(REPO, "evals", "app_testing")
 RESULTS = os.path.join(CORPUS, "results")
 
-PROMPT_VERSION = "2026-09-15.1"
+PROMPT_VERSION = "2026-09-15.2"
 
 # Floors are set one run below the measurement, never at it (D-403): a floor set at the
 # measurement fails on a flake and then gets quietly lowered, which is how a regression gate
-# turns into a rubber stamp.
+# turns into a rubber stamp. Three runs per case, so one run below 100% is 0.66.
 #
-# **Measured 2026-09-15, 3 runs, PROMPT_VERSION 2026-09-15.1**: 8 steps and 3 journeys every
-# run, 5-6 tests, every assertion checking behaviour rather than that a page loaded, 4-5 of
-# them traced to the supplied requirement. `ran` 100%. `detects_break` 100% -- the suite found
-# more failures on the broken build than on the fixed one in all three. **`discriminates` 33%**,
-# because in two of the three runs exactly one test also failed on the *working* application.
+# **Measured 2026-09-15, PROMPT_VERSION 2026-09-15.2, 9 sessions (3 per case), $1.15 total
+# and $0.128 a session.** `discriminates` **9 of 9**, `detects_break` 9 of 9, `ran` 9 of 9,
+# and **no test failed on the working application in any run**.
 #
-# So there is deliberately **no `discriminates` floor yet**. One run in three is not a gate:
-# set at the measurement it fails on any flake, and one run below it is zero, which gates
-# nothing. Writing a number there to make the file look finished would be the rubber stamp
-# this comment exists to prevent. The two floors below are real, and the honest statement of
-# where this product stands is that it reliably sees a regression and does not yet reliably
-# leave a good build green.
+#   task-ownership   11-19 steps, 3 journeys, 8-11 tests, 1-3 of them separating
+#   basket-total      6-7 steps, 1 journey, 6-7 tests, 5-6 of them separating, 6-7 controls
+#                     withheld -- the first scored runs in which the denylist did anything
+#   signup-wizard     7 steps, 1 journey, 4 tests, 2-3 of them separating
+#
+# The first baseline on this corpus was `discriminates` **33%** on the one case that then
+# existed (`results/2026-09-15-first-baseline-one-case.json`), and the gap between the two is
+# the session's actual work rather than a prompt tidy-up: a negative assertion that drove
+# controls existing only on the broken build, an explorer that could see no page text and so
+# could not assert a value, a login it could not get past because a password field reported
+# itself empty however much had been typed into it, a cleanup hook that hung, and a suite of
+# zero files stored as a success. Each was found by a run and fixed; D-411 through D-417
+# carry the detail.
+#
+# A floor is now worth setting, which it was not at 33% -- one run below that measurement is
+# zero and gates nothing. Read them as "this has stopped working" detectors, not as a claim
+# that the product is finished: three cases is a count and not a percentage (C-95), and none
+# of them exercises the collector work these numbers depend on (C-97).
 FLOORS = {
-    "task-ownership": {"ran": 0.66, "detects_break": 0.66},
+    "task-ownership": {"ran": 0.66, "detects_break": 0.66, "discriminates": 0.66},
+    "basket-total": {"ran": 0.66, "detects_break": 0.66, "discriminates": 0.66},
+    "signup-wizard": {"ran": 0.66, "detects_break": 0.66, "discriminates": 0.66},
 }
 
 _JUNK_DIRS = ("node_modules", ".git", "lm-test-results", "__pycache__", ".pytest_cache")
@@ -274,13 +319,12 @@ def explore(client, headers, spec, base_url, max_steps, verbose=True):
         try:
             page.goto(base_url, wait_until="domcontentloaded", timeout=15000)
             for _ in range(max_steps * 2):
-                path, title, raw = explore_app.observe(page)
+                path, title, raw, texts = explore_app.observe(page)
                 reply = client.post(
                     "/api/v1/app-testing/sessions/" + session_id + "/step",
                     json={"url_path": path, "page_title": title,
-                          "candidates": [{"role": c["role"], "name": c["name"],
-                                          "value": c["value"], "enabled": c["enabled"]}
-                                         for c in raw],
+                          "candidates": explore_app.candidate_payload(raw),
+                          "page_texts": texts,
                           "last_outcome": last_outcome,
                           "credentials_note": credentials_note},
                     headers=headers)
@@ -413,8 +457,19 @@ def run_suite(result, base_url, node_cache):
 
 # Phrases that mean an assertion checked nothing about behaviour. The C-66 measure for this
 # product: a suite of twelve tests that all assert a URL is a green suite proving nothing.
+# Widened after a live run against a real application, where a session with no requirement
+# supplied produced eleven tests of which nine were some form of "the button is visible" --
+# and only one of those phrasings was on the original list. A suite can be entirely composed
+# of presence checks and score as though it checked behaviour.
+#
+# Deliberately biased towards calling an assertion hollow. "the error message naming the
+# field is visible" is a real check and will be counted as hollow by this, which understates
+# the number; the opposite error flatters a suite that proves nothing, and this measure
+# exists precisely because that is the failure to fear. It is reported, never a floor.
 _HOLLOW = ("page loaded", "page loads", "loads successfully", "url changed", "navigates to",
-           "element exists", "element is visible", "is displayed", "renders", "no errors")
+           "element exists", "element is visible", "is displayed", "renders", "no errors",
+           "is visible", "are visible", "is present", "are present", "remains visible",
+           "remain visible", "still visible", "still present", "is shown", "appears on")
 
 
 def meaningful(basis_rows):
@@ -424,6 +479,24 @@ def meaningful(basis_rows):
         if text and not any(p in text for p in _HOLLOW):
             hits += 1
     return hits
+
+
+def _failures(run):
+    """Which tests failed, by name, with what the runner said about each.
+
+    The first baseline recorded only the broken build's output tail and then deleted the
+    suite, so when the headline finding turned out to be "one test also fails on the working
+    application" there was no record of *which* test or why -- the evidence for the finding
+    had to be reproduced by hand afterwards. A run that costs money should not have to be
+    paid for twice to answer the obvious next question.
+    """
+    out = []
+    for row in run.get("rows") or []:
+        if row.get("status") in ("failed", "errored"):
+            out.append({"name": row.get("name", ""),
+                        "file": row.get("file", ""),
+                        "why": " ".join(str(row.get("message") or "").split())[:240]})
+    return out
 
 
 def score(result, session_stats, broken, fixed):
@@ -465,8 +538,55 @@ def score(result, session_stats, broken, fixed):
         "specified_count": result.get("specified_count", 0),
         "observed_count": result.get("observed_count", 0),
         "downgraded": result.get("assertions_downgraded", 0),
+        # `failed_on_fixed` is the important one and is listed first for that reason: it is
+        # the noisy-assertion measure, and every entry in it is a test that would go red on
+        # a customer's good build.
+        "failed_on_fixed": _failures(fixed),
+        "failed_on_broken": _failures(broken),
+        # How many tests actually separate the builds, rather than whether any does.
+        # `discriminates` is satisfied by a single test; this says how much of the suite is
+        # doing regression work. The first measurement after the assertion fix showed why it
+        # is worth reporting: two runs wrote a direct-request test that accepted a 303 as
+        # proof of refusal, and a *successful* save redirects too -- so the test passed on
+        # both builds and proved nothing while looking rigorous (C-66 in a new costume).
+        "separating_tests": len(
+            set(r["name"] for r in _failures(broken))
+            - set(r["name"] for r in _failures(fixed))),
         "broken_tail": (broken.get("tail") or "")[-300:],
+        "fixed_tail": (fixed.get("tail") or "")[-300:],
     }
+
+
+def keep_suite(out_dir, case, attempt, result):
+    """Save what the model wrote, beside the scores.
+
+    A generated suite is the evidence for every number in the report, and the first baseline
+    threw it away: the database it was written to was a throwaway deleted at the end of the
+    run, so when the result needed explaining there was nothing left to read. Disk is
+    cheaper than a second paid run. Ignored by git (`evals/app_testing/results/suites/`).
+    """
+    folder = os.path.join(out_dir, "%s-run%d" % (case, attempt + 1))
+    try:
+        os.makedirs(folder, exist_ok=True)
+        for f in result.get("test_files") or []:
+            rel = (f.get("path") or "").strip()
+            if not rel or not _safe_rel(rel):
+                continue
+            dst = os.path.join(folder, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            io.open(dst, "w", encoding="utf-8", newline="\n").write(f.get("content") or "")
+        io.open(os.path.join(folder, "assertion_basis.json"), "w",
+                encoding="utf-8", newline="\n").write(json.dumps(
+                    result.get("assertion_basis") or [], indent=2, default=str))
+    except OSError as exc:
+        print("    (could not save the suite: %s)" % exc)
+        return ""
+    return folder
+
+
+def _safe_rel(rel):
+    from backend.services import test_runner_plan
+    return test_runner_plan.safe_path(rel)
 
 
 def _spend():
@@ -517,12 +637,19 @@ def report(runs, repeat, spend):
                   % (verdict, b["passed"], b["total"], b["failed"], b["errored"],
                      f["passed"], f["total"], f["failed"], f["errored"]))
             print("     %d test(s) in %d file(s) from %d journey(s), %d step(s), "
-                  "%d control(s) withheld"
-                  % (r["tests"], r["files"], r["journeys"], r["steps"], r["withheld"]))
+                  "%d control(s) withheld; %d test(s) separate the builds"
+                  % (r["tests"], r["files"], r["journeys"], r["steps"], r["withheld"],
+                     r.get("separating_tests", 0)))
             print("     assertions: %d/%d check behaviour, %d specified, %d observed%s"
                   % (r["meaningful_assertions"], r["assertions"], r["specified_count"],
                      r["observed_count"],
                      (", %d downgraded" % r["downgraded"]) if r["downgraded"] else ""))
+            # Named, not counted. A test that fails on the working application is the one
+            # thing in this report an operator has to read rather than tally, because it is
+            # what a customer's CI would go red on for no reason.
+            for bad in r.get("failed_on_fixed") or []:
+                print("     NOISY on the working build: %s — %s"
+                      % (bad["name"], bad["why"][:120]))
             if not r["ran"] and r.get("broken_tail"):
                 print("     runner said: " + r["broken_tail"][-200:])
         rate_disc = sum(1 for r in produced if r["discriminates"]) / len(produced)
@@ -556,15 +683,20 @@ def report(runs, repeat, spend):
         for line in failures:
             print("  - " + line)
     return 1 if failures else 0
-
-
 # ── Self-check ──────────────────────────────────────────────────────────────
 
-# A suite a person wrote, asserting exactly the behaviour the case is about. It exists so the
-# harness can be proved without calling the model -- the same reason `run_tests.py --fixture`
-# exists. If this does not discriminate, nothing the agent writes can, and finding that out
-# after paying for three sessions is the avoidable version of the result.
-REFERENCE_SUITE = """const { test, expect } = require('@playwright/test');
+# One hand-written suite per case, asserting exactly the behaviour that case is about. They
+# exist so the harness can be proved without calling the model -- the same reason
+# `run_tests.py --fixture` exists. If a reference suite does not separate a case's two
+# variants, nothing the agent writes for that case can either, and finding that out after
+# paying for three sessions is the avoidable version of the result.
+#
+# Every case needs one. A case with no reference here fails `--self-check` rather than being
+# skipped: a free proof that quietly stops covering new cases is worse than no proof, because
+# it still reports PASS.
+REFERENCE_SUITES = {
+
+    "task-ownership": """const { test, expect } = require('@playwright/test');
 
 async function signIn(page, user, password) {
   await page.goto('/');
@@ -585,48 +717,126 @@ test('another user is offered no way to change a task they do not own', async ({
   await page.getByRole('link', { name: 'Book the venue' }).click();
   await expect(page.getByRole('button', { name: 'Save changes' })).toHaveCount(0);
 });
-"""
+""",
+
+    # Asserts the arithmetic at a quantity of two, which is the only place the defect shows.
+    # A reference suite that added one of something would be green on both variants, which is
+    # exactly the mistake the case is built to catch an agent making.
+    "basket-total": """const { test, expect } = require('@playwright/test');
+
+test('a basket line costs its price times the quantity', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add Widget' }).click();
+  await page.getByRole('button', { name: 'One more Widget' }).click();
+  await expect(page.getByRole('status')).toHaveText('GBP 8.00');
+});
+
+test('taking away the last of an item empties the basket', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Add Gadget' }).click();
+  await page.getByRole('button', { name: 'One fewer Gadget' }).click();
+  await expect(page.getByText('Your basket is empty.')).toBeVisible();
+  await expect(page.getByRole('status')).toHaveText('GBP 0.00');
+});
+""",
+
+    # Walks the whole flow. Nothing shorter can separate the variants: the defect is only
+    # visible at step three, and only to a session that arrived there with a completed draft.
+    "signup-wizard": """const { test, expect } = require('@playwright/test');
+
+test('the review step shows what the earlier steps collected', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('Full name').fill('Alice Green');
+  await page.getByLabel('Email address').fill('alice.green@example.com');
+  await page.getByRole('button', { name: 'Continue' }).click();
+
+  await page.getByLabel('Street').fill('12 Mill Lane');
+  await page.getByLabel('Town or city').fill('Harrogate');
+  await page.getByRole('button', { name: 'Continue' }).click();
+
+  await expect(page.getByText('Name: Alice Green')).toBeVisible();
+  await expect(page.getByText('Email: alice.green@example.com')).toBeVisible();
+  await expect(page.getByText('Street: 12 Mill Lane')).toBeVisible();
+});
+
+test('the confirmation names the person who signed up', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('Full name').fill('Bob Shah');
+  await page.getByLabel('Email address').fill('bob.shah@example.com');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByLabel('Street').fill('4 Fore Street');
+  await page.getByLabel('Town or city').fill('Truro');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await page.getByRole('button', { name: 'Create account' }).click();
+
+  await expect(page.getByText('Account created for Bob Shah (bob.shah@example.com).'))
+    .toBeVisible();
+});
+""",
+}
 
 
-def self_check(node_cache):
-    """Run the reference suite against both variants and report whether it separates them."""
-    specs = cases()
+def self_check(node_cache, specs):
+    """Run each case's reference suite against both of its variants. Free, calls no model."""
     if not specs:
         print("No cases to check.")
         return 1
-    spec = specs[0]
-    print("Self-check on %s — a hand-written suite, no model, nothing spent.\n" % spec["name"])
-    result = {"test_files": [{
-        "path": "reference.spec.js", "framework": "Playwright",
-        "content": REFERENCE_SUITE,
-        "test_names": ["the owner is offered an edit form on their own task",
-                       "another user is offered no way to change a task they do not own"]}]}
-    with serving(spec, "fixed") as (base, _w):
-        fixed = run_suite(result, base, node_cache)
-    with serving(spec, "source") as (base, _w):
-        broken = run_suite(result, base, node_cache)
 
-    f, b = fixed["summary"], broken["summary"]
-    print("  fixed   %d/%d passed, %d failed, %d errored  (exit %s)"
-          % (f["passed"], f["total"], f["failed"], f["errored"], fixed["exit"]))
-    print("  broken  %d/%d passed, %d failed, %d errored  (exit %s)"
-          % (b["passed"], b["total"], b["failed"], b["errored"], broken["exit"]))
-    ok_ran = f["total"] > 0 and b["total"] > 0
-    ok_green = f["total"] > 0 and f["failed"] == 0 and f["errored"] == 0
-    ok_red = b["total"] > 0 and (b["failed"] + b["errored"]) > 0
-    print()
-    print("  %s  the suite runs against both variants" % ("PASS" if ok_ran else "FAIL"))
-    print("  %s  it is green on the fixed application" % ("PASS" if ok_green else "FAIL"))
-    print("  %s  it is red on the broken one" % ("PASS" if ok_red else "FAIL"))
-    if not (ok_ran and ok_green and ok_red):
-        print("\n  The harness cannot separate the variants, so a live run would measure the\n"
-              "  harness rather than the agent. Fix this before spending.")
-        if broken.get("tail"):
-            print("\n  runner said:\n" + broken["tail"][-900:])
+    print("Self-check: hand-written suites, no model, nothing spent.\n")
+    failures = []
+    for spec in specs:
+        name = spec["name"]
+        content = REFERENCE_SUITES.get(name)
+        print("%s" % name)
+        if not content:
+            print("  FAIL  no reference suite — this case cannot be proved before spending")
+            failures.append(name + ": no reference suite in REFERENCE_SUITES")
+            continue
+
+        result = {"test_files": [{"path": "reference.spec.js", "framework": "Playwright",
+                                  "content": content}]}
+        try:
+            with serving(spec, "fixed") as (base, _w):
+                fixed = run_suite(result, base, node_cache)
+            with serving(spec, "source") as (base, _w):
+                broken = run_suite(result, base, node_cache)
+        except Exception as exc:
+            print("  FAIL  could not serve or run: %s" % exc)
+            failures.append("%s: %s" % (name, exc))
+            continue
+
+        f, b = fixed["summary"], broken["summary"]
+        print("  fixed   %d/%d passed, %d failed, %d errored  (exit %s)"
+              % (f["passed"], f["total"], f["failed"], f["errored"], fixed["exit"]))
+        print("  broken  %d/%d passed, %d failed, %d errored  (exit %s)"
+              % (b["passed"], b["total"], b["failed"], b["errored"], broken["exit"]))
+        ok_ran = f["total"] > 0 and b["total"] > 0
+        ok_green = f["total"] > 0 and f["failed"] == 0 and f["errored"] == 0
+        ok_red = b["total"] > 0 and (b["failed"] + b["errored"]) > 0
+        print("  %s  the suite runs against both variants" % ("PASS" if ok_ran else "FAIL"))
+        print("  %s  it is green on the fixed application" % ("PASS" if ok_green else "FAIL"))
+        print("  %s  it is red on the broken one" % ("PASS" if ok_red else "FAIL"))
+        if not (ok_ran and ok_green and ok_red):
+            failures.append(name + ": the reference suite does not separate the variants")
+            for label, run in (("fixed", fixed), ("broken", broken)):
+                for row in run.get("rows") or []:
+                    if row.get("status") in ("failed", "errored"):
+                        print("    %s failed: %s — %s"
+                              % (label, row.get("name", ""),
+                                 " ".join(str(row.get("message") or "").split())[:200]))
+            if not ok_ran and broken.get("tail"):
+                print("    runner said: " + broken["tail"][-500:])
+        print()
+
+    if failures:
+        print("The harness cannot separate the variants for %d case(s), so a live run would\n"
+              "measure the harness rather than the agent. Fix this before spending.\n"
+              % len(failures))
+        for line in failures:
+            print("  - " + line)
         return 1
-    print("\n  The harness separates the variants. A live run measures the agent.")
+    print("The harness separates every case. A live run measures the agent.")
     return 0
-
 
 # ── Entry point ─────────────────────────────────────────────────────────────
 
@@ -664,7 +874,7 @@ def main():
     node_cache = ensure_node_playwright()
 
     if args.self_check:
-        return self_check(node_cache)
+        return self_check(node_cache, specs)
 
     # A throwaway database, so the spend query sees this run and nothing else.
     db = os.path.join(tempfile.gettempdir(), "eval_app_%d.db" % os.getpid())
@@ -680,6 +890,9 @@ def main():
 
     database.init_db()
     main_app._init_default_admin()
+
+    stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%SZ")
+    suites_dir = os.path.join(RESULTS, "suites", stamp)
 
     total = len(specs) * args.repeat
     print("%d case(s) x %d run(s) = %d session(s)." % (len(specs), args.repeat, total))
@@ -721,6 +934,7 @@ def main():
 
                     row = score(result, stats, broken, fixed)
                     row["review_id"] = result.get("review_id")
+                    row["suite_kept"] = keep_suite(suites_dir, spec["name"], attempt, result)
                     runs[spec["name"]].append(row)
                     print("    %d test(s), broken=%s, fixed=%s, discriminates=%s\n"
                           % (row["tests"],
@@ -735,8 +949,7 @@ def main():
 
     code = report(runs, args.repeat, spend)
 
-    out = args.out or os.path.join(
-        RESULTS, datetime.datetime.now().strftime("%Y%m%dT%H%M%SZ") + ".json")
+    out = args.out or os.path.join(RESULTS, stamp + ".json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     io.open(out, "w", encoding="utf-8", newline="\n").write(json.dumps({
         "prompt_version": PROMPT_VERSION,
@@ -749,6 +962,8 @@ def main():
         "runs": runs,
     }, indent=2, default=str))
     print("Written to " + out)
+    if os.path.isdir(suites_dir):
+        print("Suites kept in " + suites_dir)
     with contextlib.suppress(OSError):
         os.remove(db)
     return code
