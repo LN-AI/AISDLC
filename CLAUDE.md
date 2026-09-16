@@ -226,7 +226,15 @@ can assert which buttons exist and nothing about what the application did — a 
 total is wrong offers exactly the same controls as one whose total is right. Each candidate
 carries **how to address it** and, for a submit control, **what request its form sends**
 (D-415), both sanitised by the route, because `getByRole` resolves through the accessibility
-tree and finds nothing for an `<li>` that merely behaves like a button. And a clickable
+tree and finds nothing for an `<li>` that merely behaves like a button. **The name it carries
+has to be the one that tree computes** (D-427): the first two live sessions against public
+applications each produced a suite in which every test timed out on the shared sign-in helper,
+because an `<input type="submit">` was named from its `name` attribute rather than its `value`.
+Read that row before touching the name chain — a name that looks plausible and resolves to
+nothing is the whole failure, so the fixture asserts that Playwright finds exactly one element
+rather than that the string looks right. What a page *says* has the same problem still open
+(C-100): the text selector leans on `[id]`, and on an application carrying classes instead it
+collected the navigation chrome and none of the prices. And a clickable
 element is a candidate even when it is not a control (D-414): pointed at this platform's own
 interface, the explorer was offered **two** controls after signing in — the whole navigation
 is `<li data-page=…>` with a click handler — and spent twenty-two of twenty-five steps

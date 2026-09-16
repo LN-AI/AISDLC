@@ -190,22 +190,60 @@ COLLECT_JS = r"""
       } else role = 'button';
     }
 
+    // The name has to be the name the *accessibility tree* would compute, because that is
+    // what `getByRole` resolves against. Getting a different string that merely identifies
+    // the element is not a near miss -- it produces a locator matching nothing.
+    //
+    // `<input type="submit">` is where that went wrong on both of the first two real
+    // applications. Its accessible name is its `value` (HTML-AAM), and this chain did not
+    // look at `value` at all: it fell through to the `name` *attribute*, which is a form
+    // field name and never an accessible name. SauceDemo's
+    // `<input type="submit" id="login-button" name="login-button" value="Login">` was
+    // therefore offered as "login-button", the suite was written against
+    // `getByRole('button', { name: 'login-button' })`, and all 18 of its tests timed out on
+    // that one line without reaching a single assertion. ParaBank's login button carries no
+    // `name` attribute at all, so it was offered with an empty name and the suite got
+    // `getByRole('button', { name: '' })`. The right string was present the whole time, in
+    // the `value` field, where it meant "what somebody typed here".
+    const isButtonish = tag === 'input'
+                     && (itype === 'submit' || itype === 'button' || itype === 'reset');
+
     let name = el.getAttribute('aria-label') || '';
+    let nameIsAccessible = !!name;
     const lbId = el.getAttribute('aria-labelledby');
     if (!name && lbId) {
       const lb = document.getElementById(lbId);
-      if (lb) name = lb.textContent || '';
+      if (lb) { name = lb.textContent || ''; nameIsAccessible = !!name; }
+    }
+    if (!name && isButtonish) {
+      // A submit control with no value reads as "Submit" to a screen reader, and to
+      // Playwright.
+      name = el.getAttribute('value') || (itype === 'submit' ? 'Submit' : '');
+      nameIsAccessible = !!name;
     }
     if (!name && el.id) {
       try {
         const lab = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
-        if (lab) name = lab.textContent || '';
+        if (lab) { name = lab.textContent || ''; nameIsAccessible = !!name; }
       } catch (e) { /* malformed id */ }
     }
-    if (!name && el.closest && el.closest('label')) name = el.closest('label').textContent || '';
-    if (!name) name = el.getAttribute('placeholder') || el.getAttribute('title') || '';
-    if (!name && tag !== 'input') name = el.textContent || '';
-    if (!name) name = el.getAttribute('name') || '';
+    if (!name && el.closest && el.closest('label')) {
+      name = el.closest('label').textContent || '';
+      nameIsAccessible = !!name;
+    }
+    if (!name) {
+      // Both are genuine accessible-name fallbacks, so a role locator still resolves.
+      name = el.getAttribute('placeholder') || el.getAttribute('title') || '';
+      nameIsAccessible = !!name;
+    }
+    if (!name && tag !== 'input') { name = el.textContent || ''; nameIsAccessible = !!name; }
+    if (!name) {
+      // Last resort, and deliberately *not* an accessible name: it is kept only so the
+      // control has something the denylist can read and a person can recognise. The flag
+      // is what stops it being turned into a role locator below.
+      name = el.getAttribute('name') || '';
+      nameIsAccessible = false;
+    }
     name = name.replace(/\s+/g, ' ').trim().slice(0, 120);
 
     // A password value is never read out of the page. It cannot be leaked by a transcript
@@ -222,6 +260,11 @@ COLLECT_JS = r"""
     let value = '';
     if (isPassword) {
       value = (el.value ? '(a value has been entered)' : '');
+    } else if (isButtonish) {
+      // A button's `value` is its label, not an entry. Reported as a value it says
+      // "Login has already been typed in here", which is both false and a reason not to
+      // press it.
+      value = '';
     } else if (tag === 'input' || tag === 'textarea' || tag === 'select') {
       value = String(el.value == null ? '' : el.value).slice(0, 60);
     }
@@ -266,7 +309,14 @@ COLLECT_JS = r"""
                      || (tag === 'a' && el.hasAttribute('href'))
                      || ['button', 'input', 'select', 'textarea', 'summary'].includes(tag);
     let locator = '';
-    if (name) {
+    if (name && !nameIsAccessible) {
+      // The name came off the `name` attribute, so neither `getByRole` nor `getByText`
+      // can find it -- one resolves through the accessibility tree and the other through
+      // rendered text, and this string is in neither. An attribute selector is the only
+      // honest answer, and it is a durable one.
+      const sel = (tag === 'input' || tag === 'select' || tag === 'textarea') ? tag : '*';
+      locator = "locator(\"" + sel + "[name='" + esc(name) + "']\")";
+    } else if (name) {
       locator = (hasRealRole && ROLE_IS_REAL.includes(role))
         ? "getByRole('" + role + "', { name: '" + esc(name) + "' })"
         : "getByText('" + esc(name) + "', { exact: true })";
@@ -537,6 +587,20 @@ FIXTURE_PAGES = {
 <button onclick="alert(1)">Delete account</button>
 <a href="/logout.html">Log out</a>
 """,
+    "signin.html": """<!doctype html><title>Sign in</title>
+<h1>Sign in</h1>
+<form action="/list.html">
+<label for="u">Username</label><input id="u" name="user-name">
+<label for="p">Password</label><input id="p" name="password" type="password">
+<!-- SauceDemo's shape: a `name` attribute that is not the accessible name, and a `value`
+     that is. Offered as "login-button", a whole generated suite timed out on one line. -->
+<input type="submit" id="login-button" name="login-button" value="Login">
+<!-- ParaBank's shape: no `name` attribute at all, so the old chain produced "". -->
+<input type="submit" value="Log In">
+<!-- No value either: the tree calls this one "Submit". -->
+<input type="submit">
+</form>
+""",
     "list.html": """<!doctype html><title>Items</title>
 <h1>Items</h1><ul><li>Widget</li><li>Gadget</li></ul>
 <a href="/index.html">Home</a><button>Place order</button>
@@ -644,6 +708,46 @@ def fixture():
             check("a purchase control is withheld",
                   "Place order" in [r["name"] for r in refused2],
                   [r["name"] for r in refused2])
+
+
+            # ── A control's name has to be the one the accessibility tree computes ──
+            #
+            # Nothing else in this fixture is an `<input type="submit">`, and that is the
+            # only shape the defect fires on: the name chain skipped `value` and fell back
+            # to the `name` *attribute*, which no locator can resolve. Two live sessions
+            # against two public applications each produced a suite that could not run a
+            # single test. Both were `<input type="submit">`.
+            page.goto(base + "/signin.html", wait_until="domcontentloaded")
+            _p3, _t3, raw3, _x3 = observe(page)
+            by_name = {c["name"]: c for c in raw3}
+
+            check("a submit button is named by its value, not its name attribute",
+                  "Login" in by_name and "login-button" not in by_name,
+                  sorted(by_name))
+            check("...including one with no name attribute at all",
+                  "Log In" in by_name, sorted(by_name))
+            check("...and one with no value either is named as the tree names it",
+                  "Submit" in by_name, sorted(by_name))
+
+            # The check that actually matters: Playwright has to find it. A name that looks
+            # plausible and resolves to nothing is the failure being guarded against, and
+            # only resolution can tell the two apart.
+            for _nm in ("Login", "Log In", "Submit"):
+                _hits = page.get_by_role("button", name=_nm, exact=True).count()
+                check(f"getByRole('button', {{name: '{_nm}'}}) resolves", _hits == 1,
+                      f"matched {_hits} element(s)")
+
+            check("the offered locator is the one that resolves",
+                  by_name["Login"]["locator"] == "getByRole('button', { name: 'Login' })",
+                  by_name["Login"]["locator"])
+            check("a button reports no typed-in value",
+                  by_name["Login"]["value"] == "",
+                  "a button's value is its label, and reporting it as an entry says the "
+                  "form is already filled")
+
+            # A text field still keeps the label-driven name it always had.
+            check("a labelled input is still named by its label",
+                  "Username" in by_name and "Password" in by_name, sorted(by_name))
 
             # The request a form control actually sends. Without this a test for "the server
             # refuses that" has to invent a path, and the measured baseline showed what
