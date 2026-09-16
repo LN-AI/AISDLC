@@ -3883,6 +3883,42 @@ check('a live session shows a stop that is requested but not yet taken', () => {
          'the browser is on another machine and the screen has to say so');
 });
 
+check('a session that stopped without a suite offers to write one from what it did', () => {
+  sandbox.renderAppSession(
+    { id: 's2', status: 'finished', steps_used: 6, max_steps: 40, target_label: 'staging',
+      journeys: [], refusals: [], review_id: null },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('stopped without writing a suite'), 'the state is not named');
+  assert(html.includes('were charged for'),
+         'the steps were paid for, and that is the reason to salvage rather than restart');
+  assert(html.includes('Write the suite from these 6 step(s)'), 'no way to recover the spend');
+  assert(html.includes('cannot be reopened'),
+         'the boundary has to be stated: the browser is on another machine');
+});
+
+check('a session that took no steps says nothing was billed', () => {
+  sandbox.renderAppSession(
+    { id: 's3', status: 'finished', steps_used: 0, max_steps: 40, target_label: 'staging',
+      journeys: [], refusals: [], review_id: null },
+    []);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('nothing was billed'),
+         'the first thing somebody with a dead session wants to know');
+  assert(!html.includes('Write the suite'), 'there is nothing to write a suite from');
+});
+
+check('a session that already has a suite points at it instead of offering another', () => {
+  sandbox.renderAppSession(
+    { id: 's4', status: 'generated', steps_used: 6, max_steps: 40, target_label: 'staging',
+      journeys: [], refusals: [], review_id: 'rev-9' },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('Open it'), 'the suite it produced is unreachable from here');
+  assert(!html.includes('Write the suite from'),
+         'a second generation orphans the first suite, which may already be delivered');
+});
+
 check('what the policy withheld is shown, with the cost of it in both directions', () => {
   sandbox.renderAppSession(
     { id: 's1', status: 'finished', steps_used: 9, max_steps: 40, target_label: 'staging',

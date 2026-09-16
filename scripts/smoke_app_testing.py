@@ -993,6 +993,19 @@ def main_():
     check("a stopped session can still write a suite from the steps it took",
           salvage.status_code == 200, salvage.text[:200])
 
+    # A second generation writes a second `reviews` row and repoints `review_id` at it,
+    # leaving the first unreachable from the session that produced it -- including one
+    # already delivered to a repository. Latent while nothing in the browser could call this
+    # route; the screen now offers it for a session that stopped, so it is refused here
+    # rather than left to the UI being careful.
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    twice = client.post(f"/api/v1/app-testing/sessions/{stoppable}/generate",
+                        json={}, headers=scoped)
+    check("...but not a second one, which would orphan the first",
+          twice.status_code == 400 and "already written" in twice.text,
+          twice.text[:200])
+
     # ── 17. What was withheld, by name ────────────────────────────────────
     #
     # The counts were always kept and the names always discarded, so the record could say

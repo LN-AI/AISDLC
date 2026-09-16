@@ -672,6 +672,19 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
             "generated from an empty session would be invented rather than observed.",
         )
 
+    # A second generation writes a second `reviews` row and repoints `review_id` at it,
+    # orphaning the first -- a suite somebody may already have delivered to a repository,
+    # now unreachable from the session that produced it. Harmless while nothing in the
+    # browser could call this route; the screen now offers it for abandoned sessions, so it
+    # is refused here rather than left to the UI being careful.
+    if session.get("review_id"):
+        raise HTTPException(
+            400,
+            "This session has already written a suite. Open it rather than generating a "
+            "second one - a second generation would leave the first unreachable from this "
+            "session, including one that has already been delivered to a repository.",
+        )
+
     try:
         result = agent_guard.guarded_call(
             caller, PRODUCT, override,

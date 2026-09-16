@@ -6,7 +6,7 @@ have found**, **what we have not thought about yet**, and **what is suggested ne
 Everything below is written for a reader who does not work on the code. Where a decision is
 yours rather than mine it says so.
 
-Last updated: 2026-09-15.
+Last updated: 2026-09-16.
 
 ---
 
@@ -142,6 +142,36 @@ visible.
 the platform pushes the claim down to whatever the session could actually support.
 
 ---
+
+## What was built on 2026-09-16 — the screen
+
+Before pointing this at a real customer application we looked at the screen a customer would
+use, and found that **three of its inputs never reached the session at all**. The requirement
+you typed was not sent anywhere: the command it printed referred to a file nobody was told to
+create, so a first run died on a missing path. The command never named the project, so the
+session was filed under nothing, the earlier runs you ticked came back as "no such run", and
+the project's uploaded documents were never read. The compulsory-basis feature built the day
+before was, from the screen, unreachable.
+
+That is fixed, and with it:
+
+- **You can watch a session happen.** Step by step, live, with a plain sentence saying what it
+  just did.
+- **And see what is *not* happening** — "the last 4 steps reached no page it had not already
+  seen", "it has been moving between two pages for 18 steps". The 25-step session that went in
+  circles would have been visible within seconds.
+- **You can stop one.** It lands at the next step, not instantly, and the button says so.
+- **You can see what was withheld** — by name, and grouped by why. This was recorded nowhere
+  and is the product's main safety story. It reads in both directions: half a page withheld is
+  a coverage problem, not a safety win.
+- **Sessions that died are visible**, with an honest note about whether anything was billed,
+  and an offer to write the suite from the steps they did take.
+- **The tick box is now the declaration.** The script used to assert "this is a test
+  environment" on your behalf regardless of what you ticked.
+
+Two promises that were not being kept, now kept: an abandoned session's page content was never
+deleted (the code said it would be; the line underneath excluded exactly that case), and it now
+expires on **the window you chose**, with zero meaning zero.
 
 ## What we have not thought about yet
 

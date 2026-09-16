@@ -3221,6 +3221,7 @@ function renderAppSession(session, steps) {
         <div class="field-hint">It lands at a step boundary — usually seconds, up to about
           twenty if the browser is part way through loading a page. The browser window stays
           open on the machine driving it; this platform cannot close it.</div>` : ''}
+      ${_appSalvage(session, steps)}
     </div>
     ${renderAppStalls(steps, session)}
     ${renderAppRefusals(session)}
@@ -3343,6 +3344,97 @@ function renderAppRefusals(session) {
         <td>${esc(r.name)}</td><td>${esc(r.group || '')}</td><td>${r.count}</td>
       </tr>`).join('')}</tbody>
     </table>`;
+}
+
+/** What can be done about a session that has stopped.
+ *
+ *  A session whose browser was closed half way through has steps that were paid for and no
+ *  suite. Writing one from those steps is the only thing that recovers that spend, and
+ *  until now nothing in the browser could call the route that does it. */
+function _appSalvage(session, steps) {
+  if (session.status === 'exploring') return '';
+  const took = (steps || []).length || session.steps_used || 0;
+  if (session.review_id) {
+    return `<div class="field-hint" style="margin-top:8px">A suite was written from this
+      session. <a href="#/app-testing/run/${esc(session.review_id)}">Open it</a>.</div>`;
+  }
+  if (!took) {
+    return `<div class="field-hint" style="margin-top:8px">This session took no steps, so
+      there is nothing to write a suite from — and <b>nothing was billed</b>: opening a
+      session is free and only steps call the model.
+      <button class="btn btn-link" style="font-size:11px;padding:0"
+              onclick="restartAppSession('${jsArg(session.id)}')">Start again with these
+        settings</button></div>`;
+  }
+  const pages = new Set((steps || []).map(s => s.page_signature || '')).size;
+  return `
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-top:8px">
+      <b>This session stopped without writing a suite</b>, and the ${took} step(s) it took
+      were charged for. A suite can still be written from them.
+      ${pages <= 2 ? `<div style="margin-top:4px">Be warned: those steps covered only
+        ${pages} distinct page(s), so a suite from them will cover very little.</div>` : ''}
+      <div class="form-actions" style="margin-top:8px">
+        <button class="btn btn-secondary"
+                onclick="generateFromAppSession('${jsArg(session.id)}', ${took})">
+          Write the suite from these ${took} step(s)</button>
+        <button class="btn btn-link"
+                onclick="restartAppSession('${jsArg(session.id)}')">Start again with these
+          settings</button>
+      </div>
+      <div class="field-hint">Writing the suite is one large model call and is charged like
+        any other. What cannot be done from here: the browser that was driving this is on
+        another machine, so it cannot be reopened, resumed or pointed somewhere else.</div>
+    </div>`;
+}
+
+async function generateFromAppSession(sessionId, steps) {
+  if (!confirm(`Write a Playwright suite from the ${steps} step(s) this session took?\n\n`
+             + 'This is one large model call and is charged like any other run.')) return;
+  showLoading('Writing the suite…');
+  try {
+    const r = await apiFetch(
+      `/api/v1/app-testing/sessions/${encodeURIComponent(sessionId)}/generate`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    renderAppTesting('app-testing-result', r);
+    loadAgentRuns('app-testing');
+    loadAppTestingSessions();
+    _appSessionTick();
+  } catch (e) {
+    alert(`Could not write a suite: ${e.message}`);
+  } finally {
+    hideLoading();
+  }
+}
+
+/** Put this session's settings back on the form, so the command can be rebuilt.
+ *
+ *  Client-only: there is nothing to re-open, because the session that matters is the
+ *  browser on somebody else's machine. What this recovers is the typing. */
+async function restartAppSession(sessionId) {
+  let d;
+  try {
+    d = await apiFetch(`/api/v1/app-testing/sessions/${encodeURIComponent(sessionId)}`,
+                       { _silent: true });
+  } catch (e) {
+    alert(`Could not read that session: ${e.message}`);
+    return;
+  }
+  const s = d.session || {};
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.value = value;
+  };
+  set('app-testing-goal', s.goal || '');
+  set('app-testing-steps', s.max_steps || 40);
+  set('app-testing-requirement', s.requirement || '');
+  set('app-testing-retention', String(s.page_text_retention_days ?? 7));
+  const reads = document.getElementById('app-testing-page-text');
+  if (reads) reads.checked = s.collect_page_text !== false;
+  _appTestingChosen = (s.source_review_ids || []).slice();
+  renderAppTestingChosen();
+  renderAppTestingCommand();
+  const form = document.querySelector('#page-app-testing .form-card');
+  if (form && form.scrollIntoView) form.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 async function requestAppStop(sessionId) {
