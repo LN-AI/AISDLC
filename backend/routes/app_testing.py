@@ -268,6 +268,29 @@ def _visible_session(session_id: str, caller: dict) -> dict:
     return session
 
 
+def _outcomes_by_step(steps: List[dict]) -> dict:
+    """What each step's action actually *did*, keyed by position in `steps`.
+
+    An outcome can only be known by looking at the page again, so the driver sends it with
+    the following request and the route stores it on the step it is creating -- `StepRequest`
+    calls the field "what happened when the previous action ran". The column on step N
+    therefore describes step N-1.
+
+    Reading it off the step it sits on does not merely mislabel a display. It tells the
+    suite writer something false about the application, and the first live session against a
+    public shop shows the cost exactly: step 3 clicked **Login**, and the outcome stored
+    beside it was `filled Password; still on /`. The model was told, in as many words, that
+    signing in went nowhere. It then invented a landing assertion for the sign-in helper --
+    a heading that does not exist on that page -- and every test in the suite failed on that
+    one line.
+    """
+    shifted = {}
+    for i, _step in enumerate(steps):
+        nxt = steps[i + 1] if i + 1 < len(steps) else None
+        shifted[i] = (nxt or {}).get("outcome") or ""
+    return shifted
+
+
 def _history(steps: List[dict], limit: int = 12) -> str:
     """The last few steps, as one line each.
 
@@ -276,13 +299,18 @@ def _history(steps: List[dict], limit: int = 12) -> str:
     model mostly does not use. The journey names carry the structure that matters.
     """
     lines = []
-    for step in steps[-limit:]:
+    # Computed over the whole list and sliced afterwards: the shift needs the step *after*
+    # each one, and the newest step in the window has no successor to take it from.
+    shifted = _outcomes_by_step(steps)
+    first = max(0, len(steps) - limit)
+    for offset, step in enumerate(steps[-limit:]):
         action = step.get("action") or {}
         kind = action.get("action_kind", "?")
         detail = action.get("target_name") or action.get("value") or ""
+        did = shifted.get(first + offset) or "not reported yet"
         lines.append(
             f"{step.get('step_index')}. [{step.get('journey', '')}] {kind} {detail} "
-            f"on {step.get('url_path', '')} -> {step.get('outcome', '') or 'ok'}"
+            f"on {step.get('url_path', '')} -> {did}"
         )
     return "\n".join(lines)
 
@@ -319,19 +347,22 @@ def _journeys_markdown(steps: List[dict]) -> str:
     a test file. Each step carries the role and accessible name it acted on, which is what
     lets the suite be written in durable locators instead of invented ones.
     """
+    # Paired before grouping: a journey is a subset of the run, and the step that reports
+    # what an action did is the next one *chronologically*, not the next one in its journey.
+    shifted = _outcomes_by_step(steps)
     grouped: dict = {}
     order: List[str] = []
-    for step in steps:
+    for position, step in enumerate(steps):
         name = step.get("journey") or "Unlabelled"
         if name not in order:
             order.append(name)
             grouped[name] = []
-        grouped[name].append(step)
+        grouped[name].append((position, step))
 
     out = []
     for name in order:
         out.append(f"### Journey: {name}")
-        for step in grouped[name]:
+        for position, step in grouped[name]:
             action = step.get("action") or {}
             bits = [f"- `{action.get('action_kind', '?')}`"]
             if action.get("target_role") or action.get("target_name"):
@@ -355,8 +386,15 @@ def _journeys_markdown(steps: List[dict]) -> str:
                 bits.append(f"— sends `{action['submits']}`")
             if action.get("rationale"):
                 bits.append(f"— expected: {action['rationale']}")
-            if step.get("outcome"):
-                bits.append(f"— observed: {step['outcome']}")
+            did = shifted.get(position) or ""
+            if did:
+                # What this action did, taken from the step that reported it. Attaching the
+                # column that sits on this row would say that clicking Sign In left the
+                # page it was on, which is how a suite ends up asserting a landing page
+                # nobody ever saw.
+                bits.append(f"— observed: {did}")
+            else:
+                bits.append("— observed: nothing reported; the session ended here")
             out.append(" ".join(bits))
             if step.get("page_texts"):
                 # What the page said when this step was taken. This is where an assertion

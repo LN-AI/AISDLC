@@ -105,24 +105,46 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 CORPUS = os.path.join(REPO, "evals", "app_testing")
 RESULTS = os.path.join(CORPUS, "results")
 
-PROMPT_VERSION = "2026-09-15.3"
+PROMPT_VERSION = "2026-09-16.1"
 
 # Floors are set one run below the measurement, never at it (D-403): a floor set at the
 # measurement fails on a flake and then gets quietly lowered, which is how a regression gate
-# turns into a rubber stamp. Three runs per case, so one run below 100% is 0.66.
+# turns into a rubber stamp. Three runs per case, so one run below 100% is 0.66 --
+# which is where they already were, so the 2026-09-16 measurement moving every case to
+# 3/3 does not move them. Raising them to 1.0 would fail the suite on a single flake.
 #
-# **Measured 2026-09-15, PROMPT_VERSION 2026-09-15.3, 9 sessions (3 per case), $1.30 total
-# and $0.144 a session.** `discriminates` **8 of 9**, and **no test failed on the working
-# application in any session that produced one**.
+# **Measured 2026-09-16, PROMPT_VERSION 2026-09-16.1, 9 sessions (3 per case), $1.1828
+# total and $0.131 a session.** `discriminates` **9 of 9**, and **no test failed on the
+# working application in any session** — every case ran, produced a suite, and separated
+# the builds.
 #
-#   task-ownership   3/3 -- 14-25 steps, 3 journeys, 6-10 tests, 1-2 of them separating
-#   basket-total     3/3 -- 7-8 steps, 1 journey, 7-8 tests, 5-7 separating, 7-8 controls
-#                    withheld: the first scored runs in which the denylist did anything
-#   signup-wizard    2/3 -- 7 steps, 1 journey, 3-6 tests. The missing one is not a bad
-#                    suite but *no* suite: the generation returned a confident summary and
-#                    an empty `test_files` (D-421). Measured before the retry that now
-#                    recovers it, so the next measurement should be better and this one
-#                    should not be quoted as though it already were.
+#   basket-total     3/3 -- 9-10 steps, 1 journey, 10-11 tests, 7-9 of them separating,
+#                    9-10 controls withheld
+#   signup-wizard    3/3 -- 7 steps, 1 journey, 3-5 tests, 2-3 separating. Was 2/3; the
+#                    miss was a generation returning a confident summary and an empty
+#                    `test_files` (D-421), and the retry added afterwards is what closed it
+#   task-ownership   3/3 -- 8-11 steps, 3-4 journeys, 6-7 tests, 2-3 separating
+#
+# Previous measurement, 2026-09-15, PROMPT_VERSION 2026-09-15.3: **8 of 9** at **$0.144 a
+# session**. Three changes sit between them, all forced by live runs against public
+# applications rather than by tuning:
+#
+#   D-427  a submit button is named by its `value`, not its `name` attribute. Two live
+#          suites could not run a single test because of this; invisible to this corpus,
+#          where every control is a semantic `<button>`.
+#   D-430  the suite writer is told what each action *did*, taken from the step that
+#          reported it. It was being told that clicking Sign In left the page it was on.
+#   D-431  page text is collected from the element that renders the words rather than from
+#          whatever carries an `id`.
+#
+# **Read the step counts before concluding the collector made sessions more expensive.**
+# The worry going in was the opposite of what happened: more page text makes a page
+# signature more sensitive, so the no-progress rule fires later and a session should run
+# longer. `basket-total` did drift up, 7-8 steps to 9-10. But `task-ownership` fell from
+# **14-25 steps to 8-11** -- an explorer that can read the page stops wandering to find out
+# what is on it -- and that is most of why the per-session price went *down* while the
+# suites got bigger: `basket-total` now writes 10-11 tests where it wrote 7-8, and 7-9 of
+# them separate the builds where 5-7 did.
 #
 # The denominator is every session **attempted**, which is why this reads 8 of 9 rather than
 # the 8 of 8 a "produced a suite" denominator would give. A session that returns nothing has

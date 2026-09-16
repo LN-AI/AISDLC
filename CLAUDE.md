@@ -187,7 +187,13 @@ fleet could not do. **The model picks from a screened list and never writes a se
 (D-408): `services/action_policy.py` removes dangerous controls before the model sees them,
 re-checks its choice, and is imported by the driver so the same rule applies where the click
 lands; read that module before touching the denylist, because its first version allowed a
-button called *Cancel subscription*. **An assertion says what it rests on** (D-409): with no
+button called *Cancel subscription*. **A project can permit a named control the list
+withholds** (D-429), which exists because measurement made it necessary: against a banking
+demo the list withheld every money movement in three steps, and against a shop it withheld
+`Remove` and `Checkout`, leaving six of fifteen supplied requirements untestable. Matching is
+exact and never a substring, and the permitted list is **frozen onto the session and handed
+to the driver** — the platform picks an index and the driver resolves it, so the two
+sides screening to different lists is a click on an element nobody chose. **An assertion says what it rests on** (D-409): with no
 requirement supplied a suite can only describe what the application already does, so a
 `specified` claim made without one is downgraded to `observed` in code and the count is
 reported.
@@ -232,15 +238,29 @@ applications each produced a suite in which every test timed out on the shared s
 because an `<input type="submit">` was named from its `name` attribute rather than its `value`.
 Read that row before touching the name chain — a name that looks plausible and resolves to
 nothing is the whole failure, so the fixture asserts that Playwright finds exactly one element
-rather than that the string looks right. What a page *says* has the same problem still open
-(C-100): the text selector leans on `[id]`, and on an application carrying classes instead it
-collected the navigation chrome and none of the prices. And a clickable
+rather than that the string looks right. What a page *says* had the same
+problem, and `TEXTS_JS` now collects from **the element that renders the words** rather than
+from whatever carries an `id` (D-431) — on a live catalogue the old selector matched 34
+elements, none of them a heading, and sent the navigation run together as one line while
+every product name and price went missing. Read that row before widening it again: inline
+markup must not count as a child, candidates are excluded by the stamp `COLLECT_JS` already
+leaves, and the driver's cap and `app_session.clip_texts` have to move together. And a clickable
 element is a candidate even when it is not a control (D-414): pointed at this platform's own
 interface, the explorer was offered **two** controls after signing in — the whole navigation
 is `<li data-page=…>` with a click handler — and spent twenty-two of twenty-five steps
 guessing URLs. Related: a password field reports *that* it holds a value and never what
 (D-413), because an explorer that cannot tell its own typing landed types it again instead of
 pressing Sign In, which is how a live run failed to get past a login form at all.
+
+**What each action *did* reaches the suite writer from the step that reported it**
+(D-430, and D-428 for the same fault on screen). An outcome is only knowable by looking at
+the page again, so it is stored against the *following* step — which meant the generation
+input told the model that clicking **Login** resulted in "filled Password; still on /".
+Signing in went nowhere, as far as the writer knew, so it invented a landing condition for
+the sign-in helper and **every test in the suite failed on that one line**. Relatedly,
+`run_tests.py` now says when most failures share one call site (D-432): an all-red suite is
+what a broken application looks like, and a helper that cries wolf costs the reader more than
+a missing test.
 
 `eval_app_testing.py` asks the same question `eval_test_automation.py` does, aimed at the
 narrower claim this product actually makes: explore the **working** application, then replay
@@ -261,16 +281,26 @@ page that is wrong. Still a count and not a percentage (C-95), and note what non
 measures: all three are ordinary semantic HTML, so the collector work in D-414 has the
 fixture and a live run as its only evidence (C-97).
 
-**The measured baseline is 8 of 9, and how it got there matters more than the number.**
-2026-09-15, PROMPT_VERSION 2026-09-15.3, three cases x three runs: `discriminates` **8/9** at
-**$0.144 a session**, with **no test failing on the working application in any session that
-produced one**. The miss is not a weak suite but *no* suite — a generation returning a
-confident summary and an empty `test_files` (D-421), measured before the retry that now
-recovers it. **The denominator is every session attempted**, deliberately: counting only the
-sessions that produced something reports 8 of 8, which is the scoreboard committing the
-flattering-number error the eval exists to catch. Floors are 0.66 on all three measures for
-all three cases — one session below a measured 3/3, and exactly on `signup-wizard`'s 2/3 so
-that a failure of the retry to take is caught.
+**The measured baseline is 9 of 9, and how it got there matters more than the number.**
+2026-09-16, PROMPT_VERSION 2026-09-16.1, three cases x three runs: `discriminates` **9/9** at
+**$0.131 a session**, with **no test failing on the working application in any session**.
+The previous measurement was 8 of 9 at $0.144 (2026-09-15), and the three changes between
+them all came from live runs against public applications rather than from tuning: D-427, a
+submit button named by its `value` rather than its `name` attribute, which had left two real
+suites unable to run a single test; D-430, the suite writer being told what each action
+actually did instead of what the one before it did; and D-431, page text collected from the
+element that renders the words. **The denominator is every session attempted**, deliberately:
+counting only the sessions that produced something is the scoreboard committing the
+flattering-number error the eval exists to catch.
+
+**The step counts are the part to read before assuming the collector made sessions dearer.**
+More page text makes a signature more sensitive, so the no-progress rule fires later and a
+session ought to run longer — and `basket-total` did drift from 7-8 steps to 9-10. But
+`task-ownership` fell from **14-25 steps to 8-11**, because an explorer that can read a page
+stops wandering to find out what is on it, and that is most of why the price per session went
+*down* while the suites grew: `basket-total` writes 10-11 tests where it wrote 7-8, 7-9 of
+them separating where 5-7 did. Floors stay at 0.66 on all three measures for all three cases —
+one session below a measured 3/3. Raising them to 1.0 would fail the suite on a single flake.
 
 The first baseline that morning was **33%**, and the gap is the work rather than a prompt
 tidy-up. Each defect between the two was found by a run and none was visible offline: a
@@ -285,9 +315,11 @@ ceiling sat *below* its own forecast (D-412).
 
 Read the 9/9 as "nothing here is broken", not as a claim the product is finished. Three cases
 is a count and not a percentage (C-95); none of them exercises the collector those numbers
-depend on (C-97); and a live run with no requirement supplied still produced a suite that was
-nine-tenths "the button is visible", which is C-66 wearing a new hat and is why `_HOLLOW` in
-the eval was widened.
+depend on (C-97), which is exactly why D-427 and D-431 were found by a live run and not here;
+and a live run with no requirement supplied still produced a suite that was nine-tenths "the
+button is visible", which is C-66 wearing a new hat and is why `_HOLLOW` in the eval was
+widened. Three findings from those live runs are open and are the customer's call rather than
+ours: C-100, C-101 and C-102.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

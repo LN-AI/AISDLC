@@ -72,7 +72,11 @@ MAX_CANDIDATES = 60
 # (`app_session.clip_texts`) and that is not redundant: a driver is a client, and a limit a
 # client can raise by not honouring it is not a limit. This copy exists so a dense page does
 # not cost a large `page.evaluate` before the request is even made.
-MAX_PAGE_TEXTS = 18
+# Raised with the leaf rule below: a six-item catalogue produces a name and a
+# price each, plus the page's own furniture, and 18 cut the list before the
+# last price. Roughly 80 more input tokens a step against ~1,300, so the cost
+# is noise next to being able to assert a value at all.
+MAX_PAGE_TEXTS = 28
 
 
 def section(title):
@@ -344,21 +348,67 @@ COLLECT_JS = r"""
 # restriction is what keeps a dense page from turning every step into a large prompt.
 TEXTS_JS = r"""
 () => {
-  const SEL = 'h1, h2, h3, h4, h5, h6, [role=status], [role=alert], [aria-live], [id]';
+  // Which elements hold a page's own words.
+  //
+  // This used to select `h1-h6, [role=status], [role=alert], [aria-live], [id]`, and the
+  // `[id]` half is what carried it on a real application. That assumption broke in the
+  // open: on a live shop's catalogue **34 elements matched and not one was a heading** --
+  // the application uses no `h1`-`h6` at all -- so every match was a container carrying an
+  // id, and the single line collected was the navigation run together into one string. The
+  // six product names and six prices, which are what the supplied requirements were
+  // actually about, were never sent at all. The suite asserted them regardless, through
+  // `.inventory_item_price` and `.summary_subtotal_label`: recalled from training rather
+  // than observed, on an application well known enough for that to work. On a customer's
+  // own application it would not.
+  //
+  // So the question is no longer "does this element carry an id" -- a habit of one era of
+  // front-end code -- but "is this the element that renders these words".
+  const SKIP = ['input', 'button', 'select', 'textarea', 'a', 'form', 'script', 'style',
+                'option', 'svg', 'path', 'noscript', 'template'];
+  // Inline markup does not make its parent a container: a heading reading
+  // `<h1>Order <span>#12</span></h1>` renders one line of text and must be collected as
+  // one, not shattered into the fragment that happens to sit in a span.
+  const INLINE = ['span', 'b', 'i', 'em', 'strong', 'small', 'code', 'abbr', 'mark',
+                  'sub', 'sup', 'u', 's', 'time', 'bdi', 'br', 'wbr', 'label'];
+  const LANDMARK = 'h1, h2, h3, h4, h5, h6, [role=status], [role=alert], [aria-live]';
+
   const out = [];
   const seen = new Set();
-  for (const el of document.querySelectorAll(SEL)) {
+  for (const el of document.querySelectorAll('body *')) {
     if (out.length >= MAXT) break;
     const tag = el.tagName.toLowerCase();
-    // A control's own text is already reported as its accessible name; repeating it here
-    // would be paying twice for the same words.
-    if (['input', 'button', 'select', 'textarea', 'a', 'form', 'script', 'style'].includes(tag)) continue;
+    if (SKIP.includes(tag)) continue;
+    // Already reported as a candidate's accessible name. `COLLECT_JS` runs first and stamps
+    // these, so this is exact rather than a guess from the tag -- which matters since a
+    // navigation built from `<li>` elements with click handlers is a candidate (D-414) and
+    // would otherwise be paid for twice, once as a control and once as text.
+    if (el.hasAttribute('data-lm-cand')) continue;
+
+    let text = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    // 120, not 200. With the leaf rule the long lines are no longer run-together
+    // containers but genuine prose -- product descriptions, marketing copy -- and on a
+    // six-item catalogue three of those filled the budget before the last two prices
+    // arrived. A landmark worth asserting is a value, a total, a status or a message, and
+    // all of those are short; a paragraph is page furniture that costs tokens and buys no
+    // assertion.
+    if (!text || text.length > 120) continue;
+
+    // A landmark is collected whatever it contains; everything else has to be the element
+    // that actually renders the words, or its text is other elements' text run together.
+    if (!el.matches(LANDMARK)) {
+      let container = false;
+      for (const kid of el.getElementsByTagName('*')) {
+        const kidTag = kid.tagName.toLowerCase();
+        if (INLINE.includes(kidTag)) continue;
+        if ((kid.textContent || '').trim()) { container = true; break; }
+      }
+      if (container) continue;
+    }
+
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) continue;
     const style = window.getComputedStyle(el);
     if (style.visibility === 'hidden' || style.display === 'none') continue;
-    let text = (el.textContent || '').replace(/\s+/g, ' ').trim();
-    if (!text || text.length > 200) continue;   // a long one is a container, not a landmark
     if (seen.has(text)) continue;
     seen.add(text);
 
@@ -367,7 +417,9 @@ TEXTS_JS = r"""
     // an item price, a line total and a basket total are all "GBP 4.00", a getByText for it
     // matches three elements and Playwright's strict mode fails the test on a correct
     // application. A role is the durable way to point at one of them, and it is the same
-    // currency the candidate list is already written in.
+    // currency the candidate list is already written in. Never claimed where it is not
+    // real: an element with no role says `text`, and the suite writer is told that a
+    // `getByRole('heading', ...)` for something listed as `text` matches nothing.
     let role = el.getAttribute('role') || '';
     if (!role && /^h[1-6]$/.test(tag)) role = 'heading';
     if (!role && el.getAttribute('aria-live')) role = 'status';
@@ -593,6 +645,23 @@ FIXTURE_PAGES = {
 <button onclick="alert(1)">Delete account</button>
 <a href="/logout.html">Log out</a>
 """,
+    "catalogue.html": """<!doctype html><title>Catalogue</title>
+<div class="page">
+  <div class="masthead"><div class="brand">Fixture Shop</div></div>
+  <div class="title">Products</div>
+  <div class="item">
+    <div class="item-name">Widget</div>
+    <div class="blurb">A widget that does widget things, at length, in prose nobody
+      will ever write an assertion about and which would otherwise fill the budget.</div>
+    <div class="row"><div class="price">GBP 4.00</div><button>Add to basket</button></div>
+  </div>
+  <div class="item">
+    <div class="item-name">Gizmo</div>
+    <div class="row"><div class="price">GBP 6.50</div><button>Add to basket</button></div>
+  </div>
+  <div class="totals"><div class="total">Total: GBP 10.50</div></div>
+</div>
+""",
     "signin.html": """<!doctype html><title>Sign in</title>
 <h1>Sign in</h1>
 <form action="/list.html">
@@ -715,6 +784,42 @@ def fixture():
                   "Place order" in [r["name"] for r in refused2],
                   [r["name"] for r in refused2])
 
+
+
+            # ── The page's own words, on an application built out of classes ───
+            #
+            # The old selector asked "does this element carry an id", which is a habit of
+            # one era of front-end code rather than a fact about where words live. On a
+            # live shop's catalogue 34 elements matched it and **not one was a heading**;
+            # every match was a container, and the single line collected was the navigation
+            # run together. Six product names and six prices -- exactly what the supplied
+            # requirements were about -- were never sent, and the suite asserted them
+            # anyway from selectors it recalled rather than observed.
+            page.goto(base + "/catalogue.html", wait_until="domcontentloaded")
+            _p4, _t4, raw4, texts4 = observe(page)
+            _said = [t.split(": ", 1)[1] for t in texts4 if ": " in t]
+
+            check("a value in a class-only page is collected",
+                  "GBP 4.00" in _said and "GBP 6.50" in _said, texts4)
+            check("...and so is the total an arithmetic test needs",
+                  "Total: GBP 10.50" in _said, texts4)
+            check("...and the names beside them",
+                  "Widget" in _said and "Gizmo" in _said, texts4)
+
+            # The failure the leaf rule exists to prevent: a container's text is its
+            # children's words run together, and it is worth nothing to a suite.
+            check("a container is not collected as though it were one line",
+                  not any(t.startswith("GBP 4.00Add to basket") for t in _said)
+                  and not any("WidgetGizmo" in t for t in _said),
+                  texts4)
+            check("a control's own label is still not repeated as page text",
+                  not any(t == "Add to basket" for t in _said),
+                  "it is already reported as a candidate's accessible name, and paying "
+                  "for it twice is how a budget goes on furniture")
+            check("prose too long to assert on is left out",
+                  not any(t.startswith("A widget that does") for t in _said),
+                  "a landmark worth asserting is a value, a total or a message, and all "
+                  "of those are short")
 
             # ── A control's name has to be the one the accessibility tree computes ──
             #

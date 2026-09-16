@@ -71,7 +71,9 @@ MAX_JOURNEY_CHARS = 120
 # for an assertion to be written about a value the application displayed, few enough that a
 # dense page cannot turn every step into a large prompt. These two numbers are the entire
 # cost control on it, so keep them small.
-MAX_PAGE_TEXTS = 18
+# Must equal the driver's cap in `scripts/explore_app.py`: this one clips what
+# arrives, so a lower value here silently discards what that one collected.
+MAX_PAGE_TEXTS = 28
 MAX_PAGE_TEXT_CHARS = 160
 
 # How long a session's page-text digest is kept, in days. Seven matches

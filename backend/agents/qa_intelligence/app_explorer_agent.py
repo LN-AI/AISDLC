@@ -370,6 +370,19 @@ out. Make it check first -- if the signed-in view is already showing, return. A 
 two tests on a correct application to exactly this, in an `afterEach` that signed in again \
 to tidy up.
 
+What a shared helper asserts at the end has the blast radius of the whole suite, so it must \
+rest on something that was actually observed. Every journey below records what each action \
+*did*: when the observation says an action navigated somewhere, wait for that path -- \
+`await page.waitForURL('**/inventory.html')` -- because that is a fact this session \
+witnessed. Do not invent a landing condition, and in particular do not assert a role you \
+were not shown: if the page text does not list `heading: Products`, then \
+`getByRole('heading', { name: 'Products' })` matches nothing, and putting it in the sign-in \
+helper fails every test in the file. Two suites written against real applications were lost \
+this way, 18 of 18 and 14 of 17, each to one line. Where the observation shows no navigation \
+-- a page that rewrites itself without changing its address -- wait for a line of page text \
+you were actually given instead. An all-red suite is what a broken application looks like, \
+so a helper that cries wolf costs the reader more than a missing test does.
+
 Prefer independence by construction over undoing changes afterwards. Each test gets a fresh \
 browser context, so cookies and storage are already isolated and only state on the *server* \
 survives a test. Where a test changes shared server state, the safest answer is to create \
