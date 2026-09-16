@@ -175,11 +175,13 @@ def brief_from_reviews(review_ids: List[str], visible_project_ids) -> Dict[str, 
             skipped.append(f"{review_id}: its result could not be read")
             continue
 
+        items = 0
         if review_type == "test_cases":
             cases = _rows(result.get("test_cases"))
             if not cases:
                 skipped.append(f"{review_id}: that run produced no test cases")
                 continue
+            items = len(cases)
             lines.append(f"### Test cases from an earlier run ({len(cases)})")
             lines.extend(_render_cases(cases))
             case_ids.extend(
@@ -191,10 +193,16 @@ def brief_from_reviews(review_ids: List[str], visible_project_ids) -> Dict[str, 
             if not scenarios:
                 skipped.append(f"{review_id}: that run produced no scenarios")
                 continue
+            items = len(scenarios)
             lines.append(f"### Scenarios from an earlier run ({len(scenarios)})")
             lines.extend(_render_scenarios(scenarios))
 
-        used.append({"review_id": review_id, "review_type": review_type})
+        # `items` travels with the reference so a screen can say what a run contributes
+        # without re-reading it. A picker offering four runs that all read "Test cases" is
+        # a picker nobody can choose from.
+        used.append({"review_id": review_id, "review_type": review_type,
+                     "items": items, "created_at": str(review.get("created_at") or ""),
+                     "summary": str(review.get("input_summary") or "")[:160]})
         lines.append("")
 
     return {

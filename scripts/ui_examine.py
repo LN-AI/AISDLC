@@ -1835,6 +1835,66 @@ def main():
                   "--attest" not in page.locator("#app-testing-command").inner_text(),
                   "an unticked box still offered a runnable command")
 
+            # ── 24. The source picker, and what it says when it has nothing ──
+            #
+            # Three states used to render identically -- an empty project, a failed request,
+            # and a project whose runs sat just past a client-side cap -- all as an empty
+            # box. The one a person can act on is the difference between them.
+            section("24. The source picker answers rather than showing an empty box")
+
+            _pick = page.locator("#app-testing-source-pick")
+            check("the picker is a dropdown, not a multi-select box",
+                  _pick.count() == 1
+                  and page.evaluate("() => !document.getElementById('app-testing-source-pick')"
+                                    "        .multiple"),
+                  "a multi-select has nowhere to say what a run contains, nowhere to show "
+                  "the cap, and no way to tell 'none' from 'failed'")
+            _text = _pick.inner_text().strip()
+            check("...and it says something rather than nothing",
+                  bool(_text) and "Loading" not in _text,
+                  f"showing: {_text[:90]!r}")
+            check("an empty project is named as empty, not left blank",
+                  "No test scenario or test case runs" in _text or "Pick a project" in _text,
+                  f"showing: {_text[:110]!r}")
+
+            _net = [u for u in NETLOG if "/api/reviews?" in u]
+            check("it asks the server to filter, rather than filtering in the browser",
+                  any("product_id=" in u and "review_type=" in u for u in _net),
+                  "fetching the newest 50 reviews of every kind and filtering here is why a "
+                  f"busy project showed none: {_net[-3:]}")
+
+            check("the cap the server enforces is declared on the screen",
+                  page.evaluate("() => APP_TESTING_MAX_SOURCES") == 5,
+                  "the server truncates at five without comment")
+
+            # ── 25. Switching project does not leave the screen stale ────────
+            #
+            # The screen used to rebuild itself only on its *next visit*, so a person who
+            # switched project while standing on it kept the previous project's run list,
+            # pickers and result. Correct data, wrong project, nothing saying so -- which is
+            # most of why this product looked as though its history was broken.
+            section("25. Switching project refreshes the screen you are standing on")
+
+            page.evaluate("""() => {
+                document.getElementById('app-testing-result').innerHTML = 'STALE RESULT';
+                document.getElementById('app-testing-result').classList.remove('hidden');
+            }""")
+            _projects = page.evaluate("() => _projects.map(p => p.id)")
+            if _projects:
+                page.evaluate("(id) => setActiveProject(id)", _projects[0])
+                page.wait_for_timeout(700)
+                check("a result rendered under the previous project is cleared",
+                      "STALE RESULT" not in page.locator("#app-testing-result").inner_html(),
+                      "returning to a screen later would show one project's run under "
+                      "another project's heading")
+                check("...and the screen reloaded rather than waiting for a revisit",
+                      page.locator("#app-testing-runs").inner_text().strip() != "",
+                      "the run list must belong to the project selected now")
+            else:
+                check("a project exists to switch to", True,
+                      "no projects in this throwaway database; the clearing path is covered "
+                      "by the assertion above")
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.

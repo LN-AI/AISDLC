@@ -59,6 +59,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/app-testing", tags=["Application testing"])
 
+# How much of the brief the screen may show back. The whole thing can be 40 000 chars
+# (`app_basis.MAX_BRIEF_CHARS`) and this response is drawn on every add and remove.
+BRIEF_PREVIEW_CHARS = 2_000
+
 PRODUCT = "app-testing"
 
 # Roughly what one step's prompt costs, in characters, for the free quote. A page's
@@ -192,6 +196,13 @@ class PreflightRequest(BaseModel):
     requirement: str = Field("")
     goal: str = Field("")
     llm_connection_id: Optional[str] = None
+
+
+class BasisRequest(BaseModel):
+    """What a session would have to check the application against, before it opens."""
+    requirement: str = Field("")
+    project_id: Optional[str] = None
+    source_review_ids: List[str] = Field(default_factory=list)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -723,4 +734,60 @@ def preflight(req: PreflightRequest, caller: dict = Depends(get_caller)):
             "suite. The step cap is what bounds it. Replaying the suite afterwards calls no "
             "model at all."
         ),
+    }
+
+
+@router.post("/basis", summary="What this session could check against (free, calls no model)")
+def basis(req: BasisRequest, caller: dict = Depends(get_caller)):
+    """The same question `open_session` asks, asked early enough to be useful.
+
+    A session refuses to open without a basis (D-419), and that refusal used to arrive
+    *after* somebody had launched a browser on their own machine -- the screen guessed at the
+    answer in JavaScript, which it cannot do: it knows nothing about the project's uploaded
+    documents, so it warned about a project holding a full specification and stayed quiet
+    when every ticked reference was stale. This calls `app_basis.collect` directly, so the
+    screen and the session reach the same verdict in the same words.
+
+    Free and calls no model, so it is entitlement-checked and not budget-enforced -- the same
+    policy as `/preflight`, for the same reason.
+
+    What it deliberately does not return is the *documents*. Their presence and size are the
+    useful facts; the text itself is the customer's own content, already on their Knowledge
+    Base screen, and echoing it here would put it in a response nothing needs it in. The
+    brief is different: it is what the model will be sent, the person is choosing whether to
+    send it, and showing it is the only way that choice is informed.
+    """
+    subject = subject_from_caller(caller)
+    try:
+        agent_guard.check_scope(subject, PRODUCT)
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    resolved = app_basis.collect(
+        requirement=req.requirement,
+        project_id=_project_for(caller, req.project_id),
+        source_review_ids=req.source_review_ids,
+        visible_project_ids=scope.visible_from_caller(caller),
+    )
+    brief = resolved.get("brief_markdown") or ""
+    return {
+        "has_stated": resolved["has_stated"],
+        "has_derived": resolved["has_derived"],
+        "has_any": resolved["has_any"],
+        "strongest_basis": resolved["strongest_basis"],
+        "project_name": resolved["project_name"],
+        "has_requirement": bool(resolved["requirement"]),
+        "has_documents": resolved["has_documents"],
+        "document_chars": len(resolved.get("documents") or ""),
+        "source_reviews": resolved["source_reviews"],
+        # Verbatim. Each one is already written for a customer to read, and the whole point
+        # of the list is that a reference which silently did nothing is how somebody believes
+        # their cases are covered when they are not.
+        "skipped_sources": resolved["skipped_sources"],
+        "case_ids": resolved["case_ids"],
+        "brief_markdown": brief[:BRIEF_PREVIEW_CHARS],
+        "brief_chars": len(brief),
+        "brief_truncated": len(brief) > BRIEF_PREVIEW_CHARS,
+        "max_sources": app_basis.MAX_SOURCE_REVIEWS,
+        "refusal": None if resolved["has_any"] else app_basis.NOTHING_TO_CHECK_AGAINST,
     }

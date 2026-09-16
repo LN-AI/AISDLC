@@ -830,6 +830,103 @@ def main_():
     finally:
         conn.close()
 
+    # ── 15. What a session would have to check against, before it opens ───
+    #
+    # The screen used to answer this in JavaScript, from the requirement box and a count of
+    # ticked runs. It cannot: the browser has no idea what documents are filed against the
+    # project, so it warned "nothing to check against" at a project holding a full
+    # specification, and said nothing when every ticked reference was stale. Either way the
+    # real answer arrived as a 400 *after* somebody had started a browser on their own
+    # machine.
+    section("15. The basis a session would have, asked before one is opened")
+
+    def _basis(body, headers=None):
+        return client.post("/api/v1/app-testing/basis", json=body,
+                           headers=headers if headers is not None else scoped)
+
+    _before_basis = len(_llm_calls)
+    empty = _basis({"requirement": "", "source_review_ids": []})
+    check("asking costs nothing and is allowed", empty.status_code == 200, empty.text[:200])
+    check("...and it calls no model", len(_llm_calls) == _before_basis,
+          f"{len(_llm_calls) - _before_basis} call(s) -- a preview that spends is not a "
+          "preview")
+    check("a session with nothing supplied is told so, in the words it would be refused in",
+          empty.json().get("has_any") is False
+          and (empty.json().get("refusal") or "").startswith(
+              app_basis.NOTHING_TO_CHECK_AGAINST[:40]),
+          empty.json())
+    check("...and its strongest claim would be `observed`",
+          empty.json().get("strongest_basis") == "observed", empty.json())
+
+    typed = _basis({"requirement": "A basket total equals the sum of its lines.",
+                    "source_review_ids": []})
+    check("a typed requirement is a stated basis", typed.json().get("has_stated") is True)
+    check("...and nothing is refused", typed.json().get("refusal") is None)
+    check("...and it may claim `stated`",
+          typed.json().get("strongest_basis") == "stated", typed.json())
+
+    # The three reasons a reference is dropped, each reported rather than swallowed. This is
+    # the list the screen shows: a reference that silently did nothing is how somebody
+    # believes their cases are covered when they are not.
+    dropped = _basis({"requirement": "", "source_review_ids": [wrong_kind, "no-such-review"]})
+    _skipped = " | ".join(dropped.json().get("skipped_sources") or [])
+    check("a run of the wrong kind is named as dropped, with the reason",
+          "is not a brief" in _skipped, _skipped)
+    check("...so is one that does not exist", "no such run" in _skipped, _skipped)
+    check("...and neither of them silently counts as a basis",
+          dropped.json().get("has_any") is False, dropped.json())
+
+    check("the cap the server enforces is reported, so a screen can show it",
+          dropped.json().get("max_sources") == app_basis.MAX_SOURCE_REVIEWS,
+          dropped.json().get("max_sources"))
+
+    # The brief is returned because it is what the model will be sent and the person is
+    # choosing whether to send it. The *documents* are not: their presence and size are the
+    # useful facts, and the text is the customer's own content, already on the screen it was
+    # uploaded from.
+    check("the documents themselves are never echoed back",
+          "documents" not in typed.json(),
+          "returning the document text would put it in a response nothing needs it in")
+    check("...but whether there are any, and how much, is",
+          "has_documents" in typed.json() and "document_chars" in typed.json())
+
+    real_cases = database.save_review(
+        review_type="test_cases", project_name="App Testing Smoke",
+        input_summary="Checkout rules", input_content="x",
+        result={"test_cases": [
+            {"test_case_id": "TC-001", "title": "Total is right",
+             "steps": [{"action": "add two items", "expected": "total doubles"}]},
+            {"test_case_id": "TC-002", "title": "Empty basket", "steps": []}]})
+    with contextlib.closing(database.get_connection()) as _c:
+        _c.execute("UPDATE reviews SET project_id = ? WHERE id = ?", (project_id, real_cases))
+        _c.commit()
+
+    covered = _basis({"requirement": "", "source_review_ids": [real_cases]})
+    _used = covered.json().get("source_reviews") or []
+    check("a real test-case run is accepted as a basis",
+          covered.json().get("has_derived") is True, covered.json())
+    check("...and is labelled `derived`, never `stated`",
+          covered.json().get("strongest_basis") == "derived",
+          "a machine-written case laundered into a verified requirement is D-406 at one "
+          "remove")
+    check("...and says how much it contributes, so two runs can be told apart",
+          len(_used) == 1 and _used[0].get("items") == 2, _used)
+    check("the brief itself is shown, because the person is choosing whether to send it",
+          "TC-001" in (covered.json().get("brief_markdown") or ""),
+          covered.json().get("brief_markdown", "")[:120])
+    check("...and its full size is stated even when the preview is clipped",
+          covered.json().get("brief_chars", 0) > 0)
+
+    # A caller scoped to a different project cannot learn that the id is real, for the
+    # reason `_visible_session` gives: confirming an id exists is itself a disclosure. So it
+    # reads as absent rather than as forbidden.
+    _other = client.post("/api/v1/projects", json={"name": "Somebody Else"}, headers=admin)
+    other_proj = {**admin, "X-Project-Id": _other.json()["project"]["id"]}
+    other = _basis({"requirement": "", "source_review_ids": [real_cases]}, headers=other_proj)
+    check("a run in a project the caller cannot see reads as absent, not as forbidden",
+          "no such run" in " ".join(other.json().get("skipped_sources") or []),
+          other.json().get("skipped_sources"))
+
     # ── 14. The product agrees with itself ────────────────────────────────
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
@@ -859,6 +956,29 @@ def main_():
     check("its run history container exists", 'id="app-testing-runs"' in index_html)
     check("the nav item declares the product",
           'data-page="app-testing" data-product="app-testing"' in index_html)
+    check("the screen's cap on source runs matches the one the server enforces",
+          f"APP_TESTING_MAX_SOURCES = {app_basis.MAX_SOURCE_REVIEWS}" in app_js,
+          f"the server truncates at {app_basis.MAX_SOURCE_REVIEWS} without comment, so a "
+          "screen that offers more silently drops the rest")
+    check("the retired two-word assertion vocabulary is gone from the screen",
+          "basis === 'specified'" not in app_js,
+          "the table reported every `stated` assertion as observed, under a banner that "
+          "counted it correctly")
+    check("...and all three words are rendered",
+          "_ASSERTION_LABELS" in app_js and "derived:" in app_js)
+    check("the source picker filters on the server, not in the browser",
+          "product_id=${encodeURIComponent(spec.product)}" in app_js,
+          "asking for the newest 50 reviews of every kind and filtering here showed an "
+          "empty picker on any project with 50 recent reviews of another kind")
+    check("the built command carries the project",
+          "'--project ' + projectId" in app_js,
+          "without it the session is filed under nothing and every covered run comes back "
+          "as 'no such run'")
+    check("...and the attestation, rather than the driver assuming it",
+          "parts.push('--attest')" in app_js
+          and "bool(args.attest)" in (ROOT / "scripts" / "explore_app.py").read_text(
+              encoding="utf-8"),
+          "a declaration the driver makes on the caller's behalf is nobody's declaration")
 
     print("\n" + "-" * 60)
     if _failures:

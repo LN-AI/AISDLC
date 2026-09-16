@@ -382,11 +382,51 @@ async function setActiveProject(projectId) {
   else localStorage.removeItem('sdlc_project_id');
   renderProjectSelector();
   await refreshEntitlements();
-  // History and the Dashboard are scoped to the selected project, so whichever of them is
-  // on screen is now showing the previous project's work.
+  _refreshForProjectChange();
+}
+
+/** Everything on screen now belongs to the project that was selected a moment ago.
+ *
+ *  This used to reload History and the Dashboard and nothing else, on the theory that every
+ *  other screen rebuilds itself on its next visit — which is true, and is the wrong test.
+ *  A person who switches project while standing on an agent screen never leaves it, so the
+ *  run list, the "start from an earlier run" pickers and the result panel all carried on
+ *  describing the previous project. That is most of what made this product look as though
+ *  its history and its pickers were broken: they were correct, and stale.
+ *
+ *  Hidden screens are cleared too, not just the visible one. `showPage` only toggles a
+ *  class, so a screen opened under one project keeps its rendered result in the document —
+ *  and returning to it later shows that result under the new project's heading, with the
+ *  new project's runs listed above it. */
+function _refreshForProjectChange() {
+  Object.keys(AGENT_SCREENS).forEach(page => {
+    const spec = AGENT_SCREENS[page];
+    _runsOffset[page] = 0;
+    _openRunId[page] = null;
+    const result = document.getElementById(spec.result);
+    if (result) { result.innerHTML = ''; result.classList.add('hidden'); }
+    // The suite these buttons hand over belongs to a project that is no longer selected.
+    delete _lastSuites[spec.result];
+    delete _runnerPlans[spec.result];
+  });
+  _lastTestAutomation = null;
+  _lastAppTesting = null;
+
   const active = document.querySelector('.page.active');
-  if (active && active.id === 'page-history') loadHistory();
-  if (active && active.id === 'page-dashboard') loadDashboard();
+  const page = active ? active.id.replace(/^page-/, '') : '';
+  if (!page) return;
+
+  // A quote carries the previous project's budget headroom and arms a run button against
+  // it. The server re-checks at run time, so this is a truthfulness fix rather than a
+  // spending one — but a figure that is quietly about a different project is worse than no
+  // figure.
+  const quote = document.getElementById(`${page}-cost-preview`);
+  if (quote) { quote.innerHTML = ''; quote.classList.add('hidden'); }
+
+  // `_runPageLoader` is the one place a screen loads itself, and it already covers History
+  // and the Dashboard. `github` is skipped because its loader navigates to another screen,
+  // which would move the user somewhere they did not ask to go.
+  if (page !== 'github') _runPageLoader(page);
 }
 
 /**
@@ -2853,31 +2893,211 @@ function _assertionBasis(row) {
 // Which earlier Test Scenario / Test Case runs this session should cover. Empty is the
 // normal case: those agents may never have run for this system, and a typed requirement or a
 // project document does the same job.
+// The two upstream QA products, and only those: they are the only ones whose output is a
+// brief. A code review is not a statement about what the application should do, and
+// `app_basis.SOURCE_REVIEW_TYPES` refuses one — so offering it here would be offering
+// something the session will drop.
+const APP_TESTING_SOURCES = ['test-scenario', 'test-case'];
+
+// Must equal `app_basis.MAX_SOURCE_REVIEWS`. `smoke_app_testing.py` asserts the two agree:
+// a cap the screen does not know about is a cap that truncates silently on the server.
+const APP_TESTING_MAX_SOURCES = 5;
+
+// Chosen runs, by id, in the order they were added. Held here rather than read off the
+// control, because the list is rebuilt whenever the project changes and a selection read
+// from the DOM would vanish with it.
+let _appTestingChosen = [];
+let _appTestingOffered = {};   // id -> the row, so the chosen list can describe it
+
 function appTestingSources() {
-  const picker = document.getElementById('app-testing-sources');
-  if (!picker) return [];
-  return Array.from(picker.selectedOptions || []).map(o => o.value).filter(Boolean);
+  return _appTestingChosen.slice();
 }
 
-// Fills that picker from the project's own history. Only the two upstream QA products are
-// offered, because they are the only ones whose output is a brief — a code review is not a
-// statement about what the application should do, and the API refuses one.
+/** Fill the dropdown from this project's own history.
+ *
+ *  One request per source product, filtered *by the server*. The previous version asked for
+ *  the newest 50 reviews of every kind and sorted them out in the browser, so a project with
+ *  fifty recent code reviews showed an empty box while its test-case runs sat just past the
+ *  cap — indistinguishable from having none. `GET /api/reviews` takes `product_id` and
+ *  `review_type`; two requests is the right price for a filter that is actually applied.
+ *
+ *  Two requests rather than one because the endpoint takes a single `review_type`, and
+ *  teaching it a comma list would change a documented public parameter for one caller. */
 async function loadAppTestingSources() {
-  const picker = document.getElementById('app-testing-sources');
-  if (!picker) return;
-  try {
-    const res = await apiFetch('/api/reviews?limit=50');
-    const runs = ((res && res.reviews) || []).filter(
-      r => r.review_type === 'test_cases' || r.review_type === 'test_scenarios');
-    picker.innerHTML = runs.length
-      ? runs.map(r => `<option value="${esc(r.id)}">${
-          r.review_type === 'test_cases' ? 'Test cases' : 'Scenarios'} — ${
-          esc((r.input_summary || r.project_name || r.id).slice(0, 70))}</option>`).join('')
-      : '';
-    picker.parentElement.querySelector('.field-hint').style.opacity = runs.length ? '' : '0.7';
-  } catch (e) {
-    picker.innerHTML = '';
+  const pick = document.getElementById('app-testing-source-pick');
+  if (!pick) return;
+
+  // No project, nothing offered. Not cosmetic: `apiFetch` only sends `X-Project-Id` when a
+  // project is selected, so an unscoped read hands a super admin every tenant's run titles —
+  // and a run from another project is unusable anyway, because the session that would cover
+  // it cannot see it and reports it as "no such run".
+  if (!getActiveProjectId()) {
+    _appTestingChosen = []; _appTestingOffered = {};
+    pick.innerHTML = '<option value="">Pick a project in the sidebar first</option>';
+    pick.disabled = true;
+    renderAppTestingChosen();
+    return;
   }
+
+  pick.disabled = true;
+  pick.innerHTML = '<option value="">Loading…</option>';
+  try {
+    const pages = await Promise.all(APP_TESTING_SOURCES.map(screen => {
+      const spec = AGENT_SCREENS[screen];
+      return apiFetch(`/api/reviews?product_id=${encodeURIComponent(spec.product)}`
+                      + `&review_type=${encodeURIComponent(spec.reviewType)}`
+                      + `&limit=${RUNS_PAGE_SIZE}&offset=0`, { _silent: true });
+    }));
+    const runs = [].concat(...pages.map(d => (d && d.reviews) || []))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    _appTestingOffered = {};
+    runs.forEach(r => { _appTestingOffered[r.id] = r; });
+    // A chosen run that is no longer offered — because the project changed — must not stay
+    // in the command.
+    _appTestingChosen = _appTestingChosen.filter(id => _appTestingOffered[id]);
+
+    if (!runs.length) {
+      pick.innerHTML = '<option value="">No test scenario or test case runs in this '
+                     + 'project yet — a requirement or an uploaded document does the same '
+                     + 'job</option>';
+      pick.disabled = true;
+    } else {
+      pick.disabled = false;
+      // The newest is not preselected, for the reason `loadRunHandoffOptions` gives: seeding
+      // an input from a run nobody chose is C-54.
+      pick.innerHTML = '<option value="">— add a run —</option>'
+        + runs.map(r => `<option value="${esc(r.id)}">${esc(appTestingSourceLabel(r))}</option>`)
+              .join('');
+    }
+  } catch (e) {
+    // An error and an empty project used to render identically, which is the one thing a
+    // person cannot act on.
+    pick.innerHTML = `<option value="">Could not load earlier runs: ${esc(e.message)}</option>`;
+    pick.disabled = true;
+  }
+  renderAppTestingChosen();
+}
+
+/** Date, kind, and what it was run against.
+ *
+ *  Deliberately no gate and no finding count, though `/api/reviews` carries both: these two
+ *  products are `gated: false` and their stored rows default to Green / 0, so printing that
+ *  would be a claim of safety nobody made. */
+function appTestingSourceLabel(r) {
+  const when = r.created_at ? new Date(r.created_at + 'Z').toLocaleString() : 'undated';
+  const kind = r.review_type === 'test_cases' ? 'Test cases' : 'Scenarios';
+  return `${when} · ${kind} · ${(r.input_summary || 'no summary').slice(0, 70)}`;
+}
+
+function addAppTestingSource() {
+  const pick = document.getElementById('app-testing-source-pick');
+  const id = pick && pick.value;
+  if (!id) return;
+  if (_appTestingChosen.indexOf(id) < 0) _appTestingChosen.push(id);
+  pick.value = '';
+  renderAppTestingChosen();
+}
+
+function removeAppTestingSource(id) {
+  _appTestingChosen = _appTestingChosen.filter(x => x !== id);
+  renderAppTestingChosen();
+}
+
+/** The runs chosen so far, and the cap made visible.
+ *
+ *  Reaching the cap has to be shown here, because the server truncates the list at five
+ *  without comment — a sixth reference that silently does nothing is exactly the class of
+ *  failure the skipped-sources list exists to prevent. */
+function renderAppTestingChosen() {
+  const box = document.getElementById('app-testing-sources-chosen');
+  const pick = document.getElementById('app-testing-source-pick');
+  if (!box) return;
+  const full = _appTestingChosen.length >= APP_TESTING_MAX_SOURCES;
+  if (pick && !pick.disabled) {
+    pick.disabled = full;
+    if (full) {
+      pick.innerHTML = `<option value="">${APP_TESTING_MAX_SOURCES} of `
+                     + `${APP_TESTING_MAX_SOURCES} — remove one to add another</option>`;
+    }
+  }
+  box.innerHTML = _appTestingChosen.map(id => {
+    const r = _appTestingOffered[id] || {};
+    return `<div class="review-pick" style="display:flex;gap:8px;align-items:center">
+      <span style="flex:1">${esc(appTestingSourceLabel(r))}</span>
+      <button type="button" class="btn btn-link" style="font-size:11px;padding:0"
+              onclick="removeAppTestingSource('${jsArg(id)}')">remove</button>
+    </div>`;
+  }).join('');
+  if (full && !pick?.disabled) { /* nothing: the select already says it */ }
+  renderAppTestingCommand();
+  loadAppTestingBasis();
+}
+
+/** What the session would actually have to check against — asked of the server.
+ *
+ *  This screen used to answer it in JavaScript, from the requirement box and the number of
+ *  ticked runs. It cannot: it knows nothing about the project's uploaded documents, so it
+ *  warned "nothing to check against" at a project holding a full specification, and said
+ *  nothing when every ticked reference was stale. The refusal a session would give arrives
+ *  here instead of after somebody has launched a browser. */
+let _appBasisTimer = null;
+function loadAppTestingBasis() {
+  clearTimeout(_appBasisTimer);
+  _appBasisTimer = setTimeout(_loadAppTestingBasisNow, 250);
+}
+
+async function _loadAppTestingBasisNow() {
+  const box = document.getElementById('app-testing-basis');
+  if (!box) return;
+  if (!getActiveProjectId()) { box.innerHTML = ''; return; }
+  const requirement = ((document.getElementById('app-testing-requirement') || {}).value || '');
+  let d;
+  try {
+    d = await apiFetch('/api/v1/app-testing/basis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requirement,
+                             project_id: getActiveProjectId(),
+                             source_review_ids: appTestingSources() }),
+      _silent: true,
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="cost-note">Could not check what this session has to test
+      against: ${esc(e.message)}</div>`;
+    return;
+  }
+  const parts = [];
+  if (d.has_requirement) parts.push('the requirement you typed');
+  if (d.has_documents) parts.push(`${d.document_chars.toLocaleString()} characters of `
+                                  + `Requirements and QA documents on this project`);
+  (d.source_reviews || []).forEach(r => parts.push(
+    `${r.items} ${r.review_type === 'test_cases' ? 'test case(s)' : 'scenario(s)'} from an `
+    + `earlier run`));
+
+  box.innerHTML = `
+    <div class="cost-note" style="border-left:3px solid var(--${
+        d.has_stated ? 'green' : d.has_derived ? 'amber' : 'red'})">
+      ${d.has_any ? `
+        <b>This session can check against ${esc(parts.join(', '))}.</b>
+        Its strongest assertion may claim <b>${esc(d.strongest_basis)}</b>${
+          d.strongest_basis === 'derived'
+            ? ' — a case this platform generated, which nobody has checked against what you '
+              + 'actually wanted'
+            : ''}.`
+        : `<b>${esc(d.refusal || '')}</b>`}
+      ${(d.skipped_sources || []).length ? `
+        <div style="margin-top:6px">
+          <b>Dropped:</b>
+          ${d.skipped_sources.map(x => `<div>${esc(x)}</div>`).join('')}
+        </div>` : ''}
+      ${d.brief_markdown ? `
+        <details style="margin-top:8px">
+          <summary style="cursor:pointer">Read exactly what will be sent
+            (${d.brief_chars.toLocaleString()} characters)</summary>
+          <pre class="api-usage-code" style="margin-top:6px;max-height:280px;overflow:auto">${
+            esc(d.brief_markdown)}${d.brief_truncated ? '\n…' : ''}</pre>
+        </details>` : ''}
+    </div>`;
 }
 
 function appTestingCommand() {
@@ -3001,7 +3221,6 @@ async function previewAppTestingCost() {
       body: JSON.stringify(body),
     });
     const q = (res && res.estimate) || {};
-    const hasReq = (body.requirement || '').trim().length > 0;
     box.innerHTML = `
       <div class="cost-note">
         <div><b>About $${(q.expected_usd || 0).toFixed(4)}</b> expected, up to
@@ -3011,13 +3230,12 @@ async function previewAppTestingCost() {
           ${body.max_steps} exploration step(s) plus one to write the suite. A step that gets
           refused is not charged against the budget. Replaying the finished suite calls no
           model at all.</div>
-        ${(hasReq || appTestingSources().length) ? '' :
-          `<div class="field-hint" style="margin-top:6px;color:var(--amber)">
-          Nothing supplied to check against yet. A session needs at least one of: a
-          requirement in your own words, a requirements or QA document uploaded against this
-          project, or an earlier Test Scenario / Test Case run to cover &mdash; otherwise the
-          suite can only describe what the application does today.</div>`}
       </div>`;
+    // What this session has to check against is answered by the server, in the panel under
+    // the source picker, and not guessed at here. The guess this replaces read the
+    // requirement box and counted ticked runs, which meant it fired at a project holding a
+    // full specification and stayed silent when every ticked reference was stale.
+    loadAppTestingBasis();
   } catch (e) {
     box.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--amber)">
       Could not price a session: ${esc((e && e.message) || String(e))}</div>`;

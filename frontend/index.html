@@ -709,7 +709,8 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
 
           <div class="form-group">
             <label for="app-testing-requirement">In your own words</label>
-            <textarea id="app-testing-requirement" rows="4" oninput="renderAppTestingCommand()"
+            <textarea id="app-testing-requirement" rows="4"
+                      oninput="renderAppTestingCommand(); loadAppTestingBasis()"
                       placeholder="e.g. A task may only be edited by the user who created it. Any other signed-in user attempting to edit it must be refused."></textarea>
             <div class="field-hint">A sentence or two is enough. Tests that check it are
               labelled <b>stated</b> &mdash; traced to something a person wrote.</div>
@@ -726,16 +727,29 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
           </div>
 
           <div class="form-group">
-            <label for="app-testing-sources">Cover an earlier Test Scenario or Test Case run
+            <label for="app-testing-source-pick">Cover an earlier Test Scenario or Test Case run
               (optional)</label>
-            <select id="app-testing-sources" multiple size="4"
-                    onchange="renderAppTestingCommand()"></select>
+            <!-- A dropdown that adds to a list, rather than a multi-select box. The cap is
+                 five (app_basis.MAX_SOURCE_REVIEWS) and a multi-select has nowhere to say so,
+                 nowhere to show what a run contains, and no way to tell "this project has
+                 none" from "the request failed" -- all three rendered as an empty box. -->
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <select id="app-testing-source-pick" style="flex:1;min-width:280px"></select>
+              <button type="button" class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
+                      onclick="addAppTestingSource()">Add</button>
+            </div>
+            <div id="app-testing-sources-chosen"></div>
             <div class="field-hint">Only if those agents have already run for this system
               &mdash; most sessions will not have them, and that is fine. A test case already
               carries steps and expected results, so it is the closest thing to a plan for the
               suite. Tests that check one are labelled <b>derived</b> rather than stated,
               because this platform wrote that case rather than a person.</div>
           </div>
+
+          <!-- What the session would actually be given, resolved by the server rather than
+               guessed at here. The browser cannot see the project's uploaded documents, so
+               anything it concluded about "is there a basis" was wrong in both directions. -->
+          <div id="app-testing-basis" class="field-hint"></div>
 
           <div class="section-title">3. Confirm where it is pointed</div>
           <div class="form-group">
