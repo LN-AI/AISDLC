@@ -136,6 +136,18 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             source_review_ids  TEXT DEFAULT '',
             has_stated_basis   INTEGER DEFAULT 0,
             has_derived_basis  INTEGER DEFAULT 0,
+            -- A stop asked for from a screen. The driver runs on somebody else's machine
+            -- and cannot be reached, so this is left here and collected on its next step:
+            -- the platform answers `done`, which every driver already honours, and closes
+            -- the session. Enforcement is therefore server-side rather than cooperative --
+            -- a driver that ignored the answer would be refused on the step after.
+            stop_requested_at  TEXT DEFAULT NULL,
+            stop_requested_by  TEXT DEFAULT '',
+            -- What the policy withheld, as JSON {name: {group, count}}. The counts were
+            -- always kept and the names always discarded, which left the session record
+            -- saying "14 controls declined" and unable to say which -- the half an operator
+            -- needs in order to judge whether the denylist is too tight for their app.
+            refused_summary    TEXT DEFAULT '',
             started_at         TEXT NOT NULL,
             finished_at        TEXT DEFAULT NULL,
             last_error         TEXT DEFAULT '',
@@ -183,7 +195,10 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
                         ("page_text_expires_at", "TEXT DEFAULT NULL"),
                         ("source_review_ids", "TEXT DEFAULT ''"),
                         ("has_stated_basis", "INTEGER DEFAULT 0"),
-                        ("has_derived_basis", "INTEGER DEFAULT 0")):
+                        ("has_derived_basis", "INTEGER DEFAULT 0"),
+                        ("stop_requested_at", "TEXT DEFAULT NULL"),
+                        ("stop_requested_by", "TEXT DEFAULT ''"),
+                        ("refused_summary", "TEXT DEFAULT ''")):
         try:
             cursor.execute(f"ALTER TABLE app_sessions ADD COLUMN {_col} {_type}")
         except sqlite3.OperationalError:
@@ -508,20 +523,42 @@ def sweep_expired_page_text(conn) -> int:
     `lapse_expired_waivers` do. A retention promise that only holds while the process happens
     to have been restarted is not a retention promise.
 
-    A session that was abandoned before generating has no expiry set, so it is swept on the
-    same window measured from when it started -- otherwise closing the browser half way
-    through would be a way of keeping the digest indefinitely.
+    A session that was abandoned before generating never reaches
+    `start_page_text_retention`, so it has no expiry. It is swept on **its own chosen
+    window, measured from when it started** -- the same number of days the person picked on
+    the screen, applied to a session that never finished. Otherwise closing the browser half
+    way through would be a way of keeping the digest indefinitely.
+
+    Two things this gets right that the previous version did not.
+
+    It used to require `status != 'exploring'` for that branch, which excluded the only case
+    the paragraph above describes: an abandoned session stays at `exploring` for ever, so it
+    was never swept at all -- the text promised one thing and the SQL did the opposite.
+    `reap_abandoned` now moves that status, which is why it has to run first.
+
+    And the window is the customer's choice rather than a fixed ninety-day backstop. **Zero
+    is honoured**: it means "keep this no longer than necessary", and for a session that
+    will never write a suite, necessary ends when the session closes. The cost is that a
+    zero-day session cannot later have a suite written from the steps it did take, so the
+    screen says so where the choice is made rather than leaving it to be discovered.
     """
     now = datetime.now(timezone.utc)
     stale = now.isoformat()
-    abandoned = (now - timedelta(days=MAX_PAGE_TEXT_RETENTION_DAYS)).isoformat()
     rows = conn.execute(
-        "SELECT id FROM app_sessions WHERE "
+        "SELECT id, page_text_expires_at, page_text_retention_days, started_at "
+        "FROM app_sessions WHERE "
         "  (page_text_expires_at IS NOT NULL AND page_text_expires_at < ?) "
-        "  OR (page_text_expires_at IS NULL AND status != 'exploring' AND started_at < ?)",
-        (stale, abandoned)).fetchall()
+        "  OR (page_text_expires_at IS NULL AND status != 'exploring')",
+        (stale,)).fetchall()
     cleared = 0
     for row in rows:
+        if not row["page_text_expires_at"]:
+            # No expiry means the suite was never written, so the clock runs from the
+            # session's own start against the window it was opened with.
+            age = _age_seconds(row["started_at"], now)
+            window = normalise_retention(row["page_text_retention_days"]) * 86_400
+            if age is not None and age < window:
+                continue
         if wipe_page_text(conn, row["id"]):
             cleared += 1
     if cleared:
@@ -577,6 +614,254 @@ def journeys(conn, session_id):
     ]
 
 
+# How long a session may sit at `exploring` with no step before it is treated as gone.
+# Deliberately generous: reaping early is the dangerous direction, because `require_open`
+# then refuses a *live* driver's next step and kills a session that was working. A driver on
+# a slow application, with 180-second HTTP timeouts and somebody intervening at the browser,
+# can idle for a long time without being dead.
+ABANDONED_AFTER_HOURS = 6
+
+# The most distinct control names a session's refusal record will hold. A session that meets
+# the same Delete button thirty times stores one entry with a count of thirty, so this caps
+# variety rather than volume.
+MAX_REFUSED_NAMES = 40
+
+
+def request_stop(conn, session_id, who=""):
+    """Ask a running session to stop at its next step.
+
+    Idempotent, and only meaningful while the session is open: the flag is collected inside
+    `take_step`, which `require_open` no longer admits once a session has finished. The
+    first requester is kept -- a second person pressing the button is agreeing, not
+    overriding.
+    """
+    row = get(conn, session_id)
+    if not row:
+        return None
+    status = str(row["status"] or "")
+    if status != "exploring":
+        return {"stopped": False, "already": status}
+    if row["stop_requested_at"]:
+        return {"stopped": True, "requested_at": row["stop_requested_at"],
+                "requested_by": row["stop_requested_by"] or ""}
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE app_sessions SET stop_requested_at = ?, stop_requested_by = ? WHERE id = ?",
+        (now, who or "", session_id))
+    conn.commit()
+    return {"stopped": True, "requested_at": now, "requested_by": who or ""}
+
+
+def stop_requested(session) -> bool:
+    """Whether a screen has asked this session to stop."""
+    try:
+        return bool(session["stop_requested_at"])
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
+def record_refusals(conn, session_id, refused):
+    """Merge this step's withheld controls into the session's own record.
+
+    Session-level rather than per-step, for the reason the `app_steps` comment gives: an
+    operator wants "it declined 14 controls, here is why" once, not fourteen rows of button
+    names per step. Bounded by distinct name, so a loop that meets the same button on every
+    page cannot grow it.
+
+    Deliberately outside `wipe_page_text`: that promises a person can still see *what a
+    session refused* after the digest is gone, and this is that.
+    """
+    rows = [r for r in (refused or []) if isinstance(r, dict)]
+    if not rows:
+        return
+    row = get(conn, session_id)
+    if not row:
+        return
+    try:
+        summary = json.loads(row["refused_summary"] or "{}")
+    except (ValueError, TypeError):
+        summary = {}
+    if not isinstance(summary, dict):
+        summary = {}
+    for cand in rows:
+        name = str(cand.get("name") or "").strip()[:80]
+        if not name:
+            continue
+        if name not in summary and len(summary) >= MAX_REFUSED_NAMES:
+            continue
+        entry = summary.get(name)
+        if not isinstance(entry, dict):
+            entry = {"group": "", "count": 0}
+        entry["count"] = int(entry.get("count") or 0) + 1
+        entry["group"] = str(cand.get("refused_group")
+                             or entry.get("group")
+                             or cand.get("refused_because") or "")[:120]
+        summary[name] = entry
+    conn.execute("UPDATE app_sessions SET refused_summary = ? WHERE id = ?",
+                 (json.dumps(summary), session_id))
+    conn.commit()
+
+
+def refusals(session) -> list:
+    """The withheld controls, newest counts first, as a screen would draw them."""
+    try:
+        raw = session["refused_summary"]
+    except (KeyError, IndexError, TypeError):
+        return []
+    try:
+        summary = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(summary, dict):
+        return []
+    out = []
+    for name, entry in summary.items():
+        if not isinstance(entry, dict):
+            continue
+        out.append({"name": name,
+                    "group": str(entry.get("group") or ""),
+                    "count": int(entry.get("count") or 0)})
+    out.sort(key=lambda r: (-r["count"], r["name"]))
+    return out
+
+
+def reap_abandoned(conn, hours=ABANDONED_AFTER_HOURS) -> int:
+    """Close sessions whose driver stopped talking to us.
+
+    Two reasons this exists, and the second is the one that matters. A session left at
+    `exploring` for ever is invisible to any screen built on finished runs, so somebody who
+    paid for thirty steps and closed their laptop sees nothing at all. And
+    `sweep_expired_page_text` excludes `status = 'exploring'` from its abandoned branch, so
+    the digest of an abandoned session was never swept -- closing the browser half way
+    through was a way of keeping it indefinitely, which is the exact thing that sweep's own
+    docstring says it prevents. Moving the status is what lets the existing sweep see it.
+
+    `finished` rather than `failed`: a closed laptop is not a failure, and the stop reason
+    says what happened.
+
+    It deliberately does **not** start the retention clock. At a retention of zero days that
+    would wipe the digest immediately and destroy the one thing worth doing with an
+    abandoned session -- writing the suite from the steps it did take. Retention starts
+    normally if the suite is written.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(1, int(hours)))).isoformat()
+    rows = conn.execute(
+        "SELECT s.id FROM app_sessions s WHERE s.status = 'exploring' AND "
+        "  COALESCE((SELECT MAX(created_at) FROM app_steps WHERE session_id = s.id),"
+        "           s.started_at) < ?",
+        (cutoff,)).fetchall()
+    for row in rows:
+        conn.execute(
+            "UPDATE app_sessions SET status = 'finished', finished_at = ?, "
+            "  stop_reason = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(),
+             f"abandoned - no step arrived for {int(hours)} hours", row["id"]))
+    if rows:
+        conn.commit()
+        logger.info("app-testing: closed %d abandoned session(s)", len(rows))
+    return len(rows)
+
+
+# Everything a list of sessions needs and nothing a list does not. `requirement` is left out
+# on purpose -- it runs to 20 000 characters and twenty of them would be a 400 KB response
+# for a screen that only needs to know whether there is one. So is anything from
+# `app_steps.page_texts`: `public()` reaches those through `journeys()` and decrypts every
+# one, which is fine for a single session and is hundreds of Fernet decrypts for a page of
+# twenty.
+_LIST_COLUMNS = """
+    s.id, s.project_id, s.review_id, s.target_label, s.goal, s.status, s.stop_reason,
+    s.max_steps, s.steps_used, s.refused_total, s.attested_test_env, s.collect_page_text,
+    s.page_text_retention_days, s.has_stated_basis, s.has_derived_basis,
+    s.stop_requested_at, s.started_at, s.finished_at, s.last_error, s.created_by,
+    LENGTH(COALESCE(s.requirement, '')) AS requirement_chars,
+    COUNT(st.id)                      AS recorded_steps,
+    COUNT(DISTINCT st.page_signature) AS distinct_pages,
+    COUNT(DISTINCT st.journey)        AS journey_count,
+    MAX(st.created_at)                AS last_step_at
+"""
+
+
+def _scope_sql(project_ids):
+    """The same three-state contract `database._project_scope_sql` uses.
+
+    `None` means unrestricted, `[]` means *nothing* -- never silently widened to everything,
+    which is how a caller with no visible projects would otherwise be shown every project.
+    """
+    if project_ids is None:
+        return "", []
+    if not project_ids:
+        return " AND 1 = 0", []
+    marks = ",".join("?" for _ in project_ids)
+    return f" AND s.project_id IN ({marks})", list(project_ids)
+
+
+def list_sessions(conn, project_ids=None, limit=20, offset=0, status=""):
+    """One page of sessions, newest first."""
+    where, params = _scope_sql(project_ids)
+    if status:
+        where += " AND s.status = ?"
+        params.append(status)
+    rows = conn.execute(
+        f"SELECT {_LIST_COLUMNS} FROM app_sessions s "
+        f"LEFT JOIN app_steps st ON st.session_id = s.id "
+        f"WHERE 1 = 1{where} GROUP BY s.id ORDER BY s.started_at DESC LIMIT ? OFFSET ?",
+        params + [max(1, int(limit)), max(0, int(offset))]).fetchall()
+    now = datetime.now(timezone.utc)
+    out = []
+    for row in rows:
+        item = dict(row)
+        item["has_requirement"] = bool(item.pop("requirement_chars", 0))
+        item["attested_test_env"] = bool(item.get("attested_test_env"))
+        item["collect_page_text"] = bool(item.get("collect_page_text", 1))
+        item["steps_remaining"] = max(0, int(item["max_steps"]) - int(item["steps_used"]))
+        item["stop_requested"] = bool(item.get("stop_requested_at"))
+        item["strongest_basis"] = ("stated" if item.get("has_stated_basis")
+                                   else "derived" if item.get("has_derived_basis")
+                                   else "observed")
+        item["has_stated_basis"] = bool(item.get("has_stated_basis"))
+        item["has_derived_basis"] = bool(item.get("has_derived_basis"))
+        # How long since anything happened, so a screen can say "nothing for 40 minutes"
+        # rather than leaving a reader to subtract timestamps. Computed here because the
+        # server's clock is the only one both sides share.
+        marker = item.get("last_step_at") or item.get("started_at")
+        item["idle_seconds"] = _age_seconds(marker, now)
+        item["looks_abandoned"] = bool(
+            item["status"] == "exploring"
+            and item["idle_seconds"] is not None
+            and item["idle_seconds"] > ABANDONED_AFTER_HOURS * 3600)
+        out.append(item)
+    return out
+
+
+def count_sessions(conn, project_ids=None, status="") -> int:
+    """How many the caller may see in all -- what a pager needs to know there is a next page.
+
+    Counted under exactly the same scope as the page itself, for the reason
+    `database.count_reviews` gives about its own duplicated predicate: a count that forgot
+    the filter reports "3 of 0".
+    """
+    where, params = _scope_sql(project_ids)
+    if status:
+        where += " AND s.status = ?"
+        params.append(status)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n FROM app_sessions s WHERE 1 = 1{where}", params).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def _age_seconds(stamp, now=None):
+    """Seconds since an ISO timestamp, or None if it cannot be read."""
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0, int(((now or datetime.now(timezone.utc)) - parsed).total_seconds()))
+
+
 def public(conn, session_id):
     """What a screen or a driver may see. Never includes anything a URL could be rebuilt from."""
     session = get(conn, session_id)
@@ -592,6 +877,9 @@ def public(conn, session_id):
     row["strongest_basis"] = ("stated" if row["has_stated_basis"]
                               else "derived" if row["has_derived_basis"] else "observed")
     row["source_review_ids"] = source_review_ids(row)
+    row["stop_requested"] = stop_requested(row)
+    row["refusals"] = refusals(row)
+    row["idle_seconds"] = _age_seconds(row.get("finished_at") or row.get("started_at"))
     row["collect_page_text"] = bool(row.get("collect_page_text", 1))
     row["page_text_retention_days"] = normalise_retention(
         row.get("page_text_retention_days"))

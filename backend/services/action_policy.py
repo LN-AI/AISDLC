@@ -131,36 +131,51 @@ def classify(candidate):
     records what it would not do and an operator reads that list to decide whether the
     denylist is too tight for their application.
     """
+    verdict, reason, _group = classify_detail(candidate)
+    return verdict, reason
+
+
+def classify_detail(candidate):
+    """The same judgement, plus *which rule* refused it: `(verdict, reason, group)`.
+
+    The group is a bare noun phrase -- "destroys data", "spends money" -- and the reason is
+    a sentence built around it. Kept separate rather than parsed back out of the sentence,
+    because a screen groups refusals by rule and re-deriving a field by stripping a label
+    prefix off a sentence is the kind of thing that works until somebody renames a button.
+
+    `classify` stays as it was so its two existing callers, and the driver that imports this
+    module, are untouched.
+    """
     name = normalise(candidate.get("name"))
     role = normalise(candidate.get("role"))
     label = str(candidate.get("name") or "")
 
     if candidate.get("enabled") is False:
-        return "refuse", "the control is disabled"
+        return "refuse", "the control is disabled", "is disabled"
     if role and role not in INTERACTIVE_ROLES:
-        return "refuse", role + " is not an interactive role"
+        return "refuse", role + " is not an interactive role", "is not interactive"
 
     # The dismiss exception, checked before the denylist: "Cancel" on its own is how a
     # person backs out of a dialog safely, and refusing it traps the explorer inside modals.
     if name in DISMISS_EXACT:
-        return "allow", ""
+        return "allow", "", ""
 
     for group, phrases in DESTRUCTIVE_PHRASES.items():
         for phrase in phrases:
             if phrase in name:
-                return "refuse", label + " " + group
+                return "refuse", label + " " + group, group
 
     words = name.split()
     for group, stems in DESTRUCTIVE_GROUPS.items():
         for stem in stems:
             if any(word.startswith(stem) for word in words):
-                return "refuse", label + " " + group
+                return "refuse", label + " " + group, group
 
     for term in SESSION_ENDING:
         if term in name:
-            return "refuse", label + " ends the session"
+            return "refuse", label + " ends the session", "ends the session"
 
-    return "allow", ""
+    return "allow", "", ""
 
 
 def screen(candidates):
@@ -175,13 +190,14 @@ def screen(candidates):
     for original in candidates or []:
         if not isinstance(original, dict):
             continue
-        verdict, reason = classify(original)
+        verdict, reason, group = classify_detail(original)
         row = dict(original)
         if verdict == "allow":
             row["index"] = len(allowed)
             allowed.append(row)
         else:
             row["refused_because"] = reason
+            row["refused_group"] = group
             refused.append(row)
     return allowed, refused
 

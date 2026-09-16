@@ -34,6 +34,7 @@ import os
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -926,6 +927,231 @@ def main_():
     check("a run in a project the caller cannot see reads as absent, not as forbidden",
           "no such run" in " ".join(other.json().get("skipped_sources") or []),
           other.json().get("skipped_sources"))
+
+    # ── 16. Stopping a session from a screen ──────────────────────────────
+    #
+    # The browser runs on the customer's machine and this platform cannot reach it (D-407).
+    # What it can do is answer the *next* step with `done` -- which every driver already
+    # honours, so this needed no change to `explore_app.py` and every copy in the field
+    # obeys it. Two orderings carry the whole design and both are asserted below: the check
+    # sits before `require_open`, because a 400 makes the driver exit non-zero and lose the
+    # session, and before metering, because a stopping step must not be charged for.
+    section("16. A session can be stopped from a screen, at its next step")
+
+    stoppable = _open_session(client, scoped, max_steps=10).json()["session"]["id"]
+    _step(client, scoped, stoppable, [{"role": "link", "name": "Items"}], url_path="/items")
+
+    asked = client.post(f"/api/v1/app-testing/sessions/{stoppable}/request-stop",
+                        headers=scoped)
+    check("asking to stop is accepted", asked.status_code == 200, asked.text[:200])
+    check("...and costs nothing to ask", asked.json().get("stopped") is True)
+    check("...and says it lands at the next step rather than immediately",
+          "next step" in (asked.json().get("note") or ""), asked.json().get("note"))
+    check("...and says the browser window is not ours to close",
+          "cannot close it" in (asked.json().get("note") or ""),
+          "a person who expects the window to shut will think the button is broken")
+
+    check("a session with a stop pending is still `exploring` until the driver reaches it",
+          asked.json()["session"]["status"] == "exploring",
+          "showing a stopped state before the row says so is a lie the screen cannot "
+          "retract")
+    check("...and the screen can see that a stop is pending",
+          asked.json()["session"].get("stop_requested") is True)
+
+    _before_stop = len(_llm_calls)
+    stopped = _step(client, scoped, stoppable, [{"role": "link", "name": "Items"}],
+                    url_path="/items")
+    check("the next step is answered rather than refused",
+          stopped.status_code == 200,
+          "a 4xx here makes the driver exit non-zero, and the steps already paid for never "
+          f"become a suite: {stopped.text[:160]}")
+    check("...as `done`, which every driver already honours",
+          stopped.json().get("done") is True, stopped.json())
+    check("...and the stopping step calls no model",
+          len(_llm_calls) == _before_stop,
+          f"{len(_llm_calls) - _before_stop} call(s) -- the step that stops a session must "
+          "not be charged for")
+    check("the session is closed, so enforcement does not depend on the driver obeying",
+          stopped.json()["session"]["status"] == "finished",
+          stopped.json()["session"]["status"])
+
+    again = client.post(f"/api/v1/app-testing/sessions/{stoppable}/request-stop",
+                        headers=scoped)
+    check("stopping an already-stopped session is not an error",
+          again.status_code == 200 and again.json().get("stopped") is False,
+          "a race where the driver finished a second earlier is not something to report as "
+          "a failure")
+    check("...and says so plainly", "already stopped" in (again.json().get("note") or ""),
+          again.json().get("note"))
+
+    # The steps it did take are still worth something -- that is the whole reason a stop is
+    # served as `done` rather than as an error.
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    salvage = client.post(f"/api/v1/app-testing/sessions/{stoppable}/generate",
+                          json={}, headers=scoped)
+    check("a stopped session can still write a suite from the steps it took",
+          salvage.status_code == 200, salvage.text[:200])
+
+    # ── 17. What was withheld, by name ────────────────────────────────────
+    #
+    # The counts were always kept and the names always discarded, so the record could say
+    # "14 controls declined" and not which. That is the half an operator needs: a denylist
+    # eating half a page is a coverage problem, not a safety win, and nothing could show it.
+    section("17. The session records what the policy withheld, not just how many")
+
+    withholding = _open_session(client, scoped, max_steps=10).json()["session"]["id"]
+    _step(client, scoped, withholding, [
+        {"role": "button", "name": "Delete account"},
+        {"role": "button", "name": "Delete account"},
+        {"role": "button", "name": "Place order"},
+        {"role": "link", "name": "Items"},
+    ], url_path="/items")
+    seen = client.get(f"/api/v1/app-testing/sessions/{withholding}", headers=scoped)
+    _refusals = {r["name"]: r for r in seen.json()["session"].get("refusals", [])}
+    check("the names of withheld controls reach the screen",
+          "Delete account" in _refusals and "Place order" in _refusals, _refusals)
+    check("...with which rule refused each one",
+          _refusals.get("Delete account", {}).get("group") == "destroys data"
+          and _refusals.get("Place order", {}).get("group") == "spends money",
+          _refusals)
+    check("...and the same control met twice is one entry with a count, not two entries",
+          _refusals.get("Delete account", {}).get("count") == 2,
+          "bounded by distinct name, so a loop that meets the same button on every page "
+          "cannot grow the record")
+
+    # Page text is the customer's own content and is wiped on a clock. What a session
+    # *refused* is not: `wipe_page_text` promises a person can still see that a session ran,
+    # how far it got, and what it would not do.
+    with contextlib.closing(database.get_connection()) as _c:
+        app_session.wipe_page_text(_c, withholding)
+    after_wipe = client.get(f"/api/v1/app-testing/sessions/{withholding}", headers=scoped)
+    check("the refusal record survives the page-text wipe",
+          len(after_wipe.json()["session"].get("refusals", [])) == 2,
+          "the wipe promises that what a session refused stays visible")
+
+    # ── 18. A session whose driver stopped talking to us ──────────────────
+    #
+    # Two things go wrong when nothing closes these. A person who paid for thirty steps and
+    # closed their laptop sees nothing at all, because every list is built on finished runs.
+    # And `sweep_expired_page_text` excludes `exploring` from its abandoned branch, so the
+    # digest was never swept -- closing the browser half way through kept it indefinitely,
+    # which is the exact thing that sweep's own docstring says it prevents.
+    section("18. An abandoned session is closed, and its digest then expires")
+
+    ghost = _open_session(client, scoped, max_steps=10).json()["session"]["id"]
+    _step(client, scoped, ghost, [{"role": "link", "name": "Items"}], url_path="/items",
+          page_texts=["heading: Items"])
+    with contextlib.closing(database.get_connection()) as _c:
+        # Old enough to be abandoned (hours) and old enough for its own seven-day window to
+        # have passed. Both are needed and they are different clocks: one decides that the
+        # driver is gone, the other decides that the digest's time is up.
+        _old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        _c.execute("UPDATE app_sessions SET started_at = ? WHERE id = ?", (_old, ghost))
+        _c.execute("UPDATE app_steps SET created_at = ? WHERE session_id = ?", (_old, ghost))
+        _c.commit()
+        _held_before = _c.execute(
+            "SELECT COUNT(*) FROM app_steps WHERE session_id = ? AND page_texts != ''",
+            (ghost,)).fetchone()[0]
+    check("its digest is held while it looks live", _held_before == 1, _held_before)
+
+    with contextlib.closing(database.get_connection()) as _c:
+        _reaped = app_session.reap_abandoned(_c)
+        check("a session with no step for hours is closed", _reaped >= 1, _reaped)
+        _row = app_session.get(_c, ghost)
+        check("...as finished rather than failed, because a closed laptop is not a failure",
+              _row["status"] == "finished", _row["status"])
+        check("...and says why", "abandoned" in (_row["stop_reason"] or ""),
+              _row["stop_reason"])
+        # The reap deliberately does not start the retention clock: at zero days that would
+        # wipe the digest immediately and destroy the one useful thing left to do with an
+        # abandoned session, which is to write the suite from the steps it did take.
+        _still = _c.execute(
+            "SELECT COUNT(*) FROM app_steps WHERE session_id = ? AND page_texts != ''",
+            (ghost,)).fetchone()[0]
+        check("reaping does not itself wipe the digest",
+              _still == 1,
+              "writing a suite from an abandoned session is the whole point of keeping it")
+        _cleared = app_session.sweep_expired_page_text(_c)
+        _after = _c.execute(
+            "SELECT COUNT(*) FROM app_steps WHERE session_id = ? AND page_texts != ''",
+            (ghost,)).fetchone()[0]
+    check("...but the sweep can now see it, which it could not while it said `exploring`",
+          _after == 0,
+          f"{_cleared} cleared; an abandoned session used to keep its digest for ever")
+
+    # The window is the customer's choice, not a fixed backstop. A session still inside its
+    # own window keeps its digest, which is what makes "write the suite from these steps"
+    # possible at all.
+    young = _open_session(client, scoped, max_steps=10).json()["session"]["id"]
+    _step(client, scoped, young, [{"role": "link", "name": "Items"}], url_path="/items",
+          page_texts=["heading: Items"])
+    with contextlib.closing(database.get_connection()) as _c:
+        _c.execute("UPDATE app_sessions SET started_at = ? WHERE id = ?",
+                   ((datetime.now(timezone.utc) - timedelta(days=2)).isoformat(), young))
+        _c.execute("UPDATE app_steps SET created_at = ? WHERE session_id = ?",
+                   ((datetime.now(timezone.utc) - timedelta(days=2)).isoformat(), young))
+        _c.commit()
+        app_session.reap_abandoned(_c)
+        app_session.sweep_expired_page_text(_c)
+        _kept = _c.execute(
+            "SELECT COUNT(*) FROM app_steps WHERE session_id = ? AND page_texts != ''",
+            (young,)).fetchone()[0]
+    check("an abandoned session inside its own window keeps its digest",
+          _kept == 1,
+          "two days into a seven-day window; wiping here would destroy the one useful thing "
+          "left to do with an abandoned session")
+
+    # Zero days means "keep this no longer than necessary", and for a session that will
+    # never write a suite, necessary ends when it closes. The consequence -- no suite can be
+    # written from it afterwards -- is stated on the screen where the choice is made.
+    nothing_kept = _open_session(client, scoped, max_steps=10,
+                                 page_text_retention_days=0).json()["session"]["id"]
+    _step(client, scoped, nothing_kept, [{"role": "link", "name": "Items"}],
+          url_path="/items", page_texts=["heading: Items"])
+    with contextlib.closing(database.get_connection()) as _c:
+        _c.execute("UPDATE app_sessions SET started_at = ? WHERE id = ?",
+                   ((datetime.now(timezone.utc) - timedelta(hours=12)).isoformat(),
+                    nothing_kept))
+        _c.execute("UPDATE app_steps SET created_at = ? WHERE session_id = ?",
+                   ((datetime.now(timezone.utc) - timedelta(hours=12)).isoformat(),
+                    nothing_kept))
+        _c.commit()
+        app_session.reap_abandoned(_c)
+        app_session.sweep_expired_page_text(_c)
+        _zero = _c.execute(
+            "SELECT COUNT(*) FROM app_steps WHERE session_id = ? AND page_texts != ''",
+            (nothing_kept,)).fetchone()[0]
+    check("a session set to keep nothing keeps nothing, once it is closed",
+          _zero == 0,
+          "zero has to mean zero, or it is not the tightest position a customer can take")
+
+    # ── 19. The list the browser had no way to ask for ────────────────────
+    section("19. Sessions can be listed, including ones that produced nothing")
+
+    listed = client.get("/api/v1/app-testing/sessions", headers=scoped)
+    check("the list is served", listed.status_code == 200, listed.text[:200])
+    _ids = [r["id"] for r in listed.json().get("sessions", [])]
+    check("a session that never wrote a suite is in it",
+          ghost in _ids,
+          "every list until now was built on the `reviews` row that /generate writes, so a "
+          "session that produced nothing was invisible although its steps were paid for")
+    check("the total is reported, so a pager knows there is another page",
+          isinstance(listed.json().get("total"), int))
+    _ghost_row = next(r for r in listed.json()["sessions"] if r["id"] == ghost)
+    check("a row says how far it got without a second request",
+          _ghost_row["recorded_steps"] == 1 and _ghost_row["max_steps"] == 10, _ghost_row)
+    check("...and how long it has been silent",
+          isinstance(_ghost_row.get("idle_seconds"), int), _ghost_row.get("idle_seconds"))
+    check("the requirement is not shipped in a list",
+          "requirement" not in _ghost_row and _ghost_row.get("has_requirement") is True,
+          "a requirement runs to 20 000 characters and twenty rows of them is a 400 KB "
+          "response for a screen that only needs to know whether there is one")
+
+    empty_scope = client.get("/api/v1/app-testing/sessions", headers=other_proj)
+    check("another project's sessions are not listed",
+          ghost not in [r["id"] for r in empty_scope.json().get("sessions", [])],
+          "`[]` from the scope helper means nothing, and must never widen to everything")
 
     # ── 14. The product agrees with itself ────────────────────────────────
     section("14. The registry row, the estimator and the screen table agree")

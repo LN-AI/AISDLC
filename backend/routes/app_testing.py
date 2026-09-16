@@ -33,6 +33,8 @@ would bill for steps nobody took.
 """
 import logging
 import re
+import time
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -62,6 +64,22 @@ router = APIRouter(prefix="/api/v1/app-testing", tags=["Application testing"])
 # How much of the brief the screen may show back. The whole thing can be 40 000 chars
 # (`app_basis.MAX_BRIEF_CHARS`) and this response is drawn on every add and remove.
 BRIEF_PREVIEW_CHARS = 2_000
+
+# A screen watching a live session reads this route every 2.5 seconds, and the read path is
+# where the page-text sweep runs because there is no scheduler. Unthrottled that is 24 table
+# scans a minute per watcher. A retention promise that holds to the minute is the same
+# promise, and this keeps the poll from becoming a load generator.
+SWEEP_MIN_INTERVAL_S = 60.0
+_last_sweep = 0.0
+
+
+def _sweep_if_due(conn) -> None:
+    global _last_sweep
+    now = time.monotonic()
+    if now - _last_sweep < SWEEP_MIN_INTERVAL_S:
+        return
+    _last_sweep = now
+    app_session.sweep_expired_page_text(conn)
 
 PRODUCT = "app-testing"
 
@@ -465,6 +483,22 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
 
     conn = database.get_connection()
     try:
+        # A stop asked for from a screen is collected here, before `require_open` and before
+        # anything is metered. Both orderings matter. `require_open` raises a 400 and the
+        # driver turns any status >= 400 into SystemExit, losing the session; `done` is the
+        # clean exit it already handles, after which it still calls /finish and /generate,
+        # so the steps already paid for still become a suite. And being ahead of
+        # `guarded_call` is what makes the stopping step free.
+        stopping = app_session.get(conn, session_id)
+        if stopping is not None and app_session.stop_requested(stopping)                 and str(stopping["status"] or "") == "exploring":
+            app_session.finish(conn, session_id, status="finished",
+                               stop_reason="stopped from the platform")
+            return {
+                "done": True,
+                "reason": "stopped from the platform",
+                "session": app_session.public(conn, session_id),
+            }
+
         try:
             session = app_session.require_open(conn, session_id)
         except SessionError as exc:
@@ -582,6 +616,12 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
             page_texts=texts,
             outcome=req.last_outcome,
         )
+        # What was withheld, by name and group, on the session rather than per step. The
+        # counts were always kept and the names always thrown away, which left the record
+        # able to say "14 controls declined" and unable to say which -- and which is the
+        # half that tells an operator whether the denylist is too tight for their
+        # application. Bounded by distinct name, so a loop cannot grow it.
+        app_session.record_refusals(conn, session_id, refused)
         public = app_session.public(conn, session_id)
     finally:
         conn.close()
@@ -684,7 +724,14 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
 
 
 @router.get("/sessions/{session_id}", summary="A session's progress, journeys and refusals")
-def read_session(session_id: str, caller: dict = Depends(get_caller)):
+def read_session(session_id: str, since_step: int = 0, caller: dict = Depends(get_caller)):
+    """One session, with its steps.
+
+    `since_step` returns only steps after that index. Steps are append-only and immutable,
+    so a screen watching a live session accumulates them and each poll then carries the
+    session row plus at most one new step -- rather than re-sending every page digest every
+    two and a half seconds, which is what makes watching affordable at all.
+    """
     _visible_session(session_id, caller)
     conn = database.get_connection()
     try:
@@ -693,10 +740,103 @@ def read_session(session_id: str, caller: dict = Depends(get_caller)):
         # been up for three weeks would otherwise still be holding digests it promised to
         # delete after seven days. This is the read that depends on them, so this is where
         # it belongs.
-        app_session.sweep_expired_page_text(conn)
+        _sweep_if_due(conn)
+        rows = app_session.steps(conn, session_id)
+        if since_step > 0:
+            rows = [r for r in rows if int(r.get("step_index") or 0) > since_step]
         return {
             "session": app_session.public(conn, session_id),
-            "steps": app_session.steps(conn, session_id),
+            "steps": rows,
+            # Every age on screen is measured against this rather than the browser's clock,
+            # so a machine three minutes fast does not report "last step -180s ago".
+            "now": datetime.now(timezone.utc).isoformat(),
+            "policy": action_policy.describe_policy(),
+        }
+    finally:
+        conn.close()
+
+
+@router.get("/sessions", summary="Sessions for this project, newest first (free)")
+def list_sessions(limit: int = 20, offset: int = 0, status: str = "",
+                  caller: dict = Depends(get_caller)):
+    """The list the browser had no way to ask for.
+
+    Until now the only way to find a past session was the `reviews` row that `/generate`
+    writes -- so a session that never produced a suite was invisible by construction, even
+    though its steps were paid for. That is the case a person most needs to see.
+
+    Free, and scoped the same way `GET /api/reviews` is: `visible_from_caller` returns
+    `None` for unrestricted, `[]` for nothing, and `[]` must never widen to everything.
+    """
+    conn = database.get_connection()
+    try:
+        # No scheduler in this deployment, so time-based work runs at startup *and* on the
+        # read path that depends on it -- the rule `lapse_expired_waivers` and
+        # `review_source_store.sweep_expired` already follow. This is the read that depends
+        # on it: a session whose driver stopped talking to us must show as closed here.
+        app_session.reap_abandoned(conn)
+        visible = scope.visible_from_caller(caller)
+        rows = app_session.list_sessions(conn, project_ids=visible, limit=min(limit, 100),
+                                         offset=offset, status=status)
+        return {
+            "sessions": rows,
+            "total": app_session.count_sessions(conn, project_ids=visible, status=status),
+            "limit": limit,
+            "offset": offset,
+            "live_count": app_session.count_sessions(conn, project_ids=visible,
+                                                     status="exploring"),
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/sessions/{session_id}/request-stop",
+             summary="Ask a running session to stop at its next step (free)")
+def request_stop(session_id: str, caller: dict = Depends(get_caller)):
+    """Stop a session from a screen, without being able to reach the machine running it.
+
+    The browser is on the customer's side and this platform cannot touch it (D-407). What it
+    can do is answer the *next* step with `done`, which every driver already honours -- so
+    this needs no change to `explore_app.py` and every copy in the field obeys it. The flag
+    is collected in `take_step` before `require_open` and before metering, so the stopping
+    step makes no model call and costs nothing.
+
+    Enforcement is server-side rather than cooperative: the session row is closed, so a
+    driver that ignored the reply would be refused on the step after.
+
+    What it cannot do, and what the screen must say: it lands at a step boundary, not
+    immediately, and the browser window stays open on the machine driving it.
+
+    Free, so `_visible_session` is the whole authorisation -- the same policy as `/finish`,
+    which also spends nothing. Scope is checked before anything is written.
+    """
+    _visible_session(session_id, caller)
+    conn = database.get_connection()
+    try:
+        outcome = app_session.request_stop(
+            conn, session_id, who=str((caller or {}).get("username") or ""))
+        if outcome is None:
+            raise HTTPException(404, "No such session.")
+        if not outcome.get("stopped"):
+            # 200, not 409: the caller wanted this session not to be running, and it is not.
+            # A race where the driver finished a second earlier is not an error to report.
+            return {
+                "stopped": False,
+                "already": outcome.get("already"),
+                "note": ("It had already stopped on its own, so nothing was cancelled."),
+                "session": app_session.public(conn, session_id),
+            }
+        return {
+            "stopped": True,
+            "requested_at": outcome.get("requested_at"),
+            "note": (
+                "The session will stop at its next step - usually a few seconds, up to about "
+                "twenty if the browser is part way through loading a page. A step already in "
+                "flight finishes and is recorded. The browser window stays open on the "
+                "machine driving it; this platform cannot close it, and any screenshots, "
+                "video or trace stay there."
+            ),
+            "session": app_session.public(conn, session_id),
         }
     finally:
         conn.close()

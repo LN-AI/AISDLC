@@ -672,7 +672,10 @@ function _runPageLoader(page) {
     // App testing offers the same handoff in a different shape — many runs, not one, because
     // a session can cover several earlier case runs at once. Rebuilt per visit for the same
     // reason: the runs offered must belong to the project selected now.
-    if (page === 'app-testing') loadAppTestingSources();
+    if (page === 'app-testing') { loadAppTestingSources(); loadAppTestingSessions(); }
+    // A poll that survives navigation keeps fetching for a screen nobody is looking at,
+    // which is the habit modernization's single global timer has.
+    if (page !== 'app-testing') stopAppSessionPoll();
     // The mode select drives which fields exist, so the screen has to be put in
     // the selected mode on arrival as well as on change.
     if (page === 'architecture') onArchModeChange();
@@ -3098,6 +3101,309 @@ async function _loadAppTestingBasisNow() {
             esc(d.brief_markdown)}${d.brief_truncated ? '\n…' : ''}</pre>
         </details>` : ''}
     </div>`;
+}
+
+// ── Watching a session happen ──────────────────────────────────────────────
+//
+// The exploration runs in a terminal on the customer's own machine, so for the whole of a
+// forty-step session this screen used to show nothing at all. Everything needed was already
+// recorded and nothing read it: a real session in the live database burned all twenty-five
+// of its steps moving between two pages, and nobody could see it or stop it.
+//
+// The poller is `pollReviewJob`'s shape rather than modernization's: one timer per panel,
+// a consecutive-miss counter, and it stops on navigation. Modernization's single global
+// timer is the thing its own comment at the review poller warns against.
+
+const APP_POLL_MS = 2500;
+// A finished exploration is followed by one long model call before a suite exists, so the
+// poll must not stop the moment the status leaves `exploring` -- that is how the link to
+// the finished suite never appears. It keeps watching for a short grace window and then
+// says so rather than spinning for ever, which is what a `--no-generate` session would do.
+const APP_GRACE_TICKS = 8;
+
+let _appPollTimer = null;
+let _appWatching = null;      // session id
+let _appSteps = [];           // accumulated, append-only
+let _appMisses = 0;
+let _appGrace = 0;
+
+function stopAppSessionPoll() {
+  if (_appPollTimer) { clearInterval(_appPollTimer); _appPollTimer = null; }
+  _appWatching = null;
+}
+
+/** Open a session and follow it until it stops changing. */
+async function watchAppSession(sessionId) {
+  stopAppSessionPoll();
+  _appWatching = sessionId;
+  _appSteps = [];
+  _appMisses = 0;
+  _appGrace = 0;
+  const box = document.getElementById('app-testing-session');
+  if (box) { box.classList.remove('hidden'); box.innerHTML = '<div class="field-hint">Opening…</div>'; }
+  const live = await _appSessionTick();
+  if (live) {
+    _appPollTimer = setInterval(_appSessionTick, APP_POLL_MS);
+  }
+}
+
+async function _appSessionTick() {
+  if (!_appWatching) return false;
+  let d;
+  try {
+    // `since_step` is why this is cheap enough to run every 2.5 seconds: steps are
+    // append-only, so a tick carries the session row and at most one new step rather than
+    // re-sending the whole digest.
+    d = await apiFetch(`/api/v1/app-testing/sessions/${encodeURIComponent(_appWatching)}`
+                       + `?since_step=${_appSteps.length}`, { _silent: true });
+    _appMisses = 0;
+  } catch (e) {
+    // Losing contact with the platform says nothing about a browser running on somebody
+    // else's machine, so the message must not claim the session died.
+    if (++_appMisses >= 5) {
+      stopAppSessionPoll();
+      const box = document.getElementById('app-testing-session');
+      if (box) box.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--amber)">
+        Lost contact with the platform — ${esc(e.message)}. The session is driven from
+        another machine and may still be running; reopen this page to pick it up again.</div>`;
+    }
+    return true;
+  }
+  const session = d.session || {};
+  (d.steps || []).forEach(st => _appSteps.push(st));
+  renderAppSession(session, _appSteps);
+
+  if (session.status === 'exploring') { _appGrace = 0; return true; }
+  if (session.status === 'generated' || session.review_id) {
+    stopAppSessionPoll();
+    loadAgentRuns('app-testing');
+    return false;
+  }
+  // Finished, but no suite yet — either one is being written, or nobody asked for one.
+  if (++_appGrace > APP_GRACE_TICKS) { stopAppSessionPoll(); return false; }
+  return true;
+}
+
+/** The header, the steps, and what is not happening. */
+function renderAppSession(session, steps) {
+  const box = document.getElementById('app-testing-session');
+  if (!box) return;
+  box.classList.remove('hidden');
+  const used = session.steps_used || 0;
+  const max = session.max_steps || 0;
+  const pct = max ? Math.min(100, Math.round((used / max) * 100)) : 0;
+  const last = steps.length ? steps[steps.length - 1] : null;
+  const live = session.status === 'exploring';
+
+  box.innerHTML = `
+    <div class="cost-note" style="border-left:3px solid var(--${live ? 'accent' : 'green'})">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <b>${live ? 'Exploring' : esc(session.status || '')}</b>
+        <span class="compliance-chip">${esc(session.target_label || '')}</span>
+        ${session.stop_requested && live
+          ? '<span class="compliance-chip">stop requested</span>' : ''}
+        <span style="color:var(--text-muted)">${used} of ${max} steps</span>
+      </div>
+      <div class="mod-bar" style="margin:8px 0"><span style="width:${pct}%"></span></div>
+      ${last ? `<div>${_appStepSentence(last, session)}</div>` : `
+        <div class="field-hint">No step has arrived yet. The browser is opened by the command
+          on this screen, on the machine where the application is reachable.</div>`}
+      <div class="field-hint" style="margin-top:6px">
+        ${(session.journeys || []).length} journey(s) ·
+        ${session.refused_total || 0} control(s) withheld ·
+        strongest claim <b>${esc(session.strongest_basis || 'observed')}</b>
+      </div>
+      ${live ? `
+        <div class="form-actions" style="margin-top:10px">
+          <button class="btn btn-secondary" onclick="requestAppStop('${jsArg(session.id)}')">
+            Stop after the current step</button>
+        </div>
+        <div class="field-hint">It lands at a step boundary — usually seconds, up to about
+          twenty if the browser is part way through loading a page. The browser window stays
+          open on the machine driving it; this platform cannot close it.</div>` : ''}
+    </div>
+    ${renderAppStalls(steps, session)}
+    ${renderAppRefusals(session)}
+    ${renderAppJourneys(session.journeys || [])}
+    ${steps.length ? `
+      <div class="section-title" style="margin-top:14px">Steps (${steps.length})</div>
+      <div class="run-history-scroll">${steps.slice().reverse().map(_appStepRow).join('')}</div>`
+      : ''}`;
+}
+
+function _appStepSentence(step, session) {
+  const a = step.action || {};
+  const what = a.target_name ? ` “${esc(a.target_name)}”` : '';
+  return `<b>Step ${step.step_index}</b> · ${esc(step.journey || 'unlabelled')} · `
+       + `${esc(a.action_kind || '')}${what} on <code>${esc(step.url_path || '/')}</code>`
+       + (step.outcome ? ` → ${esc(step.outcome)}` : '');
+}
+
+function _appStepRow(step) {
+  const a = step.action || {};
+  const texts = Array.isArray(step.page_texts) ? step.page_texts : [];
+  return `<div class="run-card" style="cursor:default">
+    <div><b>${step.step_index}</b> [${esc(step.journey || '')}]
+      ${esc(a.action_kind || '')} ${esc(a.target_name || '')}
+      on <code>${esc(step.url_path || '/')}</code></div>
+    <div class="field-hint">${esc(step.outcome || '')}
+      · offered ${step.candidates_offered || 0}${
+        step.candidates_refused ? ` · ${step.candidates_refused} withheld` : ''}</div>
+    ${texts.length ? `<details><summary style="cursor:pointer;font-size:11px">what the page
+      showed (${texts.length})</summary><pre class="api-usage-code"
+      style="margin-top:4px">${esc(texts.join('\n'))}</pre></details>` : ''}
+  </div>`;
+}
+
+/** What is *not* happening — the half a progress bar cannot show.
+ *
+ *  A pure function of the steps so far, so it is testable with no DOM and no server. Every
+ *  line is an observation and never a verdict: a wizard that legitimately revisits a page
+ *  will trip the loop rule, and a page with a clock never repeats a signature at all, so
+ *  these have to read as "here is what I can see" rather than "this session is stuck". The
+ *  evidence behind them is one real session, which is thin.
+ */
+function renderAppStalls(steps, session) {
+  if (!steps || steps.length < 3) return '';
+  const notes = [];
+  const sigs = steps.map(s => s.page_signature || '');
+  const recent = steps.slice(-8);
+
+  // The platform's own no-progress rule, shown as a countdown rather than sprung as a
+  // surprise. It stops a session at five consecutive steps on one signature.
+  const newest = sigs[sigs.length - 1];
+  let run = 0;
+  for (let i = sigs.length - 1; i >= 0 && sigs[i] === newest; i--) run++;
+  if (run >= 2 && session.status === 'exploring') {
+    notes.push(`The last <b>${run}</b> step(s) reached no page this session had not already
+                seen. At 5 the platform stops the session.`);
+  }
+
+  // Two pages, alternating. The platform's rule cannot catch this — it requires the last
+  // five signatures to be identical, and A,B,A,B,A is not — so a session can run to its
+  // full budget going nowhere. Saying so is the point.
+  if (recent.length >= 6) {
+    const distinct = new Set(recent.map(s => s.page_signature || ''));
+    if (distinct.size <= 2 && run < 5) {
+      const paths = [...new Set(recent.map(s => s.url_path || '/'))].slice(0, 2);
+      notes.push(`It has been moving between <code>${paths.map(esc).join('</code> and <code>')}</code>
+                  for ${recent.length} steps and reached nothing else.
+                  <b>The platform's own no-progress rule does not catch a two-page loop</b>,
+                  so this session will run to its full budget unless it is stopped.`);
+    }
+  }
+
+  const gotos = recent.filter(s => (s.action || {}).action_kind === 'goto').length;
+  if (recent.length >= 5 && gotos / recent.length >= 0.6) {
+    notes.push(`${gotos} of the last ${recent.length} steps were guessed addresses rather
+                than clicks on something the page offered.`);
+  }
+
+  const starved = recent.filter(s => (s.candidates_offered || 0) <= 2).length;
+  if (starved >= 3) {
+    notes.push(`These pages are offering only a couple of things to click. Applications
+                commonly build menus from elements a collector cannot see.`);
+  }
+
+  const offered = steps.reduce((n, s) => n + (s.candidates_offered || 0), 0);
+  const withheld = steps.reduce((n, s) => n + (s.candidates_refused || 0), 0);
+  if (offered + withheld > 0 && withheld / (offered + withheld) > 0.4) {
+    notes.push(`Around half of what these pages offer is being withheld by the safety
+                policy, so the suite will not cover those journeys. If those controls are
+                safe in this environment, the list is too tight for your application.`);
+  }
+
+  const failed = steps.filter(s => String(s.outcome || '').startsWith('failed')).length;
+  if (failed) notes.push(`${failed} step(s) failed outright.`);
+
+  if (!notes.length) {
+    // An empty panel reads as a broken check rather than as good news.
+    return `<div class="cost-note" style="border-left:3px solid var(--green);margin-top:10px">
+      Nothing looks stuck: it is still reaching pages it had not already seen.</div>`;
+  }
+  return `<div class="cost-note" style="border-left:3px solid var(--amber);margin-top:10px">
+    <b>Worth a look</b>
+    ${notes.map(n => `<div style="margin-top:4px">${n}</div>`).join('')}</div>`;
+}
+
+/** What the safety policy withheld, and what that costs in both directions. */
+function renderAppRefusals(session) {
+  const rows = session.refusals || [];
+  if (!rows.length) return '';
+  return `
+    <div class="section-title" style="margin-top:14px">Withheld by the safety policy
+      (${session.refused_total || rows.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">These were removed
+      before the model ever saw them, so it could not have clicked them. This is a filter on
+      button labels, not a guarantee — what is actually protecting you is your statement that
+      this is a test environment.</p>
+    <table class="data-table">
+      <thead><tr><th>Control</th><th>Why</th><th>Met</th></tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td>${esc(r.name)}</td><td>${esc(r.group || '')}</td><td>${r.count}</td>
+      </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+async function requestAppStop(sessionId) {
+  if (!confirm('Ask this session to stop after its current step?')) return;
+  try {
+    const d = await apiFetch(
+      `/api/v1/app-testing/sessions/${encodeURIComponent(sessionId)}/request-stop`,
+      { method: 'POST' });
+    alert(d.note || 'Stop requested.');
+    _appSessionTick();
+  } catch (e) {
+    alert(`Could not request a stop: ${e.message}`);
+  }
+}
+
+/** Sessions for this project, including the ones that never produced a suite.
+ *
+ *  The "Previous sessions" list beside this one is built from `reviews` rows, so it can only
+ *  ever show sessions that finished *and* generated. A session whose browser was closed
+ *  half way through is invisible there, although its steps were paid for. */
+async function loadAppTestingSessions() {
+  const box = document.getElementById('app-testing-sessions');
+  if (!box) return;
+  if (!getActiveProjectId()) {
+    box.innerHTML = '<div class="field-hint">Pick a project in the sidebar to see its '
+                  + 'sessions.</div>';
+    return;
+  }
+  let d;
+  try {
+    d = await apiFetch('/api/v1/app-testing/sessions?limit=10&offset=0', { _silent: true });
+  } catch (e) {
+    box.innerHTML = `<div class="field-hint">Could not load sessions: ${esc(e.message)}</div>`;
+    return;
+  }
+  const rows = d.sessions || [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="field-hint">No exploration sessions in this project yet.</div>';
+    return;
+  }
+  box.innerHTML = rows.map(r => {
+    const live = r.status === 'exploring';
+    const idle = r.idle_seconds == null ? '' : _appAgo(r.idle_seconds);
+    return `<div class="run-card" onclick="watchAppSession('${jsArg(r.id)}')">
+      <div><b>${live ? '● exploring' : esc(r.status)}</b>
+        ${esc(r.target_label || '')} — ${r.recorded_steps}/${r.max_steps} steps ·
+        ${r.distinct_pages} page(s) · ${r.journey_count} journey(s)
+        ${r.refused_total ? ` · ${r.refused_total} withheld` : ''}</div>
+      <div class="field-hint">${esc(r.goal || 'no goal given')} · ${esc(idle)}
+        ${r.looks_abandoned ? ' · <b>nothing has happened for hours</b> — the browser that '
+          + 'was driving this has probably gone. Nothing further is being billed.' : ''}
+        ${r.review_id ? ' · a suite was written' : (!live ? ' · no suite was written' : '')}</div>
+    </div>`;
+  }).join('');
+}
+
+function _appAgo(seconds) {
+  if (seconds < 90) return `${seconds}s ago`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} min ago`;
+  if (seconds < 172800) return `${Math.round(seconds / 3600)} hours ago`;
+  return `${Math.round(seconds / 86400)} days ago`;
 }
 
 function appTestingCommand() {

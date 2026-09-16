@@ -205,6 +205,19 @@ remove. **What a page displays is encrypted, expires and can be refused** (D-418
 `review_source_store` treatment, with 0 days meaning "wipe it when the suite is written", and
 the consequence of refusing it stated on the screen *and* on the finished suite.
 
+**A session can be watched, and stopped, from the screen.** `GET /sessions` lists sessions
+rather than suites, which is the difference between seeing a run that produced nothing and
+not knowing it happened; `renderAppSession` polls one session and says what it is doing now.
+**A stop is served as the existing `done` reply** (D-423), checked before `require_open` and
+before metering, so it needs no driver change, costs nothing, and is enforced by closing the
+session row rather than by the driver agreeing. The loop detector is in the browser on
+purpose (D-424): `app_session.stalled` cannot see an A,B,A,B loop, and fixing that would move
+D-411's measured floors. What the denylist withheld is finally visible by name (D-426) — and
+reads in both directions, because half a page withheld is a coverage problem, not a safety
+win. An abandoned session is closed after six hours and its digest then expires on **the
+window its customer chose** (D-425), which is also what repairs a D-418 promise whose SQL
+excluded the only case its own docstring described.
+
 **And an observation is what a page offers *and* what it says, in both cases read off the
 DOM rather than inferred.** Three parts of `COLLECT_JS`/`TEXTS_JS` in `scripts/explore_app.py`
 each exist because of a specific failure, so none of them is decoration. A page's landmark

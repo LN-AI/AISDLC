@@ -3797,6 +3797,109 @@ check('...and each screen asks its loaders for its own panel', () => {
          'the app screen did not namespace its runner panel');
 });
 
+section('Watching a session — what is not happening');
+
+// The shape of a real session from the live database: twenty-five steps guessing addresses
+// between two pages, two candidates offered and two withheld every time. Nothing on any
+// screen could see it happen, and it ran to its full budget.
+const LOOPING = [];
+for (let i = 1; i <= 12; i++) {
+  LOOPING.push({
+    step_index: i,
+    journey: 'Navigate to code review',
+    url_path: i % 2 ? '/' : '/review',
+    page_signature: i % 2 ? 'sig-a' : 'sig-b',
+    action: { action_kind: 'goto', target_name: '' },
+    candidates_offered: 2, candidates_refused: 2,
+    outcome: i % 3 ? 'navigated' : 'stayed on the same page',
+  });
+}
+
+const HEALTHY = [1, 2, 3, 4, 5, 6].map(i => ({
+  step_index: i,
+  journey: 'Add to basket',
+  url_path: `/page-${i}`,
+  page_signature: `sig-${i}`,
+  action: { action_kind: 'click', target_name: 'Add Widget' },
+  candidates_offered: 9, candidates_refused: 0,
+  outcome: 'navigated',
+}));
+
+check('a two-page loop is named, and so is the fact that nothing will stop it', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('moving between'), 'the loop was not reported');
+  assert(html.includes('does not catch a two-page loop'),
+         'the platform\'s own rule requires five identical signatures, so A,B,A,B never '
+         + 'trips it — a watcher has to be told that, or they will assume it is handled');
+});
+
+check('guessing addresses rather than clicking is called out', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('guessed addresses'), 'the goto ratio was not reported');
+});
+
+check('a page offering almost nothing to click is called out', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('only a couple of things to click'),
+         'two candidates on a real application means the collector is blind to the rest');
+});
+
+check('a denylist eating half the page is reported as a coverage problem', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('too tight for your application'),
+         'half of every page withheld is not a safety win, and nothing has ever said so');
+});
+
+check('a healthy session says so rather than showing an empty panel', () => {
+  const html = sandbox.renderAppStalls(HEALTHY, { status: 'exploring' });
+  assert(html.includes('Nothing looks stuck'), 'an empty panel reads as a broken check');
+  assert(!html.includes('moving between'), 'a healthy session was reported as looping');
+});
+
+check('the no-progress rule is shown as a countdown, not sprung as a surprise', () => {
+  const stuck = HEALTHY.concat([7, 8, 9].map(i => ({
+    step_index: i, journey: 'Add to basket', url_path: '/same',
+    page_signature: 'sig-same', action: { action_kind: 'click' },
+    candidates_offered: 9, candidates_refused: 0, outcome: 'stayed on the same page',
+  })));
+  const html = sandbox.renderAppStalls(stuck, { status: 'exploring' });
+  assert(html.includes('At 5 the platform stops the session'),
+         'a person watching should see the limit approaching, not just its result');
+});
+
+check('a live session shows a stop that is requested but not yet taken', () => {
+  sandbox.renderAppSession(
+    { id: 's1', status: 'exploring', steps_used: 4, max_steps: 40, target_label: 'staging',
+      stop_requested: true, journeys: [], refusals: [], refused_total: 3 },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('stop requested'), 'a pending stop is invisible');
+  assert(html.includes('Exploring'),
+         'showing a stopped state before the session row says so is a claim that cannot be '
+         + 'retracted');
+  assert(html.includes('Stop after the current step'),
+         'the button must not be called Stop — it lands at a step boundary');
+  assert(html.includes('cannot close it'),
+         'the browser is on another machine and the screen has to say so');
+});
+
+check('what the policy withheld is shown, with the cost of it in both directions', () => {
+  sandbox.renderAppSession(
+    { id: 's1', status: 'finished', steps_used: 9, max_steps: 40, target_label: 'staging',
+      journeys: [], refused_total: 27,
+      refusals: [{ name: 'Delete account', group: 'destroys data', count: 7 },
+                 { name: 'Place order', group: 'spends money', count: 2 }] },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('Delete account') && html.includes('destroys data'),
+         'the names were always discarded and only the count kept');
+  assert(html.includes('not a guarantee'),
+         'the denylist is a filter on button labels and must not read as a promise');
+  assert(html.includes('test environment'),
+         'what actually protects a customer is the attestation, not this list');
+});
+
+
 check('the command carries the project, or says why it does not', () => {
   document.getElementById('app-testing-url').value = 'https://staging.example.com';
   document.getElementById('app-testing-attest').checked = true;

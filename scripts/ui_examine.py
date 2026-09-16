@@ -1661,7 +1661,11 @@ def main():
             # screen: a codebase alone does not say what to test, and the refusal has to
             # happen in the browser rather than as a 400 after an upload.
             ta_dialogs = []
-            page.on("dialog", lambda d: (ta_dialogs.append(d.message), d.dismiss()))
+            # Recorded, not dismissed. The handler registered earlier in this run is still
+            # attached and already dismisses every dialog, so a second one dismissing the
+            # same dialog raises "Cannot dismiss dialog which is already handled" out of a
+            # Playwright listener -- noise that reads like a failure and is not one.
+            page.on("dialog", lambda d: ta_dialogs.append(d.message))
             pick_source(page, "test-automation", "Paste")
             page.fill("#test-automation-requirement", "")
             page.fill("#test-automation-code", "def export(u):\n    return 1\n")
@@ -1894,6 +1898,55 @@ def main():
                 check("a project exists to switch to", True,
                       "no projects in this throwaway database; the clearing path is covered "
                       "by the assertion above")
+
+            # ── 26. Watching a session, and stopping one ────────────────────
+            #
+            # For the whole of a forty-step session this screen used to show nothing: the
+            # exploration runs in a terminal on the customer's machine and the browser had
+            # no way even to learn that a session existed. Everything it needed was already
+            # recorded and nothing read it.
+            section("26. A session can be watched and stopped from the screen")
+
+            check("the screen has somewhere to list sessions, separate from finished suites",
+                  page.locator("#app-testing-sessions").count() == 1,
+                  "the suite list is built from `reviews` rows, so a session that never "
+                  "generated one is invisible in it although its steps were paid for")
+
+            _sessions = page.locator("#app-testing-sessions").inner_text().strip()
+            check("...and it answers rather than hanging",
+                  bool(_sessions) and "Loading" not in _sessions,
+                  f"showing: {_sessions[:90]!r}")
+
+            # Rendered from a fixture rather than by running a real session: a live one
+            # needs a browser driving a second application and would spend money to prove a
+            # rendering property.
+            page.evaluate("""() => renderAppSession(
+                { id: 'sess-ui', status: 'exploring', steps_used: 12, max_steps: 40,
+                  target_label: 'staging.example.com', stop_requested: false,
+                  strongest_basis: 'stated', refused_total: 27, journeys: [],
+                  refusals: [{ name: 'Delete account', group: 'destroys data', count: 7 }] },
+                [{ step_index: 11, journey: 'Nav', url_path: '/',
+                   page_signature: 'a', action: { action_kind: 'goto' },
+                   candidates_offered: 2, candidates_refused: 2, outcome: 'stayed' },
+                 { step_index: 12, journey: 'Nav', url_path: '/review',
+                   page_signature: 'b', action: { action_kind: 'goto' },
+                   candidates_offered: 2, candidates_refused: 2, outcome: 'stayed' }])""")
+            page.wait_for_timeout(200)
+            _panel = page.locator("#app-testing-session").inner_text()
+
+            check("a live session says what it is doing right now",
+                  "12 of 40 steps" in _panel and "Exploring" in _panel,
+                  f"showing: {_panel[:140]!r}")
+            check("...and offers a stop that is honest about when it lands",
+                  "Stop after the current step" in _panel and "cannot close it" in _panel,
+                  "a button called Stop, on a browser this platform cannot reach, is a "
+                  "promise it cannot keep")
+            check("what the safety policy withheld is finally visible",
+                  "Delete account" in _panel and "destroys data" in _panel,
+                  "the names were recorded nowhere and only the count kept, so the product's "
+                  "main safety story could not be shown to anybody")
+            check("...without reading as a guarantee",
+                  "not a guarantee" in _panel and "test environment" in _panel)
 
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")

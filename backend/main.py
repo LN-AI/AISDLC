@@ -161,12 +161,19 @@ async def lifespan(app: FastAPI):
         # retention promise that depends on a restart is not one.
         conn = database.get_connection()
         try:
+            # Order matters: closing abandoned sessions first is what lets the sweep below
+            # see their digests at all. The sweep's abandoned branch requires a status other
+            # than `exploring`, and an abandoned session stays at `exploring` for ever --
+            # so without this, closing the browser half way through kept the digest
+            # indefinitely, which is the exact thing that sweep promises it prevents.
+            reaped = app_session.reap_abandoned(conn)
             cleared = app_session.sweep_expired_page_text(conn)
         finally:
             conn.close()
-        if lapsed or swept or cleared:
+        if lapsed or swept or cleared or reaped:
             logger.info("Housekeeping: %d risk acceptance(s) lapsed, %d source(s) expired, "
-                        "%d page-text digest(s) cleared", lapsed, swept, cleared)
+                        "%d page-text digest(s) cleared, %d abandoned session(s) closed",
+                        lapsed, swept, cleared, reaped)
     except Exception:
         # Never allowed to stop the app coming up. A missed sweep is a stale row; a failed
         # startup is an outage.

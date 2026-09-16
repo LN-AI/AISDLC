@@ -793,7 +793,12 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
             <div class="field-hint">Stored encrypted, and deleted automatically when the time
               is up. Nothing needs it once the tests exist, so
               <b>&ldquo;no time at all&rdquo; costs you nothing</b> except the ability to look
-              back later at why a particular test was written.</div>
+              back later at why a particular test was written.
+              <br>The same window applies to a session that never finishes &mdash; if the
+              browser is closed part way through, what it read is deleted this many days
+              after the session started. At <b>no time at all</b> that means as soon as the
+              session is closed, so a suite <b>cannot</b> be written afterwards from the
+              steps it did take.</div>
           </div>
 
           <div class="form-row">
@@ -818,6 +823,19 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
           <div class="section-title">5. Run it</div>
           <div id="app-testing-command"></div>
         </div>
+        <!-- Sessions, not suites. The list below this one is built from `reviews` rows, so
+             it can only ever show a session that finished *and* generated a suite. A session
+             whose browser was closed half way through is invisible there although its steps
+             were paid for, and that is the one a person most needs to find. -->
+        <div class="run-history">
+          <div class="section-title">Exploration sessions</div>
+          <p class="subtitle" style="margin-top:-6px">Every session this project has opened,
+            including ones still running and ones that never produced a suite. Open one to
+            watch it happen, or to stop it.</p>
+          <div id="app-testing-sessions" class="run-history-scroll"></div>
+        </div>
+        <div id="app-testing-session" class="hidden"></div>
+
         <div class="run-history">
           <div class="section-title">Previous sessions</div>
           <p class="subtitle" style="margin-top:-6px">Every suite this project has generated from a
