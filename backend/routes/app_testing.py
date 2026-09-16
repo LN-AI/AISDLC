@@ -216,6 +216,12 @@ class PreflightRequest(BaseModel):
     llm_connection_id: Optional[str] = None
 
 
+class AllowanceRequest(BaseModel):
+    """One control name a person is permitting for a project."""
+    control_name: str = Field(..., min_length=1, max_length=120)
+    project_id: str = ""
+
+
 class BasisRequest(BaseModel):
     """What a session would have to check the application against, before it opens."""
     requirement: str = Field("")
@@ -449,9 +455,26 @@ def open_session(req: SessionRequest, caller: dict = Depends(get_caller)):
     finally:
         conn.close()
 
+    # Frozen onto the session, and handed back, so the driver screens to the identical
+    # list rather than looking one up for itself.
+    conn = database.get_connection()
+    try:
+        permitted = sorted(app_session.allowance_names(conn, project_id))
+        app_session.record_allowances(conn, session["id"], permitted)
+    finally:
+        conn.close()
+
+    policy = dict(action_policy.describe_policy())
+    policy["permitted"] = permitted
+    if permitted:
+        policy["permitted_note"] = (
+            "Someone permitted these control names for this project, so the usual refusal "
+            "does not apply to them here. Screen with exactly this list: the platform "
+            "chooses an index into it, and a different list means a different element.")
+
     return {
         "session": app_session_public(session["id"]),
-        "policy": action_policy.describe_policy(),
+        "policy": policy,
         "estimate": _quote(session["max_steps"], req.requirement, req.goal),
         "note": (
             "This service never receives the application's URL or its credentials. Send "
@@ -510,7 +533,16 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
         # defeat by sending the field anyway is not a setting.
         texts = (app_session.clip_texts(req.page_texts)
                  if session.get("collect_page_text", 1) else [])
-        allowed, refused = action_policy.screen(raw)
+        # Read off the *session*, never off the project.
+        #
+        # The driver screens the same candidates again to resolve the index it is handed,
+        # so the two lists have to be identical or the index points at something nobody
+        # chose. Taking it from the project would mean somebody adding an allowance halfway
+        # through a session silently shifts every subsequent index under a driver still
+        # using the list it was given at the start. Frozen at open, both sides agree for
+        # the whole session, and `permits` cross-checks the name as a backstop.
+        allow = set(app_session.allowances_applied(session))
+        allowed, refused = action_policy.screen(raw, allow)
         signature = action_policy.page_signature(req.url_path, raw, texts)
 
         # The cheap stopping rule, evaluated before spending anything: if the last several
@@ -582,7 +614,10 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
         "journey": decision.get("journey", ""),
         "rationale": decision.get("rationale", ""),
     }
-    ok, reason = action_policy.permits(action, allowed)
+    # With the same list `screen` used. A re-check under different rules refuses exactly
+    # what it has just offered, which is not a safety property -- it is the policy
+    # disagreeing with itself one line later.
+    ok, reason = action_policy.permits(action, allowed, allow)
     if not ok:
         # Refused rather than corrected. Picking a different element on the model's behalf
         # is how an explorer ends up doing something nobody can account for afterwards; the
@@ -853,6 +888,120 @@ def request_stop(session_id: str, caller: dict = Depends(get_caller)):
         }
     finally:
         conn.close()
+
+
+@router.get("/allowances", summary="Controls this project permits (free)")
+def list_allowances(project_id: str = "", caller: dict = Depends(get_caller)):
+    """What somebody has decided is safe to press in this project's test environment.
+
+    The denylist reads button labels with no context, so it cannot tell "Remove [from
+    basket]" from "Remove [user]". Measured against real applications it withheld every
+    money movement on a banking demo in three steps, and on a shop it withheld `Remove` and
+    `Checkout` -- leaving six of fifteen supplied requirements untestable and forcing the
+    explorer to guess a URL for the rest. This is how a customer says which of those are
+    safe *here*, and it is theirs to say because only they know which environment this is.
+    """
+    subject = subject_from_caller(caller)
+    try:
+        agent_guard.check_scope(subject, PRODUCT)
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    resolved = _project_for(caller, project_id)
+    if not resolved:
+        # Deliberately not "everything visible to you": an allowance is a statement about
+        # one application, and pooling them across projects would widen a safety rule by
+        # accident.
+        return {"project_id": "", "allowances": [], "total": 0,
+                "note": "Choose a project. An allowance belongs to one application."}
+
+    conn = database.get_connection()
+    try:
+        rows = app_session.list_allowances(conn, resolved)
+    finally:
+        conn.close()
+    return {
+        "project_id": resolved,
+        "allowances": rows,
+        "total": len(rows),
+        "max": app_session.MAX_ALLOWANCES,
+        "note": (
+            "These are offered to the model in this project's sessions instead of being "
+            "withheld. They apply to whatever is at that address, so they are only as true "
+            "as your statement that it is a test environment."),
+    }
+
+
+@router.post("/allowances", summary="Permit one control by name (free)")
+def add_allowance(req: AllowanceRequest, caller: dict = Depends(get_caller)):
+    """Permit exactly one control name. Matching is exact and case-insensitive.
+
+    Never a substring: a substring allow-list would let "delete" permit "Delete account",
+    which is the failure the denylist exists to prevent, arrived at from the other side.
+
+    It takes effect on the *next* session. A session freezes the list at the moment it
+    opens, because the platform screens to choose an index and the driver screens again to
+    resolve it -- changing the list under a running session would shift every later index
+    under a driver still using the one it was handed.
+    """
+    subject = subject_from_caller(caller)
+    try:
+        agent_guard.check_scope(subject, PRODUCT)
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    resolved = _project_for(caller, req.project_id)
+    if not resolved:
+        raise HTTPException(400, "An allowance belongs to a project. Choose one first.")
+
+    verdict, reason, group = action_policy.classify_detail(
+        {"name": req.control_name, "role": "button", "enabled": True})
+    if verdict == "allow" and not group:
+        raise HTTPException(
+            400, f"{req.control_name!r} is not being withheld, so permitting it changes "
+                 "nothing. This list is for controls the safety policy refused.")
+
+    conn = database.get_connection()
+    try:
+        stored = app_session.add_allowance(
+            conn, resolved, req.control_name, group,
+            who=str(caller.get("email") or caller.get("name") or ""))
+        rows = app_session.list_allowances(conn, resolved)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        conn.close()
+
+    return {
+        "permitted": stored,
+        "was_refused_because": reason,
+        "group": group,
+        "allowances": rows,
+        "applies_from": "the next session -- a running one keeps the list it opened with",
+    }
+
+
+@router.delete("/allowances", summary="Withdraw one (free)")
+def remove_allowance(control_name: str, project_id: str = "",
+                     caller: dict = Depends(get_caller)):
+    """Put a control back behind the denylist. Takes effect on the next session."""
+    subject = subject_from_caller(caller)
+    try:
+        agent_guard.check_scope(subject, PRODUCT)
+    except ScopeDeniedError as exc:
+        raise HTTPException(403, str(exc))
+
+    resolved = _project_for(caller, project_id)
+    if not resolved:
+        raise HTTPException(400, "An allowance belongs to a project. Choose one first.")
+
+    conn = database.get_connection()
+    try:
+        removed = app_session.remove_allowance(conn, resolved, control_name)
+        rows = app_session.list_allowances(conn, resolved)
+    finally:
+        conn.close()
+    return {"removed": removed, "allowances": rows}
 
 
 @router.post("/preflight", summary="What a session would cost (free, calls no model)")

@@ -1167,6 +1167,127 @@ def main_():
           "`[]` from the scope helper means nothing, and must never widen to everything")
 
     # ── 14. The product agrees with itself ────────────────────────────────
+    # ── 20. A customer can permit a control the denylist withholds ────────
+    #
+    # Measured against real applications rather than argued: on a banking demo the list
+    # withheld `Transfer Funds`, `Withdraw Funds` and `Bill Pay` in the first three steps,
+    # and on a shop it withheld `Remove` as destroying data and `Checkout` as spending
+    # money, leaving six of fifteen supplied requirements untestable. The list reads button
+    # labels with no context, so it cannot tell "Remove [from basket]" from "Remove [user]",
+    # and nothing it could be taught would let it. This is the way out, and the properties
+    # below are what make it safe to have one.
+    section("20. A control can be permitted for one project, by exact name")
+
+    _allow_hdr = dict(scoped)
+    added = client.post("/api/v1/app-testing/allowances",
+                        json={"control_name": "Transfer Funds"}, headers=_allow_hdr)
+    check("a withheld control can be permitted", added.status_code == 200, added.text[:200])
+    check("...and the reply says what was refusing it",
+          added.json().get("group") == "spends money", added.text[:200])
+
+    pointless = client.post("/api/v1/app-testing/allowances",
+                            json={"control_name": "Browse items"}, headers=_allow_hdr)
+    check("permitting something that was never withheld is refused as a no-op",
+          pointless.status_code == 400,
+          "a list that accepts anything teaches people it does nothing")
+
+    # The property the whole design rests on. A substring allow-list would let "delete"
+    # permit "Delete account", which is the failure the denylist exists to prevent reached
+    # from the other side.
+    with contextlib.closing(database.get_connection()) as _c:
+        app_session.add_allowance(_c, project_id, "Remove")
+        _names = app_session.allowance_names(_c, project_id)
+    check("matching is exact, so permitting one name does not permit a longer one",
+          action_policy.classify_detail(
+              {"role": "button", "name": "Remove user", "enabled": True},
+              _names)[0] == "refuse",
+          "a substring allow-list would let 'Remove' permit 'Remove user'")
+    check("...while the permitted name itself is allowed",
+          action_policy.classify_detail(
+              {"role": "button", "name": "Remove", "enabled": True},
+              _names)[0] == "allow")
+
+    # Validity rules are not the customer's to waive: they are about whether the element
+    # can be driven at all, not about whether driving it is safe.
+    check("a disabled control stays refused however it is named",
+          action_policy.classify_detail(
+              {"role": "button", "name": "Remove", "enabled": False},
+              _names)[0] == "refuse",
+          "disabled is not a safety rule and is nobody's to overrule")
+    check("...and so does something with no interactive role",
+          action_policy.classify_detail(
+              {"role": "heading", "name": "Remove", "enabled": True},
+              _names)[0] == "refuse")
+
+    # Scope: an allowance is a statement about one application.
+    with contextlib.closing(database.get_connection()) as _c:
+        check("an allowance does not leak to another project",
+              "transfer funds" not in app_session.allowance_names(_c, "some-other-project"),
+              "pooling these across projects would widen a safety rule by accident")
+        check("...nor to a session filed under no project at all",
+              app_session.allowance_names(_c, "") == set())
+
+    # Set explicitly: these steps offer a short list, and a candidate_index left over from
+    # an earlier section refuses before anything is recorded, which reads as "nothing was
+    # withheld" rather than as a mis-set fixture.
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Bank", "rationale": "move money in a test bank"})
+
+    permitting = _open_session(client, scoped, max_steps=10)
+    check("the platform hands the driver the list it screened with",
+          "transfer funds" in (permitting.json().get("policy", {}).get("permitted") or []),
+          "the driver screens again to resolve the index, so a list it has to look up "
+          "for itself is a list that can disagree")
+    _psid = permitting.json()["session"]["id"]
+
+    _offered = _step(client, scoped, _psid, [
+        {"role": "link", "name": "Transfer Funds"},
+        {"role": "button", "name": "Delete account"},
+    ], url_path="/bank")
+    check("a permitted control is offered rather than withheld",
+          _offered.status_code == 200 and not _offered.json().get("refused"),
+          _offered.text[:300])
+    _seen = client.get(f"/api/v1/app-testing/sessions/{_psid}", headers=scoped).json()
+    check("...and the one nobody permitted is still withheld",
+          [r["name"] for r in _seen["session"].get("refusals", [])] == ["Delete account"],
+          repr(_seen["session"].get("refusals")))
+
+    # Frozen at open. The platform picks an index into its list and the driver resolves
+    # that index against its own; changing the list underneath shifts every later index.
+    with contextlib.closing(database.get_connection()) as _c:
+        app_session.add_allowance(_c, project_id, "Delete account")
+    _after = _step(client, scoped, _psid, [
+        {"role": "button", "name": "Delete account"},
+        {"role": "link", "name": "Items"},
+    ], url_path="/bank2")
+    _seen2 = client.get(f"/api/v1/app-testing/sessions/{_psid}", headers=scoped).json()
+    check("a session keeps the list it opened with",
+          any(r["name"] == "Delete account"
+              for r in _seen2["session"].get("refusals", [])),
+          "an allowance added mid-session would move every index under a driver still "
+          "using the list it was handed")
+    with contextlib.closing(database.get_connection()) as _c:
+        app_session.remove_allowance(_c, project_id, "Delete account")
+
+    # The backstop that makes any of this survivable: if the two lists ever do disagree,
+    # the chosen index points at something nobody picked, and only the name can tell.
+    _list = [{"name": "Continue", "role": "button", "enabled": True, "index": 0},
+             {"name": "Delete account", "role": "button", "enabled": True, "index": 1}]
+    ok_same, _why = action_policy.permits(
+        {"action_kind": "click", "candidate_index": 0, "target_name": "Continue"}, _list)
+    check("a chosen index whose name still matches is permitted", ok_same, _why)
+    ok_diff, why_diff = action_policy.permits(
+        {"action_kind": "click", "candidate_index": 0, "target_name": "Log In"}, _list)
+    check("a chosen index whose name has moved is refused, not clicked",
+          not ok_diff and "do not agree" in why_diff,
+          "the index is meaningful only while both sides screen to the identical list, "
+          "and nothing else in this path notices when they stop")
+
+    with contextlib.closing(database.get_connection()) as _c:
+        app_session.remove_allowance(_c, project_id, "Transfer Funds")
+        app_session.remove_allowance(_c, project_id, "Remove")
+
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)

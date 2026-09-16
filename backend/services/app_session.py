@@ -179,6 +179,26 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             created_at      TEXT NOT NULL
         );
 
+        -- Controls a person has permitted for one project, by exact name.
+        --
+        -- Per project rather than per deployment, because the judgement is about one
+        -- application: "Transfer Funds is safe" is true of a bank's test environment and
+        -- false of its production one, and no rule written here can tell them apart. Who
+        -- and when are kept because this is the record of somebody widening what an
+        -- automated explorer may press, and that is exactly the sort of thing an auditor
+        -- asks about afterwards.
+        CREATE TABLE IF NOT EXISTS app_allowances (
+            id            TEXT PRIMARY KEY,
+            project_id    TEXT NOT NULL,
+            -- Normalised at write time, so a lookup never has to guess at casing.
+            control_name  TEXT NOT NULL,
+            -- What the denylist called it, kept for the screen rather than for matching.
+            control_group TEXT DEFAULT '',
+            created_by    TEXT DEFAULT '',
+            created_at    TEXT NOT NULL,
+            UNIQUE(project_id, control_name)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_app_steps_session
             ON app_steps(session_id, step_index);
         CREATE INDEX IF NOT EXISTS idx_app_sessions_project
@@ -198,7 +218,8 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
                         ("has_derived_basis", "INTEGER DEFAULT 0"),
                         ("stop_requested_at", "TEXT DEFAULT NULL"),
                         ("stop_requested_by", "TEXT DEFAULT ''"),
-                        ("refused_summary", "TEXT DEFAULT ''")):
+                        ("refused_summary", "TEXT DEFAULT ''"),
+                        ("allowances_applied", "TEXT DEFAULT ''")):
         try:
             cursor.execute(f"ALTER TABLE app_sessions ADD COLUMN {_col} {_type}")
         except sqlite3.OperationalError:
@@ -779,6 +800,103 @@ _LIST_COLUMNS = """
     COUNT(DISTINCT st.journey)        AS journey_count,
     MAX(st.created_at)                AS last_step_at
 """
+
+
+# ── What a customer has permitted, for one project ────────────────────────────
+#
+# The denylist reads button labels with no context, so it cannot tell "Remove [from
+# basket]" from "Remove [user]" and nothing it could be taught would let it. Measured
+# rather than argued: against a banking demo it withheld every money movement in the first
+# three steps, and against a shop it withheld `Remove` and `Checkout`, leaving six of
+# fifteen supplied requirements untestable. This is the way out, and it is deliberately the
+# customer's to open rather than ours.
+
+MAX_ALLOWANCES = 60
+
+
+def allowance_names(conn, project_id) -> set:
+    """The normalised names permitted for a project. Empty set when there is no project.
+
+    Deliberately not falling back to "everything a session's own project allows" when the
+    project is unknown: an allowance is a statement about one application, and applying one
+    project's to an unattributed session would be widening a safety rule by accident.
+    """
+    if not project_id:
+        return set()
+    rows = conn.execute(
+        "SELECT control_name FROM app_allowances WHERE project_id = ?",
+        (project_id,)).fetchall()
+    return {r["control_name"] for r in rows}
+
+
+def list_allowances(conn, project_id) -> list:
+    """Every allowance for a project, newest first, for the screen that manages them."""
+    if not project_id:
+        return []
+    rows = conn.execute(
+        "SELECT control_name, control_group, created_by, created_at "
+        "FROM app_allowances WHERE project_id = ? ORDER BY created_at DESC",
+        (project_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_allowance(conn, project_id, name, group="", who="") -> str:
+    """Permit one control by name. Returns the normalised name actually stored.
+
+    Raises `ValueError` on an empty name or a full list. The cap is not a safety property --
+    it stops a script permitting every label it ever met, which would be the denylist
+    switched off by accumulation rather than by decision.
+    """
+    from backend.services import action_policy
+    normalised = action_policy.normalise(name)
+    if not normalised:
+        raise ValueError("an allowance needs a control name")
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM app_allowances WHERE project_id = ?",
+        (project_id,)).fetchone()[0]
+    if existing >= MAX_ALLOWANCES and normalised not in allowance_names(conn, project_id):
+        raise ValueError(
+            f"this project already permits {MAX_ALLOWANCES} controls, which is as far as "
+            "this goes -- remove one before adding another")
+    conn.execute(
+        "INSERT OR REPLACE INTO app_allowances "
+        "(id, project_id, control_name, control_group, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), project_id, normalised, str(group or "")[:80],
+         str(who or "")[:120], _now()))
+    conn.commit()
+    return normalised
+
+
+def remove_allowance(conn, project_id, name) -> bool:
+    """Withdraw one. Returns whether anything was there to withdraw."""
+    from backend.services import action_policy
+    cur = conn.execute(
+        "DELETE FROM app_allowances WHERE project_id = ? AND control_name = ?",
+        (project_id, action_policy.normalise(name)))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def record_allowances(conn, session_id, names) -> None:
+    """Freeze onto the session what was permitted when it ran.
+
+    Read back off the project it would answer "what is permitted now", and a suite is read
+    months after the session that produced it. What a reader needs is what was permitted at
+    the time, which is the only version that explains the tests in front of them.
+    """
+    conn.execute("UPDATE app_sessions SET allowances_applied = ? WHERE id = ?",
+                 (json.dumps(sorted(names or [])), session_id))
+    conn.commit()
+
+
+def allowances_applied(session) -> list:
+    """What this session was permitted, for the live view and the finished suite."""
+    try:
+        got = json.loads((session or {}).get("allowances_applied") or "[]")
+        return [str(x) for x in got] if isinstance(got, list) else []
+    except (ValueError, TypeError):
+        return []
 
 
 def _scope_sql(project_ids):

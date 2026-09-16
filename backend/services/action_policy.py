@@ -124,18 +124,18 @@ def normalise(text):
     return " ".join(_WORD.findall(str(text or "").lower()))
 
 
-def classify(candidate):
+def classify(candidate, allow=None):
     """Judge one candidate. Returns `(verdict, reason)` where verdict is allow or refuse.
 
     `reason` is empty on an allow and is a sentence on a refusal, because the session
     records what it would not do and an operator reads that list to decide whether the
     denylist is too tight for their application.
     """
-    verdict, reason, _group = classify_detail(candidate)
+    verdict, reason, _group = classify_detail(candidate, allow)
     return verdict, reason
 
 
-def classify_detail(candidate):
+def classify_detail(candidate, allow=None):
     """The same judgement, plus *which rule* refused it: `(verdict, reason, group)`.
 
     The group is a bare noun phrase -- "destroys data", "spends money" -- and the reason is
@@ -145,6 +145,15 @@ def classify_detail(candidate):
 
     `classify` stays as it was so its two existing callers, and the driver that imports this
     module, are untouched.
+
+    `allow` is a set of **normalised, exact** control names a person has permitted for this
+    project. It is measured rather than theoretical: pointed at a banking application the
+    denylist withheld `Transfer Funds`, `Withdraw Funds` and `Bill Pay` -- which is most of
+    what a bank *is* -- and at a shop it withheld `Remove` as destroying data and `Checkout`
+    as spending money, leaving six of fifteen supplied requirements untestable. This list
+    reads button labels with no context, so it cannot tell "Remove [from basket]" from
+    "Remove [user]", and nothing it could be taught would let it. The customer knows; we
+    do not.
     """
     name = normalise(candidate.get("name"))
     role = normalise(candidate.get("role"))
@@ -154,6 +163,17 @@ def classify_detail(candidate):
         return "refuse", "the control is disabled", "is disabled"
     if role and role not in INTERACTIVE_ROLES:
         return "refuse", role + " is not an interactive role", "is not interactive"
+
+    # A control somebody has explicitly permitted for this project.
+    #
+    # Exact and normalised, never a substring: a substring allow-list would let "delete"
+    # permit "Delete account", which is the failure this whole module exists to prevent,
+    # reached from the other side. It sits *after* the two checks above on purpose --
+    # disabled and non-interactive are validity rules rather than safety rules, and are not
+    # anybody's to waive -- and before every rule that is about danger, which are the ones
+    # a customer is entitled to overrule for their own test environment.
+    if allow and name in allow:
+        return "allow", "", ""
 
     # The dismiss exception, checked before the denylist: "Cancel" on its own is how a
     # person backs out of a dialog safely, and refusing it traps the explorer inside modals.
@@ -178,19 +198,26 @@ def classify_detail(candidate):
     return "allow", "", ""
 
 
-def screen(candidates):
+def screen(candidates, allow=None):
     """Split candidates into what the model may be offered and what it may not.
 
     Called before the model sees anything. The allowed list is re-indexed from zero so the
     index the model returns means a position in the list it was actually given -- handing it
     a list with gaps in the numbering is how an off-by-one becomes a click on the wrong row.
+
+    **`allow` must be the same on both sides.** The platform screens to choose an index and
+    the driver screens again to resolve it, and the index only means anything while the two
+    lists are identical. That held by construction -- same input, same module -- until this
+    argument existed. The platform therefore sends the list it used back to the driver
+    rather than letting it look one up, and `permits` cross-checks the chosen name against
+    the position, so a divergence becomes a refusal instead of a click on the wrong row.
     """
     allowed = []
     refused = []
     for original in candidates or []:
         if not isinstance(original, dict):
             continue
-        verdict, reason, group = classify_detail(original)
+        verdict, reason, group = classify_detail(original, allow)
         row = dict(original)
         if verdict == "allow":
             row["index"] = len(allowed)
@@ -202,7 +229,7 @@ def screen(candidates):
     return allowed, refused
 
 
-def permits(action, allowed):
+def permits(action, allowed, allow=None):
     """Re-check a chosen action against the list it was chosen from.
 
     This runs after the model answers and again inside the driver. It is not redundant with
@@ -244,9 +271,27 @@ def permits(action, allowed):
         return False, ("candidate_index " + str(index) + " is outside the "
                        + str(len(allowed)) + " candidate(s) that were offered")
 
-    verdict, reason = classify(allowed[index])
+    verdict, reason = classify(allowed[index], allow)
     if verdict != "allow":
         return False, "refused on re-check: " + reason
+
+    # The name the caller was *told* it was choosing, against the name at that position in
+    # the list the caller itself built.
+    #
+    # Only the driver can make this check, and only the driver needs it: the platform sets
+    # `target_name` from the same list it indexed into, so server-side there is nothing to
+    # disagree with. On the driver it is the one thing standing between two lists quietly
+    # diverging and a click landing on the wrong element. The index is meaningful *only*
+    # while both sides screen identical input with identical rules -- which held by
+    # construction until the moment a per-project allow-list gave the two sides different
+    # rules, and nothing else in this path would have noticed.
+    if "target_name" in action:
+        here = str(allowed[index].get("name", ""))
+        told = str(action.get("target_name") or "")
+        if here != told:
+            return False, ("position " + str(index) + " holds " + repr(here) + ", not "
+                           + repr(told) + " -- the two candidate lists do not agree, so "
+                           "this index points somewhere nobody chose")
 
     if kind in ("fill", "select") and not str(action.get("value") or "").strip():
         return False, kind + " needs a value"

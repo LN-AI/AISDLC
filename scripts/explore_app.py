@@ -501,7 +501,7 @@ def login(base, user, password):
 # ── The loop ──────────────────────────────────────────────────────────────
 
 def explore(page, api, session_id, base_url, credentials_note, max_steps, shots_dir,
-            verbose=True, send_page_text=True):
+            verbose=True, send_page_text=True, permitted=()):
     """Observe, ask, screen, act -- until the platform says stop or the budget runs out.
 
     `send_page_text=False` stops the page's own words leaving this machine at all. The
@@ -551,8 +551,14 @@ def explore(page, api, session_id, base_url, credentials_note, max_steps, shots_
         # The third screen, on the machine that will do the clicking. The allowed list is
         # rebuilt from the same raw candidates with the same module, so it is identical to
         # the one the platform indexed into -- that is what makes the index meaningful here.
-        allowed, _refused = action_policy.screen(raw)
-        ok, reason = action_policy.permits(action, allowed)
+        #
+        # `permitted` is handed over by the platform at session open rather than looked up
+        # here, for exactly that reason: it is the one input that can make these two lists
+        # disagree, and a disagreement means this index points at an element nobody chose.
+        # `permits` cross-checks the chosen name against the position as a backstop, so a
+        # divergence becomes a refusal rather than a click on the wrong thing.
+        allowed, _refused = action_policy.screen(raw, permitted)
+        ok, reason = action_policy.permits(action, allowed, permitted)
         if not ok:
             print(f"  REFUSED LOCALLY: {reason}")
             refusals += 1
@@ -952,12 +958,19 @@ def main():
         "page_text_retention_days": args.keep_page_text_days,
     })
     session_id = opened["session"]["id"]
+    # Whatever the platform says it screened with, used verbatim. Not re-derived and not
+    # defaulted: guessing this wrong is a click on the wrong element, not a warning.
+    permitted = tuple(opened.get("policy", {}).get("permitted") or ())
     quote = opened.get("estimate") or {}
     section(f"Exploring {args.url}")
     print(f"  session   {session_id}")
     print(f"  budget    {opened['session']['max_steps']} steps")
     print(f"  estimate  ${quote.get('expected_usd', 0):.4f} expected, "
           f"${quote.get('ceiling_usd', 0):.4f} ceiling")
+    if permitted:
+        print(f"  permitted {', '.join(sorted(permitted))}")
+        print("            (someone allowed these for this project, so they are offered "
+              "rather than withheld)")
     print(f"  withheld  controls that {', '.join(action_policy.DESTRUCTIVE_GROUPS)} "
           f"or end the session\n")
 
@@ -981,7 +994,8 @@ def main():
             page.goto(args.url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
             taken, refusals = explore(page, api, session_id, args.url, credentials_note,
                                       args.max_steps, args.shots,
-                                      send_page_text=not args.no_page_text)
+                                      send_page_text=not args.no_page_text,
+                                      permitted=permitted)
         except KeyboardInterrupt:
             print("\n  interrupted — the session is closed and what was walked is kept")
         except Exception as exc:
