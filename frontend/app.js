@@ -3205,7 +3205,8 @@ function renderAppSession(session, steps) {
         <span style="color:var(--text-muted)">${used} of ${max} steps</span>
       </div>
       <div class="mod-bar" style="margin:8px 0"><span style="width:${pct}%"></span></div>
-      ${last ? `<div>${_appStepSentence(last, session)}</div>` : `
+      ${last ? `<div>${_appStepSentence(last, session, _appOutcomeOf(steps, steps.length - 1),
+                                            live)}</div>` : `
         <div class="field-hint">No step has arrived yet. The browser is opened by the command
           on this screen, on the machine where the application is reachable.</div>`}
       <div class="field-hint" style="margin-top:6px">
@@ -3228,26 +3229,49 @@ function renderAppSession(session, steps) {
     ${renderAppJourneys(session.journeys || [])}
     ${steps.length ? `
       <div class="section-title" style="margin-top:14px">Steps (${steps.length})</div>
-      <div class="run-history-scroll">${steps.slice().reverse().map(_appStepRow).join('')}</div>`
+      <div class="run-history-scroll">${steps
+        .map((s, i) => _appStepRow(s, _appOutcomeOf(steps, i)))
+        .reverse().join('')}</div>`
       : ''}`;
 }
 
-function _appStepSentence(step, session) {
-  const a = step.action || {};
-  const what = a.target_name ? ` “${esc(a.target_name)}”` : '';
-  return `<b>Step ${step.step_index}</b> · ${esc(step.journey || 'unlabelled')} · `
-       + `${esc(a.action_kind || '')}${what} on <code>${esc(step.url_path || '/')}</code>`
-       + (step.outcome ? ` → ${esc(step.outcome)}` : '');
+/** What an action *did*, which is recorded on the step after it.
+ *
+ *  An outcome can only be known by looking at the page again, so the driver sends it with
+ *  the following request -- `app_testing.py:192` names the field "what happened when the
+ *  previous action ran" -- and the route stores it on the step it is creating. The column
+ *  on step N therefore describes step N-1's action, and joining them on one row states
+ *  something false: the first real session against a public application rendered as
+ *  `click "Finish" on /checkout-step-two.html → navigated to /checkout-step-two.html`,
+ *  which reads as Finish having gone nowhere. Clicking *continue*, one step earlier, is
+ *  what went there, and what Finish did was never reported at all.
+ */
+function _appOutcomeOf(steps, i) {
+  const next = (steps || [])[i + 1];
+  return next ? (next.outcome || '') : '';
 }
 
-function _appStepRow(step) {
+function _appStepSentence(step, session, outcome, live) {
+  const a = step.action || {};
+  const what = a.target_name ? ` “${esc(a.target_name)}”` : '';
+  // The newest step has no outcome yet, and saying nothing would read as "it did nothing".
+  const tail = outcome
+    ? ` → ${esc(outcome)}`
+    : (live ? ' — waiting for the next step to report what this did'
+            : ' — the session ended before anything reported what this did');
+  return `<b>Step ${step.step_index}</b> · ${esc(step.journey || 'unlabelled')} · `
+       + `${esc(a.action_kind || '')}${what} on <code>${esc(step.url_path || '/')}</code>`
+       + tail;
+}
+
+function _appStepRow(step, outcome) {
   const a = step.action || {};
   const texts = Array.isArray(step.page_texts) ? step.page_texts : [];
   return `<div class="run-card" style="cursor:default">
     <div><b>${step.step_index}</b> [${esc(step.journey || '')}]
       ${esc(a.action_kind || '')} ${esc(a.target_name || '')}
       on <code>${esc(step.url_path || '/')}</code></div>
-    <div class="field-hint">${esc(step.outcome || '')}
+    <div class="field-hint">${esc(outcome || 'no result reported yet')}
       · offered ${step.candidates_offered || 0}${
         step.candidates_refused ? ` · ${step.candidates_refused} withheld` : ''}</div>
     ${texts.length ? `<details><summary style="cursor:pointer;font-size:11px">what the page
@@ -3314,6 +3338,9 @@ function renderAppStalls(steps, session) {
                 safe in this environment, the list is too tight for your application.`);
   }
 
+  // Counted off the column directly: shifting moves each result to a different row but
+  // not out of the list, so the total is the same. The one exception is inherent -- the
+  // newest action's result has not been reported yet, by anybody.
   const failed = steps.filter(s => String(s.outcome || '').startsWith('failed')).length;
   if (failed) notes.push(`${failed} step(s) failed outright.`);
 

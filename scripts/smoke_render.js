@@ -3867,6 +3867,39 @@ check('the no-progress rule is shown as a countdown, not sprung as a surprise', 
          'a person watching should see the limit approaching, not just its result');
 });
 
+check('an action is not credited with the result of the one before it', () => {
+  // Steps 11 and 12 of the first real session against a public application. The driver
+  // sends `last_outcome` with the *next* request -- `app_testing.py:192` calls it "what
+  // happened when the previous action ran" -- so the outcome column on a step describes
+  // the step before it. Joining them on one row rendered
+  // `click "Finish" ... -> navigated to /checkout-step-two.html`, crediting Finish with
+  // arriving at the page it was standing on in order to click Finish.
+  const REAL = [
+    { step_index: 11, journey: 'Check out', url_path: '/checkout-step-one.html',
+      page_signature: 'one', action: { action_kind: 'click', target_name: 'continue' },
+      candidates_offered: 10, candidates_refused: 0,
+      outcome: 'filled Zip/Postal Code; still on /checkout-step-one.html' },
+    { step_index: 12, journey: 'Check out', url_path: '/checkout-step-two.html',
+      page_signature: 'two', action: { action_kind: 'click', target_name: 'Finish' },
+      candidates_offered: 11, candidates_refused: 0,
+      outcome: 'navigated to /checkout-step-two.html' },
+  ];
+  assert(sandbox._appOutcomeOf(REAL, 0) === 'navigated to /checkout-step-two.html',
+         'a result is recorded on the step after the action, and belongs to that action');
+  assert(sandbox._appOutcomeOf(REAL, 1) === '',
+         'the newest action cannot have a result yet -- nothing has looked at the page again');
+
+  const newest = sandbox._appStepSentence(REAL[1], {}, sandbox._appOutcomeOf(REAL, 1), false);
+  assert(!newest.includes('navigated to'),
+         'the newest step is claiming a navigation that the step before it caused');
+  assert(newest.includes('ended before anything reported'),
+         'an unreported result rendered as nothing reads as "the action did nothing"');
+
+  const caused = sandbox._appStepSentence(REAL[0], {}, sandbox._appOutcomeOf(REAL, 0), false);
+  assert(caused.includes('continue') && caused.includes('navigated to /checkout-step-two'),
+         'the arrival has to attach to the step that caused it');
+});
+
 check('a live session shows a stop that is requested but not yet taken', () => {
   sandbox.renderAppSession(
     { id: 's1', status: 'exploring', steps_used: 4, max_steps: 40, target_label: 'staging',
