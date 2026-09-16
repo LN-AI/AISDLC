@@ -748,6 +748,11 @@ def main():
     ap.add_argument("--keep-page-text-days", type=int, default=7,
                     help="How long the platform keeps that digest, encrypted, after the "
                          "suite is written. 0 wipes it the moment the suite exists.")
+    ap.add_argument("--attest", action="store_true",
+                    help="Declare that the target is a test environment. Required. This "
+                         "explorer clicks, types and submits in a live system; controls "
+                         "that look destructive are withheld, but that is a filter on "
+                         "button labels and not a guarantee.")
     ap.add_argument("--no-generate", action="store_true",
                     help="Explore and stop, without writing a suite.")
     ap.add_argument("--dry-run", action="store_true",
@@ -761,6 +766,11 @@ def main():
         return fixture()
     if not args.url:
         ap.error("--url is required (or use --fixture)")
+    # Refused here rather than by the platform, which would also refuse but only after a
+    # login round trip. `--dry-run` is exempt: it opens no session and performs no action.
+    if not args.attest and not args.dry_run:
+        ap.error("--attest is required: this drives a real browser against a live system, "
+                 "so say out loud that the target is a test environment")
 
     try:
         from playwright.sync_api import sync_playwright
@@ -773,8 +783,17 @@ def main():
 
     requirement = args.requirement
     if args.requirement_file:
-        with open(args.requirement_file, encoding="utf-8") as fh:
-            requirement = fh.read()
+        # Named rather than allowed to raise: the screen builds this command with a file it
+        # asks the user to save beside it, so "that file is not here" is the most likely way
+        # a first run fails and deserves a sentence rather than a traceback.
+        try:
+            with open(args.requirement_file, encoding="utf-8") as fh:
+                requirement = fh.read()
+        except OSError as exc:
+            print(f"Could not read --requirement-file {args.requirement_file!r}: {exc}\n"
+                  "Save the requirement shown on the Application Test Generation screen to "
+                  "that path, or pass --requirement \"...\" instead.")
+            return 1
 
     for directory in (args.shots, args.video):
         if directory:
@@ -817,9 +836,12 @@ def main():
         "goal": args.goal,
         "requirement": requirement,
         "max_steps": args.max_steps,
-        # Typed here, by the person who ran the command, against the environment they chose.
-        # The platform refuses a session without it.
-        "attested_test_env": True,
+        # Passed, never assumed. This used to be a hardcoded `True` on the grounds that the
+        # person typing the command was the one attesting -- but the screen that builds the
+        # command has its own tick box, and a declaration that the driver makes on the
+        # caller's behalf is not a declaration. `--attest` is now the record, and the tick
+        # box is what writes it into the command.
+        "attested_test_env": bool(args.attest),
         "project_id": args.project or None,
         "source_review_ids": args.cover_review,
         "collect_page_text": not args.no_page_text,

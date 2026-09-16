@@ -1728,6 +1728,113 @@ def main():
                   page.locator("#test-automation-cost-preview .cost-preview").count() == 0,
                   "a quote for the previous source survived and could be acted on")
 
+
+            # ── 22. Two screens, one document ─────────────────────────────
+            #
+            # This is the section that can see what `smoke_render.js` structurally cannot.
+            # That file's DOM stub hands out a fresh element per id, so two screens minting
+            # the same id look fine there; here there is one real document, and a screen
+            # that is merely hidden is still in it.
+            #
+            # The defect: both test screens rendered a results panel and a runner panel
+            # under fixed ids, so `getElementById` returned whichever came first in the
+            # markup -- the code-based screen. Open a code-based run, then an app-based one,
+            # and the app screen's panels stayed blank while its results were written into a
+            # screen nobody was looking at. A page reload cleared it, which is what made it
+            # look imaginary.
+            section("22. Two test screens in one document keep their own panels")
+
+            _suite = """{
+              review_id: 'rev-ui-1', summary: 'A suite.',
+              total_files: 1, total_tests: 2,
+              test_files: [{ path: 'tests/a.spec.ts', framework: 'playwright',
+                             test_names: ['t'], content: 'test("t")' }],
+              assertion_basis: [
+                { test_name: 'total is right', basis: 'stated',
+                  what_it_checks: 'the total', requirement_ref: 'REQ-1' },
+                { test_name: 'button is there', basis: 'observed',
+                  what_it_checks: 'a control' }],
+              session_detail: { journeys: [] }
+            }"""
+
+            # Rendered directly rather than by running two real agents: the collision is a
+            # property of the markup, and two live runs would cost money to prove it.
+            page.evaluate("() => renderTestAutomation('test-automation-result', %s)" % _suite)
+            page.evaluate("() => renderAppTesting('app-testing-result', %s)" % _suite)
+            page.wait_for_timeout(200)
+
+            _dupes = page.evaluate("""() => {
+                const seen = {}, dup = [];
+                document.querySelectorAll('[id]').forEach(el => {
+                    if (seen[el.id]) { if (dup.indexOf(el.id) < 0) dup.push(el.id); }
+                    seen[el.id] = true;
+                });
+                return dup;
+            }""")
+            check("no element id appears twice in the whole document",
+                  not _dupes,
+                  f"duplicated: {_dupes[:8]} -- whichever copy comes first in the markup wins "
+                  "every getElementById, so the screen you are looking at goes blank and the "
+                  "one you are not gets your results")
+
+            check("each test screen owns a results panel named after itself",
+                  page.locator("#app-testing-result-results").count() == 1
+                  and page.locator("#test-automation-result-results").count() == 1,
+                  "the two panels must be distinguishable, or only one screen can ever work")
+
+            check("...and a runner panel too",
+                  page.locator("#app-testing-result-runner").count() == 1
+                  and page.locator("#test-automation-result-runner").count() == 1)
+
+            # The three-word vocabulary, checked where a person would read it. `stated` is
+            # the value the server writes; the table used to test for the retired word
+            # `specified` and reported every one of these as observed -- directly under a
+            # banner that counted it correctly.
+            _basis_cell = page.evaluate("""() => {
+                const html = document.getElementById('app-testing-result').innerHTML;
+                const at = html.indexOf('total is right');
+                return at < 0 ? '' : html.slice(at, at + 400);
+            }""")
+            check("an assertion resting on a written requirement reads as stated",
+                  "Stated" in _basis_cell,
+                  f"showing: {_basis_cell[:120]!r}")
+            check("...and the banner above it agrees",
+                  "1 assertion(s) check something a person wrote"
+                  in page.locator("#app-testing-result").inner_text().replace("\n", " "),
+                  "the banner and the table are counting different things")
+
+            # ── 23. The command this screen builds is the whole product ───
+            #
+            # There is no Run button here on purpose -- the browser has to run where the
+            # application is reachable -- so this command *is* the handover. Every input on
+            # the screen that fails to reach it is an input that silently does nothing, and
+            # two of them did: the typed requirement and the selected project.
+            section("23. The app-testing command carries what the screen was given")
+            goto_page(page, "Application Test Generation")
+            page.wait_for_timeout(300)
+
+            page.fill("#app-testing-url", "https://staging.example.com")
+            page.fill("#app-testing-requirement", "A basket total must equal its lines.")
+            page.check("#app-testing-attest")
+            page.wait_for_timeout(200)
+
+            _cmd = page.locator("#app-testing-command").inner_text()
+            check("the attestation tick is what puts the declaration in the command",
+                  "--attest" in _cmd,
+                  "the driver used to assert a test environment on the caller's behalf, which "
+                  "is not a declaration by anybody")
+            check("the requirement is shown as the file the command reads",
+                  "requirement.txt" in _cmd
+                  and "A basket total must equal its lines." in _cmd,
+                  "the command reads the requirement from a file and nothing produced it, so "
+                  "the run died on a missing path and the typed text reached nothing")
+
+            page.uncheck("#app-testing-attest")
+            page.wait_for_timeout(150)
+            check("...and unticking it withdraws the command entirely",
+                  "--attest" not in page.locator("#app-testing-command").inner_text(),
+                  "an unticked box still offered a runnable command")
+
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")
             # A 401 before sign-in is expected and not a defect; anything else is.

@@ -2349,16 +2349,21 @@ async function runTestAutomationFromQuote() {
 // to read. Set by the renderer, so reopening a stored run arms the downloads too — the bug
 // D-369 recorded for the three in-page handoffs was exactly this, set in the run function
 // instead of where the result is drawn.
-let _lastTestAutomation = null;
+// Keyed by screen, not a single global. Both test screens render a suite, and while this
+// was one variable the app-based screen overwrote it -- so the code-based screen's Download
+// button handed you the other screen's suite. The buttons pass their own screen's id.
+const _lastSuites = {};
+let _lastTestAutomation = null;   // kept: the suite most recently rendered anywhere
 
-function downloadGeneratedTest(index) {
-  const f = (_lastTestAutomation || {}).test_files?.[index];
+function downloadGeneratedTest(index, screen) {
+  const f = (_lastSuites[screen] || _lastTestAutomation || {}).test_files?.[index];
   if (!f || !f.content) return;
   _downloadTextAsFile((f.path || `test_${index}`).split('/').pop(), f.content);
 }
 
-function downloadAllGeneratedTests() {
-  const files = (_lastTestAutomation || {}).test_files || [];
+function downloadAllGeneratedTests(screen) {
+  const suite = _lastSuites[screen] || _lastTestAutomation || {};
+  const files = suite.test_files || [];
   if (!files.length) return;
   // One text file rather than a zip: building a real archive in the browser needs a library
   // the CSP does not allow, and a single file with clear path headers is honest about being
@@ -2371,10 +2376,10 @@ function downloadAllGeneratedTests() {
     'These tests were generated and never run. Read the assumptions below before trusting them.',
     '',
   ];
-  if (_lastTestAutomation.setup_instructions) {
-    parts.push('## How to run them', '', _lastTestAutomation.setup_instructions, '');
+  if (suite.setup_instructions) {
+    parts.push('## How to run them', '', suite.setup_instructions, '');
   }
-  (_lastTestAutomation.assumptions || []).forEach(a => {
+  (suite.assumptions || []).forEach(a => {
     parts.push(`## Assumption: ${a.assumption || ''}`,
                `Risk if wrong: ${a.risk_if_wrong || ''}`, '');
   });
@@ -2394,8 +2399,13 @@ function downloadAllGeneratedTests() {
  *
  *  Fetched separately from the review rather than folded into it, because results arrive
  *  long after the generation and a stored run must not have to be rewritten to carry them. */
-async function loadTestResults(reviewId) {
-  const box = document.getElementById('test-automation-results');
+async function loadTestResults(reviewId, prefix) {
+  // `prefix` is required and has no default. Two screens render this panel -- the
+  // code-based generator and the app-based one -- and a hidden screen is still in the
+  // document, so a fixed id here resolved to whichever copy came first in the markup.
+  // That is the wrong one whenever the other screen is the visible one. A default would
+  // quietly restore the bug for any call site that forgot to pass it, and there are three.
+  const box = document.getElementById(`${prefix}-results`);
   if (!box || !reviewId) return;
   let data;
   try {
@@ -2498,10 +2508,13 @@ async function loadTestResults(reviewId) {
  *  file it wrote), so it says them here rather than leaving them to be worked out.
  *
  *  Everything below is a lookup, not a model call: nothing here costs anything. */
-let _lastRunnerPlan = null;
+// Keyed by screen prefix, not a single global: both test screens render this panel, and a
+// lone `_lastRunnerPlan` meant the Download-workflow button handed you whichever plan was
+// fetched last rather than the one belonging to the run on screen.
+const _runnerPlans = {};
 
-async function loadTestRunner(reviewId) {
-  const box = document.getElementById('test-automation-runner');
+async function loadTestRunner(reviewId, prefix) {
+  const box = document.getElementById(`${prefix}-runner`);
   if (!box || !reviewId) return;
   let d;
   try {
@@ -2509,7 +2522,7 @@ async function loadTestRunner(reviewId) {
   } catch (e) {
     return;
   }
-  _lastRunnerPlan = d;
+  _runnerPlans[prefix] = d;
   const plan = d.plan || {};
   const jobs = plan.jobs || [];
 
@@ -2565,7 +2578,7 @@ async function loadTestRunner(reviewId) {
            report home — it saves its results as its own artifact and the platform fetches
            them. Nothing needs to be exposed, and no secret is needed. Use
            <b>Fetch from GitHub Actions</b> below once the job has finished.`}</p>
-      <button class="btn-secondary btn-sm" onclick="downloadTestWorkflow()">
+      <button class="btn-secondary btn-sm" onclick="downloadTestWorkflow('${jsArg(prefix)}')">
         Download ${esc(d.workflow_path || 'workflow')}</button>
       <details style="margin-top:8px">
         <summary>Read it first (${(d.workflow_yaml || '').split('\n').length} lines)</summary>
@@ -2581,35 +2594,35 @@ async function loadTestRunner(reviewId) {
       committed alongside — so the tests run on push and their results come back. The pull
       request says plainly that nothing has run these and lists what the model assumed.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <input type="text" id="test-deliver-repo" style="flex:1;min-width:280px"
+      <input type="text" id="${prefix}-deliver-repo" style="flex:1;min-width:280px"
              placeholder="https://github.com/owner/repo" />
-      <label class="field-hint" style="margin:0"><input type="checkbox" id="test-deliver-pr" checked />
+      <label class="field-hint" style="margin:0"><input type="checkbox" id="${prefix}-deliver-pr" checked />
         open a pull request</label>
-      <button class="btn-secondary btn-sm" onclick="deliverGeneratedTests('${esc(reviewId)}')">
+      <button class="btn-secondary btn-sm" onclick="deliverGeneratedTests('${jsArg(reviewId)}', '${jsArg(prefix)}')">
         Deliver</button>
     </div>
-    <div id="test-deliver-out" style="margin-top:8px"></div>
+    <div id="${prefix}-deliver-out" style="margin-top:8px"></div>
 
     <div class="field-label" style="margin-top:16px">Fetch from GitHub Actions</div>
     <p class="field-hint">Reads a finished run's saved results and files them here. This
       direction is the one that works with no public address — the platform calls GitHub, not
       the other way round. Leave the run blank for the most recent completed one.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <input type="text" id="test-actions-repo" style="flex:1;min-width:240px"
+      <input type="text" id="${prefix}-actions-repo" style="flex:1;min-width:240px"
              placeholder="https://github.com/owner/repo" />
-      <input type="text" id="test-actions-run" style="flex:1;min-width:160px"
+      <input type="text" id="${prefix}-actions-run" style="flex:1;min-width:160px"
              placeholder="run URL or id (optional)" />
-      <button class="btn-secondary btn-sm" onclick="fetchActionsResults('${esc(reviewId)}')">
+      <button class="btn-secondary btn-sm" onclick="fetchActionsResults('${jsArg(reviewId)}', '${jsArg(prefix)}')">
         Fetch</button>
     </div>
-    <div id="test-actions-out" style="margin-top:8px"></div>`;
+    <div id="${prefix}-actions-out" style="margin-top:8px"></div>`;
 }
 
 /** Push the suite to a repository. No model call, so nothing is metered — but it writes to
  *  somebody's repository, so what it did is reported line by line rather than as "done". */
-async function deliverGeneratedTests(reviewId) {
-  const repo = (document.getElementById('test-deliver-repo') || {}).value || '';
-  const out = document.getElementById('test-deliver-out');
+async function deliverGeneratedTests(reviewId, prefix) {
+  const repo = (document.getElementById(`${prefix}-deliver-repo`) || {}).value || '';
+  const out = document.getElementById(`${prefix}-deliver-out`);
   if (!out) return;
   if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
   out.innerHTML = '<div class="cost-note">Committing…</div>';
@@ -2618,7 +2631,7 @@ async function deliverGeneratedTests(reviewId) {
       method: 'POST',
       body: JSON.stringify({
         github_repo_url: repo.trim(),
-        open_pr: !!(document.getElementById('test-deliver-pr') || {}).checked,
+        open_pr: !!(document.getElementById(`${prefix}-deliver-pr`) || {}).checked,
         include_workflow: true,
       }),
     });
@@ -2637,7 +2650,7 @@ async function deliverGeneratedTests(reviewId) {
       </div>`;
     // The repository is now the obvious place to fetch results from, so it is filled in
     // rather than typed twice.
-    const echo = document.getElementById('test-actions-repo');
+    const echo = document.getElementById(`${prefix}-actions-repo`);
     if (echo && !echo.value) echo.value = repo.trim();
   } catch (e) {
     out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
@@ -2646,10 +2659,10 @@ async function deliverGeneratedTests(reviewId) {
 
 /** Pull a finished Actions run's results in. Refreshes the results panel above on success,
  *  because the answer to "what happened" belongs where the answer already lives. */
-async function fetchActionsResults(reviewId) {
-  const repo = (document.getElementById('test-actions-repo') || {}).value || '';
-  const run = ((document.getElementById('test-actions-run') || {}).value || '').trim();
-  const out = document.getElementById('test-actions-out');
+async function fetchActionsResults(reviewId, prefix) {
+  const repo = (document.getElementById(`${prefix}-actions-repo`) || {}).value || '';
+  const run = ((document.getElementById(`${prefix}-actions-run`) || {}).value || '').trim();
+  const out = document.getElementById(`${prefix}-actions-out`);
   if (!out) return;
   if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
   out.innerHTML = '<div class="cost-note">Reading GitHub…</div>';
@@ -2669,24 +2682,28 @@ async function fetchActionsResults(reviewId) {
         ${esc(a.branch || 'unknown branch')} — ${s.passed} of ${s.total} passed.
         ${a.url ? `<a href="${esc(a.url)}" target="_blank" rel="noopener">the run</a>` : ''}
       </div>`;
-    loadTestResults(reviewId);
+    loadTestResults(reviewId, prefix);
   } catch (e) {
     out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
   }
 }
 
-function downloadTestWorkflow() {
-  const d = _lastRunnerPlan;
+function downloadTestWorkflow(prefix) {
+  const d = _runnerPlans[prefix];
   if (!d || !d.workflow_yaml) return;
   _downloadTextAsFile((d.workflow_path || 'workflow.yml').split('/').pop(), d.workflow_yaml);
 }
 
 function renderTestAutomation(targetId, r) {
   _lastTestAutomation = r;
+  _lastSuites[targetId] = r;
   // Fired after the innerHTML below lands, since both write into divs that markup creates.
+  // `targetId` is passed down as the id prefix for those divs and everything inside them:
+  // it is already unique per screen, and a fixed prefix here collided with the app-based
+  // screen, which renders the same panel.
   if (r && r.review_id) setTimeout(() => {
-    loadTestResults(r.review_id);
-    loadTestRunner(r.review_id);
+    loadTestResults(r.review_id, targetId);
+    loadTestRunner(r.review_id, targetId);
   }, 0);
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
@@ -2720,8 +2737,8 @@ function renderTestAutomation(targetId, r) {
         workflow that reports back on every push. This screen then shows which of your
         requirements actually hold.</div>
     </div>
-    <div id="test-automation-results"></div>
-    <div id="test-automation-runner"></div>
+    <div id="${targetId}-results"></div>
+    <div id="${targetId}-runner"></div>
 
     <div class="summary-box">${esc(r.summary || '')}</div>
     ${renderAutomationInputMode(r)}
@@ -2759,7 +2776,7 @@ function renderTestAutomation(targetId, r) {
     ${files.length ? `
     <div class="form-actions" style="margin-bottom:8px">
       <button class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
-              onclick="downloadAllGeneratedTests()">⬇ Download all</button>
+              onclick="downloadAllGeneratedTests('${jsArg(targetId)}')">⬇ Download all</button>
     </div>` : ''}
     ${files.map((f, i) => `
       <details style="margin-bottom:10px" ${files.length === 1 ? 'open' : ''}>
@@ -2773,7 +2790,7 @@ function renderTestAutomation(targetId, r) {
           ${(f.covers || []).length ? `<div class="field-hint">Covers: ${f.covers.map(esc).join(' · ')}</div>` : ''}
           <pre class="api-usage-code">${esc(f.content || '')}</pre>
           <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px"
-                  onclick="downloadGeneratedTest(${i})">⬇ Download this file</button>
+                  onclick="downloadGeneratedTest(${i}, '${jsArg(targetId)}')">⬇ Download this file</button>
         </div>
       </details>`).join('')}
 
@@ -2804,6 +2821,30 @@ function renderTestAutomation(targetId, r) {
 // ── Application testing ───────────────────────────────────────────────────
 
 let _lastAppTesting = null;
+
+/** Three words, one place. `stated` is something a person wrote, `derived` a case this
+ *  platform generated from something a person wrote, `observed` nothing at all.
+ *
+ *  `specified` is the retired two-word vocabulary and maps to `stated`, rather than being
+ *  dropped: a run stored before the rename can still carry it, which is the same reason the
+ *  server still writes `specified_count` beside `stated_count`. Anything unrecognised reads
+ *  as observed, because the honest answer to "I do not know what this rests on" is "nothing
+ *  said this should be true". */
+const _ASSERTION_LABELS = {
+  stated:   '<span style="color:var(--green)">✓ Stated</span>'
+          + '<div class="field-hint">someone wrote this down</div>',
+  derived:  '<span style="color:var(--amber)">◑ Derived</span>'
+          + '<div class="field-hint">a case this platform generated — nobody checked it</div>',
+  observed: '<span style="color:var(--text-muted)">— Observed</span>'
+          + '<div class="field-hint">what the app did that day</div>',
+};
+
+function _assertionBasis(row) {
+  const raw = String((row || {}).basis || '');
+  if (raw === 'stated' || raw === 'specified') return 'stated';
+  if (raw === 'derived') return 'derived';
+  return 'observed';
+}
 
 // Builds the command that actually explores, because this screen cannot do it itself. The
 // browser runs where the application is reachable -- a developer machine, a CI runner, or a
@@ -2846,8 +2887,20 @@ function appTestingCommand() {
   const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
   const readsText = (document.getElementById('app-testing-page-text') || {}).checked;
   const keepDays = (document.getElementById('app-testing-retention') || {}).value || '7';
+  const projectId = getActiveProjectId();
   const parts = ['python scripts/explore_app.py', '--url ' + url, '--max-steps ' + steps];
+  // The project has to travel with the command, not only with the browser session. Without
+  // it the driver sends `project_id: null`, the session is filed under nothing, every
+  // `--cover-review` id comes back as "no such run" because it belongs to a project the
+  // session cannot see, and the project's Knowledge Base documents are never read. All
+  // three failures are silent: the session runs, it just runs without anything it was
+  // given.
+  if (projectId) parts.push('--project ' + projectId);
   if (goal) parts.push('--goal "' + goal.replace(/"/g, '\\"').slice(0, 120) + '"');
+  // The requirement travels as a file, and `renderAppTestingCommand` shows the file to save
+  // beside the command. Not inlined as `--requirement "..."`: the escaping used for --goal
+  // above is `\"`, which is not an escape in PowerShell, and this line is pasted into
+  // whatever shell the person happens to have open.
   if (req) parts.push('--requirement-file requirement.txt');
   // Both choices are written into the command rather than left to the driver's defaults, so
   // what the person ticked on this screen is what the machine running the browser actually
@@ -2856,7 +2909,22 @@ function appTestingCommand() {
   if (String(keepDays) !== '7') parts.push('--keep-page-text-days ' + keepDays);
   appTestingSources().forEach(id => parts.push('--cover-review ' + id));
   parts.push('--shots out/');
+  // Last, because it is the one flag a reader should still see after the line wraps. The
+  // tick box on this screen *is* the declaration -- the driver no longer assumes it -- so
+  // an unticked box produces a command the platform will refuse, which is the point.
+  if ((document.getElementById('app-testing-attest') || {}).checked) parts.push('--attest');
   return parts.join(' ');
+}
+
+/** The requirement, as the file the command reads it from.
+ *
+ *  The command says `--requirement-file requirement.txt` and for a long time nothing ever
+ *  produced that file, so the typed requirement reached nothing and the run died on a
+ *  missing path. This is the other half of that flag. */
+function downloadAppTestingRequirement() {
+  const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
+  if (!req) { alert('Type the requirement first.'); return; }
+  _downloadTextAsFile('requirement.txt', req);
 }
 
 function renderAppTestingCommand() {
@@ -2864,10 +2932,25 @@ function renderAppTestingCommand() {
   if (!box) return;
   const attested = (document.getElementById('app-testing-attest') || {}).checked;
   const readsText = (document.getElementById('app-testing-page-text') || {}).checked;
+  const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
+  const projectId = getActiveProjectId();
   box.innerHTML = attested
     ? `<div class="field-hint">Run this where the application is reachable. Your credentials and
          the URL stay on that machine — the platform is sent page descriptions and answers with
          one action at a time.</div>
+       ${projectId ? '' : `<div class="cost-note" style="border-left:3px solid var(--amber)">
+         <b>No project is selected</b>, so this session would be filed under none — any earlier
+         run you tick below would come back as "no such run", and your project's uploaded
+         documents would not be read. Pick a project in the sidebar first.</div>`}
+       ${req ? `<div class="cost-note" style="margin-bottom:8px">
+         <b>Step 1 — save this as <code>requirement.txt</code></b>, in the folder you run the
+         command from. The command reads the requirement from that file; it is not sent from
+         this screen.
+         <pre class="api-usage-code" style="margin:6px 0">${esc(req)}</pre>
+         <button type="button" class="btn btn-secondary" style="font-size:11px;padding:3px 8px"
+                 onclick="downloadAppTestingRequirement()">⬇ Download requirement.txt</button>
+       </div>
+       <div class="field-hint"><b>Step 2 — run this</b></div>` : ''}
        <pre class="api-usage-code">${esc(appTestingCommand())}</pre>
        ${readsText ? '' : `<div class="cost-note" style="border-left:3px solid var(--amber)">
          This session will not read what pages display, so its tests will be able to check that
@@ -2944,14 +3027,17 @@ async function previewAppTestingCost() {
 
 function renderAppTesting(targetId, r) {
   _lastAppTesting = r;
-  _lastTestAutomation = r;   // the download helpers read this; the result shape is the same
+  _lastTestAutomation = r;
+  _lastSuites[targetId] = r;
   // Fired after the innerHTML lands, since both write into divs this markup creates. The
-  // container ids are the test-automation ones on purpose: the suite this product writes has
-  // the same shape, so the same two loaders serve it with no branch in them, and only one
-  // agent screen is ever visible at a time.
+  // two loaders are shared with the code-based generator because the suite has the same
+  // shape -- but the *ids* are namespaced by `targetId`, because a hidden screen is still
+  // in the document and the old fixed ids resolved to whichever screen came first in the
+  // markup. "Only one agent screen is ever visible at a time" was true and was the wrong
+  // test: getElementById does not care what is visible.
   if (r && r.review_id) setTimeout(() => {
-    loadTestResults(r.review_id);
-    loadTestRunner(r.review_id);
+    loadTestResults(r.review_id, targetId);
+    loadTestRunner(r.review_id, targetId);
   }, 0);
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
@@ -2960,9 +3046,17 @@ function renderAppTesting(targetId, r) {
   const cov = Array.isArray(r.requirement_coverage) ? r.requirement_coverage : [];
   const assumptions = r.assumptions || [];
   const journeys = (r.session_detail || {}).journeys || [];
-  const stated = r.stated_count || r.specified_count || 0;
-  const derived = r.derived_count || 0;
-  const observed = r.observed_count || 0;
+  // Counted from the rows when there are rows, and only falling back to the server's own
+  // counts when there are none. The server derives its counts from this same array, so this
+  // is not a second opinion -- it removes the possibility of the banner and the table below
+  // it disagreeing, which is exactly what happened while the table still spoke the old
+  // two-word vocabulary and reported every stated assertion as observed.
+  const stated = basis.length ? basis.filter(b => _assertionBasis(b) === 'stated').length
+                              : (r.stated_count || r.specified_count || 0);
+  const derived = basis.length ? basis.filter(b => _assertionBasis(b) === 'derived').length
+                               : (r.derived_count || 0);
+  const observed = basis.length ? basis.length - stated - derived
+                                : (r.observed_count || 0);
 
   wrap.innerHTML = `
     <div class="result-header">
@@ -3008,8 +3102,8 @@ function renderAppTesting(targetId, r) {
       <b>Nothing here has been run.</b> These files were generated from what the explorer saw,
       not executed. A generated test that passes is not evidence until someone runs it.
     </div>
-    <div id="test-automation-results"></div>
-    <div id="test-automation-runner"></div>
+    <div id="${targetId}-results"></div>
+    <div id="${targetId}-runner"></div>
 
     <div class="summary-box">${esc(r.summary || '')}</div>
 
@@ -3025,9 +3119,7 @@ function renderAppTesting(targetId, r) {
       <tbody>${basis.map(b => `
         <tr>
           <td style="font-family:monospace;font-size:11px">${esc(b.test_name || '')}</td>
-          <td>${b.basis === 'specified'
-                ? '<span style="color:var(--green)">✓ Requirement</span>'
-                : '<span style="color:var(--text-muted)">Observed</span>'}
+          <td>${_ASSERTION_LABELS[_assertionBasis(b)]}
               ${b.requirement_ref ? `<div class="field-hint">${esc(b.requirement_ref)}</div>` : ''}
               ${b.downgraded_because ? `<div class="field-hint">relabelled: ${esc(b.downgraded_because)}</div>` : ''}</td>
           <td>${esc(b.what_it_checks || '')}</td>
@@ -3072,7 +3164,7 @@ function renderAppTesting(targetId, r) {
         <div style="margin-top:8px">
           <pre class="api-usage-code">${esc(f.content || '')}</pre>
           <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px"
-                  onclick="downloadGeneratedTest(${i})">⬇ Download this file</button>
+                  onclick="downloadGeneratedTest(${i}, '${jsArg(targetId)}')">⬇ Download this file</button>
         </div>
       </details>`).join('')}
 

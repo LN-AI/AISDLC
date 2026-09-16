@@ -3673,11 +3673,171 @@ check('the rest of the result still renders around it', () => {
 });
 }
 
+// ── Application Test Generation ────────────────────────────────────────────
+//
+// The first offline coverage this screen has ever had, and the omission was not free: two
+// defects shipped behind it. The result table still spoke the retired two-word vocabulary,
+// so an assertion resting on the customer's own written requirement was reported as
+// "observed" directly underneath a banner correctly counting it as stated. And both test
+// screens minted elements with the same fixed ids, so whichever screen came first in the
+// markup captured the other's results panel.
+//
+// Note what this file can and cannot see: the DOM stub hands out a fresh element per id, so
+// it can never reproduce the id *collision* itself -- that check belongs in `ui_examine.py`,
+// in a real document. What it can prove is that the two renderers no longer mint the same
+// ids, which is the property the collision needed.
+function runAppTestingChecks() {
+section('Application Test Generation');
+
+const SUITE = {
+  review_id: 'rev-app-1',
+  summary: 'Explored the basket and wrote seven tests.',
+  total_files: 1, total_tests: 4,
+  test_files: [{ path: 'tests/basket.spec.ts', framework: 'playwright',
+                 test_names: ['adds an item'], content: 'test("adds an item")' }],
+  session: { steps: 8 },
+  session_detail: { journeys: [
+    { name: 'Add to basket', step_count: 5, distinct_pages: 2, actions: ['click', 'fill'] },
+    { name: 'Wander',        step_count: 3, distinct_pages: 1, actions: ['goto'] }] },
+  assertion_basis: [
+    { test_name: 'total is right',   basis: 'stated',    what_it_checks: 'the total',
+      requirement_ref: 'REQ-1' },
+    { test_name: 'legacy row',       basis: 'specified', what_it_checks: 'an older run' },
+    { test_name: 'case from a run',  basis: 'derived',   what_it_checks: 'TC-004' },
+    { test_name: 'button is there',  basis: 'observed',  what_it_checks: 'a control exists' },
+    { test_name: 'unlabelled',       basis: '',          what_it_checks: 'nothing declared' },
+  ],
+};
+
+const copy = () => JSON.parse(JSON.stringify(SUITE));
+
+check('a stated assertion is reported as stated, not as observed', () => {
+  sandbox.renderAppTesting('app-testing-result', copy());
+  const html = document.getElementById('app-testing-result').innerHTML;
+  const row = html.slice(html.indexOf('total is right'));
+  const cell = row.slice(0, row.indexOf('legacy row'));
+  assert(cell.includes('Stated'), 'a stated assertion did not render as stated');
+  assert(!cell.includes('Observed'),
+         'a stated assertion rendered as Observed -- the defect this check exists for');
+});
+
+check('the retired word `specified` still reads as stated', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  const row = html.slice(html.indexOf('legacy row'));
+  assert(row.slice(0, row.indexOf('case from a run')).includes('Stated'),
+         'a run stored before the rename lost its basis');
+});
+
+check('derived is its own answer, not folded into either neighbour', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  const row = html.slice(html.indexOf('case from a run'));
+  const cell = row.slice(0, row.indexOf('button is there'));
+  assert(cell.includes('Derived'), 'derived did not render');
+  assert(cell.includes('nobody checked it'),
+         'derived rendered without the reason it exists -- a machine-written case laundered '
+         + 'into a verified requirement is the whole thing this word prevents');
+});
+
+check('a row declaring no basis at all reads as observed', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.slice(html.indexOf('unlabelled')).includes('Observed'),
+         'a blank basis was not floored to observed');
+});
+
+check('the banner and the table cannot disagree', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  // Two stated rows (one of them legacy), one derived, two observed.
+  assert(html.includes('2 assertion(s) check something a person wrote'),
+         'the banner did not count the rows it is sitting above');
+  assert(html.includes('1 check a case this platform generated'),
+         'the derived count disagrees with the table');
+});
+
+check('the journeys walked are shown, and one that went nowhere says so', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Add to basket'), 'the journey list is missing');
+  assert(html.includes('never left one page'),
+         'a journey that never left one page is the clearest sign a session was stuck');
+});
+
+check('a session that read no page text says what its tests cannot do', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), { read_page_text: false }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('did not read what the pages displayed'),
+         'the page-text warning is gone');
+});
+
+check('a suite with nothing to check against says so rather than implying verification', () => {
+  sandbox.renderAppTesting('app-testing-result',
+                   Object.assign(copy(), { assertion_basis: [], observed_count: 6 }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Nothing was supplied to check against'),
+         'the observed-only banner is gone');
+  assert(html.includes('cannot catch behaviour that'), 'it did not say what that costs');
+});
+
+check('the two test screens no longer mint the same element ids', () => {
+  sandbox.renderTestAutomation('test-automation-result', copy());
+  const a = document.getElementById('test-automation-result').innerHTML;
+  sandbox.renderAppTesting('app-testing-result', copy());
+  const b = document.getElementById('app-testing-result').innerHTML;
+  const idsOf = h => new Set((h.match(/id="([^"]+)"/g) || []).map(m => m.slice(4, -1)));
+  const right = idsOf(b);
+  const shared = [...idsOf(a)].filter(id => right.has(id));
+  assert(!shared.length,
+         'both screens mint ' + shared.join(', ') + ' -- a hidden screen is still in the '
+         + 'document, so the loaders resolved to whichever came first in the markup');
+});
+
+check('...and each screen asks its loaders for its own panel', () => {
+  const b = document.getElementById('app-testing-result').innerHTML;
+  assert(b.includes('id="app-testing-result-results"'),
+         'the app screen did not namespace its results panel');
+  assert(b.includes('id="app-testing-result-runner"'),
+         'the app screen did not namespace its runner panel');
+});
+
+check('the command carries the project, or says why it does not', () => {
+  document.getElementById('app-testing-url').value = 'https://staging.example.com';
+  document.getElementById('app-testing-attest').checked = true;
+  document.getElementById('app-testing-requirement').value = 'A basket total must be right.';
+  sandbox.getActiveProjectId = () => 'proj-7';
+  assert(sandbox.appTestingCommand().includes('--project proj-7'),
+         'without --project the session is filed under nothing, every covered run comes back '
+         + 'as "no such run", and the project documents are never read');
+  sandbox.getActiveProjectId = () => '';
+  sandbox.renderAppTestingCommand();
+  const html = document.getElementById('app-testing-command').innerHTML;
+  assert(html.includes('No project is selected'),
+         'a command that will misfile the session was offered with no warning');
+});
+
+check('the attestation tick is what writes the declaration', () => {
+  sandbox.getActiveProjectId = () => 'proj-7';
+  document.getElementById('app-testing-attest').checked = true;
+  assert(sandbox.appTestingCommand().includes('--attest'), 'the tick box did not reach the command');
+  document.getElementById('app-testing-attest').checked = false;
+  assert(!sandbox.appTestingCommand().includes('--attest'),
+         'an unticked box still declared a test environment');
+  document.getElementById('app-testing-attest').checked = true;
+});
+
+check('the requirement is offered as the file the command reads', () => {
+  sandbox.renderAppTestingCommand();
+  const html = document.getElementById('app-testing-command').innerHTML;
+  assert(html.includes('requirement.txt'), 'the file the command needs is never named');
+  assert(html.includes('A basket total must be right.'),
+         'the typed requirement is not shown, so nothing tells the user what to save');
+  assert(html.includes('downloadAppTestingRequirement'), 'no way to get the file');
+});
+}
+
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
   .then(runReviewSourceChecks).then(runScreenIsolationChecks)
   .then(runNavigationChecks).then(runProjectWarningChecks)
   .then(runApprovalCardChecks).then(runDashboardChecks)
-  .then(runCommandPaletteChecks).then(runTestCaseChecks).then(() => {
+  .then(runCommandPaletteChecks).then(runTestCaseChecks)
+  .then(runAppTestingChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

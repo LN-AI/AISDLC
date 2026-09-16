@@ -107,11 +107,17 @@
             <li class="nav-item" data-page="test-case" data-product="test-case">
               <span class="nav-icon">📝</span> Test Case Generation
             </li>
+            <!-- These two produce the same thing from opposite inputs, sit next to each
+                 other, and were told apart by four near-identical words. The subtitle
+                 carries the only distinction that matters to somebody choosing: what you
+                 have to give it. -->
             <li class="nav-item" data-page="test-automation" data-product="test-automation">
               <span class="nav-icon">⚙️</span> Test Automation Generation
+              <span class="nav-sub">needs your source code</span>
             </li>
             <li class="nav-item" data-page="app-testing" data-product="app-testing">
               <span class="nav-icon">🧭</span> Application Test Generation
+              <span class="nav-sub">needs a running app, no source</span>
             </li>
           </ul>
         </li>
@@ -741,7 +747,9 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
               Controls whose labels suggest they destroy data, spend money, contact real people or
               end the session are withheld before the model ever sees them &mdash; but that is a
               filter on button labels, not a guarantee, so point it at an environment you can
-              afford to have changed.</div>
+              afford to have changed.
+              <b>This tick is the declaration itself:</b> it writes <code>--attest</code> into the
+              command below, and the platform refuses a session that arrives without it.</div>
           </div>
 
           <div class="form-group">

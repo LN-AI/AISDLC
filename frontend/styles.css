@@ -110,6 +110,20 @@ body {
 
 .nav-icon { font-size: 15px; }
 
+/* A nav item may carry a one-line subtitle saying what it needs as input, for the two
+   screens whose names are otherwise almost the same word for word. `flex-basis: 100%` is
+   what pushes it onto its own line; `row-gap: 0` stops it inheriting the 10px column gap
+   and floating away from the label it belongs to. Harmless for the items without one --
+   nothing else in a nav item wraps. */
+.nav-item { flex-wrap: wrap; row-gap: 0; }
+.nav-sub {
+  flex-basis: 100%;
+  padding-left: 25px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  opacity: 0.6;
+}
+
 /* ── Main ── */
 .main {
   flex: 1;
