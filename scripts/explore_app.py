@@ -1106,7 +1106,7 @@ VERIFY_TIMEOUT_SECONDS = 900
 GENERATE_TIMEOUT_SECONDS = 600
 
 
-def _verify(args, review_id: str) -> int:
+def _verify(args, review_id: str, api) -> int:
     """Run the suite against the application it was just written from.
 
     The one property this product most needs to be true is the one nothing was checking.
@@ -1177,22 +1177,62 @@ def _verify(args, review_id: str) -> int:
         print("  The suite is written and stored; run it yourself with run_tests.py.")
         return 0
 
+    # Read the verdict out of the platform's own record rather than off the runner's exit
+    # code, because they answer different questions and the difference is not academic:
+    # `run_tests.py` exits 0 when the *reporting* succeeded, whatever the tests did. The
+    # first version of this read that exit code, and on a live ParaBank run it printed
+    # "Every test passed" three lines under "Reported 13 test(s): 0 passed, 13 failed".
+    #
+    # A checking tool that gives a false green is worse than no checking tool. It is the
+    # exact failure this whole feature exists to catch, one level up, and it would have been
+    # believed because it is the last thing the driver prints.
     print()
-    if proc.returncode == 0:
-        print("  Every test passed against the application it was written from. That is the")
-        print("  weakest thing this check can tell you and the most important: the suite is")
-        print("  not going to cry wolf on the build it came from. Whether each test would")
-        print("  *catch* a real break is a different question -- read the assertion table.")
+    summary = _verified_counts(api, review_id)
+    if summary is None:
+        print("  The suite ran, and this could not read the result back from the platform.")
+        print(f"  Check it directly: GET /api/reviews/{review_id}/test-results")
+        return 0
+
+    passed, failed, errored, total = summary
+    if total and not failed and not errored:
+        print(f"  All {passed} test(s) passed against the application they were written")
+        print("  from. That is the weakest thing this check can tell you and the most")
+        print("  important: the suite will not cry wolf on the build it came from. Whether")
+        print("  each test would *catch* a real break is a different question -- read the")
+        print("  assertion table.")
     else:
-        print("  Some tests did not pass. Because the application was working throughout the")
-        print("  exploration, the first suspect is the test rather than the application --")
-        print("  a locator that matches nothing, or a value read from the wrong moment.")
-        print("  The shared-cause line above says whether one broken helper explains them all.")
+        print(f"  {failed + errored} of {total} test(s) did not pass. Because the application")
+        print("  answered every action during the exploration, the first suspect is the test")
+        print("  rather than the application -- a locator that matches nothing, or a value")
+        print("  read from the wrong moment. The shared-cause line above says whether one")
+        print("  broken helper explains them all.")
 
     # Deliberately not a failure of this command. The session succeeded, the suite exists and
     # is stored, and the customer is better off with a labelled suite than with a driver that
     # exits non-zero and looks like it lost their money.
     return 0
+
+
+def _verified_counts(api, review_id: str):
+    """(passed, failed, errored, total) for the run just posted, or None.
+
+    The platform is the source of truth on purpose: it is the same record the customer's
+    screen shows, so the driver cannot congratulate itself on a result the product would
+    report differently.
+    """
+    try:
+        body = api.get(f"/api/reviews/{review_id}/test-results")
+    except Exception:
+        return None
+    runs = (body or {}).get("runs") or []
+    if not runs:
+        return None
+    latest = runs[0]
+    for row in runs:
+        if str(row.get("created_at") or "") > str(latest.get("created_at") or ""):
+            latest = row
+    return (int(latest.get("passed") or 0), int(latest.get("failed") or 0),
+            int(latest.get("errored") or 0), int(latest.get("total") or 0))
 
 
 def main():
@@ -1441,7 +1481,7 @@ def main():
               f"supplied to check against.")
     review_id = result.get("review_id")
     if args.verify and review_id:
-        return _verify(args, review_id)
+        return _verify(args, review_id, api)
 
     print(f"\n  Run them:   python scripts/run_tests.py --review {review_id} "
           f"--into <checkout>")

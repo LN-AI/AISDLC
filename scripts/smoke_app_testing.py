@@ -1872,6 +1872,66 @@ def main_():
           "You are repeating yourself" in agent_src,
           "a note computed and never rendered is the shape of C-98")
 
+    # ── 25. The verdict the closed loop announces ─────────────────────────
+    # `run_tests.py` exits 0 when the *reporting* succeeded, whatever the tests did, and the
+    # first version of `--verify` read that exit code as the verdict. On a live ParaBank run
+    # it printed "Every test passed" three lines below "Reported 13 test(s): 0 passed, 13
+    # failed" -- a checking tool giving a false green, which is worse than no checking tool
+    # and is the exact failure the feature exists to catch, one level up. It would have been
+    # believed, because it is the last thing the driver prints.
+    section("25. The closed loop reads the result, not the runner's exit code")
+    import importlib.util as _ilu2
+    _spec2 = _ilu2.spec_from_file_location("_ea2", ROOT / "scripts" / "explore_app.py")
+    _ea = _ilu2.module_from_spec(_spec2)
+    _spec2.loader.exec_module(_ea)
+
+    class _FakeApi:
+        def __init__(self, body):
+            self.body = body
+            self.asked = []
+
+        def get(self, path):
+            self.asked.append(path)
+            if isinstance(self.body, Exception):
+                raise self.body
+            return self.body
+
+    _all_green = _FakeApi({"runs": [{"total": 13, "passed": 13, "failed": 0, "errored": 0,
+                                     "created_at": "2026-09-17T20:00:00"}]})
+    check("a passing run reads as passing",
+          _ea._verified_counts(_all_green, "r") == (13, 0, 0, 13),
+          _ea._verified_counts(_all_green, "r"))
+
+    _all_red = _FakeApi({"runs": [{"total": 13, "passed": 0, "failed": 13, "errored": 0,
+                                   "created_at": "2026-09-17T20:00:00"}]})
+    check("the exact ParaBank result reads as failing, not passing",
+          _ea._verified_counts(_all_red, "r") == (0, 13, 0, 13),
+          "0 passed / 13 failed was announced as 'Every test passed' because the runner "
+          "exits 0 when the *reporting* worked")
+
+    _errored = _FakeApi({"runs": [{"total": 4, "passed": 3, "failed": 0, "errored": 1,
+                                   "created_at": "2026-09-17T20:00:00"}]})
+    check("a test that errored is not counted as a pass",
+          _ea._verified_counts(_errored, "r") == (3, 0, 1, 4),
+          "'did not load' is how a whole broken suite reports itself")
+
+    # Two runs against the same review: the newest is the one just posted.
+    _two = _FakeApi({"runs": [{"total": 2, "passed": 0, "failed": 2, "errored": 0,
+                               "created_at": "2026-09-01T00:00:00"},
+                              {"total": 2, "passed": 2, "failed": 0, "errored": 0,
+                               "created_at": "2026-09-17T20:00:00"}]})
+    check("the newest run is the one read, not whichever came back first",
+          _ea._verified_counts(_two, "r") == (2, 0, 0, 2),
+          "a review can carry an older run from a previous checkout")
+
+    check("no runs recorded is not silently read as success",
+          _ea._verified_counts(_FakeApi({"runs": []}), "r") is None)
+    check("a platform that cannot be reached is not read as success",
+          _ea._verified_counts(_FakeApi(RuntimeError("down")), "r") is None,
+          "returning (0,0,0,0) here would print 'all passed' for a suite nobody ran")
+    check("it asks the platform for this review's results",
+          "/api/reviews/r/test-results" in _all_green.asked, _all_green.asked)
+
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)
