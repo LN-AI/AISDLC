@@ -291,28 +291,57 @@ def _outcomes_by_step(steps: List[dict]) -> dict:
     return shifted
 
 
-def _repetition_note(steps: List[dict], window: int = 10, floor: int = 3) -> str:
-    """Say plainly when the explorer has been doing the same thing over and over.
+def _repetition_note(steps: List[dict], window: int = 6, floor: int = 3,
+                     novel_allowed: int = 1) -> str:
+    """Say plainly when the explorer has been repeating itself **to no effect**.
 
     The stopping rule (`app_session.stalled`) is a backstop and behaves like one: it ends a
-    stuck session a few steps before the budget would have. What it cannot do is stop the
-    session becoming stuck, and the measurement says that is where the money goes — a live
-    banking session spent **22 of 26 steps** toggling two dropdowns, and the fixed rule only
-    reclaims the last four of those.
+    stuck session a few steps before the budget would have. It cannot stop a session becoming
+    stuck, and the measurement says that is where the money goes -- a live banking session
+    spent 22 of 26 steps toggling two dropdowns, and the rule reclaims only the last four.
 
-    The history is already in the prompt, so the model can in principle count for itself; it
-    demonstrably did not. A list of twelve lines is something to read, whereas "you have
-    selected this same control seven times and the page has not changed" is a fact. Stated as
-    an observation with a cost attached rather than as an instruction, because the explorer
-    still has to decide what to do instead, and it may legitimately have a reason.
+    **Repetition on its own is not the signal, and treating it as one was a real mistake.**
+    The first version of this warned whenever a control had been used three times in a
+    window, and checked against a live eval trace it fired on **seven of eleven steps of a
+    perfectly healthy session**: `basket-total` clicks "One more Widget" three times in a row
+    *because that is the test* -- the arithmetic bug it hunts is invisible at a quantity of
+    one. A warning that fires on correct behaviour is one the model learns to ignore, which
+    would have cost the real warning its only chance of being read. The smoke check missed it
+    because it exercised eight distinct targets, so nothing repeated at all.
 
-    Deliberately blunt about the remedy, since a model that knows it is stuck and has no idea
-    what to try next repeats itself politely instead.
+    What separates the two cases is not how often an action was taken but **whether taking it
+    led anywhere**. Each "One more Widget" moves the basket to a total the session has never
+    displayed, so every repeat is novel. Each dropdown toggle returns the page to one of two
+    states it has already been in. So the window is only reported when almost nothing in it
+    was new -- the same notion of progress `stalled` uses, applied one notch earlier and as a
+    nudge rather than a stop.
+
+    Stated as an observation with a cost attached rather than as an instruction, and blunt
+    about the alternatives, because a model that knows it is stuck and is offered no other
+    move repeats itself politely.
     """
     if not steps:
         return ""
+    recent = steps[-window:]
+    if len(recent) < window:
+        return ""
+
+    # How many steps in the window reached a signature the session had not seen before then.
+    seen = {str(step.get("page_signature") or "")
+            for step in steps[:len(steps) - len(recent)]}
+    seen.discard("")
+    novel = 0
+    for step in recent:
+        sig = str(step.get("page_signature") or "")
+        if sig and sig not in seen:
+            novel += 1
+        if sig:
+            seen.add(sig)
+    if novel > novel_allowed:
+        return ""            # still finding things; repetition is not what is wrong here
+
     counts = {}
-    for step in steps[-window:]:
+    for step in recent:
         action = step.get("action") or {}
         key = (str(action.get("action_kind") or "?"),
                str(action.get("target_name") or "")[:60])
@@ -323,12 +352,12 @@ def _repetition_note(steps: List[dict], window: int = 10, floor: int = 3) -> str
     worst.sort(reverse=True)
     listed = "; ".join('%s "%s" %d times' % (kind, name, n) for n, kind, name in worst[:3])
     return (
-        f"In your last {min(window, len(steps))} steps you have: {listed}. Repeating an "
-        "action you have already taken teaches this session nothing and spends a step that "
-        "cannot be got back. If the page is not changing in a way that is worth a test, "
-        "leave it: go back, open something you have not opened, navigate to a part of the "
-        "application the requirement mentions, or declare yourself done. Being done early is "
-        "a better outcome than a budget spent on one page."
+        f"In your last {len(recent)} steps you have: {listed}, and the application has not "
+        "shown you anything it had not already shown you. Repeating an action that is not "
+        "changing anything teaches this session nothing and spends a step that cannot be got "
+        "back. Leave this page: go back, open something you have not opened, navigate to a "
+        "part of the application the requirement mentions, or declare yourself done. Being "
+        "done early is a better outcome than a budget spent in one place."
     )
 
 

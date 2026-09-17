@@ -1763,20 +1763,55 @@ def main_():
     # Upstream of the rule: the explorer is told it is repeating itself, because the rule is
     # only a backstop and reclaims the last few steps of a session that is already wasted.
     from backend.routes.app_testing import _repetition_note
-    fiddling = ([{"action": {"action_kind": "select", "target_name": "All January February"}},
-                 {"action": {"action_kind": "select", "target_name": "All Credit Debit"}}] * 4)
+
+    # Repetition that is getting nowhere: the same two dropdowns, and the page keeps
+    # returning to states the session has already been in.
+    # The earlier half matters: a signature is only "already seen" relative to what came
+    # before the window, so a fixture with no history would have every state looking new on
+    # first sight -- which is the correct behaviour and the wrong test.
+    fiddling = [{"action": {"action_kind": "click", "target_name": "Go"},
+                 "page_signature": sig} for sig in ("8e59380a", "4f947a9e", "8e59380a")]
+    fiddling += [{"action": {"action_kind": "select", "target_name": n},
+                  "page_signature": sig}
+                 for n, sig in (("All January February", "8e59380a"),
+                                ("All Credit Debit", "4f947a9e"),
+                                ("All January February", "8e59380a"),
+                                ("All Credit Debit", "4f947a9e"),
+                                ("All January February", "8e59380a"),
+                                ("All Credit Debit", "4f947a9e"))]
     note = _repetition_note(fiddling)
-    check("an explorer that keeps poking the same control is told so",
-          "4 times" in note and "All Credit Debit" in note, note[:160])
-    check("...and told what it costs, in steps",
-          "cannot be got back" in note, note[:200])
-    check("...and given somewhere else to go, since a model with no alternative repeats itself",
-          "declare yourself done" in note, note[:400])
-    check("a session doing something different each step is not nagged",
-          _repetition_note([{"action": {"action_kind": "click",
-                                        "target_name": "Item %d" % i}}
-                            for i in range(8)]) == "",
-          "a warning that fires on healthy behaviour is one the model learns to ignore")
+    check("an explorer getting nowhere with the same control is told so",
+          "3 times" in note and "All Credit Debit" in note, note[:200])
+    check("...and told that the application has stopped showing it anything new",
+          "had not already shown you" in note, note[:220])
+    check("...and told what it costs, in steps", "cannot be got back" in note, note[:260])
+    check("...and given somewhere else to go, since a model with no alternative repeats "
+          "itself", "declare yourself done" in note, note[:400])
+
+    # **The case that matters most**, and the one the first version of this got wrong.
+    #
+    # This is the real `basket-total` trace from a live eval session: three clicks on "One
+    # more Widget" in a row, *because that is the test* -- the arithmetic bug the case hunts
+    # is invisible at a quantity of one. The first version counted repeats alone and fired on
+    # **seven of these eleven steps**, and the check that was supposed to catch that used
+    # eight distinct targets, so nothing repeated and it passed. Each click here moves the
+    # basket to a total the session has not displayed before, which is exactly what
+    # distinguishes it from the dropdown above.
+    _healthy = ["Add Widget", "One more Widget", "One more Widget", "One more Widget",
+                "Add Gadget", "One more Gadget", "One fewer Widget", "One fewer Widget",
+                "One fewer Gadget", "One fewer Widget", "One fewer Gadget"]
+    _built, _nagged = [], []
+    for _i, _name in enumerate(_healthy, 1):
+        if _repetition_note(_built):
+            _nagged.append(_i)
+        _built.append({"action": {"action_kind": "click", "target_name": _name},
+                       "page_signature": "total-%d" % _i})
+    check("a session repeating an action that keeps changing the page is never nagged",
+          not _nagged,
+          "fired before step(s) %s of a healthy basket-total run; a warning that fires on "
+          "correct behaviour is one the model learns to ignore, which costs the real warning "
+          "its only chance of being read" % (_nagged,))
+
     check("the explorer is actually shown it, not just handed it",
           "You are repeating yourself" in agent_src,
           "a note computed and never rendered is the shape of C-98")
