@@ -293,8 +293,11 @@ else was recalled. Given the session's own collected text it also catches a **he
 saw** (D-438), which is D-430's failure and is invisible to shape alone. `assertion_audit`
 (D-437) asks whether a test could ever fail: one whose every matcher is `toBeVisible` or
 `toHaveURL` passes against an application with the feature ripped out, which is worse than a
-missing test because it is counted as coverage. Neither can see a *wrong value* — that is
-what `--verify` is for, and the three are complements rather than layers.
+missing test because it is counted as coverage. Neither can see a *wrong value*, a wrong
+credential, or an invented fixture — that is what `--verify` is for, and the three are
+complements rather than layers. **Do not read two passing audits as a working suite**: a
+healthy SauceDemo session scored 144 grounded locators and 0 invented while 10 of its 21
+tests failed against the working application (C-109).
 
 **A locator the session never observed is counted rather than forbidden** (D-433). The
 observation contract is closed — a role, visible text, or `locator("input[name='…']")`, and
