@@ -217,9 +217,14 @@ rather than suites, which is the difference between seeing a run that produced n
 not knowing it happened; `renderAppSession` polls one session and says what it is doing now.
 **A stop is served as the existing `done` reply** (D-423), checked before `require_open` and
 before metering, so it needs no driver change, costs nothing, and is enforced by closing the
-session row rather than by the driver agreeing. The loop detector is in the browser on
-purpose (D-424): `app_session.stalled` cannot see an A,B,A,B loop, and fixing that would move
-D-411's measured floors. What the denylist withheld is finally visible by name (D-426) — and
+session row rather than by the driver agreeing. The loop detector in the browser (D-424) was
+built because `app_session.stalled` could not see an A,B,A,B loop; **the server-side rule can
+now** (D-441). Progress means reaching something the session has not reached before, rather
+than the last five pages being identical — the old question could never be answered yes by a
+session alternating between two known states, and a live banking run spent 22 of 26 steps
+doing exactly that. Read D-441 before widening it: a signature carries each control's current
+*value* so that filling a form reads as progress, which is precisely why the explorer could
+always move the measure by typing something. What the denylist withheld is finally visible by name (D-426) — and
 reads in both directions, because half a page withheld is a coverage problem, not a safety
 win. An abandoned session is closed after six hours and its digest then expires on **the
 window its customer chose** (D-425), which is also what repairs a D-418 promise whose SQL
