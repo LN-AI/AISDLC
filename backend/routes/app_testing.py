@@ -812,6 +812,13 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
                          "steps": len(recorded),
                          "target_label": session.get("target_label", ""),
                          "collect_page_text": bool(session.get("collect_page_text", 1)),
+                         # Every line this session actually saw, so the locator audit can
+                         # tell a heading that was observed from one that was remembered
+                         # (D-430). Assembled here because this is the only layer holding
+                         # the raw steps; the orchestrator sees the markdown, which has
+                         # already been capped per step.
+                         "observed_texts": [t for step in recorded
+                                            for t in (step.get("page_texts") or [])],
                          # Re-resolved from what the session recorded, rather than carried in
                          # memory: a session is a conversation spread over minutes and the
                          # process that generates may not be the one that opened it.

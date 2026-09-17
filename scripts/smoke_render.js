@@ -3825,6 +3825,37 @@ check('...and says when a second attempt was made and thrown away', () => {
          'the money was spent on a second generation and the reader was not told');
 });
 
+check('tests that would not notice a break are named on the screen', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    assertion_strength_note: 'Of 20 test(s), 3 assert only that something is present, '
+      + 'visible or that the address changed. A test of that kind passes against an '
+      + 'application whose feature is completely broken.',
+    assertion_audit: { tests_total: 20, hollow_count: 3, silent_count: 0, skipped_count: 0,
+      strong_count: 17,
+      hollow: [{ path: 'tests/cart.spec.ts', name: 'cart_badge_is_visible', line: 12,
+                 weak: 2, expects: 2 }],
+      silent: [], skipped: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('would not notice a break'), 'the panel is missing');
+  assert(html.includes('cart_badge_is_visible'), 'it did not name the test');
+  assert(html.includes('tests/cart.spec.ts') && html.includes('12'),
+         'it did not say where to look');
+  assert(html.includes('completely broken'),
+         'without this the reader treats a hollow test as coverage');
+});
+
+check('...and a suite where every test can fail says so', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    assertion_audit: { tests_total: 9, hollow_count: 0, silent_count: 0, skipped_count: 0,
+                       strong_count: 9, hollow: [], silent: [], skipped: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Every one of the 9'),
+         'blank when nothing is wrong looks identical to blank when nobody checked');
+  assert(!html.includes('would not notice a break'), 'it warned about a healthy suite');
+});
+
 check('the two test screens no longer mint the same element ids', () => {
   sandbox.renderTestAutomation('test-automation-result', copy());
   const a = document.getElementById('test-automation-result').innerHTML;

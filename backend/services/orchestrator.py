@@ -26,7 +26,7 @@ from backend.agents.qa_intelligence.test_automation_agent import TestAutomationA
 from backend.agents.qa_intelligence.app_explorer_agent import AppExplorerAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
-from backend.services import cost_optimization_service, locator_audit
+from backend.services import assertion_audit, cost_optimization_service, locator_audit
 from backend import config, database
 from backend.workflows import shared as workflow_shared
 from backend.workflows import autofix_pr as autofix_pr_workflow
@@ -1124,7 +1124,8 @@ class SDLCOrchestrator:
         # application. Both failures are invisible to a reader holding only the suite, and
         # this one is worse in one specific way: it fails against a *correct* build, so the
         # reader's first conclusion is that their application is broken.
-        locators = locator_audit.audit(files)
+        locators = locator_audit.audit(
+            files, observed_texts=(session or {}).get("observed_texts"))
         result["locator_audit"] = locators
         result["locators_grounded"] = locators["grounded"]
         result["locators_invented"] = locators["invented_count"]
@@ -1134,6 +1135,20 @@ class SDLCOrchestrator:
             logger.warning(
                 "app-testing: suite kept %d locator(s) the session never observed (%s)",
                 locators["invented_count"], locators["kinds"])
+
+        # How much each test can *see*, which is a different question from whether it works.
+        # A suite of "the button is visible" is green on an application whose feature is
+        # entirely broken, so it is worse than a missing test: a missing test shows up in the
+        # coverage table and this one looks like coverage. Counted from the code rather than
+        # from the model's own `what_it_checks` sentence, because that sentence is a claim
+        # about its own output and D-406 says a claim is not evidence — a `toBeVisible` can
+        # be described as "the total updates correctly" at no cost.
+        assertions = assertion_audit.audit(files)
+        result["assertion_audit"] = assertions
+        result["hollow_test_count"] = assertions["hollow_count"]
+        assertion_note = assertion_audit.summary_sentence(assertions)
+        if assertion_note:
+            result["assertion_strength_note"] = assertion_note
 
         # Whether this suite could see values at all, stated on the result rather than left
         # to be inferred from its contents. A customer who turned page text off gets a suite

@@ -3681,6 +3681,42 @@ async function previewAppTestingCost() {
  *
  * Reads in both directions, like the withheld panel. A suite with none of these says so,
  * because "we checked and there are none" and "nobody checked" look identical otherwise. */
+/* How much each test can see. Reads beside the locator panel and answers the other half
+ * of the same question: that one asks whether a test will cry wolf, this one asks whether
+ * it would notice anything at all.
+ *
+ * Worth a panel rather than a number because of what it does to the coverage table above
+ * it. A test that only asserts a control is visible still gets counted, still gets filed
+ * under a requirement, and still reads as "covered" — so a suite can report 15 of 15 while
+ * several of those fifteen would pass against an application with the feature ripped out.
+ * Naming them is the only way a reader can tell the difference. */
+function _appAssertionPanel(r) {
+  const a = (r && r.assertion_audit) || null;
+  if (!a || !a.tests_total) return '';
+  const weak = (a.hollow_count || 0) + (a.silent_count || 0) + (a.skipped_count || 0);
+  if (!weak) {
+    return `<p class="field-hint" style="margin-top:14px">Every one of the ${a.tests_total}
+      test(s) here makes at least one assertion that could be wrong — a value, a count, a
+      status or an absence. None of them is a presence check standing in for a test.</p>`;
+  }
+  const rows = [].concat(
+    (a.hollow || []).map(t => Object.assign({ why: 'only checks presence or the address' }, t)),
+    (a.silent || []).map(t => Object.assign({ why: 'makes no assertion at all' }, t)),
+    (a.skipped || []).map(t => Object.assign({ why: 'skipped' }, t)));
+  return `
+    <div class="section-title" style="margin-top:20px">Tests that would not notice a break (${weak} of ${a.tests_total})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${esc(r.assertion_strength_note || '')}</p>
+    ${rows.length ? `<table class="data-table">
+      <thead><tr><th>Test</th><th>File</th><th>Line</th><th>Why</th></tr></thead>
+      <tbody>${rows.map(t => `<tr>
+        <td style="font-family:monospace;font-size:11px">${esc(t.name || '')}</td>
+        <td style="font-family:monospace;font-size:11px">${esc(t.path || '')}</td>
+        <td>${esc(String(t.line || ''))}</td>
+        <td>${esc(t.why)}</td>
+      </tr>`).join('')}</tbody>
+    </table>` : ''}`;
+}
+
 function _appLocatorPanel(r) {
   const invented = (r && r.locators_invented) || 0;
   const grounded = (r && r.locators_grounded) || 0;
@@ -3816,6 +3852,7 @@ function renderAppTesting(targetId, r) {
       Treat those as observed.</p>` : ''}
 
     ${_appLocatorPanel(r)}
+    ${_appAssertionPanel(r)}
 
     ${assumptions.length ? `
     <div class="section-title" style="margin-top:20px">⚠ What it had to assume (${assumptions.length})</div>

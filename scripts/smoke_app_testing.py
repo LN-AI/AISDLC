@@ -1571,6 +1571,100 @@ def main_():
           "Read the labels rather than the order" in agent_src,
           "the model has to know which of the two values an assertion wants")
 
+    # ── 23. Whether a test could ever fail, and whether a name was real ──
+    section("23. A test that cannot fail is named, and so is a heading nobody saw")
+    from backend.services import assertion_audit
+
+    suite_code = "\n".join([
+        "import { test, expect } from '@playwright/test';",
+        "test('badge_is_visible', async ({ page }) => {",
+        "  await expect(page.getByRole('button', { name: 'Cart' })).toBeVisible();",
+        "  await expect(page).toHaveURL(/inventory/);",
+        "});",
+        "test('total_is_right', async ({ page }) => {",
+        "  await expect(page.getByRole('status')).toHaveText('GBP 8.00');",
+        "});",
+        "test('save_is_refused', async ({ page }) => {",
+        "  await expect(page.getByRole('button', { name: 'Save' })).toHaveCount(0);",
+        "});",
+        "test('clicks_and_checks_nothing', async ({ page }) => {",
+        "  await page.getByRole('button', { name: 'Go' }).click();",
+        "});",
+        "test.skip('later', async ({ page }) => {",
+        "  await expect(page.getByText('x')).toHaveText('x');",
+        "});",
+    ])
+    rep = assertion_audit.audit([{"path": "tests/a.spec.ts", "content": suite_code}])
+
+    check("every test in the file is counted", rep["tests_total"] == 5, rep["tests_total"])
+    check("a test that only checks presence and the address is named",
+          [t["name"] for t in rep["hollow"]] == ["badge_is_visible"], rep["hollow"])
+    check("...and a test asserting a value is not",
+          all(t["name"] != "total_is_right" for t in rep["hollow"]), rep["hollow"])
+    check("asserting an absence counts as a real assertion",
+          all(t["name"] != "save_is_refused" for t in rep["hollow"]),
+          "toHaveCount(0) is the form the prompt teaches for 'must not be offered'; "
+          "calling it hollow would punish the one honest way to write a negative test")
+    check("a test with no assertion at all is reported separately",
+          [t["name"] for t in rep["silent"]] == ["clicks_and_checks_nothing"], rep["silent"])
+    check("a skipped test is neither hollow nor silent, it is skipped",
+          rep["skipped_count"] == 1 and rep["hollow_count"] == 1
+          and rep["silent_count"] == 1,
+          (rep["skipped_count"], rep["hollow_count"], rep["silent_count"]))
+
+    sentence = assertion_audit.summary_sentence(rep)
+    check("the sentence says what a weak test costs the reader",
+          "passes against an application whose feature is completely broken" in sentence,
+          sentence[:200])
+    check("...and reads as grammar rather than as counters",
+          "1 asserts only" in sentence and "1 is skipped" in sentence, sentence[:200])
+    check("a suite where every test can fail says so rather than staying blank",
+          assertion_audit.summary_sentence(assertion_audit.audit(
+              [{"path": "b", "content": "test('x', async () => "
+                                        "{ await expect(a).toHaveText('1'); });"}])) == "",
+          "silence when nothing is wrong and silence when nobody looked are the same sight")
+
+    # The check the shape of a locator alone cannot make: a name that was never on any page.
+    # This is D-430's failure exactly -- a sign-in helper waiting for a heading called
+    # 'Products' on a page with no headings at all -- and it took a whole suite with it.
+    helper = "\n".join([
+        "async function signIn(page) {",
+        "  await page.getByRole('button', { name: 'Login' }).click();",
+        "  await expect(page.getByRole('heading', { name: 'Products' })).toBeVisible();",
+        "}",
+        "test('overview', async ({ page }) => {",
+        "  await expect(page.getByRole('heading', { name: 'Checkout: Overview' }))"
+        ".toBeVisible();",
+        "});",
+    ])
+    hfiles = [{"path": "tests/login.spec.ts", "content": helper}]
+    observed = ["heading: Checkout: Overview", "text: $29.99", "status: Total 55.97"]
+
+    blind = locator_audit.audit(hfiles)
+    check("shape alone cannot see an invented heading",
+          blind["invented_count"] == 0,
+          "getByRole looks grounded whatever name is inside it: %s" % blind["kinds"])
+
+    seeing = locator_audit.audit(hfiles, observed_texts=observed)
+    check("...but a heading the session never collected is caught",
+          [r["kind"] for r in seeing["invented"]] == ["unseen-name"], seeing["invented"])
+    check("...and named with the line to open",
+          seeing["invented"][0]["line"] == 3 and "Products" in seeing["invented"][0]["selector"],
+          seeing["invented"])
+    check("a heading that WAS collected stays grounded",
+          all("Checkout" not in r["selector"] for r in seeing["invented"]),
+          "flagging a correct locator is the failure this check must not have")
+
+    check("a session that collected no text turns the check off entirely",
+          locator_audit.audit(hfiles, observed_texts=[])["invented_count"] == 0,
+          "'nothing was observed' would otherwise make every name look invented, which is "
+          "how a checker earns being switched off")
+
+    app_js_now = (ROOT / "frontend" / "app.js").read_text(encoding="utf-8")
+    check("the screen shows which tests would not notice a break",
+          "_appAssertionPanel" in app_js_now,
+          "a count nobody renders is a count nobody reads")
+
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)

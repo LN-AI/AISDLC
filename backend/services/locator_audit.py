@@ -103,7 +103,7 @@ _ATTR_RE = re.compile(r"\[\s*([A-Za-z_:][\w:.-]*)\s*(?:[~^|*$]?=|\])")
 _ENGINES = ("xpath=", "css=", "text=", "id=", "data-testid=", "role=", "internal:")
 
 # Read by the reporting side so a sentence does not have to re-derive the vocabulary.
-KINDS = ("class", "id", "testid", "attribute", "xpath")
+KINDS = ("class", "id", "testid", "attribute", "xpath", "unseen-name")
 
 
 def classify_selector(selector: str) -> str:
@@ -190,8 +190,35 @@ def audit_content(content: str, path: str = "") -> Dict[str, Any]:
     return {"grounded": grounded, "generic": generic, "invented": invented}
 
 
-def audit(files) -> Dict[str, Any]:
+# `getByRole('heading', { name: 'Products' })` -- the exact shape that cost two live suites
+# every test they had (D-430). A heading is the one landmark the collector *always* gathers
+# (D-431's LANDMARK list is `h1`-`h6` plus the live regions), so if a heading name was never
+# collected, the page did not have it, and this locator matches nothing.
+_HEADING_RE = re.compile(
+    r"getByRole\s*\(\s*['\"`]heading['\"`]\s*,\s*\{[^}]*?name\s*:\s*['\"`](.*?)['\"`]",
+    re.S)
+
+
+def _normalise(text: str) -> str:
+    """Whitespace-collapsed and case-folded, so 'Sign In' and 'sign  in' are one name."""
+    return " ".join(str(text or "").split()).casefold()
+
+
+def audit(files, observed_texts=None) -> Dict[str, Any]:
     """Audit a whole `test_files` array.
+
+    `observed_texts` is every line of page text the session actually collected. Supplying it
+    turns on the one check that shape alone cannot make -- a locator that *looks* grounded
+    because it uses `getByRole`, and names something that was never on any page. That is not
+    a hypothetical: it is D-430's failure exactly, a sign-in helper waiting for a heading
+    called "Products" on a page that has no headings at all, and it took a whole suite down
+    with it. Left off when the session collected no text, because "nothing was observed"
+    would otherwise make every name look invented.
+
+    Deliberately limited to headings. A heading is always collected when present, so its
+    absence is real evidence; a button name or a fragment of body text can be missing from
+    the digest for a dozen innocent reasons -- the cap, the leaf rule, a later page -- and
+    flagging those would produce exactly the false alarms this module exists to prevent.
 
     Returns the two counts a reader needs and the offending lines, capped. Rows that are not
     objects are ignored rather than coerced -- the orchestrator has already dropped them
@@ -200,13 +227,44 @@ def audit(files) -> Dict[str, Any]:
     grounded = 0
     generic = 0
     invented: List[Dict[str, Any]] = []
+    seen_names = None
+    if observed_texts:
+        seen_names = set()
+        for line in observed_texts:
+            raw = str(line or "")
+            # Lines arrive prefixed with how to address them -- `heading: Checkout`. Both
+            # halves are kept: the prefix is this module's business, but a suite may quote
+            # either form and a false alarm here is worse than a missed one.
+            seen_names.add(_normalise(raw))
+            if ":" in raw:
+                seen_names.add(_normalise(raw.split(":", 1)[1]))
+
     for entry in (files if isinstance(files, list) else []):
         if not isinstance(entry, dict):
             continue
-        one = audit_content(entry.get("content") or "", str(entry.get("path") or ""))
+        content = entry.get("content") or ""
+        path = str(entry.get("path") or "")
+        one = audit_content(content, path)
         grounded += one["grounded"]
         generic += one["generic"]
         invented.extend(one["invented"])
+
+        if seen_names is not None:
+            for match in _HEADING_RE.finditer(content):
+                name = _normalise(match.group(1))
+                if not name:
+                    continue
+                # A substring match counts as seen: a collected line may carry more than the
+                # heading alone, and demanding equality would flag a correct locator.
+                if any(name in seen for seen in seen_names):
+                    continue
+                grounded -= 1          # it was counted as grounded a moment ago
+                invented.append({
+                    "path": path,
+                    "line": content.count("\n", 0, match.start()) + 1,
+                    "selector": "getByRole('heading', { name: '%s' })" % match.group(1)[:60],
+                    "kind": "unseen-name",
+                })
 
     kinds: Dict[str, int] = {}
     for row in invented:
