@@ -194,6 +194,18 @@ def audit_content(content: str, path: str = "") -> Dict[str, Any]:
 # every test they had (D-430). A heading is the one landmark the collector *always* gathers
 # (D-431's LANDMARK list is `h1`-`h6` plus the live regions), so if a heading name was never
 # collected, the page did not have it, and this locator matches nothing.
+# An assertion that something is **not** there. A name asserted absent was never observed --
+# that is the entire claim -- so demanding it appear in the session's text would flag the one
+# honest way to write a negative requirement. `toHaveCount(0)` is the form the suite prompt
+# itself teaches for "must not be offered", and the first version of this check flagged it:
+# two of three `task-ownership` sessions in the 2026-09-17 baseline, on suites that passed
+# 8 of 8 against the working application.
+_ABSENCE_RE = re.compile(
+    # Whatever closes the locator expression -- ` }))`, `)`, `] )` -- then the matcher.
+    r"[\s)}\],]*\.\s*(?:toHaveCount\s*\(\s*0\s*\)"
+    r"|toBeHidden\b"
+    r"|not\s*\.\s*(?:toBeVisible|toBeAttached|toHaveText|toContainText)\b)")
+
 _HEADING_RE = re.compile(
     r"getByRole\s*\(\s*['\"`]heading['\"`]\s*,\s*\{[^}]*?name\s*:\s*['\"`](.*?)['\"`]",
     re.S)
@@ -253,6 +265,9 @@ def audit(files, observed_texts=None) -> Dict[str, Any]:
             for match in _HEADING_RE.finditer(content):
                 name = _normalise(match.group(1))
                 if not name:
+                    continue
+                # Asserted absent? Then not having seen it is the point, not a mistake.
+                if _ABSENCE_RE.match(content, match.end(), match.end() + 90):
                     continue
                 # A substring match counts as seen: a collected line may carry more than the
                 # heading alone, and demanding equality would flag a correct locator.

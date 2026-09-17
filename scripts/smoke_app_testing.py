@@ -1696,6 +1696,30 @@ def main_():
           all("Checkout" not in r["selector"] for r in seeing["invented"]),
           "flagging a correct locator is the failure this check must not have")
 
+    # A heading asserted **absent** was never observed -- that is the claim, not a mistake.
+    # `toHaveCount(0)` is the form the suite prompt teaches for "must not be offered", and the
+    # first version of this check flagged it: two of three `task-ownership` sessions in the
+    # 2026-09-17 baseline, on suites that passed 8 of 8 against the working application. A
+    # checker that punishes the one honest way to write a negative test earns its own removal.
+    for _neg, _how in (
+            ("await expect(page.getByRole('heading', { name: 'Edit this' })).toHaveCount(0);",
+             "toHaveCount(0)"),
+            ("await expect(page.getByRole('heading', { name: 'Edit this' })).not.toBeVisible();",
+             "not.toBeVisible"),
+            ("await expect(page.getByRole('heading', { name: 'Edit this' })).toBeHidden();",
+             "toBeHidden")):
+        check("a heading asserted absent is not called invented (%s)" % _how,
+              locator_audit.audit([{"path": "n.ts", "content": _neg}],
+                                  observed_texts=["heading: All tasks"])["invented_count"] == 0,
+              "never having seen it is the whole point of the assertion")
+    check("...while one asserted present and never seen still is",
+          locator_audit.audit(
+              [{"path": "n.ts",
+                "content": "await expect(page.getByRole('heading', "
+                           "{ name: 'Products' })).toBeVisible();"}],
+              observed_texts=["heading: All tasks"])["invented_count"] == 1,
+          "exempting absence must not exempt everything")
+
     check("a session that collected no text turns the check off entirely",
           locator_audit.audit(hfiles, observed_texts=[])["invented_count"] == 0,
           "'nothing was observed' would otherwise make every name look invented, which is "

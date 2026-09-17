@@ -326,15 +326,15 @@ page that is wrong. Still a count and not a percentage (C-95), and note what non
 measures: all three are ordinary semantic HTML, so the collector work in D-414 has the
 fixture and a live run as its only evidence (C-97).
 
-**The measured baseline is 8 of 9, and the headline number is the least informative part
-of it.** 2026-09-17, PROMPT_VERSION 2026-09-17.2, three cases x three runs: `discriminates`
-**8/9** at **$0.135 a session**, every session producing a suite and every case seeing the
-break. The previous measurement was 9 of 9 at $0.131 (2026-09-16) and the one before that 8
-of 9 at $0.144, all on `basket-total` — the only client-rendered case, now measured at 2 of
-3 twice and 3 of 3 once. Read that as a case sitting near two-thirds to three-thirds rather
-than as a plateau we fell off, and read the rest of the run instead: tests that **separate
-the builds** went from 7-9 to **8-12**, and a session that was red **eight times against the
-working application** is now red once. That session is what found D-434 in the first place.
+**The measured baseline is 9 of 9, and the headline number is the least informative part
+of it.** 2026-09-17, PROMPT_VERSION 2026-09-17.3, three cases x three runs: `discriminates`
+**9/9** at **$0.135 a session**, every session producing a suite, every case seeing the
+break, and no test failing on the working application. It reached 8 of 9 twice earlier the same day, and every one of those misses was
+`basket-total` — the only client-rendered case, now measured 3/3, 2/3, 2/3, 3/3 across four
+runs. Read it as a case living around two-thirds to three-thirds rather than as one that has
+been fixed. The runs that scored lower are the ones that earned the day: the first found
+D-434, where a single session had **all eight** of its failing assertions wrong by exactly one
+step, and the second still carried one noisy test.
 **The denominator is every session attempted**, deliberately: counting only the sessions that
 produced something is the scoreboard committing the flattering-number error the eval exists
 to catch — and a single test failing on the good build is enough to lose the case, which is
