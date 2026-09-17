@@ -292,17 +292,19 @@ page that is wrong. Still a count and not a percentage (C-95), and note what non
 measures: all three are ordinary semantic HTML, so the collector work in D-414 has the
 fixture and a live run as its only evidence (C-97).
 
-**The measured baseline is 9 of 9, and how it got there matters more than the number.**
-2026-09-16, PROMPT_VERSION 2026-09-16.1, three cases x three runs: `discriminates` **9/9** at
-**$0.131 a session**, with **no test failing on the working application in any session**.
-The previous measurement was 8 of 9 at $0.144 (2026-09-15), and the three changes between
-them all came from live runs against public applications rather than from tuning: D-427, a
-submit button named by its `value` rather than its `name` attribute, which had left two real
-suites unable to run a single test; D-430, the suite writer being told what each action
-actually did instead of what the one before it did; and D-431, page text collected from the
-element that renders the words. **The denominator is every session attempted**, deliberately:
-counting only the sessions that produced something is the scoreboard committing the
-flattering-number error the eval exists to catch.
+**The measured baseline is 8 of 9, and the headline number is the least informative part
+of it.** 2026-09-17, PROMPT_VERSION 2026-09-17.2, three cases x three runs: `discriminates`
+**8/9** at **$0.135 a session**, every session producing a suite and every case seeing the
+break. The previous measurement was 9 of 9 at $0.131 (2026-09-16) and the one before that 8
+of 9 at $0.144, all on `basket-total` — the only client-rendered case, now measured at 2 of
+3 twice and 3 of 3 once. Read that as a case sitting near two-thirds to three-thirds rather
+than as a plateau we fell off, and read the rest of the run instead: tests that **separate
+the builds** went from 7-9 to **8-12**, and a session that was red **eight times against the
+working application** is now red once. That session is what found D-434 in the first place.
+**The denominator is every session attempted**, deliberately: counting only the sessions that
+produced something is the scoreboard committing the flattering-number error the eval exists
+to catch — and a single test failing on the good build is enough to lose the case, which is
+the strictness this measure is for.
 
 **The step counts are the part to read before assuming the collector made sessions dearer.**
 More page text makes a signature more sensitive, so the no-progress rule fires later and a
@@ -329,8 +331,9 @@ is a count and not a percentage (C-95); none of them exercises the collector tho
 depend on (C-97), which is exactly why D-427 and D-431 were found by a live run and not here;
 and a live run with no requirement supplied still produced a suite that was nine-tenths "the
 button is visible", which is C-66 wearing a new hat and is why `_HOLLOW` in the eval was
-widened. Three findings from those live runs are open: C-100 and C-101 name what the collector
-and the locator audit still cannot see, and C-102 is the customer's call rather than ours.
+widened. Four findings from those live runs are open: C-100 and C-101 name what the collector and
+the locator audit still cannot see, C-103 is the same mistake as C-101 aimed at a value
+instead of a selector, and C-102 is the customer's call rather than ours.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

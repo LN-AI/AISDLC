@@ -113,38 +113,51 @@ PROMPT_VERSION = "2026-09-17.2"
 # which is where they already were, so the 2026-09-16 measurement moving every case to
 # 3/3 does not move them. Raising them to 1.0 would fail the suite on a single flake.
 #
-# **Measured 2026-09-16, PROMPT_VERSION 2026-09-16.1, 9 sessions (3 per case), $1.1828
-# total and $0.131 a session.** `discriminates` **9 of 9**, and **no test failed on the
-# working application in any session** — every case ran, produced a suite, and separated
-# the builds.
+# **Measured 2026-09-17, PROMPT_VERSION 2026-09-17.2, 9 sessions (3 per case), $1.2162
+# total and $0.135 a session.** `discriminates` **8 of 9**. Every session ran and produced
+# a suite, and every case saw the break it was given.
 #
-#   basket-total     3/3 -- 9-10 steps, 1 journey, 10-11 tests, 7-9 of them separating,
-#                    9-10 controls withheld
-#   signup-wizard    3/3 -- 7 steps, 1 journey, 3-5 tests, 2-3 separating. Was 2/3; the
-#                    miss was a generation returning a confident summary and an empty
-#                    `test_files` (D-421), and the retry added afterwards is what closed it
-#   task-ownership   3/3 -- 8-11 steps, 3-4 journeys, 6-7 tests, 2-3 separating
+#   basket-total     2/3 -- 10-11 steps, 1 journey, 10-14 tests, 8-12 of them separating,
+#                    10-11 controls withheld. The miss is one test of ten going red on the
+#                    working build; see the note below, because it is not what it looks like
+#   signup-wizard    3/3 -- 7 steps, 1 journey, 4-6 tests, 3-4 separating
+#   task-ownership   3/3 -- 8 steps, 2-3 journeys, 8-9 tests, 3-4 separating
 #
-# Previous measurement, 2026-09-15, PROMPT_VERSION 2026-09-15.3: **8 of 9** at **$0.144 a
-# session**. Three changes sit between them, all forced by live runs against public
-# applications rather than by tuning:
+# **This is a lower number than the 9/9 measured on 2026-09-16, and reading it as a
+# regression would be the wrong lesson.** `basket-total` has now measured 2 of 3 twice in a
+# row against 3 of 3 once, which is three measurements of n=3 on the only client-rendered
+# case -- the honest reading is that it sits somewhere near two-thirds to three-thirds and
+# the 9/9 was the top of that range rather than a plateau. What the same two runs show
+# underneath the headline is not ambiguous at all:
 #
-#   D-427  a submit button is named by its `value`, not its `name` attribute. Two live
-#          suites could not run a single test because of this; invisible to this corpus,
-#          where every control is a semantic `<button>`.
-#   D-430  the suite writer is told what each action *did*, taken from the step that
-#          reported it. It was being told that clicking Sign In left the page it was on.
-#   D-431  page text is collected from the element that renders the words rather than from
-#          whatever carries an `id`.
+#                              2026-09-16   2026-09-17 (a)   2026-09-17 (b)
+#   tests separating builds     7-9          0 / 6 / 7        8 / 12 / 10
+#   red on the WORKING build    0            8 / 0 / 0        1 / 0 / 0
+#   saw the break               3/3          2/3              3/3
 #
-# **Read the step counts before concluding the collector made sessions more expensive.**
-# The worry going in was the opposite of what happened: more page text makes a page
-# signature more sensitive, so the no-progress rule fires later and a session should run
-# longer. `basket-total` did drift up, 7-8 steps to 9-10. But `task-ownership` fell from
-# **14-25 steps to 8-11** -- an explorer that can read the page stops wandering to find out
-# what is on it -- and that is most of why the per-session price went *down* while the
-# suites got bigger: `basket-total` now writes 10-11 tests where it wrote 7-8, and 7-9 of
-# them separate the builds where 5-7 did.
+# Run (a) is the same code as 2026-09-16 plus D-433, and it is the run that **found**
+# D-434: one session read the page text as the state *after* each action when it was the
+# state before, and every one of its eight failing assertions was wrong by exactly one
+# step. Run (b) is after that fix. A suite that separated nothing and was red eight times
+# against a correct application now catches eight of the injected failures. That is the
+# change worth reading; the case count moved by one because a single noisy test is enough
+# to lose `green_on_fixed`, which is the strictness this measure is for.
+#
+# The one test still failing is a *different* fault and is recorded as C-103: the model
+# computed "3 -> 2 -> 1, so 1 x GBP 4.00 = GBP 4.00" correctly in its own comment and then
+# overrode itself with GBP 8.00, a total the session had displayed at a different quantity.
+# A recalled value rather than a recalled selector -- C-101's shape, one noun over.
+#
+# Previous measurements:
+#   2026-09-16, 2026-09-16.1: 9 of 9 at $0.131 a session.
+#   2026-09-15, 2026-09-15.3: 8 of 9 at $0.144 a session.
+#
+# **Invented locators are now counted per session** (D-433) and every one of these nine
+# reported **zero**. Read that as the null result it is rather than as a pass: all three
+# cases are bespoke fixtures the model has no memory of, so it has nothing to recall here
+# and the honest expectation was zero either way (C-101). The measurement that meant
+# something was a live run against a famous application the same day -- 19 invented
+# locators before the change and 0 after, on 135 observed.
 #
 # The denominator is every session **attempted**, which is why this reads 8 of 9 rather than
 # the 8 of 8 a "produced a suite" denominator would give. A session that returns nothing has
