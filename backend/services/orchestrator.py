@@ -985,6 +985,7 @@ class SDLCOrchestrator:
             requirement=requirement,
             target_label=target_label,
             context=context,
+            observed_locators=(session or {}).get("observed_locators"),
             llm_override=llm_override,
         )
 
@@ -1125,7 +1126,9 @@ class SDLCOrchestrator:
         # this one is worse in one specific way: it fails against a *correct* build, so the
         # reader's first conclusion is that their application is broken.
         locators = locator_audit.audit(
-            files, observed_texts=(session or {}).get("observed_texts"))
+            files,
+            observed_texts=(session or {}).get("observed_texts"),
+            observed_locators=(session or {}).get("observed_locators"))
         result["locator_audit"] = locators
         result["locators_grounded"] = locators["grounded"]
         result["locators_invented"] = locators["invented_count"]

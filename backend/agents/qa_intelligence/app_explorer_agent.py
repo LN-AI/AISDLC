@@ -560,6 +560,7 @@ class AppExplorerAgent(BaseAgent):
         brief_markdown: str = "",
         target_label: str = "",
         context: str = "",
+        observed_locators: Optional[List[Dict[str, Any]]] = None,
         llm_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """One call at the end of a session. The large half.
@@ -681,7 +682,15 @@ class AppExplorerAgent(BaseAgent):
         # That is deliberate: a suite with a known invented locator, labelled, is more useful
         # than no suite, and `locator_audit.summary_sentence` tells the reader to suspect the
         # test before the application.
-        audit = locator_audit.audit((result or {}).get("test_files"))
+        # Audited **against what the session was told**, not only against shape. A suite can
+        # be written entirely in `getByRole` -- the canonical grounded form -- and still
+        # address nothing, which is not a hypothetical: a live ParaBank suite scored "88
+        # observed, 0 invented" on this check and failed 16 of 16, because the login fields
+        # are named by their `name` attribute and the record had offered
+        # `locator("input[name='username']")` for them. This is the one case where a retry is
+        # almost certain to help, since the correct locator is already in the prompt.
+        audit = locator_audit.audit((result or {}).get("test_files"),
+                                    observed_locators=observed_locators)
         if audit["invented_count"] and not result.get("generation_retried"):
             logger.warning(
                 "App suite generation used %d locator(s) that were never observed (%s); "
@@ -694,7 +703,8 @@ class AppExplorerAgent(BaseAgent):
             )
             result["locators_retried"] = True
             if _has_files(cleaner):
-                second = locator_audit.audit(cleaner.get("test_files"))
+                second = locator_audit.audit(cleaner.get("test_files"),
+                                             observed_locators=observed_locators)
                 kept_files = _file_count(cleaner) >= _file_count(result)
                 kept_tests = _test_count(cleaner) >= _test_count(result)
                 if second["invented_count"] < audit["invented_count"] and kept_files \

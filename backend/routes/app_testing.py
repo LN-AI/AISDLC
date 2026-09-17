@@ -914,6 +914,15 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
                          # already been capped per step.
                          "observed_texts": [t for step in recorded
                                             for t in (step.get("page_texts") or [])],
+                         # How the session was told to address each thing it acted on. A
+                         # suite that writes `getByRole` where the record said
+                         # `locator("input[name=...]")` is using the right *kind* of locator
+                         # and still addressing nothing, which cost a live suite all sixteen
+                         # of its tests.
+                         "observed_locators": [
+                             {"name": (step.get("action") or {}).get("target_name") or "",
+                              "locator": (step.get("action") or {}).get("locator") or ""}
+                             for step in recorded],
                          # Re-resolved from what the session recorded, rather than carried in
                          # memory: a session is a conversation spread over minutes and the
                          # process that generates may not be the one that opened it.

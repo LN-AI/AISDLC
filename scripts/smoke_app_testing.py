@@ -1720,6 +1720,38 @@ def main_():
               observed_texts=["heading: All tasks"])["invented_count"] == 1,
           "exempting absence must not exempt everything")
 
+    # **The failure that shape alone cannot see**, and the one that cost the most.
+    #
+    # A live ParaBank suite was written entirely in `getByRole` -- the canonical grounded
+    # form -- scored "88 observed, 0 invented", and failed **16 of 16**: the login fields are
+    # named by their `name` attribute, so the record offered
+    # `locator("input[name='username']")` and `getByRole('textbox', { name: 'username' })`
+    # resolves to nothing. The sign-in helper timed out and took every test with it.
+    _told = [{"name": "username", "locator": "locator(\"input[name='username']\")"},
+             {"name": "Log In", "locator": "getByRole('button', { name: 'Log In' })"}]
+    _helper = "\n".join((
+        "await page.getByRole('textbox', { name: 'username' }).fill('john');",
+        "await page.getByRole('button', { name: 'Log In' }).click();"))
+    _files = [{"path": "tests/log-in.spec.ts", "content": _helper}]
+
+    check("shape alone calls a suite that addresses nothing perfectly grounded",
+          locator_audit.audit(_files)["invented_count"] == 0,
+          "getByRole is the canonical grounded form whatever name is inside it")
+    _seen = locator_audit.audit(_files, observed_locators=_told)
+    check("...but a locator contradicting the record is caught",
+          [r["kind"] for r in _seen["invented"]] == ["contradicts-record"], _seen["invented"])
+    check("...naming the element the session was told to address differently",
+          "username" in _seen["invented"][0]["selector"], _seen["invented"])
+    check("a locator that matches what the record offered is left alone",
+          _seen["invented_count"] == 1,
+          "the Log In button was offered as getByRole and used as getByRole; flagging it "
+          "would make this check the false alarm it exists to prevent")
+    check("with no record supplied the check stays off",
+          locator_audit.audit(_files, observed_locators=[])["invented_count"] == 0)
+    check("the retry tells the model the easy fix rather than only the diagnosis",
+          "use the locator the record gives for it" in locator_audit.retry_note(_seen),
+          locator_audit.retry_note(_seen)[:200])
+
     check("a session that collected no text turns the check off entirely",
           locator_audit.audit(hfiles, observed_texts=[])["invented_count"] == 0,
           "'nothing was observed' would otherwise make every name look invented, which is "

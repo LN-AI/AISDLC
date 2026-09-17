@@ -103,7 +103,8 @@ _ATTR_RE = re.compile(r"\[\s*([A-Za-z_:][\w:.-]*)\s*(?:[~^|*$]?=|\])")
 _ENGINES = ("xpath=", "css=", "text=", "id=", "data-testid=", "role=", "internal:")
 
 # Read by the reporting side so a sentence does not have to re-derive the vocabulary.
-KINDS = ("class", "id", "testid", "attribute", "xpath", "unseen-name")
+KINDS = ("class", "id", "testid", "attribute", "xpath", "unseen-name",
+         "contradicts-record")
 
 
 def classify_selector(selector: str) -> str:
@@ -216,7 +217,14 @@ def _normalise(text: str) -> str:
     return " ".join(str(text or "").split()).casefold()
 
 
-def audit(files, observed_texts=None) -> Dict[str, Any]:
+# A role locator the suite wrote: `getByRole('textbox', { name: 'username' })`. Captured so
+# the name can be checked against how the session was actually told to address that element.
+_ROLE_RE = re.compile(
+    r"getByRole\s*\(\s*['\"`]([a-z]+)['\"`]\s*,\s*\{[^}]*?name\s*:\s*['\"`](.*?)['\"`]",
+    re.S)
+
+
+def audit(files, observed_texts=None, observed_locators=None) -> Dict[str, Any]:
     """Audit a whole `test_files` array.
 
     `observed_texts` is every line of page text the session actually collected. Supplying it
@@ -232,6 +240,21 @@ def audit(files, observed_texts=None) -> Dict[str, Any]:
     the digest for a dozen innocent reasons -- the cap, the leaf rule, a later page -- and
     flagging those would produce exactly the false alarms this module exists to prevent.
 
+    `observed_locators` maps an element's accessible name to **how the session was told to
+    address it**, and catches the failure that cost a live ParaBank suite every one of its
+    sixteen tests. The record offered `locator("input[name=\'username\']")` for the login
+    field, because its name comes from the `name` attribute and neither the accessibility
+    tree nor the rendered text carries it (D-427). The model wrote
+    `getByRole('textbox', { name: 'username' })` instead -- which resolves to **nothing** --
+    so the sign-in helper timed out and the whole suite failed on one line.
+
+    **Shape alone scores that suite as perfect**: `getByRole` is the canonical grounded form,
+    so the audit reported "88 observed, 0 invented" for a suite that was 0 of 16. A locator
+    can be the right *kind* and still contradict what the session was told, and only the
+    record can tell the difference. Limited to names the session actually acted on, because
+    those are the ones whose addressing is known first-hand -- and they are also the ones a
+    sign-in helper is built from, which is where this failure is fatal rather than annoying.
+
     Returns the two counts a reader needs and the offending lines, capped. Rows that are not
     objects are ignored rather than coerced -- the orchestrator has already dropped them
     (D-392), and this must not be the thing that raises on a malformed response.
@@ -239,6 +262,17 @@ def audit(files, observed_texts=None) -> Dict[str, Any]:
     grounded = 0
     generic = 0
     invented: List[Dict[str, Any]] = []
+
+    # name -> the locator the session was given for it, for names the session acted on.
+    told = {}
+    for row in (observed_locators or ()):
+        if not isinstance(row, dict):
+            continue
+        name = _normalise(row.get("name"))
+        locator = str(row.get("locator") or "")
+        if name and locator:
+            told.setdefault(name, locator)
+
     seen_names = None
     if observed_texts:
         seen_names = set()
@@ -260,6 +294,25 @@ def audit(files, observed_texts=None) -> Dict[str, Any]:
         grounded += one["grounded"]
         generic += one["generic"]
         invented.extend(one["invented"])
+
+        if told:
+            for match in _ROLE_RE.finditer(content):
+                name = _normalise(match.group(2))
+                offered = told.get(name)
+                # Only a direct contradiction counts: the session was told to use a raw
+                # attribute selector for this element and the suite used a role instead.
+                # Anything softer -- a name the session never acted on, a role that merely
+                # differs -- is the false alarm this module exists to avoid.
+                if not offered or not offered.startswith("locator("):
+                    continue
+                grounded -= 1
+                invented.append({
+                    "path": path,
+                    "line": content.count("\n", 0, match.start()) + 1,
+                    "selector": "getByRole('%s', { name: '%s' })"
+                                % (match.group(1), match.group(2)[:40]),
+                    "kind": "contradicts-record",
+                })
 
         if seen_names is not None:
             for match in _HEADING_RE.finditer(content):
@@ -338,7 +391,10 @@ def retry_note(report: Dict[str, Any], limit: int = 12) -> str:
         "You were given roles, accessible names, page text, and -- where neither of those "
         "resolves -- an explicit `locator(\"input[name='...']\")`. You were never given a "
         "class name, an id or a test id, so each of these came from memory of some other "
-        "application:\n\n"
+        "application. A line marked `contradicts-record` is a different mistake and the "
+        "easier one to fix: the record told you how to address that element and you used "
+        "something else, so **use the locator the record gives for it, exactly as "
+        "written**.\n\n"
         f"{listed}\n\n"
         "Write the suite again. Keep the tests, the assertions and the coverage you already "
         "have -- this is not a request for a smaller suite -- and replace each of these with "
