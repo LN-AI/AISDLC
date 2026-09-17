@@ -109,7 +109,39 @@ def free_port():
 # `querySelectorAll` would silently drift if the page mutated between reading and clicking.
 COLLECT_JS = r"""
 () => {
-  document.querySelectorAll('[data-lm-cand]').forEach(e => e.removeAttribute('data-lm-cand'));
+  // Every element under a root, **including the ones inside open shadow roots**.
+  //
+  // `document.querySelectorAll` stops at a shadow boundary, which is not an edge case on a
+  // modern application: Angular, Lit, Stencil and Salesforce build whole interfaces out of
+  // custom elements, and a page that keeps its controls in one used to come back looking
+  // like a page with no controls. Measured before this existed, on a four-control page with
+  // one plain button, one web component and one iframe: **1 of 4 offered, and none of the
+  // page text behind either boundary collected**, so a displayed total could not be
+  // asserted at all. The session did not fail -- it reported a small page, which is the
+  // dangerous half (C-104).
+  //
+  // Only *open* roots are reachable. A closed root is closed to Playwright too, so nothing
+  // is lost by not trying. Depth is bounded because a component tree can nest deeply and
+  // this runs on every step of every session.
+  const deepAll = (root, sel) => {
+    const out = [];
+    const walk = (node, depth) => {
+      if (depth > 12) return;
+      let found;
+      try { found = node.querySelectorAll(sel || '*'); } catch (e) { return; }
+      for (const el of found) out.push(el);
+      // Hosts are looked up separately from `found`: a host does not have to match `sel`
+      // itself for its contents to matter, and `<my-widget>` matches almost nothing.
+      let hosts;
+      try { hosts = node.querySelectorAll('*'); } catch (e) { return; }
+      for (const el of hosts) if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+    };
+    walk(root, 0);
+    return out;
+  };
+  window.__lmDeepAll = deepAll;
+
+  deepAll(document, '[data-lm-cand]').forEach(e => e.removeAttribute('data-lm-cand'));
   const SEL = 'a[href], button, input:not([type=hidden]), select, textarea, summary,' +
               '[role=button], [role=link], [role=tab], [role=checkbox], [role=switch], [role=menuitem]';
 
@@ -125,14 +157,14 @@ COLLECT_JS = r"""
   // signals that are actually observable: an inline handler, focusability, or a pointer
   // cursor. It is the same evidence a person uses, and an element that fails all three is
   // one a screen-reader user could not operate either.
-  document.querySelectorAll('[data-lm-outer]').forEach(e => e.removeAttribute('data-lm-outer'));
+  deepAll(document, '[data-lm-outer]').forEach(e => e.removeAttribute('data-lm-outer'));
   const clickable = [];
-  const semantic = new Set(document.querySelectorAll(SEL));
+  const semantic = new Set(deepAll(document, SEL));
   // Bounded scan. Detecting a pointer cursor needs `getComputedStyle` per element, so on a
   // page with tens of thousands of nodes an unbounded walk is a visible pause on every step
   // of every session. Cheap tests come first below for the same reason.
   let scanned = 0;
-  for (const el of document.querySelectorAll('body *')) {
+  for (const el of deepAll(document.body, '*')) {
     if (clickable.length >= MAXC || ++scanned > 8000) break;
     if (semantic.has(el)) continue;
     const tag = el.tagName.toLowerCase();
@@ -374,7 +406,30 @@ TEXTS_JS = r"""
 
   const out = [];
   const seen = new Set();
-  for (const el of document.querySelectorAll('body *')) {
+  // The same deep walk as the candidate collector (C-104): a total rendered inside a web
+  // component is exactly the value a suite most needs to assert, and it is invisible to a
+  // plain `querySelectorAll`.
+  //
+  // Defined again here rather than borrowed from `COLLECT_JS`, on purpose. Reaching for a
+  // global that another pass happened to leave behind would work until the day it did not,
+  // and the failure would be **silent** -- text collection quietly going shallow again on
+  // exactly the applications this was written for. A dozen duplicated lines is the cheaper
+  // side of that trade.
+  const deep = (root, sel) => {
+    const out = [];
+    const walk = (node, depth) => {
+      if (depth > 12) return;
+      let found;
+      try { found = node.querySelectorAll(sel || '*'); } catch (e) { return; }
+      for (const el of found) out.push(el);
+      let hosts;
+      try { hosts = node.querySelectorAll('*'); } catch (e) { return; }
+      for (const el of hosts) if (el.shadowRoot) walk(el.shadowRoot, depth + 1);
+    };
+    walk(root, 0);
+    return out;
+  };
+  for (const el of deep(document.body, '*')) {
     if (out.length >= MAXT) break;
     const tag = el.tagName.toLowerCase();
     if (SKIP.includes(tag)) continue;
@@ -446,7 +501,42 @@ def observe(page):
         # worse result than losing the session.
         texts = []
     path = urllib.parse.urlparse(page.url).path or "/"
+    _warn_about_frames(page, path)
     return path, (page.title() or ""), candidates, texts
+
+
+# Pages already reported on, so a session that returns to the checkout eight times says this
+# once rather than eight times.
+_FRAMES_REPORTED = set()
+
+
+def _warn_about_frames(page, path: str) -> int:
+    """Say when part of a page is in a frame this session cannot read. -> frame count.
+
+    Shadow roots are now walked into (C-104); frames are not, and the difference is that a
+    frame is a **separate document** with its own locator scope, so reaching into one is not
+    a selector change -- it is a change to what an address in this contract means, which the
+    platform and the driver would both have to agree on.
+
+    What is fixed here is the silence rather than the gap. A payment step, an embedded
+    legacy portal and a consent dialog are all ordinarily iframes, and until now a session
+    walked past one with no sign that anything was missing: the page simply looked like it
+    had fewer controls, the suite was written without them, and the run reported success.
+    An operator who is told "three controls here live in a frame I cannot see" can decide to
+    point the session at the frame's own address instead; an operator who is told nothing
+    cannot.
+    """
+    try:
+        frames = [f for f in page.frames if f != page.main_frame]
+    except Exception:
+        return 0
+    if not frames or path in _FRAMES_REPORTED:
+        return len(frames)
+    _FRAMES_REPORTED.add(path)
+    print(f"    note: {len(frames)} frame(s) on {path} are not read by this session. "
+          f"Anything inside them\n          is neither offered nor asserted. Explore a "
+          f"frame's own address directly if it matters.")
+    return len(frames)
 
 
 def candidate_payload(raw):
@@ -676,6 +766,33 @@ FIXTURE_PAGES = {
 <input type="submit">
 </form>
 """,
+    # A page built the way a modern front end builds one. Angular, Lit, Stencil and
+    # Salesforce all put the real interface inside custom elements, and a plain
+    # `querySelectorAll` stops dead at the boundary -- so before C-104 this page offered its
+    # one ordinary button and nothing else, reported no error, and looked small.
+    "widget.html": """<!doctype html><title>Modern</title>
+<h1>Modern App</h1>
+<button>Plain Button</button>
+<my-basket></my-basket>
+<iframe src="/list.html" title="Embedded" width="300" height="100"></iframe>
+<script>
+class MyBasket extends HTMLElement {
+  connectedCallback() {
+    this.attachShadow({mode: 'open'}).innerHTML =
+      '<h2>Basket</h2><p>Total: GBP 42.00</p>' +
+      '<button>Apply Coupon</button><input name="coupon">' +
+      '<my-inner></my-inner>';
+  }
+}
+class MyInner extends HTMLElement {
+  connectedCallback() {
+    this.attachShadow({mode: 'open'}).innerHTML = '<button>Nested Button</button>';
+  }
+}
+customElements.define('my-inner', MyInner);
+customElements.define('my-basket', MyBasket);
+</script>
+""",
     "list.html": """<!doctype html><title>Items</title>
 <h1>Items</h1><ul><li>Widget</li><li>Gadget</li></ul>
 <a href="/index.html">Home</a><button>Place order</button>
@@ -795,6 +912,52 @@ def fixture():
             # run together. Six product names and six prices -- exactly what the supplied
             # requirements were about -- were never sent, and the suite asserted them
             # anyway from selectors it recalled rather than observed.
+            # ── A page that keeps itself inside web components (C-104) ──────
+            # The applications most worth testing are the ones most likely to be built this
+            # way, and the failure was silent: one button offered, no error, a small suite,
+            # a successful-looking session. Measured before the fix on a page of this exact
+            # shape: 1 of 4 controls and none of the text behind the boundary.
+            page.goto(base + "/widget.html", wait_until="domcontentloaded")
+            _p5, _t5, raw5, texts5 = observe(page)
+            names5 = {c["name"] for c in raw5}
+
+            check("an ordinary control is still found", "Plain Button" in names5,
+                  sorted(names5))
+            check("a control inside an open shadow root is found",
+                  "Apply Coupon" in names5,
+                  "a plain querySelectorAll stops at the boundary: %s" % sorted(names5))
+            check("...and one nested a second shadow root deep",
+                  "Nested Button" in names5, sorted(names5))
+            check("an input inside a shadow root is found too",
+                  "coupon" in names5, sorted(names5))
+
+            # Resolution, not plausibility -- the same rule as the submit-button checks
+            # above. Playwright pierces open shadow roots, which is the property that makes
+            # this fixable at all: discovery was the gap, addressing was never broken.
+            for _nm in ("Apply Coupon", "Nested Button"):
+                _hits = page.get_by_role("button", name=_nm, exact=True).count()
+                check(f"getByRole('button', {{name: '{_nm}'}}) resolves through the shadow "
+                      f"root", _hits == 1, f"matched {_hits} element(s)")
+
+            # The half that decides whether a value can be asserted at all. A total rendered
+            # inside a component is exactly what a suite is for, and it used to be invisible.
+            _blob5 = " | ".join(texts5)
+            check("text inside a shadow root is collected",
+                  "GBP 42.00" in _blob5,
+                  "without this no assertion about the total is possible: %s" % _blob5[:200])
+            check("...and its heading with it", "Basket" in _blob5, _blob5[:200])
+
+            # Frames are a different problem and are deliberately *not* solved: a frame is a
+            # separate document with its own locator scope. What must not happen is silence.
+            check("a frame's contents stay out of the candidate list",
+                  "Place order" not in names5,
+                  "reaching into a frame changes what an address means, so it is out of "
+                  "scope -- but it must be an announced gap, not a quiet one")
+            check("...and the session says the frame is there",
+                  _warn_about_frames(page, "/announced-once") == 1,
+                  "a payment step is ordinarily an iframe; walking past one with no sign "
+                  "that anything is missing is how a suite silently covers nothing")
+
             page.goto(base + "/catalogue.html", wait_until="domcontentloaded")
             _p4, _t4, raw4, texts4 = observe(page)
             _said = [t.split(": ", 1)[1] for t in texts4 if ": " in t]
@@ -930,6 +1093,95 @@ def fixture():
 
 # ── Entry point ───────────────────────────────────────────────────────────
 
+# A first verification installs a browser toolchain, which is slow and worth waiting\n# for; every later one in the same directory reuses it. Generous rather than tight,\n# because timing out here throws away a check the session already paid to make\n# possible.\nVERIFY_TIMEOUT_SECONDS = 900\n\n\ndef _verify(args, review_id: str) -> int:
+    """Run the suite against the application it was just written from.
+
+    The one property this product most needs to be true is the one nothing was checking.
+    "Green on the application you explored" has always been an instruction in the prompt, and
+    a prompt instruction is a hope: four separate defects shipped suites that were red
+    against a working application -- a submit button named so no locator could find it
+    (D-427), a sign-in helper waiting for a page nobody had seen (D-430), assertions off by
+    one step (D-434), and locators recalled from another application entirely (C-101). Every
+    one of them would have been caught here, in the seconds after generation, by the machine
+    that had just watched the application work.
+
+    The inference is what makes this worth the wall-clock. The exploration only reached the
+    generation step because the application answered every action it was given, so a test
+    that fails **now** is making a claim the application did not support minutes ago. That is
+    a wrong test, not a discovery -- and a wrong test is the expensive kind of wrong, because
+    a suite that cries wolf gets switched off and takes the next one down with it.
+
+    Run as a subprocess rather than by importing `run_tests`, deliberately. That script is
+    the documented path a customer uses, it already owns the write, install, run and report
+    logic, and it posts the JUnit back so the stored review stops saying `not_executed`.
+    Reimplementing any of that here would be a second copy that drifts, which is the mistake
+    D-364 recorded in another corner of this codebase. `--force` is passed because the
+    directory is ours and re-running a verification must not fail on the files it wrote last
+    time.
+
+    **This does not weaken D-05.** That rule is about the API host. This runs on the machine
+    already driving a browser -- the tier D-05 names -- and the backend still only ever
+    receives a report.
+    """
+    into = args.verify_into or os.path.join(
+        tempfile.gettempdir(), "lm_verify_" + review_id[:8])
+    os.makedirs(into, exist_ok=True)
+
+    section("Checking the suite against the application it was written from")
+    print(f"  running in  {into}")
+    print("  Any test that fails here is a wrong test: this application answered every")
+    print("  action a moment ago, so it was working when the suite was written.")
+
+    argv = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "run_tests.py"),
+            "--review", review_id, "--into", into, "--force", "--api", args.api,
+            "--label", "written from this session"]
+    if args.api_key:
+        argv += ["--api-key", args.api_key]
+    else:
+        argv += ["--user", args.user]
+    if args.project:
+        argv += ["--project", args.project]
+
+    env = dict(os.environ)
+    # The password travels in the environment rather than in argv, where any other process
+    # on the machine could read it out of the process table.
+    if args.password:
+        env["LM_PASSWORD"] = args.password
+    # The suite reads its own base address from BASE_URL, and the only address that makes
+    # this check mean anything is the one that was explored.
+    env["BASE_URL"] = args.url
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    try:
+        proc = subprocess.run(argv, env=env, timeout=VERIFY_TIMEOUT_SECONDS)
+    except FileNotFoundError as exc:
+        print(f"\n  could not start the runner: {exc}")
+        print("  The suite is written and stored; run it yourself with run_tests.py.")
+        return 0
+    except subprocess.TimeoutExpired:
+        print(f"\n  the verification did not finish within {VERIFY_TIMEOUT_SECONDS}s.")
+        print("  The suite is written and stored; run it yourself with run_tests.py.")
+        return 0
+
+    print()
+    if proc.returncode == 0:
+        print("  Every test passed against the application it was written from. That is the")
+        print("  weakest thing this check can tell you and the most important: the suite is")
+        print("  not going to cry wolf on the build it came from. Whether each test would")
+        print("  *catch* a real break is a different question -- read the assertion table.")
+    else:
+        print("  Some tests did not pass. Because the application was working throughout the")
+        print("  exploration, the first suspect is the test rather than the application --")
+        print("  a locator that matches nothing, or a value read from the wrong moment.")
+        print("  The shared-cause line above says whether one broken helper explains them all.")
+
+    # Deliberately not a failure of this command. The session succeeded, the suite exists and
+    # is stored, and the customer is better off with a labelled suite than with a driver that
+    # exits non-zero and looks like it lost their money.
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--url", default="", help="The running application to explore.")
@@ -968,6 +1220,14 @@ def main():
                          "explorer clicks, types and submits in a live system; controls "
                          "that look destructive are withheld, but that is a filter on "
                          "button labels and not a guarantee.")
+    ap.add_argument("--verify", action="store_true",
+                    help="After writing the suite, run it against the application it was "
+                         "written from. Any test that fails there is a wrong test, because "
+                         "that application was working when it was explored.")
+    ap.add_argument("--verify-into", default="",
+                    help="Where to run the verification. A temporary directory by default; "
+                         "naming one that keeps its node_modules makes later runs much "
+                         "faster.")
     ap.add_argument("--no-generate", action="store_true",
                     help="Explore and stop, without writing a suite.")
     ap.add_argument("--dry-run", action="store_true",
@@ -1146,10 +1406,15 @@ def main():
         print(f"\n  {result['assertions_downgraded']} assertion(s) claimed to check a "
               f"requirement and were\n  relabelled 'observed', because no requirement was "
               f"supplied to check against.")
-    print(f"\n  Run them:   python scripts/run_tests.py --review {result.get('review_id')} "
+    review_id = result.get("review_id")
+    if args.verify and review_id:
+        return _verify(args, review_id)
+
+    print(f"\n  Run them:   python scripts/run_tests.py --review {review_id} "
           f"--into <checkout>")
-    print(f"  Deliver:    POST /api/reviews/{result.get('review_id')}/deliver-tests")
+    print(f"  Deliver:    POST /api/reviews/{review_id}/deliver-tests")
     print("\n  The platform did not run these. This is what it generated.")
+    print("  Add --verify to run them here before you trust them.")
     return 0
 
 
