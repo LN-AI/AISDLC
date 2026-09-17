@@ -291,6 +291,47 @@ def _outcomes_by_step(steps: List[dict]) -> dict:
     return shifted
 
 
+def _repetition_note(steps: List[dict], window: int = 10, floor: int = 3) -> str:
+    """Say plainly when the explorer has been doing the same thing over and over.
+
+    The stopping rule (`app_session.stalled`) is a backstop and behaves like one: it ends a
+    stuck session a few steps before the budget would have. What it cannot do is stop the
+    session becoming stuck, and the measurement says that is where the money goes — a live
+    banking session spent **22 of 26 steps** toggling two dropdowns, and the fixed rule only
+    reclaims the last four of those.
+
+    The history is already in the prompt, so the model can in principle count for itself; it
+    demonstrably did not. A list of twelve lines is something to read, whereas "you have
+    selected this same control seven times and the page has not changed" is a fact. Stated as
+    an observation with a cost attached rather than as an instruction, because the explorer
+    still has to decide what to do instead, and it may legitimately have a reason.
+
+    Deliberately blunt about the remedy, since a model that knows it is stuck and has no idea
+    what to try next repeats itself politely instead.
+    """
+    if not steps:
+        return ""
+    counts = {}
+    for step in steps[-window:]:
+        action = step.get("action") or {}
+        key = (str(action.get("action_kind") or "?"),
+               str(action.get("target_name") or "")[:60])
+        counts[key] = counts.get(key, 0) + 1
+    worst = [(n, kind, name) for (kind, name), n in counts.items() if n >= floor]
+    if not worst:
+        return ""
+    worst.sort(reverse=True)
+    listed = "; ".join('%s "%s" %d times' % (kind, name, n) for n, kind, name in worst[:3])
+    return (
+        f"In your last {min(window, len(steps))} steps you have: {listed}. Repeating an "
+        "action you have already taken teaches this session nothing and spends a step that "
+        "cannot be got back. If the page is not changing in a way that is worth a test, "
+        "leave it: go back, open something you have not opened, navigate to a part of the "
+        "application the requirement mentions, or declare yourself done. Being done early is "
+        "a better outcome than a budget spent on one page."
+    )
+
+
 def _history(steps: List[dict], limit: int = 12) -> str:
     """The last few steps, as one line each.
 
@@ -659,7 +700,9 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
                 "session": app_session.public(conn, session_id),
             }
 
-        history = _history(app_session.steps(conn, session_id))
+        _recorded_so_far = app_session.steps(conn, session_id)
+        history = _history(_recorded_so_far)
+        repetition_note = _repetition_note(_recorded_so_far)
         step_index = session["steps_used"] + 1
         refused_note = "; ".join(
             r.get("refused_because", "") for r in refused[:10] if r.get("refused_because")
@@ -683,6 +726,7 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
                 history=history,
                 requirement=session.get("requirement", ""),
                 refused_note=refused_note,
+                repetition_note=repetition_note,
                 credentials_note=req.credentials_note,
                 llm_override=override,
             ),

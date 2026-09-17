@@ -1706,6 +1706,81 @@ def main_():
           "_appAssertionPanel" in app_js_now,
           "a count nobody renders is a count nobody reads")
 
+    # ── 24. Noticing that a session has stopped getting anywhere ──────────
+    # The sequence below is not invented. It is the real page-signature trace of a live
+    # session against a public banking demo on 2026-09-17, which reached the account-activity
+    # page at step 4 and spent steps 5 to 26 toggling two dropdowns. From step 14 its
+    # signature cycled between exactly **two** values, so the longest run of identical ones
+    # was three, the old rule needed five, and it never fired -- 22 of 26 paid steps, and the
+    # session never reached the feature its requirements were about (C-105).
+    section("24. A session going round in circles is noticed, and told so")
+    PARABANK_SIGS = ["4abc3dc4", "03df2fd8", "0c4f6921", "5889e5cc", "e3b8bc06", "d9495d67",
+                     "23e3a185", "4f947a9e", "141b1482", "0e3d22dc", "3877fb0b", "216920ea",
+                     "23e3a185", "4f947a9e", "4f947a9e", "8e59380a", "8e59380a", "8e59380a",
+                     "4f947a9e", "4f947a9e", "8e59380a", "8e59380a", "8e59380a", "4f947a9e",
+                     "4f947a9e", "8e59380a"]
+
+    def _stops_at(sigs, sid):
+        """Which step the no-progress rule would refuse to take, or None."""
+        conn = database.get_connection()
+        try:
+            for i, sig in enumerate(sigs):
+                if app_session.stalled(conn, sid, sig):
+                    return i + 1
+                conn.execute(
+                    "INSERT INTO app_steps (id, session_id, step_index, page_signature, "
+                    "action_json, created_at) VALUES (?,?,?,?,?,?)",
+                    ("%s-%d" % (sid, i), sid, i + 1, sig, "{}", "2026-09-17T00:00:00"))
+                conn.commit()
+        finally:
+            conn.close()
+        return None
+
+    stuck_at = _stops_at(PARABANK_SIGS, "stall-parabank")
+    check("a two-value loop is caught at all", stuck_at is not None,
+          "the old rule asked whether the last N pages were *identical*, and a session "
+          "alternating between two known states answers no to that for ever")
+    check("...and caught before the budget runs out",
+          stuck_at is not None and stuck_at < len(PARABANK_SIGS),
+          "stopped at %s of %d" % (stuck_at, len(PARABANK_SIGS)))
+
+    # The two failures this rule must not have. Both were the reason it was written narrowly
+    # in the first place, and widening it is exactly how they come back.
+    check("a session that finds something new every step is never stopped",
+          _stops_at(["new%d" % i for i in range(1, 15)], "stall-healthy") is None)
+    check("filling in a long form is not mistaken for being stuck",
+          _stops_at(["form%d" % i for i in range(1, 13)], "stall-form") is None,
+          "a signature carries each control's current value on purpose (D-411), so typing "
+          "into the next field is a genuinely new signature")
+    check("going out to a detail page and back is not a loop while it keeps finding items",
+          _stops_at(["home", "list", "item1", "list", "item2", "list", "item3", "list",
+                     "item4"], "stall-revisit") is None)
+    check("...but doing it between two pages it has already seen is",
+          _stops_at(["a", "b", "c", "a", "b", "a", "b", "a", "b", "a", "b", "a"],
+                    "stall-pingpong") is not None,
+          "this is the shape the docstring used to claim was caught and was not")
+
+    # Upstream of the rule: the explorer is told it is repeating itself, because the rule is
+    # only a backstop and reclaims the last few steps of a session that is already wasted.
+    from backend.routes.app_testing import _repetition_note
+    fiddling = ([{"action": {"action_kind": "select", "target_name": "All January February"}},
+                 {"action": {"action_kind": "select", "target_name": "All Credit Debit"}}] * 4)
+    note = _repetition_note(fiddling)
+    check("an explorer that keeps poking the same control is told so",
+          "4 times" in note and "All Credit Debit" in note, note[:160])
+    check("...and told what it costs, in steps",
+          "cannot be got back" in note, note[:200])
+    check("...and given somewhere else to go, since a model with no alternative repeats itself",
+          "declare yourself done" in note, note[:400])
+    check("a session doing something different each step is not nagged",
+          _repetition_note([{"action": {"action_kind": "click",
+                                        "target_name": "Item %d" % i}}
+                            for i in range(8)]) == "",
+          "a warning that fires on healthy behaviour is one the model learns to ignore")
+    check("the explorer is actually shown it, not just handed it",
+          "You are repeating yourself" in agent_src,
+          "a note computed and never rendered is the shape of C-98")
+
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)

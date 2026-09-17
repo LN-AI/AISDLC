@@ -54,7 +54,12 @@ MAX_STEPS_CEILING = 200
 # How many consecutive steps may produce nothing new before the session is stopped. Five is
 # enough to walk into a dialog, look at it, and come back out without being cut off, and
 # short enough that a loop between two pages does not burn forty model calls.
-NO_PROGRESS_LIMIT = 5
+# Six rather than five, because the question changed. "Five identical pages" was weak
+# evidence of being stuck and almost never fired; "six steps that found nothing this
+# session had not already found" is strong evidence and fires on the loops that were
+# previously invisible. One more step of rope before the rule bites, in exchange for a
+# rule that bites at all.
+NO_PROGRESS_LIMIT = 6
 
 # A single observation is a page's accessibility tree. Capped because it is model input that
 # a customer's page controls the size of, and an uncapped one is an uncapped bill.
@@ -350,18 +355,55 @@ def seen_signatures(conn, session_id):
     return {r["page_signature"] for r in cur.fetchall() if r["page_signature"]}
 
 
+def signatures_before(conn, session_id, skip):
+    """Every distinct signature this session reached *before* its last `skip` steps."""
+    cur = conn.execute(
+        "SELECT DISTINCT page_signature FROM app_steps WHERE session_id = ? "
+        "AND step_index <= (SELECT COALESCE(MAX(step_index), 0) - ? FROM app_steps "
+        "                   WHERE session_id = ?)",
+        (session_id, skip, session_id),
+    )
+    return {r["page_signature"] for r in cur.fetchall() if r["page_signature"]}
+
+
 def stalled(conn, session_id, signature, limit=NO_PROGRESS_LIMIT):
     """Has the session stopped finding anything new?
 
-    True when the last `limit` steps *and* the page now being observed are all the same
-    signature. Deliberately strict: a genuine two-page loop still counts as no progress,
-    while a session that reaches a new dialog and comes back does not, because the dialog
-    broke the run.
+    **Progress means reaching something this session has not reached before**, which is not
+    the same question the first version asked. That one asked whether the last `limit` pages
+    were *identical*, and a session alternating between two known states answered no to it
+    for ever. The docstring even claimed a two-page loop was caught; it was not, and the
+    measurement is unambiguous (C-105). On a live banking demo the explorer reached the
+    account-activity page at step 4 and spent **steps 5 to 26 toggling two dropdowns**: from
+    step 14 onward its signature cycled between exactly **two** values, so the longest run of
+    identical ones was **three**, the rule needed five, and it never fired. Twenty-two of
+    twenty-six paid steps, and the session never reached the feature its requirements were
+    about.
+
+    The reason the old rule could not see it is worth keeping in mind before widening
+    anything here: a signature includes each control's current *value*, deliberately, so that
+    filling in a long form reads as progress rather than as a stall (D-411). But that means
+    **the explorer can always change the signature by typing something** — the measure moves
+    when the thing being measured pokes it. Selecting a different month in a dropdown is
+    exactly that: a new signature, no progress.
+
+    So the test is now set-based. If every signature in the window — and the page now being
+    observed — was already seen *before* the window opened, nothing new has been found, no
+    matter what order they came in. An identical run is a special case, so the old behaviour
+    is preserved rather than replaced, and the two failures it must not have are both
+    avoided: filling a form produces a genuinely new signature each time, and a session that
+    reaches a new dialog and comes back has one member of the window that is new.
     """
     recent = recent_signatures(conn, session_id, limit)
     if len(recent) < limit:
         return False
-    return all(sig == signature for sig in recent)
+    if all(sig == signature for sig in recent):
+        return True                       # the original rule, kept as the obvious case
+    earlier = signatures_before(conn, session_id, limit)
+    if not earlier:
+        return False                      # too early to say anything
+    window = {sig for sig in recent if sig} | ({signature} if signature else set())
+    return bool(window) and window.issubset(earlier)
 
 
 def normalise_retention(value) -> int:

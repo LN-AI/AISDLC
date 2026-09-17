@@ -476,6 +476,7 @@ class AppExplorerAgent(BaseAgent):
         history: str = "",
         requirement: str = "",
         refused_note: str = "",
+        repetition_note: str = "",
         credentials_note: str = "",
         llm_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -522,6 +523,12 @@ class AppExplorerAgent(BaseAgent):
                 "None. Every control on this page was withheld or there are none. Go back, "
                 "navigate to a different path, or declare yourself done."
             )
+        if repetition_note:
+            # Placed before the candidate list rather than after it, because it is about
+            # what *not* to choose and a warning read after the options have been weighed
+            # arrives too late to change the answer.
+            lines.append("## You are repeating yourself\n" + repetition_note)
+
         if refused_note:
             # Stated rather than hidden: a model that does not know a control was withheld
             # will keep looking for it, and an operator reading the session wants to know
