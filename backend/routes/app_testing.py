@@ -368,6 +368,28 @@ def _texts_by_step(steps: List[dict]) -> dict:
     return shifted
 
 
+def _who(caller: dict) -> str:
+    """Who is doing this, in the words the caller actually carries.
+
+    The allowance record exists to be read later -- C-102's whole answer to "permitting a
+    money-moving control is the customer's judgement" is that the record says who made it and
+    when. That answer was worth nothing until this function: the first version asked for
+    `email` or `name`, and a caller dict has neither. `get_caller` builds `{type, team,
+    username}` for a browser session and `{type, team, key_id}` for an API key, so every
+    allowance ever added was attributed to the empty string.
+
+    Found by adding one through the API and reading it back, which is the only way it could
+    have been found -- no offline test asserted the field, and a blank column looks exactly
+    like a column nobody has written to yet.
+    """
+    caller = caller or {}
+    if caller.get("username"):
+        return str(caller["username"])
+    if caller.get("key_id"):
+        return "api key %s (%s)" % (str(caller["key_id"])[:8], caller.get("team") or "?")
+    return str(caller.get("team") or "")
+
+
 def _journeys_markdown(steps: List[dict]) -> str:
     """The session, rendered for the suite writer.
 
@@ -1048,7 +1070,7 @@ def add_allowance(req: AllowanceRequest, caller: dict = Depends(get_caller)):
     try:
         stored = app_session.add_allowance(
             conn, resolved, req.control_name, group,
-            who=str(caller.get("email") or caller.get("name") or ""))
+            who=_who(caller))
         rows = app_session.list_allowances(conn, resolved)
     except ValueError as exc:
         raise HTTPException(400, str(exc))

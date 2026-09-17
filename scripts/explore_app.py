@@ -616,9 +616,9 @@ class Api:
             h["X-Project-Id"] = self.project
         return h
 
-    def post(self, path, body):
+    def post(self, path, body, timeout=180.0):
         import httpx
-        r = httpx.post(self.base + path, json=body, headers=self._headers(), timeout=180.0)
+        r = httpx.post(self.base + path, json=body, headers=self._headers(), timeout=timeout)
         if r.status_code >= 400:
             raise SystemExit(f"{path} -> {r.status_code}: {r.text[:500]}")
         return r.json()
@@ -1093,7 +1093,20 @@ def fixture():
 
 # ── Entry point ───────────────────────────────────────────────────────────
 
-# A first verification installs a browser toolchain, which is slow and worth waiting\n# for; every later one in the same directory reuses it. Generous rather than tight,\n# because timing out here throws away a check the session already paid to make\n# possible.\nVERIFY_TIMEOUT_SECONDS = 900\n\n\ndef _verify(args, review_id: str) -> int:
+# A first verification installs a browser toolchain, which is slow and worth waiting
+# for; every later one in the same directory reuses it. Generous rather than tight,
+# because timing out here throws away a check the session already paid to make
+# possible.
+VERIFY_TIMEOUT_SECONDS = 900
+
+# How long to wait for the one large call. Measured rather than guessed: 150s for a 24-step
+# session, 260s for a 26-step one against a page-heavy bank. Ten minutes is roughly twice the
+# worst seen, because the cost of waiting too long is a slow command and the cost of not
+# waiting long enough is an operator told their paid-for session produced nothing.
+GENERATE_TIMEOUT_SECONDS = 600
+
+
+def _verify(args, review_id: str) -> int:
     """Run the suite against the application it was just written from.
 
     The one property this product most needs to be true is the one nothing was checking.
@@ -1393,7 +1406,27 @@ def main():
         return 0
 
     section("Writing the suite")
-    result = api.post(f"/api/v1/app-testing/sessions/{session_id}/generate", {})
+    # Generation is the one large call -- 32,000 output tokens against every journey walked
+    # -- and the old 180s ceiling was not a ceiling on the work, only on the client's
+    # patience. A 26-step session against a bank took **260 seconds and completed**, writing
+    # a suite that cost $0.31; the driver had already given up at 180 and told its operator
+    # the run had crashed. A 24-step session the same afternoon took 150s, so this was a
+    # coin flip on any session of a realistic size rather than an edge case.
+    try:
+        result = api.post(f"/api/v1/app-testing/sessions/{session_id}/generate", {},
+                          timeout=GENERATE_TIMEOUT_SECONDS)
+    except Exception as exc:
+        # The work is not lost and the operator must not be told it is. The session is
+        # closed, every step is stored, and generation either finished server-side or can be
+        # asked for again -- so the one thing worse than this error is an error that reads
+        # like the money went nowhere.
+        print(f"\n  the platform did not answer in time: {exc}")
+        print(f"  This does not mean the suite was lost. The session is stored and the")
+        print(f"  generation may have finished after the wait ran out. Check with:")
+        print(f"    GET  /api/v1/app-testing/sessions/{session_id}")
+        print(f"  and if it has no suite yet, ask for one without exploring again:")
+        print(f"    POST /api/v1/app-testing/sessions/{session_id}/generate")
+        return 0
     print(f"  review id   {result.get('review_id')}")
     print(f"  {result.get('total_files', 0)} file(s), {result.get('total_tests', 0)} test(s)")
     print(f"  assertions  {result.get('specified_count', 0)} specified, "

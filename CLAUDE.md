@@ -101,6 +101,7 @@ python scripts/eval_test_automation.py --repeat 1        # cheaper; cannot measu
 python scripts/eval_app_testing.py                       # explore an app, does the suite guard it
 python scripts/eval_app_testing.py --self-check          # free: proves the harness, calls no model
 python scripts/explore_app.py --url <app> --max-steps 40 # explore a running app, write a suite
+python scripts/explore_app.py --url <app> --verify        # ...then run the suite against it
 python scripts/explore_app.py --url <app> --dry-run      # ...what it would be offered, spends nothing
 python scripts/explore_app.py --fixture                  # offline: no server, no key, no model
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
@@ -262,6 +263,34 @@ the sign-in helper and **every test in the suite failed on that one line**. Rela
 what a broken application looks like, and a helper that cries wolf costs the reader more than
 a missing test.
 
+**The session now runs the suite it wrote, against the application it wrote it from**
+(D-435, `--verify`). This is the cheapest check in the product and it went missing for
+months: *"green on the application you explored"* was a sentence in the prompt, and four
+separate defects shipped suites that were red against a working application (D-427, D-430,
+D-434, C-101), each found by a person running them by hand days later. The inference is what
+makes it cheap — exploration only reaches generation because every action was answered, so a
+test that fails now is wrong about an application that was working minutes ago. It shells out
+to `run_tests.py` rather than reimplementing it, because a second copy of a delivery path is
+how D-364 happened.
+
+**The collector sees inside open shadow roots, and says when it cannot see into a frame**
+(D-436). Measured on a four-control page before the change: **1 of 4** offered and none of
+the text behind either boundary, reported as a success. Angular, Lit, Stencil and Salesforce
+build whole interfaces out of custom elements, so the applications most worth testing were
+the ones coming back emptiest. Read D-436 before touching `deepAll` — it is written out
+twice on purpose, and frames are deliberately still out of scope because reaching into one
+changes what an address *means* in this contract.
+
+**Two audits read the finished suite, and they answer different questions.**
+`locator_audit` (D-433) asks whether a locator could have come from the session — the
+contract sends roles, names and page text and never a class, an id or a test id, so anything
+else was recalled. Given the session's own collected text it also catches a **heading nobody
+saw** (D-438), which is D-430's failure and is invisible to shape alone. `assertion_audit`
+(D-437) asks whether a test could ever fail: one whose every matcher is `toBeVisible` or
+`toHaveURL` passes against an application with the feature ripped out, which is worse than a
+missing test because it is counted as coverage. Neither can see a *wrong value* — that is
+what `--verify` is for, and the three are complements rather than layers.
+
 **A locator the session never observed is counted rather than forbidden** (D-433). The
 observation contract is closed — a role, visible text, or `locator("input[name='…']")`, and
 nothing else — so a class, an id or a test id in a finished suite was recalled from some
@@ -331,9 +360,10 @@ is a count and not a percentage (C-95); none of them exercises the collector tho
 depend on (C-97), which is exactly why D-427 and D-431 were found by a live run and not here;
 and a live run with no requirement supplied still produced a suite that was nine-tenths "the
 button is visible", which is C-66 wearing a new hat and is why `_HOLLOW` in the eval was
-widened. Four findings from those live runs are open: C-100 and C-101 name what the collector and
+widened. Five findings from those live runs are open: C-100 and C-101 name what the collector and
 the locator audit still cannot see, C-103 is the same mistake as C-101 aimed at a value
-instead of a selector, and C-102 is the customer's call rather than ours.
+instead of a selector, C-104 is a frame's contents, and C-102 is the customer's call rather
+than ours.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

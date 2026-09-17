@@ -1572,6 +1572,47 @@ def main_():
           "the model has to know which of the two values an assertion wants")
 
     # ── 23. Whether a test could ever fail, and whether a name was real ──
+    # The whole answer to "permitting a money-moving control is the customer's judgement"
+    # is that the record says who made it. It said nobody: the first version read `email` or
+    # `name` off a caller dict that carries neither, so every allowance ever added was
+    # attributed to the empty string. Found by adding one through the API and reading it
+    # back -- a blank column looks exactly like a column nobody has written to yet.
+    from backend.routes.app_testing import _who
+    check("a browser caller is recorded by username",
+          _who({"type": "jwt", "team": "admin", "username": "admin"}) == "admin")
+    check("an API key is recorded as a key rather than as nobody",
+          _who({"type": "api_key", "team": "Acme", "key_id": "abcdef1234"})
+          == "api key abcdef12 (Acme)",
+          _who({"type": "api_key", "team": "Acme", "key_id": "abcdef1234"}))
+    check("...and an unrecognised caller still says something",
+          _who({"team": "Acme"}) == "Acme")
+    check("the accountability record is never silently empty",
+          all(_who(c) for c in ({"username": "u"}, {"key_id": "k", "team": "t"},
+                                {"team": "t"})),
+          "C-102 rests on this record being readable; blank is the one answer it may not give")
+
+    # The driver's own entry points, asserted as *objects* rather than as text.
+    #
+    # This exists because of a real escape: a patch wrote literal backslash-n characters
+    # instead of newlines, so a comment block and `def _verify` became one enormous comment
+    # line and the function was never defined. Everything offline still passed -- the
+    # fixture never reaches that path -- `--help` still listed the flag, and the defect
+    # surfaced only after a live session had spent its money exploring, at the very last
+    # step. Importing the module and looking at the attribute is the cheapest check that
+    # could have caught it, and text matching could not have: the broken file *contained*
+    # the string `def _verify`.
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_explore_app", ROOT / "scripts" / "explore_app.py")
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    for _name in ("_verify", "observe", "explore", "main", "_warn_about_frames"):
+        check("the driver actually defines %s()" % _name,
+              callable(getattr(_mod, _name, None)),
+              "a source file can contain the words `def %s` and still not define it" % _name)
+    check("the verification timeout is a number, not a string of escapes",
+          isinstance(getattr(_mod, "VERIFY_TIMEOUT_SECONDS", None), int),
+          getattr(_mod, "VERIFY_TIMEOUT_SECONDS", None))
+
     section("23. A test that cannot fail is named, and so is a heading nobody saw")
     from backend.services import assertion_audit
 
