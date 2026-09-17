@@ -509,6 +509,13 @@ def observe(page):
 # once rather than eight times.
 _FRAMES_REPORTED = set()
 
+# One page this session demonstrably saw, kept so a failed verification can ask whether the
+# application is still the one that was explored. Module-level for the same reason
+# `_FRAMES_REPORTED` is: the driver is a script with one session in flight, and threading a
+# value through `explore` -> `main` -> `_verify` to be read once would be more moving parts
+# than the fact deserves.
+_WITNESS = {}
+
 
 def _warn_about_frames(page, path: str) -> int:
     """Say when part of a page is in a frame this session cannot read. -> frame count.
@@ -660,6 +667,17 @@ def explore(page, api, session_id, base_url, credentials_note, max_steps, shots_
             with contextlib.suppress(Exception):
                 page.screenshot(path=os.path.join(shots_dir, f"{taken:03d}-{path.strip('/').replace('/', '_') or 'root'}.png"),
                                 full_page=True)
+
+        if texts and not _WITNESS:
+            # The first page that said anything. Landmarks only -- a heading or a status is
+            # part of the application's own furniture, while a price or a row is exactly the
+            # sort of thing that legitimately changes between two visits and would make this
+            # check cry wolf.
+            _WITNESS.update({
+                "url": page.url,
+                "texts": [t for t in texts
+                          if t.startswith(("heading:", "status:", "alert:"))][:6],
+            })
 
         payload = {
             "url_path": path,
@@ -1206,11 +1224,83 @@ def _verify(args, review_id: str, api) -> int:
         print("  rather than the application -- a locator that matches nothing, or a value")
         print("  read from the wrong moment. The shared-cause line above says whether one")
         print("  broken helper explains them all.")
+        if total and failed + errored == total:
+            # Said separately because it flips the odds. One test failing is usually one bad
+            # assertion; *every* test failing is usually one broken thing they all depend on,
+            # and that thing is as often the environment as the suite.
+            print()
+            print("  **Every test failed**, which is more often one shared cause than many")
+            print("  independent mistakes -- a sign-in that no longer works, an application")
+            print("  that has reset, a rate limit. Weigh that before reading it as a bad suite.")
+        note = _recheck_application()
+        if note:
+            print()
+            print(note)
 
     # Deliberately not a failure of this command. The session succeeded, the suite exists and
     # is stored, and the customer is better off with a labelled suite than with a driver that
     # exits non-zero and looks like it lost their money.
     return 0
+
+
+def _recheck_application() -> str:
+    """Is the application still the one the session explored? -> a sentence, or ''.
+
+    Asked only when a verification fails, and it exists because of a wrong conclusion drawn
+    from a real run. A ParaBank suite came back 13 of 13 failed and the obvious reading --
+    every test is bad -- was wrong: the public demo had started rendering a heading reading
+    `Error!` where the account overview belongs, so no data loaded. The suite was largely
+    fine. An application that breaks, resets or rate-limits between exploration and
+    verification produces exactly the same signal as a suite full of bad locators (C-108).
+
+    The question is answerable cheaply because the session wrote down what it saw. Reloading
+    one page it demonstrably reached and looking for a couple of the landmarks it recorded
+    separates "the application moved" from "the tests are wrong" for the price of a single
+    page load and no model call.
+
+    Deliberately reports rather than decides. A landmark can disappear for innocent reasons
+    -- a banner that rotates, a name that includes the date -- so this says what it found and
+    leaves the reader to weigh it, which is the same standing rule as every other panel here.
+    """
+    url = _WITNESS.get("url")
+    wanted = _WITNESS.get("texts") or []
+    if not url or not wanted:
+        return ""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            page = browser.new_page()
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(SETTLE_MS)
+                now = page.evaluate(TEXTS_JS) or []
+            finally:
+                browser.close()
+    except Exception as exc:
+        return f"  (could not re-open {url} to check: {exc})"
+
+    present = [t for t in wanted if t in now]
+    if len(present) == len(wanted):
+        # Says only what it checked. The first draft ended "that points at the tests", and
+        # on the very run that motivated this it would have been wrong: ParaBank's entry
+        # page was perfect and the *signed-in* overview was rendering `Error!`. A fresh
+        # browser has no session, so everything behind a login is exactly what this cannot
+        # see -- and a confident all-clear about the part it did not look at is the same
+        # false green D-444 was about.
+        return (f"  {url} still shows everything this session recorded there, so the "
+                f"application\n  has not gone away. **This checks the entry page only** — a "
+                f"fresh browser is not\n  signed in, so anything behind a login was not "
+                f"looked at, and that is where an\n  application most often differs from the "
+                f"one that was explored.")
+    missing = [t for t in wanted if t not in present]
+    return (
+        f"  **{len(missing)} of {len(wanted)} thing(s) this session recorded on {url} are no "
+        f"longer\n  there** — missing: {'; '.join(m[:48] for m in missing[:3])}. The "
+        f"application is not in\n  the state it was explored in, so some of these failures "
+        f"may be the application\n  rather than the suite. A public demo that resets, an "
+        f"expired login and a rate limit\n  all look like this."
+    )
 
 
 def _verified_counts(api, review_id: str):

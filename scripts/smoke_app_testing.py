@@ -1932,6 +1932,44 @@ def main_():
     check("it asks the platform for this review's results",
           "/api/reviews/r/test-results" in _all_green.asked, _all_green.asked)
 
+    # ── 26. Telling a broken application from a bad suite ─────────────────
+    # A ParaBank verification came back 13 of 13 failed and the obvious reading -- every test
+    # is bad -- was wrong: the public demo had started rendering a heading reading `Error!`
+    # where the account overview belongs. An application that breaks, resets or rate-limits
+    # between exploration and verification produces exactly the same signal as a suite full
+    # of bad locators (C-108).
+    section("26. A failed verification asks whether the application moved")
+    _ea_src = (ROOT / "scripts" / "explore_app.py").read_text(encoding="utf-8")
+
+    check("every test failing is called out as one shared cause, not many mistakes",
+          "Every test failed" in _ea_src,
+          "one failure is usually one bad assertion; all of them is usually one broken thing "
+          "they share, and that is as often the environment as the suite")
+    check("...and the reader is told to weigh that before blaming the suite",
+          "Weigh that before reading it as a bad suite" in _ea_src)
+
+    # The honest-limits check, and the reason it exists. The first draft of the all-clear
+    # ended "that points at the tests" -- and on the very run that motivated this it would
+    # have been wrong, because ParaBank's entry page was perfect and the *signed-in* overview
+    # was the broken one. A fresh browser has no session, so the logged-in half of an
+    # application is exactly what this cannot see.
+    check("the all-clear says which part of the application it actually checked",
+          "checks the entry page only" in _ea_src,
+          "a confident all-clear about the part it did not look at is D-444's false green "
+          "wearing a different hat")
+    check("...and names the reason it cannot see further",
+          "not\\n  signed in" in _ea_src or "is not\\n  signed in" in _ea_src
+          or "fresh browser is not" in _ea_src,
+          "the limit has to travel with the message, not live in a docstring")
+    check("the re-check only looks at landmarks, not at values",
+          'startswith(("heading:", "status:", "alert:"))' in _ea_src,
+          "a price or a table row legitimately changes between two visits, so checking those "
+          "would make this cry wolf on a healthy application")
+    check("it is only asked when something failed",
+          _ea_src.index("note = _recheck_application()")
+          > _ea_src.index("Every test failed"),
+          "re-opening a browser after a clean run spends time to learn nothing")
+
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)
