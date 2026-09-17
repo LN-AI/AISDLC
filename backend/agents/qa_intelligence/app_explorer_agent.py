@@ -24,8 +24,17 @@ describing it, no matter what any prompt said.
 It also solves a problem the code-based product has no answer for. A generated UI test is
 only worth anything if its selectors survive the next redesign, and a model asked to invent
 one will reach for CSS. Here every candidate arrives carrying the role and accessible name
-Playwright itself reported, so the suite is written in role-and-name locators by
+Playwright itself reported, so the *action* half is written in role-and-name locators by
 construction rather than by instruction.
+
+The suite half is not, and it is worth being exact about the difference, because the module
+used to claim the property for both. `next_action` cannot name an element that was not
+offered -- it returns an index. `generate_suite` writes free text, so nothing structural
+stops it reaching for a class name it remembers, and a live run showed it doing exactly
+that: nineteen raw CSS locators in one suite, three of them matching nothing, against a
+prompt that had said "never write a CSS selector" all along. `services/locator_audit.py` is
+the part that does not rely on the model agreeing -- it counts what was recalled, hands the
+offending lines back for one retry, and reports what survives.
 
 Why the suite schema is the code-based one, plus a field
 --------------------------------------------------------
@@ -56,7 +65,7 @@ from backend.agents.qa_intelligence.test_automation_agent import (
     PREREQUISITES,
     TEST_AUTOMATION_TOOL_SCHEMA,
 )
-from backend.services import action_policy, llm_gateway
+from backend.services import action_policy, llm_gateway, locator_audit
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +199,28 @@ for an assertion later, and a step recorded with no expectation is a step that c
 produce "the page loaded", which is not a test."""
 
 
+def _file_count(result) -> int:
+    """How many real file objects a response carries. Object rows only, same as `_has_files`."""
+    files = (result or {}).get("test_files")
+    return sum(1 for row in (files if isinstance(files, list) else []) if isinstance(row, dict))
+
+
+def _test_count(result) -> int:
+    """How many named tests a response carries, across every file.
+
+    Counted because "stop writing invented locators" has an easy wrong answer -- delete the
+    tests that used them -- and a file count alone would not notice a file that kept its name
+    and lost four of its five tests.
+    """
+    files = (result or {}).get("test_files")
+    total = 0
+    for row in (files if isinstance(files, list) else []):
+        if isinstance(row, dict):
+            names = row.get("test_names")
+            total += len(names) if isinstance(names, list) else 0
+    return total
+
+
 def _app_suite_schema() -> Dict[str, Any]:
     """`TEST_AUTOMATION_TOOL_SCHEMA` plus `assertion_basis`, as a copy.
 
@@ -276,9 +307,30 @@ Locators. Every step in the record says how to address the thing it acted on -- 
 given, exactly as written.** It was worked out from the element itself, so it is a fact \
 about the page rather than a guess: where the record says `getByText`, the element has no \
 role in the accessibility tree and `getByRole` would match nothing at all, however much it \
-looks like a button on the screen. Never write a CSS selector or an XPath. Role, name and \
-visible text survive a redesign; a CSS path does not, and a suite that breaks on every \
-cosmetic change gets deleted by the team that owns it.
+looks like a button on the screen.
+
+**You were never shown a class name, an id or a test id, so you cannot have one.** The \
+record carries exactly three ways to address an element: `getByRole(...)` where the element \
+has a real role, `getByText(...)` where it does not, and an explicit \
+`locator("input[name='...']")` where neither resolves. Nothing else was collected and \
+nothing else was sent. So `page.locator('.item-price')`, `page.locator('#total')` and \
+`page.getByTestId('cart')` did not come from this session -- they came from your memory of \
+some other application, and on this one they match nothing.
+
+A locator that matches nothing is not a weak test, it is a **false alarm**, and that is the \
+one failure a suite cannot survive. It goes red against a *correct* build, the team reads \
+red as "our application is broken", and when they find out it was the test they switch the \
+suite off -- which leaves them worse off than no suite at all, because now they distrust \
+the next one too. A real suite lost its only arithmetic check this way: it summed prices \
+from `.inventory_item_price`, which matched zero elements, and compared 0 against a \
+displayed total of 55.97 that was perfectly right. It had been shown that page's prices as \
+`text:` lines and reached past them for a remembered class.
+
+So: use the locator the record gives you. Where you need a value rather than a control, use \
+the `page showed:` line the record carries for it. Where the record gives you no way to \
+reach something, put it in not_automated and say why -- an honest gap is worth more than a \
+guess that fails on a working application. The only raw selector you may write is the \
+`[name='...']` form, and only when the record hands it to you.
 
 Assertions are the whole value, and the place a suite like this usually fails. An assertion \
 that a page loaded, that a URL changed, or that an element exists is not a test -- it passes \
@@ -586,6 +638,67 @@ class AppExplorerAgent(BaseAgent):
                 # "we tried twice" is part of why.
                 result = retried or result
                 result["generation_retried"] = True
+
+        # The second retry, for the second failure that is worth paying to avoid: a suite
+        # whose locators were remembered rather than observed (C-101).
+        #
+        # This one is not a total loss the way an empty `test_files` is, so it is bounded
+        # harder. The prompt has forbidden CSS selectors since the first version and a live
+        # run produced nineteen of them anyway, which is the evidence that saying it again
+        # would not help; what this does instead is quote the model's own lines back and ask
+        # for those specific ones. Naming them is the part a general instruction cannot do.
+        #
+        # Three guards, each against a way this could cost more than it returns:
+        #
+        # * **Never after the empty-files retry.** Two generation calls is the ceiling this
+        #   product has always had, and `agent_guard`'s reservation is sized for it. A
+        #   session that already paid twice to get any suite at all does not also pay to
+        #   tidy its selectors.
+        # * **Only accept a strictly cleaner answer.** A retry that comes back with the same
+        #   number of invented locators bought nothing, and one with more is worse.
+        # * **Only accept one that did not shrink.** The obvious way to satisfy "stop using
+        #   class names" is to delete the tests that used them, which would trade a false
+        #   alarm for a coverage hole and score better on the only number being checked. So
+        #   the retry must keep at least as many files and at least as many tests.
+        #
+        # When the retry is refused the first answer stands and the count is reported on it.
+        # That is deliberate: a suite with a known invented locator, labelled, is more useful
+        # than no suite, and `locator_audit.summary_sentence` tells the reader to suspect the
+        # test before the application.
+        audit = locator_audit.audit((result or {}).get("test_files"))
+        if audit["invented_count"] and not result.get("generation_retried"):
+            logger.warning(
+                "App suite generation used %d locator(s) that were never observed (%s); "
+                "retrying once with the offending lines named.",
+                audit["invented_count"], audit["kinds"])
+            note = locator_audit.retry_note(audit)
+            cleaner = llm_gateway.call_tool(
+                APP_SUITE_SYSTEM_PROMPT, user_content + "\n\n" + note, APP_SUITE_TOOL_SCHEMA,
+                llm_override, max_tokens=32000,
+            )
+            result["locators_retried"] = True
+            if _has_files(cleaner):
+                second = locator_audit.audit(cleaner.get("test_files"))
+                kept_files = _file_count(cleaner) >= _file_count(result)
+                kept_tests = _test_count(cleaner) >= _test_count(result)
+                if second["invented_count"] < audit["invented_count"] and kept_files \
+                        and kept_tests:
+                    result = cleaner
+                    result["locators_retried"] = True
+                    audit = second
+                else:
+                    # Said out loud rather than dropped silently: the money was spent, and
+                    # "we tried and the second answer was not better" is a different fact
+                    # from "we never tried", especially when the counts are being measured.
+                    logger.warning(
+                        "App suite locator retry rejected: invented %d -> %d, files %d -> "
+                        "%d, tests %d -> %d.",
+                        audit["invented_count"], second["invented_count"],
+                        _file_count(result), _file_count(cleaner),
+                        _test_count(result), _test_count(cleaner))
+                    result["locator_retry_rejected"] = True
+
+        result["locator_audit"] = audit
 
         result["agent_name"] = self.agent_name
         return result

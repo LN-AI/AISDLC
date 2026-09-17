@@ -26,7 +26,7 @@ from backend.agents.qa_intelligence.test_automation_agent import TestAutomationA
 from backend.agents.qa_intelligence.app_explorer_agent import AppExplorerAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
-from backend.services import cost_optimization_service
+from backend.services import cost_optimization_service, locator_audit
 from backend import config, database
 from backend.workflows import shared as workflow_shared
 from backend.workflows import autofix_pr as autofix_pr_workflow
@@ -1111,6 +1111,29 @@ class SDLCOrchestrator:
         result["specified_count"] = len(stated)
         result["assertion_basis_missing"] = max(0, len(test_names) - len(basis))
         result["had_requirement"] = had_requirement
+
+        # Where this suite's locators came from, counted here rather than taken from the
+        # model, for the same reason `total_tests` is (D-406). The agent has already audited
+        # its own answer and may have retried once on the strength of it; this runs again
+        # over the *filtered* files so the stored number describes the suite that was
+        # actually kept, not the response that came back.
+        #
+        # This is the honesty pass aimed at a third noun. `assertion_basis` stops a suite
+        # claiming to have verified something nobody wrote down; this stops it looking
+        # thorough while resting on element names that were remembered from another
+        # application. Both failures are invisible to a reader holding only the suite, and
+        # this one is worse in one specific way: it fails against a *correct* build, so the
+        # reader's first conclusion is that their application is broken.
+        locators = locator_audit.audit(files)
+        result["locator_audit"] = locators
+        result["locators_grounded"] = locators["grounded"]
+        result["locators_invented"] = locators["invented_count"]
+        locator_note = locator_audit.summary_sentence(locators)
+        if locator_note:
+            result["locator_note"] = locator_note
+            logger.warning(
+                "app-testing: suite kept %d locator(s) the session never observed (%s)",
+                locators["invented_count"], locators["kinds"])
 
         # Whether this suite could see values at all, stated on the result rather than left
         # to be inferred from its contents. A customer who turned page text off gets a suite

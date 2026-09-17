@@ -3776,6 +3776,55 @@ check('a suite with nothing to check against says so rather than implying verifi
   assert(html.includes('cannot catch behaviour that'), 'it did not say what that costs');
 });
 
+check('a locator the session never saw is named, with the line to open', () => {
+  // The single failure of the 2026-09-16 live run, in the shape the screen receives it.
+  // The suite scored 16 of 17 and the one red test was red about a *correct* page, so what
+  // the reader needs first is which of the two to distrust.
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    locators_grounded: 87,
+    locators_invented: 3,
+    locator_note: 'Three locator(s) in this suite name something the session never observed '
+                + '(3 class), against 87 written from what it did observe. A recalled '
+                + 'locator that is wrong matches nothing and fails against a working '
+                + 'application, so treat a failure on one of these lines as a broken test '
+                + 'before concluding the application is broken.',
+    locator_audit: { grounded: 87, invented_count: 3, kinds: { class: 3 }, invented: [
+      { path: 'tests/checkout.spec.ts', line: 41, selector: '.inventory_item_price',
+        kind: 'class' },
+    ] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Locators that were not observed'), 'the panel is missing entirely');
+  assert(html.includes('.inventory_item_price'), 'it did not name the offending locator');
+  assert(html.includes('tests/checkout.spec.ts') && html.includes('41'),
+         'it did not say which line to open, which is the only actionable part');
+  assert(html.includes('before concluding the application is broken'),
+         'without this the reader goes looking for a defect that was never there');
+});
+
+check('...and a clean suite says so rather than leaving an empty space', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    locators_grounded: 40, locators_invented: 0,
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('All 40 locator(s)'),
+         'a panel that is blank when nothing is wrong and blank when nobody checked cannot '
+         + 'be told apart');
+  assert(!html.includes('Locators that were not observed'),
+         'it warned about a suite that has nothing wrong with it');
+});
+
+check('...and says when a second attempt was made and thrown away', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    locators_grounded: 10, locators_invented: 2, locator_retry_rejected: true,
+    locator_audit: { invented: [{ path: 'a.spec.ts', line: 3, selector: '#total',
+                                  kind: 'id' }] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('was not an improvement'),
+         'the money was spent on a second generation and the reader was not told');
+});
+
 check('the two test screens no longer mint the same element ids', () => {
   sandbox.renderTestAutomation('test-automation-result', copy());
   const a = document.getElementById('test-automation-result').innerHTML;

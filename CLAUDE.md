@@ -262,6 +262,17 @@ the sign-in helper and **every test in the suite failed on that one line**. Rela
 what a broken application looks like, and a helper that cries wolf costs the reader more than
 a missing test.
 
+**A locator the session never observed is counted rather than forbidden** (D-433). The
+observation contract is closed — a role, visible text, or `locator("input[name='…']")`, and
+nothing else — so a class, an id or a test id in a finished suite was recalled from some
+other application by construction, and `services/locator_audit.py` says how many. This exists
+because the prompt had forbidden CSS selectors all along and a live suite contained nineteen
+of them: a rule the model already has and does not follow is not fixed by repeating it. Read
+that row before widening the check — the line is drawn at *application-specific* tokens and
+not at CSS, because narrowing with `tbody tr` before asserting inside a row is what the
+prompt itself asks for. One retry, refused if the second answer lost a file or a test, since
+the cheapest way to stop using class selectors is to delete the tests that used them.
+
 `eval_app_testing.py` asks the same question `eval_test_automation.py` does, aimed at the
 narrower claim this product actually makes: explore the **working** application, then replay
 the suite against both it and a broken build — green on one, red on the other. Its
@@ -318,8 +329,8 @@ is a count and not a percentage (C-95); none of them exercises the collector tho
 depend on (C-97), which is exactly why D-427 and D-431 were found by a live run and not here;
 and a live run with no requirement supplied still produced a suite that was nine-tenths "the
 button is visible", which is C-66 wearing a new hat and is why `_HOLLOW` in the eval was
-widened. Three findings from those live runs are open and are the customer's call rather than
-ours: C-100, C-101 and C-102.
+widened. Three findings from those live runs are open: C-100 and C-101 name what the collector
+and the locator audit still cannot see, and C-102 is the customer's call rather than ours.
 
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —

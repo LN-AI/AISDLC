@@ -3668,6 +3668,49 @@ async function previewAppTestingCost() {
   renderAppTestingCommand();
 }
 
+/* Where this suite's locators came from, and why a reader needs to be told.
+ *
+ * The session only ever carries three ways to address an element -- a role, visible text,
+ * or a `[name='...']` attribute -- so a class, an id or a test id in the finished suite was
+ * remembered from some other application rather than seen in this one. Roughly one in six
+ * was wrong on the run that found this, and a wrong one matches nothing, which means it goes
+ * red against a *correct* build. That is the reason this panel exists and is worded the way
+ * it is: without it the reader's first conclusion on a red run is "our application broke",
+ * and the expensive part is not the failing test, it is the hour spent looking for a defect
+ * that was never there.
+ *
+ * Reads in both directions, like the withheld panel. A suite with none of these says so,
+ * because "we checked and there are none" and "nobody checked" look identical otherwise. */
+function _appLocatorPanel(r) {
+  const invented = (r && r.locators_invented) || 0;
+  const grounded = (r && r.locators_grounded) || 0;
+  if (!invented) {
+    if (!grounded) return '';
+    return `<p class="field-hint" style="margin-top:14px">All ${grounded} locator(s) in this
+      suite were written from what the session observed — roles, accessible names and page
+      text. None was recalled from another application.</p>`;
+  }
+  const rows = ((r.locator_audit || {}).invented) || [];
+  return `
+    <div class="section-title" style="margin-top:20px">Locators that were not observed
+      (${invented})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${esc(r.locator_note || '')}</p>
+    ${rows.length ? `<table class="data-table">
+      <thead><tr><th>File</th><th>Line</th><th>Locator</th><th>Kind</th></tr></thead>
+      <tbody>${rows.map(l => `<tr>
+        <td style="font-family:monospace;font-size:11px">${esc(l.path || '')}</td>
+        <td>${esc(String(l.line || ''))}</td>
+        <td style="font-family:monospace;font-size:11px">${esc(l.selector || '')}</td>
+        <td>${esc(l.kind || '')}</td>
+      </tr>`).join('')}</tbody>
+    </table>` : ''}
+    ${r.locator_retry_rejected ? `<p class="field-hint">The suite was generated a second time
+      with these lines named, and the second answer was not an improvement — it was
+      discarded and this one kept.</p>` : (r.locators_retried ? `<p class="field-hint">These
+      are what remained after the suite was generated a second time with the offending lines
+      named.</p>` : '')}`;
+}
+
 function renderAppTesting(targetId, r) {
   _lastAppTesting = r;
   _lastTestAutomation = r;
@@ -3771,6 +3814,8 @@ function renderAppTesting(targetId, r) {
     ${r.assertion_basis_missing ? `
     <p class="field-hint">${r.assertion_basis_missing} generated test(s) declared no basis at all.
       Treat those as observed.</p>` : ''}
+
+    ${_appLocatorPanel(r)}
 
     ${assumptions.length ? `
     <div class="section-title" style="margin-top:20px">⚠ What it had to assume (${assumptions.length})</div>

@@ -105,7 +105,7 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 CORPUS = os.path.join(REPO, "evals", "app_testing")
 RESULTS = os.path.join(CORPUS, "results")
 
-PROMPT_VERSION = "2026-09-16.1"
+PROMPT_VERSION = "2026-09-17.1"
 
 # Floors are set one run below the measurement, never at it (D-403): a floor set at the
 # measurement fails on a flake and then gets quietly lowered, which is how a regression gate
@@ -571,6 +571,17 @@ def score(result, session_stats, broken, fixed):
         "specified_count": result.get("specified_count", 0),
         "observed_count": result.get("observed_count", 0),
         "downgraded": result.get("assertions_downgraded", 0),
+        # Where the suite's locators came from (C-101). This corpus is the *weakest* place
+        # to measure it -- the three cases are bespoke fixtures the model has no memory of,
+        # so it has nothing to recall and the honest expectation is a number near zero
+        # either way. It is recorded anyway for two reasons: a non-zero count here would
+        # mean the model invents selectors even with nothing to recall, which is a worse
+        # finding than the live one; and a *rising* count after a prompt change is the
+        # regression this row exists to catch. The number that decides whether C-101 is
+        # fixed comes from a live run against a famous application, not from here.
+        "locators_grounded": result.get("locators_grounded", 0),
+        "locators_invented": result.get("locators_invented", 0),
+        "locators_retried": bool(result.get("locators_retried")),
         # `failed_on_fixed` is the important one and is listed first for that reason: it is
         # the noisy-assertion measure, and every entry in it is a test that would go red on
         # a customer's good build.
@@ -677,6 +688,9 @@ def report(runs, repeat, spend):
                   % (r["meaningful_assertions"], r["assertions"], r["specified_count"],
                      r["observed_count"],
                      (", %d downgraded" % r["downgraded"]) if r["downgraded"] else ""))
+            print("     locators: %d observed, %d invented%s"
+                  % (r.get("locators_grounded", 0), r.get("locators_invented", 0),
+                     " (regenerated once)" if r.get("locators_retried") else ""))
             # Named, not counted. A test that fails on the working application is the one
             # thing in this report an operator has to read rather than tally, because it is
             # what a customer's CI would go red on for no reason.

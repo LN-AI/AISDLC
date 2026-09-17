@@ -1288,6 +1288,202 @@ def main_():
         app_session.remove_allowance(_c, project_id, "Transfer Funds")
         app_session.remove_allowance(_c, project_id, "Remove")
 
+    # ── 21. Locators the session never saw ────────────────────────────────
+    # The prompt has said "never write a CSS selector" since the first version and a live
+    # run produced nineteen of them, three matching nothing. So the rule is enforced here
+    # instead, and what makes that possible is that the observation contract is closed:
+    # `COLLECT_JS` emits a role locator, a text locator, or a `[name='...']` attribute
+    # selector, and nothing else. Any class, id or test id in a finished suite therefore
+    # came from the model's memory of another application rather than from this session.
+    section("21. A locator that was never observed is counted, retried and reported")
+    from backend.services import locator_audit
+
+    # The three forms the collector can actually emit, taken from its own branch. If this
+    # ever fails it means the contract widened and the audit is now calling an observed
+    # locator invented -- which would be worse than not checking, because it would send
+    # somebody to fix a correct line.
+    for observed in ("input[name='user-name']", "*[name='login-button']",
+                     "select[name='qty']"):
+        check("the collector's own attribute form reads as observed: " + observed,
+              locator_audit.classify_selector(observed) == "grounded",
+              locator_audit.classify_selector(observed))
+
+    for selector, kind in ((".inventory_item_price", "class"),
+                           ("div.summary_subtotal_label", "class"),
+                           ("#user-name", "id"),
+                           ("[data-test='checkout']", "testid"),
+                           ("[href='/cart']", "attribute"),
+                           ("//div[@id='total']", "xpath"),
+                           ("xpath=//button", "xpath")):
+        check("%s reads as invented (%s)" % (selector, kind),
+              locator_audit.classify_selector(selector) == kind,
+              locator_audit.classify_selector(selector))
+
+    # The other direction, and the reason this is not just "ban CSS". Narrowing to a row
+    # before asserting inside it is what the prompt actually asks for, so a bare tag must
+    # not be reported -- a checker that cries wolf on correct lines gets switched off in
+    # the same way a suite does.
+    for benign in ("tbody tr", "text=Total", "tr:has-text('Widget a.b')", "li >> nth=0"):
+        check("a structural or text locator is not called invented: " + benign,
+              locator_audit.classify_selector(benign) == "generic",
+              locator_audit.classify_selector(benign))
+
+    dirty_code = "\n".join([
+        "import { test, expect } from '@playwright/test';",
+        "test('signs in', async ({ page }) => {",
+        "  await page.getByRole('button', { name: 'Login' }).click();",
+        "  await page.waitForURL('**/inventory.html');",
+        "  await page.locator(\"input[name='user-name']\").fill('standard_user');",
+        "  const prices = await page.locator('.inventory_item_price').allTextContents();",
+        "  await page.getByTestId('cart-badge').click();",
+        "  await expect(page.getByText('$29.99')).toBeVisible();",
+        "});",
+    ])
+    one = locator_audit.audit_content(dirty_code, "tests/checkout.spec.ts")
+    check("a value filled into a locator is not mistaken for a selector",
+          all(row["selector"] != "standard_user" for row in one["invented"]),
+          [r["selector"] for r in one["invented"]])
+    check("the class selector is found", any(r["kind"] == "class" for r in one["invented"]),
+          one["invented"])
+    check("...and so is the test id, which looks like good practice and was still recalled",
+          any(r["kind"] == "testid" for r in one["invented"]), one["invented"])
+    check("exactly the two invented ones are reported", len(one["invented"]) == 2,
+          one["invented"])
+    check("the observed locators are counted too, so the ratio means something",
+          one["grounded"] == 4, one["grounded"])
+    check("each one names the line somebody has to open",
+          sorted(r["line"] for r in one["invented"]) == [6, 7],
+          [r["line"] for r in one["invented"]])
+
+    report = locator_audit.audit([{"path": "a.spec.ts", "content": dirty_code}])
+    sentence = locator_audit.summary_sentence(report)
+    check("the sentence tells the reader to suspect the test before the application",
+          "before concluding the application is broken" in sentence, sentence[:160])
+    check("a clean suite says so rather than staying silent",
+          locator_audit.summary_sentence(
+              locator_audit.audit([{"path": "a", "content": "page.getByRole('button')"}])) == "",
+          "a panel that is empty when there is nothing wrong and empty when nobody checked "
+          "cannot be told apart")
+    note = locator_audit.retry_note(report)
+    check("the retry quotes the model's own line back at it",
+          ".inventory_item_price" in note and "a.spec.ts:6" in note, note[:200])
+    check("...and says not to shrink the suite to satisfy it",
+          "not a request for a smaller suite" in note, note[:400])
+
+    # End to end: a dirty generation is retried once, and the cleaner answer is kept.
+    def _suite(files, basis):
+        return {"levels_chosen": [{"level": "UI/End-to-End", "rationale": "walked"}],
+                "test_files": files, "requirement_coverage": [], "assumptions": [],
+                "not_automated": [], "assertion_basis": basis,
+                "summary": "A suite was written."}
+
+    _dirty_files = [{"path": "tests/a.spec.ts", "framework": "Playwright",
+                     "level": "UI/End-to-End", "content": dirty_code,
+                     "test_names": ["signs in", "totals"], "covers": ["login"],
+                     "prerequisites": ["running application"]}]
+    _clean_files = [{"path": "tests/a.spec.ts", "framework": "Playwright",
+                     "level": "UI/End-to-End",
+                     "content": "page.getByRole('button', { name: 'Login' }).click();",
+                     "test_names": ["signs in", "totals"], "covers": ["login"],
+                     "prerequisites": ["running application"]}]
+    _shrunk_files = [{"path": "tests/a.spec.ts", "framework": "Playwright",
+                      "level": "UI/End-to-End",
+                      "content": "page.getByRole('button', { name: 'Login' }).click();",
+                      "test_names": ["signs in"], "covers": ["login"],
+                      "prerequisites": ["running application"]}]
+    _basis2 = [{"test_name": "signs in", "basis": "observed", "what_it_checks": "it signs in"},
+               {"test_name": "totals", "basis": "observed", "what_it_checks": "the total"}]
+    _basis1 = [{"test_name": "signs in", "basis": "observed", "what_it_checks": "it signs in"}]
+
+    _stub_before = llm_gateway.call_tool
+
+    def _two_answers(first, second):
+        state = {"n": 0}
+
+        def _stub(system_prompt, user_content, tool_schema, llm_override=None,
+                  max_tokens=None):
+            if tool_schema.get("name") == "submit_app_test_suite":
+                state["n"] += 1
+                _llm_calls.append({"name": "submit_app_test_suite", "content": user_content})
+                llm_gateway._record_usage("anthropic", config.MODEL, 1000, 100)
+                return copy.deepcopy(first if state["n"] == 1 else second)
+            return _stub_before(system_prompt, user_content, tool_schema, llm_override,
+                                max_tokens)
+        return _stub, state
+
+    def _generate_with(stub):
+        sid = _open_session(client, scoped, max_steps=5).json()["session"]["id"]
+        _step(client, scoped, sid, [{"role": "link", "name": "Items"}], url_path="/items")
+        llm_gateway.call_tool = stub
+        try:
+            return client.post(f"/api/v1/app-testing/sessions/{sid}/generate",
+                               json={}, headers=scoped)
+        finally:
+            llm_gateway.call_tool = _stub_before
+
+    stub, state = _two_answers(_suite(_dirty_files, _basis2), _suite(_clean_files, _basis2))
+    got = _generate_with(stub).json()
+    check("a suite with a recalled locator is generated a second time", state["n"] == 2,
+          state["n"])
+    check("the cleaner answer is the one kept", got.get("locators_invented") == 0,
+          got.get("locators_invented"))
+    check("and the retry is reported rather than hidden",
+          got.get("locators_retried") is True, got.get("locators_retried"))
+    check("the suite kept its tests", got.get("total_tests") == 2, got.get("total_tests"))
+
+    # The guard that matters most: the cheapest way to stop using class selectors is to
+    # delete the tests that used them, which would trade a false alarm for a coverage hole
+    # and score perfectly on the only number being measured.
+    stub, state = _two_answers(_suite(_dirty_files, _basis2), _suite(_shrunk_files, _basis1))
+    shrunk = _generate_with(stub).json()
+    check("a second answer that dropped a test is refused", state["n"] == 2, state["n"])
+    check("...and the first suite is kept instead", shrunk.get("total_tests") == 2,
+          shrunk.get("total_tests"))
+    check("...with the invented locators still counted, not quietly forgiven",
+          shrunk.get("locators_invented") == 2, shrunk.get("locators_invented"))
+    check("...and the rejection stated, because the money was still spent",
+          shrunk.get("locator_retry_rejected") is True,
+          shrunk.get("locator_retry_rejected"))
+    check("the reader is told which line to open",
+          any(r.get("kind") == "class"
+              for r in (shrunk.get("locator_audit") or {}).get("invented") or []),
+          shrunk.get("locator_audit"))
+
+    # Two generation calls is the ceiling `agent_guard`'s reservation is sized for, so a
+    # session that already paid twice to get any suite at all does not also pay to tidy it.
+    def _empty_then_dirty(system_prompt, user_content, tool_schema, llm_override=None,
+                          max_tokens=None):
+        if tool_schema.get("name") == "submit_app_test_suite":
+            _ceiling["n"] += 1
+            _llm_calls.append({"name": "submit_app_test_suite", "content": user_content})
+            llm_gateway._record_usage("anthropic", config.MODEL, 1000, 100)
+            if _ceiling["n"] == 1:
+                return {"test_files": [], "assertion_basis": [], "summary": "All covered."}
+            return copy.deepcopy(_suite(_dirty_files, _basis2))
+        return _stub_before(system_prompt, user_content, tool_schema, llm_override, max_tokens)
+
+    _ceiling = {"n": 0}
+    capped = _generate_with(_empty_then_dirty).json()
+    check("an empty generation still costs at most two calls, even if the second is dirty",
+          _ceiling["n"] == 2, _ceiling["n"])
+    check("...and the dirty suite is kept and labelled rather than retried a third time",
+          capped.get("locators_invented") == 2 and not capped.get("locators_retried"),
+          (capped.get("locators_invented"), capped.get("locators_retried")))
+
+    # The prompt still has to carry the reason, because the audit only catches what it knows
+    # to look for and a model that understands why writes fewer of them in the first place.
+    agent_src = (ROOT / "backend" / "agents" / "qa_intelligence"
+                 / "app_explorer_agent.py").read_text(encoding="utf-8")
+    check("the prompt argues from what the model was shown, not from durability alone",
+          "You were never shown a class name" in agent_src)
+    check("...and names the cost of a locator that matches nothing",
+          "false alarm" in agent_src)
+    check("...and still permits the one raw form the collector supplies",
+          "[name='...']" in agent_src)
+    check("the screen shows the reader where the locators came from",
+          "_appLocatorPanel" in (ROOT / "frontend" / "app.js").read_text(encoding="utf-8"),
+          "a count nobody renders is a count nobody reads")
+
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)
