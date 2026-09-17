@@ -105,7 +105,7 @@ sys.path.insert(0, os.path.join(REPO, "scripts"))
 CORPUS = os.path.join(REPO, "evals", "app_testing")
 RESULTS = os.path.join(CORPUS, "results")
 
-PROMPT_VERSION = "2026-09-17.1"
+PROMPT_VERSION = "2026-09-17.2"
 
 # Floors are set one run below the measurement, never at it (D-403): a floor set at the
 # measurement fails on a flake and then gets quietly lowered, which is how a regression gate

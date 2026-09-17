@@ -340,6 +340,34 @@ def _locator(raw: str) -> str:
     return text if _LOCATOR.match(text) else ""
 
 
+def _texts_by_step(steps: List[dict]) -> dict:
+    """What the page said *after* each step's action, keyed by position in `steps`.
+
+    The same shift as `_outcomes_by_step`, for the same structural reason and found the same
+    way -- by a run going wrong. A step is recorded when the platform is *asked* what to do
+    next, so everything observed on it, the page text included, is the state the action was
+    chosen from. `step[N].page_texts` is therefore the page before step N ran, which is the
+    page after step N-1 ran.
+
+    Printed under the action line with no label, it reads as the result of that action, and
+    on an application whose address never changes there is nothing to contradict that
+    reading. The 2026-09-17 re-baseline shows the cost precisely: one `basket-total` session
+    asserted the total was GBP 4.00 after a click that took it to GBP 8.00, and **all eight
+    of its failing assertions were wrong by exactly one step**. That suite ran red against a
+    correct application, which is the one failure mode this product cannot afford.
+
+    Kept separate from the outcome shift rather than folded into it because the two answer
+    different questions -- `outcome` is one sentence the driver composed, `page_texts` is
+    what the page displayed -- and a caller wanting one and not the other should not have to
+    take both.
+    """
+    shifted = {}
+    for i, _step in enumerate(steps):
+        nxt = steps[i + 1] if i + 1 < len(steps) else None
+        shifted[i] = list((nxt or {}).get("page_texts") or [])
+    return shifted
+
+
 def _journeys_markdown(steps: List[dict]) -> str:
     """The session, rendered for the suite writer.
 
@@ -350,6 +378,7 @@ def _journeys_markdown(steps: List[dict]) -> str:
     # Paired before grouping: a journey is a subset of the run, and the step that reports
     # what an action did is the next one *chronologically*, not the next one in its journey.
     shifted = _outcomes_by_step(steps)
+    texts_after = _texts_by_step(steps)
     grouped: dict = {}
     order: List[str] = []
     for position, step in enumerate(steps):
@@ -396,13 +425,22 @@ def _journeys_markdown(steps: List[dict]) -> str:
             else:
                 bits.append("— observed: nothing reported; the session ended here")
             out.append(" ".join(bits))
-            if step.get("page_texts"):
-                # What the page said when this step was taken. This is where an assertion
-                # about a *value* comes from: without it a suite can only check which
-                # controls exist, and "the total is wrong" looks identical to "the total is
-                # right" when all you can see is buttons.
-                shown = "; ".join(str(t) for t in step["page_texts"][:8])
-                out.append(f"  page showed: {shown}")
+            # Where an assertion about a *value* comes from: without it a suite can only
+            # check which controls exist, and "the total is wrong" looks identical to "the
+            # total is right" when all you can see is buttons.
+            #
+            # Both sides are labelled, because the old single unlabelled line was the state
+            # *before* the action and read as the state after it. The second line is only
+            # printed when the page actually changed -- on a page that did not, repeating
+            # the same eight lines would spend the input budget to say nothing, and this
+            # product has already learned once that the page-text budget is the thing that
+            # runs out first (D-431).
+            before = [str(t) for t in (step.get("page_texts") or [])][:8]
+            after = [str(t) for t in (texts_after.get(position) or [])][:8]
+            if before:
+                out.append("  before this action the page showed: " + "; ".join(before))
+            if after and after != before:
+                out.append("  and after it the page showed: " + "; ".join(after))
         out.append("")
     return "\n".join(out).strip()
 

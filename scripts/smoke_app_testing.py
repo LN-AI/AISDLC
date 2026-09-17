@@ -1484,6 +1484,93 @@ def main_():
           "_appLocatorPanel" in (ROOT / "frontend" / "app.js").read_text(encoding="utf-8"),
           "a count nobody renders is a count nobody reads")
 
+    # ── 22. What the suite writer is actually told ────────────────────────
+    # `_journeys_markdown` is the whole input to the expensive half, and until now nothing
+    # offline read it. Both of its off-by-one faults were found by paying for a live run:
+    # D-430 (the outcome column) cost two suites every test they had, and the page-text
+    # shift cost a `basket-total` session all eight of its assertions on 2026-09-17. They
+    # have the same cause -- a step records the state its action was *chosen from*, so
+    # everything on it describes the moment before that action -- and the same fix.
+    section("22. Each step is told what its own action did, and what the page then said")
+    from backend.routes.app_testing import _journeys_markdown
+
+    walked = [
+        {"journey": "Buy a widget", "url_path": "/", "outcome": "",
+         "page_texts": ["status: GBP 0.00"],
+         "action": {"action_kind": "click", "target_role": "button",
+                    "target_name": "Add Widget"}},
+        {"journey": "Buy a widget", "url_path": "/", "outcome": "stayed on the same page",
+         "page_texts": ["status: GBP 4.00"],
+         "action": {"action_kind": "click", "target_role": "button",
+                    "target_name": "One more Widget"}},
+        {"journey": "Buy a widget", "url_path": "/", "outcome": "stayed on the same page",
+         "page_texts": ["status: GBP 8.00"],
+         "action": {"action_kind": "click", "target_role": "button",
+                    "target_name": "Checkout"}},
+        {"journey": "Pay", "url_path": "/pay", "outcome": "navigated to /pay",
+         "page_texts": ["heading: Payment"],
+         "action": {"action_kind": "click", "target_role": "button", "target_name": "Pay"}},
+    ]
+    md = _journeys_markdown(walked)
+    lines = [ln.strip() for ln in md.splitlines()]
+
+    def _block(name):
+        """The action line for a step, plus the two page-text lines under it."""
+        for i, ln in enumerate(lines):
+            if ('"%s"' % name) in ln:
+                return lines[i:i + 3]
+        return []
+
+    add = _block("Add Widget")
+    check("an action is credited with its own result, not the previous one's",
+          "observed: stayed on the same page" in add[0],
+          add[0] if add else "the step is missing entirely")
+    check("the page state before an action is labelled as before",
+          any(l.startswith("before this action the page showed:") and "GBP 0.00" in l
+              for l in add), add)
+    check("...and the state it produced is labelled as after",
+          any(l.startswith("and after it the page showed:") and "GBP 4.00" in l
+              for l in add),
+          "clicking Add Widget took the basket from GBP 0.00 to GBP 4.00; a suite told "
+          "otherwise asserts the total it saw before the click: %s" % (add,))
+
+    more = _block("One more Widget")
+    check("the shift holds for the next step too, not just the first",
+          any("GBP 4.00" in l and l.startswith("before this action") for l in more)
+          and any("GBP 8.00" in l and l.startswith("and after it") for l in more), more)
+
+    # The bug this replaced, stated as its own check so it cannot come back by accident.
+    check("no page text is printed without saying which side of the action it is",
+          "  page showed:" not in md,
+          "an unlabelled line under an action reads as that action's result, and on an "
+          "application whose address never changes nothing contradicts that reading")
+
+    pay = _block("Pay")
+    check("the last step reports that nothing came back rather than inventing an outcome",
+          "observed: nothing reported" in pay[0], pay[0] if pay else "missing")
+    check("...and has no 'after' state, because no step recorded one",
+          not any(l.startswith("and after it") for l in pay), pay)
+
+    # A page that did not change prints once, not twice. The page-text budget is the thing
+    # that runs out first on a real application (D-431), so saying the same eight lines
+    # twice would cost the last of it to say nothing.
+    still = [
+        {"journey": "Look", "url_path": "/", "outcome": "",
+         "page_texts": ["heading: Shop"],
+         "action": {"action_kind": "click", "target_role": "link", "target_name": "About"}},
+        {"journey": "Look", "url_path": "/", "outcome": "stayed on the same page",
+         "page_texts": ["heading: Shop"],
+         "action": {"action_kind": "click", "target_role": "link", "target_name": "Home"}},
+    ]
+    quiet = _journeys_markdown(still)
+    check("an unchanged page is described once rather than twice",
+          quiet.count("heading: Shop") == 2 and "and after it the page showed" not in quiet,
+          quiet)
+
+    check("the suite writer is told to read the labels rather than the order",
+          "Read the labels rather than the order" in agent_src,
+          "the model has to know which of the two values an assertion wants")
+
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")
     check("the registry knows the product", product is not None)
