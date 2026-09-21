@@ -349,6 +349,34 @@ def page_signature(url_path, candidates, texts=None):
     return shape + "#" + digest[:12]
 
 
+def structural_signature(url_path, candidates):
+    """The same fingerprint with what the page *says* left out. C-111's answer.
+
+    `page_signature` folds page text in on purpose, and the comment above says why: on a
+    client-rendered application the text is the only thing a click changes. It also states
+    the cost -- "a page with a clock or a live counter never repeats a signature" -- and
+    judges that the better failure to have. Measurement since then says otherwise. C-105 put
+    the price of an undetected loop at **22 of 26 paid steps**, and the blind spot is not the
+    rare case it sounds like: `TEXTS_JS` collects `[role=status]` and `[aria-live]`, so any
+    toast, badge, "last updated" stamp or clock disables the rule outright. Verified on the
+    real function -- four visits to one unchanged page with a single ticking status line give
+    four distinct signatures; remove the line and they give one.
+
+    The fix is deliberately **not** to drop live regions from `page_signature`. The
+    `basket-total` eval case renders its total as
+    `<strong id="total" role="status" aria-live="polite">`, so excluding live regions would
+    blind the rule to the one value that case exists to measure -- the obvious fix, and a
+    regression in the only case already living at two thirds.
+
+    So this is a second, coarser fingerprint rather than a change to the first, and the two
+    are asked separately (`app_session.stalled`). Nothing a page does on its own can move
+    this one: it covers the address, the controls on offer and their current values, so
+    filling in a form still reads as progress (D-413) while a clock, a toast and a
+    re-selected dropdown do not.
+    """
+    return page_signature(url_path, candidates, None)
+
+
 def describe_policy():
     """What the caller is bound by, so a driver and a screen can show it rather than guess."""
     return {

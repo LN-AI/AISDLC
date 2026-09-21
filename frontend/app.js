@@ -3717,6 +3717,32 @@ function _appAssertionPanel(r) {
     </table>` : ''}`;
 }
 
+function _appJourneyPanel(r) {
+  // C-115. A test can address real elements, be able to fail, and still describe a page
+  // nobody opened — which the other two panels cannot show, because both read the suite
+  // alone. Silent when the session recorded no paths: "nothing was observed" must not read
+  // as "everything was invented".
+  const audit = (r && r.journey_audit) || {};
+  const n = (r && r.untested_journey_count) || 0;
+  if (!audit.checked) return '';
+  if (!n) {
+    return `<p class="field-hint" style="margin-top:14px">Every test in this suite drives
+      only to pages the session actually opened.</p>`;
+  }
+  const rows = audit.unvisited || [];
+  return `
+    <div class="section-title" style="margin-top:20px">Tests for pages this session never
+      opened (${n})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${esc(r.untested_journey_note || '')}</p>
+    ${rows.length ? `<table class="data-table">
+      <thead><tr><th>File</th><th>Pages it drives to</th><th>Tests</th></tr></thead>
+      <tbody>${rows.map(j => `<tr>
+        <td style="font-family:monospace;font-size:11px">${esc(j.path || '')}</td>
+        <td style="font-family:monospace;font-size:11px">${esc((j.destinations || []).join(', '))}</td>
+        <td style="font-size:11px">${esc((j.tests || []).join(', '))}</td>
+      </tr>`).join('')}</tbody></table>` : ''}`;
+}
+
 function _appLocatorPanel(r) {
   const invented = (r && r.locators_invented) || 0;
   const grounded = (r && r.locators_grounded) || 0;
@@ -3852,6 +3878,7 @@ function renderAppTesting(targetId, r) {
       Treat those as observed.</p>` : ''}
 
     ${_appLocatorPanel(r)}
+    ${_appJourneyPanel(r)}
     ${_appAssertionPanel(r)}
 
     ${assumptions.length ? `

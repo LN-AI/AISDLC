@@ -81,6 +81,21 @@ MAX_JOURNEY_CHARS = 120
 MAX_PAGE_TEXTS = 28
 MAX_PAGE_TEXT_CHARS = 160
 
+# What the page *offered*, kept rather than counted. `candidates_offered` has always been an
+# INTEGER, so the platform recorded how many controls a step saw and discarded which -- and
+# with them any possibility of asking a question of a finished session. Every one of those
+# questions is live: whether a different page-signature rule would have caught a wandering
+# run (C-105), whether a structured outline is worth its tokens, whether a confidence signal
+# separates a stuck session from one that legitimately stopped early. Each needs the
+# observations of sessions already on disk, and each was blocked on this.
+#
+# 60 matches the driver's own cap, so this stores what arrived rather than a second opinion
+# about how much should have. It is page content of the same class as the text digest, so it
+# lives under D-418's regime exactly -- sealed at rest, expiring on the window the customer
+# chose, and wiped by the same call -- rather than becoming a new store with new promises.
+MAX_STORED_CANDIDATES = 60
+MAX_CANDIDATE_FIELD_CHARS = 200
+
 # How long a session's page-text digest is kept, in days. Seven matches
 # `review_source_store`'s default for customer source, which is the nearest thing to it
 # already in the platform: both are the customer's own content, held only because a later
@@ -231,7 +246,9 @@ def init_schema(cursor: sqlite3.Cursor) -> None:
             cursor.execute(f"ALTER TABLE app_sessions ADD COLUMN {_col} {_type}")
         except sqlite3.OperationalError:
             pass  # column already exists
-    for _col, _type in (("page_texts", "TEXT DEFAULT ''"),):
+    for _col, _type in (("page_texts", "TEXT DEFAULT ''"),
+                        ("structural_signature", "TEXT DEFAULT ''"),
+                        ("candidates_json", "TEXT DEFAULT ''")):
         try:
             cursor.execute(f"ALTER TABLE app_steps ADD COLUMN {_col} {_type}")
         except sqlite3.OperationalError:
@@ -336,37 +353,71 @@ def require_open(conn, session_id):
     return session
 
 
-def recent_signatures(conn, session_id, limit=NO_PROGRESS_LIMIT):
+# The two fingerprints a step carries, and the only column names these helpers will
+# interpolate. A whitelist rather than a parameter, because a column name cannot be bound.
+SIGNATURE_COLUMNS = ("page_signature", "structural_signature")
+
+
+def _sig_column(column: str) -> str:
+    if column not in SIGNATURE_COLUMNS:
+        raise ValueError(f"not a signature column: {column!r}")
+    return column
+
+
+def recent_signatures(conn, session_id, limit=NO_PROGRESS_LIMIT,
+                      column="page_signature"):
     """The page signatures of the last `limit` steps, newest first."""
+    col = _sig_column(column)
     cur = conn.execute(
-        "SELECT page_signature FROM app_steps WHERE session_id = ? "
+        f"SELECT {col} AS sig FROM app_steps WHERE session_id = ? "
         "ORDER BY step_index DESC LIMIT ?",
         (session_id, limit),
     )
-    return [r["page_signature"] for r in cur.fetchall()]
+    return [r["sig"] for r in cur.fetchall()]
 
 
-def seen_signatures(conn, session_id):
+def seen_signatures(conn, session_id, column="page_signature"):
     """Every distinct page signature this session has reached."""
+    col = _sig_column(column)
     cur = conn.execute(
-        "SELECT DISTINCT page_signature FROM app_steps WHERE session_id = ?",
+        f"SELECT DISTINCT {col} AS sig FROM app_steps WHERE session_id = ?",
         (session_id,),
     )
-    return {r["page_signature"] for r in cur.fetchall() if r["page_signature"]}
+    return {r["sig"] for r in cur.fetchall() if r["sig"]}
 
 
-def signatures_before(conn, session_id, skip):
+def signatures_before(conn, session_id, skip, column="page_signature"):
     """Every distinct signature this session reached *before* its last `skip` steps."""
+    col = _sig_column(column)
     cur = conn.execute(
-        "SELECT DISTINCT page_signature FROM app_steps WHERE session_id = ? "
+        f"SELECT DISTINCT {col} AS sig FROM app_steps WHERE session_id = ? "
         "AND step_index <= (SELECT COALESCE(MAX(step_index), 0) - ? FROM app_steps "
         "                   WHERE session_id = ?)",
         (session_id, skip, session_id),
     )
-    return {r["page_signature"] for r in cur.fetchall() if r["page_signature"]}
+    return {r["sig"] for r in cur.fetchall() if r["sig"]}
 
 
-def stalled(conn, session_id, signature, limit=NO_PROGRESS_LIMIT):
+def _no_new_ground(conn, session_id, signature, limit, column):
+    """The set-based test of D-441, asked about one fingerprint.
+
+    True when every signature in the window -- and the page now being observed -- was already
+    reached *before* the window opened, so nothing new has been found whatever order they
+    came in.
+    """
+    recent = recent_signatures(conn, session_id, limit, column)
+    if len(recent) < limit:
+        return False
+    if all(sig == signature for sig in recent):
+        return True                       # the original rule, kept as the obvious case
+    earlier = signatures_before(conn, session_id, limit, column)
+    if not earlier:
+        return False                      # too early to say anything
+    window = {sig for sig in recent if sig} | ({signature} if signature else set())
+    return bool(window) and window.issubset(earlier)
+
+
+def stalled(conn, session_id, signature, structural="", limit=NO_PROGRESS_LIMIT):
     """Has the session stopped finding anything new?
 
     **Progress means reaching something this session has not reached before**, which is not
@@ -393,17 +444,35 @@ def stalled(conn, session_id, signature, limit=NO_PROGRESS_LIMIT):
     is preserved rather than replaced, and the two failures it must not have are both
     avoided: filling a form produces a genuinely new signature each time, and a session that
     reaches a new dialog and comes back has one member of the window that is new.
+
+    **Asked of two fingerprints, because one of them can be defeated by the page itself**
+    (C-111). The paragraph above says the explorer can move the measure by typing; the page
+    can move it too, and without being asked. `page_signature` folds in what the page says,
+    and `TEXTS_JS` collects live regions -- so a clock, a toast, a notification badge or a
+    "last updated" stamp gives every visit a brand-new signature and this test can never
+    answer yes. Verified on the real function: four visits to one unchanged page carrying a
+    single ticking status line produce four distinct signatures, and one with the line
+    removed. On the applications this product is aimed at -- dashboards, banking portals,
+    anything with a toast -- the rule was simply off, and C-105 prices an undetected loop at
+    22 of 26 paid steps.
+
+    `structural` is the same fingerprint with the page's words left out, so nothing the page
+    does on its own can move it. Either test firing is enough. The asymmetry is deliberate
+    and is the safe direction: the structural test can only ever fire where the current one
+    was blind, and a session stopped early loses its tail, where one never stopped loses
+    everything after step four. It is **not** a replacement -- dropping text from the one
+    fingerprint would blind it to `basket-total`'s own total, which is rendered inside an
+    `aria-live` region, and that is the case already living at two thirds.
     """
-    recent = recent_signatures(conn, session_id, limit)
-    if len(recent) < limit:
-        return False
-    if all(sig == signature for sig in recent):
-        return True                       # the original rule, kept as the obvious case
-    earlier = signatures_before(conn, session_id, limit)
-    if not earlier:
-        return False                      # too early to say anything
-    window = {sig for sig in recent if sig} | ({signature} if signature else set())
-    return bool(window) and window.issubset(earlier)
+    if _no_new_ground(conn, session_id, signature, limit, "page_signature"):
+        return True
+    # Older rows predate the column and carry ''. `_no_new_ground` would then see a window of
+    # empty strings that is trivially a subset of nothing and return False, but only because
+    # `earlier` is empty -- so the guard is explicit rather than incidental.
+    if structural and _no_new_ground(conn, session_id, structural, limit,
+                                     "structural_signature"):
+        return True
+    return False
 
 
 def normalise_retention(value) -> int:
@@ -455,6 +524,35 @@ def _unseal(blob) -> list:
     return [str(t) for t in decoded] if isinstance(decoded, list) else []
 
 
+def _seal_rows(rows) -> str:
+    """`_seal` for structured rows rather than lines of text.
+
+    Deliberately not a parameter on `_seal`: that one runs `clip_texts` on its way in, which
+    joins each item's words and truncates it to a line, so a dict handed to it is stored as
+    the *string* of its repr and comes back as one. That is not hypothetical -- it is what
+    this function was written after, and the check that missed it printed the rows and read
+    dict-looking text as dicts. A `repr` in a print is a proxy, and a proxy is not the result.
+    """
+    if not rows:
+        return ""
+    return crypto_service.encrypt(json.dumps(rows))
+
+
+def _unseal_rows(blob) -> list:
+    """`_unseal` for structured rows: objects come back as objects, not as their repr."""
+    text = str(blob or "")
+    if not text:
+        return []
+    try:
+        decoded = json.loads(crypto_service.decrypt(text))
+    except Exception:
+        try:
+            decoded = json.loads(text)   # written before this column was encrypted
+        except (ValueError, TypeError):
+            return []
+    return [r for r in decoded if isinstance(r, dict)] if isinstance(decoded, list) else []
+
+
 def clip_texts(texts):
     """A page's text digest, bounded on both axes before it is stored or prompted with.
 
@@ -474,7 +572,7 @@ def clip_texts(texts):
 
 def record_step(conn, session_id, *, step_index, journey, url_path, page_signature,
                 action, observation_chars, candidates_offered, candidates_refused,
-                outcome="", page_texts=None):
+                outcome="", page_texts=None, structural_signature="", candidates=None):
     """Write one step and advance the counters, in one transaction.
 
     `steps_used` is incremented here rather than by the caller so that the count and the
@@ -485,13 +583,14 @@ def record_step(conn, session_id, *, step_index, journey, url_path, page_signatu
         """INSERT INTO app_steps
                (id, session_id, step_index, journey, url_path, page_signature, action_json,
                 observation_chars, candidates_offered, candidates_refused, page_texts,
-                outcome, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                structural_signature, candidates_json, outcome, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (str(uuid.uuid4()), session_id, step_index,
          str(journey or "")[:MAX_JOURNEY_CHARS], str(url_path or "")[:MAX_LABEL_CHARS],
          page_signature or "", json.dumps(action or {}), int(observation_chars or 0),
          int(candidates_offered or 0), int(candidates_refused or 0),
-         _seal(page_texts),
+         _seal(page_texts), structural_signature or "",
+         _seal_rows(clip_candidates(candidates)) if candidates else "",
          str(outcome or "")[:MAX_LABEL_CHARS], _now()),
     )
     conn.execute(
@@ -543,15 +642,53 @@ def source_review_ids(session) -> list:
     return [str(r) for r in decoded] if isinstance(decoded, list) else []
 
 
+def clip_candidates(candidates) -> list:
+    """What a step recorded seeing, bounded on every axis before it is stored.
+
+    The same treatment `clip_texts` gives the digest, and for the same reason: this is model
+    input whose size a customer's page decides. Only the fields that travelled over the wire
+    are kept -- a candidate arrives with six and the `dom_id` never leaves the browser -- plus
+    why the policy withheld it, which is the half D-426 found missing from the counts.
+    """
+    out = []
+    for row in (candidates or [])[:MAX_STORED_CANDIDATES]:
+        if not isinstance(row, dict):
+            continue
+        kept = {}
+        for field in ("role", "name", "value", "submits", "locator", "context",
+                      "refused_because", "refused_group"):
+            raw = row.get(field)
+            if raw:
+                kept[field] = str(raw)[:MAX_CANDIDATE_FIELD_CHARS]
+        kept["enabled"] = bool(row.get("enabled", True))
+        if row.get("positional"):
+            kept["positional"] = True
+        # The number the model was actually shown, present only on rows that reached it.
+        # Without it the record says what the page held and not what was on offer, and the
+        # two differ by whatever the policy withheld -- which is the difference D-426 exists
+        # to make visible and the one any later analysis of a session turns on.
+        if isinstance(row.get("index"), int):
+            kept["index"] = row["index"]
+        out.append(kept)
+    return out
+
+
 def wipe_page_text(conn, session_id) -> int:
-    """Forget what the pages said, keeping every other record of the session.
+    """Forget what the pages said and what they offered, keeping every other record.
 
     The same shape `review_source_store` uses for expired source: the inventory row survives
     and only the content goes, so a person can still see that a session ran, how far it got
     and what it refused, after the thing this deletes is gone.
+
+    Both columns, because both are what the page *displayed*. A control's accessible name is
+    the customer's wording and a field's value can be what somebody typed, so a promise that
+    covered the digest and left the candidate list behind would be a promise with a hole in
+    it. `refused_summary` on the session row is deliberately outside this and stays (D-426):
+    it is how a person sees what a session declined after the content is gone.
     """
     cur = conn.execute(
-        "UPDATE app_steps SET page_texts = '' WHERE session_id = ? AND page_texts != ''",
+        "UPDATE app_steps SET page_texts = '', candidates_json = '' "
+        "WHERE session_id = ? AND (page_texts != '' OR candidates_json != '')",
         (session_id,))
     conn.execute("UPDATE app_sessions SET page_text_expires_at = NULL WHERE id = ?",
                  (session_id,))
@@ -646,6 +783,12 @@ def steps(conn, session_id, limit=MAX_STEPS_CEILING):
             item["action"] = {}
         item.pop("action_json", None)
         item["page_texts"] = _unseal(item.get("page_texts"))
+        # What this step was offered, back as a list. Absent on every row written before the
+        # column existed, and on every row whose retention window has passed -- both of which
+        # read as "not available" rather than "the page offered nothing", which is why the
+        # count beside it is kept separately.
+        item["candidates"] = _unseal_rows(item.get("candidates_json"))
+        item.pop("candidates_json", None)
         out.append(item)
     return out
 

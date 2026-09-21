@@ -230,6 +230,38 @@ win. An abandoned session is closed after six hours and its digest then expires 
 window its customer chose** (D-425), which is also what repairs a D-418 promise whose SQL
 excluded the only case its own docstring described.
 
+**No fingerprint can see the wandering, and D-456 is why it stopped trying to.** The measured
+failure is not a page that looks the same — it is *one control used over and over*. Across four
+stored live sessions: SauceDemo filled **Password seven times** and never pressed Login again
+after step 4; ParaBank cycled two dropdowns and a `Go` button for **sixteen of twenty** steps;
+Shoelace clicked one `Button` six times. Every one of those genuinely changes the page, because
+a signature carries each control's value *by design* (D-441) — so `stalled` can never answer
+yes, and D-447's value-free signature gave 11 distinct values over ParaBank's 16 stuck steps
+too. So the platform counts instead: the third identical action on one page is refused, **but
+only while it can name a control on that page it has used less**. That second clause is not a
+nicety — without it a one-control page records no step at all, `stalled` never accumulates, and
+the session ends by the driver giving up instead of the platform saying `done`, which is D-440.
+Replayed over those four traces it refuses 6 of 10, 10 of 20 and 4 of 6 — and **0 of 20 on
+OrangeHRM**, the one session that actually walked the application. Read that zero before
+loosening or tightening it: a rule that also fires on good exploration is a step budget wearing
+a costume.
+
+**And a third clause, which the corpus insisted on.** Refusing on the count alone still scored
+9/9 and still cost something real: separating tests fell 41 → 29 over nine sessions, because
+`basket-total`'s arithmetic bug is invisible at a quantity of one and clicking *add* a third
+time is that entire case. So a repeat is refused only when the earlier attempts put **no text on
+the page the session had not already seen there** — the difference between a dropdown that
+changes its own value and a basket total that changes. Read D-456 before touching any of the
+three clauses; each was added because removing it was measured and cost something.
+
+**A requirement ledger was proposed for the same problem, measured, and thrown away (C-116).**
+Extracting the requirement's own words and telling the explorer which it had not yet reached
+named the right control on **0 of 56 steps** across those four sessions — the unreached terms
+are mostly English (`signing`, `taking`, `refused`, `asks`, `among`), and where they were real
+they shared no token with the interface: ParaBank's requirement never says *transfer*, and
+`address`/`phone` never meet `Update Contact Info`. That is C-90 measured a second time on a
+second product. Do not rebuild it lexically.
+
 **And an observation is what a page offers *and* what it says, in both cases read off the
 DOM rather than inferred.** Three parts of `COLLECT_JS`/`TEXTS_JS` in `scripts/explore_app.py`
 each exist because of a specific failure, so none of them is decoration. A page's landmark
@@ -244,7 +276,17 @@ applications each produced a suite in which every test timed out on the shared s
 because an `<input type="submit">` was named from its `name` attribute rather than its `value`.
 Read that row before touching the name chain — a name that looks plausible and resolves to
 nothing is the whole failure, so the fixture asserts that Playwright finds exactly one element
-rather than that the string looks right. What a page *says* had the same
+rather than that the string looks right. **And a large class of real applications gives a
+control no name at all**, which is D-457: on a live OrangeHRM admin screen **17 of 60**
+controls arrived with a role, a row context and no address whatsoever, because the labels are
+sibling `<div>`s with no `for`. The accessibility tree genuinely computes nothing for those, so
+borrowing the neighbouring text would be D-427 again — a string that reads correctly and
+matches zero elements. They are addressed by their ordinal within the role instead, computed in
+the page and flagged as weaker than a name where the suite writer will see it. Two things keep
+that honest and both are load-bearing: `roleOf` is defined once and used by both the counting
+pre-pass and the emitting loop, because an ordinal counted over a different set of elements is
+an address silently off by one; and `link` is excluded, because `roleOf` calls every `<a>` a
+link and the tree does not call an `<a>` without `href` one. What a page *says* had the same
 problem, and `TEXTS_JS` now collects from **the element that renders the words** rather than
 from whatever carries an `id` (D-431) — on a live catalogue the old selector matched 34
 elements, none of them a heading, and sent the navigation run together as one line while
@@ -391,9 +433,17 @@ The Python ones drive the real app through FastAPI's `TestClient` against a thro
 - `smoke_llm_providers.py` stubs the *provider* functions (`_call_anthropic` / `_call_openai`) rather than `call_tool`, because the resolution logic under test lives inside `call_tool` — stubbing that would stub out the thing being tested.
 - `smoke_plan_picker.js` takes a `products.json` argument (a saved `GET /api/v1/products` response) and **there is no such file in the repo**, so it dies with `ENOENT` until you capture one from a running server. `smoke_render.js` needs no argument — it defaults to `frontend/app.js`.
 
-Two of the scripts are neither tests nor throwaway tooling, and both exist because a
-caveat asked for evidence rather than an edit:
+Three of the scripts are neither tests nor throwaway tooling, and each exists because a
+caveat or a design question asked for evidence rather than an edit:
 
+- **`scripts/probe_assertion_shapes.py`** answers whether the suite writer could be made to
+  *choose* an assertion instead of writing one — D-408's rule aimed at the half of the
+  pipeline it was never applied to, which is where every recalled-information defect lives
+  (C-101, C-103, C-109, D-427, D-438, D-442). It parses every generated suite on disk, in
+  `evals/app_testing/results/suites/` **and** in the `app_testing` rows of a database, and
+  classifies each `expect(...)` by whether a deterministic compiler could have emitted it.
+  Measured 2026-09-18: **96.1% over 2,305 assertions in 176 files**, and the classifier errs
+  toward *inexpressible*, so that is a floor (D-448). Offline, no key, writes nothing.
 - **`scripts/measure_event_loop.py`** answers C-31. It starts a server whose model gateway
   sleeps, fires one review, and times `GET /` alongside it — so "does a long review freeze
   the server" has a number instead of an opinion. It found that it did (`GET /` blocked

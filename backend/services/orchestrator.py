@@ -26,7 +26,8 @@ from backend.agents.qa_intelligence.test_automation_agent import TestAutomationA
 from backend.agents.qa_intelligence.app_explorer_agent import AppExplorerAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
-from backend.services import assertion_audit, cost_optimization_service, locator_audit
+from backend.services import (assertion_audit, cost_optimization_service, journey_audit,
+                              locator_audit)
 from backend import config, database
 from backend.workflows import shared as workflow_shared
 from backend.workflows import autofix_pr as autofix_pr_workflow
@@ -986,6 +987,16 @@ class SDLCOrchestrator:
             target_label=target_label,
             context=context,
             observed_locators=(session or {}).get("observed_locators"),
+            # The agent audits its own answer and may retry once on the strength of it, and
+            # until now it did that half blind: it received the locators the session was
+            # given but not the text the session collected, so `unseen-name` -- a heading
+            # nobody saw -- could only ever be *reported* here, after the one retry it would
+            # have justified had already been skipped. That is D-430's failure exactly, the
+            # one where an invented `getByRole('heading', { name: 'Products' })` in a shared
+            # helper took every test in a live suite down with it, and it is the case a retry
+            # is most likely to fix, because the headings the session did see are already in
+            # the prompt. Same argument D-442 makes for its own check feeding the retry.
+            observed_texts=(session or {}).get("observed_texts"),
             llm_override=llm_override,
         )
 
@@ -1152,6 +1163,26 @@ class SDLCOrchestrator:
         assertion_note = assertion_audit.summary_sentence(assertions)
         if assertion_note:
             result["assertion_strength_note"] = assertion_note
+
+        # The honesty pass aimed at a fourth noun, and the one the other two cannot reach.
+        # `locator_audit` asks whether an element could have been observed and
+        # `assertion_audit` whether a test could ever fail; both read the suite alone, so
+        # neither can see a well-formed test that describes a part of the application nobody
+        # visited. A live ParaBank session walked three journeys, never reached registration,
+        # and produced three registration tests -- all failing -- while claiming every
+        # requirement covered (C-115). Counted rather than rewritten, for D-433's reason, and
+        # conservative on purpose: a false accusation teaches a reader to ignore the column.
+        journeys = journey_audit.audit(files, (session or {}).get("visited_paths"))
+        result["journey_audit"] = journeys
+        result["untested_journey_count"] = journeys["unvisited_count"]
+        journey_note = journey_audit.summary_sentence(journeys)
+        if journey_note:
+            result["untested_journey_note"] = journey_note
+            logger.warning(
+                "app-testing: suite drives to %d page(s) this session never opened "
+                "(%d test(s) across %d file(s))",
+                sum(len(r.get("destinations") or []) for r in journeys["unvisited"]),
+                journeys["unvisited_count"], journeys["files_affected"])
 
         # Whether this suite could see values at all, stated on the result rather than left
         # to be inferred from its contents. A customer who turned page text off gets a suite

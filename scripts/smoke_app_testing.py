@@ -449,6 +449,18 @@ def main_():
           g8b.get("requirement_coverage"))
     check("the requirement was sent to the model",
           "own dashboard" in _llm_calls[-1]["content"], _llm_calls[-1]["content"][:300])
+    # D-452, end to end rather than module-only: the route has to hand the orchestrator the
+    # paths the session stood on, or the audit silently turns itself off and reports a clean
+    # bill for a suite nobody checked -- which is the shape of every defect this file guards.
+    check("the generated result carries the journey audit",
+          isinstance(g8b.get("journey_audit"), dict)
+          and g8b["journey_audit"].get("checked") is True,
+          g8b.get("journey_audit"))
+    check("...built from the paths this session actually recorded",
+          "/items" in ((g8b.get("journey_audit") or {}).get("visited_paths") or []),
+          (g8b.get("journey_audit") or {}).get("visited_paths"))
+    check("...and the count is reported beside it",
+          "untested_journey_count" in g8b, sorted(g8b)[:40])
 
     # ...and so does a document somebody uploaded. A specification is filed under Requirements
     # because that is where it belongs, and it is simultaneously the most useful thing a test
@@ -1033,6 +1045,33 @@ def main_():
           "bounded by distinct name, so a loop that meets the same button on every page "
           "cannot grow the record")
 
+    # D-453. What a step was *offered* is kept, not counted. `candidates_offered` was an
+    # INTEGER, so the platform recorded how many controls a page held and threw away which --
+    # and every open question about a finished session needs the list: whether a different
+    # no-progress rule would have caught a wandering run (C-105), whether a structured
+    # outline earns its tokens, whether a confidence signal can tell a stuck session from one
+    # that stopped early. Checked by reading a stored step back rather than by asserting the
+    # column exists, because the first version of this stored each row as the *string* of its
+    # repr and a print of it looked exactly right.
+    with contextlib.closing(database.get_connection()) as _c:
+        _recorded = app_session.steps(_c, withholding)
+    _seen = [c for s in _recorded for c in (s.get("candidates") or [])]
+    check("a step records the controls it was offered, not just how many",
+          _seen and all(isinstance(c, dict) for c in _seen),
+          f"{len(_seen)} row(s), types {sorted({type(c).__name__ for c in _seen})}")
+    check("...including the number the model was shown for each",
+          any(isinstance(c.get("index"), int) for c in _seen),
+          "without it the record says what the page held and not what was on offer")
+    check("...and why the policy withheld the ones it did",
+          any(c.get("refused_group") for c in _seen),
+          "the half D-426 found missing from the counts, now per step rather than per session")
+    with contextlib.closing(database.get_connection()) as _c:
+        _raw = _c.execute("SELECT candidates_json FROM app_steps WHERE session_id = ? "
+                          "AND candidates_json != '' LIMIT 1", (withholding,)).fetchone()
+    check("...sealed at rest, because a control's name is the customer's wording",
+          _raw and "Delete account" not in (_raw["candidates_json"] or ""),
+          "it is page content of the same class as the digest and gets the same treatment")
+
     # Page text is the customer's own content and is wiped on a clock. What a session
     # *refused* is not: `wipe_page_text` promises a person can still see that a session ran,
     # how far it got, and what it would not do.
@@ -1042,6 +1081,14 @@ def main_():
     check("the refusal record survives the page-text wipe",
           len(after_wipe.json()["session"].get("refusals", [])) == 2,
           "the wipe promises that what a session refused stays visible")
+    with contextlib.closing(database.get_connection()) as _c:
+        _gone = [c for s in app_session.steps(_c, withholding)
+                 for c in (s.get("candidates") or [])]
+    check("...and the observations themselves go with the digest",
+          _gone == [],
+          "a control's accessible name is what the page displayed and a field's value can be "
+          "what somebody typed, so a promise covering the digest and not the candidate list "
+          "would be a promise with a hole in it")
 
     # ── 18. A session whose driver stopped talking to us ──────────────────
     #
@@ -1484,6 +1531,94 @@ def main_():
           "_appLocatorPanel" in (ROOT / "frontend" / "app.js").read_text(encoding="utf-8"),
           "a count nobody renders is a count nobody reads")
 
+    # C-115. The third question about a finished suite, and the one the other two audits
+    # cannot reach: a test can address real elements, be able to fail, and still describe a
+    # part of the application nobody opened. A live ParaBank session walked three journeys,
+    # never reached registration, and produced three registration tests -- all failing --
+    # while reporting every requirement covered. The shape is taken from that run.
+    from backend.services import journey_audit
+
+    _walked = ["/parabank/index.htm", "/parabank/overview.htm", "/parabank/activity.htm"]
+    _suite = [
+        {"path": "tests/account-overview.spec.ts", "test_names": ["overview_lists_accounts"],
+         "content": "await page.goto(`${BASE}/parabank/overview.htm`);\n"
+                    "await page.waitForURL('**/overview.htm');\n"},
+        {"path": "tests/registration.spec.ts",
+         "test_names": ["registration_form_asks_for_all_required_fields",
+                        "mismatched_password_confirmation_is_refused",
+                        "duplicate_username_is_refused"],
+         "content": "await page.goto(`${BASE}/parabank/register.htm`);\n"},
+    ]
+    _rep = journey_audit.audit(_suite, _walked)
+    check("a test driving to a page the session never opened is counted",
+          _rep["unvisited_count"] == 3 and _rep["files_affected"] == 1,
+          f"{_rep['unvisited_count']} test(s) in {_rep['files_affected']} file(s)")
+    check("...and named, so a reader can go and look",
+          _rep["unvisited"] and _rep["unvisited"][0]["path"] == "tests/registration.spec.ts"
+          and "/parabank/register.htm" in _rep["unvisited"][0]["destinations"],
+          _rep["unvisited"])
+    # The false alarm that would make the column worthless. `waitForURL('**/overview.htm')`
+    # is a glob suffix of a page the session *did* stand on, and reading it as a new
+    # destination would flag every well-written suite in the corpus.
+    check("a glob suffix of a visited path is not mistaken for a new page",
+          not any(r["path"].endswith("account-overview.spec.ts") for r in _rep["unvisited"]),
+          "flagging `**/overview.htm` against a visited `/parabank/overview.htm` is the "
+          "false alarm that teaches a reader to ignore the count")
+    check("the check turns itself off when the session recorded no paths",
+          journey_audit.audit(_suite, [])["unvisited_count"] == 0
+          and journey_audit.audit(_suite, [])["checked"] is False,
+          "'nothing was observed' must not make every destination look invented (D-438)")
+    check("a suite that navigates nowhere is never accused",
+          journey_audit.audit(
+              [{"path": "t.spec.ts", "test_names": ["a"],
+                "content": "await expect(page.getByRole('button')).toBeVisible();\n"}],
+              _walked)["unvisited_count"] == 0)
+    check("the sentence says what it means for the reader",
+          "never opened" in journey_audit.summary_sentence(_rep)
+          and "requirement text" in journey_audit.summary_sentence(_rep),
+          journey_audit.summary_sentence(_rep))
+    check("...and says nothing at all when there is nothing to say",
+          journey_audit.summary_sentence(journey_audit.audit(_suite[:1], _walked)) == "")
+
+    # The retry is asked with the session's *text* as well as its locators. Without it the
+    # agent-side audit could not see a heading nobody saw (D-438), so that finding could only
+    # ever be reported after the fact -- and it is D-430's failure, where one invented
+    # `getByRole('heading', …)` in a shared helper took every test in a live suite with it.
+    # It is also the case a retry is most likely to fix, since the headings the session did
+    # see are already in the prompt. Checked behaviourally: the parameter existing proves
+    # nothing about whether the finding changes the count that gates the retry.
+    import inspect as _inspect
+    from backend.agents.qa_intelligence.app_explorer_agent import AppExplorerAgent
+
+    check("the suite writer's audit is given the text the session collected",
+          "observed_texts" in _inspect.signature(
+              AppExplorerAgent.generate_suite).parameters,
+          "without it `unseen-name` is computed only in the orchestrator, after the one "
+          "retry it would have justified has already been skipped")
+    check("...at both of its audit call sites, so the retry is judged the same way twice",
+          _inspect.getsource(AppExplorerAgent.generate_suite)
+          .count("observed_texts=observed_texts") == 2,
+          "accepting a second answer that was scored by a weaker check than the first is "
+          "how a retry makes a suite worse and reports an improvement")
+
+    _unseen = [{"path": "t.spec.ts",
+                "content": "await expect(page.getByRole('heading', "
+                           "{ name: 'Products' })).toBeVisible();\n"}]
+    check("a heading the session never saw now reaches the count that gates the retry",
+          locator_audit.audit(_unseen)["invented_count"] == 0
+          and locator_audit.audit(
+              _unseen, observed_texts=["heading: Sign in"])["invented_count"] == 1,
+          "the first call is how the retry used to be asked, and it is blind")
+    check("...and a heading that was seen still does not trigger one",
+          locator_audit.audit(
+              _unseen, observed_texts=["heading: Products"])["invented_count"] == 0,
+          "retrying a healthy suite spends a second generation call to change nothing")
+    check("the orchestrator supplies it from the session it already holds",
+          "observed_texts=(session or {}).get(\"observed_texts\")"
+          in (ROOT / "backend" / "services" / "orchestrator.py").read_text(encoding="utf-8"),
+          "the generate route assembles it for the reporting audit already; the agent was "
+          "the only reader that never received it")
+
     # ── 22. What the suite writer is actually told ────────────────────────
     # `_journeys_markdown` is the whole input to the expensive half, and until now nothing
     # offline read it. Both of its off-by-one faults were found by paying for a live run:
@@ -1816,6 +1951,73 @@ def main_():
                     "stall-pingpong") is not None,
           "this is the shape the docstring used to claim was caught and was not")
 
+    # C-111. The rule above is asked of `page_signature`, which folds in what the page says,
+    # and `TEXTS_JS` collects live regions -- so a clock, a toast or a notification badge
+    # hands every visit a brand-new signature and the test can never answer yes. That is the
+    # blind spot on exactly the applications this product is aimed at, and C-105 prices an
+    # undetected loop at 22 of 26 paid steps. Driven through the real signature functions
+    # rather than over invented hashes, because the whole fault is what the real one folds in.
+    def _stops_at_pairs(pairs, sid):
+        conn = database.get_connection()
+        try:
+            for i, (sig, structural) in enumerate(pairs):
+                if app_session.stalled(conn, sid, sig, structural):
+                    return i + 1
+                conn.execute(
+                    "INSERT INTO app_steps (id, session_id, step_index, page_signature, "
+                    "structural_signature, action_json, created_at) VALUES (?,?,?,?,?,?,?)",
+                    ("%s-%d" % (sid, i), sid, i + 1, sig, structural, "{}",
+                     "2026-09-18T00:00:00"))
+                conn.commit()
+        finally:
+            conn.close()
+        return None
+
+    _CTRL = [{"role": "link", "name": "Accounts", "value": ""},
+             {"role": "button", "name": "Go", "value": ""}]
+    _ticking = [(action_policy.page_signature(
+                     "/overview" if n % 2 == 0 else "/activity", _CTRL,
+                     ["status: Last updated 10:%d:0%d" % (30 + n, n % 10)]),
+                 action_policy.structural_signature(
+                     "/overview" if n % 2 == 0 else "/activity", _CTRL))
+                for n in range(14)]
+
+    check("a live region really does defeat the page signature",
+          len({p for p, _ in _ticking}) == len(_ticking)
+          and len({s for _, s in _ticking}) == 2,
+          "14 distinct signatures over two actual pages; the structural one sees two")
+    check("...so the old single-fingerprint rule never fires on such a session",
+          _stops_at_pairs([(p, "") for p, _ in _ticking], "stall-clock-old") is None,
+          "this is the whole of C-111: the session burns its budget in a two-page loop")
+    check("...and the structural fingerprint catches it",
+          _stops_at_pairs(_ticking, "stall-clock-new") is not None,
+          "nothing the page does on its own can move a fingerprint built from the address, "
+          "the controls and their values")
+
+    # The structural test must not reintroduce the failures the first rule was written
+    # narrowly to avoid, and the form is the one that matters: same address, same controls,
+    # only the values moving (D-413).
+    _form = [(action_policy.page_signature(
+                  "/signup", [{"role": "textbox", "name": "f%d" % i, "value": "v%d" % i}], []),
+              action_policy.structural_signature(
+                  "/signup", [{"role": "textbox", "name": "f%d" % i, "value": "v%d" % i}]))
+             for i in range(1, 13)]
+    check("filling in a long form is still not mistaken for being stuck",
+          _stops_at_pairs(_form, "stall-form-2") is None,
+          "the structural fingerprint carries each control's current value for exactly this "
+          "reason; dropping values to make it coarser would stop every form half way")
+    check("...and a session finding something new every step still runs on",
+          _stops_at_pairs([("new%d" % i, "s%d" % i) for i in range(1, 15)],
+                          "stall-healthy-2") is None)
+
+    # And the reason it is a second fingerprint rather than a narrower first one.
+    check("the case that forbids simply dropping live regions is still measurable",
+          'role="status"' in (ROOT / "evals" / "app_testing" / "basket-total"
+                              / "source" / "app.py").read_text(encoding="utf-8"),
+          "basket-total renders its total inside an aria-live region, so excluding live "
+          "regions from page_signature would blind the rule to the one value that case "
+          "exists to measure")
+
     # Upstream of the rule: the explorer is told it is repeating itself, because the rule is
     # only a backstop and reclaims the last few steps of a session that is already wasted.
     from backend.routes.app_testing import _repetition_note
@@ -1867,6 +2069,43 @@ def main_():
           "fired before step(s) %s of a healthy basket-total run; a warning that fires on "
           "correct behaviour is one the model learns to ignore, which costs the real warning "
           "its only chance of being read" % (_nagged,))
+
+    # **The real trace, and it is not caught.** The `fiddling` fixture above is synthetic and
+    # it encodes an assumption the live application disproves: it alternates between *two*
+    # signatures, so the novelty gate opens and the nudge fires. A real dropdown page does
+    # not do that. This is the page-signature sequence recorded on 2026-09-18 from a live
+    # ParaBank session (review `3374b3d6`) that spent **twelve of sixteen steps** cycling two
+    # dropdowns -- and every one of those signatures is distinct, because a signature carries
+    # each control's current value (D-411) and selecting a different month moves it. So the
+    # novelty gate never closes and the nudge stays silent for the entire session.
+    #
+    # Pinned as a **known gap** rather than left to be rediscovered: this asserts today's
+    # behaviour so that whoever closes C-105 is told by a failing check that they have. The
+    # fixture being wrong in the same direction as the code is the fault
+    # `APP-TESTING-FINDINGS-2026-09-17.md` §11 names, and this is its fourth instance.
+    _live = [("fill", "username"), ("fill", "password"), ("click", "Log In"),
+             ("click", "12345"), ("select", "month"), ("select", "month"),
+             ("select", "transactionType"), ("click", "Go"), ("select", "month"),
+             ("select", "month"), ("select", "month"), ("select", "month"),
+             ("select", "transactionType"), ("click", "Go"), ("select", "month"),
+             ("select", "month")]
+    _live_sigs = ["593a3bbeff7b", "ad8e7564f17f", "d173e1223c1b", "cd87b44016f0",
+                  "9608e5e2313d", "f9bcaeb9375c", "cd265461dbef", "cd265461dbef",
+                  "7e0f8594a3db", "8d41a36b06a2", "7e0f8594a3db", "8d41a36b06a2",
+                  "7e0f8594a3db", "052d5a09f4f9", "052d5a09f4f9", "0579c6b5fb3c"]
+    _live_steps = [{"action": {"action_kind": k, "target_name": n}, "page_signature": s}
+                   for (k, n), s in zip(_live, _live_sigs)]
+    check("the live wandering trace repeats one control eight times",
+          sum(1 for k, n in _live if n == "month") == 8)
+    check("...and is nonetheless SILENT today, which is C-105 unclosed",
+          _repetition_note(_live_steps) == "",
+          "if this now fires, C-105 has been closed and the row plus this check should say "
+          "so; if it fires by accident, the basket-total guard above is the one to re-read")
+    check("...because the value in the signature keeps novelty alive",
+          len(set(_live_sigs)) == 11 and len(_live_sigs) == 16,
+          "11 distinct signatures over 16 steps on three actual pages -- the churn is the "
+          "dropdown's own value, and the structural signature of D-447 carries values too, "
+          "so it produces the identical 11 and closes nothing here")
 
     check("the explorer is actually shown it, not just handed it",
           "You are repeating yourself" in agent_src,
@@ -1969,6 +2208,361 @@ def main_():
           _ea_src.index("note = _recheck_application()")
           > _ea_src.index("Every test failed"),
           "re-opening a browser after a clean run spends time to learn nothing")
+
+    section("27. The addressing a field can only be reached by survives the sanitiser")
+    # C-110. `COLLECT_JS` emits three locator shapes; the sanitiser admitted two, so the
+    # third -- `locator("input[name='…']")`, the only honest way to address a control named
+    # by its `name` attribute (D-427) -- was stored as "". That cost twice, and the second
+    # cost is the one that reached a customer: the suite writer was told nothing about how to
+    # address such a field and guessed `getByRole`, which resolves to zero elements, and a
+    # live ParaBank suite failed 16 of 16 on the shared sign-in helper. D-442 added a checker
+    # for exactly that mistake and the checker could never fire, because the record it
+    # compares against was blank by construction.
+    #
+    # Driven through the real functions rather than by reading the pattern: a regex is easy
+    # to eyeball into looking correct, and this one did for a day.
+    from backend.routes.app_testing import _locator as _san, _journeys_markdown as _jm
+
+    _RAW_ATTR = """locator("input[name='username']")"""
+    check("the attribute shape the collector emits is kept",
+          _san(_RAW_ATTR) == _RAW_ATTR,
+          "dropping it leaves the writer with no way to address a name-attribute field")
+    check("...for every tag the collector can emit it for",
+          all(_san('locator("%s[name=\'q\']")' % t) for t in ("input", "select", "textarea", "*")))
+    check("...and the role and text shapes still are",
+          _san("getByRole('button', { name: 'Sign In' })")
+          and _san("getByText('Products', { exact: true })"))
+
+    # It stays a whitelist. Page-controlled text is on its way into a prompt, so widening it
+    # to "any locator() call" would hand the model the class names C-101 is about.
+    for _bad, _why in ((""" locator(".cart_item") """.strip(), "a class selector"),
+                       ("""locator("#login-button")""", "an id"),
+                       ("""locator("[data-testid='x']")""", "a test id"),
+                       ("""locator("input[onclick='evil()']")""", "a different attribute"),
+                       ("""locator("input[name='a'] , script")""", "a smuggled second selector"),
+                       ("""locator("iframe[name='x']")""", "a tag outside the known set")):
+        check(f"...while {_why} is still dropped", _san(_bad) == "",
+              "the model was never shown one, so accepting it re-opens C-101")
+
+    # D-457. The fourth shape: an ordinal, for a control the accessibility tree computes no
+    # name for at all. A live OrangeHRM admin screen offered **17 of 60** controls that way --
+    # the Username search box among them, because its label is a sibling `<div>` with no
+    # `for` -- and every one of them reached the suite writer with a role, a row context and
+    # no address whatsoever. This is the one shape where a character out of place changes
+    # which element is addressed, so it is matched exactly rather than by the permissive
+    # pattern the text shapes use.
+    check("an ordinal address is admitted",
+          _san("getByRole('textbox').nth(3)") == "getByRole('textbox').nth(3)")
+    check("...and so is a role with no ordinal, for the only control of its kind",
+          _san("getByRole('combobox')") == "getByRole('combobox')")
+    for _bad, _why in (("getByRole('textbox').nth(3).click()", "a call chained onto it"),
+                       ("getByRole('textbox').first()", "a method that is not nth"),
+                       ("getByRole('textbox').nth(-1)", "a negative ordinal"),
+                       ("getByRole('.cart').nth(0)", "a selector where the role goes")):
+        check(f"...while {_why} is dropped", _san(_bad) == "",
+              "an ordinal is the one shape whose meaning changes silently when it is wrong")
+
+    _steps = [{"journey": "Log in", "url_path": "/login", "page_texts": [],
+               "action": {"action_kind": "fill", "target_role": "textbox",
+                          "target_name": "username", "value": "john",
+                          "locator": _san(_RAW_ATTR), "submits": "",
+                          "rationale": "enter the username"},
+               "outcome": ""},
+              {"journey": "Log in", "url_path": "/login", "page_texts": [],
+               "action": {"action_kind": "click", "target_role": "button",
+                          "target_name": "Log In", "locator": "", "submits": "",
+                          "rationale": "sign in"},
+               "outcome": "filled username; still on /login"}]
+    check("the suite writer is handed that addressing, not left to guess it",
+          'page.locator("input[name=\'username\']")' in _jm(_steps),
+          "this is the half that cost the live suite its sixteen tests; the audit added "
+          "afterwards only counted the symptom")
+
+    _pos_steps = [{"journey": "Search", "url_path": "/admin", "page_texts": [],
+                   "action": {"action_kind": "fill", "target_role": "textbox",
+                              "target_name": "", "value": "Admin",
+                              "locator": "getByRole('textbox').nth(1)", "positional": True,
+                              "submits": "", "rationale": "search"},
+                   "outcome": ""}]
+    _pm = _jm(_pos_steps)
+    check("an ordinal address reaches the suite writer labelled as one",
+          "getByRole('textbox').nth(1)" in _pm and "no accessible name" in _pm,
+          "handed the string alone the writer treats it as equivalent to a name; it is not, "
+          "and the one thing it needs to know is why")
+    check("...and a named address is not labelled that way",
+          "no accessible name" not in _jm(_steps),
+          "the caveat has to mean something, so it cannot be on every line")
+
+    # C-112. The submit target is a *request* -- it exists so a test can replay it directly
+    # and assert a refusal (D-415) -- and a session read it as a destination, writing
+    # `waitForURL('**/signup/create')` for a form that posts there and lands on
+    # `/signup/done`. Every test in that file timed out against a working application. The
+    # correct answer was in the adjacent clause the whole time, which is worth remembering
+    # before assuming more context is the fix for anything.
+    _submitting = [{"journey": "Sign up", "url_path": "/signup/review", "page_texts": [],
+                    "action": {"action_kind": "click", "target_role": "button",
+                               "target_name": "Create account", "locator": "",
+                               "submits": "POST /signup/create",
+                               "rationale": "finish the journey"},
+                    "outcome": ""},
+                   {"journey": "Sign up", "url_path": "/signup/done", "page_texts": [],
+                    "action": {"action_kind": "click", "target_role": "link",
+                               "target_name": "Home", "locator": "", "submits": "",
+                               "rationale": "leave"},
+                    "outcome": "navigated to /signup/done"}]
+    _md = _jm(_submitting)
+    check("a submit target is named as a request, not as a destination",
+          "POST /signup/create" in _md and "not the page it lands on" in _md,
+          "read as a landing URL it produces a waitForURL that never resolves, which times "
+          "out every test in the file against a healthy application")
+    check("...and where the browser actually landed is still reported beside it",
+          "navigated to /signup/done" in _md,
+          "the right answer has to remain visible; the clause only stops the wrong field "
+          "reading like the right one")
+
+    # D-454. Controls and page text arrive as two flat lists, and on anything tabular that
+    # destroys the only relationship worth testing. Measured live: a ParaBank overview sent
+    # every one of eight balances and the suite asserted that the column header `Balance*`
+    # was visible -- all seventeen of its tests were presence checks -- because "account
+    # 12345 holds -$2430.00" was not a statement the input could make.
+    _rows = [{"journey": "Accounts", "url_path": "/overview.htm",
+              "page_texts": ["heading: Accounts Overview", "text: -$2430.00"],
+              "candidates": [{"name": "12345", "role": "link", "context": "12345 -$2430.00"},
+                             {"name": "13344", "role": "link", "context": "13344 $1231.10"},
+                             {"name": "12345", "role": "link", "context": "12345 -$2430.00"},
+                             {"name": "Accounts", "role": "link", "context": ""}],
+              "action": {"action_kind": "click", "target_name": "12345", "locator": "",
+                         "submits": "", "rationale": "open it"},
+              "outcome": ""},
+             {"journey": "Accounts", "url_path": "/activity.htm", "page_texts": [],
+              "candidates": [],
+              "action": {"action_kind": "click", "target_name": "Go", "locator": "",
+                         "submits": "", "rationale": "filter"},
+              "outcome": "navigated to /activity.htm"}]
+    _rowmd = _jm(_rows)
+    check("a page's rows reach the suite writer with their values attached",
+          "12345 -$2430.00" in _rowmd and "13344 $1231.10" in _rowmd,
+          "without this a table is loose numbers and the only safe assertion is that a "
+          "column header exists")
+    check("...de-duplicated, because a row repeats once per control inside it",
+          _rowmd.count("12345 -$2430.00") == 1, _rowmd)
+    check("...and a control whose grouping adds nothing contributes no line",
+          "Accounts;" not in _rowmd and not _rowmd.endswith("Accounts"),
+          "a navigation menu repeated on every candidate of every page is how the input "
+          "budget disappears into chrome (C-107)")
+
+    # The same field on the step side: it is what the model chooses *from*. Checked by
+    # driving a real step and reading the prompt that was captured, rather than by calling a
+    # private helper -- the question is whether it reaches the model, not whether a function
+    # can format it.
+    _ctx_sess = client.post("/api/v1/app-testing/sessions",
+                            json={"target_label": "bank.example.com",
+                                  "requirement": "each account shows its balance",
+                                  "max_steps": 4, "attested_test_env": True},
+                            headers=scoped).json()["session"]["id"]
+    _step(client, scoped, _ctx_sess,
+          [{"role": "link", "name": "12345", "context": "12345 -$2430.00"},
+           {"role": "link", "name": "Accounts", "context": ""}],
+          url_path="/overview.htm")
+    _sent = _llm_calls[-1]["content"]
+    check("the step prompt shows a control's row as well as its name",
+          "12345 -$2430.00" in _sent and '"12345"' in _sent,
+          _sent[_sent.find("## Candidates"):][:220])
+    check("...and the index contract is untouched, so the answer is still a number",
+          "0. link \"12345\"" in _sent,
+          "the row is extra information about a candidate, never a replacement for the "
+          "numbered list D-408 rests on")
+
+    # D-455. A control that did not respond is not worth a second attempt, and the model will
+    # make one: a live Shoelace session clicked the same control **six times**, every attempt
+    # ending `failed: Page.click: Timeout 15000ms exceeded` -- ninety seconds of wall clock
+    # and six model calls on an element that was never going to move. The outcome said so
+    # every time and was read every time, so saying it again is not the fix.
+    _rep_sess = client.post("/api/v1/app-testing/sessions",
+                            json={"target_label": "docs.example.com",
+                                  "requirement": "the component list opens a component",
+                                  "max_steps": 6, "attested_test_env": True},
+                            headers=scoped).json()["session"]["id"]
+    _dead = [{"role": "button", "name": "Button"}, {"role": "link", "name": "Install"}]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Find a component", "rationale": "open it"})
+    _step(client, scoped, _rep_sess, _dead, url_path="/")
+    _again = client.post(
+        f"/api/v1/app-testing/sessions/{_rep_sess}/step",
+        json={"url_path": "/", "candidates": _dead, "page_texts": [],
+              "last_outcome": "failed: Page.click: Timeout 15000ms exceeded"},
+        headers=scoped).json()
+    check("repeating an action that just failed is refused",
+          _again.get("refused") is True and "did not work" in (_again.get("reason") or ""),
+          _again)
+    check("...and the refused step is not charged to the budget",
+          _again.get("retry") is True,
+          "the driver observes again; a refusal that consumed a step would make a dead "
+          "control cost the same as a working one")
+    _next_action.update({"candidate_index": 1})
+    _other = client.post(
+        f"/api/v1/app-testing/sessions/{_rep_sess}/step",
+        json={"url_path": "/", "candidates": _dead, "page_texts": [],
+              "last_outcome": "failed: Page.click: Timeout 15000ms exceeded"},
+        headers=scoped).json()
+    check("...while a different control on the same page is still allowed",
+          not _other.get("refused"),
+          "refusing everything after one failure strands a session on a page it can still "
+          "use; only the control that failed is held back")
+
+    # D-456. The same control, the same way, on the same page, for the third time. Replayed
+    # over the four stored live sessions this refuses 6 of 10 SauceDemo steps (Password
+    # filled seven times), 10 of 20 ParaBank (two dropdowns and a Go button for sixteen
+    # steps), 4 of 6 Shoelace -- and **0 of 20 OrangeHRM**, the session that actually walked
+    # the application. The zero is the half worth guarding: a rule that also fires on good
+    # exploration is a step budget with extra steps.
+    _rep2 = client.post("/api/v1/app-testing/sessions",
+                        json={"target_label": "bank.example.com",
+                              "requirement": "the activity page can be filtered by month",
+                              "max_steps": 12, "attested_test_env": True},
+                        headers=scoped).json()["session"]["id"]
+    _filters = [{"role": "combobox", "name": "month"}, {"role": "button", "name": "Go"},
+                {"role": "link", "name": "Find Transactions"},
+                {"role": "link", "name": "Transfer Funds"}]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "select", "candidate_index": 0,
+                         "value": "January", "journey": "Filter activity", "rationale": "filter"})
+    for _ in range(2):
+        _step(client, scoped, _rep2, _filters, url_path="/activity.htm")
+    _third = client.post(
+        f"/api/v1/app-testing/sessions/{_rep2}/step",
+        json={"url_path": "/activity.htm", "candidates": _filters, "page_texts": []},
+        headers=scoped).json()
+    check("a third identical action on the same page is refused",
+          _third.get("refused") is True and "already been done" in (_third.get("reason") or ""),
+          _third)
+    check("...and the refusal names what has been used less instead",
+          "Find Transactions" in (_third.get("reason") or ""),
+          "a refusal that does not say where else to go is a dead end, and the control the "
+          "session never reached is the one worth naming")
+    check("...but never names a control the policy withheld",
+          "Transfer Funds" not in (_third.get("reason") or ""),
+          "the alternatives are read off the screened list, so a refusal cannot advertise "
+          "the money movement D-429 withheld two lines earlier")
+    check("...and it is not charged to the step budget",
+          _third.get("retry") is True, _third)
+    _next_action.update({"action_kind": "select", "candidate_index": 1})
+    _elsewhere = client.post(
+        f"/api/v1/app-testing/sessions/{_rep2}/step",
+        json={"url_path": "/activity.htm", "candidates": _filters, "page_texts": []},
+        headers=scoped).json()
+    check("...while a different control on the same page is untouched",
+          not _elsewhere.get("refused"), _elsewhere)
+    _next_action.update({"action_kind": "select", "candidate_index": 0})
+    _other_page = client.post(
+        f"/api/v1/app-testing/sessions/{_rep2}/step",
+        json={"url_path": "/overview.htm", "candidates": _filters, "page_texts": []},
+        headers=scoped).json()
+    check("...and the same control on a different page starts again from zero",
+          not _other_page.get("refused"),
+          "the count is per page, because the same control on another page is another "
+          "control as far as what it can show you goes")
+
+    # The half the first draft of this rule got wrong. On a page offering one control there
+    # is nothing less-used to name, so refusing would record no step, `stalled` would never
+    # accumulate, and the session would end by the driver giving up rather than by the
+    # platform saying `done` -- a paid session lost at a boundary, which is D-440.
+    _lone = client.post("/api/v1/app-testing/sessions",
+                        json={"target_label": "one.example.com",
+                              "requirement": "the page has a control",
+                              "max_steps": 20, "attested_test_env": True},
+                        headers=scoped).json()["session"]["id"]
+    _only = [{"role": "link", "name": "Round"}]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Go round", "rationale": "again"})
+    _rounds = [_step(client, scoped, _lone, _only, url_path="/same").json() for _ in range(5)]
+    # The clause that separates "repeating" from "learning nothing". Refusing on the count
+    # alone was measured on the corpus and cut separating tests by 29% (41 -> 29 over nine
+    # sessions) while still discriminating 9 of 9: `basket-total`'s arithmetic bug is
+    # invisible at a quantity of one, so clicking *add* a third time is the whole case. A
+    # control whose earlier presses put new words on the page is teaching the session
+    # something; ParaBank's dropdown, which only changes its own value, is not.
+    _shop = client.post("/api/v1/app-testing/sessions",
+                        json={"target_label": "shop.example.com",
+                              "requirement": "the basket total is the sum of the line totals",
+                              "max_steps": 12, "attested_test_env": True},
+                        headers=scoped).json()["session"]["id"]
+    _cart = [{"role": "button", "name": "One more Widget"}, {"role": "link", "name": "Help"}]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Add items", "rationale": "raise the quantity"})
+    for _q in (1, 2, 3):
+        _step(client, scoped, _shop, _cart, url_path="/cart",
+              page_texts=[f"Widget x{_q}", f"Total GBP {_q * 4}.00"])
+    _fourth = client.post(
+        f"/api/v1/app-testing/sessions/{_shop}/step",
+        json={"url_path": "/cart", "candidates": _cart,
+              "page_texts": ["Widget x4", "Total GBP 16.00"]},
+        headers=scoped).json()
+    # The half that made every refusal a no-op. A refused choice is never recorded -- that is
+    # the point, it is not charged to the budget -- so it never enters the history the next
+    # prompt is built from. The model therefore saw the same page, the same candidates and
+    # the same history, and returned the same answer. Measured on a live Shoelace session:
+    # one control chosen **six times in a row** against two refusals that each named eight
+    # alternatives, until the driver gave up with two steps taken.
+    _seen = client.post("/api/v1/app-testing/sessions",
+                        json={"target_label": "docs.example.com",
+                              "requirement": "a component page opens",
+                              "max_steps": 8, "attested_test_env": True},
+                        headers=scoped).json()["session"]["id"]
+    _two = [{"role": "button", "name": "Button"}, {"role": "link", "name": "Alert"}]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Find a component", "rationale": "open it"})
+    _step(client, scoped, _seen, _two, url_path="/")
+    _step(client, scoped, _seen, _two, url_path="/",
+          last_outcome="the previous choice was refused: click on \"Button\" did not work")
+    _prompt = _llm_calls[-1]["content"]
+    check("a refusal is shown to the model on the next call",
+          "not accepted" in _prompt and 'click on "Button" did not work' in _prompt,
+          "a refusal the chooser cannot see is a model call spent to change nothing")
+    _step(client, scoped, _seen, _two, url_path="/", last_outcome="filled it; still on /")
+    check("...and an ordinary outcome is not dressed up as one",
+          "not accepted" not in _llm_calls[-1]["content"],
+          "the heading has to mean something, so it cannot appear on a normal step")
+
+    check("a repeat that keeps changing the page is allowed to continue",
+          not _fourth.get("refused"),
+          "the whole of the client-rendered eval case is clicking one control until the "
+          "arithmetic is worth asserting; a ceiling that cannot see that is a step budget")
+
+    _still = client.post("/api/v1/app-testing/sessions",
+                         json={"target_label": "shop.example.com",
+                               "requirement": "the basket total is the sum of the line totals",
+                               "max_steps": 12, "attested_test_env": True},
+                         headers=scoped).json()["session"]["id"]
+    for _q in (1, 2, 3):
+        _step(client, scoped, _still, _cart, url_path="/cart",
+              page_texts=["Widget x1", "Total GBP 4.00"])
+    _stuck = client.post(
+        f"/api/v1/app-testing/sessions/{_still}/step",
+        json={"url_path": "/cart", "candidates": _cart,
+              "page_texts": ["Widget x1", "Total GBP 4.00"]},
+        headers=scoped).json()
+    check("...while the same repeat on an unchanging page is still refused",
+          _stuck.get("refused") is True, _stuck)
+
+    check("a repeat is allowed when nothing on the page has been used less",
+          not any(x.get("refused") for x in _rounds),
+          "the repeat ceiling must not be able to starve the no-progress rule: with one "
+          "control there is nowhere else to send the session, so the honest answer is to "
+          "take the step and let the stopping rule end it")
+
+    _told = [{"name": "username", "locator": _san(_RAW_ATTR)}]
+    _wrote = [{"path": "t.spec.ts",
+               "content": "await page.getByRole('textbox', { name: 'username' }).fill('j');\n"}]
+    check("...and a suite that ignores it is caught, through the real construction",
+          locator_audit.audit(_wrote, observed_locators=_told)["kinds"]
+          .get("contradicts-record") == 1,
+          "D-442's check, fed the way the route actually feeds it rather than the way its "
+          "own fixture did")
 
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")

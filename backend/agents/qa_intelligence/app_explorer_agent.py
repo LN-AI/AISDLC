@@ -477,6 +477,7 @@ class AppExplorerAgent(BaseAgent):
         requirement: str = "",
         refused_note: str = "",
         repetition_note: str = "",
+        rejected_note: str = "",
         credentials_note: str = "",
         llm_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -507,12 +508,21 @@ class AppExplorerAgent(BaseAgent):
             )
 
         if candidates:
+            # `context` is the row, card or list item this control sits in, and it is here
+            # because controls and page text otherwise arrive as two flat lists. On anything
+            # tabular that loses the only relationship worth testing: a live banking overview
+            # sent every one of its eight balances and none could be attached to an account,
+            # so the suite asserted that a column header was visible. Printed after the name
+            # and never instead of it -- the index contract is untouched and the model still
+            # answers with a number (D-408).
             rendered = "\n".join(
-                "{idx}. {role} \"{name}\"{extra}".format(
+                "{idx}. {role} \"{name}\"{extra}{ctx}".format(
                     idx=c.get("index", i),
                     role=c.get("role", "?"),
                     name=c.get("name", ""),
                     extra=(f" (current value: {c['value']})" if c.get("value") else ""),
+                    ctx=(f" — in: {c['context']}"
+                         if c.get("context") and c.get("context") != c.get("name") else ""),
                 )
                 for i, c in enumerate(candidates)
             )
@@ -528,6 +538,22 @@ class AppExplorerAgent(BaseAgent):
             # what *not* to choose and a warning read after the options have been weighed
             # arrives too late to change the answer.
             lines.append("## You are repeating yourself\n" + repetition_note)
+
+        if rejected_note:
+            # What the platform turned down last time, and why.
+            #
+            # Without this a refusal is a no-op that costs a model call. A refused choice is
+            # never recorded -- that is the point, it is not charged to the budget -- so it
+            # never enters the history this prompt is built from: the next call sees the same
+            # page, the same candidates and the same history, and returns the same answer.
+            # Measured on a live Shoelace session, one control was chosen **six times in a
+            # row** against two refusals that each named eight alternatives by name, until
+            # the driver gave up and the session ended having taken two steps. The refusals
+            # were correct, and invisible.
+            #
+            # Last, so it is the final thing read before the answer is given, and phrased as
+            # a fact about this attempt rather than as a standing rule.
+            lines.append("## Your last choice was not accepted\n" + rejected_note)
 
         if refused_note:
             # Stated rather than hidden: a model that does not know a control was withheld
@@ -561,6 +587,7 @@ class AppExplorerAgent(BaseAgent):
         target_label: str = "",
         context: str = "",
         observed_locators: Optional[List[Dict[str, Any]]] = None,
+        observed_texts: Optional[List[str]] = None,
         llm_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """One call at the end of a session. The large half.
@@ -690,6 +717,7 @@ class AppExplorerAgent(BaseAgent):
         # `locator("input[name='username']")` for them. This is the one case where a retry is
         # almost certain to help, since the correct locator is already in the prompt.
         audit = locator_audit.audit((result or {}).get("test_files"),
+                                    observed_texts=observed_texts,
                                     observed_locators=observed_locators)
         if audit["invented_count"] and not result.get("generation_retried"):
             logger.warning(
@@ -704,6 +732,7 @@ class AppExplorerAgent(BaseAgent):
             result["locators_retried"] = True
             if _has_files(cleaner):
                 second = locator_audit.audit(cleaner.get("test_files"),
+                                             observed_texts=observed_texts,
                                              observed_locators=observed_locators)
                 kept_files = _file_count(cleaner) >= _file_count(result)
                 kept_tests = _test_count(cleaner) >= _test_count(result)

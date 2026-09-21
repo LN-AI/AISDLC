@@ -3814,6 +3814,48 @@ check('...and a clean suite says so rather than leaving an empty space', () => {
          'it warned about a suite that has nothing wrong with it');
 });
 
+// C-115. Taken from the live ParaBank run that found it: three registration tests written
+// without the session ever reaching the registration page, reported as full coverage.
+check('tests written for a page nobody opened are named on the screen', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    untested_journey_count: 3,
+    untested_journey_note: '3 of 17 test(s), across 1 file(s), drive to a page this session '
+      + 'never opened (/parabank/register.htm). Those tests were written from the '
+      + 'requirement text rather than from anything observed.',
+    journey_audit: { checked: true, tests_total: 17, unvisited_count: 3, files_affected: 1,
+      unvisited: [{ path: 'tests/registration.spec.ts',
+                    destinations: ['/parabank/register.htm'],
+                    tests: ['registration_form_asks_for_all_required_fields'] }] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('never opened'), 'the reader is not told the suite tested a page '
+         + 'the session never reached, which is what made a live run report full coverage '
+         + 'of a journey it had not walked');
+  assert(html.includes('tests/registration.spec.ts') && html.includes('/parabank/register.htm'),
+         'a count with no file and no page behind it cannot be acted on');
+});
+
+check('...and a suite that stayed on ground it walked says so', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    untested_journey_count: 0,
+    journey_audit: { checked: true, tests_total: 12, unvisited_count: 0, files_affected: 0,
+                     unvisited: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('only to pages the session actually opened'),
+         'blank-when-clean and blank-when-unchecked cannot be told apart');
+});
+
+check('...and a session that recorded no paths is not accused of anything', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    untested_journey_count: 0,
+    journey_audit: { checked: false, tests_total: 12, unvisited_count: 0, unvisited: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(!html.includes('never opened') && !html.includes('pages the session actually opened'),
+         'with nothing to compare against, silence is the only honest panel');
+});
+
 check('...and says when a second attempt was made and thrown away', () => {
   sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
     locators_grounded: 10, locators_invented: 2, locator_retry_rejected: true,

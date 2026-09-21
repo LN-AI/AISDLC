@@ -199,17 +199,10 @@ COLLECT_JS = r"""
     clickable.push(el);
   }
 
-  // Semantic controls first so they always get the budget: a page with two hundred clickable
-  // rows must not crowd out its Save button.
-  const out = [];
-  let n = 0;
-  for (const el of [...semantic, ...clickable]) {
-    if (n >= MAXC) break;
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    if (rect.width === 0 || rect.height === 0) continue;
-    if (style.visibility === 'hidden' || style.display === 'none') continue;
-
+  // One definition of a role, used by the position pre-pass below and by the main loop, so
+  // the two cannot drift. A positional address is an ordinal within a role, so a role this
+  // function computes differently from the loop that emits it is an address off by one.
+  const roleOf = (el) => {
     const tag = el.tagName.toLowerCase();
     const itype = (el.getAttribute('type') || '').toLowerCase();
     let role = el.getAttribute('role');
@@ -225,6 +218,44 @@ COLLECT_JS = r"""
              : (itype === 'search') ? 'searchbox' : 'textbox';
       } else role = 'button';
     }
+    return role;
+  };
+  const isShown = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width !== 0 && rect.height !== 0
+        && style.visibility !== 'hidden' && style.display !== 'none';
+  };
+
+  // Where each control sits among the page's controls of the same role, counted over *every*
+  // semantic control in document order rather than over the ones that survive the cap. An
+  // ordinal computed after a budget cut is an ordinal Playwright will not agree with, and the
+  // whole value of this address is that it resolves.
+  //
+  // Only semantic controls are counted. `clickable` holds the non-semantic elements D-414
+  // collects, which have no role in the accessibility tree at all, so Playwright's role engine
+  // never sees them and including them would shift every ordinal after the first.
+  const roleSeen = {};
+  const roleTotal = {};
+  const position = new Map();
+  for (const el of semantic) {
+    if (!isShown(el)) continue;           // matches what the role engine ignores
+    const r = roleOf(el);
+    position.set(el, roleSeen[r] = (roleSeen[r] === undefined ? 0 : roleSeen[r] + 1));
+    roleTotal[r] = (roleTotal[r] || 0) + 1;
+  }
+
+  // Semantic controls first so they always get the budget: a page with two hundred clickable
+  // rows must not crowd out its Save button.
+  const out = [];
+  let n = 0;
+  for (const el of [...semantic, ...clickable]) {
+    if (n >= MAXC) break;
+    if (!isShown(el)) continue;
+
+    const tag = el.tagName.toLowerCase();
+    const itype = (el.getAttribute('type') || '').toLowerCase();
+    const role = roleOf(el);
 
     // The name has to be the name the *accessibility tree* would compute, because that is
     // what `getByRole` resolves against. Getting a different string that merely identifies
@@ -272,7 +303,19 @@ COLLECT_JS = r"""
       name = el.getAttribute('placeholder') || el.getAttribute('title') || '';
       nameIsAccessible = !!name;
     }
-    if (!name && tag !== 'input') { name = el.textContent || ''; nameIsAccessible = !!name; }
+    // Text inside a form control is not its name. For `<input>` there is none; for
+    // `<select>` the text is the option list and for `<textarea>` it is the current value,
+    // and in neither case does the accessibility tree compute a name from it -- an
+    // unlabelled control simply has none. Reading it anyway produced
+    // `getByRole('combobox', { name: 'AllJanuaryFebruary March' })`, which resolves to
+    // **zero** elements, against a live ParaBank page whose two activity filters are exactly
+    // this shape; three tests of a working application failed on it. This is D-427's fault
+    // two element types across -- `<input type=submit>` was named from the wrong attribute,
+    // these from the wrong node -- and the same rule settles it: a name that is not one must
+    // fall through to the attribute selector below rather than become a role locator.
+    if (!name && tag !== 'input' && tag !== 'select' && tag !== 'textarea') {
+      name = el.textContent || ''; nameIsAccessible = !!name;
+    }
     if (!name) {
       // Last resort, and deliberately *not* an accessible name: it is kept only so the
       // control has something the denylist can read and a person can recognise. The flag
@@ -341,10 +384,19 @@ COLLECT_JS = r"""
     const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     const ROLE_IS_REAL = ['button', 'link', 'textbox', 'searchbox', 'checkbox', 'radio',
                           'combobox', 'menuitem', 'tab', 'switch', 'option'];
+    // Deliberately narrower than ROLE_IS_REAL. An ordinal is only worth emitting for roles
+    // where `roleOf` above and Playwright's role engine are known to agree on *which* elements
+    // count, because disagreeing by one element shifts every address after it. These are the
+    // form-field roles, which are also where the unnamed controls actually are. `link` is
+    // excluded on purpose: `roleOf` calls every `<a>` a link and the accessibility tree does
+    // not call an `<a>` without `href` one, so the ordinals would diverge on exactly the
+    // template-heavy pages this is for. The fixture asserts the parity rather than assuming it.
+    const POSITIONAL_OK = ['textbox', 'searchbox', 'combobox', 'checkbox', 'radio', 'button'];
     const hasRealRole = el.hasAttribute('role')
                      || (tag === 'a' && el.hasAttribute('href'))
                      || ['button', 'input', 'select', 'textarea', 'summary'].includes(tag);
     let locator = '';
+    let positional = false;
     if (name && !nameIsAccessible) {
       // The name came off the `name` attribute, so neither `getByRole` nor `getByText`
       // can find it -- one resolves through the accessibility tree and the other through
@@ -356,13 +408,108 @@ COLLECT_JS = r"""
       locator = (hasRealRole && ROLE_IS_REAL.includes(role))
         ? "getByRole('" + role + "', { name: '" + esc(name) + "' })"
         : "getByText('" + esc(name) + "', { exact: true })";
+    } else if (hasRealRole && POSITIONAL_OK.includes(role) && position.has(el)) {
+      // No name of any kind, and no `name` attribute to fall back on. On a semantic page this
+      // barely happens; on a component-framework application it is a fifth of the page.
+      // Measured on a live OrangeHRM admin screen: **17 of 60** controls arrived with a role,
+      // a row context and no address at all -- the Username search box among them, because the
+      // label is a sibling `<div>` with no `for`. The accessibility tree genuinely computes no
+      // name for those, so inventing one from the neighbouring text would be D-427 again: a
+      // string that reads correctly and resolves to zero elements.
+      //
+      // An ordinal within the role is the honest answer. It is computed here, from the page,
+      // never written by the model (D-408 holds), and it carries no class, id or test id, so it
+      // is not the recalled-token problem D-433 counts. It is weaker than a name and is flagged
+      // as such rather than passed off as equivalent: it survives a re-render that keeps the
+      // control count and breaks on one that does not.
+      locator = (roleTotal[role] === 1)
+        ? "getByRole('" + role + "')"
+        : "getByRole('" + role + "').nth(" + position.get(el) + ")";
+      positional = true;
     }
 
+    // The row this control sits in, and the reason it is worth its tokens.
+    //
+    // A page's controls and a page's words arrive as two flat lists, and on anything
+    // tabular that destroys the only relationship that matters. Measured on a live ParaBank
+    // overview: the session collected every one of eight balances -- `-$2430.00`, `$1231.10`
+    // and so on -- and the suite it produced asserted that the column header `Balance*` was
+    // visible, because nothing said which balance belonged to which account. All seventeen
+    // of that suite's tests were presence checks; it passes against a bank showing blank
+    // balances. The same shape is `APP-TESTING-FINDINGS-2026-09-17.md` §1, where five prices
+    // arrived with no product names.
+    //
+    // So each control carries the smallest grouping that contains it *and* something else:
+    // walk up while the ancestor stays row-sized, and stop before it becomes the list. Two
+    // bounds decide "row-sized" -- at most two interactive descendants, and text short
+    // enough to be one record -- which is what separates `<tr>` from `<tbody>` and one
+    // product card from the whole catalogue.
     el.setAttribute('data-lm-cand', String(n));
     out.push({dom_id: n, role: role, name: name, value: value,
               enabled: !el.disabled, tag: tag, input_type: itype, submits: submits,
-              locator: locator});
+              locator: locator, positional: positional, context: ''});
     n++;
+  }
+  // ── Second pass: the row or card each control sits in ──────────────────────────────
+  //
+  // A page's controls and a page's words arrive as two flat lists, and on anything tabular
+  // that destroys the only relationship worth testing. Measured on a live ParaBank overview:
+  // every one of eight balances was collected and the suite asserted that the column header
+  // `Balance*` was visible, because "account 12345 holds -$2430.00" was not a statement the
+  // input could make. Same shape as the catalogue that sent five prices and no product names.
+  //
+  // **Run after every candidate is stamped, not inline**, which is the whole reason this is
+  // a second pass. Deciding whether a block is a record or a menu means subtracting the
+  // labels of the controls inside it, and the honest way to find those is the
+  // `data-lm-cand` stamp rather than a tag list -- exactly D-431's argument for text
+  // collection. Inline, only the candidates already emitted were stamped, so a menu built
+  // from click-handled `<li>` elements (D-414) had nothing subtracted, kept its text, and
+  // was attached to all eight of its own items on a live HR portal.
+  const stamped = deepAll(document, '[data-lm-cand]');
+  const labelOf = (node) => ((node.tagName === 'INPUT' ? node.value : '') ||
+                             node.innerText || node.textContent || '')
+                            .replace(/\s+/g, ' ').trim();
+  for (const row of out) {
+    let el = null;
+    for (const s of stamped) {
+      if (s.getAttribute('data-lm-cand') === String(row.dom_id)) { el = s; break; }
+    }
+    if (!el) continue;
+    try {
+      let node = el.parentElement, hops = 0;
+      while (node && hops < 6 && node !== document.body) {
+        const t = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t.length > 300) break;                       // past a record, into the list
+        const inner = deepAll(node, '[data-lm-cand]');
+        if (inner.length > 4) break;                     // a list, not a record
+        // What does this block say that its own controls do not? A `<tr>` keeps its
+        // balance, a product card keeps its description and price, and a navigation block
+        // is left with nothing -- which is the case that must not be reported, because
+        // repeating a menu against every candidate on every page is how the input budget
+        // disappears into chrome (C-107).
+        let rest = t;
+        for (const other of inner) {
+          const label = labelOf(other);
+          if (label) rest = rest.split(label).join(' ');
+        }
+        if (/[a-z0-9]/i.test(rest.replace(/\s+/g, ''))) { row.context = t.slice(0, 160); break; }
+        node = node.parentElement; hops++;
+      }
+      if (row.context === row.name) row.context = '';
+    } catch (e) { row.context = ''; }
+  }
+
+  // A block most of the page's controls share is the page, not a row. On a sign-in form the
+  // walk above finds the whole form -- three controls, one surrounding hint -- and attaches
+  // it to all three; on SauceDemo that hint is the site's published list of usernames, so
+  // the model was handed `locked_out_user` on every step and spent its budget signing in
+  // wrongly. That is C-109's material arriving by a new route, and the rule that removes it
+  // is structural rather than a denylist: a record describes one thing, so a string shared
+  // by more than half the candidates is not describing any of them.
+  const shares = {};
+  for (const row of out) { if (row.context) shares[row.context] = (shares[row.context] || 0) + 1; }
+  for (const row of out) {
+    if (row.context && shares[row.context] * 2 > out.length) row.context = '';
   }
   return out;
 }
@@ -492,7 +639,34 @@ def observe(page):
     except Exception:
         pass  # a page that never goes idle (polling, websockets) is still explorable
     page.wait_for_timeout(SETTLE_MS)
-    candidates = page.evaluate(COLLECT_JS)
+
+    # Re-read rather than abandon when the page moves underneath the collector.
+    #
+    # `Execution context was destroyed, most likely because of a navigation` is what
+    # Playwright raises when a script is evaluated while the document is being replaced --
+    # which is precisely what a *successful* click on a sign-in button causes, and the
+    # settle above only narrows the window rather than closing it. Unguarded, this ended a
+    # live OrangeHRM session **three paid steps in, having just signed in successfully**,
+    # and returned nothing: no suite, no journeys, three step charges and a stack trace.
+    # That is D-440's shape once more, and the asymmetry below is worth noticing -- the text
+    # pass was already wrapped because someone hit a failure there, while the call that
+    # actually decides whether the session survives was left bare. Losing the text costs the
+    # assertions; losing the candidates costs the session.
+    candidates = None
+    for attempt in range(3):
+        try:
+            candidates = page.evaluate(COLLECT_JS)
+            break
+        except Exception as exc:
+            if "context was destroyed" not in str(exc) and "navigating" not in str(exc).lower():
+                raise
+            if attempt == 2:
+                raise
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
+            page.wait_for_timeout(SETTLE_MS)
     try:
         texts = page.evaluate(TEXTS_JS)
     except Exception:
@@ -555,7 +729,30 @@ def candidate_payload(raw):
     """
     return [{"role": c["role"], "name": c["name"], "value": c["value"],
              "enabled": c["enabled"], "submits": c.get("submits", ""),
-             "locator": c.get("locator", "")} for c in raw]
+             "locator": c.get("locator", ""), "context": c.get("context", ""),
+             "positional": bool(c.get("positional"))}
+            for c in raw]
+
+
+def _origin_of(url):
+    """`https://host/parabank/index.htm` -> `https://host`. D-450.
+
+    Everything downstream of this script composes an address as *origin + path*, because a
+    path is the only half either side ever sees: a step records `url_path`, a `goto` action
+    carries a path, and the suite writer is shown a **hostname** and told to reach the
+    application through `process.env.BASE_URL`. Handing any of them the full entry URL makes
+    them build `https://host/parabank/index.htm/parabank/overview.htm`.
+
+    Found by the first live run to get past a sign-in: a correct ParaBank suite scored 0 of
+    14 under `--verify` and **10 of 14** when the same files were run against the origin, so
+    the closed loop was failing the suite it exists to vouch for and naming the test as the
+    first suspect while doing it. The eval cannot see it -- all three corpus applications are
+    served at a bare origin, so there is no path for the entry URL to carry (C-97 again).
+    """
+    parts = urllib.parse.urlparse(str(url or ""))
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return str(url or "").rstrip("/")
 
 
 def perform(page, base_url, action, dom_id):
@@ -1032,6 +1229,100 @@ def fixture():
             check("the offered locator is the one that resolves",
                   by_name["Login"]["locator"] == "getByRole('button', { name: 'Login' })",
                   by_name["Login"]["locator"])
+
+            # D-427's fault two element types across, found live (D-451). Text *inside* a
+            # form control is not its name: a `<select>`'s is its option list and a
+            # `<textarea>`'s is its current value, and the accessibility tree computes no
+            # name from either -- an unlabelled control simply has none. Reading it anyway
+            # offered `getByRole('combobox', { name: 'AllJanuaryFebruary March' })` for
+            # ParaBank's activity filters, which matches nothing, and three tests of a
+            # working application died on it. Resolution is the only check that separates a
+            # plausible name from a usable one, which is the lesson D-427 paid for.
+            section("A control's own text is not its accessible name")
+            _probe = browser.new_page()
+            _probe.set_content(
+                "<form>"
+                "<select name='month'><option>All</option><option>January</option></select>"
+                "<textarea name='notes'>draft text</textarea>"
+                "<label for='lm'>Month</label><select id='lm' name='labelled'>"
+                "<option>A</option></select>"
+                "<select aria-label='Sort by' name='sort'><option>Price</option></select>"
+                "</form>")
+            _offered = {c["name"]: c for c in _probe.evaluate(COLLECT_JS)
+                        if c["role"] in ("combobox", "textbox")}
+            check("an unlabelled select is not named from its options",
+                  "month" in _offered and not any("January" in n for n in _offered),
+                  sorted(_offered))
+            check("...and a textarea is not named from its current value",
+                  "notes" in _offered and "draft text" not in _offered, sorted(_offered))
+            check("a labelled select is still named by its label",
+                  "Month" in _offered and "Sort by" in _offered, sorted(_offered))
+            for _nm, _c in sorted(_offered.items()):
+                _loc = _c["locator"]
+                if _loc.startswith("getByRole"):
+                    _hits = _probe.get_by_role(_c["role"], name=_nm, exact=True).count()
+                elif _loc.startswith('locator("'):
+                    _hits = _probe.locator(_loc[len('locator("'):-2]).count()
+                else:
+                    _hits = -1
+                check(f"the locator offered for {_nm!r} resolves to exactly one element",
+                      _hits == 1, f"{_loc} matched {_hits}")
+            _probe.close()
+
+            # C-115, and the reason it needs an answer rather than a better name chain.
+            # OrangeHRM puts a field's label in a sibling `<div>` with no `for`, so the
+            # accessibility tree computes **no name at all** -- measured live, 17 of 60
+            # controls on one admin screen arrived with a role, a row context and no address.
+            # Naming such a field from the neighbouring text is exactly D-427: a string that
+            # reads correctly and matches zero elements. An ordinal within the role is the
+            # honest answer, and the only check worth making is whether Playwright lands on
+            # the element the collector meant -- not on some element, and not nowhere.
+            section("A control with no accessible name is addressed by position")
+            _pos = browser.new_page()
+            _pos.set_content(
+                "<div><label>Username</label><input class='x'></div>"
+                "<div><label>Employee</label><input class='x'></div>"
+                "<input aria-label='Comment'>"
+                "<div><label>Only one</label><textarea></textarea></div>")
+            _rows = _pos.evaluate(COLLECT_JS)
+            _boxes = [c for c in _rows if c["role"] == "textbox"]
+            _unnamed = [c for c in _boxes if not c["name"]]
+            check("an unlabelled input is offered rather than dropped",
+                  len(_unnamed) == 3, f"{len(_unnamed)} of {len(_boxes)} textboxes unnamed")
+            check("...each with a positional address",
+                  all(c.get("positional") and c["locator"].startswith("getByRole('textbox')")
+                      for c in _unnamed),
+                  [c["locator"] for c in _unnamed])
+            check("a named control keeps its name and is not positional",
+                  any(c["name"] == "Comment" and not c.get("positional") for c in _boxes),
+                  [(c["name"], c.get("positional")) for c in _boxes])
+
+            # The parity test. `roleOf` in the collector and Playwright's role engine have to
+            # agree on *which* elements carry a role, because an ordinal counted over a
+            # different set is an address off by one -- and an address off by one is worse
+            # than none, since it silently tests the wrong field.
+            for _c in _unnamed:
+                _expr = _c["locator"]
+                _n = int(_expr.split(".nth(")[1][:-1]) if ".nth(" in _expr else 0
+                _got = _pos.get_by_role("textbox").nth(_n)
+                check(f"{_expr} resolves to exactly one element",
+                      _pos.get_by_role("textbox").count() > _n, _expr)
+                check(f"...and it is the control the collector meant ({_c['context']!r})",
+                      _got.get_attribute("data-lm-cand") == str(_c["dom_id"]),
+                      f"landed on data-lm-cand={_got.get_attribute('data-lm-cand')}, "
+                      f"meant {_c['dom_id']}")
+
+            # A role the collector and the tree disagree about must not get an ordinal at
+            # all. `roleOf` calls every `<a>` a link; the accessibility tree calls an `<a>`
+            # with no `href` a generic. Emitting ordinals for links would therefore shift
+            # every link address after the first anchor-as-button on the page.
+            _pos.set_content("<a>no href</a><a href='/x'>Real</a><a href='/y'></a>")
+            _links = [c for c in _pos.evaluate(COLLECT_JS) if c["role"] == "link"]
+            check("a nameless link gets no positional address",
+                  not any(c.get("positional") for c in _links),
+                  [(c["name"], c["locator"], c.get("positional")) for c in _links])
+            _pos.close()
+
             check("a button reports no typed-in value",
                   by_name["Login"]["value"] == "",
                   "a button's value is its label, and reporting it as an entry says the "
@@ -1096,6 +1387,58 @@ def fixture():
             perform(page, base, fill, allowed3[fidx]["dom_id"])
             check("the field now holds the typed value",
                   page.input_value("#q") == "widget", page.input_value("#q"))
+
+            # D-450. Every address downstream is composed as origin + path, so an entry URL
+            # carrying a path of its own must be reduced to its origin before it is handed
+            # to the explorer's `goto` or to the suite as BASE_URL. A correct ParaBank suite
+            # scored 0 of 14 under `--verify` and 10 of 14 when the same files ran against
+            # the origin, and the closed loop named the *test* as the first suspect while
+            # doing it.
+            # D-454. The two shapes this exists for, both measured live. A bank table must
+            # give an account its own balance and not the whole table; a product card must
+            # give a name, a description and a price together; and a navigation menu must
+            # give nothing at all, or it repeats itself on every candidate of every page.
+            section("A control carries the row or card it sits in")
+            _ctx = browser.new_page()
+            _ctx.set_content(
+                "<h2>Accounts Overview</h2><table>"
+                "<tr><th>Account</th><th>Balance*</th></tr>"
+                "<tr><td><a href='/a'>12345</a></td><td>-$2430.00</td></tr>"
+                "<tr><td><a href='/b'>13344</a></td><td>$1231.10</td></tr></table>"
+                "<div class='item'><a href='/p1'>Backpack</a><div>carry all the things</div>"
+                "<div>$29.99</div><button>Add to cart</button></div>"
+                "<nav><ul><li><a href='/x'>Accounts</a></li>"
+                "<li><a href='/y'>Transfer</a></li></ul></nav>")
+            _by = {c["name"]: c.get("context", "") for c in _ctx.evaluate(COLLECT_JS)}
+            check("a table row gives a control the value beside it",
+                  _by.get("12345") == "12345 -$2430.00", _by.get("12345"))
+            check("...and its own row, not the whole table",
+                  "13344" not in (_by.get("12345") or ""),
+                  "walking one ancestor too far turns eight accounts into one blob and the "
+                  "relationship is lost again")
+            check("a card gives a name, a description and a price together",
+                  all(p in (_by.get("Backpack") or "")
+                      for p in ("Backpack", "carry all the things", "$29.99")),
+                  _by.get("Backpack"))
+            check("a navigation item contributes nothing, because it adds nothing",
+                  not _by.get("Accounts") and not _by.get("Transfer"),
+                  f"Accounts={_by.get('Accounts')!r} Transfer={_by.get('Transfer')!r}")
+            _ctx.close()
+
+            section("Entry URL is reduced to an origin")
+            check("a deep entry URL loses its path",
+                  _origin_of("https://parabank.parasoft.com/parabank/index.htm")
+                  == "https://parabank.parasoft.com",
+                  _origin_of("https://parabank.parasoft.com/parabank/index.htm"))
+            check("...along with any query and fragment",
+                  _origin_of("https://host:8443/a/b.jsp?x=1#f") == "https://host:8443")
+            check("a port is kept, because it is part of the origin",
+                  _origin_of("http://127.0.0.1:8123/shop") == "http://127.0.0.1:8123")
+            check("an address that is already an origin is unchanged",
+                  _origin_of("http://127.0.0.1:8123") == "http://127.0.0.1:8123"
+                  and _origin_of("https://www.saucedemo.com/") == "https://www.saucedemo.com",
+                  "this is why the eval corpus cannot see D-450 and needs no re-baseline: "
+                  "all three of its applications are served at a bare origin")
 
             browser.close()
     finally:
@@ -1179,9 +1522,12 @@ def _verify(args, review_id: str, api) -> int:
     # on the machine could read it out of the process table.
     if args.password:
         env["LM_PASSWORD"] = args.password
-    # The suite reads its own base address from BASE_URL, and the only address that makes
-    # this check mean anything is the one that was explored.
-    env["BASE_URL"] = args.url
+    # The suite reads its own base address from BASE_URL and appends a path to it, so this
+    # is the *origin* of the address explored and not the entry URL -- handing it the
+    # latter makes every `goto` in the suite build `https://host/entry.htm/real/path`
+    # (D-450). That failed a correct ParaBank suite 14 of 14, and the same files scored
+    # 10 of 14 against the origin.
+    env["BASE_URL"] = _origin_of(args.url)
     env.setdefault("PYTHONIOENCODING", "utf-8")
 
     try:
@@ -1418,6 +1764,7 @@ def main():
             os.makedirs(directory, exist_ok=True)
 
     host = urllib.parse.urlparse(args.url).hostname or args.url
+    origin = _origin_of(args.url)
 
     # ── Dry run stops here: no session, no model, nothing spent ───────────
     if args.dry_run:
@@ -1500,7 +1847,7 @@ def main():
         page = ctx.new_page()
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-            taken, refusals = explore(page, api, session_id, args.url, credentials_note,
+            taken, refusals = explore(page, api, session_id, origin, credentials_note,
                                       args.max_steps, args.shots,
                                       send_page_text=not args.no_page_text,
                                       permitted=permitted)

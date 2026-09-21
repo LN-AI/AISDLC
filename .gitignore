@@ -59,3 +59,6 @@ out-*/
 # Suites the app-testing eval kept as evidence for its scores. Model-written code from a
 # paid run: worth having on disk to explain a number, never worth committing.
 evals/app_testing/results/suites/
+
+# Scratch checkout used by explore_app.py --verify (holds node_modules)
+.live-verify/

@@ -1,0 +1,632 @@
+{
+  "prompt_version": "2026-09-17.3",
+  "repeat": 3,
+  "max_steps": 25,
+  "spend": {
+    "model_cost_usd": 1.605654,
+    "cost_usd": 1.605654,
+    "calls": 98
+  },
+  "note": "`model_cost_usd` is what the run cost us; `cost_usd` is what a customer would be billed. They are equal while app-testing has no pricing row (see D-404 for why the distinction matters to a baseline comparison).",
+  "runs": {
+    "basket-total": [
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 8,
+          "passed": 2,
+          "failed": 6,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 32808,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 8,
+          "passed": 8,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 2526,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 8,
+        "journeys": 1,
+        "steps": 10,
+        "withheld": 10,
+        "refused": 0,
+        "assertions": 8,
+        "meaningful_assertions": 8,
+        "specified_count": 8,
+        "observed_count": 0,
+        "downgraded": 0,
+        "locators_grounded": 69,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "increasing_widget_quantity_updates_total_upward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "decreasing_widget_quantity_updates_total_downward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "widget_at_quantity_4_then_back_to_2_total_is_8",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "adding_gadget_adds_second_line_and_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "increasing_gadget_quantity_updates_total_upward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "total_reflects_sum_of_both_item_lines",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          }
+        ],
+        "separating_tests": 6,
+        "broken_tail": "-quantity.spec.ts:117:5 \u203a adding_gadget_adds_second_line_and_updates_total \n    tests\\add-item-and-change-quantity.spec.ts:140:5 \u203a increasing_gadget_quantity_updates_total_upward \n    tests\\add-item-and-change-quantity.spec.ts:163:5 \u203a total_reflects_sum_of_both_item_lines \u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  2 passed (37.9s)\n",
+        "fixed_tail": "em-and-change-quantity.spec.ts:140:5 \u203a increasing_gadget_quantity_updates_total_upward\n[7/8] tests\\add-item-and-change-quantity.spec.ts:163:5 \u203a total_reflects_sum_of_both_item_lines\n[8/8] tests\\add-item-and-change-quantity.spec.ts:184:5 \u203a removing_last_item_removes_its_basket_line\n  8 passed (3.6s)\n",
+        "review_id": "4abaeca6-5cce-48fb-93ac-58c1de998cce",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\basket-total-run1"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 11,
+          "passed": 2,
+          "failed": 9,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 48853,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 11,
+          "passed": 11,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 3608,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 11,
+        "journeys": 1,
+        "steps": 10,
+        "withheld": 10,
+        "refused": 0,
+        "assertions": 11,
+        "meaningful_assertions": 11,
+        "specified_count": 11,
+        "observed_count": 0,
+        "downgraded": 0,
+        "locators_grounded": 86,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Add item and change quantity \u203a increasing_widget_quantity_doubles_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a increasing_widget_quantity_to_three_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a increasing_widget_quantity_to_four_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a decreasing_widget_quantity_updates_total_downward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a decreasing_widget_quantity_again_updates_total_downward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a adding_second_item_adds_its_price_to_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a increasing_gadget_quantity_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a increasing_gadget_quantity_to_three_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Add item and change quantity \u203a decreasing_gadget_quantity_updates_total_downward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          }
+        ],
+        "separating_tests": 9,
+        "broken_tail": "updates_total \n    tests\\add-item-change-quantity.spec.ts:148:7 \u203a Add item and change quantity \u203a increasing_gadget_quantity_to_three_updates_total \n    tests\\add-item-change-quantity.spec.ts:165:7 \u203a Add item and change quantity \u203a decreasing_gadget_quantity_updates_total_downward \n  2 passed (57.8s)\n",
+        "fixed_tail": "_three_updates_total\n[10/11] tests\\add-item-change-quantity.spec.ts:165:7 \u203a Add item and change quantity \u203a decreasing_gadget_quantity_updates_total_downward\n[11/11] tests\\add-item-change-quantity.spec.ts:185:7 \u203a Add item and change quantity \u203a removing_last_widget_removes_its_line\n  11 passed (4.7s)\n",
+        "review_id": "469ecfdf-75bd-4b4d-b820-ece25947dc56",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\basket-total-run2"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 8,
+          "passed": 2,
+          "failed": 6,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 32577,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 8,
+          "passed": 8,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 2425,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 8,
+        "journeys": 1,
+        "steps": 10,
+        "withheld": 10,
+        "refused": 0,
+        "assertions": 8,
+        "meaningful_assertions": 8,
+        "specified_count": 8,
+        "observed_count": 0,
+        "downgraded": 0,
+        "locators_grounded": 71,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "increasing_widget_quantity_updates_total_upward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "increasing_widget_quantity_multiple_times_multiplies_price",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "decreasing_widget_quantity_updates_total_downward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "adding_second_item_adds_its_price_to_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "increasing_second_item_quantity_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "decreasing_second_item_quantity_updates_total_downward",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          }
+        ],
+        "separating_tests": 6,
+        "broken_tail": "ntity.spec.ts:103:5 \u203a adding_second_item_adds_its_price_to_total \u2500\u2500\n    tests\\add-item-and-change-quantity.spec.ts:122:5 \u203a increasing_second_item_quantity_updates_total \n    tests\\add-item-and-change-quantity.spec.ts:148:5 \u203a decreasing_second_item_quantity_updates_total_downward \n  2 passed (38.1s)\n",
+        "fixed_tail": ".spec.ts:122:5 \u203a increasing_second_item_quantity_updates_total\n[7/8] tests\\add-item-and-change-quantity.spec.ts:148:5 \u203a decreasing_second_item_quantity_updates_total_downward\n[8/8] tests\\add-item-and-change-quantity.spec.ts:175:5 \u203a removing_last_widget_removes_its_line_from_basket\n  8 passed (3.5s)\n",
+        "review_id": "adc28d82-552b-41d6-8021-cd418c69e069",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\basket-total-run3"
+      }
+    ],
+    "signup-wizard": [
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 4,
+          "passed": 1,
+          "failed": 3,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 16997,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 4,
+          "passed": 4,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 1680,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 4,
+        "journeys": 1,
+        "steps": 7,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 4,
+        "meaningful_assertions": 4,
+        "specified_count": 4,
+        "observed_count": 0,
+        "downgraded": 0,
+        "locators_grounded": 19,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Sign-up journey \u203a step_1_fields_are_shown_on_review_page",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "Sign-up journey \u203a review_page_shows_all_collected_details_together",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "Sign-up journey \u203a create_account_confirmation_names_person_and_email",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          }
+        ],
+        "separating_tests": 3,
+        "broken_tail": "s:30:7 \u203a Sign-up journey \u203a step_1_fields_are_shown_on_review_page \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\sign-up.spec.ts:49:7 \u203a Sign-up journey \u203a review_page_shows_all_collected_details_together \n    tests\\sign-up.spec.ts:67:7 \u203a Sign-up journey \u203a create_account_confirmation_names_person_and_email \n  1 passed (19.7s)\n",
+        "fixed_tail": "-up.spec.ts:41:7 \u203a Sign-up journey \u203a step_2_fields_are_shown_on_review_page\n[3/4] tests\\sign-up.spec.ts:49:7 \u203a Sign-up journey \u203a review_page_shows_all_collected_details_together\n[4/4] tests\\sign-up.spec.ts:67:7 \u203a Sign-up journey \u203a create_account_confirmation_names_person_and_email\n  4 passed (2.6s)\n",
+        "review_id": "c2637b55-427f-4c4a-a894-91f41317e015",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\signup-wizard-run1"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 5,
+          "passed": 2,
+          "failed": 3,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 17083,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 5,
+          "passed": 5,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 1895,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 5,
+        "journeys": 1,
+        "steps": 7,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 5,
+        "meaningful_assertions": 4,
+        "specified_count": 4,
+        "observed_count": 1,
+        "downgraded": 0,
+        "locators_grounded": 24,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Sign-up journey \u203a step_3_review_shows_name_and_email_from_step_1",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "Sign-up journey \u203a step_3_review_shows_all_collected_details_together",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "Sign-up journey \u203a confirmation_page_names_the_same_person_and_email",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          }
+        ],
+        "separating_tests": 3,
+        "broken_tail": ":52:7 \u203a Sign-up journey \u203a step_3_review_shows_name_and_email_from_step_1 \u2500\u2500\n    tests\\sign-up.spec.ts:70:7 \u203a Sign-up journey \u203a step_3_review_shows_all_collected_details_together \n    tests\\sign-up.spec.ts:82:7 \u203a Sign-up journey \u203a confirmation_page_names_the_same_person_and_email \n  2 passed (19.7s)\n",
+        "fixed_tail": "p.spec.ts:62:7 \u203a Sign-up journey \u203a step_3_review_shows_address_from_step_2\n[4/5] tests\\sign-up.spec.ts:70:7 \u203a Sign-up journey \u203a step_3_review_shows_all_collected_details_together\n[5/5] tests\\sign-up.spec.ts:82:7 \u203a Sign-up journey \u203a confirmation_page_names_the_same_person_and_email\n  5 passed (2.9s)\n",
+        "review_id": "5e746ff2-25fe-4083-8ff5-2f819866adcb",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\signup-wizard-run2"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 5,
+          "passed": 3,
+          "failed": 2,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 11787,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 5,
+          "passed": 5,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 1651,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 5,
+        "journeys": 1,
+        "steps": 7,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 5,
+        "meaningful_assertions": 5,
+        "specified_count": 3,
+        "observed_count": 2,
+        "downgraded": 0,
+        "locators_grounded": 25,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Sign-up flow \u203a review_page_shows_name_and_email_from_step_one",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "Sign-up flow \u203a create_account_confirmation_names_person_and_email",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          }
+        ],
+        "separating_tests": 2,
+        "broken_tail": "p-Sign-up-flow-a79a1-tion-names-person-and-email\\error-context.md\n\n\n  2 failed\n    tests\\sign-up.spec.ts:78:7 \u203a Sign-up flow \u203a review_page_shows_name_and_email_from_step_one \u2500\u2500\u2500\u2500\u2500\n    tests\\sign-up.spec.ts:103:7 \u203a Sign-up flow \u203a create_account_confirmation_names_person_and_email \n  3 passed (13.3s)\n",
+        "fixed_tail": "ests\\sign-up.spec.ts:78:7 \u203a Sign-up flow \u203a review_page_shows_name_and_email_from_step_one\n[4/5] tests\\sign-up.spec.ts:91:7 \u203a Sign-up flow \u203a review_page_shows_address_from_step_two\n[5/5] tests\\sign-up.spec.ts:103:7 \u203a Sign-up flow \u203a create_account_confirmation_names_person_and_email\n  5 passed (2.5s)\n",
+        "review_id": "b72abaf0-9136-4358-bcf2-f349ae600f7b",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\signup-wizard-run3"
+      }
+    ],
+    "task-ownership": [
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 6,
+          "passed": 4,
+          "failed": 2,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 7949,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 6,
+          "passed": 6,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 2869,
+          "outcome": "passed"
+        },
+        "files": 3,
+        "tests": 6,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 6,
+        "meaningful_assertions": 4,
+        "specified_count": 4,
+        "observed_count": 2,
+        "downgraded": 0,
+        "locators_grounded": 37,
+        "locators_invented": 1,
+        "locators_retried": true,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Open task owned by somebody else \u203a non_owner_sees_no_edit_form_on_others_task",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "Open task owned by somebody else \u203a non_owner_direct_post_to_edit_is_refused",
+            "file": "",
+            "why": "expect(received).toBeGreaterThanOrEqual(expected)"
+          }
+        ],
+        "separating_tests": 2,
+        "broken_tail": "it-is-refused\\error-context.md\n\n\n  2 failed\n    tests\\open-other-task.spec.ts:20:7 \u203a Open task owned by somebody else \u203a non_owner_sees_no_edit_form_on_others_task \n    tests\\open-other-task.spec.ts:38:7 \u203a Open task owned by somebody else \u203a non_owner_direct_post_to_edit_is_refused \n  4 passed (7.7s)\n",
+        "fixed_tail": "og in journey \u203a signing_in_as_alice_lands_on_task_list\n[5/6] tests\\open-other-task.spec.ts:38:7 \u203a Open task owned by somebody else \u203a non_owner_direct_post_to_edit_is_refused\n[6/6] tests\\open-own-task.spec.ts:44:7 \u203a Open own task journey \u203a owner_can_save_new_title_and_title_updates\n  6 passed (2.3s)\n",
+        "review_id": "78a20ce5-20c8-436f-95a7-56c7ca62d337",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\task-ownership-run1"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 9,
+          "passed": 6,
+          "failed": 3,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 14739,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 9,
+          "passed": 9,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 4679,
+          "outcome": "passed"
+        },
+        "files": 3,
+        "tests": 9,
+        "journeys": 3,
+        "steps": 10,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 9,
+        "meaningful_assertions": 9,
+        "specified_count": 7,
+        "observed_count": 2,
+        "downgraded": 0,
+        "locators_grounded": 50,
+        "locators_invented": 0,
+        "locators_retried": true,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Journey: Open task owned by somebody else \u203a other_users_task_shows_no_edit_form",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "Journey: Open task owned by somebody else \u203a other_users_task_shows_no_save_button",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "Journey: Open task owned by somebody else \u203a direct_post_to_edit_other_users_task_is_refused",
+            "file": "",
+            "why": "expect(received).toBeGreaterThanOrEqual(expected)"
+          }
+        ],
+        "separating_tests": 3,
+        "broken_tail": "_form \n    tests\\journey-other-user-task.spec.ts:34:7 \u203a Journey: Open task owned by somebody else \u203a other_users_task_shows_no_save_button \n    tests\\journey-other-user-task.spec.ts:41:7 \u203a Journey: Open task owned by somebody else \u203a direct_post_to_edit_other_users_task_is_refused \n  6 passed (14.1s)\n",
+        "fixed_tail": "dit_other_users_task_is_refused\n[8/9] tests\\journey-own-task-edit.spec.ts:57:7 \u203a Journey: Open own task and edit it \u203a updated_title_appears_in_task_list\n[9/9] tests\\journey-own-task-edit.spec.ts:70:7 \u203a Journey: Open own task and edit it \u203a updated_title_persists_on_task_detail_page\n  9 passed (3.5s)\n",
+        "review_id": "556f7646-04b6-4302-8007-bc3e30b1dfdf",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\task-ownership-run2"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 13,
+          "passed": 9,
+          "failed": 4,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 22762,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 13,
+          "passed": 13,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 6975,
+          "outcome": "passed"
+        },
+        "files": 4,
+        "tests": 13,
+        "journeys": 4,
+        "steps": 11,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 13,
+        "meaningful_assertions": 10,
+        "specified_count": 8,
+        "observed_count": 5,
+        "downgraded": 0,
+        "locators_grounded": 65,
+        "locators_invented": 1,
+        "locators_retried": true,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "other_users_task_has_no_edit_heading",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "other_users_task_has_no_title_textbox",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "other_users_task_has_no_save_button",
+            "file": "",
+            "why": "expect(locator).toHaveCount(expected) failed"
+          },
+          {
+            "name": "direct_post_to_edit_other_task_is_refused",
+            "file": "",
+            "why": "expect(received).toBeGreaterThanOrEqual(expected)"
+          }
+        ],
+        "separating_tests": 4,
+        "broken_tail": "-other-task.spec.ts:34:5 \u203a other_users_task_has_no_title_textbox \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\journey-view-other-task.spec.ts:41:5 \u203a other_users_task_has_no_save_button \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\journey-view-other-task.spec.ts:48:5 \u203a direct_post_to_edit_other_task_is_refused \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  9 passed (20.6s)\n",
+        "fixed_tail": "_task_has_no_save_button\n[11/13] tests\\journey-view-task-list.spec.ts:35:5 \u203a back_link_returns_to_task_list\n[12/13] tests\\journey-view-own-task.spec.ts:45:5 \u203a owner_edit_updates_heading\n[13/13] tests\\journey-view-other-task.spec.ts:48:5 \u203a direct_post_to_edit_other_task_is_refused\n  13 passed (3.3s)\n",
+        "review_id": "971cee66-51cf-4fd0-98c6-9f1964f9cf61",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260918T175311Z\\task-ownership-run3"
+      }
+    ]
+  }
+}

@@ -113,21 +113,67 @@ PROMPT_VERSION = "2026-09-17.3"
 # which is where they already were, so the 2026-09-16 measurement moving every case to
 # 3/3 does not move them. Raising them to 1.0 would fail the suite on a single flake.
 #
-# **Measured 2026-09-17, PROMPT_VERSION 2026-09-17.3, 9 sessions (3 per case), $1.2157
-# total and $0.135 a session.** `discriminates` **9 of 9**, every case saw the break it was
+# **Measured 2026-09-18, PROMPT_VERSION 2026-09-17.3, 9 sessions (3 per case), $1.3786
+# total and $0.1532 a session.** `discriminates` **9 of 9**, every case saw the break it was
 # given, and **no test failed on the working application in any session**.
 #
-#   basket-total     3/3 -- 9-10 steps, 1 journey, 7-13 tests, 5-10 of them separating,
-#                    9-10 controls withheld
-#   signup-wizard    3/3 -- 7 steps, 1 journey, 4-6 tests, 2-3 separating
-#   task-ownership   3/3 -- 8-11 steps, 3-4 journeys, 8-14 tests, 3-4 separating
+#   basket-total     3/3 -- 7-10 steps, 1 journey, 7-11 tests, 6-9 of them separating
+#   signup-wizard    3/3 -- 7 steps, 1 journey, 5-6 tests, 3-4 separating
+#   task-ownership   3/3 -- 8-10 steps, 3 journeys, 7-9 tests, 3-4 separating
 #
-# `basket-total` is the case to watch and this is the first time it has been 3/3 in three
-# measurements: 3/3 here, 2/3 twice earlier the same day, 3/3 the day before. Read it as a
-# case that lives around two-thirds to three-thirds rather than as a number that has been
-# fixed -- the floors sit at 0.66 for exactly that reason and are not moving.
+# **Read the price and the separating count, not only the score.** Four runs the same day,
+# each adding one change. `discriminates` saturates at 9 of 9 and stops distinguishing them;
+# what a *suite* is worth shows up in how many of its tests can tell the two builds apart:
+#
+#   run  change                     score   $/session   retries   tests   separating
+#   A    D-446 + D-447              9 of 9    0.1325      0        62      33 (53%)
+#   B    + D-449                    8 of 9    0.1470      2        64      31 (48%)
+#   C    + the C-112 label fix      9 of 9    0.1784      3        69      38 (55%)
+#   D    + D-454 (row context)      9 of 9    0.1532      2        67      41 (61%)
+#
+# **D is the first change measured to improve the suites rather than only to stop breaking
+# them**, and it is cheaper than the run before it. Giving each control the row or card it
+# sits in is what lets an assertion be about a *value*: a price that belongs to a product,
+# a balance that belongs to an account. Every other change today removed a defect; this one
+# moved the number that says whether a customer's regression net would notice anything.
+# Meaningful assertions held at 92%, so the extra separating tests are not padding.
+#
+# The cost tracks the retries almost exactly, and all three in run C were triggered by
+# `unseen-name` -- the check D-449 made visible to the retry. So **D-449 is measurably
+# expensive here and its benefit is not measurable here**: 9 of 9 before and after, and of
+# the three suites it regenerated, one came back clean and two still carried one unseen
+# heading. Its justification is mechanistic rather than empirical -- D-430 is a live suite
+# where one invented heading in a shared helper took every test with it, which is a shape
+# this corpus does not produce. That is a real basis and a weaker one, and it is a pricing
+# question on an unpriced product (D-410), so it is surfaced rather than settled. The
+# sharper version, if the cost matters: D-430's damage came from a heading in *shared
+# setup*, where it fails every test, while one inside a single test fails one -- so
+# retrying only on the first would keep the protection and cut most of the spend.
+#
+# Run B's miss was `signup-wizard` writing `waitForURL('**/signup/create')` from the submit
+# target (C-112), in a session where **no retry fired at all** -- so it is independent of
+# D-449 by mechanism rather than by assumption.
+#
+# **This run confirms D-446 and D-447 rather than measuring an improvement**, and confirming
+# is what it was for: both changes move numbers this eval owns, so neither could be trusted
+# on inspection. D-446 hands the suite writer the attribute locator for a control named by
+# its `name` attribute, which the corpus barely exercises -- all three cases use semantic
+# labels, so the change that matters most on a real application is close to invisible here
+# (C-97 again, from a third direction). D-447 adds a second, text-free fingerprint to the
+# no-progress rule, and `basket-total` is where it could have done damage: that case renders
+# its total inside an `aria-live` region, its address never changes, and a rule that stopped
+# it early would cost the case outright. It came back 3/3, and its step count moved 9-10 to
+# 8-9 -- a step shorter, with *more* separating tests than before (6-8 against 5-10, on 8-10
+# tests against 7-13). A tighter stop that did not cost a case is the result to want; a drop
+# in `separating` would have been the one to fear.
+#
+# `basket-total` is the case to watch and this is the second consecutive 3/3: 3/3 here, 3/3
+# on 2026-09-17, 2/3 twice earlier that day, 3/3 the day before. Read it as a case that lives
+# around two-thirds to three-thirds rather than as a number that has been fixed -- the floors
+# sit at 0.66 for exactly that reason and are not moving.
 #
 # Previous measurements:
+#   2026-09-17, 2026-09-17.3: 9 of 9 at $0.135 (before D-446/D-447)
 #   2026-09-17, 2026-09-17.2: 8 of 9 at $0.135 (one basket-total session, one noisy test)
 #   2026-09-17, 2026-09-17.1: 8 of 9 -- the run that FOUND D-434, with one session wrong by
 #                             exactly one step in all eight of its assertions

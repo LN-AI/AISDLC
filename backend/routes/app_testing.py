@@ -88,6 +88,11 @@ PRODUCT = "app-testing"
 # labelled as one, and `eval_app_testing.py` is what will replace the guess with a number.
 ASSUMED_STEP_CHARS = 6_000
 
+# How many times one control may be acted on, the same way, on one page, before the next
+# attempt is refused. Two, so a field can be corrected once and a wrong-then-right sign-in
+# still fits. See the refusal in `next_action` for what this was measured against (D-456).
+REPEATS_PER_CONTROL = 2
+
 
 # ── Request models ────────────────────────────────────────────────────────
 
@@ -113,6 +118,27 @@ class Candidate(BaseModel):
                     "behaves like a control. Carried so the generated suite targets "
                     "something observed instead of assumed.",
         examples=["getByRole('button', { name: 'Save changes' })"],
+    )
+    context: str = Field(
+        "",
+        description="The smallest grouping on the page that contains this control and "
+                    "something it does not itself say — the table row, the card, the list "
+                    "item. Sent because controls and page text otherwise arrive as two flat "
+                    "lists, which destroys the only relationship that matters on anything "
+                    "tabular: a live banking overview supplied all eight of its balances and "
+                    "not one of them could be attached to an account. Empty when the "
+                    "grouping adds nothing, which is what keeps a navigation menu from "
+                    "repeating itself on every row.",
+        examples=["12345 -$2430.00"],
+    )
+    positional: bool = Field(
+        False,
+        description="True when the locator is an ordinal within a role rather than a name — "
+                    "the control has no accessible name of any kind, which on a "
+                    "component-framework application is common. Sent so the suite writer can "
+                    "prefer a named control where one will do: an ordinal is correct at the "
+                    "moment it was read and survives a re-render only while the control "
+                    "count holds.",
     )
 
 
@@ -361,6 +387,19 @@ def _repetition_note(steps: List[dict], window: int = 6, floor: int = 3,
     )
 
 
+# The driver reports a refusal back as the next step's `last_outcome`, prefixed. Recognising
+# it here is what turns a refusal into something the model can act on: a refused step is never
+# recorded, so it cannot reach the prompt through the history the way an ordinary outcome does.
+_REJECTED_PREFIX = "the previous choice was refused:"
+
+
+def _rejected_note(last_outcome: str) -> str:
+    text = str(last_outcome or "").strip()
+    if not text.lower().startswith(_REJECTED_PREFIX):
+        return ""
+    return text[len(_REJECTED_PREFIX):].strip()[:600]
+
+
 def _history(steps: List[dict], limit: int = 12) -> str:
     """The last few steps, as one line each.
 
@@ -401,8 +440,34 @@ def _submit_target(raw: str) -> str:
 # A locator is advisory text for the suite writer -- nothing here or in the driver ever
 # executes it, because an action is carried out against the stamped candidate and not against
 # a string. It is still page-controlled input on its way into a prompt, so it is accepted only
-# in the two shapes the driver produces and dropped otherwise.
-_LOCATOR = re.compile(r"^getBy(Role|Text|Label)\(.{1,240}\)$", re.S)
+# in the shapes the driver produces and dropped otherwise.
+#
+# There are *three* shapes, and admitting only the `getBy` family silently discarded the third
+# (C-110). `COLLECT_JS` emits `locator("input[name='…']")` for a control whose name came off
+# the `name` attribute and is therefore in neither the accessibility tree nor the rendered
+# text (D-427) -- exactly the case D-442 was written from, where ParaBank's login fields cost
+# a live suite all sixteen of its tests. Dropping it cost twice: the suite writer was told
+# nothing about how to address such a field and guessed, and `locator_audit`'s
+# `contradicts-record` check could never fire, because the record it compares against was
+# blank by construction. The attribute shape is pinned to what the collector actually
+# produces -- a known tag or `*`, a `name=` attribute, single-quoted with its escapes -- so
+# this stays a whitelist rather than becoming "any locator() call".
+# The fourth shape is an ordinal — `getByRole('textbox').nth(3)` — for a control the
+# accessibility tree computes no name for at all. A live OrangeHRM admin screen offered 17 of
+# 60 controls that way, so on a component-framework application this is not an edge case.
+# The `getByRole` branch is written out in full rather than left to the permissive `.{1,240}`
+# the other two use, because here the exact shape the collector produces is known, and an
+# ordinal is the one shape where a character out of place changes which element is addressed.
+_LOCATOR = re.compile(
+    r"^(?:"
+    r"getByRole\('[a-z]{1,24}'(?:, \{ name: '(?:[^'\\]|\\.){0,240}' \})?\)"
+    r"(?:\.nth\((?:[0-9]{1,3})\))?"
+    r"|"
+    r"getBy(?:Text|Label)\(.{1,240}\)"
+    r"|"
+    r"""locator\("(?:input|select|textarea|\*)\[name='(?:[^'\\]|\\.){1,120}'\]"\)"""
+    r")$",
+    re.S)
 
 
 def _locator(raw: str) -> str:
@@ -499,12 +564,33 @@ def _journeys_markdown(steps: List[dict]) -> str:
                 # item that is an `<li>` with a click handler has no role in the
                 # accessibility tree, so `getByRole('button', ...)` would match nothing --
                 # this says what does match.
-                bits.append(f"— address it with `page.{action['locator']}`")
+                if action.get("positional"):
+                    # An ordinal, because the accessibility tree computes no name for this
+                    # control at all. Saying so is the point: a suite writer told only the
+                    # string will reach for it as readily as for a named control, and this
+                    # one is correct for as long as the page keeps the same number of
+                    # controls of that role. On a component-framework application a fifth of
+                    # the page can arrive this way, so "avoid it" is not advice that can be
+                    # followed -- "prefer a named one, and expect this to be the brittle
+                    # line when the suite ages" is.
+                    bits.append(
+                        f"— it has no accessible name, so address it by position with "
+                        f"`page.{action['locator']}` (weaker than a name: correct as read, "
+                        f"and only while the page keeps that many `{action.get('target_role', '')}` controls)")
+                else:
+                    bits.append(f"— address it with `page.{action['locator']}`")
             if action.get("submits"):
                 # The request this control actually sends. Without it a test for "the server
                 # refuses this" has to invent a path, which is the guessing D-408 designs
                 # out; with it, the request can be written from something that was observed.
-                bits.append(f"— sends `{action['submits']}`")
+                # Named as a *request* rather than a destination, because it was read as one.
+                # A `signup-wizard` session wrote `waitForURL('**/signup/create')` from this
+                # clause and timed out on a working application: the form posts there and the
+                # browser lands on `/signup/done`, which the very next clause reports. The
+                # field exists so a test can replay the request directly and assert a refusal
+                # (D-415), and a destination is the one thing it is not. C-112.
+                bits.append(f"— its form sends the request `{action['submits']}` "
+                            f"(that is the request, not the page it lands on)")
             if action.get("rationale"):
                 bits.append(f"— expected: {action['rationale']}")
             did = shifted.get(position) or ""
@@ -533,6 +619,24 @@ def _journeys_markdown(steps: List[dict]) -> str:
                 out.append("  before this action the page showed: " + "; ".join(before))
             if after and after != before:
                 out.append("  and after it the page showed: " + "; ".join(after))
+            # The records on that page, attributed. Page text arrives as a flat list, so a
+            # table reaches the writer as loose values with nothing saying which row they
+            # belong to -- a live banking overview supplied all eight of its balances and the
+            # suite asserted that a column header was visible, because "account 12345 holds
+            # -$2430.00" was not a statement the input could make. Each control carries the
+            # smallest grouping that contains it and something else, so the distinct ones are
+            # the page's rows. De-duplicated and capped: this is the same budget the text
+            # digest spends and the same lesson (D-431).
+            records, seen_records = [], set()
+            for cand in (step.get("candidates") or []):
+                text = str((cand or {}).get("context") or "").strip()
+                if text and text not in seen_records and text != (cand or {}).get("name"):
+                    seen_records.add(text)
+                    records.append(text[:160])
+                if len(records) >= 8:
+                    break
+            if records:
+                out.append("  rows and cards on this page: " + "; ".join(records))
         out.append("")
     return "\n".join(out).strip()
 
@@ -712,11 +816,16 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
         allow = set(app_session.allowances_applied(session))
         allowed, refused = action_policy.screen(raw, allow)
         signature = action_policy.page_signature(req.url_path, raw, texts)
+        # The same fingerprint without the page's words, so that a clock, a toast or a
+        # notification badge cannot keep the session alive by ticking (C-111). Computed over
+        # `raw` for the same reason `signature` is -- what the policy withheld is still part
+        # of what this page *is*.
+        structural = action_policy.structural_signature(req.url_path, raw)
 
         # The cheap stopping rule, evaluated before spending anything: if the last several
         # steps and this page are all the same signature, the session has stopped finding
         # anything and another model call would buy nothing.
-        if app_session.stalled(conn, session_id, signature):
+        if app_session.stalled(conn, session_id, signature, structural):
             app_session.finish(
                 conn, session_id, status="finished",
                 stop_reason=f"no new page in {app_session.NO_PROGRESS_LIMIT} steps")
@@ -756,6 +865,7 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
                 requirement=session.get("requirement", ""),
                 refused_note=refused_note,
                 repetition_note=repetition_note,
+                rejected_note=_rejected_note(req.last_outcome),
                 credentials_note=req.credentials_note,
                 llm_override=override,
             ),
@@ -802,10 +912,151 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
     chosen = allowed[action["candidate_index"]] if isinstance(
         action.get("candidate_index"), int) and action["action_kind"] not in ("back", "goto") \
         else {}
+
+    # A control that did not respond is not worth a second attempt, and the model will make
+    # one. Measured on a live Shoelace session: the same control was clicked **six times**,
+    # every attempt ending `failed: Page.click: Timeout 15000ms exceeded`, which is ninety
+    # seconds of wall clock and six model calls spent on an element that was never going to
+    # move. The outcome said so each time and was read each time; saying it again is not the
+    # fix. Refused rather than corrected, on the existing path, so the step is not charged to
+    # the budget and the driver simply observes again -- and refused only for the *same*
+    # target, because a control that failed once may be reachable after something else has
+    # been done, and forbidding it outright would strand a session on a page it can still
+    # use. The driver stops itself after five refusals, which bounds the argument.
+    if chosen and str(req.last_outcome or "").startswith("failed"):
+        previous = (_recorded_so_far[-1].get("action") or {}) if _recorded_so_far else {}
+        same_target = (str(previous.get("target_name") or "")
+                       == str(chosen.get("name") or "")
+                       and str(previous.get("action_kind") or "") == action["action_kind"])
+        if same_target and previous.get("target_name"):
+            logger.warning("app-testing: refused a repeat of an action that just failed (%s)",
+                           str(chosen.get("name"))[:60])
+            return {
+                "done": False, "refused": True,
+                "reason": (
+                    f"{action['action_kind']} on \"{chosen.get('name')}\" was tried on the "
+                    f"previous step and did not work ({str(req.last_outcome)[:120]}). "
+                    f"Choose a different control, or a different kind of action on this one."
+                ),
+                "retry": True, "_budget_stats": budget,
+            }
+
+    # The same control, on the same page, for the third time, while something on that page
+    # has been used less.
+    #
+    # This is C-105's measured shape, and it is not a fingerprint problem -- which is why two
+    # fingerprints failed to close it. Replayed over the four stored live sessions, the
+    # wandering is literally one control repeated: SauceDemo filled **Password seven times**
+    # and never pressed Login again; ParaBank cycled `month`, `transactionType` and `Go` for
+    # sixteen of twenty steps; Shoelace clicked one `Button` six times. A page signature
+    # cannot see any of it, because each of those actions genuinely changes the page -- a
+    # control's value is part of the signature by deliberate design (D-441), and that is
+    # exactly what lets a session defeat the no-progress rule by fiddling.
+    #
+    # The second half of the test is what makes this safe, and the first draft did not have
+    # it. Refusing on the count alone starves the stopping rule: on a page offering one
+    # control every action is refused, no step is ever recorded, `stalled` never accumulates
+    # and the session ends by the driver giving up rather than by the platform saying `done`
+    # -- which is D-440, a paid session lost at a boundary. So the platform refuses only when
+    # it can name something on the same page it has used *less*. When it cannot, the action
+    # goes through and the no-progress rule ends the session cleanly, as it always did.
+    #
+    # Measured over those four traces, and the refinement costs nothing: 6 of 10 SauceDemo
+    # steps refused, 10 of 20 ParaBank, 4 of 6 Shoelace -- and **0 of 20 OrangeHRM**, the one
+    # session that actually walked the application. A rule that fires on three sessions and
+    # is silent on the one that worked is discriminating rather than merely strict, and that
+    # zero is the reason to ship it. SauceDemo's refusal names `Login`, which is the control
+    # that session needed and never pressed again after step 4.
+    #
+    # Two costs, accepted rather than overlooked. A genuinely repetitive control -- `Next` on
+    # a paginated table -- is refused on its third press while anything else on the page is
+    # less used; the counter is deliberately not reset by the page changing, because "reset
+    # when the page changed" is the test D-441 already showed a dropdown can defeat. And a
+    # session that signs out and back in as a second persona will find its third
+    # `fill Username` refused, which M4 will have to revisit. Both cost one model call and no
+    # step: a refusal is answered by observing again and is never charged to the budget, so a
+    # wrong refusal is the cheapest thing here.
+    if chosen and chosen.get("name"):
+        here = str(req.url_path or "")
+        kind = action["action_kind"]
+        target = str(chosen.get("name") or "")
+
+        def _used(name: str) -> int:
+            return sum(
+                1 for prior in _recorded_so_far
+                if str(prior.get("url_path") or "") == here
+                and str((prior.get("action") or {}).get("target_name") or "") == name
+            )
+
+        mine = sum(
+            1 for prior in _recorded_so_far
+            if str(prior.get("url_path") or "") == here
+            and str((prior.get("action") or {}).get("action_kind") or "") == kind
+            and str((prior.get("action") or {}).get("target_name") or "") == target
+        )
+        # ...unless those earlier attempts were *productive*. This is the clause that
+        # separates "repeating" from "learning nothing", and the first version did not have
+        # it: measured on the corpus, refusing on the count alone cut separating tests by
+        # 29% (41 -> 29 over nine sessions) while still discriminating 9 of 9, because
+        # `basket-total`'s arithmetic bug is invisible at a quantity of one and clicking
+        # *add* again is the whole point of that case. A control whose earlier presses put
+        # words on the page the session had never seen there is teaching the session
+        # something; a dropdown that only changes its own value is not, which is exactly the
+        # difference between ParaBank's `month` and a shop's `One more Widget`.
+        #
+        # An action's effect is only knowable from the *next* observation (D-430), so the
+        # text that follows each earlier attempt is what is compared -- and the last attempt's
+        # effect is the observation arriving on this very call.
+        #
+        # Known blind spot, inherited rather than introduced: a page carrying a clock or a
+        # live region puts new text on every observation, so on such a page every repeat
+        # reads as productive and this ceiling stops firing. That is C-111 again, and the
+        # failure is *to today's behaviour* rather than to something worse -- the session
+        # then ends on `stalled` or the step budget, as it does now.
+        productive = False
+        if mine >= REPEATS_PER_CONTROL:
+            seen_here, after = set(), []
+            for idx, prior in enumerate(_recorded_so_far):
+                if str(prior.get("url_path") or "") != here:
+                    continue
+                pact = prior.get("action") or {}
+                nxt = _recorded_so_far[idx + 1] if idx + 1 < len(_recorded_so_far) else None
+                follows = (list(nxt.get("page_texts") or [])
+                           if nxt is not None and str(nxt.get("url_path") or "") == here
+                           else list(req.page_texts or []) if nxt is None else [])
+                # The observation *before* the action counts as already seen, or every
+                # first attempt reads as productive and the ceiling never fires at all.
+                seen_here.update(prior.get("page_texts") or [])
+                if (str(pact.get("action_kind") or "") == kind
+                        and str(pact.get("target_name") or "") == target):
+                    after.append((set(follows), set(seen_here)))
+            productive = any(new_texts - before for new_texts, before in after)
+
+        if mine >= REPEATS_PER_CONTROL and not productive:
+            lesser = sorted(
+                {str(c.get("name")) for c in allowed
+                 if c.get("name") and _used(str(c.get("name"))) < mine}
+            )
+            if lesser:
+                logger.warning("app-testing: refused %s on %r after %d on this page",
+                               kind, target[:60], mine)
+                return {
+                    "done": False, "refused": True,
+                    "reason": (
+                        f"{kind} on \"{target}\" has already been done {mine} times on this "
+                        f"page and you are still on this page, so doing it again cannot show "
+                        f"you anything new. These controls here have been used less: "
+                        f"{', '.join(lesser[:8])}. Use one of them, go somewhere else, or "
+                        f"declare yourself done."
+                    ),
+                    "retry": True, "_budget_stats": budget,
+                }
+
     action["target_role"] = chosen.get("role", "")
     action["target_name"] = chosen.get("name", "")
     action["submits"] = _submit_target(chosen.get("submits", ""))
     action["locator"] = _locator(chosen.get("locator", ""))
+    action["positional"] = bool(chosen.get("positional")) and bool(action["locator"])
 
     conn = database.get_connection()
     try:
@@ -815,6 +1066,11 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
             journey=action["journey"],
             url_path=req.url_path,
             page_signature=signature,
+            structural_signature=structural,
+            # What this step was offered and what was withheld, kept rather than counted.
+            # `allowed` first and carrying the index the model was shown, so the record can
+            # answer "what did it choose between" and not only "how many were there".
+            candidates=list(allowed) + list(refused),
             action=action,
             observation_chars=observation_chars,
             candidates_offered=len(allowed),
@@ -923,6 +1179,12 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
                              {"name": (step.get("action") or {}).get("target_name") or "",
                               "locator": (step.get("action") or {}).get("locator") or ""}
                              for step in recorded],
+                         # Where this session actually stood, so a suite that tests a page
+                         # nobody opened can be counted rather than believed (C-115). A live
+                         # ParaBank run wrote three registration tests without ever reaching
+                         # the registration page and reported every requirement covered.
+                         "visited_paths": [step.get("url_path") or ""
+                                           for step in recorded if step.get("url_path")],
                          # Re-resolved from what the session recorded, rather than carried in
                          # memory: a session is a conversation spread over minutes and the
                          # process that generates may not be the one that opened it.
