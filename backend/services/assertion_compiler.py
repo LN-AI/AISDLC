@@ -127,8 +127,10 @@ def build(steps: List[dict]) -> Dict[str, Any]:
     values: List[dict] = []
     paths: List[dict] = []
     seen_el, seen_val, seen_path = {}, {}, {}
+    repeats: Dict[tuple, int] = {}
 
     for step in steps or ():
+        per_step: Dict[str, int] = {}
         path = _clean(step.get("url_path") or "", 200)
         if path and path not in seen_path and len(paths) < MAX_PATHS:
             seen_path[path] = f"p{len(paths) + 1}"
@@ -143,13 +145,25 @@ def build(steps: List[dict]) -> Dict[str, Any]:
             # it in prose -- which is the blank page this module exists to remove.
             if not locator or cand.get("refused_because"):
                 continue
-            key = (path, locator)
+            # Which of the several controls that share this address. A catalogue page has
+            # six buttons called "Add to cart", and the collector stamps them as six distinct
+            # candidates carrying one identical locator string -- so a test that clicks it
+            # matches all six, and Playwright's strict mode makes that an **error** rather
+            # than a failure. Measured on a live SauceDemo run: twelve of seventeen tests
+            # died on that one line, and the same shape accounts for most of ParaBank's and
+            # OrangeHRM's. The occurrence is counted within the step, because that is the
+            # order the page offered them and the order Playwright's own query returns them.
+            occurrence = per_step.get(locator, 0)
+            per_step[locator] = occurrence + 1
+            key = (path, locator, occurrence)
             if key in seen_el or len(elements) >= MAX_ELEMENTS:
                 continue
             seen_el[key] = f"e{len(elements) + 1}"
+            repeats[(path, locator)] = max(repeats.get((path, locator), 0), occurrence)
             elements.append({
                 "id": seen_el[key],
                 "path": path,
+                "occurrence": occurrence,
                 "role": _clean(cand.get("role") or "", 40),
                 "name": _clean(cand.get("name") or "", 120),
                 "locator": locator,
@@ -172,6 +186,13 @@ def build(steps: List[dict]) -> Dict[str, Any]:
             seen_val[body] = f"v{len(values) + 1}"
             values.append({"id": seen_val[body], "path": path,
                            "role": _clean(role, 24), "text": body})
+
+    # An ordinal only where one is needed. A control that is the only thing with its address
+    # keeps the plain locator, because `.nth(0)` on a unique match reads as though there were
+    # others and would age badly the first time a second one appears.
+    for row in elements:
+        if repeats.get((row["path"], row["locator"]), 0) > 0:
+            row["locator"] = f"{row['locator']}.nth({row['occurrence']})"
 
     return {
         "elements": elements,

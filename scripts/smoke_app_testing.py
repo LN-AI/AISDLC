@@ -2597,6 +2597,37 @@ def main_():
     ]
     _cat = assertion_compiler.build(_steps)
     _ids = {row["id"] for row in _cat["elements"]}
+    # Six buttons called "Add to cart" share one address, so a test that clicks it matches
+    # all six -- and Playwright's strict mode makes that an **error**, not a failure.
+    # Measured on a live SauceDemo run: twelve of seventeen tests died on that one line, and
+    # the same shape accounts for most of ParaBank's and OrangeHRM's. The ordinal is what
+    # makes each one addressable, and the row context (D-454) is what makes it choosable.
+    _shop_steps = [{"url_path": "/inventory.html", "page_texts": [], "candidates": [
+        {"role": "button", "name": "Add to cart",
+         "locator": "getByRole('button', { name: 'Add to cart' })",
+         "context": "Backpack $29.99"},
+        {"role": "button", "name": "Add to cart",
+         "locator": "getByRole('button', { name: 'Add to cart' })",
+         "context": "Bike Light $9.99"},
+        {"role": "link", "name": "Cart", "locator": "getByRole('link', { name: 'Cart' })"}]}]
+    _shop = assertion_compiler.build(_shop_steps)
+    _locs = [e["locator"] for e in _shop["elements"]]
+    check("controls sharing one address each get their own ordinal",
+          _locs[:2] == ["getByRole('button', { name: 'Add to cart' }).nth(0)",
+                        "getByRole('button', { name: 'Add to cart' }).nth(1)"], _locs)
+    check("...while a control that is the only one of its kind keeps a plain address",
+          _locs[2] == "getByRole('link', { name: 'Cart' })",
+          "`.nth(0)` on a unique match reads as though there were others and ages badly the "
+          "first time a second one appears")
+    check("...and each carries the row that tells them apart",
+          [e["context"] for e in _shop["elements"][:2]] == ["Backpack $29.99",
+                                                            "Bike Light $9.99"],
+          "an ordinal the model cannot choose between is a coin toss")
+    check("...and seeing the same page twice does not invent more of them",
+          len(assertion_compiler.build(_shop_steps * 2)["elements"]) == 3,
+          "a session revisits a page on most steps; counting each visit would make every "
+          "ordinal wrong after the first")
+
     check("a control the policy withheld is not offered as a reference",
           not any("Close account" in (e.get("name") or "") for e in _cat["elements"]),
           "a suite must not be able to name the money movement D-429 withheld from the "

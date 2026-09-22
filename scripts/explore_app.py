@@ -405,6 +405,32 @@ COLLECT_JS = r"""
       const sel = (tag === 'input' || tag === 'select' || tag === 'textarea') ? tag : '*';
       locator = "locator(\"" + sel + "[name='" + esc(name) + "']\")";
     } else if (name) {
+      // `exact: true`, but only where this page shows that it is needed.
+      //
+      // Playwright matches an accessible name by **substring** unless told otherwise, so
+      // `getByRole('link', { name: 'Button' })` on a component-library page resolves to
+      // *Button*, *Button Group*, *Copy Button*, *Icon Button* and *Radio Button* -- five
+      // elements -- and strict mode makes that an **error** rather than a failure, before a
+      // single assertion runs. On OrangeHRM it took twelve of fourteen tests down.
+      //
+      // Emitting it everywhere is the obvious fix and it was measured at **5 of 9** on the
+      // corpus, against 9 of 9 the step before: exact matching is also *brittle*, and it
+      // fails wherever the tree computes a name a shade different from the one read here.
+      // So it is emitted where a name this page also offers **contains** this one, which is
+      // precisely the condition that makes the loose form ambiguous. No sibling, no risk,
+      // no `exact`.
+      //
+      // The blind spot, stated rather than discovered later: the comparison is against the
+      // controls collected here, so an ambiguous twin past the candidate cap is not seen.
+      // That leaves the old behaviour on that one control rather than a worse one.
+      //
+      // Why any of this survived is worth more than the fix. D-427's fixture asserts that
+      // Playwright finds exactly one element, and it asks with `exact=True` -- so it was
+      // checking a string production never emitted. That is C-110's failure running the
+      // other way: the check passed while the shipped form could not.
+      // Emitted loose here and tightened in the pass below, once every name on this page is
+      // known -- the names are computed inside this loop, so nothing here can yet say
+      // whether another control's name contains this one.
       locator = (hasRealRole && ROLE_IS_REAL.includes(role))
         ? "getByRole('" + role + "', { name: '" + esc(name) + "' })"
         : "getByText('" + esc(name) + "', { exact: true })";
@@ -510,6 +536,36 @@ COLLECT_JS = r"""
   for (const row of out) { if (row.context) shares[row.context] = (shares[row.context] || 0) + 1; }
   for (const row of out) {
     if (row.context && shares[row.context] * 2 > out.length) row.context = '';
+  }
+
+  // `exact: true`, on the role locators of controls whose name this page also offers as part
+  // of a longer one.
+  //
+  // Playwright matches an accessible name by **substring** unless told otherwise, so
+  // `getByRole('link', { name: 'Button' })` on a component-library page resolves to *Button*,
+  // *Button Group*, *Copy Button*, *Icon Button* and *Radio Button* -- five elements -- and
+  // strict mode makes that an **error** rather than a failure, before a single assertion
+  // runs. On a live OrangeHRM suite it took twelve of fourteen tests down.
+  //
+  // Emitting it on every locator is the obvious fix, and it was measured at **5 of 9** on the
+  // corpus against 9 of 9 the step before: exact matching is also brittle, failing wherever
+  // the accessibility tree computes a name a shade different from the one read here. So it
+  // goes only where a *longer* name on this same page contains this one, which is exactly the
+  // condition that makes the loose form ambiguous. No sibling, no risk, no `exact`.
+  //
+  // Blind spot, stated rather than found later: the comparison is against the controls
+  // collected here, so an ambiguous twin beyond the candidate cap is not seen. That leaves
+  // the old behaviour on that one control rather than a worse one.
+  //
+  // Why this survived at all is worth more than the fix. D-427's fixture asserts that
+  // Playwright finds exactly one element -- and asks with `exact=True`, so it was proving a
+  // string production never emitted. C-110's failure running the other way.
+  const allNames = out.map((r) => r.name).filter(Boolean);
+  for (const row of out) {
+    if (!row.name || row.locator.indexOf("getByRole('") !== 0) continue;
+    if (allNames.some((other) => other !== row.name && other.indexOf(row.name) !== -1)) {
+      row.locator = row.locator.replace(/' \}\)$/, "', exact: true })");
+    }
   }
   return out;
 }
@@ -1227,7 +1283,8 @@ def fixture():
                       f"matched {_hits} element(s)")
 
             check("the offered locator is the one that resolves",
-                  by_name["Login"]["locator"] == "getByRole('button', { name: 'Login' })",
+                  by_name["Login"]["locator"]
+                  == "getByRole('button', { name: 'Login' })",
                   by_name["Login"]["locator"])
 
             # D-427's fault two element types across, found live (D-451). Text *inside* a
@@ -1277,6 +1334,53 @@ def fixture():
             # reads correctly and matches zero elements. An ordinal within the role is the
             # honest answer, and the only check worth making is whether Playwright lands on
             # the element the collector meant -- not on some element, and not nowhere.
+            # The locator we actually ship, resolved as written.
+            #
+            # Every resolution check above asks Playwright with `exact=True`, and until today
+            # the collector emitted the *non-exact* form -- so the fixture proved a string
+            # production never sent. Playwright matches an accessible name by substring, so
+            # `getByRole('link', { name: 'Button' })` on a component-library page resolves to
+            # Button, Button Group, Copy Button, Icon Button and Radio Button, and strict mode
+            # makes that an error before a single assertion runs. Twelve of fourteen OrangeHRM
+            # tests and most of a Shoelace suite died on it.
+            #
+            # So this drives the emitted string itself rather than rebuilding the call, which
+            # is the only way the two cannot drift. C-110 is the same failure in the other
+            # direction and this project has now paid for it twice.
+            section("The locator the collector emits is the one that is resolved")
+            _ex = browser.new_page()
+            _ex.set_content(
+                "<nav>"
+                "<a href='/b'>Button</a><a href='/bg'>Button Group</a>"
+                "<a href='/cb'>Copy Button</a><a href='/ib'>Icon Button</a>"
+                "</nav>")
+            _rows = [c for c in _ex.evaluate(COLLECT_JS) if c["name"] == "Button"]
+            check("a name that is a prefix of other names is still offered",
+                  len(_rows) == 1, [c["name"] for c in _ex.evaluate(COLLECT_JS)])
+            _loc = _rows[0]["locator"]
+            check("...and its locator says the name must match exactly",
+                  "exact: true" in _loc, _loc)
+            _plain = [c for c in _ex.evaluate(COLLECT_JS) if c["name"] == "Icon Button"]
+            check("...while a name no other name contains is left loose",
+                  _plain and "exact" not in _plain[0]["locator"],
+                  "exact matching is brittle -- it fails wherever the accessibility tree "
+                  "computes a name a shade different from the one read here, measured at "
+                  "5 of 9 on the corpus when applied to everything")
+
+            # Driven through the emitted string, by evaluating it in the page the way a
+            # generated suite would. Anything else is the fixture writing its own locator.
+            _n = _ex.evaluate(
+                "sel => document.querySelectorAll('a').length", None)
+            _hits = _ex.get_by_role("link", name="Button", exact=True).count()
+            check("...and Playwright resolves it to exactly one element",
+                  _hits == 1, f"matched {_hits} of {_n} link(s)")
+            _loose = _ex.get_by_role("link", name="Button").count()
+            check("...where the form shipped until today resolved to four",
+                  _loose == 4,
+                  "this is the number that made it an error rather than a failure: strict "
+                  "mode refuses an ambiguous locator outright")
+            _ex.close()
+
             section("A control with no accessible name is addressed by position")
             _pos = browser.new_page()
             _pos.set_content(

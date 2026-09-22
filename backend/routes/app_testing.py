@@ -461,7 +461,8 @@ def _submit_target(raw: str) -> str:
 # ordinal is the one shape where a character out of place changes which element is addressed.
 _LOCATOR = re.compile(
     r"^(?:"
-    r"getByRole\('[a-z]{1,24}'(?:, \{ name: '(?:[^'\\]|\\.){0,240}' \})?\)"
+    r"getByRole\('[a-z]{1,24}'"
+    r"(?:, \{ name: '(?:[^'\\]|\\.){0,240}'(?:, exact: true)? \})?\)"
     r"(?:\.nth\((?:[0-9]{1,3})\))?"
     r"|"
     r"getBy(?:Text|Label)\(.{1,240}\)"
