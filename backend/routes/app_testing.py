@@ -44,6 +44,7 @@ from backend import database, scope
 from backend.routes.v1_agents import _effective_llm_override, _orch, get_caller
 from backend.services import (
     action_policy,
+    assertion_compiler,
     app_basis,
     agent_guard,
     app_session,
@@ -1183,6 +1184,12 @@ def generate_suite(session_id: str, req: GenerateRequest, caller: dict = Depends
                          # nobody opened can be counted rather than believed (C-115). A live
                          # ParaBank run wrote three registration tests without ever reaching
                          # the registration page and reported every requirement covered.
+                         # What this session observed, each thing carrying a reference the
+                         # suite writer can quote rather than describe (D-460). Built from
+                         # the stored candidates, which is what D-453 exists for: before
+                         # them the platform kept a count of what a page offered and threw
+                         # the controls away, so there was nothing to build a catalogue from.
+                         "catalogue": assertion_compiler.build(recorded),
                          "visited_paths": [step.get("url_path") or ""
                                            for step in recorded if step.get("url_path")],
                          # Re-resolved from what the session recorded, rather than carried in

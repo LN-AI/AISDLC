@@ -56,6 +56,7 @@ from backend.services import llm_gateway  # noqa: E402
 # metering path below is exercised identically on every call.
 _next_action = {}
 _next_suite = {}
+_next_plan = {}
 _llm_calls = []
 
 
@@ -75,6 +76,8 @@ def _stub_call_tool(system_prompt, user_content, tool_schema, llm_override=None,
         return copy.deepcopy(_next_action)
     if name == "submit_app_test_suite":
         return copy.deepcopy(_next_suite)
+    if name == "submit_app_test_plan":
+        return copy.deepcopy(_next_plan)
     return {"findings": [], "summary": "stub", "risk_score": 0.0, "gate_status": "Green"}
 
 
@@ -2563,6 +2566,283 @@ def main_():
           .get("contradicts-record") == 1,
           "D-442's check, fed the way the route actually feeds it rather than the way its "
           "own fixture did")
+
+    # ── D-460. The model fills in a form; the platform writes the file ──
+    #
+    # D-408 applied to the half of the pipeline it was never applied to. The explorer has
+    # never been able to name an element that does not exist -- it answers with an index --
+    # and the suite writer could name anything at all, which is where every
+    # recalled-information defect this project has recorded lives: C-101 a CSS class, C-103 a
+    # price from a different shop, C-109 a credential from a famous demo site, D-438 a
+    # heading nobody saw, and C-117 a regex literal opening `//` that stopped a twenty-test
+    # suite from starting while all three audits passed it.
+    section("28. A suite compiled from references, not written as text")
+    from backend.services import assertion_compiler
+
+    _steps = [
+        {"url_path": "/login", "page_texts": ["heading: Sign in", "text: Welcome"],
+         "candidates": [
+             {"role": "textbox", "name": "username",
+              "locator": "locator(\"input[name='username']\")"},
+             {"role": "button", "name": "Log In",
+              "locator": "getByRole('button', { name: 'Log In' })"},
+             {"role": "link", "name": "Close account",
+              "locator": "getByRole('link', { name: 'Close account' })",
+              "refused_because": "cannot be undone"}]},
+        {"url_path": "/overview", "page_texts": ["heading: Accounts Overview",
+                                                 "text: $1,231.10"],
+         "candidates": [{"role": "link", "name": "12345",
+                         "locator": "getByRole('link', { name: '12345' })",
+                         "context": "12345 $1,231.10"}]},
+    ]
+    _cat = assertion_compiler.build(_steps)
+    _ids = {row["id"] for row in _cat["elements"]}
+    check("a control the policy withheld is not offered as a reference",
+          not any("Close account" in (e.get("name") or "") for e in _cat["elements"]),
+          "a suite must not be able to name the money movement D-429 withheld from the "
+          "session that would have driven it")
+    check("a control with no address is not offered either",
+          all(e.get("locator") for e in _cat["elements"]),
+          "an element a test cannot point at invites the model to describe it in prose, "
+          "which is the blank page this removes")
+    check("the collector's role prefix never reaches an assertable value",
+          [v["text"] for v in _cat["values"]][:2] == ["Sign in", "Welcome"],
+          [v["text"] for v in _cat["values"]])
+    check("...and the role is still shown to the model",
+          "[heading]" in assertion_compiler.markdown(_cat),
+          "the role is worth knowing when choosing what to assert; it is only the asserted "
+          "string it must stay out of")
+
+    _plan = {"files": [{"path": "tests/login.spec.ts", "journey": "Log in", "tests": [
+        {"name": "signing in shows the balance", "basis": "observed",
+         "what_it_checks": "the overview shows the balance that was observed",
+         "steps": [{"action": "goto", "path_ref": "p1"},
+                   {"action": "fill", "element_ref": "e1", "env": "APP_USER"},
+                   {"action": "click", "element_ref": "e2"}],
+         "expectations": [{"matcher": "toHaveURL", "path_ref": "p2"},
+                          {"matcher": "toContainText", "element_ref": "e3",
+                           "value_ref": "v4"}]},
+        {"name": "invented element", "basis": "observed", "what_it_checks": "nothing real",
+         "steps": [{"action": "click", "element_ref": "e99"}],
+         "expectations": [{"matcher": "toBeVisible", "element_ref": "e1"}]},
+        {"name": "invented value", "basis": "observed", "what_it_checks": "a price it recalls",
+         "steps": [{"action": "goto", "path_ref": "p2"}],
+         "expectations": [{"matcher": "toHaveText", "element_ref": "e3",
+                           "value_ref": "v99"}]},
+        {"name": "smuggled secret", "basis": "observed", "what_it_checks": "a token",
+         "steps": [{"action": "goto", "path_ref": "p1"},
+                   {"action": "fill", "element_ref": "e1", "env": "ADMIN_TOKEN"}],
+         "expectations": [{"matcher": "toBeVisible", "element_ref": "e2"}]},
+    ]}], "summary": "stub"}
+    _files, _report = assertion_compiler.compile_suite(_plan, _cat)
+    _content = _files[0]["content"] if _files else ""
+
+    check("the test whose references all resolve is written",
+          _report["tests"] == 1 and _files[0]["test_names"] == ["signing_in_shows_the_balance"],
+          _report)
+    check("...an element reference the session never issued is dropped",
+          any("e99" in row for row in _report["dropped"]), _report["dropped"])
+    check("...and so is a value the session never read",
+          any("v99" in row for row in _report["dropped"]),
+          "this is C-103: a suite asserted a basket total of GBP 8.00 where GBP 4.00 was on "
+          "the screen, and no audit reading shape can tell those apart")
+    check("...and a test left with no expectations is not written at all",
+          any("nothing left that could fail" in row for row in _report["dropped"]),
+          "a test with its assertions quietly removed still runs, still passes, and is "
+          "counted as coverage")
+    check("an environment variable nobody agreed to supply is refused",
+          any("ADMIN_TOKEN" in row for row in _report["dropped"])
+          and "ADMIN_TOKEN" not in _content,
+          "`process.env.ADMIN_TOKEN` in a generated suite is a request for a secret, "
+          "phrased as a test")
+    check("a credential is read from the environment, never written in",
+          "process.env.APP_USER" in _content and "'standard_user'" not in _content,
+          "C-109: a live suite supplied `locked_out_user`, a real account on a famous demo "
+          "site the session never had")
+    check("the asserted value is the one observed, without the collector's prefix",
+          "toContainText('$1,231.10')" in _content, _content)
+
+    # The clause measurement forced back open. Requiring every value matcher to quote a line
+    # the session read took the corpus from 9/9 to **2/9**: a session observes the states it
+    # happened to visit, a test *constructs* one, and those are usually different -- so one
+    # suite carried the comment "drops the total from GBP 28.50 to GBP 26.00" and then
+    # asserted `toBeHidden()` on a button, because GBP 26.00 was not in the catalogue. A rule
+    # written to reduce hollow tests manufactured them. Both are allowed now, and the split
+    # is reported rather than hidden, because they are not equally trustworthy.
+    _mixed = {"files": [{"path": "t.spec.ts", "journey": "Basket", "tests": [
+        {"name": "total after a third widget", "basis": "stated",
+         "what_it_checks": "the total is the sum of the line totals",
+         "steps": [{"action": "goto", "path_ref": "p1"}],
+         "expectations": [{"matcher": "toContainText", "element_ref": "e1",
+                           "text": "GBP 26.00"},
+                          {"matcher": "toContainText", "element_ref": "e3",
+                           "value_ref": "v4"}]}]}]}
+    _mf, _mr = assertion_compiler.compile_suite(_mixed, _cat)
+    # The clause that cost 9/9 -> 2/9, and it was not the value rule it was first blamed on.
+    # The catalogue offers controls, which carry a locator, and text, which does not. With
+    # `element_ref` compulsory, a model wanting to check "the page says Signed in as alice"
+    # had nothing to hang it on and reached for whatever element reference it held: a live
+    # suite asserted that the **All tasks link** contained "Signed in as alice", two
+    # unrelated things on one page. And `task-ownership`'s separating assertions are
+    # *negative* -- must be refused, must not be offered -- so a suite that cannot say "not"
+    # about a piece of text cannot catch an authorisation bug at all.
+    _texty = {"files": [{"path": "t.spec.ts", "journey": "Tasks", "tests": [
+        {"name": "alice sees only her own task", "basis": "stated",
+         "requirement_ref": "a user sees only tasks they own",
+         "what_it_checks": "another user's task is not listed",
+         "steps": [{"action": "goto", "path_ref": "p1"}],
+         "expectations": [{"matcher": "toBeVisible", "value_ref": "v1"},
+                          {"matcher": "toBeVisible", "value_ref": "v2", "negated": True},
+                          {"matcher": "toBeVisible", "text": "GBP 26.00"}]}]}]}
+    _tf, _tr = assertion_compiler.compile_suite(_texty, _cat)
+    _tc = _tf[0]["content"] if _tf else ""
+    check("a piece of observed text can be checked without naming a control",
+          "await expect(page.getByText('Sign in').first()).toBeVisible();" in _tc, _tc)
+    check("...narrowed to one element, because Playwright errors on an ambiguous locator",
+          ".first())" in _tc,
+          "a total reads as `Total: GBP 8.00` and again as `GBP 8.00`, so the shorter check "
+          "matches twice and strict mode makes that an error rather than a failure - three "
+          "tests of a *working* basket died on it")
+    check("...and it can be checked for absence, which is how a refusal is tested",
+          "await expect(page.getByText('Welcome').first()).not.toBeVisible();" in _tc,
+          "task-ownership's separating assertions are all negative ones; without this the "
+          "suite cannot express the authorisation bug it exists to catch")
+    check("...and a value the test computes works the same way",
+          "await expect(page.getByText('GBP 26.00').first()).toBeVisible();" in _tc, _tc)
+    check("a text check that names no words at all is dropped",
+          any("neither an element nor any text" in row for row in
+              assertion_compiler.compile_suite(
+                  {"files": [{"path": "t.spec.ts", "tests": [
+                      {"name": "nothing", "steps": [],
+                       "expectations": [{"matcher": "toBeVisible"}]}]}]},
+                  _cat)[1]["dropped"]),
+          "an expectation with no subject is not an expectation")
+
+    check("a value the test computes is allowed where none was observed",
+          _mr["computed_values"] == 1 and _mr["quoted_values"] == 1, _mr)
+    check("...and is marked in the file as computed rather than seen",
+          "computed, not observed" in _mf[0]["content"], _mf[0]["content"])
+    check("...while a value matcher with neither is still dropped",
+          any("needs either an observed value" in row for row in
+              assertion_compiler.compile_suite(
+                  {"files": [{"path": "t.spec.ts", "tests": [
+                      {"name": "empty", "steps": [], "expectations": [
+                          {"matcher": "toHaveText", "element_ref": "e1"}]}]}]},
+                  _cat)[1]["dropped"]),
+          "a check with nothing to check against is not a check")
+
+    # The check C-117 was crying out for, and the only one that can make it. All three audits
+    # read that ParaBank file line by line and passed it; none asked whether it was a
+    # program. A compiler cannot emit a syntax error, and this is how that claim is kept
+    # honest rather than asserted.
+    import subprocess, tempfile, shutil
+    _node = shutil.which("node")
+    if _node:
+        with tempfile.TemporaryDirectory() as _tmp:
+            _mjs = os.path.join(_tmp, "suite.mjs")
+            with open(_mjs, "w", encoding="utf-8") as _fh:
+                _fh.write(_content)
+            _proc = subprocess.run([_node, "--check", _mjs],
+                                   capture_output=True, text=True)
+        check("the emitted file is a program a parser accepts",
+              _proc.returncode == 0,
+              (_proc.stderr or "")[:400])
+    else:
+        check("the emitted file is a program a parser accepts",
+              False, "node is not on PATH, so C-117's guard could not run")
+
+    # Through the real construction, not the module alone. A checker that passes against a
+    # hand-built fixture and cannot fire in production is this project's most repeated
+    # process failure -- D-442's `contradicts-record` was inert for a day for exactly that
+    # reason (C-110), because the route's sanitiser dropped the one input shape that
+    # triggered it. So the catalogue here is the one the route builds, from steps the route
+    # stored, for a session the route opened.
+    _e2e = client.post("/api/v1/app-testing/sessions",
+                       json={"target_label": "bank.example.com",
+                             "requirement": "the overview shows each account's balance",
+                             "max_steps": 6, "attested_test_env": True},
+                       headers=scoped).json()["session"]["id"]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
+                         "journey": "Account Overview", "rationale": "open the account"})
+    _step(client, scoped, _e2e,
+          [{"role": "link", "name": "12345",
+            "locator": "getByRole('link', { name: '12345' })",
+            "context": "12345 $1,231.10"}],
+          url_path="/overview", page_texts=["heading: Accounts Overview", "text: $1,231.10"])
+    _next_plan.clear()
+    _next_plan.update({"files": [{"path": "tests/overview.spec.ts", "journey": "Account Overview",
+                                  "tests": [
+        {"name": "overview shows the balance", "basis": "stated",
+         "requirement_ref": "the overview shows each account's balance",
+         "what_it_checks": "the account row carries the balance that was observed",
+         "steps": [{"action": "goto", "path_ref": "p1"}],
+         "expectations": [{"matcher": "toContainText", "element_ref": "e1",
+                           "value_ref": "v2"}]},
+        {"name": "recalled balance", "basis": "observed", "what_it_checks": "a made-up figure",
+         "steps": [{"action": "goto", "path_ref": "p1"}],
+         "expectations": [{"matcher": "toContainText", "element_ref": "e1",
+                           "value_ref": "v77"}]}]}],
+                       "summary": "One journey, written from references.",
+                       "prerequisites": ["BASE_URL"]})
+    _gen = client.post(f"/api/v1/app-testing/sessions/{_e2e}/generate",
+                       json={"project_name": "App Testing Smoke"}, headers=scoped).json()
+    _res = _gen if isinstance(_gen, dict) else {}
+    _asked = [c["name"] for c in _llm_calls[-2:]]
+    check("generation asks for a plan before it asks for a file",
+          "submit_app_test_plan" in _asked, _asked)
+    check("...and the catalogue reaches the model with ids it can quote",
+          "`e1`" in _llm_calls[-1]["content"] and "$1,231.10" in _llm_calls[-1]["content"],
+          _llm_calls[-1]["content"][-400:])
+    check("the stored suite is the compiled one",
+          (_res.get("compiled_plan") or {}).get("compiled") is True, sorted(_res))
+    check("...carrying only the test whose references resolved",
+          _res.get("total_tests") == 1, _res.get("total_tests"))
+    check("...and the dropped reference is reported rather than silently lost",
+          (_res.get("compiled_plan") or {}).get("dropped_count") == 2,
+          _res.get("compiled_plan"))
+    _written = (_res.get("test_files") or [{}])[0].get("content", "")
+    check("...and what was stored is a file, not a description of one",
+          "await expect(page.getByRole('link', { name: '12345' })).toContainText('$1,231.10')"
+          in _written, _written)
+    check("the basis travels on the test rather than in a parallel list",
+          [(r.get("test_name"), r.get("basis")) for r in _res.get("assertion_basis") or []]
+          == [("overview_shows_the_balance", "stated")],
+          _res.get("assertion_basis"))
+    check("...so a basis row describing a test that does not exist cannot survive",
+          len(_res.get("assertion_basis") or []) == _res.get("total_tests"),
+          "D-421 is a generation that returned three basis rows for tests it never wrote")
+    check("the locator audit still reads the compiled suite",
+          _res.get("locators_grounded", 0) >= 1 and _res.get("locators_invented") == 0,
+          (_res.get("locators_grounded"), _res.get("locators_invented")))
+
+    # And the fallback, which is the reason this can be turned on at all: a plan that
+    # compiles to nothing must not cost the session. Everything the customer already paid to
+    # explore is in that record, and a second call is cheaper than losing it (D-440).
+    _fb = client.post("/api/v1/app-testing/sessions",
+                      json={"target_label": "bank.example.com",
+                            "requirement": "the overview shows each account's balance",
+                            "max_steps": 6, "attested_test_env": True},
+                      headers=scoped).json()["session"]["id"]
+    _step(client, scoped, _fb,
+          [{"role": "link", "name": "12345",
+            "locator": "getByRole('link', { name: '12345' })"}],
+          url_path="/overview", page_texts=["heading: Accounts Overview"])
+    _next_plan.clear()
+    _next_plan.update({"files": [{"path": "t.spec.ts", "journey": "x", "tests": [
+        {"name": "all invented", "basis": "observed", "what_it_checks": "nothing",
+         "steps": [{"action": "click", "element_ref": "e50"}],
+         "expectations": [{"matcher": "toBeVisible", "element_ref": "e50"}]}]}],
+                       "summary": "nothing survived"})
+    _next_suite.clear()
+    _next_suite.update(copy.deepcopy(SAFE_SUITE))
+    _fbres = client.post(f"/api/v1/app-testing/sessions/{_fb}/generate",
+                         json={"project_name": "App Testing Smoke"},
+                         headers=scoped).json()
+    check("a plan that compiles to nothing falls back rather than losing the session",
+          _fbres.get("total_tests", 0) >= 1 and not _fbres.get("compiled_plan"),
+          "the exploration was already paid for; a second call is cheaper than returning "
+          "nothing for it")
 
     section("14. The registry row, the estimator and the screen table agree")
     product = registry.get("app-testing")

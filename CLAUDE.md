@@ -328,6 +328,29 @@ the ones coming back emptiest. Read D-436 before touching `deepAll` — it is wr
 twice on purpose, and frames are deliberately still out of scope because reaching into one
 changes what an address *means* in this contract.
 
+**The suite writer selects; a compiler emits** (D-460, `services/assertion_compiler.py`).
+This is D-408 aimed at the half of the pipeline it never covered. The explorer cannot name an
+element that does not exist -- it answers with an index -- and the writer could name anything,
+which is where every recalled-information defect in this file sits. The model now fills in a
+form (*which element, what should be true, which value*) against a catalogue of what the
+session observed, and the platform writes the Playwright. Measured **9/9 at $0.0933 a session
+against free-form's 9/9 at $0.1333** -- 30% cheaper, because a plan is much smaller than a
+file and this call was always output-dominated. Free-form remains the fallback when a plan
+compiles to nothing, because a session that reached generation has already been paid for
+(D-440).
+
+**Read D-461 before tightening any of the three rules in it.** Each was first written the
+strict way, each was measured, and each cost the corpus: requiring every asserted value to be
+*quoted* from the session took 9/9 to **2/9** (a test constructs a state the session never
+visited, so the right total is a number nobody saw, and denied a value the only expressible
+check is furniture); making `element_ref` compulsory left nowhere to hang a check on page
+*text*, which is what `task-ownership`'s negative assertions are made of; and routing
+credentials through `process.env.APP_PASSWORD` scored **0 of 6 tests passing on either build**
+because nothing sets it. The compiler also emits `.first()` on every text subject, since
+Playwright's strict mode makes an ambiguous locator an error and `Total: GBP 8.00` also
+matches `GBP 8.00`. What the compiler does **not** do is judge: it will emit a suite of
+`toBeVisible` if handed one, and only `--verify` can tell a true assertion from a false one.
+
 **Two audits read the finished suite, and they answer different questions.**
 `locator_audit` (D-433) asks whether a locator could have come from the session — the
 contract sends roles, names and page text and never a class, an id or a test id, so anything

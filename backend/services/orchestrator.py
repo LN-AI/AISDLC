@@ -997,6 +997,13 @@ class SDLCOrchestrator:
             # is most likely to fix, because the headings the session did see are already in
             # the prompt. Same argument D-442 makes for its own check feeding the retry.
             observed_texts=(session or {}).get("observed_texts"),
+            # Everything the session observed, each thing with a reference the model can
+            # quote instead of describing (D-460). Assembled by the route, which is the only
+            # layer holding the raw steps -- the markdown this method receives has already
+            # been capped per step and carries only the controls that were acted on, so a
+            # catalogue built from it could describe the journey and nothing else on the
+            # page.
+            catalogue=(session or {}).get("catalogue"),
             llm_override=llm_override,
         )
 

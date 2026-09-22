@@ -65,7 +65,12 @@ from backend.agents.qa_intelligence.test_automation_agent import (
     PREREQUISITES,
     TEST_AUTOMATION_TOOL_SCHEMA,
 )
-from backend.services import action_policy, llm_gateway, locator_audit
+from backend.services import (
+    action_policy,
+    assertion_compiler,
+    llm_gateway,
+    locator_audit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +298,314 @@ def _app_suite_schema() -> Dict[str, Any]:
 
 
 APP_SUITE_TOOL_SCHEMA = _app_suite_schema()
+
+
+def _app_plan_schema():
+    """The form that replaces the blank page. D-460.
+
+    Written out rather than deep-copied from `TEST_AUTOMATION_TOOL_SCHEMA`, which every other
+    schema in this file is a copy of. The original plan for this product named schema reuse as
+    the first thing to revisit "if the two outputs diverge", and this is the divergence: the
+    code-based generator has source in front of it and must write code, while this one has a
+    record of what a browser saw and must not.
+
+    The shape is `which element - what should be true of it - which observed value`. Three
+    properties fall out of that, and none is reachable by asking the model more nicely:
+
+    * **A syntax error cannot be expressed**, because the model never writes code. A live
+      ParaBank suite died on a regex literal opening `//`, which JavaScript reads as a
+      comment, and all three audits passed the file (C-117).
+    * **A value cannot be recalled**, because `value_ref` has to name a line this session read
+      off the page. C-103 is a suite asserting a basket total of GBP 8.00 where GBP 4.00 was
+      on the screen; both are plausible, and no audit that reads shape can separate them.
+    * **`assertion_basis` cannot disagree with the tests**, because the basis is a field *on*
+      each test instead of a parallel array keyed by test name. D-421 is a generation that
+      returned three basis rows describing tests which did not exist.
+    """
+    return {
+        "name": "submit_app_test_plan",
+        "description": (
+            "Submit a test plan built from references to what this session observed. You do "
+            "not write the test code: name the element, the check and the value, and the "
+            "platform writes it. Anything you cannot name a reference for is something this "
+            "session did not see, and belongs in not_automated rather than in a test."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["files", "summary"],
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "description": "One file per journey that was walked.",
+                    "items": {
+                        "type": "object",
+                        "required": ["path", "journey", "tests"],
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "e.g. tests/login.spec.ts",
+                            },
+                            "journey": {
+                                "type": "string",
+                                "description": "The journey from the record this file covers.",
+                            },
+                            "tests": {"type": "array", "items": _plan_test_schema()},
+                        },
+                    },
+                },
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "What this suite covers and what it does not, for somebody deciding "
+                        "whether to trust it. Say plainly if it rests only on observation."
+                    ),
+                },
+                "not_automated": {
+                    "type": "array",
+                    "description": (
+                        "What could not be tested and why: anything the session never "
+                        "reached, and any value you wanted to assert and could find no "
+                        "reference for. This is the honest home for everything the "
+                        "references would not let you write."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "required": ["what", "why"],
+                        "properties": {
+                            "what": {"type": "string"},
+                            "why": {"type": "string"},
+                        },
+                    },
+                },
+                "prerequisites": {
+                    "type": "array",
+                    "description": (
+                        "What somebody must supply for this suite to run: BASE_URL, "
+                        "APP_USER, APP_PASSWORD, seeded data."
+                    ),
+                    "items": {"type": "string"},
+                },
+            },
+        },
+    }
+
+
+def _plan_test_schema():
+    """One test: how to reach the state, and what must then be true of it."""
+    return {
+        "type": "object",
+        "required": ["name", "what_it_checks", "basis", "steps", "expectations"],
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "snake_case, describing the behaviour rather than the click.",
+            },
+            "what_it_checks": {
+                "type": "string",
+                "description": (
+                    "One sentence naming the behaviour, not the mechanics: 'the overview "
+                    "total equals the sum of the balances', not 'checks the page'."
+                ),
+            },
+            "basis": {
+                "type": "string",
+                "enum": list(ASSERTION_BASES),
+                "description": (
+                    "'stated' only when a person wrote down the thing this checks, in the "
+                    "supplied requirement or a project document. 'derived' for a scenario or "
+                    "test case this platform generated earlier. 'observed' when nothing said "
+                    "this should be true and the test only records what the application did."
+                ),
+            },
+            "requirement_ref": {
+                "type": "string",
+                "description": "What it traces to. Leave empty for 'observed'.",
+            },
+            "steps": {
+                "type": "array",
+                "description": (
+                    "How to reach the state being checked. Start with a goto. Every element "
+                    "is named by its reference from the catalogue, never described."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["action"],
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": sorted(assertion_compiler.ACTIONS),
+                            "description": "What to do.",
+                        },
+                        "element_ref": {
+                            "type": "string",
+                            "description": "e.g. e12 - required for everything except goto.",
+                        },
+                        "path_ref": {
+                            "type": "string",
+                            "description": "e.g. p2 - the page a goto opens.",
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": (
+                                "What to type for a fill, or the option to choose for a "
+                                "select. Use the value the session itself typed, which the "
+                                "record shows against that step - replaying it is grounded, "
+                                "and a suite that cannot sign in tests nothing at all."
+                            ),
+                        },
+                        "env": {
+                            "type": "string",
+                            "enum": list(assertion_compiler.ENV_ALLOWED),
+                            "description": (
+                                "Fill from the environment instead of a literal. Use this "
+                                "only where the record does not show what was typed, because "
+                                "whoever runs this suite has to set the variable and an "
+                                "unset one makes the whole file fail on its first line."
+                            ),
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "For press, e.g. Enter.",
+                        },
+                    },
+                },
+            },
+            "expectations": {
+                "type": "array",
+                "description": (
+                    "What must be true once those steps have run. A test with none of these "
+                    "cannot fail, so it will not be written."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["matcher"],
+                    "properties": {
+                        "matcher": {
+                            "type": "string",
+                            "enum": sorted(assertion_compiler.MATCHERS),
+                            "description": (
+                                "toBeVisible and toHaveURL both pass against an application "
+                                "with the feature torn out, so a suite made of those is "
+                                "counted as coverage and catches nothing. Prefer a matcher "
+                                "that names a value."
+                            ),
+                        },
+                        "element_ref": {
+                            "type": "string",
+                            "description": (
+                                "e.g. e12 - the control being checked. **Leave this out to "
+                                "check the page's text instead**, and the check is made "
+                                "against the words in value_ref or text: 'the page shows "
+                                "Signed in as alice', or with negated, 'the page does not "
+                                "show Book the venue'. Only a control has a reference here; "
+                                "a heading, a total or a message is text, and text is "
+                                "checked without one."
+                            ),
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": (
+                                "The value to check for, when the session never observed it "
+                                "because this test creates the state. Work it out from the "
+                                "values that *were* observed and from what the application "
+                                "is supposed to do. Prefer value_ref where one fits: a "
+                                "reference cannot be wrong, and this can."
+                            ),
+                        },
+                        "value_ref": {
+                            "type": "string",
+                            "description": (
+                                "e.g. v7 - an observed line this must match. Use this "
+                                "whenever the value you want to assert is one the session "
+                                "already read off the page: it is then a quote from the "
+                                "record rather than your arithmetic. Where the test builds a "
+                                "state the session never reached - a different quantity, a "
+                                "different total - there will be no reference for the right "
+                                "value, and you should put it in `text` instead."
+                            ),
+                        },
+                        "path_ref": {
+                            "type": "string",
+                            "description": "e.g. p2 - for toHaveURL.",
+                        },
+                        "number": {
+                            "type": "integer",
+                            "description": "For toHaveCount.",
+                        },
+                        "negated": {
+                            "type": "boolean",
+                            "description": (
+                                "Assert the opposite. This is how 'must be refused' and "
+                                "'must not be offered' are written, and those are usually "
+                                "the checks that catch a real defect."
+                            ),
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+
+APP_PLAN_TOOL_SCHEMA = _app_plan_schema()
+
+
+APP_PLAN_SYSTEM_PROMPT = """You plan Playwright tests for an application somebody explored \
+in a real browser. You do not write the test code. The platform writes it, from the \
+references you give.
+
+You are given a catalogue: the pages this session reached (`p1`, `p2`...), the elements it \
+saw and can address (`e1`, `e2`...), and the lines of text it actually read off those pages \
+(`v1`, `v2`...). Those references are the whole of what exists. There is no way to write down \
+an element that is not in the catalogue and no way to assert a value that is not in it, and \
+that is the point rather than a limitation to work around.
+
+Why it is built this way. Every suite this platform generated before today was written as \
+free text, and the same handful of mistakes kept arriving: a CSS class nobody was shown, a \
+price that was right for a different shop, a username that belongs to a famous demo site, a \
+heading that was never on the page. Each one produces a test that goes **red against a \
+working application**, which is the one failure a suite does not survive -- the team reads \
+red as "we broke something", finds out it was the test, and switches the suite off. None of \
+those is expressible here.
+
+**Assert values, not furniture.** `toBeVisible` and `toHaveURL` pass against an application \
+with the feature ripped out of it. A suite made of those is counted as coverage and catches \
+nothing, which is worse than a missing test because somebody believes it. Check the \
+value.
+
+Two ways to name a value, and the choice matters. Where the session already read the \
+value off the page, quote it with a `value_ref`: that is a fact from the record and it \
+cannot be wrong. Where your test *builds* a state the session never reached -- a \
+different quantity, a total after a change nobody made -- there is no reference for the \
+right value, so work it out and put it in `text`. Do that rather than retreating to \
+`toBeVisible`: a test that says "the button is still there" where it meant "the total \
+is now GBP 26.00" has thrown away the only thing it was for. Prefer a reference where \
+one fits and do not force one where it does not -- quoting a total from a different \
+moment in the session is worse than computing the right one.
+
+**Most of what is worth checking is text, and text needs no element.** A heading, a total, \
+a balance, an error message and a row are all *text*: they have no `e` reference because \
+only controls do. To check them, leave `element_ref` out and name the words -- a `value_ref` \
+where the session read them, or `text` where your test creates them. That is how you say \
+"the page shows Signed in as alice", and with `negated` it is how you say "the page does \
+not show Book the venue". Hanging a piece of text on the nearest control you happen to have \
+a reference for produces a test that fails against a working application.
+
+**Negative checks are usually the valuable ones.** "Must be refused", "must not be offered", \
+"must not reach the next page": use `negated`. A requirement that says something is forbidden \
+is not tested by confirming the allowed case works.
+
+**Only what was walked.** If the session never reached a page, no test about it is possible, \
+however obvious the behaviour seems. Put it in `not_automated` and say the session never got \
+there. The same goes for a value you wanted and cannot find a reference for: say so there \
+rather than typing the number you expect.
+
+**`basis` is an honesty field, not a rating.** Mark a test `stated` only when a person wrote \
+down the thing it checks. If nothing was supplied, every test is `observed`: it records what \
+the application did, including any bug that was already in it, and the reader must be able to \
+tell that from a test that checks a requirement.
+
+Name tests for the behaviour they check, not the buttons they press."""
 
 
 APP_SUITE_SYSTEM_PROMPT = """You write Playwright test suites from journeys that were \
@@ -576,6 +889,57 @@ class AppExplorerAgent(BaseAgent):
         return result
 
     # ── Suite ─────────────────────────────────────────────────────────────
+    def _compiled_suite(self, user_content, catalogue, llm_override):
+        """One call for a plan, then a deterministic file. `None` if nothing survived.
+
+        The result is shaped exactly like a free-form generation on purpose -- same
+        `test_files`, same `assertion_basis`, same `summary` -- so that `locator_audit`,
+        `assertion_audit`, `journey_audit`, the renderer and `run_tests.py` all keep working
+        without a branch. Divergence belongs in how the suite is produced, not in what a
+        finished suite *is*; a second result shape is how a renderer quietly stops drawing
+        half of them.
+        """
+        catalogue_md = assertion_compiler.markdown(catalogue)
+        plan = llm_gateway.call_tool(
+            APP_PLAN_SYSTEM_PROMPT,
+            user_content + "\n\n## What this session observed, and what you may refer to\n"
+                           + catalogue_md,
+            APP_PLAN_TOOL_SCHEMA, llm_override, max_tokens=32000,
+        )
+        files, report = assertion_compiler.compile_suite(plan, catalogue)
+        if not files:
+            return None
+
+        # Built here from the tests themselves rather than asked for separately. D-421 is a
+        # generation that returned three `assertion_basis` rows describing tests that did not
+        # exist; a basis carried *on* the test it describes cannot drift from it.
+        basis = []
+        for spec in (plan or {}).get("files") or ():
+            for case in (spec or {}).get("tests") or ():
+                if not isinstance(case, dict) or not case.get("name"):
+                    continue
+                basis.append({
+                    "test_name": assertion_compiler._ident(case.get("name"), "test"),
+                    "basis": case.get("basis") or "observed",
+                    "requirement_ref": case.get("requirement_ref") or "",
+                    "what_it_checks": case.get("what_it_checks") or "",
+                })
+        written = {name for f in files for name in f.get("test_names") or ()}
+        basis = [row for row in basis if row["test_name"] in written]
+
+        return {
+            "test_files": files,
+            "assertion_basis": basis,
+            "summary": ((plan or {}).get("summary") or "")
+                       + ("\n\n" + assertion_compiler.summary_sentence(report)
+                          if report.get("dropped_count") else ""),
+            "not_automated": (plan or {}).get("not_automated") or [],
+            "prerequisites": (plan or {}).get("prerequisites") or [],
+            "levels_chosen": [{"level": "UI/End-to-End",
+                               "rationale": "journeys walked through a running application"}],
+            "compiled_plan": report,
+        }
+
     def generate_suite(
         self,
         *,
@@ -588,6 +952,7 @@ class AppExplorerAgent(BaseAgent):
         context: str = "",
         observed_locators: Optional[List[Dict[str, Any]]] = None,
         observed_texts: Optional[List[str]] = None,
+        catalogue: Optional[Dict[str, Any]] = None,
         llm_override: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """One call at the end of a session. The large half.
@@ -649,6 +1014,22 @@ class AppExplorerAgent(BaseAgent):
         # `test_files` is a whole file. `agent_guard.RESERVATION_MAX_TOKENS` is sized from
         # this number, so raising it here without raising that under-reserves the budget.
         user_content = "\n\n".join(parts)
+
+        # D-460. Ask for a plan rather than a file, and compile it.
+        #
+        # Tried first and fallen back from rather than switched between, because the failure
+        # this can have is total: a model that answers with no usable references produces no
+        # suite at all, and a session that reached generation has already been paid for. The
+        # fallback costs a second call on exactly the sessions where the first one failed,
+        # which is the same bargain the empty-files retry below already makes.
+        if catalogue and (catalogue.get("elements") or catalogue.get("values")):
+            compiled = self._compiled_suite(user_content, catalogue, llm_override)
+            if compiled is not None:
+                return compiled
+            logger.warning(
+                "App suite: the plan compiled to nothing; falling back to free-form "
+                "generation for this session.")
+
         result = llm_gateway.call_tool(
             APP_SUITE_SYSTEM_PROMPT, user_content, APP_SUITE_TOOL_SCHEMA,
             llm_override, max_tokens=32000,
