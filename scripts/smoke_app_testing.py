@@ -88,6 +88,7 @@ import backend.database as database  # noqa: E402
 import backend.main as main  # noqa: E402
 from backend.products import registry  # noqa: E402
 from backend.services import action_policy, app_session  # noqa: E402
+from backend.routes.app_testing import REPEATS_PER_CONTROL  # noqa: E402
 
 _failures = []
 _checks = 0
@@ -2431,13 +2432,13 @@ def main_():
     _next_action.clear()
     _next_action.update({"done": False, "action_kind": "select", "candidate_index": 0,
                          "value": "January", "journey": "Filter activity", "rationale": "filter"})
-    for _ in range(2):
+    for _ in range(REPEATS_PER_CONTROL):
         _step(client, scoped, _rep2, _filters, url_path="/activity.htm")
     _third = client.post(
         f"/api/v1/app-testing/sessions/{_rep2}/step",
         json={"url_path": "/activity.htm", "candidates": _filters, "page_texts": []},
         headers=scoped).json()
-    check("a third identical action on the same page is refused",
+    check("one identical action too many on the same page is refused",
           _third.get("refused") is True and "already been done" in (_third.get("reason") or ""),
           _third)
     check("...and the refusal names what has been used less instead",
@@ -2462,6 +2463,37 @@ def main_():
         f"/api/v1/app-testing/sessions/{_rep2}/step",
         json={"url_path": "/overview.htm", "candidates": _filters, "page_texts": []},
         headers=scoped).json()
+    # A `goto` has no candidate, so it had no target, so it sat outside this ceiling
+    # entirely -- and a model told it may not press a control simply navigates instead. A
+    # live ParaBank session spent its last four steps on `goto /parabank/overview.htm` from
+    # `/parabank/overview.htm`, which is the wandering the rule exists to stop, wearing the
+    # one costume the rule could not see.
+    _nav = client.post("/api/v1/app-testing/sessions",
+                       json={"target_label": "bank.example.com",
+                             "requirement": "the overview lists accounts",
+                             "max_steps": 12, "attested_test_env": True},
+                       headers=scoped).json()["session"]["id"]
+    _one = [{"role": "link", "name": "Statements"}]
+    _next_action.clear()
+    _next_action.update({"done": False, "action_kind": "goto", "value": "/overview.htm",
+                         "journey": "Look around", "rationale": "go back to the overview"})
+    for _ in range(REPEATS_PER_CONTROL):
+        _step(client, scoped, _nav, _one, url_path="/overview.htm")
+    _again_nav = client.post(
+        f"/api/v1/app-testing/sessions/{_nav}/step",
+        json={"url_path": "/overview.htm", "candidates": _one, "page_texts": []},
+        headers=scoped).json()
+    check("navigating to the page you are already on is counted like any repeat",
+          _again_nav.get("refused") is True, _again_nav)
+    _next_action.update({"value": "/activity.htm"})
+    _elsewhere_nav = client.post(
+        f"/api/v1/app-testing/sessions/{_nav}/step",
+        json={"url_path": "/overview.htm", "candidates": _one, "page_texts": []},
+        headers=scoped).json()
+    check("...while navigating somewhere else is not",
+          not _elsewhere_nav.get("refused"),
+          "the destination is the target, so two gotos to different pages are two actions")
+
     check("...and the same control on a different page starts again from zero",
           not _other_page.get("refused"),
           "the count is per page, because the same control on another page is another "
@@ -2496,7 +2528,7 @@ def main_():
     _next_action.clear()
     _next_action.update({"done": False, "action_kind": "click", "candidate_index": 0,
                          "journey": "Add items", "rationale": "raise the quantity"})
-    for _q in (1, 2, 3):
+    for _q in range(1, REPEATS_PER_CONTROL + 1):
         _step(client, scoped, _shop, _cart, url_path="/cart",
               page_texts=[f"Widget x{_q}", f"Total GBP {_q * 4}.00"])
     _fourth = client.post(
@@ -2541,7 +2573,7 @@ def main_():
                                "requirement": "the basket total is the sum of the line totals",
                                "max_steps": 12, "attested_test_env": True},
                          headers=scoped).json()["session"]["id"]
-    for _q in (1, 2, 3):
+    for _q in range(REPEATS_PER_CONTROL):
         _step(client, scoped, _still, _cart, url_path="/cart",
               page_texts=["Widget x1", "Total GBP 4.00"])
     _stuck = client.post(

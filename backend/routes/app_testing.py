@@ -90,9 +90,16 @@ PRODUCT = "app-testing"
 ASSUMED_STEP_CHARS = 6_000
 
 # How many times one control may be acted on, the same way, on one page, before the next
-# attempt is refused. Two, so a field can be corrected once and a wrong-then-right sign-in
-# still fits. See the refusal in `next_action` for what this was measured against (D-456).
-REPEATS_PER_CONTROL = 2
+# attempt is refused.
+#
+# **Three, not two, and two was measured wrong on live applications.** A sign-in journey is
+# routinely "wrong credentials, then correct ones", which is two fills of each field before
+# anything has been proved, so the third is the one that completes the test -- and at two,
+# OrangeHRM was refused on that third fill, offered `Forgot your password?` as the
+# alternative, and ended after eight steps having never signed in. Replayed over the stored
+# sessions the cost of the extra attempt is small: SauceDemo 6 refusals to 5, ParaBank 7 to
+# 5, Shoelace 4 to 3, and OrangeHRM still 0. See the refusal in `next_action` (D-456).
+REPEATS_PER_CONTROL = 3
 
 
 # ── Request models ────────────────────────────────────────────────────────
@@ -978,23 +985,35 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
     # `fill Username` refused, which M4 will have to revisit. Both cost one model call and no
     # step: a refusal is answered by observing again and is never charged to the budget, so a
     # wrong refusal is the cheapest thing here.
-    if chosen and chosen.get("name"):
-        here = str(req.url_path or "")
-        kind = action["action_kind"]
-        target = str(chosen.get("name") or "")
+    here = str(req.url_path or "")
+    kind = action["action_kind"]
+    # A `goto` has no candidate and so had no target, which left it outside this ceiling
+    # entirely -- and a model told it may not press a control simply navigates instead. A
+    # live ParaBank session did exactly that, spending its last four steps on
+    # `goto /parabank/overview.htm` from `/parabank/overview.htm`. Its destination is its
+    # target, and the same rule then applies.
+    target = (f"→{str(action.get('value') or '')}" if kind in ("goto", "back")
+              else str((chosen or {}).get("name") or ""))
+    if target:
+        # One definition of "what did that step act on", used by every comparison below, so
+        # a `goto` cannot be counted one way here and another way three lines down.
+        def _target_of(prior: dict) -> str:
+            pact = prior.get("action") or {}
+            if str(pact.get("action_kind") or "") in ("goto", "back"):
+                return f"→{str(pact.get('value') or '')}"
+            return str(pact.get("target_name") or "")
 
         def _used(name: str) -> int:
             return sum(
                 1 for prior in _recorded_so_far
-                if str(prior.get("url_path") or "") == here
-                and str((prior.get("action") or {}).get("target_name") or "") == name
+                if str(prior.get("url_path") or "") == here and _target_of(prior) == name
             )
 
         mine = sum(
             1 for prior in _recorded_so_far
             if str(prior.get("url_path") or "") == here
             and str((prior.get("action") or {}).get("action_kind") or "") == kind
-            and str((prior.get("action") or {}).get("target_name") or "") == target
+            and _target_of(prior) == target
         )
         # ...unless those earlier attempts were *productive*. This is the clause that
         # separates "repeating" from "learning nothing", and the first version did not have
@@ -1030,7 +1049,7 @@ def take_step(session_id: str, req: StepRequest, caller: dict = Depends(get_call
                 # first attempt reads as productive and the ceiling never fires at all.
                 seen_here.update(prior.get("page_texts") or [])
                 if (str(pact.get("action_kind") or "") == kind
-                        and str(pact.get("target_name") or "") == target):
+                        and _target_of(prior) == target):
                     after.append((set(follows), set(seen_here)))
             productive = any(new_texts - before for new_texts, before in after)
 
