@@ -72,7 +72,7 @@ python run.py
 
 ## Tests: smoke scripts, no framework
 
-There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. **`pytest` is now installed in `venv`, and that is not an invitation**: it is there because `eval_test_automation.py`'s Python case needs a runner to execute the suite the model wrote for it. Nothing in this repo is a pytest test, and writing one would be the wrong shape (D-09). Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These nine scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
+There is no test framework, linter/formatter config, or CI pipeline (no `.github/` either). Don't assume `pytest`, `ruff`, `eslint` etc. are available — check before suggesting a command that relies on them. **`pytest` is now installed in `venv`, and that is not an invitation**: it is there because `eval_test_automation.py`'s Python case needs a runner to execute the suite the model wrote for it. Nothing in this repo is a pytest test, and writing one would be the wrong shape (D-09). Tests are plain scripts that exit 0/1 and print a PASS/FAIL line per check (see D-09 in `DECISIONS.md`); new tests should follow that shape rather than introduce a framework. These ten scripts are the *entire* regression net — there is no CI and nothing else to fall back on, and the pass counts quoted in `DECISIONS.md`'s history table are this project's only record that a change was verified.
 
 ```
 python scripts/smoke_products.py        # registry, entitlement, quota, metering, project scoping
@@ -84,6 +84,7 @@ python scripts/smoke_llm_providers.py   # admin LLM connections: key never retur
 python scripts/smoke_cli.py             # scripts/lmsdlc.py driven as a subprocess against a real server
 node   scripts/smoke_render.js          # frontend result rendering (DOM-stubbed, no deps)
 node   scripts/smoke_plan_picker.js frontend/app.js products.json    # Plans screen product picker
+python scripts/smoke_app_testing.py     # app-testing: the action policy, step caps, assertion honesty
 python scripts/ui_examine.py            # the real UI in a real browser — every review source, no model called
 ```
 
@@ -97,6 +98,12 @@ python scripts/eval_code_review.py                       # accuracy, 3 runs per 
 python scripts/eval_code_review.py --repeat 1            # cheaper; cannot measure variance
 python scripts/eval_test_automation.py                   # do the generated tests work (~$0.43)
 python scripts/eval_test_automation.py --repeat 1        # cheaper; cannot measure variance
+python scripts/eval_app_testing.py                       # explore an app, does the suite guard it
+python scripts/eval_app_testing.py --self-check          # free: proves the harness, calls no model
+python scripts/explore_app.py --url <app> --max-steps 40 # explore a running app, write a suite
+python scripts/explore_app.py --url <app> --verify        # ...then run the suite against it
+python scripts/explore_app.py --url <app> --dry-run      # ...what it would be offered, spends nothing
+python scripts/explore_app.py --fixture                  # offline: no server, no key, no model
 python scripts/verify_pr_review.py <pr-url>              # every GitHub write path, on a real PR
 python scripts/verify_pr_review.py <pr-url> --dry-run    # ...the same, writing nothing
 python scripts/verify_pr_review.py <pr-url> --cleanup    # remove what it posted
@@ -166,6 +173,271 @@ from the Contents and Pull requests permissions everything else here uses, and a
 looks like a missing repository, because GitHub answers 404 for anything a credential cannot
 see.
 
+**Application-based testing is the sibling product, and it inverts the intake.**
+`test_runner_plan.CANNOT_SUPPLY` names `running application` as a prerequisite the code-based
+generator cannot conjure; `app-testing` is the case where that is the *input* and there is no
+source at all. An explorer drives a real browser, the platform chooses one action per step,
+and a Playwright suite is written from the journeys walked. The result has the same shape as
+a code-generated suite on purpose — same renderer, same `plan_for`, same `deliver-tests`,
+same results contract — so nothing downstream has a branch for it.
+
+Four things to know before changing any of it. **The browser never runs here** (D-407): the
+platform is sent page descriptions and answers with one action, so it never learns the URL,
+never holds a credential, and an application behind a VPN works — which a hosted browser
+fleet could not do. **The model picks from a screened list and never writes a selector**
+(D-408): `services/action_policy.py` removes dangerous controls before the model sees them,
+re-checks its choice, and is imported by the driver so the same rule applies where the click
+lands; read that module before touching the denylist, because its first version allowed a
+button called *Cancel subscription*. **A project can permit a named control the list
+withholds** (D-429), which exists because measurement made it necessary: against a banking
+demo the list withheld every money movement in three steps, and against a shop it withheld
+`Remove` and `Checkout`, leaving six of fifteen supplied requirements untestable. Matching is
+exact and never a substring, and the permitted list is **frozen onto the session and handed
+to the driver** — the platform picks an index and the driver resolves it, so the two
+sides screening to different lists is a click on an element nobody chose. **An assertion says what it rests on** (D-409): with no
+requirement supplied a suite can only describe what the application already does, so a
+`specified` claim made without one is downgraded to `observed` in code and the count is
+reported.
+
+**A session will not start without something to check the application against** (D-419):
+a typed requirement, a Requirements or QA document on the project, or a finished Test
+Scenario / Test Case run to cover — any one, and the third is optional and usually absent.
+`services/app_basis.py` resolves it and `app_session.create` refuses beside the attestation.
+Without this the product writes furniture tests: a live session opened with nothing supplied
+produced eleven tests of which nine were "the button is visible". The same module decides
+what a finished test may *claim* — `stated` for something a person wrote, `derived` for a
+case this platform generated, `observed` for nothing (D-420) — applied as a ceiling in code,
+because a machine-written case laundered into "we verified your requirement" is D-406 at one
+remove. **What a page displays is encrypted, expires and can be refused** (D-418): the
+`review_source_store` treatment, with 0 days meaning "wipe it when the suite is written", and
+the consequence of refusing it stated on the screen *and* on the finished suite.
+
+**A session can be watched, and stopped, from the screen.** `GET /sessions` lists sessions
+rather than suites, which is the difference between seeing a run that produced nothing and
+not knowing it happened; `renderAppSession` polls one session and says what it is doing now.
+**A stop is served as the existing `done` reply** (D-423), checked before `require_open` and
+before metering, so it needs no driver change, costs nothing, and is enforced by closing the
+session row rather than by the driver agreeing. The loop detector in the browser (D-424) was
+built because `app_session.stalled` could not see an A,B,A,B loop; **the server-side rule can
+now** (D-441). Progress means reaching something the session has not reached before, rather
+than the last five pages being identical — the old question could never be answered yes by a
+session alternating between two known states, and a live banking run spent 22 of 26 steps
+doing exactly that. Read D-441 before widening it: a signature carries each control's current
+*value* so that filling a form reads as progress, which is precisely why the explorer could
+always move the measure by typing something. What the denylist withheld is finally visible by name (D-426) — and
+reads in both directions, because half a page withheld is a coverage problem, not a safety
+win. An abandoned session is closed after six hours and its digest then expires on **the
+window its customer chose** (D-425), which is also what repairs a D-418 promise whose SQL
+excluded the only case its own docstring described.
+
+**No fingerprint can see the wandering, and D-456 is why it stopped trying to.** The measured
+failure is not a page that looks the same — it is *one control used over and over*. Across four
+stored live sessions: SauceDemo filled **Password seven times** and never pressed Login again
+after step 4; ParaBank cycled two dropdowns and a `Go` button for **sixteen of twenty** steps;
+Shoelace clicked one `Button` six times. Every one of those genuinely changes the page, because
+a signature carries each control's value *by design* (D-441) — so `stalled` can never answer
+yes, and D-447's value-free signature gave 11 distinct values over ParaBank's 16 stuck steps
+too. So the platform counts instead: the third identical action on one page is refused, **but
+only while it can name a control on that page it has used less**. That second clause is not a
+nicety — without it a one-control page records no step at all, `stalled` never accumulates, and
+the session ends by the driver giving up instead of the platform saying `done`, which is D-440.
+Replayed over those four traces it refuses 6 of 10, 10 of 20 and 4 of 6 — and **0 of 20 on
+OrangeHRM**, the one session that actually walked the application. Read that zero before
+loosening or tightening it: a rule that also fires on good exploration is a step budget wearing
+a costume.
+
+**And a third clause, which the corpus insisted on.** Refusing on the count alone still scored
+9/9 and still cost something real: separating tests fell 41 → 29 over nine sessions, because
+`basket-total`'s arithmetic bug is invisible at a quantity of one and clicking *add* a third
+time is that entire case. So a repeat is refused only when the earlier attempts put **no text on
+the page the session had not already seen there** — the difference between a dropdown that
+changes its own value and a basket total that changes. Read D-456 before touching any of the
+three clauses; each was added because removing it was measured and cost something.
+
+**A requirement ledger was proposed for the same problem, measured, and thrown away (C-116).**
+Extracting the requirement's own words and telling the explorer which it had not yet reached
+named the right control on **0 of 56 steps** across those four sessions — the unreached terms
+are mostly English (`signing`, `taking`, `refused`, `asks`, `among`), and where they were real
+they shared no token with the interface: ParaBank's requirement never says *transfer*, and
+`address`/`phone` never meet `Update Contact Info`. That is C-90 measured a second time on a
+second product. Do not rebuild it lexically.
+
+**And an observation is what a page offers *and* what it says, in both cases read off the
+DOM rather than inferred.** Three parts of `COLLECT_JS`/`TEXTS_JS` in `scripts/explore_app.py`
+each exist because of a specific failure, so none of them is decoration. A page's landmark
+text is collected and capped on arrival (D-416), because a suite written from controls alone
+can assert which buttons exist and nothing about what the application did — a basket whose
+total is wrong offers exactly the same controls as one whose total is right. Each candidate
+carries **how to address it** and, for a submit control, **what request its form sends**
+(D-415), both sanitised by the route, because `getByRole` resolves through the accessibility
+tree and finds nothing for an `<li>` that merely behaves like a button. **The name it carries
+has to be the one that tree computes** (D-427): the first two live sessions against public
+applications each produced a suite in which every test timed out on the shared sign-in helper,
+because an `<input type="submit">` was named from its `name` attribute rather than its `value`.
+Read that row before touching the name chain — a name that looks plausible and resolves to
+nothing is the whole failure, so the fixture asserts that Playwright finds exactly one element
+rather than that the string looks right. **And a large class of real applications gives a
+control no name at all**, which is D-457: on a live OrangeHRM admin screen **17 of 60**
+controls arrived with a role, a row context and no address whatsoever, because the labels are
+sibling `<div>`s with no `for`. The accessibility tree genuinely computes nothing for those, so
+borrowing the neighbouring text would be D-427 again — a string that reads correctly and
+matches zero elements. They are addressed by their ordinal within the role instead, computed in
+the page and flagged as weaker than a name where the suite writer will see it. Two things keep
+that honest and both are load-bearing: `roleOf` is defined once and used by both the counting
+pre-pass and the emitting loop, because an ordinal counted over a different set of elements is
+an address silently off by one; and `link` is excluded, because `roleOf` calls every `<a>` a
+link and the tree does not call an `<a>` without `href` one. What a page *says* had the same
+problem, and `TEXTS_JS` now collects from **the element that renders the words** rather than
+from whatever carries an `id` (D-431) — on a live catalogue the old selector matched 34
+elements, none of them a heading, and sent the navigation run together as one line while
+every product name and price went missing. Read that row before widening it again: inline
+markup must not count as a child, candidates are excluded by the stamp `COLLECT_JS` already
+leaves, and the driver's cap and `app_session.clip_texts` have to move together. And a clickable
+element is a candidate even when it is not a control (D-414): pointed at this platform's own
+interface, the explorer was offered **two** controls after signing in — the whole navigation
+is `<li data-page=…>` with a click handler — and spent twenty-two of twenty-five steps
+guessing URLs. Related: a password field reports *that* it holds a value and never what
+(D-413), because an explorer that cannot tell its own typing landed types it again instead of
+pressing Sign In, which is how a live run failed to get past a login form at all.
+
+**What each action *did* reaches the suite writer from the step that reported it**
+(D-430, and D-428 for the same fault on screen). An outcome is only knowable by looking at
+the page again, so it is stored against the *following* step — which meant the generation
+input told the model that clicking **Login** resulted in "filled Password; still on /".
+Signing in went nowhere, as far as the writer knew, so it invented a landing condition for
+the sign-in helper and **every test in the suite failed on that one line**. Relatedly,
+`run_tests.py` now says when most failures share one call site (D-432): an all-red suite is
+what a broken application looks like, and a helper that cries wolf costs the reader more than
+a missing test.
+
+**The session now runs the suite it wrote, against the application it wrote it from**
+(D-435, `--verify`). This is the cheapest check in the product and it went missing for
+months: *"green on the application you explored"* was a sentence in the prompt, and four
+separate defects shipped suites that were red against a working application (D-427, D-430,
+D-434, C-101), each found by a person running them by hand days later. The inference is what
+makes it cheap — exploration only reaches generation because every action was answered, so a
+test that fails now is wrong about an application that was working minutes ago. It shells out
+to `run_tests.py` rather than reimplementing it, because a second copy of a delivery path is
+how D-364 happened.
+
+**The collector sees inside open shadow roots, and says when it cannot see into a frame**
+(D-436). Measured on a four-control page before the change: **1 of 4** offered and none of
+the text behind either boundary, reported as a success. Angular, Lit, Stencil and Salesforce
+build whole interfaces out of custom elements, so the applications most worth testing were
+the ones coming back emptiest. Read D-436 before touching `deepAll` — it is written out
+twice on purpose, and frames are deliberately still out of scope because reaching into one
+changes what an address *means* in this contract.
+
+**The suite writer selects; a compiler emits** (D-460, `services/assertion_compiler.py`).
+This is D-408 aimed at the half of the pipeline it never covered. The explorer cannot name an
+element that does not exist -- it answers with an index -- and the writer could name anything,
+which is where every recalled-information defect in this file sits. The model now fills in a
+form (*which element, what should be true, which value*) against a catalogue of what the
+session observed, and the platform writes the Playwright. Measured **9/9 at $0.0933 a session
+against free-form's 9/9 at $0.1333** -- 30% cheaper, because a plan is much smaller than a
+file and this call was always output-dominated. Free-form remains the fallback when a plan
+compiles to nothing, because a session that reached generation has already been paid for
+(D-440).
+
+**Read D-461 before tightening any of the three rules in it.** Each was first written the
+strict way, each was measured, and each cost the corpus: requiring every asserted value to be
+*quoted* from the session took 9/9 to **2/9** (a test constructs a state the session never
+visited, so the right total is a number nobody saw, and denied a value the only expressible
+check is furniture); making `element_ref` compulsory left nowhere to hang a check on page
+*text*, which is what `task-ownership`'s negative assertions are made of; and routing
+credentials through `process.env.APP_PASSWORD` scored **0 of 6 tests passing on either build**
+because nothing sets it. The compiler also emits `.first()` on every text subject, since
+Playwright's strict mode makes an ambiguous locator an error and `Total: GBP 8.00` also
+matches `GBP 8.00`. What the compiler does **not** do is judge: it will emit a suite of
+`toBeVisible` if handed one, and only `--verify` can tell a true assertion from a false one.
+
+**Two audits read the finished suite, and they answer different questions.**
+`locator_audit` (D-433) asks whether a locator could have come from the session — the
+contract sends roles, names and page text and never a class, an id or a test id, so anything
+else was recalled. Given the session's own collected text it also catches a **heading nobody
+saw** (D-438), which is D-430's failure and is invisible to shape alone. `assertion_audit`
+(D-437) asks whether a test could ever fail: one whose every matcher is `toBeVisible` or
+`toHaveURL` passes against an application with the feature ripped out, which is worse than a
+missing test because it is counted as coverage. Neither can see a *wrong value*, a wrong
+credential, or an invented fixture — that is what `--verify` is for, and the three are
+complements rather than layers. **Do not read two passing audits as a working suite**: a
+healthy SauceDemo session scored 144 grounded locators and 0 invented while 10 of its 21
+tests failed against the working application (C-109).
+
+**A locator the session never observed is counted rather than forbidden** (D-433). The
+observation contract is closed — a role, visible text, or `locator("input[name='…']")`, and
+nothing else — so a class, an id or a test id in a finished suite was recalled from some
+other application by construction, and `services/locator_audit.py` says how many. This exists
+because the prompt had forbidden CSS selectors all along and a live suite contained nineteen
+of them: a rule the model already has and does not follow is not fixed by repeating it. Read
+that row before widening the check — the line is drawn at *application-specific* tokens and
+not at CSS, because narrowing with `tbody tr` before asserting inside a row is what the
+prompt itself asks for. One retry, refused if the second answer lost a file or a test, since
+the cheapest way to stop using class selectors is to delete the tests that used them.
+
+`eval_app_testing.py` asks the same question `eval_test_automation.py` does, aimed at the
+narrower claim this product actually makes: explore the **working** application, then replay
+the suite against both it and a broken build — green on one, red on the other. Its
+`--self-check` runs a hand-written reference suite through the whole harness for free, so
+"the harness cannot separate these variants" is never discovered after paying for three
+sessions; it covers **every** case and **fails a case that has none**, so the free proof
+cannot quietly stop covering new ones.
+
+Three cases, chosen as three *shapes* rather than three samples. `task-ownership` is
+server-rendered with an authorisation bug, and its separating assertions are negative ones —
+"must be refused", "must not be offered". `basket-total` is client-rendered: the URL never
+changes, every click rewrites part of the page, and the arithmetic bug is invisible at a
+quantity of one, so an explorer that adds a single item writes a suite green on both builds.
+`signup-wizard` is the depth case — a three-step form whose defect no single page shows,
+because each step is correct in isolation and only a completed journey reaches the review
+page that is wrong. Still a count and not a percentage (C-95), and note what none of them
+measures: all three are ordinary semantic HTML, so the collector work in D-414 has the
+fixture and a live run as its only evidence (C-97).
+
+**The measured baseline is 9 of 9, and the headline number is the least informative part
+of it.** 2026-09-17, PROMPT_VERSION 2026-09-17.3, three cases x three runs: `discriminates`
+**9/9** at **$0.135 a session**, every session producing a suite, every case seeing the
+break, and no test failing on the working application. It reached 8 of 9 twice earlier the same day, and every one of those misses was
+`basket-total` — the only client-rendered case, now measured 3/3, 2/3, 2/3, 3/3 across four
+runs. Read it as a case living around two-thirds to three-thirds rather than as one that has
+been fixed. The runs that scored lower are the ones that earned the day: the first found
+D-434, where a single session had **all eight** of its failing assertions wrong by exactly one
+step, and the second still carried one noisy test.
+**The denominator is every session attempted**, deliberately: counting only the sessions that
+produced something is the scoreboard committing the flattering-number error the eval exists
+to catch — and a single test failing on the good build is enough to lose the case, which is
+the strictness this measure is for.
+
+**The step counts are the part to read before assuming the collector made sessions dearer.**
+More page text makes a signature more sensitive, so the no-progress rule fires later and a
+session ought to run longer — and `basket-total` did drift from 7-8 steps to 9-10. But
+`task-ownership` fell from **14-25 steps to 8-11**, because an explorer that can read a page
+stops wandering to find out what is on it, and that is most of why the price per session went
+*down* while the suites grew: `basket-total` writes 10-11 tests where it wrote 7-8, 7-9 of
+them separating where 5-7 did. Floors stay at 0.66 on all three measures for all three cases —
+one session below a measured 3/3. Raising them to 1.0 would fail the suite on a single flake.
+
+The first baseline that morning was **33%**, and the gap is the work rather than a prompt
+tidy-up. Each defect between the two was found by a run and none was visible offline: a
+"must be refused" test that drove controls existing only on the *broken* build, so it timed
+out on the good one; an explorer that could see no page text and therefore could not assert
+any value (D-416); a login it could not get past at all, because a password field reported
+itself empty however much had been typed in (D-413); a cleanup hook that signed in again and
+hung; and a suite of **zero test files** stored as a success because its summary was
+confident (D-417). Two more came from pointing it at this platform's own interface rather
+than at the corpus: navigation invisible to the collector (D-414) and a session quote whose
+ceiling sat *below* its own forecast (D-412).
+
+Read the 9/9 as "nothing here is broken", not as a claim the product is finished. Three cases
+is a count and not a percentage (C-95); none of them exercises the collector those numbers
+depend on (C-97), which is exactly why D-427 and D-431 were found by a live run and not here;
+and a live run with no requirement supplied still produced a suite that was nine-tenths "the
+button is visible", which is C-66 wearing a new hat and is why `_HOLLOW` in the eval was
+widened. Five findings from those live runs are open: C-100 and C-101 name what the collector and
+the locator audit still cannot see, C-103 is the same mistake as C-101 aimed at a value
+instead of a selector, C-104 is a frame's contents, and C-102 is the customer's call rather
+than ours.
+
 `ui_examine.py` is the only one that drives a browser (Playwright + Chromium, both already in
 `venv`). It starts its own server on a spare port with its own database and **calls no model** —
 every case stops at the free cost estimate. `--with-review` runs a full review with the gateway
@@ -184,9 +456,17 @@ The Python ones drive the real app through FastAPI's `TestClient` against a thro
 - `smoke_llm_providers.py` stubs the *provider* functions (`_call_anthropic` / `_call_openai`) rather than `call_tool`, because the resolution logic under test lives inside `call_tool` — stubbing that would stub out the thing being tested.
 - `smoke_plan_picker.js` takes a `products.json` argument (a saved `GET /api/v1/products` response) and **there is no such file in the repo**, so it dies with `ENOENT` until you capture one from a running server. `smoke_render.js` needs no argument — it defaults to `frontend/app.js`.
 
-Two of the scripts are neither tests nor throwaway tooling, and both exist because a
-caveat asked for evidence rather than an edit:
+Three of the scripts are neither tests nor throwaway tooling, and each exists because a
+caveat or a design question asked for evidence rather than an edit:
 
+- **`scripts/probe_assertion_shapes.py`** answers whether the suite writer could be made to
+  *choose* an assertion instead of writing one — D-408's rule aimed at the half of the
+  pipeline it was never applied to, which is where every recalled-information defect lives
+  (C-101, C-103, C-109, D-427, D-438, D-442). It parses every generated suite on disk, in
+  `evals/app_testing/results/suites/` **and** in the `app_testing` rows of a database, and
+  classifies each `expect(...)` by whether a deterministic compiler could have emitted it.
+  Measured 2026-09-18: **96.1% over 2,305 assertions in 176 files**, and the classifier errs
+  toward *inexpressible*, so that is a floor (D-448). Offline, no key, writes nothing.
 - **`scripts/measure_event_loop.py`** answers C-31. It starts a server whose model gateway
   sleeps, fires one review, and times `GET /` alongside it — so "does a long review freeze
   the server" has a number instead of an opinion. It found that it did (`GET /` blocked
@@ -399,5 +679,11 @@ per-project credentials live in the `github_credentials` table (encrypted, manag
 see D-236. Optional: `GITHUB_TOKEN` (fine-grained PAT, "Pull requests: Read and Write" — needed for GitHub PR/Auto-Fix features; public repos/PRs/issues work without it. **Also "Contents: Read and Write"** if you use the modernization PR workflow, which pushes a converted tree to a branch rather than only commenting), `DATABASE_PATH` (default `sdlc_agent.db`), `CLAUDE_MODEL` (default `claude-sonnet-4-6`), `MAX_TOKENS`, `APP_ENV`, `SECRET_KEY` (JWT/crypto — must be changed for production). Also present in `backend/config.py` but not in `.env.example`: `JIRA_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`/`JIRA_PROJECT` (optional Jira integration), `DEFAULT_ADMIN_PASSWORD` (defaults to a hardcoded value — flag this if touching real deployment config), `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_PATH` (optional — the only credential GitHub accepts for a **check run**, which is the only way a finding lands on a diff line; unset means the commit-status path, unchanged. `docs/github-app.md`, D-343), `INCREMENTAL_PR_REVIEW` (default **true** — a push to an open pull request reviews only the commits since the last review; see D-341 for the trade it makes and why the gate stays correct), `COST_OPTIMIZATION_ENABLED`, `MAX_AGENT_INPUT_CHARS`, `LLM_TIMEOUT_SECONDS`, `LLM_MAX_RETRIES`, `PUBLIC_BASE_URL` (only for the modernization build loop — the address a GitHub Actions runner posts diagnostics back to; it cannot be derived from the request behind a proxy).
 
 ## Windows-specific note
+
+`requirements-explorer.txt` holds Playwright and is **deliberately separate from**
+`requirements.txt`: `backend/` imports none of it, and installing a browser toolchain on
+the API host would be paying for a capability D-05 forbids that host from using. It covers
+`scripts/explore_app.py` and `scripts/ui_examine.py`, which had the same undeclared
+dependency long before the first of those existed.
 
 `requirements.txt` deliberately pins `litellm<1.92.0` — from 1.92.0 onward litellm ships a Rust extension with no prebuilt Windows wheel, which would otherwise require an MSVC toolchain to install. Don't bump this pin without checking Windows wheel availability. `headroom-ai` (cost optimization) also compiles a Rust extension; if it fails to install, cost-optimization compression fails open (no-ops) rather than breaking the app.

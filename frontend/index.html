@@ -107,8 +107,17 @@
             <li class="nav-item" data-page="test-case" data-product="test-case">
               <span class="nav-icon">📝</span> Test Case Generation
             </li>
+            <!-- These two produce the same thing from opposite inputs, sit next to each
+                 other, and were told apart by four near-identical words. The subtitle
+                 carries the only distinction that matters to somebody choosing: what you
+                 have to give it. -->
             <li class="nav-item" data-page="test-automation" data-product="test-automation">
               <span class="nav-icon">⚙️</span> Test Automation Generation
+              <span class="nav-sub">needs your source code</span>
+            </li>
+            <li class="nav-item" data-page="app-testing" data-product="app-testing">
+              <span class="nav-icon">🧭</span> Application Test Generation
+              <span class="nav-sub">needs a running app, no source</span>
             </li>
           </ul>
         </li>
@@ -653,6 +662,187 @@ e.g. A clinician may export a patient's visit history to CSV only if they are th
           <div id="test-automation-runs" class="run-history-scroll"></div>
         </div>
         <div id="test-automation-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Application Test Generation Page -->
+      <div id="page-app-testing" class="page">
+        <div class="page-header">
+          <h1>Application Test Generation</h1>
+          <p class="subtitle">Point it at a running application and it explores in a real browser,
+            then writes a Playwright suite from the journeys it walked. <b>No source code
+            required</b> &mdash; the application itself is the input, which is the one thing the
+            code-based generator cannot work without.</p>
+          <p class="subtitle">Exploration runs <b>where the application is reachable</b>: your
+            machine, a CI runner, or a box inside your network. The platform is never sent the URL
+            or your credentials &mdash; it receives descriptions of what is on screen and answers
+            with one action at a time. That is also why an internal application behind a VPN works
+            here at all.</p>
+        </div>
+        <div class="form-card">
+          <div class="section-title">1. What should it explore?</div>
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label for="app-testing-url">Application URL</label>
+              <input type="text" id="app-testing-url" placeholder="https://staging.example.com"
+                     oninput="renderAppTestingCommand()" />
+              <div class="field-hint">Used only to build the command below. It is not sent to the
+                platform and is not stored.</div>
+            </div>
+            <div class="form-group" style="max-width:150px">
+              <label for="app-testing-steps">Step budget</label>
+              <input type="number" id="app-testing-steps" value="40" min="1" max="200"
+                     oninput="renderAppTestingCommand()" />
+              <div class="field-hint">Each step is one model call.</div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="app-testing-goal">Goal (optional)</label>
+            <input type="text" id="app-testing-goal" oninput="renderAppTestingCommand()"
+                   placeholder="e.g. Cover signing in, searching, and adding an item to the cart" />
+          </div>
+          <div class="section-title">2. Say what the application is supposed to do</div>
+          <div class="field-hint" style="margin-bottom:10px">
+            <b>A session needs at least one of the three below, and this is why.</b> With
+            nothing to compare the application to, the tests can only record what it happens
+            to do today &mdash; they catch a later change and cannot catch a mistake that is
+            already there. Any one of these is enough; use more than one if you have it.</div>
+
+          <div class="form-group">
+            <label for="app-testing-requirement">In your own words</label>
+            <textarea id="app-testing-requirement" rows="4"
+                      oninput="renderAppTestingCommand(); loadAppTestingBasis()"
+                      placeholder="e.g. A task may only be edited by the user who created it. Any other signed-in user attempting to edit it must be refused."></textarea>
+            <div class="field-hint">A sentence or two is enough. Tests that check it are
+              labelled <b>stated</b> &mdash; traced to something a person wrote.</div>
+          </div>
+
+          <div class="form-group">
+            <label>Documents held for this project</label>
+            <div id="app-testing-docs" class="field-hint">Requirements and QA documents
+              uploaded against this project are read automatically &mdash; a specification,
+              acceptance criteria, a test policy. Add them under
+              <b>Knowledge Base</b>, filed as <b>Requirement Review</b> or
+              <b>QA / Test Standards</b>. Tests that check them are also
+              <b>stated</b>.</div>
+          </div>
+
+          <div class="form-group">
+            <label for="app-testing-source-pick">Cover an earlier Test Scenario or Test Case run
+              (optional)</label>
+            <!-- A dropdown that adds to a list, rather than a multi-select box. The cap is
+                 five (app_basis.MAX_SOURCE_REVIEWS) and a multi-select has nowhere to say so,
+                 nowhere to show what a run contains, and no way to tell "this project has
+                 none" from "the request failed" -- all three rendered as an empty box. -->
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <select id="app-testing-source-pick" style="flex:1;min-width:280px"></select>
+              <button type="button" class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
+                      onclick="addAppTestingSource()">Add</button>
+            </div>
+            <div id="app-testing-sources-chosen"></div>
+            <div class="field-hint">Only if those agents have already run for this system
+              &mdash; most sessions will not have them, and that is fine. A test case already
+              carries steps and expected results, so it is the closest thing to a plan for the
+              suite. Tests that check one are labelled <b>derived</b> rather than stated,
+              because this platform wrote that case rather than a person.</div>
+          </div>
+
+          <!-- What the session would actually be given, resolved by the server rather than
+               guessed at here. The browser cannot see the project's uploaded documents, so
+               anything it concluded about "is there a basis" was wrong in both directions. -->
+          <div id="app-testing-basis" class="field-hint"></div>
+
+          <div class="section-title">3. Confirm where it is pointed</div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="app-testing-attest" onchange="renderAppTestingCommand()" />
+              This is a test environment, not production.
+            </label>
+            <div class="field-hint">The explorer clicks, types and submits in a live system.
+              Controls whose labels suggest they destroy data, spend money, contact real people or
+              end the session are withheld before the model ever sees them &mdash; but that is a
+              filter on button labels, not a guarantee, so point it at an environment you can
+              afford to have changed.
+              <b>This tick is the declaration itself:</b> it writes <code>--attest</code> into the
+              command below, and the platform refuses a session that arrives without it.</div>
+          </div>
+
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="app-testing-page-text" checked
+                     onchange="renderAppTestingCommand()" />
+              Let it read what each page displays (recommended)
+            </label>
+            <div class="field-hint">Your address and your password never leave your machine
+              either way. This is about the rest: a short digest of the text each page shows
+              &mdash; a heading, a total, an error message.
+              <b>With it on</b>, a test can check that your total is <em>right</em>.
+              <b>With it off</b>, a test can only check that a control is <em>there</em>,
+              which passes just as happily when the feature behind it is broken. If the target
+              is a copy of live data, that digest will contain it, so this is a real choice
+              and not a formality &mdash; the finished suite states which of the two it was.</div>
+          </div>
+
+          <div class="form-group">
+            <label>Keep that digest for</label>
+            <select id="app-testing-retention" onchange="renderAppTestingCommand()">
+              <option value="0">No time at all &mdash; wipe it as soon as the tests are written</option>
+              <option value="7" selected>7 days (default)</option>
+              <option value="30">30 days</option>
+              <option value="90">90 days</option>
+            </select>
+            <div class="field-hint">Stored encrypted, and deleted automatically when the time
+              is up. Nothing needs it once the tests exist, so
+              <b>&ldquo;no time at all&rdquo; costs you nothing</b> except the ability to look
+              back later at why a particular test was written.
+              <br>The same window applies to a session that never finishes &mdash; if the
+              browser is closed part way through, what it read is deleted this many days
+              after the session started. At <b>no time at all</b> that means as soon as the
+              session is closed, so a suite <b>cannot</b> be written afterwards from the
+              steps it did take.</div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group flex1">
+              <label>Project</label>
+              <input type="hidden" id="app-testing-project" class="project-bound" />
+              <div class="project-caption" data-for="app-testing-project"></div>
+            </div>
+          </div>
+
+          <div class="section-title">4. See what it will cost</div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="previewAppTestingCost()">
+              <span class="btn-icon">$</span> Estimate cost
+            </button>
+          </div>
+          <div class="field-hint">Free &mdash; no model is called. A session costs one small call
+            per step plus one larger call to write the suite, so the step budget is what makes the
+            price knowable in advance. Replaying the suite afterwards calls no model at all.</div>
+          <div id="app-testing-cost-preview" class="hidden"></div>
+
+          <div class="section-title">5. Run it</div>
+          <div id="app-testing-command"></div>
+        </div>
+        <!-- Sessions, not suites. The list below this one is built from `reviews` rows, so
+             it can only ever show a session that finished *and* generated a suite. A session
+             whose browser was closed half way through is invisible there although its steps
+             were paid for, and that is the one a person most needs to find. -->
+        <div class="run-history">
+          <div class="section-title">Exploration sessions</div>
+          <p class="subtitle" style="margin-top:-6px">Every session this project has opened,
+            including ones still running and ones that never produced a suite. Open one to
+            watch it happen, or to stop it.</p>
+          <div id="app-testing-sessions" class="run-history-scroll"></div>
+        </div>
+        <div id="app-testing-session" class="hidden"></div>
+
+        <div class="run-history">
+          <div class="section-title">Previous sessions</div>
+          <p class="subtitle" style="margin-top:-6px">Every suite this project has generated from a
+            running application, newest first. Opening one costs nothing and calls no model.</p>
+          <div id="app-testing-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="app-testing-result" class="result-area hidden"></div>
       </div>
 
       <!-- Code Review Page -->

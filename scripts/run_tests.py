@@ -278,12 +278,91 @@ def report(api: str, review_id: str, documents, ran: bool, key: str = "",
         return code
 
     _print_reconciliation(body)
+    # Printed last, from the local XML rather than the reply: the platform is told what
+    # passed and failed, never the stack traces, and this reads those.
+    _print_shared_cause(merged)
     return 0
 
 
 # ── The other two doors: deliver the tests, and fetch what CI made of them ──
 
 _RUN_URL = re.compile(r"github\.com/([^/]+)/([^/]+)/actions/runs/(\d+)")
+
+
+# The innermost frame of a stack trace: `at signIn (C:\...\login.spec.ts:13:65)`, and
+# also the bare `at C:\...\spec.ts:21:5` form a top-level failure produces.
+# A Windows path can contain spaces, so the file group stops only at a bracket or a
+# line end -- anchoring it on non-whitespace found nothing on the machine that
+# produced the first real report.
+# A Windows path can contain spaces, so the file group stops only at a bracket or a
+# line end. Anchoring it on non-whitespace matched nothing at all on the machine that
+# produced the first real report, because the home directory has a space in it.
+_FRAME = re.compile(r"\bat (?:(?P<fn>[\w.<>$]+) )?\(?(?P<file>[^()\r\n]+?):(?P<line>\d+):\d+\)?")
+# Playwright says what it gave up waiting for, which is usually the actual culprit.
+_WAITING = re.compile(r"waiting for (.+)")
+
+
+def _shared_cause(junit_xml: str):
+    """-> (count, total, description) when most failures come from one place.
+
+    Why this exists at all. A generated suite routes every test through one sign-in helper,
+    so a single wrong locator in it fails the whole suite -- twice now against real
+    applications, at 18 of 18 and then 14 of 17. That is not merely annoying: an all-red
+    suite is exactly what a genuinely broken application looks like, so the reader concludes
+    their app is down when in fact the tests could not get past the login form. It is the
+    most expensive way to be wrong, because red is the signal this product exists to
+    produce, and one false alarm devalues every later one.
+
+    Nothing else can say this. The platform never runs what it writes (D-05 keeps generated
+    code off the API host), and the per-requirement reconciliation groups by *requirement*,
+    so one broken helper reads as fifteen independent failures.
+    """
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(junit_xml or "")
+    except Exception:
+        return None                      # a report we cannot parse is not a finding
+
+    frames, waits, total = [], [], 0
+    for case in root.iter("testcase"):
+        bad = list(case.iter("failure")) + list(case.iter("error"))
+        if not bad:
+            continue
+        total += 1
+        text = " ".join((e.text or "") + " " + (e.get("message") or "") for e in bad)
+        hit = _FRAME.search(text)
+        if hit:
+            frames.append((os.path.basename(hit.group("file")), hit.group("line"),
+                           hit.group("fn") or ""))
+        wait = _WAITING.search(text)
+        if wait:
+            waits.append(wait.group(1).strip())
+
+    if total < 2 or not frames:
+        return None
+    top, count = max(((f, frames.count(f)) for f in set(frames)), key=lambda x: x[1])
+    # Two thirds, and never a single test: below that these really are separate failures
+    # and saying otherwise would send somebody after a helper that is fine.
+    if count < 2 or count * 3 < total * 2:
+        return None
+    where = f"{top[0]}:{top[1]}" + (f"  (in {top[2]})" if top[2] else "")
+    waited = max(set(waits), key=waits.count) if waits else ""
+    return count, total, where, waited
+
+
+def _print_shared_cause(junit_xml: str) -> None:
+    found = _shared_cause(junit_xml)
+    if not found:
+        return
+    count, total, where, waited = found
+    print()
+    print(f"  {count} of {total} failure(s) come from one place:")
+    print(f"      {where}")
+    if waited:
+        print(f"      gave up waiting for {waited}")
+    print("  A suite that fails everywhere it does the same setup step is usually one")
+    print("  broken locator in a shared helper, not an application that is down. Check")
+    print("  that line before concluding anything about the application.")
 
 
 def _print_reconciliation(body: dict) -> None:
@@ -479,6 +558,66 @@ def fixture() -> int:
         root = scope["ET"].fromstring(text)
         for suite in ([root] if root.tag == "testsuite" else list(root.iter("testsuite"))):
             merged_ci.append(suite)
+    # ── One broken helper must not read as an application outage ──────────
+    #
+    # Both real runs against public applications failed this way: a single wrong locator in
+    # the shared sign-in helper, 18 of 18 and then 14 of 17 red. An all-red suite is exactly
+    # what a genuinely broken application looks like, so the reader concludes their app is
+    # down when the tests could not get past the login form -- and red is the one signal
+    # this product exists to produce, so a false alarm devalues every later one.
+    #
+    # The per-requirement reconciliation cannot say it, because it groups by requirement:
+    # one broken helper reads there as fifteen unrelated failures.
+    _shared_xml = """<testsuites><testsuite name="s">
+      <testcase name="a" classname="t"><failure message="Test timeout of 30000ms exceeded.">
+        Error: locator.click: Test timeout of 30000ms exceeded.
+        Call log:
+          - waiting for getByRole('heading', { name: 'Products' })
+        at signIn (C:\\Users\\Some One\\checkout\\tests\\journey.spec.ts:13:65)
+        at C:\\Users\\Some One\\checkout\\tests\\journey.spec.ts:44:5
+      </failure></testcase>
+      <testcase name="b" classname="t"><failure message="Test timeout of 30000ms exceeded.">
+        Call log:
+          - waiting for getByRole('heading', { name: 'Products' })
+        at signIn (C:\\Users\\Some One\\checkout\\tests\\journey.spec.ts:13:65)
+        at C:\\Users\\Some One\\checkout\\tests\\journey.spec.ts:51:5
+      </failure></testcase>
+      <testcase name="c" classname="t"><failure message="Test timeout of 30000ms exceeded.">
+        at signIn (C:\\Users\\Some One\\checkout\\tests\\journey.spec.ts:13:65)
+      </failure></testcase>
+    </testsuite></testsuites>"""
+    _found = _shared_cause(_shared_xml)
+    check("failures funnelling through one helper are reported as one cause",
+          _found is not None and _found[0] == 3 and _found[1] == 3,
+          f"got {_found}")
+    check("...naming the line, the function and what it waited for",
+          bool(_found) and "journey.spec.ts:13" in _found[2] and "signIn" in _found[2]
+          and "Products" in _found[3],
+          f"got {_found}")
+
+    # A Windows home directory with a space in it is the normal case, and anchoring the
+    # file group on non-whitespace matched nothing at all on the first machine that ran it.
+    check("...even when the path has spaces in it",
+          bool(_found) and "Some One" not in _found[2] and _found[2].startswith("journey"),
+          f"got {_found}")
+
+    # Three genuinely different failures must not be collapsed into a false lead.
+    _apart = """<testsuites><testsuite name="s">
+      <testcase name="a" classname="t"><failure message="x">
+        at C:\\w\\one.spec.ts:10:1</failure></testcase>
+      <testcase name="b" classname="t"><failure message="x">
+        at C:\\w\\two.spec.ts:20:1</failure></testcase>
+      <testcase name="c" classname="t"><failure message="x">
+        at C:\\w\\three.spec.ts:30:1</failure></testcase>
+    </testsuite></testsuites>"""
+    check("unrelated failures are not collapsed into a cause they do not share",
+          _shared_cause(_apart) is None,
+          "sending somebody after a helper that is fine costs more than saying nothing")
+    check("a single failure is never called a shared cause",
+          _shared_cause('''<testsuites><testsuite name="s"><testcase name="a" classname="t">
+             <failure message="x">at C:\\w\\one.spec.ts:10:1</failure>
+          </testcase></testsuite></testsuites>''') is None)
+
     check("the workflow's own copy of the merge agrees with this one",
           scope["ET"].tostring(merged_ci, encoding="unicode").count("<testsuite ") == 2)
 

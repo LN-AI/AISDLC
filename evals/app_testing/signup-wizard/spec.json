@@ -1,0 +1,11 @@
+{
+  "name": "signup-wizard",
+  "language": "javascript",
+  "framework": "playwright",
+  "entry": "app.py",
+  "requirement": "Signing up collects details over three steps and keeps everything the earlier steps collected. Step three must show the full name and email address entered at step one alongside the address entered at step two, and the page shown after creating the account must name the same person and email.",
+  "bug": "store.remember() replaces the draft on every step instead of adding to it, so the name and email collected at step one are gone by the time step three renders. Step three shows an empty name and an empty email, and so does the confirmation page.",
+  "fix": "fixed/store.py merges into the existing draft rather than overwriting it. One line.",
+  "goal": "Complete the whole sign-up from the first page to the confirmation: fill in the name and email, continue, fill in the address, continue, check the details shown back to you, and create the account.",
+  "notes": "The depth case. `task-ownership` measures whether assertions are honest and `basket-total` measures whether a client-rendered page can be read; neither measures whether the explorer finishes anything.\n\nThis defect is invisible from any single page. Step one accepts a name and an email and moves on; step two accepts an address and moves on; both are correct in isolation. Only step three, reached with a completed draft behind it, shows that the first step's details are gone. An explorer that opens each page, reads it, and moves on scores nothing here — which is exactly the failure worth measuring, because wandering is the characteristic weakness of an exploring agent and it is invisible in a corpus where every bug sits on one page.\n\nIt also puts the value the model chose under test. The suite can only assert that step three shows the name that was entered if the journey record carries the value the explorer typed; a test written against a made-up name passes on neither build.\n\nServer-rendered on purpose, like `task-ownership`: adding client-side rendering here as well would confound depth with the collector's ability to read a virtual DOM, and `basket-total` already measures that separately."
+}

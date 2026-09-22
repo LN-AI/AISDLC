@@ -172,16 +172,23 @@ def main_():
     check("every declared review_type is one the code really writes",
           declared <= written, f"orphaned: {sorted(declared - written)}")
 
-    # `swarm` and `modernization` are the two products whose own service owns dispatch:
-    # neither is a single orchestrator call a flat params dict could drive. Everything else
-    # must have an adapter, or it is entitleable and meterable but not runnable.
-    SERVICE_DISPATCHED = {"swarm", "modernization"}
+    # `swarm`, `modernization` and `app-testing` are the products whose own service owns
+    # dispatch: none is a single orchestrator call a flat params dict could drive.
+    # Everything else must have an adapter, or it is entitleable and meterable but not
+    # runnable.
+    #
+    # `app-testing` is the third for a different reason than the other two. It is not one
+    # long call -- it is a *conversation*: dozens of separate requests, minutes apart,
+    # driven by a browser on somebody else's machine, each one metered on its own. There is
+    # no single params dict that could express it, so `routes/app_testing.py` owns dispatch
+    # and the registry row carries the entitlement, the quota and the price basis.
+    SERVICE_DISPATCHED = {"swarm", "modernization", "app-testing"}
     every_invocable = all(p.invoke is not None
                           for p in registry.PRODUCTS if p.id not in SERVICE_DISPATCHED)
     check("every product except the service-dispatched ones has an invoke adapter",
           every_invocable,
           f"missing: {sorted(p.id for p in registry.PRODUCTS if p.invoke is None) }")
-    check("only swarm and modernization are service-dispatched",
+    check("only the three service-dispatched products have no adapter",
           {p.id for p in registry.PRODUCTS if p.invoke is None} == SERVICE_DISPATCHED)
 
     # ── 2. back-compat: an existing key keeps working ──────────────────────
@@ -1733,6 +1740,16 @@ def main_():
             # The dispatcher runs on a thread. Rather than sleep, drain it here — the
             # thread and this call take the same code path and only one of them is
             # deterministic.
+            #
+            # `recover_sending()` first, because draining alone is *not* deterministic and
+            # this check flaked on roughly one run in three because of it: `save_review`
+            # kicks a daemon thread, `_claim` moves the row to `sending` with
+            # `WHERE status='pending'`, and if that thread wins the race the synchronous
+            # drain below finds nothing to do and the row is still `sending` when it is
+            # asserted on. Putting an in-flight row back to `pending` is exactly what
+            # `notify` itself does at startup for a row whose process died, so this is the
+            # module's own recovery path rather than a trick invented for the test.
+            _n20.recover_sending()
             _n20.dispatch_pending()
             _after = _deliveries(_rid20)
             check("the dispatcher marks it sent", _after and _after[0]["status"] == "sent",

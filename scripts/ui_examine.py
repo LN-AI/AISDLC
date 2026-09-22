@@ -1661,7 +1661,11 @@ def main():
             # screen: a codebase alone does not say what to test, and the refusal has to
             # happen in the browser rather than as a 400 after an upload.
             ta_dialogs = []
-            page.on("dialog", lambda d: (ta_dialogs.append(d.message), d.dismiss()))
+            # Recorded, not dismissed. The handler registered earlier in this run is still
+            # attached and already dismisses every dialog, so a second one dismissing the
+            # same dialog raises "Cannot dismiss dialog which is already handled" out of a
+            # Playwright listener -- noise that reads like a failure and is not one.
+            page.on("dialog", lambda d: ta_dialogs.append(d.message))
             pick_source(page, "test-automation", "Paste")
             page.fill("#test-automation-requirement", "")
             page.fill("#test-automation-code", "def export(u):\n    return 1\n")
@@ -1727,6 +1731,222 @@ def main():
             check("changing the source discards the quote it was taken for",
                   page.locator("#test-automation-cost-preview .cost-preview").count() == 0,
                   "a quote for the previous source survived and could be acted on")
+
+
+            # ── 22. Two screens, one document ─────────────────────────────
+            #
+            # This is the section that can see what `smoke_render.js` structurally cannot.
+            # That file's DOM stub hands out a fresh element per id, so two screens minting
+            # the same id look fine there; here there is one real document, and a screen
+            # that is merely hidden is still in it.
+            #
+            # The defect: both test screens rendered a results panel and a runner panel
+            # under fixed ids, so `getElementById` returned whichever came first in the
+            # markup -- the code-based screen. Open a code-based run, then an app-based one,
+            # and the app screen's panels stayed blank while its results were written into a
+            # screen nobody was looking at. A page reload cleared it, which is what made it
+            # look imaginary.
+            section("22. Two test screens in one document keep their own panels")
+
+            _suite = """{
+              review_id: 'rev-ui-1', summary: 'A suite.',
+              total_files: 1, total_tests: 2,
+              test_files: [{ path: 'tests/a.spec.ts', framework: 'playwright',
+                             test_names: ['t'], content: 'test("t")' }],
+              assertion_basis: [
+                { test_name: 'total is right', basis: 'stated',
+                  what_it_checks: 'the total', requirement_ref: 'REQ-1' },
+                { test_name: 'button is there', basis: 'observed',
+                  what_it_checks: 'a control' }],
+              session_detail: { journeys: [] }
+            }"""
+
+            # Rendered directly rather than by running two real agents: the collision is a
+            # property of the markup, and two live runs would cost money to prove it.
+            page.evaluate("() => renderTestAutomation('test-automation-result', %s)" % _suite)
+            page.evaluate("() => renderAppTesting('app-testing-result', %s)" % _suite)
+            page.wait_for_timeout(200)
+
+            _dupes = page.evaluate("""() => {
+                const seen = {}, dup = [];
+                document.querySelectorAll('[id]').forEach(el => {
+                    if (seen[el.id]) { if (dup.indexOf(el.id) < 0) dup.push(el.id); }
+                    seen[el.id] = true;
+                });
+                return dup;
+            }""")
+            check("no element id appears twice in the whole document",
+                  not _dupes,
+                  f"duplicated: {_dupes[:8]} -- whichever copy comes first in the markup wins "
+                  "every getElementById, so the screen you are looking at goes blank and the "
+                  "one you are not gets your results")
+
+            check("each test screen owns a results panel named after itself",
+                  page.locator("#app-testing-result-results").count() == 1
+                  and page.locator("#test-automation-result-results").count() == 1,
+                  "the two panels must be distinguishable, or only one screen can ever work")
+
+            check("...and a runner panel too",
+                  page.locator("#app-testing-result-runner").count() == 1
+                  and page.locator("#test-automation-result-runner").count() == 1)
+
+            # The three-word vocabulary, checked where a person would read it. `stated` is
+            # the value the server writes; the table used to test for the retired word
+            # `specified` and reported every one of these as observed -- directly under a
+            # banner that counted it correctly.
+            _basis_cell = page.evaluate("""() => {
+                const html = document.getElementById('app-testing-result').innerHTML;
+                const at = html.indexOf('total is right');
+                return at < 0 ? '' : html.slice(at, at + 400);
+            }""")
+            check("an assertion resting on a written requirement reads as stated",
+                  "Stated" in _basis_cell,
+                  f"showing: {_basis_cell[:120]!r}")
+            check("...and the banner above it agrees",
+                  "1 assertion(s) check something a person wrote"
+                  in page.locator("#app-testing-result").inner_text().replace("\n", " "),
+                  "the banner and the table are counting different things")
+
+            # ── 23. The command this screen builds is the whole product ───
+            #
+            # There is no Run button here on purpose -- the browser has to run where the
+            # application is reachable -- so this command *is* the handover. Every input on
+            # the screen that fails to reach it is an input that silently does nothing, and
+            # two of them did: the typed requirement and the selected project.
+            section("23. The app-testing command carries what the screen was given")
+            goto_page(page, "Application Test Generation")
+            page.wait_for_timeout(300)
+
+            page.fill("#app-testing-url", "https://staging.example.com")
+            page.fill("#app-testing-requirement", "A basket total must equal its lines.")
+            page.check("#app-testing-attest")
+            page.wait_for_timeout(200)
+
+            _cmd = page.locator("#app-testing-command").inner_text()
+            check("the attestation tick is what puts the declaration in the command",
+                  "--attest" in _cmd,
+                  "the driver used to assert a test environment on the caller's behalf, which "
+                  "is not a declaration by anybody")
+            check("the requirement is shown as the file the command reads",
+                  "requirement.txt" in _cmd
+                  and "A basket total must equal its lines." in _cmd,
+                  "the command reads the requirement from a file and nothing produced it, so "
+                  "the run died on a missing path and the typed text reached nothing")
+
+            page.uncheck("#app-testing-attest")
+            page.wait_for_timeout(150)
+            check("...and unticking it withdraws the command entirely",
+                  "--attest" not in page.locator("#app-testing-command").inner_text(),
+                  "an unticked box still offered a runnable command")
+
+            # ── 24. The source picker, and what it says when it has nothing ──
+            #
+            # Three states used to render identically -- an empty project, a failed request,
+            # and a project whose runs sat just past a client-side cap -- all as an empty
+            # box. The one a person can act on is the difference between them.
+            section("24. The source picker answers rather than showing an empty box")
+
+            _pick = page.locator("#app-testing-source-pick")
+            check("the picker is a dropdown, not a multi-select box",
+                  _pick.count() == 1
+                  and page.evaluate("() => !document.getElementById('app-testing-source-pick')"
+                                    "        .multiple"),
+                  "a multi-select has nowhere to say what a run contains, nowhere to show "
+                  "the cap, and no way to tell 'none' from 'failed'")
+            _text = _pick.inner_text().strip()
+            check("...and it says something rather than nothing",
+                  bool(_text) and "Loading" not in _text,
+                  f"showing: {_text[:90]!r}")
+            check("an empty project is named as empty, not left blank",
+                  "No test scenario or test case runs" in _text or "Pick a project" in _text,
+                  f"showing: {_text[:110]!r}")
+
+            _net = [u for u in NETLOG if "/api/reviews?" in u]
+            check("it asks the server to filter, rather than filtering in the browser",
+                  any("product_id=" in u and "review_type=" in u for u in _net),
+                  "fetching the newest 50 reviews of every kind and filtering here is why a "
+                  f"busy project showed none: {_net[-3:]}")
+
+            check("the cap the server enforces is declared on the screen",
+                  page.evaluate("() => APP_TESTING_MAX_SOURCES") == 5,
+                  "the server truncates at five without comment")
+
+            # ── 25. Switching project does not leave the screen stale ────────
+            #
+            # The screen used to rebuild itself only on its *next visit*, so a person who
+            # switched project while standing on it kept the previous project's run list,
+            # pickers and result. Correct data, wrong project, nothing saying so -- which is
+            # most of why this product looked as though its history was broken.
+            section("25. Switching project refreshes the screen you are standing on")
+
+            page.evaluate("""() => {
+                document.getElementById('app-testing-result').innerHTML = 'STALE RESULT';
+                document.getElementById('app-testing-result').classList.remove('hidden');
+            }""")
+            _projects = page.evaluate("() => _projects.map(p => p.id)")
+            if _projects:
+                page.evaluate("(id) => setActiveProject(id)", _projects[0])
+                page.wait_for_timeout(700)
+                check("a result rendered under the previous project is cleared",
+                      "STALE RESULT" not in page.locator("#app-testing-result").inner_html(),
+                      "returning to a screen later would show one project's run under "
+                      "another project's heading")
+                check("...and the screen reloaded rather than waiting for a revisit",
+                      page.locator("#app-testing-runs").inner_text().strip() != "",
+                      "the run list must belong to the project selected now")
+            else:
+                check("a project exists to switch to", True,
+                      "no projects in this throwaway database; the clearing path is covered "
+                      "by the assertion above")
+
+            # ── 26. Watching a session, and stopping one ────────────────────
+            #
+            # For the whole of a forty-step session this screen used to show nothing: the
+            # exploration runs in a terminal on the customer's machine and the browser had
+            # no way even to learn that a session existed. Everything it needed was already
+            # recorded and nothing read it.
+            section("26. A session can be watched and stopped from the screen")
+
+            check("the screen has somewhere to list sessions, separate from finished suites",
+                  page.locator("#app-testing-sessions").count() == 1,
+                  "the suite list is built from `reviews` rows, so a session that never "
+                  "generated one is invisible in it although its steps were paid for")
+
+            _sessions = page.locator("#app-testing-sessions").inner_text().strip()
+            check("...and it answers rather than hanging",
+                  bool(_sessions) and "Loading" not in _sessions,
+                  f"showing: {_sessions[:90]!r}")
+
+            # Rendered from a fixture rather than by running a real session: a live one
+            # needs a browser driving a second application and would spend money to prove a
+            # rendering property.
+            page.evaluate("""() => renderAppSession(
+                { id: 'sess-ui', status: 'exploring', steps_used: 12, max_steps: 40,
+                  target_label: 'staging.example.com', stop_requested: false,
+                  strongest_basis: 'stated', refused_total: 27, journeys: [],
+                  refusals: [{ name: 'Delete account', group: 'destroys data', count: 7 }] },
+                [{ step_index: 11, journey: 'Nav', url_path: '/',
+                   page_signature: 'a', action: { action_kind: 'goto' },
+                   candidates_offered: 2, candidates_refused: 2, outcome: 'stayed' },
+                 { step_index: 12, journey: 'Nav', url_path: '/review',
+                   page_signature: 'b', action: { action_kind: 'goto' },
+                   candidates_offered: 2, candidates_refused: 2, outcome: 'stayed' }])""")
+            page.wait_for_timeout(200)
+            _panel = page.locator("#app-testing-session").inner_text()
+
+            check("a live session says what it is doing right now",
+                  "12 of 40 steps" in _panel and "Exploring" in _panel,
+                  f"showing: {_panel[:140]!r}")
+            check("...and offers a stop that is honest about when it lands",
+                  "Stop after the current step" in _panel and "cannot close it" in _panel,
+                  "a button called Stop, on a browser this platform cannot reach, is a "
+                  "promise it cannot keep")
+            check("what the safety policy withheld is finally visible",
+                  "Delete account" in _panel and "destroys data" in _panel,
+                  "the names were recorded nowhere and only the count kept, so the product's "
+                  "main safety story could not be shown to anybody")
+            check("...without reading as a guarantee",
+                  "not a guarantee" in _panel and "test environment" in _panel)
 
             # ── 13. No JavaScript errors anywhere ─────────────────────────
             section("13. No JavaScript errors during any of the above")

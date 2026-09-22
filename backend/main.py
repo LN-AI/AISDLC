@@ -35,6 +35,7 @@ from backend.routes.agents import router as agents_router
 from backend.routes.inventory import router as inventory_router
 from backend.routes.findings import router as findings_router
 from backend.routes.notifications import router as notifications_router
+from backend.routes.app_testing import router as app_testing_router
 from backend.routes.github_credentials import router as github_credentials_router
 from backend.routes.github_webhook import router as github_webhook_router
 from backend.routes.modernization import (router as modernization_router,
@@ -98,6 +99,7 @@ from backend.services import job_service
 from backend.services import notify
 from backend.services.knowledge_base import knowledge_base
 from backend.services import agent_guard, legacy_guard, llm_settings_service, subject_service
+from backend.services import app_session
 from backend.services import code_brief
 from backend.services import test_context_brief
 from backend.services import code_delivery
@@ -154,9 +156,24 @@ async def lifespan(app: FastAPI):
     try:
         lapsed = database.lapse_expired_waivers()
         swept = review_source_store.sweep_expired()
-        if lapsed or swept:
-            logger.info("Housekeeping: %d risk acceptance(s) lapsed, %d source(s) expired",
-                        lapsed, swept)
+        # The same rule for the page-text digest an app-testing session collects: it is the
+        # customer's own page content, kept encrypted only until its window passes, and a
+        # retention promise that depends on a restart is not one.
+        conn = database.get_connection()
+        try:
+            # Order matters: closing abandoned sessions first is what lets the sweep below
+            # see their digests at all. The sweep's abandoned branch requires a status other
+            # than `exploring`, and an abandoned session stays at `exploring` for ever --
+            # so without this, closing the browser half way through kept the digest
+            # indefinitely, which is the exact thing that sweep promises it prevents.
+            reaped = app_session.reap_abandoned(conn)
+            cleared = app_session.sweep_expired_page_text(conn)
+        finally:
+            conn.close()
+        if lapsed or swept or cleared or reaped:
+            logger.info("Housekeeping: %d risk acceptance(s) lapsed, %d source(s) expired, "
+                        "%d page-text digest(s) cleared, %d abandoned session(s) closed",
+                        lapsed, swept, cleared, reaped)
     except Exception:
         # Never allowed to stop the app coming up. A missed sweep is a stale row; a failed
         # startup is an outage.
@@ -324,6 +341,7 @@ app.include_router(inventory_router)
 app.include_router(v1_agents_router)
 app.include_router(findings_router)
 app.include_router(notifications_router)
+app.include_router(app_testing_router)
 app.include_router(github_credentials_router)
 app.include_router(github_webhook_router)
 app.include_router(modernization_router)

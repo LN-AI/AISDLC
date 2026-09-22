@@ -3673,11 +3673,465 @@ check('the rest of the result still renders around it', () => {
 });
 }
 
+// ── Application Test Generation ────────────────────────────────────────────
+//
+// The first offline coverage this screen has ever had, and the omission was not free: two
+// defects shipped behind it. The result table still spoke the retired two-word vocabulary,
+// so an assertion resting on the customer's own written requirement was reported as
+// "observed" directly underneath a banner correctly counting it as stated. And both test
+// screens minted elements with the same fixed ids, so whichever screen came first in the
+// markup captured the other's results panel.
+//
+// Note what this file can and cannot see: the DOM stub hands out a fresh element per id, so
+// it can never reproduce the id *collision* itself -- that check belongs in `ui_examine.py`,
+// in a real document. What it can prove is that the two renderers no longer mint the same
+// ids, which is the property the collision needed.
+function runAppTestingChecks() {
+section('Application Test Generation');
+
+const SUITE = {
+  review_id: 'rev-app-1',
+  summary: 'Explored the basket and wrote seven tests.',
+  total_files: 1, total_tests: 4,
+  test_files: [{ path: 'tests/basket.spec.ts', framework: 'playwright',
+                 test_names: ['adds an item'], content: 'test("adds an item")' }],
+  session: { steps: 8 },
+  session_detail: { journeys: [
+    { name: 'Add to basket', step_count: 5, distinct_pages: 2, actions: ['click', 'fill'] },
+    { name: 'Wander',        step_count: 3, distinct_pages: 1, actions: ['goto'] }] },
+  assertion_basis: [
+    { test_name: 'total is right',   basis: 'stated',    what_it_checks: 'the total',
+      requirement_ref: 'REQ-1' },
+    { test_name: 'legacy row',       basis: 'specified', what_it_checks: 'an older run' },
+    { test_name: 'case from a run',  basis: 'derived',   what_it_checks: 'TC-004' },
+    { test_name: 'button is there',  basis: 'observed',  what_it_checks: 'a control exists' },
+    { test_name: 'unlabelled',       basis: '',          what_it_checks: 'nothing declared' },
+  ],
+};
+
+const copy = () => JSON.parse(JSON.stringify(SUITE));
+
+check('a stated assertion is reported as stated, not as observed', () => {
+  sandbox.renderAppTesting('app-testing-result', copy());
+  const html = document.getElementById('app-testing-result').innerHTML;
+  const row = html.slice(html.indexOf('total is right'));
+  const cell = row.slice(0, row.indexOf('legacy row'));
+  assert(cell.includes('Stated'), 'a stated assertion did not render as stated');
+  assert(!cell.includes('Observed'),
+         'a stated assertion rendered as Observed -- the defect this check exists for');
+});
+
+check('the retired word `specified` still reads as stated', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  const row = html.slice(html.indexOf('legacy row'));
+  assert(row.slice(0, row.indexOf('case from a run')).includes('Stated'),
+         'a run stored before the rename lost its basis');
+});
+
+check('derived is its own answer, not folded into either neighbour', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  const row = html.slice(html.indexOf('case from a run'));
+  const cell = row.slice(0, row.indexOf('button is there'));
+  assert(cell.includes('Derived'), 'derived did not render');
+  assert(cell.includes('nobody checked it'),
+         'derived rendered without the reason it exists -- a machine-written case laundered '
+         + 'into a verified requirement is the whole thing this word prevents');
+});
+
+check('a row declaring no basis at all reads as observed', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.slice(html.indexOf('unlabelled')).includes('Observed'),
+         'a blank basis was not floored to observed');
+});
+
+check('the banner and the table cannot disagree', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  // Two stated rows (one of them legacy), one derived, two observed.
+  assert(html.includes('2 assertion(s) check something a person wrote'),
+         'the banner did not count the rows it is sitting above');
+  assert(html.includes('1 check a case this platform generated'),
+         'the derived count disagrees with the table');
+});
+
+check('the journeys walked are shown, and one that went nowhere says so', () => {
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Add to basket'), 'the journey list is missing');
+  assert(html.includes('never left one page'),
+         'a journey that never left one page is the clearest sign a session was stuck');
+});
+
+check('a session that read no page text says what its tests cannot do', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), { read_page_text: false }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('did not read what the pages displayed'),
+         'the page-text warning is gone');
+});
+
+check('a suite with nothing to check against says so rather than implying verification', () => {
+  sandbox.renderAppTesting('app-testing-result',
+                   Object.assign(copy(), { assertion_basis: [], observed_count: 6 }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Nothing was supplied to check against'),
+         'the observed-only banner is gone');
+  assert(html.includes('cannot catch behaviour that'), 'it did not say what that costs');
+});
+
+check('a locator the session never saw is named, with the line to open', () => {
+  // The single failure of the 2026-09-16 live run, in the shape the screen receives it.
+  // The suite scored 16 of 17 and the one red test was red about a *correct* page, so what
+  // the reader needs first is which of the two to distrust.
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    locators_grounded: 87,
+    locators_invented: 3,
+    locator_note: 'Three locator(s) in this suite name something the session never observed '
+                + '(3 class), against 87 written from what it did observe. A recalled '
+                + 'locator that is wrong matches nothing and fails against a working '
+                + 'application, so treat a failure on one of these lines as a broken test '
+                + 'before concluding the application is broken.',
+    locator_audit: { grounded: 87, invented_count: 3, kinds: { class: 3 }, invented: [
+      { path: 'tests/checkout.spec.ts', line: 41, selector: '.inventory_item_price',
+        kind: 'class' },
+    ] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Locators that were not observed'), 'the panel is missing entirely');
+  assert(html.includes('.inventory_item_price'), 'it did not name the offending locator');
+  assert(html.includes('tests/checkout.spec.ts') && html.includes('41'),
+         'it did not say which line to open, which is the only actionable part');
+  assert(html.includes('before concluding the application is broken'),
+         'without this the reader goes looking for a defect that was never there');
+});
+
+check('...and a clean suite says so rather than leaving an empty space', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    locators_grounded: 40, locators_invented: 0,
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('All 40 locator(s)'),
+         'a panel that is blank when nothing is wrong and blank when nobody checked cannot '
+         + 'be told apart');
+  assert(!html.includes('Locators that were not observed'),
+         'it warned about a suite that has nothing wrong with it');
+});
+
+// C-115. Taken from the live ParaBank run that found it: three registration tests written
+// without the session ever reaching the registration page, reported as full coverage.
+check('tests written for a page nobody opened are named on the screen', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    untested_journey_count: 3,
+    untested_journey_note: '3 of 17 test(s), across 1 file(s), drive to a page this session '
+      + 'never opened (/parabank/register.htm). Those tests were written from the '
+      + 'requirement text rather than from anything observed.',
+    journey_audit: { checked: true, tests_total: 17, unvisited_count: 3, files_affected: 1,
+      unvisited: [{ path: 'tests/registration.spec.ts',
+                    destinations: ['/parabank/register.htm'],
+                    tests: ['registration_form_asks_for_all_required_fields'] }] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('never opened'), 'the reader is not told the suite tested a page '
+         + 'the session never reached, which is what made a live run report full coverage '
+         + 'of a journey it had not walked');
+  assert(html.includes('tests/registration.spec.ts') && html.includes('/parabank/register.htm'),
+         'a count with no file and no page behind it cannot be acted on');
+});
+
+check('...and a suite that stayed on ground it walked says so', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    untested_journey_count: 0,
+    journey_audit: { checked: true, tests_total: 12, unvisited_count: 0, files_affected: 0,
+                     unvisited: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('only to pages the session actually opened'),
+         'blank-when-clean and blank-when-unchecked cannot be told apart');
+});
+
+check('...and a session that recorded no paths is not accused of anything', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    untested_journey_count: 0,
+    journey_audit: { checked: false, tests_total: 12, unvisited_count: 0, unvisited: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(!html.includes('never opened') && !html.includes('pages the session actually opened'),
+         'with nothing to compare against, silence is the only honest panel');
+});
+
+check('...and says when a second attempt was made and thrown away', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    locators_grounded: 10, locators_invented: 2, locator_retry_rejected: true,
+    locator_audit: { invented: [{ path: 'a.spec.ts', line: 3, selector: '#total',
+                                  kind: 'id' }] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('was not an improvement'),
+         'the money was spent on a second generation and the reader was not told');
+});
+
+check('tests that would not notice a break are named on the screen', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    assertion_strength_note: 'Of 20 test(s), 3 assert only that something is present, '
+      + 'visible or that the address changed. A test of that kind passes against an '
+      + 'application whose feature is completely broken.',
+    assertion_audit: { tests_total: 20, hollow_count: 3, silent_count: 0, skipped_count: 0,
+      strong_count: 17,
+      hollow: [{ path: 'tests/cart.spec.ts', name: 'cart_badge_is_visible', line: 12,
+                 weak: 2, expects: 2 }],
+      silent: [], skipped: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('would not notice a break'), 'the panel is missing');
+  assert(html.includes('cart_badge_is_visible'), 'it did not name the test');
+  assert(html.includes('tests/cart.spec.ts') && html.includes('12'),
+         'it did not say where to look');
+  assert(html.includes('completely broken'),
+         'without this the reader treats a hollow test as coverage');
+});
+
+check('...and a suite where every test can fail says so', () => {
+  sandbox.renderAppTesting('app-testing-result', Object.assign(copy(), {
+    assertion_audit: { tests_total: 9, hollow_count: 0, silent_count: 0, skipped_count: 0,
+                       strong_count: 9, hollow: [], silent: [], skipped: [] },
+  }));
+  const html = document.getElementById('app-testing-result').innerHTML;
+  assert(html.includes('Every one of the 9'),
+         'blank when nothing is wrong looks identical to blank when nobody checked');
+  assert(!html.includes('would not notice a break'), 'it warned about a healthy suite');
+});
+
+check('the two test screens no longer mint the same element ids', () => {
+  sandbox.renderTestAutomation('test-automation-result', copy());
+  const a = document.getElementById('test-automation-result').innerHTML;
+  sandbox.renderAppTesting('app-testing-result', copy());
+  const b = document.getElementById('app-testing-result').innerHTML;
+  const idsOf = h => new Set((h.match(/id="([^"]+)"/g) || []).map(m => m.slice(4, -1)));
+  const right = idsOf(b);
+  const shared = [...idsOf(a)].filter(id => right.has(id));
+  assert(!shared.length,
+         'both screens mint ' + shared.join(', ') + ' -- a hidden screen is still in the '
+         + 'document, so the loaders resolved to whichever came first in the markup');
+});
+
+check('...and each screen asks its loaders for its own panel', () => {
+  const b = document.getElementById('app-testing-result').innerHTML;
+  assert(b.includes('id="app-testing-result-results"'),
+         'the app screen did not namespace its results panel');
+  assert(b.includes('id="app-testing-result-runner"'),
+         'the app screen did not namespace its runner panel');
+});
+
+section('Watching a session — what is not happening');
+
+// The shape of a real session from the live database: twenty-five steps guessing addresses
+// between two pages, two candidates offered and two withheld every time. Nothing on any
+// screen could see it happen, and it ran to its full budget.
+const LOOPING = [];
+for (let i = 1; i <= 12; i++) {
+  LOOPING.push({
+    step_index: i,
+    journey: 'Navigate to code review',
+    url_path: i % 2 ? '/' : '/review',
+    page_signature: i % 2 ? 'sig-a' : 'sig-b',
+    action: { action_kind: 'goto', target_name: '' },
+    candidates_offered: 2, candidates_refused: 2,
+    outcome: i % 3 ? 'navigated' : 'stayed on the same page',
+  });
+}
+
+const HEALTHY = [1, 2, 3, 4, 5, 6].map(i => ({
+  step_index: i,
+  journey: 'Add to basket',
+  url_path: `/page-${i}`,
+  page_signature: `sig-${i}`,
+  action: { action_kind: 'click', target_name: 'Add Widget' },
+  candidates_offered: 9, candidates_refused: 0,
+  outcome: 'navigated',
+}));
+
+check('a two-page loop is named, and so is the fact that nothing will stop it', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('moving between'), 'the loop was not reported');
+  assert(html.includes('does not catch a two-page loop'),
+         'the platform\'s own rule requires five identical signatures, so A,B,A,B never '
+         + 'trips it — a watcher has to be told that, or they will assume it is handled');
+});
+
+check('guessing addresses rather than clicking is called out', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('guessed addresses'), 'the goto ratio was not reported');
+});
+
+check('a page offering almost nothing to click is called out', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('only a couple of things to click'),
+         'two candidates on a real application means the collector is blind to the rest');
+});
+
+check('a denylist eating half the page is reported as a coverage problem', () => {
+  const html = sandbox.renderAppStalls(LOOPING, { status: 'exploring' });
+  assert(html.includes('too tight for your application'),
+         'half of every page withheld is not a safety win, and nothing has ever said so');
+});
+
+check('a healthy session says so rather than showing an empty panel', () => {
+  const html = sandbox.renderAppStalls(HEALTHY, { status: 'exploring' });
+  assert(html.includes('Nothing looks stuck'), 'an empty panel reads as a broken check');
+  assert(!html.includes('moving between'), 'a healthy session was reported as looping');
+});
+
+check('the no-progress rule is shown as a countdown, not sprung as a surprise', () => {
+  const stuck = HEALTHY.concat([7, 8, 9].map(i => ({
+    step_index: i, journey: 'Add to basket', url_path: '/same',
+    page_signature: 'sig-same', action: { action_kind: 'click' },
+    candidates_offered: 9, candidates_refused: 0, outcome: 'stayed on the same page',
+  })));
+  const html = sandbox.renderAppStalls(stuck, { status: 'exploring' });
+  assert(html.includes('At 5 the platform stops the session'),
+         'a person watching should see the limit approaching, not just its result');
+});
+
+check('an action is not credited with the result of the one before it', () => {
+  // Steps 11 and 12 of the first real session against a public application. The driver
+  // sends `last_outcome` with the *next* request -- `app_testing.py:192` calls it "what
+  // happened when the previous action ran" -- so the outcome column on a step describes
+  // the step before it. Joining them on one row rendered
+  // `click "Finish" ... -> navigated to /checkout-step-two.html`, crediting Finish with
+  // arriving at the page it was standing on in order to click Finish.
+  const REAL = [
+    { step_index: 11, journey: 'Check out', url_path: '/checkout-step-one.html',
+      page_signature: 'one', action: { action_kind: 'click', target_name: 'continue' },
+      candidates_offered: 10, candidates_refused: 0,
+      outcome: 'filled Zip/Postal Code; still on /checkout-step-one.html' },
+    { step_index: 12, journey: 'Check out', url_path: '/checkout-step-two.html',
+      page_signature: 'two', action: { action_kind: 'click', target_name: 'Finish' },
+      candidates_offered: 11, candidates_refused: 0,
+      outcome: 'navigated to /checkout-step-two.html' },
+  ];
+  assert(sandbox._appOutcomeOf(REAL, 0) === 'navigated to /checkout-step-two.html',
+         'a result is recorded on the step after the action, and belongs to that action');
+  assert(sandbox._appOutcomeOf(REAL, 1) === '',
+         'the newest action cannot have a result yet -- nothing has looked at the page again');
+
+  const newest = sandbox._appStepSentence(REAL[1], {}, sandbox._appOutcomeOf(REAL, 1), false);
+  assert(!newest.includes('navigated to'),
+         'the newest step is claiming a navigation that the step before it caused');
+  assert(newest.includes('ended before anything reported'),
+         'an unreported result rendered as nothing reads as "the action did nothing"');
+
+  const caused = sandbox._appStepSentence(REAL[0], {}, sandbox._appOutcomeOf(REAL, 0), false);
+  assert(caused.includes('continue') && caused.includes('navigated to /checkout-step-two'),
+         'the arrival has to attach to the step that caused it');
+});
+
+check('a live session shows a stop that is requested but not yet taken', () => {
+  sandbox.renderAppSession(
+    { id: 's1', status: 'exploring', steps_used: 4, max_steps: 40, target_label: 'staging',
+      stop_requested: true, journeys: [], refusals: [], refused_total: 3 },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('stop requested'), 'a pending stop is invisible');
+  assert(html.includes('Exploring'),
+         'showing a stopped state before the session row says so is a claim that cannot be '
+         + 'retracted');
+  assert(html.includes('Stop after the current step'),
+         'the button must not be called Stop — it lands at a step boundary');
+  assert(html.includes('cannot close it'),
+         'the browser is on another machine and the screen has to say so');
+});
+
+check('a session that stopped without a suite offers to write one from what it did', () => {
+  sandbox.renderAppSession(
+    { id: 's2', status: 'finished', steps_used: 6, max_steps: 40, target_label: 'staging',
+      journeys: [], refusals: [], review_id: null },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('stopped without writing a suite'), 'the state is not named');
+  assert(html.includes('were charged for'),
+         'the steps were paid for, and that is the reason to salvage rather than restart');
+  assert(html.includes('Write the suite from these 6 step(s)'), 'no way to recover the spend');
+  assert(html.includes('cannot be reopened'),
+         'the boundary has to be stated: the browser is on another machine');
+});
+
+check('a session that took no steps says nothing was billed', () => {
+  sandbox.renderAppSession(
+    { id: 's3', status: 'finished', steps_used: 0, max_steps: 40, target_label: 'staging',
+      journeys: [], refusals: [], review_id: null },
+    []);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('nothing was billed'),
+         'the first thing somebody with a dead session wants to know');
+  assert(!html.includes('Write the suite'), 'there is nothing to write a suite from');
+});
+
+check('a session that already has a suite points at it instead of offering another', () => {
+  sandbox.renderAppSession(
+    { id: 's4', status: 'generated', steps_used: 6, max_steps: 40, target_label: 'staging',
+      journeys: [], refusals: [], review_id: 'rev-9' },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('Open it'), 'the suite it produced is unreachable from here');
+  assert(!html.includes('Write the suite from'),
+         'a second generation orphans the first suite, which may already be delivered');
+});
+
+check('what the policy withheld is shown, with the cost of it in both directions', () => {
+  sandbox.renderAppSession(
+    { id: 's1', status: 'finished', steps_used: 9, max_steps: 40, target_label: 'staging',
+      journeys: [], refused_total: 27,
+      refusals: [{ name: 'Delete account', group: 'destroys data', count: 7 },
+                 { name: 'Place order', group: 'spends money', count: 2 }] },
+    HEALTHY);
+  const html = document.getElementById('app-testing-session').innerHTML;
+  assert(html.includes('Delete account') && html.includes('destroys data'),
+         'the names were always discarded and only the count kept');
+  assert(html.includes('not a guarantee'),
+         'the denylist is a filter on button labels and must not read as a promise');
+  assert(html.includes('test environment'),
+         'what actually protects a customer is the attestation, not this list');
+});
+
+
+check('the command carries the project, or says why it does not', () => {
+  document.getElementById('app-testing-url').value = 'https://staging.example.com';
+  document.getElementById('app-testing-attest').checked = true;
+  document.getElementById('app-testing-requirement').value = 'A basket total must be right.';
+  sandbox.getActiveProjectId = () => 'proj-7';
+  assert(sandbox.appTestingCommand().includes('--project proj-7'),
+         'without --project the session is filed under nothing, every covered run comes back '
+         + 'as "no such run", and the project documents are never read');
+  sandbox.getActiveProjectId = () => '';
+  sandbox.renderAppTestingCommand();
+  const html = document.getElementById('app-testing-command').innerHTML;
+  assert(html.includes('No project is selected'),
+         'a command that will misfile the session was offered with no warning');
+});
+
+check('the attestation tick is what writes the declaration', () => {
+  sandbox.getActiveProjectId = () => 'proj-7';
+  document.getElementById('app-testing-attest').checked = true;
+  assert(sandbox.appTestingCommand().includes('--attest'), 'the tick box did not reach the command');
+  document.getElementById('app-testing-attest').checked = false;
+  assert(!sandbox.appTestingCommand().includes('--attest'),
+         'an unticked box still declared a test environment');
+  document.getElementById('app-testing-attest').checked = true;
+});
+
+check('the requirement is offered as the file the command reads', () => {
+  sandbox.renderAppTestingCommand();
+  const html = document.getElementById('app-testing-command').innerHTML;
+  assert(html.includes('requirement.txt'), 'the file the command needs is never named');
+  assert(html.includes('A basket total must be right.'),
+         'the typed requirement is not shown, so nothing tells the user what to save');
+  assert(html.includes('downloadAppTestingRequirement'), 'no way to get the file');
+});
+}
+
 runCharterChecks().then(runPagingChecks).then(runModernizationChecks)
   .then(runReviewSourceChecks).then(runScreenIsolationChecks)
   .then(runNavigationChecks).then(runProjectWarningChecks)
   .then(runApprovalCardChecks).then(runDashboardChecks)
-  .then(runCommandPaletteChecks).then(runTestCaseChecks).then(() => {
+  .then(runCommandPaletteChecks).then(runTestCaseChecks)
+  .then(runAppTestingChecks).then(() => {
   console.log('\n' + '-'.repeat(60));
   if (failures) { console.log(`FAILED: ${failures} check(s)`); process.exit(1); }
   console.log('OK: all render checks passed');

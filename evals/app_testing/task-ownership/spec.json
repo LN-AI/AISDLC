@@ -1,0 +1,12 @@
+{
+  "name": "task-ownership",
+  "language": "javascript",
+  "framework": "playwright",
+  "entry": "app.py",
+  "requirement": "A task may only be edited by the user who created it. When a signed-in user opens a task somebody else owns, the page must not offer any way to change it, and a direct attempt to save a change to that task must be refused. A user opening a task they own must be offered an edit form, and saving a new title from it must update the task.",
+  "bug": "auth.may_edit() checks only that somebody is signed in, not that the task belongs to them — so every signed-in user is offered an edit form on every task, including tasks owned by other people, and a saved change is accepted.",
+  "fix": "fixed/auth.py adds the ownership comparison: a task may be edited only when task['owner'] equals the signed-in user. One line.",
+  "credentials": {"username": "alice", "password": "alice123"},
+  "goal": "Sign in as alice, look at the task list, open a task alice owns, and open a task owned by somebody else.",
+  "notes": "Discovery runs against the FIXED application, which is what a customer does: you explore the system you have and get a suite that guards it. The suite is then replayed against both variants, and `discriminates` means green on fixed and red on broken.\n\nTwo of the requirement's four behaviours are identical in both variants and are the controls: alice is offered an edit form on her own task, and saving from it updates the title. A suite that only walks the owner's happy path is green on both and does not discriminate — which is the likely failure, because the owner's path is the one an explorer reaches first and most easily.\n\nThe separating behaviour is the one an explorer has to go looking for: opening task 2, which bob owns, while signed in as alice. On the fixed app that page offers no edit control and says so in #readonly-note; on the broken app it offers a full edit form. An assertion that the edit control is absent there is the one that goes red on the broken build.\n\nThe case is deliberately ordinary server-rendered HTML with real labels and real form posts. A JavaScript-driven single-page app would be measuring whether the collector copes with a virtual DOM, which is a different question from whether the agent explores well."
+}

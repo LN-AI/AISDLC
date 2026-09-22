@@ -382,11 +382,51 @@ async function setActiveProject(projectId) {
   else localStorage.removeItem('sdlc_project_id');
   renderProjectSelector();
   await refreshEntitlements();
-  // History and the Dashboard are scoped to the selected project, so whichever of them is
-  // on screen is now showing the previous project's work.
+  _refreshForProjectChange();
+}
+
+/** Everything on screen now belongs to the project that was selected a moment ago.
+ *
+ *  This used to reload History and the Dashboard and nothing else, on the theory that every
+ *  other screen rebuilds itself on its next visit — which is true, and is the wrong test.
+ *  A person who switches project while standing on an agent screen never leaves it, so the
+ *  run list, the "start from an earlier run" pickers and the result panel all carried on
+ *  describing the previous project. That is most of what made this product look as though
+ *  its history and its pickers were broken: they were correct, and stale.
+ *
+ *  Hidden screens are cleared too, not just the visible one. `showPage` only toggles a
+ *  class, so a screen opened under one project keeps its rendered result in the document —
+ *  and returning to it later shows that result under the new project's heading, with the
+ *  new project's runs listed above it. */
+function _refreshForProjectChange() {
+  Object.keys(AGENT_SCREENS).forEach(page => {
+    const spec = AGENT_SCREENS[page];
+    _runsOffset[page] = 0;
+    _openRunId[page] = null;
+    const result = document.getElementById(spec.result);
+    if (result) { result.innerHTML = ''; result.classList.add('hidden'); }
+    // The suite these buttons hand over belongs to a project that is no longer selected.
+    delete _lastSuites[spec.result];
+    delete _runnerPlans[spec.result];
+  });
+  _lastTestAutomation = null;
+  _lastAppTesting = null;
+
   const active = document.querySelector('.page.active');
-  if (active && active.id === 'page-history') loadHistory();
-  if (active && active.id === 'page-dashboard') loadDashboard();
+  const page = active ? active.id.replace(/^page-/, '') : '';
+  if (!page) return;
+
+  // A quote carries the previous project's budget headroom and arms a run button against
+  // it. The server re-checks at run time, so this is a truthfulness fix rather than a
+  // spending one — but a figure that is quietly about a different project is worse than no
+  // figure.
+  const quote = document.getElementById(`${page}-cost-preview`);
+  if (quote) { quote.innerHTML = ''; quote.classList.add('hidden'); }
+
+  // `_runPageLoader` is the one place a screen loads itself, and it already covers History
+  // and the Dashboard. `github` is skipped because its loader navigates to another screen,
+  // which would move the user somewhere they did not ask to go.
+  if (page !== 'github') _runPageLoader(page);
 }
 
 /**
@@ -629,6 +669,13 @@ function _runPageLoader(page) {
     // agent's output. Rebuilt per visit for the same reason the history list is: the run
     // it offers must belong to the project selected now, not the one selected last time.
     if (RUN_HANDOFFS[page]) renderRunHandoff(page);
+    // App testing offers the same handoff in a different shape — many runs, not one, because
+    // a session can cover several earlier case runs at once. Rebuilt per visit for the same
+    // reason: the runs offered must belong to the project selected now.
+    if (page === 'app-testing') { loadAppTestingSources(); loadAppTestingSessions(); }
+    // A poll that survives navigation keeps fetching for a screen nobody is looking at,
+    // which is the habit modernization's single global timer has.
+    if (page !== 'app-testing') stopAppSessionPoll();
     // The mode select drives which fields exist, so the screen has to be put in
     // the selected mode on arrival as well as on change.
     if (page === 'architecture') onArchModeChange();
@@ -2345,16 +2392,21 @@ async function runTestAutomationFromQuote() {
 // to read. Set by the renderer, so reopening a stored run arms the downloads too — the bug
 // D-369 recorded for the three in-page handoffs was exactly this, set in the run function
 // instead of where the result is drawn.
-let _lastTestAutomation = null;
+// Keyed by screen, not a single global. Both test screens render a suite, and while this
+// was one variable the app-based screen overwrote it -- so the code-based screen's Download
+// button handed you the other screen's suite. The buttons pass their own screen's id.
+const _lastSuites = {};
+let _lastTestAutomation = null;   // kept: the suite most recently rendered anywhere
 
-function downloadGeneratedTest(index) {
-  const f = (_lastTestAutomation || {}).test_files?.[index];
+function downloadGeneratedTest(index, screen) {
+  const f = (_lastSuites[screen] || _lastTestAutomation || {}).test_files?.[index];
   if (!f || !f.content) return;
   _downloadTextAsFile((f.path || `test_${index}`).split('/').pop(), f.content);
 }
 
-function downloadAllGeneratedTests() {
-  const files = (_lastTestAutomation || {}).test_files || [];
+function downloadAllGeneratedTests(screen) {
+  const suite = _lastSuites[screen] || _lastTestAutomation || {};
+  const files = suite.test_files || [];
   if (!files.length) return;
   // One text file rather than a zip: building a real archive in the browser needs a library
   // the CSP does not allow, and a single file with clear path headers is honest about being
@@ -2367,10 +2419,10 @@ function downloadAllGeneratedTests() {
     'These tests were generated and never run. Read the assumptions below before trusting them.',
     '',
   ];
-  if (_lastTestAutomation.setup_instructions) {
-    parts.push('## How to run them', '', _lastTestAutomation.setup_instructions, '');
+  if (suite.setup_instructions) {
+    parts.push('## How to run them', '', suite.setup_instructions, '');
   }
-  (_lastTestAutomation.assumptions || []).forEach(a => {
+  (suite.assumptions || []).forEach(a => {
     parts.push(`## Assumption: ${a.assumption || ''}`,
                `Risk if wrong: ${a.risk_if_wrong || ''}`, '');
   });
@@ -2390,8 +2442,13 @@ function downloadAllGeneratedTests() {
  *
  *  Fetched separately from the review rather than folded into it, because results arrive
  *  long after the generation and a stored run must not have to be rewritten to carry them. */
-async function loadTestResults(reviewId) {
-  const box = document.getElementById('test-automation-results');
+async function loadTestResults(reviewId, prefix) {
+  // `prefix` is required and has no default. Two screens render this panel -- the
+  // code-based generator and the app-based one -- and a hidden screen is still in the
+  // document, so a fixed id here resolved to whichever copy came first in the markup.
+  // That is the wrong one whenever the other screen is the visible one. A default would
+  // quietly restore the bug for any call site that forgot to pass it, and there are three.
+  const box = document.getElementById(`${prefix}-results`);
   if (!box || !reviewId) return;
   let data;
   try {
@@ -2494,10 +2551,13 @@ async function loadTestResults(reviewId) {
  *  file it wrote), so it says them here rather than leaving them to be worked out.
  *
  *  Everything below is a lookup, not a model call: nothing here costs anything. */
-let _lastRunnerPlan = null;
+// Keyed by screen prefix, not a single global: both test screens render this panel, and a
+// lone `_lastRunnerPlan` meant the Download-workflow button handed you whichever plan was
+// fetched last rather than the one belonging to the run on screen.
+const _runnerPlans = {};
 
-async function loadTestRunner(reviewId) {
-  const box = document.getElementById('test-automation-runner');
+async function loadTestRunner(reviewId, prefix) {
+  const box = document.getElementById(`${prefix}-runner`);
   if (!box || !reviewId) return;
   let d;
   try {
@@ -2505,7 +2565,7 @@ async function loadTestRunner(reviewId) {
   } catch (e) {
     return;
   }
-  _lastRunnerPlan = d;
+  _runnerPlans[prefix] = d;
   const plan = d.plan || {};
   const jobs = plan.jobs || [];
 
@@ -2561,7 +2621,7 @@ async function loadTestRunner(reviewId) {
            report home — it saves its results as its own artifact and the platform fetches
            them. Nothing needs to be exposed, and no secret is needed. Use
            <b>Fetch from GitHub Actions</b> below once the job has finished.`}</p>
-      <button class="btn-secondary btn-sm" onclick="downloadTestWorkflow()">
+      <button class="btn-secondary btn-sm" onclick="downloadTestWorkflow('${jsArg(prefix)}')">
         Download ${esc(d.workflow_path || 'workflow')}</button>
       <details style="margin-top:8px">
         <summary>Read it first (${(d.workflow_yaml || '').split('\n').length} lines)</summary>
@@ -2577,35 +2637,35 @@ async function loadTestRunner(reviewId) {
       committed alongside — so the tests run on push and their results come back. The pull
       request says plainly that nothing has run these and lists what the model assumed.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <input type="text" id="test-deliver-repo" style="flex:1;min-width:280px"
+      <input type="text" id="${prefix}-deliver-repo" style="flex:1;min-width:280px"
              placeholder="https://github.com/owner/repo" />
-      <label class="field-hint" style="margin:0"><input type="checkbox" id="test-deliver-pr" checked />
+      <label class="field-hint" style="margin:0"><input type="checkbox" id="${prefix}-deliver-pr" checked />
         open a pull request</label>
-      <button class="btn-secondary btn-sm" onclick="deliverGeneratedTests('${esc(reviewId)}')">
+      <button class="btn-secondary btn-sm" onclick="deliverGeneratedTests('${jsArg(reviewId)}', '${jsArg(prefix)}')">
         Deliver</button>
     </div>
-    <div id="test-deliver-out" style="margin-top:8px"></div>
+    <div id="${prefix}-deliver-out" style="margin-top:8px"></div>
 
     <div class="field-label" style="margin-top:16px">Fetch from GitHub Actions</div>
     <p class="field-hint">Reads a finished run's saved results and files them here. This
       direction is the one that works with no public address — the platform calls GitHub, not
       the other way round. Leave the run blank for the most recent completed one.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <input type="text" id="test-actions-repo" style="flex:1;min-width:240px"
+      <input type="text" id="${prefix}-actions-repo" style="flex:1;min-width:240px"
              placeholder="https://github.com/owner/repo" />
-      <input type="text" id="test-actions-run" style="flex:1;min-width:160px"
+      <input type="text" id="${prefix}-actions-run" style="flex:1;min-width:160px"
              placeholder="run URL or id (optional)" />
-      <button class="btn-secondary btn-sm" onclick="fetchActionsResults('${esc(reviewId)}')">
+      <button class="btn-secondary btn-sm" onclick="fetchActionsResults('${jsArg(reviewId)}', '${jsArg(prefix)}')">
         Fetch</button>
     </div>
-    <div id="test-actions-out" style="margin-top:8px"></div>`;
+    <div id="${prefix}-actions-out" style="margin-top:8px"></div>`;
 }
 
 /** Push the suite to a repository. No model call, so nothing is metered — but it writes to
  *  somebody's repository, so what it did is reported line by line rather than as "done". */
-async function deliverGeneratedTests(reviewId) {
-  const repo = (document.getElementById('test-deliver-repo') || {}).value || '';
-  const out = document.getElementById('test-deliver-out');
+async function deliverGeneratedTests(reviewId, prefix) {
+  const repo = (document.getElementById(`${prefix}-deliver-repo`) || {}).value || '';
+  const out = document.getElementById(`${prefix}-deliver-out`);
   if (!out) return;
   if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
   out.innerHTML = '<div class="cost-note">Committing…</div>';
@@ -2614,7 +2674,7 @@ async function deliverGeneratedTests(reviewId) {
       method: 'POST',
       body: JSON.stringify({
         github_repo_url: repo.trim(),
-        open_pr: !!(document.getElementById('test-deliver-pr') || {}).checked,
+        open_pr: !!(document.getElementById(`${prefix}-deliver-pr`) || {}).checked,
         include_workflow: true,
       }),
     });
@@ -2633,7 +2693,7 @@ async function deliverGeneratedTests(reviewId) {
       </div>`;
     // The repository is now the obvious place to fetch results from, so it is filled in
     // rather than typed twice.
-    const echo = document.getElementById('test-actions-repo');
+    const echo = document.getElementById(`${prefix}-actions-repo`);
     if (echo && !echo.value) echo.value = repo.trim();
   } catch (e) {
     out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
@@ -2642,10 +2702,10 @@ async function deliverGeneratedTests(reviewId) {
 
 /** Pull a finished Actions run's results in. Refreshes the results panel above on success,
  *  because the answer to "what happened" belongs where the answer already lives. */
-async function fetchActionsResults(reviewId) {
-  const repo = (document.getElementById('test-actions-repo') || {}).value || '';
-  const run = ((document.getElementById('test-actions-run') || {}).value || '').trim();
-  const out = document.getElementById('test-actions-out');
+async function fetchActionsResults(reviewId, prefix) {
+  const repo = (document.getElementById(`${prefix}-actions-repo`) || {}).value || '';
+  const run = ((document.getElementById(`${prefix}-actions-run`) || {}).value || '').trim();
+  const out = document.getElementById(`${prefix}-actions-out`);
   if (!out) return;
   if (!repo.trim()) { out.innerHTML = '<div class="cost-note">Which repository?</div>'; return; }
   out.innerHTML = '<div class="cost-note">Reading GitHub…</div>';
@@ -2665,24 +2725,28 @@ async function fetchActionsResults(reviewId) {
         ${esc(a.branch || 'unknown branch')} — ${s.passed} of ${s.total} passed.
         ${a.url ? `<a href="${esc(a.url)}" target="_blank" rel="noopener">the run</a>` : ''}
       </div>`;
-    loadTestResults(reviewId);
+    loadTestResults(reviewId, prefix);
   } catch (e) {
     out.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--red)">${esc(e.message || String(e))}</div>`;
   }
 }
 
-function downloadTestWorkflow() {
-  const d = _lastRunnerPlan;
+function downloadTestWorkflow(prefix) {
+  const d = _runnerPlans[prefix];
   if (!d || !d.workflow_yaml) return;
   _downloadTextAsFile((d.workflow_path || 'workflow.yml').split('/').pop(), d.workflow_yaml);
 }
 
 function renderTestAutomation(targetId, r) {
   _lastTestAutomation = r;
+  _lastSuites[targetId] = r;
   // Fired after the innerHTML below lands, since both write into divs that markup creates.
+  // `targetId` is passed down as the id prefix for those divs and everything inside them:
+  // it is already unique per screen, and a fixed prefix here collided with the app-based
+  // screen, which renders the same panel.
   if (r && r.review_id) setTimeout(() => {
-    loadTestResults(r.review_id);
-    loadTestRunner(r.review_id);
+    loadTestResults(r.review_id, targetId);
+    loadTestRunner(r.review_id, targetId);
   }, 0);
   const wrap = document.getElementById(targetId);
   wrap.classList.remove('hidden');
@@ -2716,8 +2780,8 @@ function renderTestAutomation(targetId, r) {
         workflow that reports back on every push. This screen then shows which of your
         requirements actually hold.</div>
     </div>
-    <div id="test-automation-results"></div>
-    <div id="test-automation-runner"></div>
+    <div id="${targetId}-results"></div>
+    <div id="${targetId}-runner"></div>
 
     <div class="summary-box">${esc(r.summary || '')}</div>
     ${renderAutomationInputMode(r)}
@@ -2755,7 +2819,7 @@ function renderTestAutomation(targetId, r) {
     ${files.length ? `
     <div class="form-actions" style="margin-bottom:8px">
       <button class="btn btn-secondary" style="font-size:12px;padding:4px 10px"
-              onclick="downloadAllGeneratedTests()">⬇ Download all</button>
+              onclick="downloadAllGeneratedTests('${jsArg(targetId)}')">⬇ Download all</button>
     </div>` : ''}
     ${files.map((f, i) => `
       <details style="margin-bottom:10px" ${files.length === 1 ? 'open' : ''}>
@@ -2769,7 +2833,7 @@ function renderTestAutomation(targetId, r) {
           ${(f.covers || []).length ? `<div class="field-hint">Covers: ${f.covers.map(esc).join(' · ')}</div>` : ''}
           <pre class="api-usage-code">${esc(f.content || '')}</pre>
           <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px"
-                  onclick="downloadGeneratedTest(${i})">⬇ Download this file</button>
+                  onclick="downloadGeneratedTest(${i}, '${jsArg(targetId)}')">⬇ Download this file</button>
         </div>
       </details>`).join('')}
 
@@ -2792,6 +2856,1069 @@ function renderTestAutomation(targetId, r) {
     ${r.setup_instructions ? `
     <div class="section-title" style="margin-top:20px">How to run them</div>
     <div class="summary-box">${esc(r.setup_instructions)}</div>` : ''}
+
+    <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
+  `;
+}
+
+// ── Application testing ───────────────────────────────────────────────────
+
+let _lastAppTesting = null;
+
+/** Three words, one place. `stated` is something a person wrote, `derived` a case this
+ *  platform generated from something a person wrote, `observed` nothing at all.
+ *
+ *  `specified` is the retired two-word vocabulary and maps to `stated`, rather than being
+ *  dropped: a run stored before the rename can still carry it, which is the same reason the
+ *  server still writes `specified_count` beside `stated_count`. Anything unrecognised reads
+ *  as observed, because the honest answer to "I do not know what this rests on" is "nothing
+ *  said this should be true". */
+const _ASSERTION_LABELS = {
+  stated:   '<span style="color:var(--green)">✓ Stated</span>'
+          + '<div class="field-hint">someone wrote this down</div>',
+  derived:  '<span style="color:var(--amber)">◑ Derived</span>'
+          + '<div class="field-hint">a case this platform generated — nobody checked it</div>',
+  observed: '<span style="color:var(--text-muted)">— Observed</span>'
+          + '<div class="field-hint">what the app did that day</div>',
+};
+
+function _assertionBasis(row) {
+  const raw = String((row || {}).basis || '');
+  if (raw === 'stated' || raw === 'specified') return 'stated';
+  if (raw === 'derived') return 'derived';
+  return 'observed';
+}
+
+// Builds the command that actually explores, because this screen cannot do it itself. The
+// browser runs where the application is reachable -- a developer machine, a CI runner, or a
+// box inside the customer's network -- and saying so plainly is better than a Run button
+// that works for public URLs and mystifies everyone behind a VPN.
+// Which earlier Test Scenario / Test Case runs this session should cover. Empty is the
+// normal case: those agents may never have run for this system, and a typed requirement or a
+// project document does the same job.
+// The two upstream QA products, and only those: they are the only ones whose output is a
+// brief. A code review is not a statement about what the application should do, and
+// `app_basis.SOURCE_REVIEW_TYPES` refuses one — so offering it here would be offering
+// something the session will drop.
+const APP_TESTING_SOURCES = ['test-scenario', 'test-case'];
+
+// Must equal `app_basis.MAX_SOURCE_REVIEWS`. `smoke_app_testing.py` asserts the two agree:
+// a cap the screen does not know about is a cap that truncates silently on the server.
+const APP_TESTING_MAX_SOURCES = 5;
+
+// Chosen runs, by id, in the order they were added. Held here rather than read off the
+// control, because the list is rebuilt whenever the project changes and a selection read
+// from the DOM would vanish with it.
+let _appTestingChosen = [];
+let _appTestingOffered = {};   // id -> the row, so the chosen list can describe it
+
+function appTestingSources() {
+  return _appTestingChosen.slice();
+}
+
+/** Fill the dropdown from this project's own history.
+ *
+ *  One request per source product, filtered *by the server*. The previous version asked for
+ *  the newest 50 reviews of every kind and sorted them out in the browser, so a project with
+ *  fifty recent code reviews showed an empty box while its test-case runs sat just past the
+ *  cap — indistinguishable from having none. `GET /api/reviews` takes `product_id` and
+ *  `review_type`; two requests is the right price for a filter that is actually applied.
+ *
+ *  Two requests rather than one because the endpoint takes a single `review_type`, and
+ *  teaching it a comma list would change a documented public parameter for one caller. */
+async function loadAppTestingSources() {
+  const pick = document.getElementById('app-testing-source-pick');
+  if (!pick) return;
+
+  // No project, nothing offered. Not cosmetic: `apiFetch` only sends `X-Project-Id` when a
+  // project is selected, so an unscoped read hands a super admin every tenant's run titles —
+  // and a run from another project is unusable anyway, because the session that would cover
+  // it cannot see it and reports it as "no such run".
+  if (!getActiveProjectId()) {
+    _appTestingChosen = []; _appTestingOffered = {};
+    pick.innerHTML = '<option value="">Pick a project in the sidebar first</option>';
+    pick.disabled = true;
+    renderAppTestingChosen();
+    return;
+  }
+
+  pick.disabled = true;
+  pick.innerHTML = '<option value="">Loading…</option>';
+  try {
+    const pages = await Promise.all(APP_TESTING_SOURCES.map(screen => {
+      const spec = AGENT_SCREENS[screen];
+      return apiFetch(`/api/reviews?product_id=${encodeURIComponent(spec.product)}`
+                      + `&review_type=${encodeURIComponent(spec.reviewType)}`
+                      + `&limit=${RUNS_PAGE_SIZE}&offset=0`, { _silent: true });
+    }));
+    const runs = [].concat(...pages.map(d => (d && d.reviews) || []))
+      .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+    _appTestingOffered = {};
+    runs.forEach(r => { _appTestingOffered[r.id] = r; });
+    // A chosen run that is no longer offered — because the project changed — must not stay
+    // in the command.
+    _appTestingChosen = _appTestingChosen.filter(id => _appTestingOffered[id]);
+
+    if (!runs.length) {
+      pick.innerHTML = '<option value="">No test scenario or test case runs in this '
+                     + 'project yet — a requirement or an uploaded document does the same '
+                     + 'job</option>';
+      pick.disabled = true;
+    } else {
+      pick.disabled = false;
+      // The newest is not preselected, for the reason `loadRunHandoffOptions` gives: seeding
+      // an input from a run nobody chose is C-54.
+      pick.innerHTML = '<option value="">— add a run —</option>'
+        + runs.map(r => `<option value="${esc(r.id)}">${esc(appTestingSourceLabel(r))}</option>`)
+              .join('');
+    }
+  } catch (e) {
+    // An error and an empty project used to render identically, which is the one thing a
+    // person cannot act on.
+    pick.innerHTML = `<option value="">Could not load earlier runs: ${esc(e.message)}</option>`;
+    pick.disabled = true;
+  }
+  renderAppTestingChosen();
+}
+
+/** Date, kind, and what it was run against.
+ *
+ *  Deliberately no gate and no finding count, though `/api/reviews` carries both: these two
+ *  products are `gated: false` and their stored rows default to Green / 0, so printing that
+ *  would be a claim of safety nobody made. */
+function appTestingSourceLabel(r) {
+  const when = r.created_at ? new Date(r.created_at + 'Z').toLocaleString() : 'undated';
+  const kind = r.review_type === 'test_cases' ? 'Test cases' : 'Scenarios';
+  return `${when} · ${kind} · ${(r.input_summary || 'no summary').slice(0, 70)}`;
+}
+
+function addAppTestingSource() {
+  const pick = document.getElementById('app-testing-source-pick');
+  const id = pick && pick.value;
+  if (!id) return;
+  if (_appTestingChosen.indexOf(id) < 0) _appTestingChosen.push(id);
+  pick.value = '';
+  renderAppTestingChosen();
+}
+
+function removeAppTestingSource(id) {
+  _appTestingChosen = _appTestingChosen.filter(x => x !== id);
+  renderAppTestingChosen();
+}
+
+/** The runs chosen so far, and the cap made visible.
+ *
+ *  Reaching the cap has to be shown here, because the server truncates the list at five
+ *  without comment — a sixth reference that silently does nothing is exactly the class of
+ *  failure the skipped-sources list exists to prevent. */
+function renderAppTestingChosen() {
+  const box = document.getElementById('app-testing-sources-chosen');
+  const pick = document.getElementById('app-testing-source-pick');
+  if (!box) return;
+  const full = _appTestingChosen.length >= APP_TESTING_MAX_SOURCES;
+  if (pick && !pick.disabled) {
+    pick.disabled = full;
+    if (full) {
+      pick.innerHTML = `<option value="">${APP_TESTING_MAX_SOURCES} of `
+                     + `${APP_TESTING_MAX_SOURCES} — remove one to add another</option>`;
+    }
+  }
+  box.innerHTML = _appTestingChosen.map(id => {
+    const r = _appTestingOffered[id] || {};
+    return `<div class="review-pick" style="display:flex;gap:8px;align-items:center">
+      <span style="flex:1">${esc(appTestingSourceLabel(r))}</span>
+      <button type="button" class="btn btn-link" style="font-size:11px;padding:0"
+              onclick="removeAppTestingSource('${jsArg(id)}')">remove</button>
+    </div>`;
+  }).join('');
+  if (full && !pick?.disabled) { /* nothing: the select already says it */ }
+  renderAppTestingCommand();
+  loadAppTestingBasis();
+}
+
+/** What the session would actually have to check against — asked of the server.
+ *
+ *  This screen used to answer it in JavaScript, from the requirement box and the number of
+ *  ticked runs. It cannot: it knows nothing about the project's uploaded documents, so it
+ *  warned "nothing to check against" at a project holding a full specification, and said
+ *  nothing when every ticked reference was stale. The refusal a session would give arrives
+ *  here instead of after somebody has launched a browser. */
+let _appBasisTimer = null;
+function loadAppTestingBasis() {
+  clearTimeout(_appBasisTimer);
+  _appBasisTimer = setTimeout(_loadAppTestingBasisNow, 250);
+}
+
+async function _loadAppTestingBasisNow() {
+  const box = document.getElementById('app-testing-basis');
+  if (!box) return;
+  if (!getActiveProjectId()) { box.innerHTML = ''; return; }
+  const requirement = ((document.getElementById('app-testing-requirement') || {}).value || '');
+  let d;
+  try {
+    d = await apiFetch('/api/v1/app-testing/basis', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requirement,
+                             project_id: getActiveProjectId(),
+                             source_review_ids: appTestingSources() }),
+      _silent: true,
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="cost-note">Could not check what this session has to test
+      against: ${esc(e.message)}</div>`;
+    return;
+  }
+  const parts = [];
+  if (d.has_requirement) parts.push('the requirement you typed');
+  if (d.has_documents) parts.push(`${d.document_chars.toLocaleString()} characters of `
+                                  + `Requirements and QA documents on this project`);
+  (d.source_reviews || []).forEach(r => parts.push(
+    `${r.items} ${r.review_type === 'test_cases' ? 'test case(s)' : 'scenario(s)'} from an `
+    + `earlier run`));
+
+  box.innerHTML = `
+    <div class="cost-note" style="border-left:3px solid var(--${
+        d.has_stated ? 'green' : d.has_derived ? 'amber' : 'red'})">
+      ${d.has_any ? `
+        <b>This session can check against ${esc(parts.join(', '))}.</b>
+        Its strongest assertion may claim <b>${esc(d.strongest_basis)}</b>${
+          d.strongest_basis === 'derived'
+            ? ' — a case this platform generated, which nobody has checked against what you '
+              + 'actually wanted'
+            : ''}.`
+        : `<b>${esc(d.refusal || '')}</b>`}
+      ${(d.skipped_sources || []).length ? `
+        <div style="margin-top:6px">
+          <b>Dropped:</b>
+          ${d.skipped_sources.map(x => `<div>${esc(x)}</div>`).join('')}
+        </div>` : ''}
+      ${d.brief_markdown ? `
+        <details style="margin-top:8px">
+          <summary style="cursor:pointer">Read exactly what will be sent
+            (${d.brief_chars.toLocaleString()} characters)</summary>
+          <pre class="api-usage-code" style="margin-top:6px;max-height:280px;overflow:auto">${
+            esc(d.brief_markdown)}${d.brief_truncated ? '\n…' : ''}</pre>
+        </details>` : ''}
+    </div>`;
+}
+
+// ── Watching a session happen ──────────────────────────────────────────────
+//
+// The exploration runs in a terminal on the customer's own machine, so for the whole of a
+// forty-step session this screen used to show nothing at all. Everything needed was already
+// recorded and nothing read it: a real session in the live database burned all twenty-five
+// of its steps moving between two pages, and nobody could see it or stop it.
+//
+// The poller is `pollReviewJob`'s shape rather than modernization's: one timer per panel,
+// a consecutive-miss counter, and it stops on navigation. Modernization's single global
+// timer is the thing its own comment at the review poller warns against.
+
+const APP_POLL_MS = 2500;
+// A finished exploration is followed by one long model call before a suite exists, so the
+// poll must not stop the moment the status leaves `exploring` -- that is how the link to
+// the finished suite never appears. It keeps watching for a short grace window and then
+// says so rather than spinning for ever, which is what a `--no-generate` session would do.
+const APP_GRACE_TICKS = 8;
+
+let _appPollTimer = null;
+let _appWatching = null;      // session id
+let _appSteps = [];           // accumulated, append-only
+let _appMisses = 0;
+let _appGrace = 0;
+
+function stopAppSessionPoll() {
+  if (_appPollTimer) { clearInterval(_appPollTimer); _appPollTimer = null; }
+  _appWatching = null;
+}
+
+/** Open a session and follow it until it stops changing. */
+async function watchAppSession(sessionId) {
+  stopAppSessionPoll();
+  _appWatching = sessionId;
+  _appSteps = [];
+  _appMisses = 0;
+  _appGrace = 0;
+  const box = document.getElementById('app-testing-session');
+  if (box) { box.classList.remove('hidden'); box.innerHTML = '<div class="field-hint">Opening…</div>'; }
+  const live = await _appSessionTick();
+  if (live) {
+    _appPollTimer = setInterval(_appSessionTick, APP_POLL_MS);
+  }
+}
+
+async function _appSessionTick() {
+  if (!_appWatching) return false;
+  let d;
+  try {
+    // `since_step` is why this is cheap enough to run every 2.5 seconds: steps are
+    // append-only, so a tick carries the session row and at most one new step rather than
+    // re-sending the whole digest.
+    d = await apiFetch(`/api/v1/app-testing/sessions/${encodeURIComponent(_appWatching)}`
+                       + `?since_step=${_appSteps.length}`, { _silent: true });
+    _appMisses = 0;
+  } catch (e) {
+    // Losing contact with the platform says nothing about a browser running on somebody
+    // else's machine, so the message must not claim the session died.
+    if (++_appMisses >= 5) {
+      stopAppSessionPoll();
+      const box = document.getElementById('app-testing-session');
+      if (box) box.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--amber)">
+        Lost contact with the platform — ${esc(e.message)}. The session is driven from
+        another machine and may still be running; reopen this page to pick it up again.</div>`;
+    }
+    return true;
+  }
+  const session = d.session || {};
+  (d.steps || []).forEach(st => _appSteps.push(st));
+  renderAppSession(session, _appSteps);
+
+  if (session.status === 'exploring') { _appGrace = 0; return true; }
+  if (session.status === 'generated' || session.review_id) {
+    stopAppSessionPoll();
+    loadAgentRuns('app-testing');
+    return false;
+  }
+  // Finished, but no suite yet — either one is being written, or nobody asked for one.
+  if (++_appGrace > APP_GRACE_TICKS) { stopAppSessionPoll(); return false; }
+  return true;
+}
+
+/** The header, the steps, and what is not happening. */
+function renderAppSession(session, steps) {
+  const box = document.getElementById('app-testing-session');
+  if (!box) return;
+  box.classList.remove('hidden');
+  const used = session.steps_used || 0;
+  const max = session.max_steps || 0;
+  const pct = max ? Math.min(100, Math.round((used / max) * 100)) : 0;
+  const last = steps.length ? steps[steps.length - 1] : null;
+  const live = session.status === 'exploring';
+
+  box.innerHTML = `
+    <div class="cost-note" style="border-left:3px solid var(--${live ? 'accent' : 'green'})">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <b>${live ? 'Exploring' : esc(session.status || '')}</b>
+        <span class="compliance-chip">${esc(session.target_label || '')}</span>
+        ${session.stop_requested && live
+          ? '<span class="compliance-chip">stop requested</span>' : ''}
+        <span style="color:var(--text-muted)">${used} of ${max} steps</span>
+      </div>
+      <div class="mod-bar" style="margin:8px 0"><span style="width:${pct}%"></span></div>
+      ${last ? `<div>${_appStepSentence(last, session, _appOutcomeOf(steps, steps.length - 1),
+                                            live)}</div>` : `
+        <div class="field-hint">No step has arrived yet. The browser is opened by the command
+          on this screen, on the machine where the application is reachable.</div>`}
+      <div class="field-hint" style="margin-top:6px">
+        ${(session.journeys || []).length} journey(s) ·
+        ${session.refused_total || 0} control(s) withheld ·
+        strongest claim <b>${esc(session.strongest_basis || 'observed')}</b>
+      </div>
+      ${live ? `
+        <div class="form-actions" style="margin-top:10px">
+          <button class="btn btn-secondary" onclick="requestAppStop('${jsArg(session.id)}')">
+            Stop after the current step</button>
+        </div>
+        <div class="field-hint">It lands at a step boundary — usually seconds, up to about
+          twenty if the browser is part way through loading a page. The browser window stays
+          open on the machine driving it; this platform cannot close it.</div>` : ''}
+      ${_appSalvage(session, steps)}
+    </div>
+    ${renderAppStalls(steps, session)}
+    ${renderAppRefusals(session)}
+    ${renderAppJourneys(session.journeys || [])}
+    ${steps.length ? `
+      <div class="section-title" style="margin-top:14px">Steps (${steps.length})</div>
+      <div class="run-history-scroll">${steps
+        .map((s, i) => _appStepRow(s, _appOutcomeOf(steps, i)))
+        .reverse().join('')}</div>`
+      : ''}`;
+}
+
+/** What an action *did*, which is recorded on the step after it.
+ *
+ *  An outcome can only be known by looking at the page again, so the driver sends it with
+ *  the following request -- `app_testing.py:192` names the field "what happened when the
+ *  previous action ran" -- and the route stores it on the step it is creating. The column
+ *  on step N therefore describes step N-1's action, and joining them on one row states
+ *  something false: the first real session against a public application rendered as
+ *  `click "Finish" on /checkout-step-two.html → navigated to /checkout-step-two.html`,
+ *  which reads as Finish having gone nowhere. Clicking *continue*, one step earlier, is
+ *  what went there, and what Finish did was never reported at all.
+ */
+function _appOutcomeOf(steps, i) {
+  const next = (steps || [])[i + 1];
+  return next ? (next.outcome || '') : '';
+}
+
+function _appStepSentence(step, session, outcome, live) {
+  const a = step.action || {};
+  const what = a.target_name ? ` “${esc(a.target_name)}”` : '';
+  // The newest step has no outcome yet, and saying nothing would read as "it did nothing".
+  const tail = outcome
+    ? ` → ${esc(outcome)}`
+    : (live ? ' — waiting for the next step to report what this did'
+            : ' — the session ended before anything reported what this did');
+  return `<b>Step ${step.step_index}</b> · ${esc(step.journey || 'unlabelled')} · `
+       + `${esc(a.action_kind || '')}${what} on <code>${esc(step.url_path || '/')}</code>`
+       + tail;
+}
+
+function _appStepRow(step, outcome) {
+  const a = step.action || {};
+  const texts = Array.isArray(step.page_texts) ? step.page_texts : [];
+  return `<div class="run-card" style="cursor:default">
+    <div><b>${step.step_index}</b> [${esc(step.journey || '')}]
+      ${esc(a.action_kind || '')} ${esc(a.target_name || '')}
+      on <code>${esc(step.url_path || '/')}</code></div>
+    <div class="field-hint">${esc(outcome || 'no result reported yet')}
+      · offered ${step.candidates_offered || 0}${
+        step.candidates_refused ? ` · ${step.candidates_refused} withheld` : ''}</div>
+    ${texts.length ? `<details><summary style="cursor:pointer;font-size:11px">what the page
+      showed (${texts.length})</summary><pre class="api-usage-code"
+      style="margin-top:4px">${esc(texts.join('\n'))}</pre></details>` : ''}
+  </div>`;
+}
+
+/** What is *not* happening — the half a progress bar cannot show.
+ *
+ *  A pure function of the steps so far, so it is testable with no DOM and no server. Every
+ *  line is an observation and never a verdict: a wizard that legitimately revisits a page
+ *  will trip the loop rule, and a page with a clock never repeats a signature at all, so
+ *  these have to read as "here is what I can see" rather than "this session is stuck". The
+ *  evidence behind them is one real session, which is thin.
+ */
+function renderAppStalls(steps, session) {
+  if (!steps || steps.length < 3) return '';
+  const notes = [];
+  const sigs = steps.map(s => s.page_signature || '');
+  const recent = steps.slice(-8);
+
+  // The platform's own no-progress rule, shown as a countdown rather than sprung as a
+  // surprise. It stops a session at five consecutive steps on one signature.
+  const newest = sigs[sigs.length - 1];
+  let run = 0;
+  for (let i = sigs.length - 1; i >= 0 && sigs[i] === newest; i--) run++;
+  if (run >= 2 && session.status === 'exploring') {
+    notes.push(`The last <b>${run}</b> step(s) reached no page this session had not already
+                seen. At 5 the platform stops the session.`);
+  }
+
+  // Two pages, alternating. The platform's rule cannot catch this — it requires the last
+  // five signatures to be identical, and A,B,A,B,A is not — so a session can run to its
+  // full budget going nowhere. Saying so is the point.
+  if (recent.length >= 6) {
+    const distinct = new Set(recent.map(s => s.page_signature || ''));
+    if (distinct.size <= 2 && run < 5) {
+      const paths = [...new Set(recent.map(s => s.url_path || '/'))].slice(0, 2);
+      notes.push(`It has been moving between <code>${paths.map(esc).join('</code> and <code>')}</code>
+                  for ${recent.length} steps and reached nothing else.
+                  <b>The platform's own no-progress rule does not catch a two-page loop</b>,
+                  so this session will run to its full budget unless it is stopped.`);
+    }
+  }
+
+  const gotos = recent.filter(s => (s.action || {}).action_kind === 'goto').length;
+  if (recent.length >= 5 && gotos / recent.length >= 0.6) {
+    notes.push(`${gotos} of the last ${recent.length} steps were guessed addresses rather
+                than clicks on something the page offered.`);
+  }
+
+  const starved = recent.filter(s => (s.candidates_offered || 0) <= 2).length;
+  if (starved >= 3) {
+    notes.push(`These pages are offering only a couple of things to click. Applications
+                commonly build menus from elements a collector cannot see.`);
+  }
+
+  const offered = steps.reduce((n, s) => n + (s.candidates_offered || 0), 0);
+  const withheld = steps.reduce((n, s) => n + (s.candidates_refused || 0), 0);
+  if (offered + withheld > 0 && withheld / (offered + withheld) > 0.4) {
+    notes.push(`Around half of what these pages offer is being withheld by the safety
+                policy, so the suite will not cover those journeys. If those controls are
+                safe in this environment, the list is too tight for your application.`);
+  }
+
+  // Counted off the column directly: shifting moves each result to a different row but
+  // not out of the list, so the total is the same. The one exception is inherent -- the
+  // newest action's result has not been reported yet, by anybody.
+  const failed = steps.filter(s => String(s.outcome || '').startsWith('failed')).length;
+  if (failed) notes.push(`${failed} step(s) failed outright.`);
+
+  if (!notes.length) {
+    // An empty panel reads as a broken check rather than as good news.
+    return `<div class="cost-note" style="border-left:3px solid var(--green);margin-top:10px">
+      Nothing looks stuck: it is still reaching pages it had not already seen.</div>`;
+  }
+  return `<div class="cost-note" style="border-left:3px solid var(--amber);margin-top:10px">
+    <b>Worth a look</b>
+    ${notes.map(n => `<div style="margin-top:4px">${n}</div>`).join('')}</div>`;
+}
+
+/** What the safety policy withheld, and what that costs in both directions. */
+function renderAppRefusals(session) {
+  const rows = session.refusals || [];
+  if (!rows.length) return '';
+  return `
+    <div class="section-title" style="margin-top:14px">Withheld by the safety policy
+      (${session.refused_total || rows.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">These were removed
+      before the model ever saw them, so it could not have clicked them. This is a filter on
+      button labels, not a guarantee — what is actually protecting you is your statement that
+      this is a test environment.</p>
+    <table class="data-table">
+      <thead><tr><th>Control</th><th>Why</th><th>Met</th></tr></thead>
+      <tbody>${rows.map(r => `<tr>
+        <td>${esc(r.name)}</td><td>${esc(r.group || '')}</td><td>${r.count}</td>
+      </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+/** What can be done about a session that has stopped.
+ *
+ *  A session whose browser was closed half way through has steps that were paid for and no
+ *  suite. Writing one from those steps is the only thing that recovers that spend, and
+ *  until now nothing in the browser could call the route that does it. */
+function _appSalvage(session, steps) {
+  if (session.status === 'exploring') return '';
+  const took = (steps || []).length || session.steps_used || 0;
+  if (session.review_id) {
+    return `<div class="field-hint" style="margin-top:8px">A suite was written from this
+      session. <a href="#/app-testing/run/${esc(session.review_id)}">Open it</a>.</div>`;
+  }
+  if (!took) {
+    return `<div class="field-hint" style="margin-top:8px">This session took no steps, so
+      there is nothing to write a suite from — and <b>nothing was billed</b>: opening a
+      session is free and only steps call the model.
+      <button class="btn btn-link" style="font-size:11px;padding:0"
+              onclick="restartAppSession('${jsArg(session.id)}')">Start again with these
+        settings</button></div>`;
+  }
+  const pages = new Set((steps || []).map(s => s.page_signature || '')).size;
+  return `
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-top:8px">
+      <b>This session stopped without writing a suite</b>, and the ${took} step(s) it took
+      were charged for. A suite can still be written from them.
+      ${pages <= 2 ? `<div style="margin-top:4px">Be warned: those steps covered only
+        ${pages} distinct page(s), so a suite from them will cover very little.</div>` : ''}
+      <div class="form-actions" style="margin-top:8px">
+        <button class="btn btn-secondary"
+                onclick="generateFromAppSession('${jsArg(session.id)}', ${took})">
+          Write the suite from these ${took} step(s)</button>
+        <button class="btn btn-link"
+                onclick="restartAppSession('${jsArg(session.id)}')">Start again with these
+          settings</button>
+      </div>
+      <div class="field-hint">Writing the suite is one large model call and is charged like
+        any other. What cannot be done from here: the browser that was driving this is on
+        another machine, so it cannot be reopened, resumed or pointed somewhere else.</div>
+    </div>`;
+}
+
+async function generateFromAppSession(sessionId, steps) {
+  if (!confirm(`Write a Playwright suite from the ${steps} step(s) this session took?\n\n`
+             + 'This is one large model call and is charged like any other run.')) return;
+  showLoading('Writing the suite…');
+  try {
+    const r = await apiFetch(
+      `/api/v1/app-testing/sessions/${encodeURIComponent(sessionId)}/generate`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    renderAppTesting('app-testing-result', r);
+    loadAgentRuns('app-testing');
+    loadAppTestingSessions();
+    _appSessionTick();
+  } catch (e) {
+    alert(`Could not write a suite: ${e.message}`);
+  } finally {
+    hideLoading();
+  }
+}
+
+/** Put this session's settings back on the form, so the command can be rebuilt.
+ *
+ *  Client-only: there is nothing to re-open, because the session that matters is the
+ *  browser on somebody else's machine. What this recovers is the typing. */
+async function restartAppSession(sessionId) {
+  let d;
+  try {
+    d = await apiFetch(`/api/v1/app-testing/sessions/${encodeURIComponent(sessionId)}`,
+                       { _silent: true });
+  } catch (e) {
+    alert(`Could not read that session: ${e.message}`);
+    return;
+  }
+  const s = d.session || {};
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.value = value;
+  };
+  set('app-testing-goal', s.goal || '');
+  set('app-testing-steps', s.max_steps || 40);
+  set('app-testing-requirement', s.requirement || '');
+  set('app-testing-retention', String(s.page_text_retention_days ?? 7));
+  const reads = document.getElementById('app-testing-page-text');
+  if (reads) reads.checked = s.collect_page_text !== false;
+  _appTestingChosen = (s.source_review_ids || []).slice();
+  renderAppTestingChosen();
+  renderAppTestingCommand();
+  const form = document.querySelector('#page-app-testing .form-card');
+  if (form && form.scrollIntoView) form.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+async function requestAppStop(sessionId) {
+  if (!confirm('Ask this session to stop after its current step?')) return;
+  try {
+    const d = await apiFetch(
+      `/api/v1/app-testing/sessions/${encodeURIComponent(sessionId)}/request-stop`,
+      { method: 'POST' });
+    alert(d.note || 'Stop requested.');
+    _appSessionTick();
+  } catch (e) {
+    alert(`Could not request a stop: ${e.message}`);
+  }
+}
+
+/** Sessions for this project, including the ones that never produced a suite.
+ *
+ *  The "Previous sessions" list beside this one is built from `reviews` rows, so it can only
+ *  ever show sessions that finished *and* generated. A session whose browser was closed
+ *  half way through is invisible there, although its steps were paid for. */
+async function loadAppTestingSessions() {
+  const box = document.getElementById('app-testing-sessions');
+  if (!box) return;
+  if (!getActiveProjectId()) {
+    box.innerHTML = '<div class="field-hint">Pick a project in the sidebar to see its '
+                  + 'sessions.</div>';
+    return;
+  }
+  let d;
+  try {
+    d = await apiFetch('/api/v1/app-testing/sessions?limit=10&offset=0', { _silent: true });
+  } catch (e) {
+    box.innerHTML = `<div class="field-hint">Could not load sessions: ${esc(e.message)}</div>`;
+    return;
+  }
+  const rows = d.sessions || [];
+  if (!rows.length) {
+    box.innerHTML = '<div class="field-hint">No exploration sessions in this project yet.</div>';
+    return;
+  }
+  box.innerHTML = rows.map(r => {
+    const live = r.status === 'exploring';
+    const idle = r.idle_seconds == null ? '' : _appAgo(r.idle_seconds);
+    return `<div class="run-card" onclick="watchAppSession('${jsArg(r.id)}')">
+      <div><b>${live ? '● exploring' : esc(r.status)}</b>
+        ${esc(r.target_label || '')} — ${r.recorded_steps}/${r.max_steps} steps ·
+        ${r.distinct_pages} page(s) · ${r.journey_count} journey(s)
+        ${r.refused_total ? ` · ${r.refused_total} withheld` : ''}</div>
+      <div class="field-hint">${esc(r.goal || 'no goal given')} · ${esc(idle)}
+        ${r.looks_abandoned ? ' · <b>nothing has happened for hours</b> — the browser that '
+          + 'was driving this has probably gone. Nothing further is being billed.' : ''}
+        ${r.review_id ? ' · a suite was written' : (!live ? ' · no suite was written' : '')}</div>
+    </div>`;
+  }).join('');
+}
+
+function _appAgo(seconds) {
+  if (seconds < 90) return `${seconds}s ago`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} min ago`;
+  if (seconds < 172800) return `${Math.round(seconds / 3600)} hours ago`;
+  return `${Math.round(seconds / 86400)} days ago`;
+}
+
+function appTestingCommand() {
+  const url = (document.getElementById('app-testing-url') || {}).value || '<url>';
+  const steps = (document.getElementById('app-testing-steps') || {}).value || '40';
+  const goal = ((document.getElementById('app-testing-goal') || {}).value || '').trim();
+  const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
+  const readsText = (document.getElementById('app-testing-page-text') || {}).checked;
+  const keepDays = (document.getElementById('app-testing-retention') || {}).value || '7';
+  const projectId = getActiveProjectId();
+  const parts = ['python scripts/explore_app.py', '--url ' + url, '--max-steps ' + steps];
+  // The project has to travel with the command, not only with the browser session. Without
+  // it the driver sends `project_id: null`, the session is filed under nothing, every
+  // `--cover-review` id comes back as "no such run" because it belongs to a project the
+  // session cannot see, and the project's Knowledge Base documents are never read. All
+  // three failures are silent: the session runs, it just runs without anything it was
+  // given.
+  if (projectId) parts.push('--project ' + projectId);
+  if (goal) parts.push('--goal "' + goal.replace(/"/g, '\\"').slice(0, 120) + '"');
+  // The requirement travels as a file, and `renderAppTestingCommand` shows the file to save
+  // beside the command. Not inlined as `--requirement "..."`: the escaping used for --goal
+  // above is `\"`, which is not an escape in PowerShell, and this line is pasted into
+  // whatever shell the person happens to have open.
+  if (req) parts.push('--requirement-file requirement.txt');
+  // Both choices are written into the command rather than left to the driver's defaults, so
+  // what the person ticked on this screen is what the machine running the browser actually
+  // does. A privacy choice that lives only in the browser is not a choice.
+  if (!readsText) parts.push('--no-page-text');
+  if (String(keepDays) !== '7') parts.push('--keep-page-text-days ' + keepDays);
+  appTestingSources().forEach(id => parts.push('--cover-review ' + id));
+  parts.push('--shots out/');
+  // Last, because it is the one flag a reader should still see after the line wraps. The
+  // tick box on this screen *is* the declaration -- the driver no longer assumes it -- so
+  // an unticked box produces a command the platform will refuse, which is the point.
+  if ((document.getElementById('app-testing-attest') || {}).checked) parts.push('--attest');
+  return parts.join(' ');
+}
+
+/** The requirement, as the file the command reads it from.
+ *
+ *  The command says `--requirement-file requirement.txt` and for a long time nothing ever
+ *  produced that file, so the typed requirement reached nothing and the run died on a
+ *  missing path. This is the other half of that flag. */
+function downloadAppTestingRequirement() {
+  const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
+  if (!req) { alert('Type the requirement first.'); return; }
+  _downloadTextAsFile('requirement.txt', req);
+}
+
+function renderAppTestingCommand() {
+  const box = document.getElementById('app-testing-command');
+  if (!box) return;
+  const attested = (document.getElementById('app-testing-attest') || {}).checked;
+  const readsText = (document.getElementById('app-testing-page-text') || {}).checked;
+  const req = ((document.getElementById('app-testing-requirement') || {}).value || '').trim();
+  const projectId = getActiveProjectId();
+  box.innerHTML = attested
+    ? `<div class="field-hint">Run this where the application is reachable. Your credentials and
+         the URL stay on that machine — the platform is sent page descriptions and answers with
+         one action at a time.</div>
+       ${projectId ? '' : `<div class="cost-note" style="border-left:3px solid var(--amber)">
+         <b>No project is selected</b>, so this session would be filed under none — any earlier
+         run you tick below would come back as "no such run", and your project's uploaded
+         documents would not be read. Pick a project in the sidebar first.</div>`}
+       ${req ? `<div class="cost-note" style="margin-bottom:8px">
+         <b>Step 1 — save this as <code>requirement.txt</code></b>, in the folder you run the
+         command from. The command reads the requirement from that file; it is not sent from
+         this screen.
+         <pre class="api-usage-code" style="margin:6px 0">${esc(req)}</pre>
+         <button type="button" class="btn btn-secondary" style="font-size:11px;padding:3px 8px"
+                 onclick="downloadAppTestingRequirement()">⬇ Download requirement.txt</button>
+       </div>
+       <div class="field-hint"><b>Step 2 — run this</b></div>` : ''}
+       <pre class="api-usage-code">${esc(appTestingCommand())}</pre>
+       ${readsText ? '' : `<div class="cost-note" style="border-left:3px solid var(--amber)">
+         This session will not read what pages display, so its tests will be able to check that
+         a control is present and will not be able to check that a value is correct — a test
+         like that passes even when the feature behind the button is broken.</div>`}`
+    : `<div class="cost-note" style="border-left:3px solid var(--amber)">
+         Confirm the target is a test environment first. This explorer clicks, types and submits
+         in a live system; controls that look destructive are withheld, but that is a filter on
+         button labels, not a guarantee.</div>`;
+}
+
+// One row per journey, which is the unit a person judges this product by: were these real
+// user flows, or noise? The count of distinct pages is there because a "journey" that never
+// left one page is usually the latter.
+function renderAppJourneys(journeys) {
+  if (!journeys || !journeys.length) return '';
+  return `
+    <div class="section-title" style="margin-top:20px">Journeys walked (${journeys.length})</div>
+    <table class="data-table">
+      <thead><tr><th>Journey</th><th>Steps</th><th>Pages</th><th>Actions</th></tr></thead>
+      <tbody>${journeys.map(j => `
+        <tr>
+          <td>${esc(j.name || '')}</td>
+          <td>${j.step_count || 0}</td>
+          <td>${j.distinct_pages || 0}${(j.distinct_pages || 0) <= 1 ? ' <span class="field-hint">(never left one page)</span>' : ''}</td>
+          <td style="font-family:monospace;font-size:11px">${(j.actions || []).map(esc).join(' → ')}</td>
+        </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+// The free quote. There is deliberately no "Run" button beside it: this screen cannot drive
+// the browser, because the browser has to run where the application is reachable. Pretending
+// otherwise would produce a control that works for public URLs and silently fails for every
+// internal one, which is most of them.
+async function previewAppTestingCost() {
+  const box = document.getElementById('app-testing-cost-preview');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="field-hint">Pricing a session&hellip;</div>';
+  const body = {
+    max_steps: parseInt((document.getElementById('app-testing-steps') || {}).value || '40', 10),
+    goal: ((document.getElementById('app-testing-goal') || {}).value || ''),
+    requirement: ((document.getElementById('app-testing-requirement') || {}).value || ''),
+  };
+  try {
+    const res = await apiFetch('/api/v1/app-testing/preflight', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const q = (res && res.estimate) || {};
+    box.innerHTML = `
+      <div class="cost-note">
+        <div><b>About $${(q.expected_usd || 0).toFixed(4)}</b> expected, up to
+          <b>$${(q.ceiling_usd || 0).toFixed(4)}</b> if every call runs to its limit.</div>
+        <div class="field-hint" style="margin-top:6px">${esc(res.explanation || '')}</div>
+        <div class="field-hint" style="margin-top:6px">${q.calls || 0} call(s):
+          ${body.max_steps} exploration step(s) plus one to write the suite. A step that gets
+          refused is not charged against the budget. Replaying the finished suite calls no
+          model at all.</div>
+      </div>`;
+    // What this session has to check against is answered by the server, in the panel under
+    // the source picker, and not guessed at here. The guess this replaces read the
+    // requirement box and counted ticked runs, which meant it fired at a project holding a
+    // full specification and stayed silent when every ticked reference was stale.
+    loadAppTestingBasis();
+  } catch (e) {
+    box.innerHTML = `<div class="cost-note" style="border-left:3px solid var(--amber)">
+      Could not price a session: ${esc((e && e.message) || String(e))}</div>`;
+  }
+  renderAppTestingCommand();
+}
+
+/* Where this suite's locators came from, and why a reader needs to be told.
+ *
+ * The session only ever carries three ways to address an element -- a role, visible text,
+ * or a `[name='...']` attribute -- so a class, an id or a test id in the finished suite was
+ * remembered from some other application rather than seen in this one. Roughly one in six
+ * was wrong on the run that found this, and a wrong one matches nothing, which means it goes
+ * red against a *correct* build. That is the reason this panel exists and is worded the way
+ * it is: without it the reader's first conclusion on a red run is "our application broke",
+ * and the expensive part is not the failing test, it is the hour spent looking for a defect
+ * that was never there.
+ *
+ * Reads in both directions, like the withheld panel. A suite with none of these says so,
+ * because "we checked and there are none" and "nobody checked" look identical otherwise. */
+/* How much each test can see. Reads beside the locator panel and answers the other half
+ * of the same question: that one asks whether a test will cry wolf, this one asks whether
+ * it would notice anything at all.
+ *
+ * Worth a panel rather than a number because of what it does to the coverage table above
+ * it. A test that only asserts a control is visible still gets counted, still gets filed
+ * under a requirement, and still reads as "covered" — so a suite can report 15 of 15 while
+ * several of those fifteen would pass against an application with the feature ripped out.
+ * Naming them is the only way a reader can tell the difference. */
+function _appAssertionPanel(r) {
+  const a = (r && r.assertion_audit) || null;
+  if (!a || !a.tests_total) return '';
+  const weak = (a.hollow_count || 0) + (a.silent_count || 0) + (a.skipped_count || 0);
+  if (!weak) {
+    return `<p class="field-hint" style="margin-top:14px">Every one of the ${a.tests_total}
+      test(s) here makes at least one assertion that could be wrong — a value, a count, a
+      status or an absence. None of them is a presence check standing in for a test.</p>`;
+  }
+  const rows = [].concat(
+    (a.hollow || []).map(t => Object.assign({ why: 'only checks presence or the address' }, t)),
+    (a.silent || []).map(t => Object.assign({ why: 'makes no assertion at all' }, t)),
+    (a.skipped || []).map(t => Object.assign({ why: 'skipped' }, t)));
+  return `
+    <div class="section-title" style="margin-top:20px">Tests that would not notice a break (${weak} of ${a.tests_total})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${esc(r.assertion_strength_note || '')}</p>
+    ${rows.length ? `<table class="data-table">
+      <thead><tr><th>Test</th><th>File</th><th>Line</th><th>Why</th></tr></thead>
+      <tbody>${rows.map(t => `<tr>
+        <td style="font-family:monospace;font-size:11px">${esc(t.name || '')}</td>
+        <td style="font-family:monospace;font-size:11px">${esc(t.path || '')}</td>
+        <td>${esc(String(t.line || ''))}</td>
+        <td>${esc(t.why)}</td>
+      </tr>`).join('')}</tbody>
+    </table>` : ''}`;
+}
+
+function _appJourneyPanel(r) {
+  // C-115. A test can address real elements, be able to fail, and still describe a page
+  // nobody opened — which the other two panels cannot show, because both read the suite
+  // alone. Silent when the session recorded no paths: "nothing was observed" must not read
+  // as "everything was invented".
+  const audit = (r && r.journey_audit) || {};
+  const n = (r && r.untested_journey_count) || 0;
+  if (!audit.checked) return '';
+  if (!n) {
+    return `<p class="field-hint" style="margin-top:14px">Every test in this suite drives
+      only to pages the session actually opened.</p>`;
+  }
+  const rows = audit.unvisited || [];
+  return `
+    <div class="section-title" style="margin-top:20px">Tests for pages this session never
+      opened (${n})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${esc(r.untested_journey_note || '')}</p>
+    ${rows.length ? `<table class="data-table">
+      <thead><tr><th>File</th><th>Pages it drives to</th><th>Tests</th></tr></thead>
+      <tbody>${rows.map(j => `<tr>
+        <td style="font-family:monospace;font-size:11px">${esc(j.path || '')}</td>
+        <td style="font-family:monospace;font-size:11px">${esc((j.destinations || []).join(', '))}</td>
+        <td style="font-size:11px">${esc((j.tests || []).join(', '))}</td>
+      </tr>`).join('')}</tbody></table>` : ''}`;
+}
+
+function _appLocatorPanel(r) {
+  const invented = (r && r.locators_invented) || 0;
+  const grounded = (r && r.locators_grounded) || 0;
+  if (!invented) {
+    if (!grounded) return '';
+    return `<p class="field-hint" style="margin-top:14px">All ${grounded} locator(s) in this
+      suite were written from what the session observed — roles, accessible names and page
+      text. None was recalled from another application.</p>`;
+  }
+  const rows = ((r.locator_audit || {}).invented) || [];
+  return `
+    <div class="section-title" style="margin-top:20px">Locators that were not observed
+      (${invented})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">${esc(r.locator_note || '')}</p>
+    ${rows.length ? `<table class="data-table">
+      <thead><tr><th>File</th><th>Line</th><th>Locator</th><th>Kind</th></tr></thead>
+      <tbody>${rows.map(l => `<tr>
+        <td style="font-family:monospace;font-size:11px">${esc(l.path || '')}</td>
+        <td>${esc(String(l.line || ''))}</td>
+        <td style="font-family:monospace;font-size:11px">${esc(l.selector || '')}</td>
+        <td>${esc(l.kind || '')}</td>
+      </tr>`).join('')}</tbody>
+    </table>` : ''}
+    ${r.locator_retry_rejected ? `<p class="field-hint">The suite was generated a second time
+      with these lines named, and the second answer was not an improvement — it was
+      discarded and this one kept.</p>` : (r.locators_retried ? `<p class="field-hint">These
+      are what remained after the suite was generated a second time with the offending lines
+      named.</p>` : '')}`;
+}
+
+function renderAppTesting(targetId, r) {
+  _lastAppTesting = r;
+  _lastTestAutomation = r;
+  _lastSuites[targetId] = r;
+  // Fired after the innerHTML lands, since both write into divs this markup creates. The
+  // two loaders are shared with the code-based generator because the suite has the same
+  // shape -- but the *ids* are namespaced by `targetId`, because a hidden screen is still
+  // in the document and the old fixed ids resolved to whichever screen came first in the
+  // markup. "Only one agent screen is ever visible at a time" was true and was the wrong
+  // test: getElementById does not care what is visible.
+  if (r && r.review_id) setTimeout(() => {
+    loadTestResults(r.review_id, targetId);
+    loadTestRunner(r.review_id, targetId);
+  }, 0);
+  const wrap = document.getElementById(targetId);
+  wrap.classList.remove('hidden');
+  const files = r.test_files || [];
+  const basis = Array.isArray(r.assertion_basis) ? r.assertion_basis : [];
+  const cov = Array.isArray(r.requirement_coverage) ? r.requirement_coverage : [];
+  const assumptions = r.assumptions || [];
+  const journeys = (r.session_detail || {}).journeys || [];
+  // Counted from the rows when there are rows, and only falling back to the server's own
+  // counts when there are none. The server derives its counts from this same array, so this
+  // is not a second opinion -- it removes the possibility of the banner and the table below
+  // it disagreeing, which is exactly what happened while the table still spoke the old
+  // two-word vocabulary and reported every stated assertion as observed.
+  const stated = basis.length ? basis.filter(b => _assertionBasis(b) === 'stated').length
+                              : (r.stated_count || r.specified_count || 0);
+  const derived = basis.length ? basis.filter(b => _assertionBasis(b) === 'derived').length
+                               : (r.derived_count || 0);
+  const observed = basis.length ? basis.length - stated - derived
+                                : (r.observed_count || 0);
+
+  wrap.innerHTML = `
+    <div class="result-header">
+      <h2>Generated Application Suite</h2>
+      <span style="color:var(--text-muted);font-size:13px">${r.total_files || files.length} file(s) ·
+        ${r.total_tests || 0} test(s)${(r.session || {}).steps ? ' · ' + r.session.steps + ' step(s) explored' : ''}</span>
+    </div>
+    ${renderReviewTransparency(r)}
+
+    <!-- The single most important thing on this screen. A suite written from an application
+         with no specification asserts what the application did on the day it was explored,
+         which catches a regression and cannot catch a bug that was already there. Saying
+         that once, at the top, is the difference between a useful regression suite and a
+         false claim of verification. -->
+    ${(stated || derived) ? `
+    <div class="cost-note" style="border-left:3px solid var(--${stated ? 'green' : 'amber'});margin-bottom:12px">
+      <b>${stated} assertion(s) check something a person wrote${derived ?
+        `, ${derived} check a case this platform generated` : ''}, ${observed} record what the
+      app does today.</b>
+      ${derived && !stated ? `The middle kind is real material, but nobody has checked it
+        against what you actually wanted — this platform wrote those cases.` : ''}
+      The last kind catches a change to the behaviour, not a mistake in it.
+      ${r.assertions_downgraded ? `<div style="margin-top:6px">${r.assertions_downgraded}
+        assertion(s) claimed more than this session could support and were relabelled.</div>` : ''}
+    </div>` : `
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>Nothing was supplied to check against, so all ${observed} assertion(s) describe what the
+      application did today.</b> This suite will catch a regression. It cannot catch behaviour that
+      was already wrong, because nothing told it what "right" is.
+      ${r.assertions_downgraded ? `<div style="margin-top:6px">${r.assertions_downgraded}
+        assertion(s) claimed to check a requirement and were relabelled — there was none to check.</div>` : ''}
+    </div>`}
+
+    ${r.read_page_text === false ? `
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>This session did not read what the pages displayed.</b> Every test here checks that a
+      control is present rather than that a value is correct — and a test like that passes even
+      when the feature behind the control is broken. Re-run with page text enabled to get
+      assertions about values.
+    </div>` : ''}
+
+    <div class="cost-note" style="border-left:3px solid var(--amber);margin-bottom:12px">
+      <b>Nothing here has been run.</b> These files were generated from what the explorer saw,
+      not executed. A generated test that passes is not evidence until someone runs it.
+    </div>
+    <div id="${targetId}-results"></div>
+    <div id="${targetId}-runner"></div>
+
+    <div class="summary-box">${esc(r.summary || '')}</div>
+
+    ${renderAppJourneys(journeys)}
+
+    ${basis.length ? `
+    <div class="section-title" style="margin-top:20px">What each test actually checks (${basis.length})</div>
+    <p style="font-size:11px;color:var(--text-muted);margin-top:-6px">A row that can only say
+      "the page loaded" is telling you that test is worth nothing — which is worth knowing before
+      it goes into a pipeline.</p>
+    <table class="data-table">
+      <thead><tr><th>Test</th><th>Basis</th><th>Checks</th></tr></thead>
+      <tbody>${basis.map(b => `
+        <tr>
+          <td style="font-family:monospace;font-size:11px">${esc(b.test_name || '')}</td>
+          <td>${_ASSERTION_LABELS[_assertionBasis(b)]}
+              ${b.requirement_ref ? `<div class="field-hint">${esc(b.requirement_ref)}</div>` : ''}
+              ${b.downgraded_because ? `<div class="field-hint">relabelled: ${esc(b.downgraded_because)}</div>` : ''}</td>
+          <td>${esc(b.what_it_checks || '')}</td>
+        </tr>`).join('')}</tbody>
+    </table>` : ''}
+    ${r.assertion_basis_missing ? `
+    <p class="field-hint">${r.assertion_basis_missing} generated test(s) declared no basis at all.
+      Treat those as observed.</p>` : ''}
+
+    ${_appLocatorPanel(r)}
+    ${_appJourneyPanel(r)}
+    ${_appAssertionPanel(r)}
+
+    ${assumptions.length ? `
+    <div class="section-title" style="margin-top:20px">⚠ What it had to assume (${assumptions.length})</div>
+    ${assumptions.map(a => `
+      <div class="antipattern-card">
+        <div class="antipattern-name">${esc(a.assumption || '')}</div>
+        <div class="antipattern-impact">If wrong: ${esc(a.risk_if_wrong || '')}</div>
+      </div>`).join('')}` : ''}
+
+    ${(r.prerequisites_present || []).length ? `
+    <div class="section-title" style="margin-top:20px">Before these can run</div>
+    <div class="compliance-chips">${r.prerequisites_present.map(p => `<span class="compliance-chip">${esc(p)}</span>`).join('')}</div>` : ''}
+
+    ${cov.length ? `
+    <div class="section-title" style="margin-top:20px">Requirement coverage</div>
+    <table class="data-table">
+      <thead><tr><th>Requirement</th><th>Tests</th><th>Status</th></tr></thead>
+      <tbody>${cov.map(c => `
+        <tr>
+          <td>${esc(c.requirement_ref || '')}</td>
+          <td style="font-family:monospace;font-size:11px">${(c.test_names || []).map(esc).join('<br>') || '—'}</td>
+          <td>${c.covered ? '<span style="color:var(--green)">✓ Covered</span>' : '<span style="color:var(--amber)">✗ Not covered</span>'}</td>
+        </tr>`).join('')}</tbody>
+    </table>` : ''}
+
+    <div class="section-title" style="margin-top:20px">Test files (${files.length})</div>
+    ${files.map((f, i) => `
+      <details style="margin-bottom:10px" ${files.length === 1 ? 'open' : ''}>
+        <summary style="cursor:pointer;font-family:monospace;font-size:13px;color:var(--accent)">
+          ${esc(f.path || '')}
+          <span style="color:var(--text-muted);font-family:inherit;font-size:11px">
+            ${esc(f.framework || '')} · ${(f.test_names || []).length} test(s)</span>
+        </summary>
+        <div style="margin-top:8px">
+          <pre class="api-usage-code">${esc(f.content || '')}</pre>
+          <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px;margin-top:6px"
+                  onclick="downloadGeneratedTest(${i}, '${jsArg(targetId)}')">⬇ Download this file</button>
+        </div>
+      </details>`).join('')}
 
     <div style="margin-top:16px;font-size:11px;color:var(--text-muted)">Review ID: ${esc(r.review_id || '')}</div>
   `;
@@ -11380,6 +12507,12 @@ const AGENT_SCREENS = {
                   { product: 'test-automation',     reviewType: 'test_automation',
                     result: 'test-automation-result', render: renderTestAutomation,
                     noun: 'generations',            gated: false },
+  // `inventory: false` by omission, like test-automation: this product stores no source
+  // because it never reads any -- the application under test is the input, and the session
+  // record holds page paths and control names, not code.
+  'app-testing':  { product: 'app-testing',         reviewType: 'app_testing',
+                    result: 'app-testing-result',   render: renderAppTesting,
+                    noun: 'sessions',               gated: false },
   vapt:           { product: 'vapt',                reviewType: 'vapt',
                     result: 'vapt-result',          render: renderVAPTResult,
                     noun: 'assessments',            gated: true, inventory: true },

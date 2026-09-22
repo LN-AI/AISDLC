@@ -2155,6 +2155,13 @@ def main():
                 "swarm": "/api/v1/swarm forwards _budget_stats",
                 "report-generate": "/api/v1/agents/report-generate forwards _budget_stats",
                 "modernization": "prices per run; shows spent-of-cap in its own header",
+                # Metered per *step* rather than per session, which is the same exception
+                # modernization makes and for the same reason: a session is not one request
+                # but dozens, spread over minutes, that an operator may abandon halfway.
+                # `guarded_call` wraps each step and each generation, and both routes
+                # forward the resulting `_budget_stats` on the body.
+                "app-testing": "/api/v1/app-testing/* forwards _budget_stats per step and "
+                               "on the generation",
             }
             _unmetered = sorted(
                 p.id for p in _reg.list_products()

@@ -1,0 +1,887 @@
+{
+  "prompt_version": "2026-09-17.3",
+  "repeat": 3,
+  "max_steps": 25,
+  "spend": {
+    "model_cost_usd": 1.209084,
+    "cost_usd": 1.209084,
+    "calls": 102
+  },
+  "note": "`model_cost_usd` is what the run cost us; `cost_usd` is what a customer would be billed. They are equal while app-testing has no pricing row (see D-404 for why the distinction matters to a baseline comparison).",
+  "runs": {
+    "basket-total": [
+      {
+        "ran": true,
+        "red_on_broken": false,
+        "green_on_fixed": true,
+        "detects_break": false,
+        "discriminates": false,
+        "broken": {
+          "total": 2,
+          "passed": 2,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 1400,
+          "outcome": "passed"
+        },
+        "fixed": {
+          "total": 2,
+          "passed": 2,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 1305,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 2,
+        "journeys": 1,
+        "steps": 19,
+        "withheld": 19,
+        "refused": 0,
+        "assertions": 2,
+        "meaningful_assertions": 2,
+        "specified_count": 2,
+        "observed_count": 0,
+        "downgraded": 0,
+        "locators_grounded": 28,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [],
+        "separating_tests": 0,
+        "broken_tail": "\nRunning 2 tests using 1 worker\n\n[1/2] tests\\basket_quantity_and_total.spec.ts:8:5 \u203a removing_last_gadget_removes_line_from_basket\n[2/2] tests\\basket_quantity_and_total.spec.ts:26:5 \u203a removing_last_sprocket_removes_line_from_basket\n  2 passed (2.3s)\n",
+        "fixed_tail": "\nRunning 2 tests using 1 worker\n\n[1/2] tests\\basket_quantity_and_total.spec.ts:8:5 \u203a removing_last_gadget_removes_line_from_basket\n[2/2] tests\\basket_quantity_and_total.spec.ts:26:5 \u203a removing_last_sprocket_removes_line_from_basket\n  2 passed (2.1s)\n",
+        "review_id": "8fd06e09-0874-44d7-886a-0e2c5128ce91",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\basket-total-run1"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 9,
+          "passed": 3,
+          "failed": 6,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 32973,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 9,
+          "passed": 9,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 2498,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 9,
+        "journeys": 1,
+        "steps": 7,
+        "withheld": 7,
+        "refused": 0,
+        "assertions": 9,
+        "meaningful_assertions": 9,
+        "specified_count": 8,
+        "observed_count": 1,
+        "downgraded": 0,
+        "locators_grounded": 58,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "increasing Widget quantity to 2 doubles the line to GBP 8.00 and updates the total",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "adding a Gadget creates a second basket line and adds GBP 2.50 to the total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "increasing Gadget quantity to 2 updates Gadget line to GBP 5.00 and total to GBP 13.00",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "increasing Widget quantity to 3 updates Widget line to GBP 12.00 and total to GBP 17.00",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "adding a Sprocket creates a third basket line and updates total to GBP 26.00",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "increasing Sprocket quantity to 2 updates Sprocket line to GBP 18.00 and total to GBP 35.00",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          }
+        ],
+        "separating_tests": 6,
+        "broken_tail": "    tests\\add-item-and-change-quantity.spec.ts:108:5 \u203a adding a Sprocket creates a third basket line and updates total to GBP 26.00 \n    tests\\add-item-and-change-quantity.spec.ts:127:5 \u203a increasing Sprocket quantity to 2 updates Sprocket line to GBP 18.00 and total to GBP 35.00 \n  3 passed (38.0s)\n",
+        "fixed_tail": "tal to GBP 26.00\n[8/9] tests\\add-item-and-change-quantity.spec.ts:127:5 \u203a increasing Sprocket quantity to 2 updates Sprocket line to GBP 18.00 and total to GBP 35.00\n[9/9] tests\\add-item-and-change-quantity.spec.ts:148:5 \u203a decreasing Widget quantity to zero removes its basket line\n  9 passed (3.6s)\n",
+        "review_id": "3c7e96ed-a2f0-4fd7-b757-3f8b940bf9ae",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\basket-total-run2"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": true,
+        "detects_break": true,
+        "discriminates": true,
+        "broken": {
+          "total": 10,
+          "passed": 2,
+          "failed": 8,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 43574,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 10,
+          "passed": 10,
+          "failed": 0,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 3047,
+          "outcome": "passed"
+        },
+        "files": 1,
+        "tests": 10,
+        "journeys": 1,
+        "steps": 10,
+        "withheld": 10,
+        "refused": 0,
+        "assertions": 10,
+        "meaningful_assertions": 10,
+        "specified_count": 10,
+        "observed_count": 0,
+        "downgraded": 0,
+        "locators_grounded": 60,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [],
+        "failed_on_broken": [
+          {
+            "name": "Basket quantity and total behaviour \u203a increasing_widget_quantity_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Basket quantity and total behaviour \u203a adding_second_item_adds_line_and_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Basket quantity and total behaviour \u203a increasing_second_item_quantity_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Basket quantity and total behaviour \u203a decreasing_widget_quantity_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Basket quantity and total behaviour \u203a increasing_widget_quantity_again_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Basket quantity and total behaviour \u203a decreasing_widget_quantity_again_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Basket quantity and total behaviour \u203a decreasing_gadget_quantity_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "Basket quantity and total behaviour \u203a increasing_gadget_quantity_updates_total",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          }
+        ],
+        "separating_tests": 8,
+        "broken_tail": "widget_quantity_again_updates_total \n    tests\\basket-quantity.spec.ts:152:7 \u203a Basket quantity and total behaviour \u203a decreasing_gadget_quantity_updates_total \n    tests\\basket-quantity.spec.ts:165:7 \u203a Basket quantity and total behaviour \u203a increasing_gadget_quantity_updates_total \n  2 passed (50.1s)\n",
+        "fixed_tail": "antity_updates_total\n[9/10] tests\\basket-quantity.spec.ts:165:7 \u203a Basket quantity and total behaviour \u203a increasing_gadget_quantity_updates_total\n[10/10] tests\\basket-quantity.spec.ts:178:7 \u203a Basket quantity and total behaviour \u203a removing_last_widget_removes_line_and_updates_total\n  10 passed (4.0s)\n",
+        "review_id": "d9ad95a5-ca2c-42e5-95ba-8b9c5a17d46f",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\basket-total-run3"
+      }
+    ],
+    "signup-wizard": [
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "detects_break": false,
+        "discriminates": false,
+        "broken": {
+          "total": 9,
+          "passed": 1,
+          "failed": 8,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 43281,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 9,
+          "passed": 1,
+          "failed": 8,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 43334,
+          "outcome": "failed"
+        },
+        "files": 1,
+        "tests": 9,
+        "journeys": 1,
+        "steps": 7,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 9,
+        "meaningful_assertions": 9,
+        "specified_count": 7,
+        "observed_count": 2,
+        "downgraded": 0,
+        "locators_grounded": 57,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [
+          {
+            "name": "step_one_heading_identifies_the_current_step",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "step_one_advances_to_step_two_after_valid_name_and_email",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "step_two_heading_identifies_the_current_step",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "step_two_advances_to_review_after_valid_address",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_name_entered_at_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_email_entered_at_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_street_entered_at_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_town_entered_at_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          }
+        ],
+        "failed_on_broken": [
+          {
+            "name": "step_one_heading_identifies_the_current_step",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "step_one_advances_to_step_two_after_valid_name_and_email",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "step_two_heading_identifies_the_current_step",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "step_two_advances_to_review_after_valid_address",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_name_entered_at_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_email_entered_at_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_street_entered_at_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_town_entered_at_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          }
+        ],
+        "separating_tests": 0,
+        "broken_tail": ".ts:58:5 \u203a review_page_shows_email_entered_at_step_one \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\sign_up.spec.ts:71:5 \u203a review_page_shows_street_entered_at_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\sign_up.spec.ts:84:5 \u203a review_page_shows_town_entered_at_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  1 passed (49.7s)\n",
+        "fixed_tail": ".ts:58:5 \u203a review_page_shows_email_entered_at_step_one \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\sign_up.spec.ts:71:5 \u203a review_page_shows_street_entered_at_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\sign_up.spec.ts:84:5 \u203a review_page_shows_town_entered_at_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  1 passed (49.8s)\n",
+        "review_id": "bbfe3e0a-a1e6-4d83-afcc-f929c3823d3a",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\signup-wizard-run1"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "detects_break": false,
+        "discriminates": false,
+        "broken": {
+          "total": 10,
+          "passed": 3,
+          "failed": 7,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 38291,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 10,
+          "passed": 3,
+          "failed": 7,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 38309,
+          "outcome": "failed"
+        },
+        "files": 1,
+        "tests": 10,
+        "journeys": 1,
+        "steps": 7,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 10,
+        "meaningful_assertions": 10,
+        "specified_count": 7,
+        "observed_count": 3,
+        "downgraded": 0,
+        "locators_grounded": 58,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [
+          {
+            "name": "step_one_heading_is_step_1_of_3",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "continuing_from_step_one_reaches_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_name_from_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_email_from_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_street_from_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_town_from_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_heading_is_step_3_of_3",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          }
+        ],
+        "failed_on_broken": [
+          {
+            "name": "step_one_heading_is_step_1_of_3",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "continuing_from_step_one_reaches_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_name_from_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_email_from_step_one",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_street_from_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_shows_town_from_step_two",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "review_page_heading_is_step_3_of_3",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          }
+        ],
+        "separating_tests": 0,
+        "broken_tail": "ts:66:5 \u203a review_page_shows_street_from_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\signup.spec.ts:79:5 \u203a review_page_shows_town_from_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\signup.spec.ts:92:5 \u203a review_page_heading_is_step_3_of_3 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  3 passed (44.1s)\n",
+        "fixed_tail": "ts:66:5 \u203a review_page_shows_street_from_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\signup.spec.ts:79:5 \u203a review_page_shows_town_from_step_two \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\signup.spec.ts:92:5 \u203a review_page_heading_is_step_3_of_3 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  3 passed (44.1s)\n",
+        "review_id": "b6a54534-fc7c-4eaf-952f-53b72d1c9ba2",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\signup-wizard-run2"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "detects_break": false,
+        "discriminates": false,
+        "broken": {
+          "total": 4,
+          "passed": 3,
+          "failed": 1,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 6153,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 4,
+          "passed": 3,
+          "failed": 1,
+          "errored": 0,
+          "skipped": 0,
+          "duration_ms": 6139,
+          "outcome": "failed"
+        },
+        "files": 1,
+        "tests": 4,
+        "journeys": 1,
+        "steps": 7,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 4,
+        "meaningful_assertions": 4,
+        "specified_count": 0,
+        "observed_count": 2,
+        "downgraded": 0,
+        "locators_grounded": 15,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [
+          {
+            "name": "step_two_heading_identifies_correct_step",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          }
+        ],
+        "failed_on_broken": [
+          {
+            "name": "step_two_heading_identifies_correct_step",
+            "file": "",
+            "why": "expect(locator).toHaveText(expected) failed"
+          }
+        ],
+        "separating_tests": 0,
+        "broken_tail": "..\\test-results\\tests-sign_up-step-two-heading-identifies-correct-step\\error-context.md\n\n\n[4/4] tests\\sign_up.spec.ts:32:5 \u203a create_account_leaves_step_three_review_page\n  1 failed\n    tests\\sign_up.spec.ts:23:5 \u203a step_two_heading_identifies_correct_step \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  3 passed (7.7s)\n",
+        "fixed_tail": "..\\test-results\\tests-sign_up-step-two-heading-identifies-correct-step\\error-context.md\n\n\n[4/4] tests\\sign_up.spec.ts:32:5 \u203a create_account_leaves_step_three_review_page\n  1 failed\n    tests\\sign_up.spec.ts:23:5 \u203a step_two_heading_identifies_correct_step \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  3 passed (7.7s)\n",
+        "review_id": "42591c9a-4f99-46f6-b87c-1374453f05e5",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\signup-wizard-run3"
+      }
+    ],
+    "task-ownership": [
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "detects_break": false,
+        "discriminates": false,
+        "broken": {
+          "total": 5,
+          "passed": 0,
+          "failed": 2,
+          "errored": 3,
+          "skipped": 0,
+          "duration_ms": 70912,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 5,
+          "passed": 0,
+          "failed": 2,
+          "errored": 3,
+          "skipped": 0,
+          "duration_ms": 70867,
+          "outcome": "failed"
+        },
+        "files": 3,
+        "tests": 5,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 5,
+        "meaningful_assertions": 5,
+        "specified_count": 3,
+        "observed_count": 2,
+        "downgraded": 0,
+        "locators_grounded": 28,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [
+          {
+            "name": "task_list_shows_alice_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "task_list_shows_bob_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "owner_sees_edit_form_on_their_task",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "updated_task_title_appears_in_task_list",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "non_owner_sees_no_edit_form_on_another_users_task",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          }
+        ],
+        "failed_on_broken": [
+          {
+            "name": "task_list_shows_alice_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "task_list_shows_bob_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "owner_sees_edit_form_on_their_task",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "updated_task_title_appears_in_task_list",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "non_owner_sees_no_edit_form_on_another_users_task",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          }
+        ],
+        "separating_tests": 0,
+        "broken_tail": "\\open_own_task.spec.ts:8:5 \u203a owner_sees_edit_form_on_their_task \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_own_task.spec.ts:19:5 \u203a updated_task_title_appears_in_task_list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_task_owned_by_another_user.spec.ts:8:5 \u203a non_owner_sees_no_edit_form_on_another_users_task \n",
+        "fixed_tail": "\\open_own_task.spec.ts:8:5 \u203a owner_sees_edit_form_on_their_task \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_own_task.spec.ts:19:5 \u203a updated_task_title_appears_in_task_list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_task_owned_by_another_user.spec.ts:8:5 \u203a non_owner_sees_no_edit_form_on_another_users_task \n",
+        "review_id": "d2e46588-257d-4281-8e9d-a9e489aea3a3",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\task-ownership-run1"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "detects_break": false,
+        "discriminates": false,
+        "broken": {
+          "total": 9,
+          "passed": 1,
+          "failed": 3,
+          "errored": 5,
+          "skipped": 0,
+          "duration_ms": 116408,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 9,
+          "passed": 1,
+          "failed": 3,
+          "errored": 5,
+          "skipped": 0,
+          "duration_ms": 116499,
+          "outcome": "failed"
+        },
+        "files": 3,
+        "tests": 9,
+        "journeys": 3,
+        "steps": 8,
+        "withheld": 0,
+        "refused": 0,
+        "assertions": 9,
+        "meaningful_assertions": 8,
+        "specified_count": 5,
+        "observed_count": 4,
+        "downgraded": 0,
+        "locators_grounded": 49,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [
+          {
+            "name": "signed_in_identity_shown_on_task_list",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "task_list_shows_alice_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "task_list_shows_bob_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "own_task_page_shows_edit_form",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "own_task_page_shows_correct_heading_and_owner",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "saving_new_title_updates_task_heading",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "updated_title_appears_in_task_list",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "other_users_task_offers_no_edit_form",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          }
+        ],
+        "failed_on_broken": [
+          {
+            "name": "signed_in_identity_shown_on_task_list",
+            "file": "",
+            "why": "expect(locator).toContainText(expected) failed"
+          },
+          {
+            "name": "task_list_shows_alice_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "task_list_shows_bob_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "own_task_page_shows_edit_form",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "own_task_page_shows_correct_heading_and_owner",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "saving_new_title_updates_task_heading",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "updated_title_appears_in_task_list",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "other_users_task_offers_no_edit_form",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          }
+        ],
+        "separating_tests": 0,
+        "broken_tail": "sk.spec.ts:29:5 \u203a saving_new_title_updates_task_heading \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_own_task.spec.ts:41:5 \u203a updated_title_appears_in_task_list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_task_owned_by_another_user.spec.ts:8:5 \u203a other_users_task_offers_no_edit_form \u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  1 passed (1.4m)\n",
+        "fixed_tail": "sk.spec.ts:29:5 \u203a saving_new_title_updates_task_heading \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_own_task.spec.ts:41:5 \u203a updated_title_appears_in_task_list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\open_task_owned_by_another_user.spec.ts:8:5 \u203a other_users_task_offers_no_edit_form \u2500\u2500\u2500\u2500\u2500\u2500\u2500\n  1 passed (1.4m)\n",
+        "review_id": "a36c17fc-5bfe-4868-8c4f-8dfe78d0d312",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\task-ownership-run2"
+      },
+      {
+        "ran": true,
+        "red_on_broken": true,
+        "green_on_fixed": false,
+        "detects_break": false,
+        "discriminates": false,
+        "broken": {
+          "total": 8,
+          "passed": 0,
+          "failed": 3,
+          "errored": 5,
+          "skipped": 0,
+          "duration_ms": 116197,
+          "outcome": "failed"
+        },
+        "fixed": {
+          "total": 8,
+          "passed": 0,
+          "failed": 3,
+          "errored": 5,
+          "skipped": 0,
+          "duration_ms": 116224,
+          "outcome": "failed"
+        },
+        "files": 3,
+        "tests": 8,
+        "journeys": 3,
+        "steps": 11,
+        "withheld": 0,
+        "refused": 2,
+        "assertions": 8,
+        "meaningful_assertions": 7,
+        "specified_count": 4,
+        "observed_count": 4,
+        "downgraded": 0,
+        "locators_grounded": 46,
+        "locators_invented": 0,
+        "locators_retried": false,
+        "failed_on_fixed": [
+          {
+            "name": "successful_login_lands_on_task_list_as_alice",
+            "file": "",
+            "why": "expect(page).toHaveURL(expected) failed"
+          },
+          {
+            "name": "task_list_shows_alice_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "task_list_shows_bob_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "non_owner_is_not_offered_edit_form",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "owner_sees_edit_form_on_own_task",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "own_task_page_shows_correct_heading_and_owner",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "saving_new_title_updates_task_heading",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "updated_title_appears_in_task_list",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          }
+        ],
+        "failed_on_broken": [
+          {
+            "name": "successful_login_lands_on_task_list_as_alice",
+            "file": "",
+            "why": "expect(page).toHaveURL(expected) failed"
+          },
+          {
+            "name": "task_list_shows_alice_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "task_list_shows_bob_owned_task",
+            "file": "",
+            "why": "expect(locator).toBeVisible() failed"
+          },
+          {
+            "name": "non_owner_is_not_offered_edit_form",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "owner_sees_edit_form_on_own_task",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "own_task_page_shows_correct_heading_and_owner",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "saving_new_title_updates_task_heading",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          },
+          {
+            "name": "updated_title_appears_in_task_list",
+            "file": "",
+            "why": "Test timeout of 20000ms exceeded."
+          }
+        ],
+        "separating_tests": 0,
+        "broken_tail": " tests\\own_task_edit.spec.ts:19:5 \u203a own_task_page_shows_correct_heading_and_owner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\own_task_edit.spec.ts:30:5 \u203a saving_new_title_updates_task_heading \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\own_task_edit.spec.ts:42:5 \u203a updated_title_appears_in_task_list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "fixed_tail": " tests\\own_task_edit.spec.ts:19:5 \u203a own_task_page_shows_correct_heading_and_owner \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\own_task_edit.spec.ts:30:5 \u203a saving_new_title_updates_task_heading \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n    tests\\own_task_edit.spec.ts:42:5 \u203a updated_title_appears_in_task_list \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+        "review_id": "5844069b-b3f7-4eeb-b9af-55d5c7f90e72",
+        "suite_kept": "D:\\GitRepos\\prodreadyagent\\evals\\app_testing\\results\\suites\\20260922T094902Z\\task-ownership-run3"
+      }
+    ]
+  }
+}

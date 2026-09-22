@@ -1,0 +1,14 @@
+# Dependencies for scripts/explore_app.py only — NOT for the API host.
+#
+# `backend/` imports none of this. Playwright pulls a browser toolchain behind it, and
+# installing that on the machine serving the API would be paying for a capability D-05
+# forbids that machine from using. The explorer runs where the application under test is
+# reachable — a developer machine, a CI runner, or a box inside the customer network —
+# and that is the only place this file needs to be installed.
+#
+#     pip install -r requirements-explorer.txt
+#     python -m playwright install chromium
+#
+# `scripts/ui_examine.py` has the same dependency and predates this file; both are covered
+# here so the requirement is declared in exactly one place rather than nowhere.
+playwright>=1.55,<2

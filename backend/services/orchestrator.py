@@ -23,9 +23,11 @@ from backend.agents.governance_intelligence.report_generator import ReportGenera
 from backend.agents.qa_intelligence.test_scenario_agent import TestScenarioAgent
 from backend.agents.qa_intelligence.test_case_agent import TestCaseAgent
 from backend.agents.qa_intelligence.test_automation_agent import TestAutomationAgent
+from backend.agents.qa_intelligence.app_explorer_agent import AppExplorerAgent
 from backend.services.github_service import GitHubService
 from backend.services.knowledge_base import knowledge_base
-from backend.services import cost_optimization_service
+from backend.services import (assertion_audit, cost_optimization_service, journey_audit,
+                              locator_audit)
 from backend import config, database
 from backend.workflows import shared as workflow_shared
 from backend.workflows import autofix_pr as autofix_pr_workflow
@@ -70,7 +72,7 @@ def _log_call(method):
 
 
 def _refuse_degenerate(product: str, produced: Any, result: Dict[str, Any],
-                      field: str, remedy: str) -> None:
+                      field: str, remedy: str, require_payload: bool = False) -> None:
     """Raise when a QA generator came back with nothing at all, rather than storing it.
 
     None of the three QA generators goes through `BaseAgent.review()`, so `attest`'s
@@ -92,9 +94,41 @@ def _refuse_degenerate(product: str, produced: Any, result: Dict[str, Any],
     `attest`'s 200-character floor is deliberately *not* applied here. That floor exists so a
     caller probing a code-review endpoint with a one-liner is not refused; a requirement is
     prose a person wrote on purpose, and "login must work" is short but entirely testable.
+
+    **`require_payload` is for the two generators that emit files rather than a catalogue.**
+    A summary rescuing an empty result is the right rule for a scenario or case list: a model
+    that found nothing to enumerate can say so, and the reader has the sentence explaining
+    why. It is the wrong rule for a *suite*, because the deliverable is the files and no
+    sentence substitutes for them. A live eval run produced exactly that shape — zero test
+    files, three `assertion_basis` rows describing tests that did not exist, and a confident
+    summary — and it was stored as a successful run that `run_tests.py` would then find
+    nothing to execute. So for those two, no files is an error whatever the summary says.
+    Nothing that produced files is affected, which is why this does not move a measured
+    baseline.
     """
-    if produced or (result.get("summary") or "").strip():
+    if (produced or (result.get("summary") or "").strip()) and not (require_payload
+                                                                   and not produced):
         return
+    # What came back instead, named before the error is raised. An empty result is rare and
+    # intermittent, which is the worst combination to diagnose: by the time somebody asks why,
+    # the response is gone and reproducing it costs another paid run. Keys and shapes only --
+    # the content is the customer's.
+    keys = sorted(str(k) for k in (result or {}).keys())
+    raw = (result or {}).get("test_files")
+    logger.warning(
+        "%s produced no %s. Keys returned: %s. Raw test_files: %s. "
+        "(Absent means the model skipped the field; present-but-empty after filtering means "
+        "its entries were the wrong shape.)",
+        product, field, keys[:25],
+        "absent" if raw is None else f"{type(raw).__name__} of length {len(raw)}"
+        if hasattr(raw, "__len__") else type(raw).__name__,
+    )
+    if require_payload and not produced:
+        raise RuntimeError(
+            f"{product} returned no {field}. The suite *is* the files, so a summary "
+            f"without them is not a result — it usually means the response was truncated "
+            f"mid-object. Try again{remedy}."
+        )
     raise RuntimeError(
         f"{product} returned no {field} and no summary — this usually means the LLM "
         f"response was truncated or malformed rather than a genuine empty result. "
@@ -125,6 +159,7 @@ class SDLCOrchestrator:
         self.test_scenario_agent = TestScenarioAgent()
         self.test_case_agent = TestCaseAgent()
         self.test_automation_agent = TestAutomationAgent()
+        self.app_explorer_agent = AppExplorerAgent()
         self.github = GitHubService()
 
     @staticmethod
@@ -877,7 +912,7 @@ class SDLCOrchestrator:
         # which is right: it is malformed, not empty, and this is the error that says so.
         _refuse_degenerate("Test automation generation", files, result, "test files",
                            ", narrow the source to the files this requirement touches, or "
-                           "reduce the number of levels requested")
+                           "reduce the number of levels requested", require_payload=True)
         if cost_stats:
             result["_cost_stats"] = cost_stats
 
@@ -910,6 +945,284 @@ class SDLCOrchestrator:
                 f"{requirement[:120]}{'...' if len(requirement) > 120 else ''}"
             ),
             input_content=requirement[:5000],
+            result=result,
+        )
+        result["review_id"] = review_id
+        return result
+
+    @_log_call
+    def generate_app_suite(
+        self,
+        journeys_markdown: str,
+        goal: str = "",
+        requirement: str = "",
+        target_label: str = "",
+        context: str = "",
+        project_name: str = "Unnamed Project",
+        llm_override: Optional[Dict[str, Any]] = None,
+        session: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """A Playwright suite written from journeys walked through a running application.
+
+        The sibling of `generate_test_automation`, and deliberately the same shape: one
+        call, the same result keys, the same degeneracy guard, the same `reviews` row. What
+        differs is the input (journeys, not source) and one extra honesty pass below.
+
+        Nothing here is compressed. `journeys_markdown` is computed output -- paths, roles
+        and accessible names -- and `_compress` is documented to no-op on anything that does
+        not read as prose, so running it would spend time to change nothing.
+        """
+        # Documents and any generated brief arrive on `session`, resolved when the session
+        # opened so the suite is written against the same basis the session was allowed to
+        # start with. `_kb("qa", ...)` still runs for the shared QA standards that are not
+        # project material -- those are style, not specification, and belong in `context`.
+        session_basis = (session or {}).get("basis") or {}
+        context = self._kb("qa", context, goal or requirement, project_name)
+        result = self.app_explorer_agent.generate_suite(
+            documents=session_basis.get("documents", ""),
+            brief_markdown=session_basis.get("brief_markdown", ""),
+            journeys_markdown=journeys_markdown,
+            goal=goal,
+            requirement=requirement,
+            target_label=target_label,
+            context=context,
+            observed_locators=(session or {}).get("observed_locators"),
+            # The agent audits its own answer and may retry once on the strength of it, and
+            # until now it did that half blind: it received the locators the session was
+            # given but not the text the session collected, so `unseen-name` -- a heading
+            # nobody saw -- could only ever be *reported* here, after the one retry it would
+            # have justified had already been skipped. That is D-430's failure exactly, the
+            # one where an invented `getByRole('heading', { name: 'Products' })` in a shared
+            # helper took every test in a live suite down with it, and it is the case a retry
+            # is most likely to fix, because the headings the session did see are already in
+            # the prompt. Same argument D-442 makes for its own check feeding the retry.
+            observed_texts=(session or {}).get("observed_texts"),
+            # Everything the session observed, each thing with a reference the model can
+            # quote instead of describing (D-460). Assembled by the route, which is the only
+            # layer holding the raw steps -- the markdown this method receives has already
+            # been capped per step and carries only the controls that were acted on, so a
+            # catalogue built from it could describe the journey and nothing else on the
+            # page.
+            catalogue=(session or {}).get("catalogue"),
+            llm_override=llm_override,
+        )
+
+        # Same defence and same reason as `generate_test_automation` (D-392): a schema is a
+        # request, not a guarantee, and a live run has already returned a list of strings
+        # where a list of objects belonged. Rows of the wrong shape are dropped rather than
+        # coerced, and the count of what was dropped is reported.
+        def _rows(value):
+            items = value if isinstance(value, list) else []
+            return [row for row in items if isinstance(row, dict)], sum(
+                1 for row in items if not isinstance(row, dict))
+
+        files, dropped_files = _rows(result.get("test_files"))
+        coverage, dropped_coverage = _rows(result.get("requirement_coverage"))
+        assumptions, dropped_assumptions = _rows(result.get("assumptions"))
+        not_automated, dropped_not_automated = _rows(result.get("not_automated"))
+        basis, dropped_basis = _rows(result.get("assertion_basis"))
+        malformed = (dropped_files + dropped_coverage + dropped_assumptions
+                     + dropped_not_automated + dropped_basis)
+        if malformed:
+            logger.warning(
+                "app-testing: discarded %d response row(s) that were not objects "
+                "(test_files=%d, requirement_coverage=%d, assumptions=%d, "
+                "not_automated=%d, assertion_basis=%d)",
+                malformed, dropped_files, dropped_coverage, dropped_assumptions,
+                dropped_not_automated, dropped_basis)
+            result["malformed_rows"] = malformed
+
+        # The honesty pass, and the reason this product can be sold without overclaiming.
+        #
+        # With no requirement supplied there is no specification, so a model can only assert
+        # what it watched the application do. Such a suite catches a regression and cannot
+        # catch behaviour that was already wrong, and calling it "verified against a
+        # requirement" would be a false claim the customer has no way to check. So a
+        # `specified` basis is *downgraded* here rather than trusted, and any requirement
+        # coverage claimed without a requirement to cover is dropped entirely.
+        #
+        # This is `attest.coverage_claim`'s rule aimed at a different noun, and it is
+        # enforced in code rather than asked for in the prompt for the reason D-406 gives:
+        # a claim the model makes about its own output is not evidence.
+        # The honesty pass, and it is a *ceiling* rather than a correction. What the session
+        # actually had decides the strongest label any assertion in it may carry, and
+        # anything above that ceiling is pushed down to it -- enforced here rather than asked
+        # for in the prompt, because a model's claim about its own output is not evidence
+        # (D-406). What this cannot do is verify that a row labelled `derived` really traces
+        # to the case it names; it only stops a claim the session could not support at all.
+        session_basis = (session or {}).get("basis") or {}
+        had_stated = bool(session_basis.get("has_stated", bool((requirement or "").strip())))
+        had_derived = bool(session_basis.get("has_derived"))
+        had_requirement = had_stated
+
+        # Weakest sufficient label, and why it was not allowed to stand higher.
+        if had_stated:
+            ceiling, ceiling_reason = "stated", ""
+        elif had_derived:
+            ceiling, ceiling_reason = (
+                "derived",
+                "this session had generated scenarios or cases to cover, but nothing a "
+                "person wrote, so no assertion here can claim to check a stated requirement",
+            )
+        else:
+            ceiling, ceiling_reason = (
+                "observed",
+                "nothing was supplied to check this application against, so every assertion "
+                "here rests on what the application did during exploration",
+            )
+        rank = {"stated": 0, "derived": 1, "observed": 2}
+        downgraded = 0
+        for row in basis:
+            claimed = str(row.get("basis") or "").strip()
+            if claimed not in rank:
+                row["basis"] = "observed"   # an unrecognised word is not a claim we honour
+                continue
+            if rank[claimed] < rank[ceiling]:
+                row["basis"] = ceiling
+                row["downgraded_because"] = ceiling_reason
+                downgraded += 1
+        if not had_requirement:
+            # A coverage row with no requirement behind it is D-316's shape again: a model
+            # referring to something that was never given to it.
+            if coverage:
+                logger.warning(
+                    "app-testing: dropped %d requirement_coverage row(s) claimed without a "
+                    "requirement", len(coverage))
+            coverage = []
+        if downgraded:
+            result["assertions_downgraded"] = downgraded
+
+        result["test_files"] = files
+        result["requirement_coverage"] = coverage
+        result["assumptions"] = assumptions
+        result["not_automated"] = not_automated
+        result["assertion_basis"] = basis
+
+        # Reached after filtering, deliberately: a response whose every entry was the wrong
+        # shape lands here, which is right -- it is malformed rather than empty, and this is
+        # the error that says so.
+        _refuse_degenerate("Application suite generation", files, result, "test files",
+                           ", explore further before generating, or narrow the goal to one "
+                           "journey at a time", require_payload=True)
+
+        test_names = [n for f in files for n in (f.get("test_names") or [])]
+        result["total_files"] = len(files)
+        result["total_tests"] = len(test_names)
+        result["levels_present"] = sorted({f.get("level") or "" for f in files} - {""})
+        result["prerequisites_present"] = sorted(
+            {p for f in files for p in (f.get("prerequisites") or []) if p and p != "none"}
+        )
+        result["uncovered_count"] = sum(1 for row in coverage if not row.get("covered"))
+        result["assumption_count"] = len(assumptions)
+        result["not_automated_count"] = len(not_automated)
+
+        # The split a reader has to see before trusting any of it. Counted here rather than
+        # taken from the model, for the same reason `total_tests` is.
+        stated = [r for r in basis if str(r.get("basis") or "") == "stated"]
+        derived = [r for r in basis if str(r.get("basis") or "") == "derived"]
+        result["stated_count"] = len(stated)
+        result["derived_count"] = len(derived)
+        result["observed_count"] = len(basis) - len(stated) - len(derived)
+        result["strongest_basis"] = ceiling
+        # Kept under its old name as well. The renderer, the smoke checks and the eval all
+        # read `specified_count`, and a count that silently becomes zero because a word
+        # changed reads as a collapse in quality rather than as a rename.
+        result["specified_count"] = len(stated)
+        result["assertion_basis_missing"] = max(0, len(test_names) - len(basis))
+        result["had_requirement"] = had_requirement
+
+        # Where this suite's locators came from, counted here rather than taken from the
+        # model, for the same reason `total_tests` is (D-406). The agent has already audited
+        # its own answer and may have retried once on the strength of it; this runs again
+        # over the *filtered* files so the stored number describes the suite that was
+        # actually kept, not the response that came back.
+        #
+        # This is the honesty pass aimed at a third noun. `assertion_basis` stops a suite
+        # claiming to have verified something nobody wrote down; this stops it looking
+        # thorough while resting on element names that were remembered from another
+        # application. Both failures are invisible to a reader holding only the suite, and
+        # this one is worse in one specific way: it fails against a *correct* build, so the
+        # reader's first conclusion is that their application is broken.
+        locators = locator_audit.audit(
+            files,
+            observed_texts=(session or {}).get("observed_texts"),
+            observed_locators=(session or {}).get("observed_locators"))
+        result["locator_audit"] = locators
+        result["locators_grounded"] = locators["grounded"]
+        result["locators_invented"] = locators["invented_count"]
+        locator_note = locator_audit.summary_sentence(locators)
+        if locator_note:
+            result["locator_note"] = locator_note
+            logger.warning(
+                "app-testing: suite kept %d locator(s) the session never observed (%s)",
+                locators["invented_count"], locators["kinds"])
+
+        # How much each test can *see*, which is a different question from whether it works.
+        # A suite of "the button is visible" is green on an application whose feature is
+        # entirely broken, so it is worse than a missing test: a missing test shows up in the
+        # coverage table and this one looks like coverage. Counted from the code rather than
+        # from the model's own `what_it_checks` sentence, because that sentence is a claim
+        # about its own output and D-406 says a claim is not evidence — a `toBeVisible` can
+        # be described as "the total updates correctly" at no cost.
+        assertions = assertion_audit.audit(files)
+        result["assertion_audit"] = assertions
+        result["hollow_test_count"] = assertions["hollow_count"]
+        assertion_note = assertion_audit.summary_sentence(assertions)
+        if assertion_note:
+            result["assertion_strength_note"] = assertion_note
+
+        # The honesty pass aimed at a fourth noun, and the one the other two cannot reach.
+        # `locator_audit` asks whether an element could have been observed and
+        # `assertion_audit` whether a test could ever fail; both read the suite alone, so
+        # neither can see a well-formed test that describes a part of the application nobody
+        # visited. A live ParaBank session walked three journeys, never reached registration,
+        # and produced three registration tests -- all failing -- while claiming every
+        # requirement covered (C-115). Counted rather than rewritten, for D-433's reason, and
+        # conservative on purpose: a false accusation teaches a reader to ignore the column.
+        journeys = journey_audit.audit(files, (session or {}).get("visited_paths"))
+        result["journey_audit"] = journeys
+        result["untested_journey_count"] = journeys["unvisited_count"]
+        journey_note = journey_audit.summary_sentence(journeys)
+        if journey_note:
+            result["untested_journey_note"] = journey_note
+            logger.warning(
+                "app-testing: suite drives to %d page(s) this session never opened "
+                "(%d test(s) across %d file(s))",
+                sum(len(r.get("destinations") or []) for r in journeys["unvisited"]),
+                journeys["unvisited_count"], journeys["files_affected"])
+
+        # Whether this suite could see values at all, stated on the result rather than left
+        # to be inferred from its contents. A customer who turned page text off gets a suite
+        # of presence checks, which is a legitimate choice and an illegitimate surprise --
+        # and six months later, whoever inherits the suite has no other way to find out why
+        # it only ever checks that buttons exist.
+        read_page_text = bool((session or {}).get("collect_page_text", True))
+        result["read_page_text"] = read_page_text
+        if not read_page_text:
+            result["page_text_note"] = (
+                "This session did not read what the pages displayed, so every test here "
+                "checks that a control is present rather than that a value is correct. A "
+                "test of that kind passes even when the feature behind the control is "
+                "broken. Re-run with page text enabled for assertions about values."
+            )
+
+        # Same claim, same words, same reason as the code-based product: nothing in this
+        # pipeline runs what it produced (D-05), so a stored suite is "generated", never
+        # "passing". The results contract is what changes this, once somebody replays it.
+        result["execution_status"] = "not_executed"
+        if session:
+            result["session"] = session
+
+        journey_count = len({(f.get("path") or "") for f in files})
+        review_id = database.save_review(
+            review_type="app_testing",
+            project_name=project_name,
+            input_summary=(
+                f"Application testing — {len(files)} file(s), {len(test_names)} test(s) "
+                f"from {journey_count} journey(s) on "
+                f"{target_label or 'an application'}"
+            ),
+            input_content=(journeys_markdown or "")[:5000],
             result=result,
         )
         result["review_id"] = review_id

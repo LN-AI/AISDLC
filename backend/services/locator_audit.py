@@ -1,0 +1,417 @@
+"""Which locators in a generated suite came from the session, and which were remembered.
+
+The observation contract is narrow on purpose, and that narrowness is what makes this
+checkable rather than a matter of taste. `COLLECT_JS` in `scripts/explore_app.py` emits
+exactly three ways to address an element, and the suite writer is shown nothing else:
+
+    getByRole('button', { name: 'Sign In' })       a real role in the accessibility tree
+    getByText('Go to shop', { exact: true })       no role, but rendered text
+    locator("input[name='username']")              neither resolves; the name attribute does
+
+There is no class name anywhere in that list. There is no id, and no test id. So a
+`page.locator('.inventory_item_price')` in the output **cannot** have come from anything this
+session observed -- the model recalled it from training, and it happened to be right because
+the application was famous. On a customer's application it matches nothing.
+
+That failure runs in the expensive direction. A locator matching nothing does not report a
+missing feature; it fails against a *correct* build, and a suite that cries wolf is switched
+off by the team that owns it, which leaves them worse off than no suite at all. It cost the
+2026-09-16 live run its only arithmetic check: a total computed from `.inventory_item_price`
+summed to 0 and was compared against a displayed 55.97 that was right.
+
+Why this is code and not another sentence in the prompt
+------------------------------------------------------
+The prompt has said "Never write a CSS selector or an XPath" since the first version, and
+the model wrote nineteen of them anyway. A rule the model already has and does not follow is
+not fixed by repeating it, so this module is the part that does not depend on persuasion: it
+counts, it reports, and it gives `generate_suite` something specific to hand back. D-406's
+rule again -- a model's claim about its own output is not evidence -- aimed at locators.
+
+The line drawn here, and why it is where it is
+----------------------------------------------
+Not all raw CSS is invented, and calling it all invented would produce a number nobody
+trusts. What matters is whether the selector names something **specific to this application**
+that the session never carried:
+
+* **invented** -- a class, an id, a test id, an attribute other than `name`, or an XPath.
+  Each names a token unique to the application under test, and none of them was ever sent.
+* **grounded** -- the `getBy*` family, `waitForURL`, and the `[name='...']` form the
+  collector itself supplies (D-427). The string inside came from the observation.
+* **generic** -- bare tags and combinators (`tr`, `tbody td`), Playwright's `text=` engine,
+  `:has-text(...)`. Structural or text-based rather than recalled. Fragile, sometimes the
+  only honest answer when narrowing inside a row, and counted separately rather than blamed.
+
+`getByTestId` sits under **invented** deliberately, and it is the one people argue about: a
+test id is the most durable locator there is *when the application has one*, but this session
+was never shown any, so a test id in the output is as recalled as a class name. Counting it
+as grounded because it looks like good practice would be the flattering-number error the
+eval exists to catch. It carries its own `kind` so the split stays visible.
+
+What this module does not do
+----------------------------
+It does not edit the suite. Mechanically rewriting generated test code is how a working file
+becomes a broken one, and a locator cannot be repaired without knowing what the test meant.
+The response to a finding is a bounded retry in `app_explorer_agent.generate_suite` and,
+failing that, a count on the result that the reader can see.
+"""
+import re
+from typing import Any, Dict, List
+
+# How many offending selectors travel on the result and into the retry note. Enough to show a
+# pattern, bounded because this goes in a stored review row and into a prompt.
+MAX_REPORTED = 25
+
+# Locators whose content came from the observation. `waitForURL` is here because a path is
+# something the session witnessed (D-430) and the sign-in helper is where it matters most.
+_GROUNDED_CALLS = (
+    "getByRole", "getByText", "getByLabel", "getByPlaceholder", "getByTitle",
+    "getByAltText", "waitForURL",
+)
+_GROUNDED_RE = re.compile(r"\.(?:" + "|".join(_GROUNDED_CALLS) + r")\s*\(")
+
+# A test id is application-specific and was never supplied, so it is counted with the
+# invented ones -- but found separately, because it is not a selector string.
+_TESTID_RE = re.compile(r"\.getByTestId\s*\(")
+
+# Calls whose first argument is a selector string.
+#
+# `.locator(`, `.waitForSelector(` and `$`/`$$` take a selector on any receiver. The
+# one-shot action methods (`click`, `fill`, ...) take a selector *only* when called on a
+# page or a frame -- on a Locator they take a value or nothing at all, and reading
+# `loc.fill('standard_user')` as a selector would invent a finding out of a correct line.
+_SELECTOR_PATTERNS = (
+    re.compile(r"\.(?:locator|waitForSelector)\s*\(\s*(['\"`])(.*?)\1", re.S),
+    re.compile(r"\b(?:page|frame)\s*\.\s*\$\$?(?:eval)?\s*\(\s*(['\"`])(.*?)\1", re.S),
+    re.compile(
+        r"\b(?:page|frame)\s*\.\s*(?:click|fill|type|press|check|uncheck|selectOption"
+        r"|hover|dblclick|focus|tap|textContent|innerText|innerHTML|isVisible|isEnabled"
+        r"|isChecked|getAttribute|setInputFiles|dispatchEvent|dragAndDrop)"
+        r"\s*\(\s*(['\"`])(.*?)\1",
+        re.S,
+    ),
+)
+
+# A CSS class or id token: a dot or hash followed by something that can start an identifier.
+# The leading-character rule is what keeps `$29.99` and `1.5` out of the class count.
+_CLASS_RE = re.compile(r"\.-?[A-Za-z_][\w-]*")
+_ID_RE = re.compile(r"#-?[A-Za-z_][\w-]*")
+# An attribute selector, capturing the attribute name so `[name=...]` can be told from the
+# rest. `[name='x']` is the one raw form the collector itself hands over.
+_ATTR_RE = re.compile(r"\[\s*([A-Za-z_:][\w:.-]*)\s*(?:[~^|*$]?=|\])")
+
+# Engine prefixes Playwright accepts in front of a selector.
+_ENGINES = ("xpath=", "css=", "text=", "id=", "data-testid=", "role=", "internal:")
+
+# Read by the reporting side so a sentence does not have to re-derive the vocabulary.
+KINDS = ("class", "id", "testid", "attribute", "xpath", "unseen-name",
+         "contradicts-record")
+
+
+def classify_selector(selector: str) -> str:
+    """One selector string -> 'class', 'id', 'testid', 'attribute', 'xpath' or 'generic'.
+
+    Precedence runs most-specific first: a selector mixing a class and a tag is reported as a
+    class, because the class is the part that was recalled.
+    """
+    raw = (selector or "").strip()
+    if not raw:
+        return "generic"
+
+    lowered = raw.lower()
+    if lowered.startswith("xpath=") or raw.startswith("//") or raw.startswith(".//"):
+        return "xpath"
+    if lowered.startswith("id="):
+        return "id"
+    if lowered.startswith("data-testid="):
+        return "testid"
+    for engine in _ENGINES:
+        if lowered.startswith(engine):
+            if engine == "text=":
+                return "generic"      # text was observed; it is the value, not a recalled token
+            raw = raw[len(engine):]
+            break
+
+    # `:has-text('a.b')` and friends carry arbitrary quoted text that must not be read as a
+    # class. Blank the quoted runs before looking for selector tokens.
+    probe = re.sub(r"(['\"])(?:\\.|(?!\1).)*\1", "''", raw)
+
+    if _CLASS_RE.search(probe):
+        return "class"
+    if _ID_RE.search(probe):
+        return "id"
+    attrs = [a.lower() for a in _ATTR_RE.findall(probe)]
+    if attrs:
+        if any(a in ("data-test", "data-testid", "data-test-id", "testid") for a in attrs):
+            return "testid"
+        # `[name='...']` is the collector's own third form (D-427) and is therefore observed.
+        if all(a == "name" for a in attrs):
+            return "grounded"
+        return "attribute"
+    return "generic"
+
+
+def audit_content(content: str, path: str = "") -> Dict[str, Any]:
+    """Audit one generated file. Pure, so the smoke script can drive it with no server."""
+    text = content if isinstance(content, str) else ""
+    grounded = len(_GROUNDED_RE.findall(text))
+    generic = 0
+    invented: List[Dict[str, Any]] = []
+
+    testids = list(_TESTID_RE.finditer(text))
+    for match in testids:
+        invented.append({
+            "path": path,
+            "line": text.count("\n", 0, match.start()) + 1,
+            "selector": "getByTestId(...)",
+            "kind": "testid",
+        })
+
+    seen = set()
+    for pattern in _SELECTOR_PATTERNS:
+        for match in pattern.finditer(text):
+            span = match.span()
+            if span in seen:
+                continue
+            seen.add(span)
+            selector = match.group(2)
+            kind = classify_selector(selector)
+            if kind == "grounded":
+                grounded += 1
+            elif kind == "generic":
+                generic += 1
+            else:
+                invented.append({
+                    "path": path,
+                    "line": text.count("\n", 0, match.start()) + 1,
+                    "selector": selector[:120],
+                    "kind": kind,
+                })
+
+    invented.sort(key=lambda row: row["line"])
+    return {"grounded": grounded, "generic": generic, "invented": invented}
+
+
+# `getByRole('heading', { name: 'Products' })` -- the exact shape that cost two live suites
+# every test they had (D-430). A heading is the one landmark the collector *always* gathers
+# (D-431's LANDMARK list is `h1`-`h6` plus the live regions), so if a heading name was never
+# collected, the page did not have it, and this locator matches nothing.
+# An assertion that something is **not** there. A name asserted absent was never observed --
+# that is the entire claim -- so demanding it appear in the session's text would flag the one
+# honest way to write a negative requirement. `toHaveCount(0)` is the form the suite prompt
+# itself teaches for "must not be offered", and the first version of this check flagged it:
+# two of three `task-ownership` sessions in the 2026-09-17 baseline, on suites that passed
+# 8 of 8 against the working application.
+_ABSENCE_RE = re.compile(
+    # Whatever closes the locator expression -- ` }))`, `)`, `] )` -- then the matcher.
+    r"[\s)}\],]*\.\s*(?:toHaveCount\s*\(\s*0\s*\)"
+    r"|toBeHidden\b"
+    r"|not\s*\.\s*(?:toBeVisible|toBeAttached|toHaveText|toContainText)\b)")
+
+_HEADING_RE = re.compile(
+    r"getByRole\s*\(\s*['\"`]heading['\"`]\s*,\s*\{[^}]*?name\s*:\s*['\"`](.*?)['\"`]",
+    re.S)
+
+
+def _normalise(text: str) -> str:
+    """Whitespace-collapsed and case-folded, so 'Sign In' and 'sign  in' are one name."""
+    return " ".join(str(text or "").split()).casefold()
+
+
+# A role locator the suite wrote: `getByRole('textbox', { name: 'username' })`. Captured so
+# the name can be checked against how the session was actually told to address that element.
+_ROLE_RE = re.compile(
+    r"getByRole\s*\(\s*['\"`]([a-z]+)['\"`]\s*,\s*\{[^}]*?name\s*:\s*['\"`](.*?)['\"`]",
+    re.S)
+
+
+def audit(files, observed_texts=None, observed_locators=None) -> Dict[str, Any]:
+    """Audit a whole `test_files` array.
+
+    `observed_texts` is every line of page text the session actually collected. Supplying it
+    turns on the one check that shape alone cannot make -- a locator that *looks* grounded
+    because it uses `getByRole`, and names something that was never on any page. That is not
+    a hypothetical: it is D-430's failure exactly, a sign-in helper waiting for a heading
+    called "Products" on a page that has no headings at all, and it took a whole suite down
+    with it. Left off when the session collected no text, because "nothing was observed"
+    would otherwise make every name look invented.
+
+    Deliberately limited to headings. A heading is always collected when present, so its
+    absence is real evidence; a button name or a fragment of body text can be missing from
+    the digest for a dozen innocent reasons -- the cap, the leaf rule, a later page -- and
+    flagging those would produce exactly the false alarms this module exists to prevent.
+
+    `observed_locators` maps an element's accessible name to **how the session was told to
+    address it**, and catches the failure that cost a live ParaBank suite every one of its
+    sixteen tests. The record offered `locator("input[name=\'username\']")` for the login
+    field, because its name comes from the `name` attribute and neither the accessibility
+    tree nor the rendered text carries it (D-427). The model wrote
+    `getByRole('textbox', { name: 'username' })` instead -- which resolves to **nothing** --
+    so the sign-in helper timed out and the whole suite failed on one line.
+
+    **Shape alone scores that suite as perfect**: `getByRole` is the canonical grounded form,
+    so the audit reported "88 observed, 0 invented" for a suite that was 0 of 16. A locator
+    can be the right *kind* and still contradict what the session was told, and only the
+    record can tell the difference. Limited to names the session actually acted on, because
+    those are the ones whose addressing is known first-hand -- and they are also the ones a
+    sign-in helper is built from, which is where this failure is fatal rather than annoying.
+
+    Returns the two counts a reader needs and the offending lines, capped. Rows that are not
+    objects are ignored rather than coerced -- the orchestrator has already dropped them
+    (D-392), and this must not be the thing that raises on a malformed response.
+    """
+    grounded = 0
+    generic = 0
+    invented: List[Dict[str, Any]] = []
+
+    # name -> the locator the session was given for it, for names the session acted on.
+    told = {}
+    for row in (observed_locators or ()):
+        if not isinstance(row, dict):
+            continue
+        name = _normalise(row.get("name"))
+        locator = str(row.get("locator") or "")
+        if name and locator:
+            told.setdefault(name, locator)
+
+    seen_names = None
+    if observed_texts:
+        seen_names = set()
+        for line in observed_texts:
+            raw = str(line or "")
+            # Lines arrive prefixed with how to address them -- `heading: Checkout`. Both
+            # halves are kept: the prefix is this module's business, but a suite may quote
+            # either form and a false alarm here is worse than a missed one.
+            seen_names.add(_normalise(raw))
+            if ":" in raw:
+                seen_names.add(_normalise(raw.split(":", 1)[1]))
+
+    for entry in (files if isinstance(files, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        content = entry.get("content") or ""
+        path = str(entry.get("path") or "")
+        one = audit_content(content, path)
+        grounded += one["grounded"]
+        generic += one["generic"]
+        invented.extend(one["invented"])
+
+        if told:
+            for match in _ROLE_RE.finditer(content):
+                name = _normalise(match.group(2))
+                offered = told.get(name)
+                # Only a direct contradiction counts: the session was told to use a raw
+                # attribute selector for this element and the suite used a role instead.
+                # Anything softer -- a name the session never acted on, a role that merely
+                # differs -- is the false alarm this module exists to avoid.
+                if not offered or not offered.startswith("locator("):
+                    continue
+                grounded -= 1
+                invented.append({
+                    "path": path,
+                    "line": content.count("\n", 0, match.start()) + 1,
+                    "selector": "getByRole('%s', { name: '%s' })"
+                                % (match.group(1), match.group(2)[:40]),
+                    "kind": "contradicts-record",
+                })
+
+        if seen_names is not None:
+            for match in _HEADING_RE.finditer(content):
+                name = _normalise(match.group(1))
+                if not name:
+                    continue
+                # Asserted absent? Then not having seen it is the point, not a mistake.
+                if _ABSENCE_RE.match(content, match.end(), match.end() + 90):
+                    continue
+                # A substring match counts as seen: a collected line may carry more than the
+                # heading alone, and demanding equality would flag a correct locator.
+                if any(name in seen for seen in seen_names):
+                    continue
+                grounded -= 1          # it was counted as grounded a moment ago
+                invented.append({
+                    "path": path,
+                    "line": content.count("\n", 0, match.start()) + 1,
+                    "selector": "getByRole('heading', { name: '%s' })" % match.group(1)[:60],
+                    "kind": "unseen-name",
+                })
+
+    kinds: Dict[str, int] = {}
+    for row in invented:
+        kinds[row["kind"]] = kinds.get(row["kind"], 0) + 1
+
+    return {
+        "grounded": grounded,
+        "generic": generic,
+        "invented_count": len(invented),
+        "invented": invented[:MAX_REPORTED],
+        "kinds": kinds,
+    }
+
+
+def summary_sentence(report: Dict[str, Any]) -> str:
+    """One line for a person, or '' when there is nothing to say.
+
+    Phrased as what it costs rather than as a scolding: the reader's question is whether to
+    trust a red test, and the answer is that these fail on a working application.
+    """
+    count = int((report or {}).get("invented_count") or 0)
+    if not count:
+        return ""
+    grounded = int(report.get("grounded") or 0)
+    kinds = report.get("kinds") or {}
+    named = ", ".join(f"{n} {k}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]))
+    return (
+        f"{count} locator(s) in this suite name something the session never observed "
+        f"({named}), against {grounded} written from what it did observe. The observation "
+        "carries roles, accessible names and page text and never a class, id or test id, so "
+        "these were recalled rather than seen. A recalled locator that is wrong matches "
+        "nothing and fails against a working application, so treat a failure on one of these "
+        "lines as a broken test before concluding the application is broken."
+    )
+
+
+def retry_note(report: Dict[str, Any], limit: int = 12) -> str:
+    """What to hand back to the model, naming the lines rather than repeating the rule.
+
+    The rule is already in the system prompt and was already ignored, so this quotes the
+    model's own output back at it. Naming the offending selector is the part a general
+    instruction cannot do.
+    """
+    rows = (report or {}).get("invented") or []
+    if not rows:
+        return ""
+    listed = "\n".join(
+        "- {path}:{line} -> `{selector}` ({kind})".format(**row) for row in rows[:limit]
+    )
+    more = len(rows) - limit
+    if more > 0:
+        listed += f"\n- ...and {more} more of the same kind"
+    return (
+        "## These locators were not in anything you were shown\n"
+        "The suite you just wrote addresses elements by tokens this session never carried. "
+        "You were given roles, accessible names, page text, and -- where neither of those "
+        "resolves -- an explicit `locator(\"input[name='...']\")`. You were never given a "
+        "class name, an id or a test id, so each of these came from memory of some other "
+        "application. A line marked `contradicts-record` is a different mistake and the "
+        "easier one to fix: the record told you how to address that element and you used "
+        "something else, so **use the locator the record gives for it, exactly as "
+        "written**.\n\n"
+        f"{listed}\n\n"
+        "Write the suite again. Keep the tests, the assertions and the coverage you already "
+        "have -- this is not a request for a smaller suite -- and replace each of these with "
+        "the way the record actually addresses that element, or with the page text the "
+        "record shows for the value being checked. Where the record gives you no way to "
+        "reach something, drop that assertion and say so in not_automated rather than "
+        "guessing a selector. A locator that matches nothing fails against a working "
+        "application, which is the one outcome that makes a suite worthless."
+    )
+
+
+__all__ = [
+    "KINDS",
+    "MAX_REPORTED",
+    "audit",
+    "audit_content",
+    "classify_selector",
+    "retry_note",
+    "summary_sentence",
+]
