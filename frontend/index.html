@@ -149,6 +149,24 @@
           </ul>
         </li>
 
+        <li class="nav-section" data-section="devops-intelligence">
+          <div class="nav-section-header" onclick="toggleNavSection(this)">
+            <span class="nav-section-label">DevOps Intelligence</span>
+            <span class="nav-section-chevron"></span>
+          </div>
+          <ul class="nav-section-items">
+            <li class="nav-item" data-page="deployment-readiness" data-product="deployment-readiness">
+              <span class="nav-icon">🚀</span> Deployment Readiness
+            </li>
+            <li class="nav-item" data-page="cicd-pipeline-review" data-product="cicd-pipeline-review">
+              <span class="nav-icon">🔁</span> CI/CD Pipeline Review
+            </li>
+            <li class="nav-item" data-page="iac-review" data-product="iac-review">
+              <span class="nav-icon">🏗️</span> Infrastructure-as-Code Review
+            </li>
+          </ul>
+        </li>
+
         <li class="nav-section" data-section="operations-intelligence">
           <div class="nav-section-header" onclick="toggleNavSection(this)">
             <span class="nav-section-label">Operations Intelligence</span>
@@ -157,6 +175,12 @@
           <ul class="nav-section-items">
             <li class="nav-item" data-page="issue-triage" data-product="issue-triage">
               <span class="nav-icon">🧯</span> Issue Triage
+            </li>
+            <li class="nav-item" data-page="incident-postmortem" data-product="incident-postmortem">
+              <span class="nav-icon">🔥</span> Incident & Postmortem
+            </li>
+            <li class="nav-item" data-page="monitoring-alerting-review" data-product="monitoring-alerting-review">
+              <span class="nav-icon">📈</span> Monitoring & Alerting Review
             </li>
           </ul>
         </li>
@@ -221,6 +245,9 @@
           <ul class="nav-section-items">
             <li class="nav-item" data-page="agent-hub" data-product="swarm">
               <span class="nav-icon">⚡</span> Agent Hub
+            </li>
+            <li class="nav-item" data-page="workshop">
+              <span class="nav-icon">🧪</span> Workshop
             </li>
             <li class="nav-item" data-page="knowledge-base">
               <span class="nav-icon">📚</span> Knowledge Base
@@ -380,6 +407,175 @@ Acceptance Criteria:
           <div id="requirement-runs" class="run-history-scroll"></div>
         </div>
         <div id="req-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Deployment Readiness Page -->
+      <div id="page-deployment-readiness" class="page">
+        <div class="page-header">
+          <h1>Deployment Readiness</h1>
+          <p class="subtitle">Paste a release/deployment plan, changelog, or point at the PR being released, to get a rollout-risk review</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project</label>
+            <input type="hidden" id="depr-project" class="project-bound" />
+            <div class="project-caption" data-for="depr-project"></div>
+          </div>
+          <div class="form-group">
+            <label>Deployment / Release Plan <span class="required">*</span></label>
+            <textarea id="depr-content" rows="12" placeholder="Paste your release plan, changelog, or runbook here...
+
+Example:
+Deploying v3.2 with a payments schema migration. Big-bang rollout to all regions.
+No feature flag. Rollback plan: redeploy previous image (migration not reversed)."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="depr-context" placeholder="e.g. production, EU region, payments service" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewDeploymentReadiness()">
+              <span class="btn-icon">🚀</span> Run Deployment Readiness Review
+            </button>
+          </div>
+        </div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <div id="deployment-readiness-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="depr-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- CI/CD Pipeline Review Page -->
+      <div id="page-cicd-pipeline-review" class="page">
+        <div class="page-header">
+          <h1>CI/CD Pipeline Review</h1>
+          <p class="subtitle">Paste a pipeline definition (GitHub Actions, GitLab CI, Jenkinsfile) for a security and best-practice review</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project</label>
+            <input type="hidden" id="cicd-project" class="project-bound" />
+            <div class="project-caption" data-for="cicd-project"></div>
+          </div>
+          <div class="form-group">
+            <label>Pipeline Definition <span class="required">*</span></label>
+            <textarea id="cicd-content" rows="12" placeholder="Paste your pipeline YAML or Jenkinsfile here..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="cicd-context" placeholder="e.g. production deploy workflow, self-hosted runner" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewCicdPipeline()">
+              <span class="btn-icon">🔁</span> Run CI/CD Pipeline Review
+            </button>
+          </div>
+        </div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <div id="cicd-pipeline-review-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="cicd-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Infrastructure-as-Code Review Page -->
+      <div id="page-iac-review" class="page">
+        <div class="page-header">
+          <h1>Infrastructure-as-Code Review</h1>
+          <p class="subtitle">Paste a Terraform, CloudFormation, or Kubernetes manifest for a security and best-practice review</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project</label>
+            <input type="hidden" id="iac-project" class="project-bound" />
+            <div class="project-caption" data-for="iac-project"></div>
+          </div>
+          <div class="form-group">
+            <label>Manifest <span class="required">*</span></label>
+            <textarea id="iac-content" rows="12" placeholder="Paste your Terraform, CloudFormation, or Kubernetes manifest here..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="iac-context" placeholder="e.g. production VPC, payments namespace" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewIac()">
+              <span class="btn-icon">🏗️</span> Run Infrastructure-as-Code Review
+            </button>
+          </div>
+        </div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <div id="iac-review-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="iac-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Incident & Postmortem Page -->
+      <div id="page-incident-postmortem" class="page">
+        <div class="page-header">
+          <h1>Incident & Postmortem</h1>
+          <p class="subtitle">Paste an incident timeline, log excerpt, or draft postmortem for a completeness review, in the blameless tradition</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project</label>
+            <input type="hidden" id="incident-project" class="project-bound" />
+            <div class="project-caption" data-for="incident-project"></div>
+          </div>
+          <div class="form-group">
+            <label>Incident Timeline / Postmortem Draft <span class="required">*</span></label>
+            <textarea id="incident-content" rows="12" placeholder="Paste your incident timeline, logs, or draft postmortem here..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="incident-context" placeholder="e.g. Sev-1, payments outage, 2026-09-14" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewIncidentPostmortem()">
+              <span class="btn-icon">🔥</span> Run Incident & Postmortem Review
+            </button>
+          </div>
+        </div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <div id="incident-postmortem-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="incident-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Monitoring & Alerting Config Review Page -->
+      <div id="page-monitoring-alerting-review" class="page">
+        <div class="page-header">
+          <h1>Monitoring & Alerting Config Review</h1>
+          <p class="subtitle">Paste alerting rules, SLO/SLI definitions, or dashboard config for a coverage-gap review</p>
+        </div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Project</label>
+            <input type="hidden" id="monitor-project" class="project-bound" />
+            <div class="project-caption" data-for="monitor-project"></div>
+          </div>
+          <div class="form-group">
+            <label>Alerting / Monitoring Configuration <span class="required">*</span></label>
+            <textarea id="monitor-content" rows="12" placeholder="Paste your alert rules (e.g. Prometheus), SLO/SLI definitions, or dashboard config here..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="monitor-context" placeholder="e.g. checkout service, production" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="reviewMonitoringAlerting()">
+              <span class="btn-icon">📈</span> Run Monitoring & Alerting Review
+            </button>
+          </div>
+        </div>
+        <div class="run-history">
+          <div class="section-title">Previous runs</div>
+          <div id="monitoring-alerting-review-runs" class="run-history-scroll"></div>
+        </div>
+        <div id="monitor-result" class="result-area hidden"></div>
       </div>
 
       <!-- Test Scenario Generation Page -->
@@ -2827,6 +3023,71 @@ Examples:
         </div>
         <div id="agent-cards" class="agent-grid"></div>
         <div id="hub-result" class="result-area hidden"></div>
+      </div>
+
+      <!-- Workshop Page -->
+      <div id="page-workshop" class="page">
+        <div class="page-header">
+          <h1>Workshop</h1>
+          <p class="subtitle">Practice a real agent risk-free, or build and run your own — nothing here spends project budget, counts toward a quota, or is saved as a review.</p>
+        </div>
+        <div id="ws-status" style="font-size:12px;color:var(--text-muted);margin-bottom:16px"></div>
+
+        <div class="section-title">Practice an Agent</div>
+        <div class="form-card">
+          <div class="form-group">
+            <label>Agent</label>
+            <select id="ws-practice-agent"></select>
+            <div id="ws-practice-agent-desc" style="font-size:12px;color:var(--text-muted);margin-top:4px"></div>
+          </div>
+          <div class="form-group">
+            <label>Content <span class="required">*</span></label>
+            <textarea id="ws-practice-content" rows="8" placeholder="Paste something to try this agent on — a requirement, a code snippet, a pipeline file, whatever fits the agent you picked above."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Context (optional)</label>
+            <input type="text" id="ws-practice-context" placeholder="e.g. just experimenting, ignore the specifics" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="runPractice()">▶ Practice</button>
+          </div>
+        </div>
+        <div id="ws-practice-result" class="result-area hidden"></div>
+
+        <div class="section-title" style="margin-top:28px">Team Custom Agents</div>
+        <p class="subtitle" style="margin-top:-6px">Freeform prompt-based agents belonging to your current project — any member can run one, only its creator or a project admin can edit or delete it. Not a governance tool — no findings, no gate, just a response.</p>
+        <div class="users-toolbar">
+          <button class="btn btn-primary" onclick="openCreateCustomAgent()">+ New Custom Agent</button>
+        </div>
+
+        <div id="custom-agent-panel" class="create-user-panel hidden" style="margin-top:16px">
+          <h3 id="custom-agent-panel-title">New Custom Agent</h3>
+          <input type="hidden" id="ca-editing-id" />
+          <div class="form-group">
+            <label>Name <span class="required">*</span></label>
+            <input type="text" id="ca-name" placeholder="e.g. Meeting Notes Summarizer" maxlength="100" />
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input type="text" id="ca-description" placeholder="What this agent is for" maxlength="500" />
+          </div>
+          <div class="form-group">
+            <label>System Prompt <span class="required">*</span></label>
+            <textarea id="ca-system-prompt" rows="6" maxlength="4000" placeholder="You are an assistant that..."></textarea>
+          </div>
+          <div class="form-group">
+            <label>Input Label</label>
+            <input type="text" id="ca-input-label" placeholder="e.g. Transcript, Meeting Notes" maxlength="60" />
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="saveCustomAgent()">Save</button>
+            <button class="btn btn-secondary" onclick="closeCustomAgentPanel()">Cancel</button>
+          </div>
+        </div>
+
+        <div id="ws-custom-agents-list" style="margin-top:16px">
+          <div class="empty-state">Loading…</div>
+        </div>
       </div>
 
       <!-- AI Inventory Page -->

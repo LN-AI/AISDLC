@@ -44,6 +44,7 @@ from backend.routes.v1_agents import router as v1_agents_router
 from backend.routes.frameworks import router as frameworks_router
 from backend.routes.api_keys import router as api_keys_router
 from backend.routes.plans import router as plans_router
+from backend.routes.sandbox import router as sandbox_router
 from backend.routes.products import router as products_router
 from backend.routes.usage import router as usage_router
 from backend.routes.swarm import router as swarm_router
@@ -347,6 +348,7 @@ app.include_router(github_webhook_router)
 app.include_router(modernization_router)
 app.include_router(api_keys_router)
 app.include_router(plans_router)
+app.include_router(sandbox_router)
 app.include_router(products_router)
 app.include_router(frameworks_router)
 app.include_router(usage_router)
@@ -1538,6 +1540,91 @@ async def review_requirement_file(
             project_name=project_name or file.filename,
         )
         return result
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+# ── Deployment Readiness ───────────────────────────────────────────────────
+
+@app.post("/api/review/deployment-readiness")
+def review_deployment_readiness(req: ReviewRequest, project_name: str = ""):
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+    _require_llm()
+    try:
+        return orchestrator.review_deployment_readiness(
+            content=req.content, context=req.context or "", project_name=project_name,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+# ── CI/CD Pipeline Review ──────────────────────────────────────────────────
+
+@app.post("/api/review/cicd-pipeline-review")
+def review_cicd_pipeline(req: ReviewRequest, project_name: str = ""):
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+    _require_llm()
+    try:
+        return orchestrator.review_cicd_pipeline(
+            content=req.content, context=req.context or "", project_name=project_name,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+# ── Infrastructure-as-Code Review ──────────────────────────────────────────
+
+@app.post("/api/review/iac-review")
+def review_iac(req: ReviewRequest, project_name: str = ""):
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+    _require_llm()
+    try:
+        return orchestrator.review_iac(
+            content=req.content, context=req.context or "", project_name=project_name,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+# ── Incident & Postmortem ──────────────────────────────────────────────────
+
+@app.post("/api/review/incident-postmortem")
+def review_incident_postmortem(req: ReviewRequest, project_name: str = ""):
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+    _require_llm()
+    try:
+        return orchestrator.review_incident_postmortem(
+            content=req.content, context=req.context or "", project_name=project_name,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error: %s", e)
+        status, body = format_error_response(e)
+        raise HTTPException(status_code=status, detail=body)
+
+
+# ── Monitoring & Alerting Config Review ────────────────────────────────────
+
+@app.post("/api/review/monitoring-alerting-review")
+def review_monitoring_alerting(req: ReviewRequest, project_name: str = ""):
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="Content is required")
+    _require_llm()
+    try:
+        return orchestrator.review_monitoring_alerting(
+            content=req.content, context=req.context or "", project_name=project_name,
+        )
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
         status, body = format_error_response(e)

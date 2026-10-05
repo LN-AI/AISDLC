@@ -167,3 +167,28 @@ def deactivate_user(user_id: str, user=Depends(require_admin)):
     database.audit_event("user_deactivated", "user", user_id,
                          actor=user.get("username", "admin"), project_id="")
     return {"message": "User deactivated"}
+
+
+class SetUserPlanRequest(BaseModel):
+    plan_id: Optional[str] = None
+
+
+@router.patch(
+    "/users/{user_id}/plan",
+    summary="Grant a user a personal agent plan",
+    description="Assigns a plan (a named bundle of specific agents, from GET /api/v1/plans) "
+                "directly to this user. Only takes effect when they are not acting inside a "
+                "project — a project's own plan governs members while they're working in it, "
+                "the same as any other member. Pass `plan_id: null` to remove it.",
+)
+def set_user_plan(user_id: str, req: SetUserPlanRequest, user=Depends(require_admin)):
+    if not database.get_user_by_id(user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    if req.plan_id and not database.get_plan(req.plan_id):
+        raise HTTPException(status_code=404, detail=f"Plan '{req.plan_id}' not found")
+    database.set_user_plan(user_id, req.plan_id, actor=user.get("username", "admin"))
+    return {
+        "message": "Plan assigned" if req.plan_id else "Plan removed",
+        "user_id": user_id,
+        "plan_id": req.plan_id,
+    }

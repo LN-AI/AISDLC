@@ -130,6 +130,14 @@ MAX_AGENT_INPUT_CHARS = int(os.getenv("MAX_AGENT_INPUT_CHARS", "400000"))
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "900"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 
+# Workshop (per-user sandbox): practice runs and custom agents both spend no project
+# budget and write no `reviews` row (see context.practice_mode()), so without a cap of
+# their own they would be free, unlimited real model calls. One cap covers both kinds,
+# counted on `sandbox_runs` — see services/sandbox_service.py.
+SANDBOX_DAILY_CAP = int(os.getenv("SANDBOX_DAILY_CAP", "20"))
+SANDBOX_MAX_CUSTOM_AGENTS = int(os.getenv("SANDBOX_MAX_CUSTOM_AGENTS", "10"))
+SANDBOX_MAX_SYSTEM_PROMPT_CHARS = int(os.getenv("SANDBOX_MAX_SYSTEM_PROMPT_CHARS", "4000"))
+
 # Anthropic prompt caching — marks the system prompt + tool schema (a byte-identical
 # prefix across every call to the same agent) as cacheable. Output is unchanged; only
 # billing differs: a cache write costs 1.25x and a read 0.1x, so break-even is two

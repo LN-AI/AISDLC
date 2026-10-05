@@ -18,6 +18,11 @@ from backend.agents.security_intelligence.cfr21_agent import CFR21VerificationAg
 from backend.agents.security_intelligence.gxp_document_agent import GxPDocumentAgent
 from backend.agents.security_intelligence.gxp_generator_agent import GxPGeneratorAgent
 from backend.agents.operations_intelligence.issue_triage_agent import IssueTriageAgent
+from backend.agents.operations_intelligence.incident_postmortem_agent import IncidentPostmortemAgent
+from backend.agents.operations_intelligence.monitoring_alerting_agent import MonitoringAlertingAgent
+from backend.agents.devops_intelligence.deployment_readiness_agent import DeploymentReadinessAgent
+from backend.agents.devops_intelligence.cicd_pipeline_agent import CicdPipelineAgent
+from backend.agents.devops_intelligence.iac_review_agent import IacReviewAgent
 from backend.agents.governance_intelligence.release_gate import ReleaseGateAgent
 from backend.agents.governance_intelligence.report_generator import ReportGeneratorAgent
 from backend.agents.qa_intelligence.test_scenario_agent import TestScenarioAgent
@@ -160,7 +165,97 @@ class SDLCOrchestrator:
         self.test_case_agent = TestCaseAgent()
         self.test_automation_agent = TestAutomationAgent()
         self.app_explorer_agent = AppExplorerAgent()
+        self.incident_postmortem_agent = IncidentPostmortemAgent()
+        self.monitoring_alerting_agent = MonitoringAlertingAgent()
+        self.deployment_readiness_agent = DeploymentReadinessAgent()
+        self.cicd_pipeline_agent = CicdPipelineAgent()
+        self.iac_review_agent = IacReviewAgent()
         self.github = GitHubService()
+
+    @_log_call
+    def review_deployment_readiness(self, content: str, context: str = "", project_name: str = "") -> Dict[str, Any]:
+        context = self._kb("deployment-readiness", context, content, project_name)
+        compressed_content, cost_stats = self._compress(content)
+        result = self.deployment_readiness_agent.review_deployment(compressed_content, context)
+        if cost_stats:
+            result["_cost_stats"] = cost_stats
+        review_id = database.save_review(
+            review_type="deployment_readiness",
+            project_name=project_name,
+            input_summary=content[:200] + "..." if len(content) > 200 else content,
+            input_content=content,
+            result=result,
+        )
+        result["review_id"] = review_id
+        return result
+
+    @_log_call
+    def review_cicd_pipeline(self, content: str, context: str = "", project_name: str = "") -> Dict[str, Any]:
+        context = self._kb("cicd-pipeline", context, content, project_name)
+        compressed_content, cost_stats = self._compress(content)
+        result = self.cicd_pipeline_agent.review_pipeline(compressed_content, context)
+        if cost_stats:
+            result["_cost_stats"] = cost_stats
+        review_id = database.save_review(
+            review_type="cicd_pipeline",
+            project_name=project_name,
+            input_summary=content[:200] + "..." if len(content) > 200 else content,
+            input_content=content,
+            result=result,
+        )
+        result["review_id"] = review_id
+        return result
+
+    @_log_call
+    def review_iac(self, content: str, context: str = "", project_name: str = "") -> Dict[str, Any]:
+        context = self._kb("iac-review", context, content, project_name)
+        compressed_content, cost_stats = self._compress(content)
+        result = self.iac_review_agent.review_iac(compressed_content, context)
+        if cost_stats:
+            result["_cost_stats"] = cost_stats
+        review_id = database.save_review(
+            review_type="iac_review",
+            project_name=project_name,
+            input_summary=content[:200] + "..." if len(content) > 200 else content,
+            input_content=content,
+            result=result,
+        )
+        result["review_id"] = review_id
+        return result
+
+    @_log_call
+    def review_incident_postmortem(self, content: str, context: str = "", project_name: str = "") -> Dict[str, Any]:
+        context = self._kb("incident-postmortem", context, content, project_name)
+        compressed_content, cost_stats = self._compress(content)
+        result = self.incident_postmortem_agent.review_incident(compressed_content, context)
+        if cost_stats:
+            result["_cost_stats"] = cost_stats
+        review_id = database.save_review(
+            review_type="incident_postmortem",
+            project_name=project_name,
+            input_summary=content[:200] + "..." if len(content) > 200 else content,
+            input_content=content,
+            result=result,
+        )
+        result["review_id"] = review_id
+        return result
+
+    @_log_call
+    def review_monitoring_alerting(self, content: str, context: str = "", project_name: str = "") -> Dict[str, Any]:
+        context = self._kb("monitoring-alerting", context, content, project_name)
+        compressed_content, cost_stats = self._compress(content)
+        result = self.monitoring_alerting_agent.review_monitoring(compressed_content, context)
+        if cost_stats:
+            result["_cost_stats"] = cost_stats
+        review_id = database.save_review(
+            review_type="monitoring_alerting",
+            project_name=project_name,
+            input_summary=content[:200] + "..." if len(content) > 200 else content,
+            input_content=content,
+            result=result,
+        )
+        result["review_id"] = review_id
+        return result
 
     @staticmethod
     def _kb(category: str, context: str, query: str, project_name: str) -> str:

@@ -61,6 +61,11 @@ logger = logging.getLogger(__name__)
 LEGACY_PRODUCT_ROUTES = {
     "/api/review/requirement": "requirement",
     "/api/review/requirement/upload": "requirement",
+    "/api/review/deployment-readiness": "deployment-readiness",
+    "/api/review/cicd-pipeline-review": "cicd-pipeline-review",
+    "/api/review/iac-review": "iac-review",
+    "/api/review/incident-postmortem": "incident-postmortem",
+    "/api/review/monitoring-alerting-review": "monitoring-alerting-review",
     "/api/review/code": "code",
     # The source-capable twins. Same product, so the same entitlement, quota and budget
     # apply — a customer entitled to `code` gets zip and repository review without a new

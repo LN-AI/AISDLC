@@ -402,6 +402,47 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_plan_products_plan
             ON plan_products(plan_id);
 
+        -- A team's own sandbox: freeform prompt-based agents a project's members write for
+        -- themselves (never a governance finding — see sandbox_service's module docstring).
+        -- Scoped to the project (`project_id`) a member was working in when they created
+        -- it, same as any other team asset here; `user_id` is the creator, kept so edit/
+        -- delete can be "the creator, or an admin of this project" rather than "anyone on
+        -- the team" (D-465).
+        CREATE TABLE IF NOT EXISTS custom_agents (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            project_id TEXT,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            system_prompt TEXT NOT NULL,
+            input_label TEXT DEFAULT 'Input',
+            is_active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_custom_agents_user
+            ON custom_agents(user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_custom_agents_project
+            ON custom_agents(project_id);
+
+        -- Every practice run and every custom-agent run, regardless of outcome. This is
+        -- both the audit trail for the sandbox and the input to its own daily cap
+        -- (sandbox_service.check_daily_cap) — a practice run spends no project budget and
+        -- writes no `reviews` row, so without this table it would be invisible to every
+        -- existing cost control and could be called without limit.
+        CREATE TABLE IF NOT EXISTS sandbox_runs (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            kind TEXT NOT NULL,        -- 'practice' | 'custom'
+            ref_id TEXT NOT NULL,      -- product id (practice) or custom_agents.id (custom)
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sandbox_runs_user_time
+            ON sandbox_runs(user_id, created_at);
+
         CREATE TABLE IF NOT EXISTS usage_events (
             id TEXT PRIMARY KEY,
             key_id TEXT,
@@ -502,6 +543,34 @@ def init_db():
         try:
             cursor.execute(
                 f"ALTER TABLE projects ADD COLUMN {column} {ddl_type} DEFAULT {default}"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # A user's own plan is a third governance layer, consulted only when a browser session
+    # has no project selected (see entitlement_service.resolve_entitlements, USER_AXIS) — so
+    # an admin can grant a specific person agent access without needing a project at all.
+    # NULL means unrestricted, same fallback as every other plan pointer here.
+    for column, ddl_type, default in (
+        ("plan_id", "TEXT", "NULL"),
+    ):
+        try:
+            cursor.execute(
+                f"ALTER TABLE users ADD COLUMN {column} {ddl_type} DEFAULT {default}"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # D-465: a custom agent moved from "private to the creator" to "belongs to the team" —
+    # existing rows (created before this column existed) have no project and stay visible
+    # only to their creator until one is assigned, rather than becoming an orphan nobody can
+    # reach or a row that errors out on the new project-scoped list query.
+    for column, ddl_type, default in (
+        ("project_id", "TEXT", "NULL"),
+    ):
+        try:
+            cursor.execute(
+                f"ALTER TABLE custom_agents ADD COLUMN {column} {ddl_type} DEFAULT {default}"
             )
         except sqlite3.OperationalError:
             pass  # column already exists
@@ -845,6 +914,12 @@ def save_review(
     result: Dict[str, Any],
 ) -> str:
     review_id = str(uuid.uuid4())
+    if context.is_practice_mode():
+        # No `reviews` row, no `findings` rows, no approval request — see
+        # context.practice_mode()'s docstring. The id is still handed back so every
+        # orchestrator method's `result["review_id"] = review_id` keeps working unchanged;
+        # it simply names nothing that exists.
+        return review_id
     # Reported back to whatever is metering this request, so the ledger row it writes can
     # name this review and history can later say what the run cost. See backend/context.py.
     context.note_review_saved(review_id)
@@ -1858,7 +1933,7 @@ def list_users() -> List[Dict[str, Any]]:
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id, username, email, role, full_name, is_active, created_at, last_login FROM users ORDER BY created_at DESC"
+        "SELECT id, username, email, role, full_name, is_active, created_at, last_login, plan_id FROM users ORDER BY created_at DESC"
     )
     rows = cursor.fetchall()
     conn.close()
@@ -2900,8 +2975,10 @@ def plan_subjects(plan_id: str) -> Dict[str, List[Dict[str, str]]]:
     projects = [{"id": r["id"], "name": r["name"]} for r in cursor.fetchall()]
     cursor.execute("SELECT id, team_name FROM api_keys WHERE plan_id = ? AND is_active = 1", (plan_id,))
     keys = [{"id": r["id"], "name": r["team_name"]} for r in cursor.fetchall()]
+    cursor.execute("SELECT id, username FROM users WHERE plan_id = ? AND is_active = 1", (plan_id,))
+    users = [{"id": r["id"], "name": r["username"]} for r in cursor.fetchall()]
     conn.close()
-    return {"projects": projects, "api_keys": keys}
+    return {"projects": projects, "api_keys": keys, "users": users}
 
 
 def delete_plan(plan_id: str, actor: str = "admin") -> bool:
@@ -2918,6 +2995,7 @@ def delete_plan(plan_id: str, actor: str = "admin") -> bool:
     cursor.execute("DELETE FROM plan_products WHERE plan_id = ?", (plan_id,))
     cursor.execute("UPDATE api_keys SET plan_id = NULL WHERE plan_id = ?", (plan_id,))
     cursor.execute("UPDATE projects SET plan_id = NULL WHERE plan_id = ?", (plan_id,))
+    cursor.execute("UPDATE users SET plan_id = NULL WHERE plan_id = ?", (plan_id,))
     cursor.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
     changed = cursor.rowcount > 0
     conn.commit()
@@ -2975,6 +3053,37 @@ def get_plan_for_project(project_id: str) -> Optional[Dict[str, Any]]:
     if plan and not plan.get("is_active"):
         return None
     return plan
+
+
+def get_plan_for_user(user_id: str) -> Optional[Dict[str, Any]]:
+    """A user's own plan, or None when they have none or it was deactivated. Only consulted
+    when the request has no project layer at all (see entitlement_service.USER_AXIS) — same
+    deactivation fallback as a project's or a key's plan."""
+    if not user_id:
+        return None
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT plan_id FROM users WHERE id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row or not row["plan_id"]:
+        return None
+    plan = get_plan(row["plan_id"])
+    if plan and not plan.get("is_active"):
+        return None
+    return plan
+
+
+def set_user_plan(user_id: str, plan_id: Optional[str], actor: str = "admin") -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET plan_id = ? WHERE id = ?", (plan_id, user_id))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    if changed:
+        _audit("plan_assigned", "user", user_id, actor, f"plan_id={plan_id}")
+    return changed
 
 
 def get_project_budget(project_id: str) -> Dict[str, Any]:
@@ -3153,6 +3262,27 @@ def get_usage_totals(key_id: str, product_id: str, since_iso: str) -> Dict[str, 
         "COALESCE(SUM(CASE WHEN billable = 1 THEN cost_usd ELSE 0 END), 0) AS billable_cost_usd "
         "FROM usage_events WHERE key_id = ? AND product_id = ? AND created_at >= ?",
         (key_id, product_id, since_iso),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return {
+        "events": row["events"] or 0,
+        "cost_usd": row["cost_usd"] or 0.0,
+        "billable_cost_usd": row["billable_cost_usd"] or 0.0,
+    }
+
+
+def get_usage_totals_for_user(username: str, product_id: str, since_iso: str) -> Dict[str, Any]:
+    """Calls and spend for one UI user+product since `since_iso` — the per-user quota
+    layer's input. Joins on `caller_ref`, which is the username a UI call records
+    (`agent_guard._caller_identity`); there is no `usage_events.user_id` column."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COUNT(*) AS events, COALESCE(SUM(cost_usd), 0) AS cost_usd, "
+        "COALESCE(SUM(CASE WHEN billable = 1 THEN cost_usd ELSE 0 END), 0) AS billable_cost_usd "
+        "FROM usage_events WHERE caller_type = 'ui' AND caller_ref = ? AND product_id = ? AND created_at >= ?",
+        (username, product_id, since_iso),
     )
     row = cursor.fetchone()
     conn.close()
@@ -4636,3 +4766,123 @@ def get_test_results(run_id: str, limit: int = 5000) -> List[Dict[str, Any]]:
     # Failures first, deliberately: a reader opening a report of 400 tests is looking for
     # the ones that broke, and making them scroll for it is how a red build gets ignored.
     return [dict(row) for row in rows]
+
+
+# ── Workshop / sandbox: custom agents + practice runs ───────────────────────
+
+def create_custom_agent(user_id: str, project_id: str, name: str, description: str,
+                        system_prompt: str, input_label: str) -> Dict[str, Any]:
+    agent_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """INSERT INTO custom_agents
+           (id, user_id, project_id, name, description, system_prompt, input_label, is_active, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+        (agent_id, user_id, project_id, name, description, system_prompt, input_label or "Input", now, now),
+    )
+    conn.commit()
+    conn.close()
+    _audit("custom_agent_created", "custom_agent", agent_id, user_id, f"name={name} project_id={project_id}")
+    return get_custom_agent(agent_id)
+
+
+def list_custom_agents_for_project(project_id: str) -> List[Dict[str, Any]]:
+    """Every custom agent the whole team can see — D-465. Includes who made each one, both
+    as `user_id` (for the server-side edit-rights check) and `created_by` (the creator's
+    username, since that's the only form the UI has to show or compare against)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT ca.*, u.username AS created_by
+           FROM custom_agents ca LEFT JOIN users u ON u.id = ca.user_id
+           WHERE ca.project_id = ? AND ca.is_active = 1 ORDER BY ca.created_at DESC""",
+        (project_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_custom_agent(agent_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT ca.*, u.username AS created_by
+           FROM custom_agents ca LEFT JOIN users u ON u.id = ca.user_id
+           WHERE ca.id = ?""",
+        (agent_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_custom_agent(agent_id: str, name: Optional[str], description: Optional[str],
+                        system_prompt: Optional[str], input_label: Optional[str]) -> bool:
+    current = get_custom_agent(agent_id)
+    if not current:
+        return False
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE custom_agents SET name = ?, description = ?, system_prompt = ?, "
+        "input_label = ?, updated_at = ? WHERE id = ?",
+        (
+            name if name is not None else current["name"],
+            description if description is not None else current["description"],
+            system_prompt if system_prompt is not None else current["system_prompt"],
+            input_label if input_label is not None else current["input_label"],
+            datetime.utcnow().isoformat(),
+            agent_id,
+        ),
+    )
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def delete_custom_agent(agent_id: str) -> bool:
+    """Hard delete — a team sandbox, not an audit record. The caller (creator-or-admin) is
+    checked by the route before this runs; by the time it's called the permission question
+    is already answered, so this takes only the id."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM custom_agents WHERE id = ?", (agent_id,))
+    changed = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+    return changed
+
+
+def record_sandbox_run(user_id: str, kind: str, ref_id: str) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.utcnow()
+    cursor.execute(
+        "INSERT INTO sandbox_runs (id, user_id, kind, ref_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), user_id, kind, ref_id, now.isoformat()),
+    )
+    # Bound table growth the same way api_key_usage does — only the last 2 days are ever
+    # queried (the daily cap resets at midnight UTC), so nothing older is ever read.
+    cursor.execute(
+        "DELETE FROM sandbox_runs WHERE user_id = ? AND created_at < ?",
+        (user_id, (now - timedelta(days=2)).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_sandbox_runs_today(user_id: str) -> int:
+    today_start = datetime.utcnow().strftime("%Y-%m-%dT00:00:00")
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM sandbox_runs WHERE user_id = ? AND created_at >= ?",
+        (user_id, today_start),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row["cnt"] if row else 0

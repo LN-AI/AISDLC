@@ -37,19 +37,24 @@ from backend.models.api_models import (
     AIProvenanceRequest,
     ArchitectureReviewRequest,
     CFR21VerificationRequest,
+    CicdPipelineReviewRequest,
     CodeGenAdvisoryRequest,
     CodeGenScaffoldRequest,
     CodeReviewRequest,
     ComplianceRequest,
+    DeploymentReadinessRequest,
     FullReviewRequest,
     GithubAutoFixV1Request,
     GxPDocumentCheckRequest,
     GxPDocumentGenerateRequest,
     GxPValidationPlanRequest,
+    IacReviewRequest,
+    IncidentPostmortemRequest,
     IssueTriageBatchGitHubRequest,
     IssueTriageRequest,
     MigrationAssessmentRequest,
     MigrationExecutionRequest,
+    MonitoringAlertingReviewRequest,
     PromptSafetyRequest,
     ReleaseGateRequest,
     ReportGenerateRequest,
@@ -587,6 +592,154 @@ def run_requirement(req: RequirementReviewRequest, caller: dict = Depends(get_ca
     )
     pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
     return _wrap("requirement", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+
+# ── 1b. Deployment Readiness ──────────────────────────────────────────────
+
+@router.post(
+    "/deployment-readiness",
+    summary="Review a release/deployment plan for rollout risk",
+    description="""Assesses a release/deployment plan, changelog, or the pull request being released for:
+
+- **Rollback & recovery** — documented, tested rollback; safe migration/backward-compatibility window
+- **Rollout strategy** — staged/canary/blue-green vs. big-bang for a high-blast-radius change
+- **Observability** — monitoring/alerting named for the new code path, on-call assignment
+- **Dependency readiness** — downstream/upstream compatibility, deploy ordering
+- **Change management** — test evidence, approval, release notes
+
+**Sources:** `text` · `github_pr_url`
+
+**Returns:** Findings with control IDs, gate decision (Red/Amber/Green), risk score 0–100.
+""",
+)
+def run_deployment_readiness(req: DeploymentReadinessRequest, caller: dict = Depends(get_caller)):
+    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
+    override = _effective_llm_override(req, caller, "deployment-readiness")
+    result = agent_guard.guarded_call(
+        caller, "deployment-readiness", override,
+        lambda: _orch.review_deployment_readiness(artifact, ctx, req.project_name or src_ref[:60]),
+    )
+    pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
+    return _wrap("deployment-readiness", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+
+# ── 1c. CI/CD Pipeline Review ─────────────────────────────────────────────
+
+@router.post(
+    "/cicd-pipeline-review",
+    summary="Review a CI/CD pipeline definition for security and best-practice issues",
+    description="""Scans pipeline definitions (GitHub Actions, GitLab CI, Jenkinsfile, etc.) for:
+
+- **Secrets & credentials** — hardcoded secrets, secrets printed to logs, unpinned third-party actions
+- **Permissions & trust boundaries** — overly broad `GITHUB_TOKEN` scope, `pull_request_target` risk
+- **Supply chain** — missing lock files, no SBOM/signing for production builds
+- **Pipeline correctness** — deploy jobs with no preceding tests, no approval gate, no timeout/concurrency control
+
+**Sources:** `text` · `github_file_url`
+
+**Returns:** Findings with control IDs, gate decision (Red/Amber/Green), risk score 0–100.
+""",
+)
+def run_cicd_pipeline_review(req: CicdPipelineReviewRequest, caller: dict = Depends(get_caller)):
+    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
+    override = _effective_llm_override(req, caller, "cicd-pipeline-review")
+    result = agent_guard.guarded_call(
+        caller, "cicd-pipeline-review", override,
+        lambda: _orch.review_cicd_pipeline(artifact, ctx, req.project_name or src_ref[:60]),
+    )
+    pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
+    return _wrap("cicd-pipeline-review", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+
+# ── 1d. Infrastructure-as-Code Review ─────────────────────────────────────
+
+@router.post(
+    "/iac-review",
+    summary="Review a Terraform/CloudFormation/Kubernetes manifest for security issues",
+    description="""Scans an infrastructure-as-code manifest for:
+
+- **Network exposure** — security groups/firewalls open to the internet, internal services with public IPs
+- **Identity & access** — overly broad IAM policies, hardcoded credentials, privileged containers
+- **Data protection** — missing encryption-at-rest, public database accessibility
+- **Resilience** — single-AZ production resources, missing resource limits/health probes
+
+Scoped to a pasted manifest or a handful of files, not a whole infrastructure repository.
+
+**Sources:** `text` · `github_file_url`
+
+**Returns:** Findings with control IDs, gate decision (Red/Amber/Green), risk score 0–100.
+""",
+)
+def run_iac_review(req: IacReviewRequest, caller: dict = Depends(get_caller)):
+    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
+    override = _effective_llm_override(req, caller, "iac-review")
+    result = agent_guard.guarded_call(
+        caller, "iac-review", override,
+        lambda: _orch.review_iac(artifact, ctx, req.project_name or src_ref[:60]),
+    )
+    pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
+    return _wrap("iac-review", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+
+# ── 1e. Incident & Postmortem ─────────────────────────────────────────────
+
+@router.post(
+    "/incident-postmortem",
+    summary="Review an incident timeline or draft postmortem for completeness",
+    description="""Assesses an incident timeline, log excerpt, or draft postmortem, in the blameless tradition, for:
+
+- **Timeline completeness** — detection time, escalation, mitigation, resolution all accounted for
+- **Root cause & contributing factors** — not just the proximate trigger
+- **Detection & response quality** — did monitoring fire, was the runbook followed, were stakeholders told
+- **Action items** — specific, owned, timelined, addressing contributing factors not just the trigger
+
+**Sources:** `text`
+
+**Returns:** Findings with control IDs, gate decision (Red/Amber/Green), risk score 0–100.
+""",
+)
+def run_incident_postmortem(req: IncidentPostmortemRequest, caller: dict = Depends(get_caller)):
+    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
+    override = _effective_llm_override(req, caller, "incident-postmortem")
+    result = agent_guard.guarded_call(
+        caller, "incident-postmortem", override,
+        lambda: _orch.review_incident_postmortem(artifact, ctx, req.project_name or src_ref[:60]),
+    )
+    pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
+    return _wrap("incident-postmortem", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
+
+
+# ── 1f. Monitoring & Alerting Config Review ───────────────────────────────
+
+@router.post(
+    "/monitoring-alerting-review",
+    summary="Review alerting rules, SLOs, or dashboard config for coverage gaps",
+    description="""Assesses alerting rules, SLO/SLI definitions, and dashboard configuration for:
+
+- **Alert coverage** — golden signals (error rate, latency, traffic, saturation), dependency alerts
+- **Alert quality** — justified thresholds, page vs. ticket routing, runbook links, dedup/hysteresis
+- **SLO/SLI definition** — a matching SLI for every SLO, error budget policy, measurement window
+- **Dashboard & visibility** — baselines, coverage matching the alert rules defined
+
+**Sources:** `text` · `github_file_url`
+
+**Returns:** Findings with control IDs, gate decision (Red/Amber/Green), risk score 0–100.
+""",
+)
+def run_monitoring_alerting_review(req: MonitoringAlertingReviewRequest, caller: dict = Depends(get_caller)):
+    artifact, src_type, src_ref, pb_ref = _resolve(req)
+    ctx = f"Source: {src_type} — {src_ref}\n{req.context or ''}".strip()
+    override = _effective_llm_override(req, caller, "monitoring-alerting-review")
+    result = agent_guard.guarded_call(
+        caller, "monitoring-alerting-review", override,
+        lambda: _orch.review_monitoring_alerting(artifact, ctx, req.project_name or src_ref[:60]),
+    )
+    pb = _do_postback(src_type, pb_ref, result) if req.post_back else "not_requested"
+    return _wrap("monitoring-alerting-review", result, src_type, src_ref, pb, req.project_name or "", llm_gateway.describe(override))
 
 
 # ── 2. Code Review ────────────────────────────────────────────────────────

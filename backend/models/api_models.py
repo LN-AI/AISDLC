@@ -130,6 +130,67 @@ class RequirementReviewRequest(_SourceBase):
     )
 
 
+class DeploymentReadinessRequest(_SourceBase):
+    """Review a release/deployment plan, changelog, or the PR being released for rollout risk."""
+    text: Optional[str] = Field(
+        None,
+        description="Deployment/release plan, changelog, or runbook text to review",
+        examples=["Deploying v3.2 with a payments schema migration. Big-bang rollout, no feature flag..."]
+    )
+    github_pr_url: Optional[str] = Field(
+        None,
+        description="GitHub Pull Request URL — reviews readiness of the change being released",
+        examples=["https://github.com/owner/repo/pull/88"],
+    )
+
+
+class CicdPipelineReviewRequest(_SourceBase):
+    """Review a CI/CD pipeline definition (GitHub Actions, GitLab CI, Jenkinsfile, etc.) for security and best-practice issues."""
+    text: Optional[str] = Field(
+        None,
+        description="Pasted pipeline definition (YAML or Jenkinsfile text) to review",
+    )
+    github_file_url: Optional[str] = Field(
+        None,
+        description="GitHub file blob URL pointing at the pipeline definition",
+        examples=["https://github.com/owner/repo/blob/main/.github/workflows/deploy.yml"],
+    )
+
+
+class IacReviewRequest(_SourceBase):
+    """Review a Terraform, CloudFormation, or Kubernetes manifest for security and best-practice issues."""
+    text: Optional[str] = Field(
+        None,
+        description="Pasted infrastructure-as-code manifest to review",
+    )
+    github_file_url: Optional[str] = Field(
+        None,
+        description="GitHub file blob URL pointing at the manifest",
+        examples=["https://github.com/owner/repo/blob/main/infra/main.tf"],
+    )
+
+
+class IncidentPostmortemRequest(_SourceBase):
+    """Review an incident timeline, log excerpt, or draft postmortem for completeness, in the blameless tradition."""
+    text: Optional[str] = Field(
+        None,
+        description="Incident timeline, log excerpt, or draft postmortem to review",
+    )
+
+
+class MonitoringAlertingReviewRequest(_SourceBase):
+    """Review alerting rules, SLO/SLI definitions, or dashboard configuration for coverage gaps."""
+    text: Optional[str] = Field(
+        None,
+        description="Pasted alerting rules, SLO/SLI definitions, or dashboard config (e.g. Prometheus alert rules, Grafana JSON)",
+    )
+    github_file_url: Optional[str] = Field(
+        None,
+        description="GitHub file blob URL pointing at the alerting/monitoring config",
+        examples=["https://github.com/owner/repo/blob/main/monitoring/alerts.yml"],
+    )
+
+
 class CodeReviewRequest(_CodeSourceBase):
     """Security and quality review of code, diffs, pull requests, or a whole repository."""
     code: Optional[str] = Field(

@@ -2269,15 +2269,31 @@ def main_():
           "charging a fee for a request that did no work makes failing the cheapest way to "
           "bill somebody")
 
-    # The check that matters most for everything else in this file.
-    for _pid22 in ("code", "vapt", "test-case", "codegen-scaffold", "cfr21-verification"):
+    # The check that matters most for everything else in this file: adding D-464's policy
+    # entries for `code`/`vapt`/etc. must not have moved anything NOT in that decision.
+    for _pid22 in ("test-case", "codegen-scaffold", "cfr21-verification"):
         _pt22 = _pr22.price(_pid22, 0.1234)
         check(f"{_pid22} is unchanged, still pass-through",
               _pt22["total_usd"] == 0.1234 and not _pt22["priced"],
-              "one product's pricing, not a platform-wide repricing nobody asked for")
+              "D-464 priced a named set of flagship products, not a platform-wide repricing")
     check("...and a pass-through product gets no pricing sentence at all",
-          _pr22.describe(_pr22.price("code", 0.5)) == "",
+          _pr22.describe(_pr22.price("test-case", 0.5)) == "",
           "'no markup applied' on a product that was never marked up is noise")
+
+    # D-464: `code` and `vapt` moved off pass-through deliberately -- the two products a
+    # customer is most likely to buy on their own. Same shape of proof test-automation got.
+    for _pid22b, _fee22b, _markup22b, _ceiling22b in (
+        ("code", 0.25, 2.00, 3.00), ("vapt", 0.50, 2.00, 5.00),
+    ):
+        _pt22b = _pr22.price(_pid22b, 0.10)
+        check(f"{_pid22b} is priced per D-464, not pass-through",
+              _pt22b["priced"]
+              and abs(_pt22b["total_usd"] - (_fee22b + _markup22b * 0.10)) < 1e-6,
+              f"{_pid22b}: {_pt22b}")
+        _big22b = _pr22.price(_pid22b, 100.0)
+        check(f"...and {_pid22b} is capped at ${_ceiling22b:.2f} like every other priced product",
+              _big22b["capped"] and _big22b["total_usd"] == _ceiling22b,
+              f"{_pid22b}: {_big22b}")
 
     _q22 = _pr22.apply_to_quote({"expected_usd": 0.10, "ceiling_usd": 0.60},
                                 "test-automation")
@@ -2289,7 +2305,9 @@ def main_():
           _q22["expected_usd"] == 0.10,
           "both numbers answer different questions and the screen shows both")
     check("...and a pass-through quote is returned untouched",
-          "billing" not in _pr22.apply_to_quote({"expected_usd": 0.10}, "code"))
+          "billing" not in _pr22.apply_to_quote({"expected_usd": 0.10}, "test-case"))
+    check("...and a now-priced product's quote picks up billing too",
+          "billing" in _pr22.apply_to_quote({"expected_usd": 0.10}, "code"))
 
     # The ledger keeps both, because storing only the price makes margin unanswerable and
     # storing only the cost makes the invoice a derivation nobody can check.

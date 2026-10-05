@@ -38,6 +38,11 @@ KB_CATEGORIES = [
     {"key": "gxp", "label": "GxP / 21 CFR Part 11", "agents": ["21 CFR Part 11 Verification", "GxP Document Check", "GxP Document Generation"]},
     {"key": "issue-triage", "label": "Issue Triage", "agents": ["Issue Triaging Agent"]},
     {"key": "qa", "label": "QA / Test Standards", "agents": ["Test Scenario Generation", "Test Case Generation"]},
+    {"key": "deployment-readiness", "label": "Deployment Readiness", "agents": ["Deployment Readiness"]},
+    {"key": "cicd-pipeline", "label": "CI/CD Pipeline Standards", "agents": ["CI/CD Pipeline Review"]},
+    {"key": "iac-review", "label": "Infrastructure-as-Code Standards", "agents": ["Infrastructure-as-Code Review"]},
+    {"key": "incident-postmortem", "label": "Incident & Postmortem Standards", "agents": ["Incident & Postmortem"]},
+    {"key": "monitoring-alerting", "label": "Monitoring & Alerting Standards", "agents": ["Monitoring & Alerting Config Review"]},
 ]
 VALID_KB_CATEGORIES = tuple(c["key"] for c in KB_CATEGORIES)
 

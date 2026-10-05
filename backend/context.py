@@ -27,7 +27,8 @@ from typing import Optional
 __all__ = ["bind_project", "current_project_id", "current_project_name",
            "current_product_id", "current_actor", "bind_source", "current_source_ref",
            "collect_saved_reviews", "note_review_saved", "saved_review_ids",
-           "current_release_id", "bind_derived_from", "current_derived_from"]
+           "current_release_id", "bind_derived_from", "current_derived_from",
+           "practice_mode", "is_practice_mode"]
 
 _project_id: ContextVar[Optional[str]] = ContextVar("current_project_id", default=None)
 _project_name: ContextVar[str] = ContextVar("current_project_name", default="")
@@ -71,6 +72,31 @@ _actor: ContextVar[str] = ContextVar("current_actor", default="")
 # outer one is still the same release, and minting a fresh id there would split one run
 # back into the several rows this exists to merge.
 _release_id: ContextVar[Optional[str]] = ContextVar("current_release_id", default=None)
+
+# **A practice/sandbox run must never become a real governance record.** `save_review`
+# writes the `reviews` and `findings` rows and auto-raises an approval request for a Red
+# gate or a Critical finding (`finding_gate.requires_human_signoff`) — exactly right for a
+# real call, and exactly wrong for a workspace run meant to have zero consequence. Threading
+# a `practice=True` flag through every orchestrator method and the 19 callers of
+# `save_review` is the cost this module exists to avoid (see the module docstring), so this
+# is published the same way `project_id` is: `sandbox_service` sets it once around the call,
+# `save_review` reads it and returns a review id that was never persisted.
+_practice_mode: ContextVar[bool] = ContextVar("practice_mode", default=False)
+
+
+@contextmanager
+def practice_mode():
+    """Mark everything done inside this block as a practice/sandbox run — no `reviews` row,
+    no `findings` rows, no approval request, however the gate came out."""
+    token = _practice_mode.set(True)
+    try:
+        yield
+    finally:
+        _practice_mode.reset(token)
+
+
+def is_practice_mode() -> bool:
+    return _practice_mode.get()
 
 
 @contextmanager

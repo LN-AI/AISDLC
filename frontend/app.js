@@ -690,6 +690,7 @@ function _runPageLoader(page) {
     if (page === 'audit') loadAuditTrail();
     if (page === 'users') loadUsers();
     if (page === 'agent-hub') { loadAgentHub(); loadSwarmPolicies(); }
+    if (page === 'workshop') loadWorkshop();
     if (page === 'gate') loadReviewPicker();
     if (page === 'governance-report') { loadReportReviewPicker(); loadReportList(); }
     if (page === 'findings') {
@@ -1992,6 +1993,120 @@ async function uploadRequirement() {
   } finally {
     hideLoading();
     document.getElementById('req-file').value = '';
+  }
+}
+
+// ── DevOps Intelligence ─────────────────────────────────────────────────────
+
+async function reviewDeploymentReadiness() {
+  const content = document.getElementById('depr-content').value.trim();
+  if (!content) { alert('Please enter a deployment/release plan.'); return; }
+  const project = document.getElementById('depr-project').value.trim();
+  const context = document.getElementById('depr-context').value.trim();
+
+  showLoading('Running Deployment Readiness Review...');
+  try {
+    const result = await apiFetch(`/api/review/deployment-readiness?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    renderResult('depr-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('depr-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function reviewCicdPipeline() {
+  const content = document.getElementById('cicd-content').value.trim();
+  if (!content) { alert('Please paste a pipeline definition.'); return; }
+  const project = document.getElementById('cicd-project').value.trim();
+  const context = document.getElementById('cicd-context').value.trim();
+
+  showLoading('Running CI/CD Pipeline Review...');
+  try {
+    const result = await apiFetch(`/api/review/cicd-pipeline-review?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    renderResult('cicd-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('cicd-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function reviewIac() {
+  const content = document.getElementById('iac-content').value.trim();
+  if (!content) { alert('Please paste an infrastructure-as-code manifest.'); return; }
+  const project = document.getElementById('iac-project').value.trim();
+  const context = document.getElementById('iac-context').value.trim();
+
+  showLoading('Running Infrastructure-as-Code Review...');
+  try {
+    const result = await apiFetch(`/api/review/iac-review?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    renderResult('iac-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('iac-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+// ── Operations Intelligence (continued) ─────────────────────────────────────
+
+async function reviewIncidentPostmortem() {
+  const content = document.getElementById('incident-content').value.trim();
+  if (!content) { alert('Please enter an incident timeline or draft postmortem.'); return; }
+  const project = document.getElementById('incident-project').value.trim();
+  const context = document.getElementById('incident-context').value.trim();
+
+  showLoading('Running Incident & Postmortem Review...');
+  try {
+    const result = await apiFetch(`/api/review/incident-postmortem?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    renderResult('incident-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('incident-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function reviewMonitoringAlerting() {
+  const content = document.getElementById('monitor-content').value.trim();
+  if (!content) { alert('Please paste alerting rules, SLO/SLI definitions, or dashboard config.'); return; }
+  const project = document.getElementById('monitor-project').value.trim();
+  const context = document.getElementById('monitor-context').value.trim();
+
+  showLoading('Running Monitoring & Alerting Config Review...');
+  try {
+    const result = await apiFetch(`/api/review/monitoring-alerting-review?project_name=${encodeURIComponent(project)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    renderResult('monitor-result', result);
+    loadDashboard();
+  } catch (e) {
+    showError('monitor-result', e.message);
+  } finally {
+    hideLoading();
   }
 }
 
@@ -7108,6 +7223,194 @@ function onSwarmSourceChange() {
   }
 }
 
+// ── Workshop ─────────────────────────────────────────────────────────────
+
+let _practiceAgents = [];
+
+async function loadWorkshop() {
+  await Promise.all([_loadWorkshopStatus(), _loadPracticeAgents(), loadCustomAgents()]);
+}
+
+async function _loadWorkshopStatus() {
+  const el = document.getElementById('ws-status');
+  try {
+    const s = await apiFetch('/api/v1/sandbox/status', { _silent: true });
+    el.textContent = `${s.used_today} of ${s.daily_cap} practice/custom-agent runs used today — resets at midnight UTC.`;
+  } catch (e) {
+    el.textContent = '';
+  }
+}
+
+async function _loadPracticeAgents() {
+  const sel = document.getElementById('ws-practice-agent');
+  try {
+    const data = await apiFetch('/api/v1/sandbox/practice-agents', { _silent: true });
+    _practiceAgents = data.agents || [];
+    sel.innerHTML = _practiceAgents.map(a => `<option value="${esc(a.id)}">${esc(a.title)}</option>`).join('');
+    sel.onchange = () => {
+      const a = _practiceAgents.find(x => x.id === sel.value);
+      document.getElementById('ws-practice-agent-desc').textContent = a ? a.description : '';
+    };
+    sel.onchange();
+  } catch (e) {
+    sel.innerHTML = '<option value="">Could not load agents</option>';
+  }
+}
+
+async function runPractice() {
+  const agentId = document.getElementById('ws-practice-agent').value;
+  const content = document.getElementById('ws-practice-content').value.trim();
+  const context = document.getElementById('ws-practice-context').value.trim();
+  if (!agentId) { alert('Pick an agent to practice.'); return; }
+  if (!content) { alert('Enter something for the agent to work on.'); return; }
+
+  showLoading('Running practice call…');
+  try {
+    const result = await apiFetch(`/api/v1/sandbox/practice/${encodeURIComponent(agentId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content, context }),
+    });
+    renderResult('ws-practice-result', result);
+    _loadWorkshopStatus();
+  } catch (e) {
+    showError('ws-practice-result', e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
+async function loadCustomAgents() {
+  const wrap = document.getElementById('ws-custom-agents-list');
+  try {
+    const data = await apiFetch('/api/v1/sandbox/custom-agents', { _silent: true });
+    const agents = data.agents || [];
+    if (!agents.length) {
+      wrap.innerHTML = '<div class="empty-state">No custom agents yet for this project — create one above.</div>';
+      return;
+    }
+    // The server is the real gate (creator or a project admin) — this only avoids showing
+    // buttons that would just 403. A project_admin of some *other* project still sees them
+    // here and gets a 403 on click, which is a minor UX gap, not a security one.
+    const me = _authUser && _authUser.username;
+    const mayEdit = a => isSuperAdmin() || isProjectAdmin() || (me && a.created_by === me);
+    wrap.innerHTML = agents.map(a => `
+      <div class="form-card" style="margin-bottom:12px" id="ca-card-${esc(a.id)}">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start">
+          <div>
+            <strong>${esc(a.name)}</strong>
+            <div style="font-size:12px;color:var(--text-muted)">${esc(a.description || '')}</div>
+            <div style="font-size:11px;color:var(--text-muted)">Created by ${esc(a.created_by || 'a team member')}</div>
+          </div>
+          <div>
+            ${mayEdit(a) ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick='editCustomAgent(${JSON.stringify(a)})'>Edit</button>
+            <button class="btn btn-secondary" style="font-size:11px;padding:3px 8px" onclick="deleteCustomAgent('${esc(a.id)}','${esc(a.name)}')">Delete</button>` : ''}
+          </div>
+        </div>
+        <div class="form-group" style="margin-top:10px">
+          <label>${esc(a.input_label || 'Input')}</label>
+          <textarea id="ca-input-${esc(a.id)}" rows="4"></textarea>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick="runCustomAgent('${esc(a.id)}')">▶ Run</button>
+        </div>
+        <div id="ca-result-${esc(a.id)}" class="result-area hidden"></div>
+      </div>`).join('');
+  } catch (e) {
+    // apiFetch doesn't attach a status code to the Error it throws, and this is the one
+    // message worth distinguishing from a real failure: no project picked yet, not broken.
+    const noProject = /select a project/i.test(e.message || '');
+    wrap.innerHTML = `<div class="empty-state"${noProject ? '' : ' style="color:var(--red)"'}>${esc(e.message)}</div>`;
+  }
+}
+
+function openCreateCustomAgent() {
+  document.getElementById('custom-agent-panel-title').textContent = 'New Custom Agent';
+  document.getElementById('ca-editing-id').value = '';
+  ['ca-name', 'ca-description', 'ca-system-prompt', 'ca-input-label'].forEach(id => {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('custom-agent-panel').classList.remove('hidden');
+}
+
+function editCustomAgent(agent) {
+  document.getElementById('custom-agent-panel-title').textContent = 'Edit Custom Agent';
+  document.getElementById('ca-editing-id').value = agent.id;
+  document.getElementById('ca-name').value = agent.name || '';
+  document.getElementById('ca-description').value = agent.description || '';
+  document.getElementById('ca-system-prompt').value = agent.system_prompt || '';
+  document.getElementById('ca-input-label').value = agent.input_label || '';
+  document.getElementById('custom-agent-panel').classList.remove('hidden');
+  document.getElementById('custom-agent-panel').scrollIntoView({ behavior: 'smooth' });
+}
+
+function closeCustomAgentPanel() {
+  document.getElementById('custom-agent-panel').classList.add('hidden');
+}
+
+async function saveCustomAgent() {
+  const id = document.getElementById('ca-editing-id').value;
+  const name = document.getElementById('ca-name').value.trim();
+  const description = document.getElementById('ca-description').value.trim();
+  const system_prompt = document.getElementById('ca-system-prompt').value.trim();
+  const input_label = document.getElementById('ca-input-label').value.trim() || 'Input';
+  if (!name || !system_prompt) { alert('Name and system prompt are required.'); return; }
+
+  try {
+    if (id) {
+      await apiFetch(`/api/v1/sandbox/custom-agents/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description, system_prompt, input_label }),
+      });
+    } else {
+      await apiFetch('/api/v1/sandbox/custom-agents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, description, system_prompt, input_label }),
+      });
+    }
+    closeCustomAgentPanel();
+    loadCustomAgents();
+  } catch (e) {
+    alert('Failed to save: ' + e.message);
+  }
+}
+
+async function deleteCustomAgent(id, name) {
+  if (!confirm(`Delete custom agent "${name}"? This cannot be undone.`)) return;
+  try {
+    await apiFetch(`/api/v1/sandbox/custom-agents/${id}`, { method: 'DELETE' });
+    loadCustomAgents();
+  } catch (e) {
+    alert('Failed to delete: ' + e.message);
+  }
+}
+
+async function runCustomAgent(id) {
+  const input_text = document.getElementById(`ca-input-${id}`).value.trim();
+  if (!input_text) { alert('Enter some input first.'); return; }
+  const resultEl = `ca-result-${id}`;
+  showLoading('Running custom agent…');
+  try {
+    const result = await apiFetch(`/api/v1/sandbox/custom-agents/${id}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input_text }),
+    });
+    const el = document.getElementById(resultEl);
+    el.classList.remove('hidden');
+    el.innerHTML = `<div class="field-hint" style="white-space:pre-wrap">${esc(result.response || '')}</div>`
+      + (result.guardrail_flags && result.guardrail_flags.length
+          ? `<div class="field-hint" style="color:var(--amber);margin-top:8px">Flagged: ${esc(result.guardrail_flags.join(', '))}</div>` : '');
+    _loadWorkshopStatus();
+  } catch (e) {
+    showError(resultEl, e.message);
+  } finally {
+    hideLoading();
+  }
+}
+
 async function runSwarm() {
   const project_name = document.getElementById('swarm-project').value.trim();
   if (!project_name) { alert('Project name is required — the swarm result is filed against it.'); return; }
@@ -8066,9 +8369,16 @@ async function loadUsers() {
   const wrap = document.getElementById('users-list');
   wrap.innerHTML = '<div class="empty-state">Loading…</div>';
   try {
-    const data = await apiFetch('/api/auth/users');
+    const [data, plansData] = await Promise.all([
+      apiFetch('/api/auth/users'),
+      apiFetch('/api/v1/plans', { _silent: true }).catch(() => ({ plans: [] })),
+    ]);
     const users = data.users || [];
+    const plans = (plansData.plans || []).filter(pl => pl.is_active);
     if (!users.length) { wrap.innerHTML = '<div class="empty-state">No users found.</div>'; return; }
+    const planOptions = (currentPlanId) => ['<option value="">Unrestricted (role default)</option>']
+      .concat(plans.map(pl => `<option value="${esc(pl.id)}"${pl.id === currentPlanId ? ' selected' : ''}>${esc(pl.name)} (${(pl.products || []).length} agents)</option>`))
+      .join('');
     const rows = users.map(u => `
       <tr>
         <td><strong>${esc(u.username)}</strong></td>
@@ -8077,15 +8387,34 @@ async function loadUsers() {
         <td><span class="role-badge role-${u.role}">${esc(u.role)}</span></td>
         <td><span class="${u.is_active ? 'user-status-active' : 'user-status-inactive'}">${u.is_active ? '● Active' : '○ Inactive'}</span></td>
         <td style="color:var(--text-muted);font-size:12px">${(u.last_login || '').slice(0, 16).replace('T', ' ') || '—'}</td>
+        <td>
+          <select style="font-size:11px;max-width:220px" onchange="setUserPlan(this, '${u.id}')" title="Personal agent plan — only applies when this user isn't working inside a project">
+            ${planOptions(u.plan_id || '')}
+          </select>
+        </td>
         <td>${u.username !== 'admin' ? `<button class="btn btn-secondary" style="font-size:11px;padding:3px 10px" onclick="deactivateUser('${u.id}','${esc(u.username)}')">Deactivate</button>` : ''}</td>
       </tr>`).join('');
     wrap.innerHTML = `
       <table class="users-table">
-        <thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last Login</th><th></th></tr></thead>
+        <thead><tr><th>Username</th><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last Login</th><th>Personal Agent Plan</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>`;
   } catch (e) {
     wrap.innerHTML = `<div class="empty-state" style="color:var(--red);">Error: ${esc(e.message)} — Admin login required.</div>`;
+  }
+}
+
+async function setUserPlan(selectEl, userId) {
+  const plan_id = selectEl.value || null;
+  try {
+    await apiFetch(`/api/auth/users/${userId}/plan`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan_id }),
+    });
+  } catch (e) {
+    alert('Failed to update plan: ' + e.message);
+    loadUsers();
   }
 }
 
@@ -12543,6 +12872,21 @@ const AGENT_SCREENS = {
   'agent-hub':    { product: 'swarm',               reviewType: 'swarm',
                     result: 'swarm-result',         render: renderSwarmResult,
                     noun: 'swarm runs',             gated: true },
+  'deployment-readiness': { product: 'deployment-readiness', reviewType: 'deployment_readiness',
+                    result: 'depr-result',          render: renderResult,
+                    noun: 'reviews',                gated: true },
+  'cicd-pipeline-review': { product: 'cicd-pipeline-review', reviewType: 'cicd_pipeline',
+                    result: 'cicd-result',          render: renderResult,
+                    noun: 'reviews',                gated: true },
+  'iac-review':   { product: 'iac-review',          reviewType: 'iac_review',
+                    result: 'iac-result',           render: renderResult,
+                    noun: 'reviews',                gated: true },
+  'incident-postmortem': { product: 'incident-postmortem', reviewType: 'incident_postmortem',
+                    result: 'incident-result',      render: renderResult,
+                    noun: 'reviews',                gated: true },
+  'monitoring-alerting-review': { product: 'monitoring-alerting-review', reviewType: 'monitoring_alerting',
+                    result: 'monitor-result',       render: renderResult,
+                    noun: 'reviews',                gated: true },
 };
 
 /** The screen a stored review belongs to, or null. Used to keep one screen's panels out

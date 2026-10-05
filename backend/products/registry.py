@@ -443,6 +443,70 @@ PRODUCTS: List[Product] = [
         invoke=None,
     ),
 
+    # ── DevOps Intelligence ─────────────────────────────────────────────────
+    Product(
+        id="deployment-readiness",
+        kind=AGENT,
+        title="Deployment Readiness",
+        module="devops_intelligence",
+        description="Reviews a release/deployment plan or the pull request being released for rollout risk — rollback plan, staged-rollout strategy, monitoring coverage, dependency readiness, and change-management evidence.",
+        endpoint="POST /api/v1/agents/deployment-readiness",
+        sources=("text", "github_pr_url"),
+        frameworks=("NIST-AI-RMF", "SOC2"),
+        review_type="deployment_readiness",
+        invoke=_adapter("review_deployment_readiness", {"content": _ARTIFACT, "context": _CTX, "project_name": _PROJECT}),
+    ),
+    Product(
+        id="cicd-pipeline-review",
+        kind=AGENT,
+        title="CI/CD Pipeline Review",
+        module="devops_intelligence",
+        description="Reviews pipeline definitions (GitHub Actions, GitLab CI, Jenkinsfile, etc.) for hardcoded secrets, unpinned third-party actions, overly broad token permissions, and missing approval gates before a production deploy job.",
+        endpoint="POST /api/v1/agents/cicd-pipeline-review",
+        sources=("text", "github_file_url"),
+        frameworks=("OWASP-Web-Top10", "SOC2"),
+        review_type="cicd_pipeline",
+        invoke=_adapter("review_cicd_pipeline", {"content": _ARTIFACT, "context": _CTX, "project_name": _PROJECT}),
+    ),
+    Product(
+        id="iac-review",
+        kind=AGENT,
+        title="Infrastructure-as-Code Review",
+        module="devops_intelligence",
+        description="Reviews a Terraform, CloudFormation, or Kubernetes manifest for security and best-practice issues — public network exposure, overly broad IAM policies, missing encryption-at-rest, privileged containers. Scoped to a pasted manifest or a handful of files, not a whole infrastructure repository.",
+        endpoint="POST /api/v1/agents/iac-review",
+        sources=("text", "github_file_url"),
+        frameworks=("SOC2", "NIST-AI-RMF"),
+        review_type="iac_review",
+        invoke=_adapter("review_iac", {"content": _ARTIFACT, "context": _CTX, "project_name": _PROJECT}),
+    ),
+
+    # ── Operations Intelligence (continued) ─────────────────────────────────
+    Product(
+        id="incident-postmortem",
+        kind=AGENT,
+        title="Incident & Postmortem",
+        module="operations_intelligence",
+        description="Reviews an incident timeline, log excerpt, or draft postmortem for completeness in the blameless tradition — timeline gaps, root cause vs. contributing factors, detection/response quality, and specific owned action items.",
+        endpoint="POST /api/v1/agents/incident-postmortem",
+        sources=("text",),
+        frameworks=("NIST-AI-RMF", "SOC2"),
+        review_type="incident_postmortem",
+        invoke=_adapter("review_incident_postmortem", {"content": _ARTIFACT, "context": _CTX, "project_name": _PROJECT}),
+    ),
+    Product(
+        id="monitoring-alerting-review",
+        kind=AGENT,
+        title="Monitoring & Alerting Config Review",
+        module="operations_intelligence",
+        description="Reviews alerting rules, SLO/SLI definitions, and dashboard configurations for coverage gaps — missing golden-signal alerts, unjustified thresholds, SLOs with no matching SLI or error budget policy.",
+        endpoint="POST /api/v1/agents/monitoring-alerting-review",
+        sources=("text", "github_file_url"),
+        frameworks=("SOC2", "NIST-AI-RMF"),
+        review_type="monitoring_alerting",
+        invoke=_adapter("review_monitoring_alerting", {"content": _ARTIFACT, "context": _CTX, "project_name": _PROJECT}),
+    ),
+
     # ── Workflows (multi-agent / multi-stage composites) ───────────────────
     Product(
         # The ID stays `full` even though the title no longer says "Full": IDs are

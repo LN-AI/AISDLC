@@ -41,6 +41,7 @@ ALL = "all"
 
 PROJECT_AXIS = "project"
 KEY_AXIS = "key"
+USER_AXIS = "user"
 
 
 class QuotaExceededError(Exception):
@@ -205,6 +206,23 @@ def resolve_entitlements(caller_or_subject: Union[Subject, dict, None]) -> Entit
                 plan, PROJECT_AXIS, subject.project_id,
                 f"project '{subject.project_name or subject.project_id}'",
             ))
+    elif subject.user:
+        # A personal plan only applies when there is no project layer to intersect with —
+        # a browser session acting inside a project is governed by that project's plan,
+        # same as any other member; the user's own plan is a fallback for working outside
+        # one, not an additional ceiling on top of it (see subject_service docstring).
+        user_id = subject.user.get("sub")
+        user_record = database.get_user_by_id(user_id) if user_id else None
+        if user_record and user_record.get("plan_id"):
+            plan = database.get_plan(user_record["plan_id"])
+            if plan and plan.get("is_active"):
+                # axis_id is the username, not the user id: that's the join key recorded on
+                # usage_events.caller_ref for a UI caller (agent_guard._caller_identity), and
+                # _usage_for needs it to count this layer's quota.
+                username = user_record.get("username") or user_id
+                layers.append(_plan_allowance(
+                    plan, USER_AXIS, username, f"user '{username}'",
+                ))
 
     record = subject.key_record
     if record:
@@ -229,6 +247,8 @@ def resolve_entitlements(caller_or_subject: Union[Subject, dict, None]) -> Entit
 def _usage_for(layer: Allowance, product_id: str, period: str) -> Dict[str, Any]:
     if layer.axis == PROJECT_AXIS:
         return database.get_usage_totals_for_project(layer.axis_id, product_id, period)
+    if layer.axis == USER_AXIS:
+        return database.get_usage_totals_for_user(layer.axis_id, product_id, period)
     return database.get_usage_totals(layer.axis_id, product_id, period)
 
 

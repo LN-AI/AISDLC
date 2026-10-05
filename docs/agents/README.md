@@ -61,12 +61,22 @@ One nuance worth knowing up front: **not every endpoint returns `_budget_stats` 
 | [Core SDLC Review](full.md) | `POST /api/v1/agents/full` | Runs requirement, compliance, architecture, code and prompt-safety agents in one call, then the release gate. STRIDE, VAPT and sensitive-data are opt-in; whatever is skipped is reported. |
 | [Governance Report Generator](report-generate.md) | `POST /api/v1/agents/report-generate` | Synthesizes prior review findings into an audit-ready governance report without re-running a review. |
 
+## DevOps Intelligence
+
+| Agent | Endpoint | Description |
+|---|---|---|
+| [Deployment Readiness](deployment-readiness.md) | `POST /api/v1/agents/deployment-readiness` | Reviews a release/deployment plan or the PR being released for rollout risk — rollback, staged-rollout strategy, monitoring coverage, dependency readiness. |
+| [CI/CD Pipeline Review](cicd-pipeline-review.md) | `POST /api/v1/agents/cicd-pipeline-review` | Reviews a pipeline definition (GitHub Actions, GitLab CI, Jenkinsfile) for hardcoded secrets, unpinned actions, and missing approval gates. |
+| [Infrastructure-as-Code Review](iac-review.md) | `POST /api/v1/agents/iac-review` | Reviews a Terraform/CloudFormation/Kubernetes manifest for public network exposure, broad IAM policies, and missing encryption. |
+
 ## Operations Intelligence
 
 | Agent | Endpoint | Description |
 |---|---|---|
 | [Issue Triaging Agent](issue-triage.md) | `POST /api/v1/agents/issue-triage` | Classifies, prioritizes, and recommends assignment for a defect/incident/support ticket/security finding. |
 | [Issue Triaging — GitHub Batch](issue-triage-batch-github.md) | `POST /api/v1/agents/issue-triage/batch-github` | Pulls open issues from a GitHub repo and triages each one, with a severity/escalation summary. |
+| [Incident & Postmortem](incident-postmortem.md) | `POST /api/v1/agents/incident-postmortem` | Reviews an incident timeline or draft postmortem for completeness, in the blameless tradition. |
+| [Monitoring & Alerting Config Review](monitoring-alerting-review.md) | `POST /api/v1/agents/monitoring-alerting-review` | Reviews alerting rules, SLO/SLI definitions, and dashboards for coverage gaps. |
 
 ## QA Intelligence
 

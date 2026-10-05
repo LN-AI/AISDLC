@@ -72,6 +72,24 @@ PASS_THROUGH: Dict[str, Any] = {"fee_usd": 0.0, "markup": 1.0, "ceiling_usd": 0.
 # input rather than ordinary use.
 POLICY: Dict[str, Dict[str, Any]] = {
     "test-automation": {"fee_usd": 0.50, "markup": 2.0, "ceiling_usd": 5.00},
+
+    # The flagship, sellable-on-their-own products — see D-464 for the reasoning behind
+    # pricing this set now and leaving the rest pass-through. Starting numbers, not a
+    # considered business decision: deliberately round, deliberately easy to change, and
+    # unvalidated against real usage volume the way test-automation's were (D-383). Revisit
+    # once real customer usage gives an actual cost distribution to price against.
+    "code":                  {"fee_usd": 0.25, "markup": 2.00, "ceiling_usd": 3.00},
+    "vapt":                  {"fee_usd": 0.50, "markup": 2.00, "ceiling_usd": 5.00},
+    "security":              {"fee_usd": 0.50, "markup": 2.00, "ceiling_usd": 5.00},
+    "architecture":          {"fee_usd": 0.50, "markup": 2.00, "ceiling_usd": 5.00},
+    "compliance":            {"fee_usd": 0.25, "markup": 1.75, "ceiling_usd": 3.00},
+    "gxp-document-check":    {"fee_usd": 0.50, "markup": 1.75, "ceiling_usd": 5.00},
+    "gxp-generate-plan":     {"fee_usd": 0.75, "markup": 2.00, "ceiling_usd": 7.50},
+    "gxp-generate-document": {"fee_usd": 1.00, "markup": 2.00, "ceiling_usd": 10.00},
+    "full":                  {"fee_usd": 1.00, "markup": 1.75, "ceiling_usd": 10.00},
+    "auto-fix":              {"fee_usd": 0.75, "markup": 2.00, "ceiling_usd": 7.50},
+    "migration-execute":     {"fee_usd": 0.75, "markup": 1.75, "ceiling_usd": 7.50},
+    "app-testing":           {"fee_usd": 0.50, "markup": 2.00, "ceiling_usd": 5.00},
 }
 
 

@@ -141,8 +141,12 @@ def delete_plan(plan_id: str, force: bool = False, user: dict = Depends(_require
         raise HTTPException(status_code=404, detail="Plan not found")
 
     subjects = database.plan_subjects(plan_id)
-    if not force and (subjects["projects"] or subjects["api_keys"]):
-        names = [p["name"] for p in subjects["projects"]] + [k["name"] for k in subjects["api_keys"]]
+    if not force and (subjects["projects"] or subjects["api_keys"] or subjects["users"]):
+        names = (
+            [p["name"] for p in subjects["projects"]]
+            + [k["name"] for k in subjects["api_keys"]]
+            + [u["name"] for u in subjects["users"]]
+        )
         raise HTTPException(
             status_code=409,
             detail={
